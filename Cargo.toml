@@ -1,0 +1,21 @@
+[package]
+name = "git_manager"
+version = "0.1.0"
+edition = "2021"
+description = "A dedicated Git branch & worktree manager GUI"
+homepage = "https://github.com/JohnXu22786/GitManager"
+repository = "https://github.com/JohnXu22786/GitManager"
+
+[dependencies]
+eframe = { version = "0.31", features = ["wgpu"] }
+egui = "0.31"
+git2 = "0.20"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
