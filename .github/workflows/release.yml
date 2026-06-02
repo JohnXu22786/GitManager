@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build and Release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $ver = $tag -replace '^v', ''
+          Write-Output "version=$ver" | Out-File -Append $env:GITHUB_OUTPUT
+          $content = Get-Content Cargo.toml -Raw
+          $content = $content -replace '^version = ".*"', "version = `"$ver`""
+          Set-Content Cargo.toml $content
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Package
+        run: |
+          Compress-Archive -Path target/release/git_manager.exe -DestinationPath git-manager-${{ steps.version.outputs.version }}-windows-x86_64.zip
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Git Manager ${{ steps.version.outputs.version }}
+          body: |
+            ## Git Manager v${{ steps.version.outputs.version }}
+
+            A dedicated Git branch & worktree manager GUI built with Rust + egui.
+
+            ### Features
+            - Branch management (create, rename, delete, switch, merge)
+            - Worktree management (add, remove, prune)
+            - Status & commit (stage/unstage, diff, commit, amend, uncommit)
+            - Commit log viewer
+            - Stash management
+            - Push/Pull/Fetch with remotes
+            - System dark/light theme following
+          files: git-manager-${{ steps.version.outputs.version }}-windows-x86_64.zip
