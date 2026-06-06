@@ -532,7 +532,7 @@ impl eframe::App for App {
         // --- Top Bar ---
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if ui.add_enabled(!self.is_busy(), egui::Button::new("📂")).clicked() {
+                if crate::ui::add_enabled_ellipsis(ui, !self.is_busy(), "📂").clicked() {
                     let path = crate::native_file_dialog();
                     if let Some(p) = path {
                         self.open_repo(&p);
@@ -567,7 +567,7 @@ impl eframe::App for App {
                                         .size(10.0)
                                         .color(egui::Color32::GRAY),
                                 );
-                                if ui.button("🗑").clicked() {
+                                if crate::ui::ellipsis_button(ui, "🗑").clicked() {
                                     to_delete = Some(i);
                                 }
                             });
@@ -584,7 +584,7 @@ impl eframe::App for App {
                             .color(egui::Color32::GRAY)
                             .text_style(egui::TextStyle::Small),
                     );
-                    if ui.button("ⓘ").clicked() {
+                        if crate::ui::ellipsis_button(ui, "ⓘ").clicked() {
                         self.show_about = !self.show_about;
                     }
                 });
@@ -625,10 +625,10 @@ impl eframe::App for App {
                             }
                         }
                         // Disable refresh button while busy
-                        if ui.add_enabled(!self.is_busy(), egui::Button::new("🔄")).clicked() {
+                        if crate::ui::add_enabled_ellipsis(ui, !self.is_busy(), "🔄").clicked() {
                             self.refresh_all();
                         }
-                        if ui.button("ⓘ").clicked() {
+                        if crate::ui::ellipsis_button(ui, "ⓘ").clicked() {
                             self.show_about = !self.show_about;
                         }
                     });
@@ -704,10 +704,10 @@ impl eframe::App for App {
                                     } else {
                                         "▲"
                                     };
-                                    if ui.button(expand_label).clicked() {
+                                    if crate::ui::ellipsis_button(ui, expand_label).clicked() {
                                         self.status_expanded = !self.status_expanded;
                                     }
-                                    if ui.button("x").clicked() {
+                                    if crate::ui::ellipsis_button(ui, "x").clicked() {
                                         self.error_message.clear();
                                         self.success_message.clear();
                                     }
@@ -751,8 +751,7 @@ impl eframe::App for App {
                     ui.heading("Git Manager");
                     ui.label("Open a Git repository to get started.");
                     ui.add_space(20.0);
-                    let open_btn = egui::Button::new("📂 Open Repository");
-                    if ui.add_enabled(!self.is_busy(), open_btn).clicked() {
+                    if crate::ui::add_enabled_ellipsis(ui, !self.is_busy(), "📂 Open Repository").clicked() {
                         let path = crate::native_file_dialog();
                         if let Some(p) = path {
                             self.open_repo(&p);
@@ -760,7 +759,7 @@ impl eframe::App for App {
                     }
                     ui.add_space(10.0);
                     ui.label("Or drag & drop a folder");
-                    if ui.button("Clone Repository...").clicked() {
+                    if crate::ui::ellipsis_button(ui, "Clone Repository...").clicked() {
                         self.current_tab = Tab::Remotes;
                     }
 
@@ -795,7 +794,7 @@ impl eframe::App for App {
                                                 .size(10.0)
                                                 .color(egui::Color32::GRAY),
                                         );
-                                        if ui.button("🗑 Delete").clicked() {
+                                        if crate::ui::ellipsis_button(ui, "🗑 Delete").clicked() {
                                             to_delete = Some(i);
                                         }
                                     });
@@ -823,12 +822,13 @@ impl eframe::App for App {
                 for (tab, label) in &tabs {
                     let selected = self.current_tab == *tab;
                     let btn = egui::Button::new(*label)
+                        .truncate()
                         .fill(if selected {
                             ui.style().visuals.selection.bg_fill
                         } else {
                             egui::Color32::TRANSPARENT
                         });
-                    if ui.add(btn).clicked() {
+                    if ui.add(btn).on_hover_text(*label).clicked() {
                         self.current_tab = tab.clone();
                     }
                 }
@@ -874,7 +874,7 @@ impl eframe::App for App {
                             let state = self.update_state.lock().unwrap().clone();
                             match state {
                                 UpdateState::Idle | UpdateState::UpToDate => {
-                                    if ui.button("Check for Updates").clicked() {
+                                    if crate::ui::ellipsis_button(ui, "Check for Updates").clicked() {
                                         self.trigger_update_check();
                                     }
                                     if state == UpdateState::UpToDate {
@@ -888,13 +888,13 @@ impl eframe::App for App {
                                 }
                                 UpdateState::UpdateAvailable { latest_version, download_url } => {
                                     ui.colored_label(App::adaptive_yellow(dark), format!("Update available: {}!", latest_version));
-                                    if ui.button("Download").clicked() {
+                                    if crate::ui::ellipsis_button(ui, "Download").clicked() {
                                         let _ = open::that(&download_url);
                                     }
                                 }
                                 UpdateState::Error(ref msg) => {
                                     ui.colored_label(App::adaptive_red(dark), msg.as_str());
-                                    if ui.button("Retry").clicked() {
+                                    if crate::ui::ellipsis_button(ui, "Retry").clicked() {
                                         self.trigger_update_check();
                                     }
                                 }
@@ -902,7 +902,7 @@ impl eframe::App for App {
                         }
 
                         ui.add_space(8.0);
-                        if ui.button("Close").clicked() {
+                        if crate::ui::ellipsis_button(ui, "Close").clicked() {
                             self.show_about = false;
                         }
                     });
@@ -930,11 +930,11 @@ impl eframe::App for App {
                             ui.label("Visit the GitHub releases page to download the latest version.");
                             ui.add_space(12.0);
                             ui.horizontal(|ui| {
-                                if ui.button("Download").clicked() {
+                                if crate::ui::ellipsis_button(ui, "Download").clicked() {
                                     let _ = open::that(download_url);
                                     self.show_update_dialog = false;
                                 }
-                                if ui.button("Remind Later").clicked() {
+                                if crate::ui::ellipsis_button(ui, "Remind Later").clicked() {
                                     self.show_update_dialog = false;
                                 }
                             });

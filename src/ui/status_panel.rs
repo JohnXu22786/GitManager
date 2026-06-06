@@ -8,13 +8,13 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.heading("Changes");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let busy = app.is_busy();
-            if ui.add_enabled(!busy, egui::Button::new("Stage All")).clicked() {
+            if crate::ui::add_enabled_ellipsis(ui, !busy, "Stage All").clicked() {
                 app.start_operation(ctx, "Staging all", GitOperation::StageAll);
             }
-            if ui.add_enabled(!busy, egui::Button::new("Unstage All")).clicked() {
+            if crate::ui::add_enabled_ellipsis(ui, !busy, "Unstage All").clicked() {
                 app.start_operation(ctx, "Unstaging all", GitOperation::UnstageAll);
             }
-            if ui.add_enabled(!busy, egui::Button::new("Discard All")).clicked() {
+            if crate::ui::add_enabled_ellipsis(ui, !busy, "Discard All").clicked() {
                 app.start_operation(ctx, "Discarding all", GitOperation::RestoreAll);
             }
         });
@@ -33,10 +33,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 let busy = app.is_busy();
                 let color = crate::app::App::status_color_by_type(entry.status, dark);
                 ui.label(egui::RichText::new(format!("[{}]", entry.status)).color(color).monospace());
-                if ui.add_enabled(!busy, egui::Button::new("Unstage")).clicked() {
+                if crate::ui::add_enabled_ellipsis(ui, !busy, "Unstage").clicked() {
                     app.start_operation(ctx, &format!("Unstage {}", path), GitOperation::UnstageFile(path.clone()));
                 }
-                if ui.add_enabled(!busy, egui::Button::new("Diff")).clicked() {
+                if crate::ui::add_enabled_ellipsis(ui, !busy, "Diff").clicked() {
                     app.start_operation(ctx, &format!("Diff {}", path), GitOperation::GetDiff { path: path.clone(), staged: true });
                 }
                 ui.label(&path);
@@ -55,16 +55,16 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 ui.label(egui::RichText::new(format!("[{}]", entry.status)).color(color).monospace());
 
                 if entry.status != 'D' && entry.status != '?' && entry.status != '!' {
-                    if ui.add_enabled(!busy, egui::Button::new("Stage")).clicked() {
+                    if crate::ui::add_enabled_ellipsis(ui, !busy, "Stage").clicked() {
                         app.start_operation(ctx, &format!("Stage {}", path), GitOperation::StageFile(path.clone()));
                     }
                 }
                 if entry.status != '?' && entry.status != '!' {
-                    if ui.add_enabled(!busy, egui::Button::new("Discard")).clicked() {
+                    if crate::ui::add_enabled_ellipsis(ui, !busy, "Discard").clicked() {
                         app.start_operation(ctx, &format!("Restore {}", path), GitOperation::RestoreFile(path.clone()));
                     }
                 }
-                if ui.add_enabled(!busy, egui::Button::new("Diff")).clicked() {
+                if crate::ui::add_enabled_ellipsis(ui, !busy, "Diff").clicked() {
                     app.start_operation(ctx, &format!("Diff {}", path), GitOperation::GetDiff { path: path.clone(), staged: false });
                 }
                 ui.label(&path);
@@ -95,7 +95,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         });
 
     let busy = app.is_busy();
-    if ui.add_enabled(!busy, egui::Button::new("Commit")).clicked() {
+    if crate::ui::add_enabled_ellipsis(ui, !busy, "Commit").clicked() {
         if app.commit_msg.trim().is_empty() {
             app.show_error("Commit message cannot be empty".into());
         } else {
@@ -106,7 +106,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             app.commit_amend = false;
         }
     }
-    if ui.add_enabled(!busy, egui::Button::new("Uncommit")).clicked() {
+    if crate::ui::add_enabled_ellipsis(ui, !busy, "Uncommit").clicked() {
         app.start_operation(ctx, "Uncommitting", GitOperation::Uncommit);
     }
 

@@ -7,7 +7,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     ui.horizontal(|ui| {
         ui.heading("Stash");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.add_enabled(!app.is_busy(), egui::Button::new("🔄 Refresh")).clicked() {
+            if crate::ui::add_enabled_ellipsis(ui, !app.is_busy(), "🔄 Refresh").clicked() {
                 app.refresh_all();
             }
         });
@@ -20,7 +20,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.text_edit_singleline(&mut app.stash_message);
     });
     let busy = app.is_busy();
-    if ui.add_enabled(!busy, egui::Button::new("Stash All")).clicked() {
+    if crate::ui::add_enabled_ellipsis(ui, !busy, "Stash All").clicked() {
         let msg = if app.stash_message.trim().is_empty() {
             None
         } else {
@@ -32,10 +32,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
 
     ui.separator();
 
-    if ui.add_enabled(!busy, egui::Button::new("Pop Stash")).clicked() {
+    if crate::ui::add_enabled_ellipsis(ui, !busy, "Pop Stash").clicked() {
         app.start_operation(ctx, "Popping stash", GitOperation::StashPop);
     }
-    if ui.add_enabled(!busy, egui::Button::new("Apply Stash")).clicked() {
+    if crate::ui::add_enabled_ellipsis(ui, !busy, "Apply Stash").clicked() {
         app.start_operation(ctx, "Applying stash", GitOperation::StashApply(0));
     }
 
@@ -63,10 +63,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                         .color(egui::Color32::GRAY)
                         .text_style(egui::TextStyle::Small),
                 );
-                if ui.add_enabled(!busy, egui::Button::new("Drop")).clicked() {
+                if crate::ui::add_enabled_ellipsis(ui, !busy, "Drop").clicked() {
                     app.start_operation(ctx, &format!("Drop stash@{{{}}}", index), GitOperation::StashDrop(index));
                 }
-                if ui.add_enabled(!busy, egui::Button::new("Apply")).clicked() {
+                if crate::ui::add_enabled_ellipsis(ui, !busy, "Apply").clicked() {
                     // FIX: Pass the specific stash index instead of always applying index 0
                     app.start_operation(ctx, &format!("Apply stash@{{{}}}", index), GitOperation::StashApply(index));
                 }

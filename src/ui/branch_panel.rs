@@ -7,7 +7,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     ui.horizontal(|ui| {
         ui.heading("Branches");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.add_enabled(!app.is_busy(), egui::Button::new("🔄 Refresh")).clicked() {
+            if crate::ui::add_enabled_ellipsis(ui, !app.is_busy(), "🔄 Refresh").clicked() {
                 app.refresh_all();
             }
         });
@@ -61,7 +61,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.label("(leave empty for current HEAD)");
     });
     let busy = app.is_busy();
-    if ui.add_enabled(!busy, egui::Button::new("Create Branch")).clicked() {
+    if crate::ui::add_enabled_ellipsis(ui, !busy, "Create Branch").clicked() {
         let name = app.new_branch_name.trim().to_string();
         if name.is_empty() {
             app.show_error("Branch name required".into());
@@ -83,7 +83,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.label("From:");
         ui.text_edit_singleline(&mut app.merge_branch_name);
     });
-    if ui.add_enabled(!busy, egui::Button::new("Merge")).clicked() {
+    if crate::ui::add_enabled_ellipsis(ui, !busy, "Merge").clicked() {
         let name = app.merge_branch_name.trim().to_string();
         if name.is_empty() {
             app.show_error("Branch name required".into());
@@ -103,7 +103,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.label("To:");
         ui.text_edit_singleline(&mut app.rename_branch_new);
     });
-    if ui.add_enabled(!busy, egui::Button::new("Rename")).clicked() {
+    if crate::ui::add_enabled_ellipsis(ui, !busy, "Rename").clicked() {
         let old = app.rename_branch_old.trim().to_string();
         let new = app.rename_branch_new.trim().to_string();
         if old.is_empty() || new.is_empty() {
@@ -161,20 +161,20 @@ fn show_branch_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, branch
         let busy = app.is_busy();
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if !is_head && !is_remote {
-                if ui.add_enabled(!busy, egui::Button::new("Copy")).clicked() {
+                if crate::ui::add_enabled_ellipsis(ui, !busy, "Copy").clicked() {
                     ui.ctx().copy_text(name.clone());
                     app.show_success(format!("Copied {}", name));
                 }
-                if ui.add_enabled(!busy, egui::Button::new("Delete")).clicked() {
+                if crate::ui::add_enabled_ellipsis(ui, !busy, "Delete").clicked() {
                     app.start_operation(ctx, &format!("Delete '{}'", name), GitOperation::DeleteBranch { name: name.clone(), force: false });
                 }
-                if ui.add_enabled(!busy, egui::Button::new("Force Del")).clicked() {
+                if crate::ui::add_enabled_ellipsis(ui, !busy, "Force Del").clicked() {
                     // FIX: Pass force=true for Force Del, and try reference deletion
                     app.start_operation(ctx, &format!("Force delete '{}'", name), GitOperation::DeleteBranch { name: name.clone(), force: true });
                 }
             }
             if !is_head {
-                if ui.add_enabled(!busy, egui::Button::new("Checkout")).clicked() {
+                if crate::ui::add_enabled_ellipsis(ui, !busy, "Checkout").clicked() {
                     app.start_operation(ctx, &format!("Checkout '{}'", name), GitOperation::CheckoutBranch(name));
                 }
             }
