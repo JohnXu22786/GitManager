@@ -117,6 +117,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
 }
 
 fn show_branch_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, branch: &BranchInfo) {
+    let dark = ctx.style().visuals.dark_mode;
     let name = branch.name.clone();
     let is_remote = branch.is_remote;
     let is_head = branch.is_head;
@@ -124,7 +125,7 @@ fn show_branch_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, branch
     ui.horizontal(|ui| {
         let icon = if is_head { "▶" } else { " " };
         let name_color = if is_head {
-            egui::Color32::GREEN
+            App::adaptive_green(dark)
         } else {
             ui.style().visuals.text_color()
         };
