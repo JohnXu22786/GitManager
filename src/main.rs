@@ -4,6 +4,7 @@ mod app;
 mod git_ops;
 mod recent;
 mod ui;
+mod updater;
 
 use eframe::egui;
 

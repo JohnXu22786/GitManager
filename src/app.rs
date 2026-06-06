@@ -1,8 +1,10 @@
 use crate::git_ops::*;
 use crate::recent::RecentRepos;
+use crate::updater::{self, UpdateState};
 use eframe::egui;
 use std::path::Path;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// Tracks a Git operation running in a background thread.
@@ -66,6 +68,9 @@ pub struct App {
 
     pub show_about: bool,
 
+    pub update_state: Arc<Mutex<UpdateState>>,
+    pub show_update_dialog: bool,
+    pub auto_check_done: bool,
     /// Pending Git operations running in background threads.
     pending_ops: Vec<PendingOp>,
     /// Accumulated error messages from background operations.
@@ -124,6 +129,9 @@ impl App {
 
             show_about: false,
 
+            update_state: Arc::new(Mutex::new(UpdateState::Idle)),
+            show_update_dialog: false,
+            auto_check_done: false,
             pending_ops: Vec::new(),
             pending_errors: Vec::new(),
             pending_successes: Vec::new(),
@@ -131,6 +139,17 @@ impl App {
             recent_repos: RecentRepos::load(),
             status_expanded: false,
         }
+    }
+
+    pub fn trigger_update_check(&mut self) {
+        let current_version = env!("CARGO_PKG_VERSION").to_string();
+        let state = self.update_state.clone();
+        *state.lock().unwrap() = UpdateState::Checking;
+
+        std::thread::spawn(move || {
+            let result = updater::check_for_update(&current_version);
+            *state.lock().unwrap() = result;
+        });
     }
 
     pub fn open_repo(&mut self, path: &str) {
@@ -354,6 +373,30 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Auto-check for updates on startup (first frame only)
+        if !self.auto_check_done {
+            self.auto_check_done = true;
+            self.trigger_update_check();
+            ctx.request_repaint();
+        }
+
+        // Poll update state from background thread
+        {
+            let state = self.update_state.lock().unwrap();
+            match &*state {
+                UpdateState::UpdateAvailable { latest_version, download_url: _ } => {
+                    if !self.show_update_dialog {
+                        self.show_update_dialog = true;
+                    }
+                    let _ = latest_version;
+                }
+                UpdateState::Checking => {
+                    ctx.request_repaint();
+                }
+                _ => {}
+            }
+        }
+
         // --- Phase 1: Process any completed background operations ---
         self.process_pending_ops(ctx);
         self.flush_messages();
@@ -452,6 +495,16 @@ impl eframe::App for App {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Show update indicator if an update is available
+                        {
+                            let state = self.update_state.lock().unwrap();
+                            if matches!(*state, UpdateState::UpdateAvailable { .. }) {
+                                ui.label(
+                                    egui::RichText::new("⬆ Update")
+                                        .color(egui::Color32::YELLOW),
+                                );
+                            }
+                        }
                         // Disable refresh button while busy
                         if ui.add_enabled(!self.is_busy(), egui::Button::new("🔄")).clicked() {
                             self.refresh_all();
@@ -663,11 +716,82 @@ impl eframe::App for App {
                         ui.add_space(4.0);
                         ui.label("Built with Rust + egui + libgit2");
                         ui.add_space(12.0);
+
+                        // Check for Updates button
+                        {
+                            let state = self.update_state.lock().unwrap().clone();
+                            match state {
+                                UpdateState::Idle | UpdateState::UpToDate => {
+                                    if ui.button("Check for Updates").clicked() {
+                                        self.trigger_update_check();
+                                    }
+                                    if state == UpdateState::UpToDate {
+                                        ui.add_space(4.0);
+                                        ui.label(egui::RichText::new("✓ You're up to date!").color(egui::Color32::GREEN));
+                                    }
+                                }
+                                UpdateState::Checking => {
+                                    ui.add(egui::Spinner::new());
+                                    ui.label("Checking for updates...");
+                                }
+                                UpdateState::UpdateAvailable { latest_version, download_url } => {
+                                    ui.colored_label(egui::Color32::YELLOW, format!("Update available: {}!", latest_version));
+                                    if ui.button("Download").clicked() {
+                                        let _ = open::that(&download_url);
+                                    }
+                                }
+                                UpdateState::Error(ref msg) => {
+                                    ui.colored_label(egui::Color32::RED, msg.as_str());
+                                    if ui.button("Retry").clicked() {
+                                        self.trigger_update_check();
+                                    }
+                                }
+                            }
+                        }
+
+                        ui.add_space(8.0);
                         if ui.button("Close").clicked() {
                             self.show_about = false;
                         }
                     });
                 });
+        }
+
+        // Auto-update notification dialog
+        if self.show_update_dialog {
+            let state = self.update_state.lock().unwrap().clone();
+            if let UpdateState::UpdateAvailable { ref latest_version, ref download_url } = state {
+                egui::Window::new("Update Available")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.heading("🚀 Update Available!");
+                            ui.add_space(8.0);
+                            ui.label(format!(
+                                "Version {} is now available (you have {}).",
+                                latest_version,
+                                env!("CARGO_PKG_VERSION"),
+                            ));
+                            ui.add_space(8.0);
+                            ui.label("Visit the GitHub releases page to download the latest version.");
+                            ui.add_space(12.0);
+                            ui.horizontal(|ui| {
+                                if ui.button("Download").clicked() {
+                                    let _ = open::that(download_url);
+                                    self.show_update_dialog = false;
+                                }
+                                if ui.button("Remind Later").clicked() {
+                                    self.show_update_dialog = false;
+                                }
+                            });
+                        });
+                    });
+            } else {
+                // State changed while dialog was open
+                self.show_update_dialog = false;
+            }
         }
 
         // Keep repainting while operations are in progress
