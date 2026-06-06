@@ -2,7 +2,7 @@ use crate::git_ops::*;
 use eframe::egui;
 use std::path::Path;
 
-#[derive(PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum Tab {
     Status,
     Branches,
@@ -56,9 +56,13 @@ pub struct App {
     pub last_refresh: std::time::Instant,
 
     pub show_about: bool,
+    pub font_size: f32,
 }
 
 impl App {
+    const MIN_FONT_SIZE: f32 = 10.0;
+    const MAX_FONT_SIZE: f32 = 24.0;
+
     pub fn new() -> Self {
         Self {
             git: GitRepo::new(),
@@ -104,6 +108,7 @@ impl App {
             last_refresh: std::time::Instant::now(),
 
             show_about: false,
+            font_size: 14.0,
         }
     }
 
@@ -199,10 +204,21 @@ impl eframe::App for App {
             ctx.set_visuals(egui::Visuals::light());
         }
 
+        // Apply font size via text styles
+        let fs = self.font_size;
+        ctx.style_mut(|style| {
+            style.text_styles = [
+                (egui::TextStyle::Body, egui::FontId::proportional(fs)),
+                (egui::TextStyle::Button, egui::FontId::proportional(fs)),
+                (egui::TextStyle::Heading, egui::FontId::proportional(fs + 4.0)),
+                (egui::TextStyle::Small, egui::FontId::proportional(fs - 2.0)),
+                (egui::TextStyle::Monospace, egui::FontId::monospace(fs)),
+            ].into();
+        });
+
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label("📂");
-                if ui.button("Open Repo...").clicked() {
+                if ui.button("📂").clicked() {
                     let path = native_dialog_path();
                     if let Some(p) = path {
                         self.open_repo(&p);
@@ -210,7 +226,7 @@ impl eframe::App for App {
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("ℹ️").clicked() {
+                    if ui.button("ⓘ").clicked() {
                         self.show_about = !self.show_about;
                     }
                 });
@@ -243,7 +259,7 @@ impl eframe::App for App {
                         if ui.button("🔄").clicked() {
                             self.refresh_all();
                         }
-                        if ui.button("ℹ️").clicked() {
+                        if ui.button("ⓘ").clicked() {
                             self.show_about = !self.show_about;
                         }
                     });
@@ -275,6 +291,12 @@ impl eframe::App for App {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let elapsed = self.last_refresh.elapsed().as_secs();
                         ui.label(format!("Updated {}s ago", elapsed));
+                        ui.separator();
+                        ui.label("Font:");
+                        ui.add(
+                            egui::Slider::new(&mut self.font_size, Self::MIN_FONT_SIZE..=Self::MAX_FONT_SIZE)
+                                .show_value(false),
+                        );
                     });
                 });
             });
@@ -307,7 +329,7 @@ impl eframe::App for App {
                     (Tab::Status, "📊 Status"),
                     (Tab::Branches, "🔀 Branches"),
                     (Tab::Worktrees, "📂 Worktrees"),
-                    (Tab::Log, "📜 Log"),
+                    (Tab::Log, "⏰ Log"),
                     (Tab::Stash, "📦 Stash"),
                     (Tab::Remotes, "🌐 Remotes"),
                 ];
@@ -390,4 +412,89 @@ if ($result -eq 'OK') { Write-Output $f.SelectedPath }
 
     let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if path.is_empty() { None } else { Some(path) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_app_new_defaults() {
+        let app = App::new();
+        assert_eq!(app.font_size, 14.0);
+        assert!(!app.show_about);
+        assert!(!app.git.is_open());
+        assert_eq!(app.current_tab, Tab::Status);
+    }
+
+    #[test]
+    fn test_font_size_default_in_range() {
+        let app = App::new();
+        // Default value should be between min and max
+        assert!(app.font_size >= App::MIN_FONT_SIZE);
+        assert!(app.font_size <= App::MAX_FONT_SIZE);
+    }
+
+    #[test]
+    fn test_status_icon_known_values() {
+        assert_eq!(App::status_icon('M'), "M");
+        assert_eq!(App::status_icon('A'), "A");
+        assert_eq!(App::status_icon('D'), "D");
+        assert_eq!(App::status_icon('R'), "R");
+        assert_eq!(App::status_icon('C'), "C");
+        assert_eq!(App::status_icon('?'), "?");
+        assert_eq!(App::status_icon('!'), "!");
+        assert_eq!(App::status_icon('U'), "U");
+    }
+
+    #[test]
+    fn test_status_icon_unknown() {
+        assert_eq!(App::status_icon('X'), " ");
+        assert_eq!(App::status_icon(' '), " ");
+    }
+
+    #[test]
+    fn test_status_color_by_type_known() {
+        assert_eq!(App::status_color_by_type('M'), egui::Color32::GREEN);
+        assert_eq!(App::status_color_by_type('A'), egui::Color32::GREEN);
+        assert_eq!(App::status_color_by_type('R'), egui::Color32::GREEN);
+        assert_eq!(App::status_color_by_type('D'), egui::Color32::RED);
+        assert_eq!(App::status_color_by_type('?'), egui::Color32::GRAY);
+        assert_eq!(App::status_color_by_type('!'), egui::Color32::GRAY);
+        assert_eq!(App::status_color_by_type('U'), egui::Color32::YELLOW);
+    }
+
+    #[test]
+    fn test_status_color_by_type_unknown() {
+        assert_eq!(App::status_color_by_type('X'), egui::Color32::GRAY);
+    }
+
+    #[test]
+    fn test_status_label() {
+        assert_eq!(App::status_label(' '), "");
+        assert_eq!(App::status_label('+'), "");
+        assert_eq!(App::status_label('-'), "del");
+        assert_eq!(App::status_label('M'), "mod");
+        assert_eq!(App::status_label('?'), "mod");
+    }
+
+    #[test]
+    fn test_status_color() {
+        assert_eq!(App::status_color('+'), egui::Color32::GREEN);
+        assert_eq!(App::status_color('-'), egui::Color32::RED);
+        assert_eq!(App::status_color('M'), egui::Color32::GRAY);
+    }
+
+    #[test]
+    fn test_tab_partial_eq() {
+        assert_eq!(Tab::Status, Tab::Status);
+        assert_eq!(Tab::Log, Tab::Log);
+        assert_ne!(Tab::Status, Tab::Branches);
+    }
+
+    #[test]
+    fn test_tab_clone() {
+        let tab = Tab::Worktrees;
+        assert_eq!(tab.clone(), Tab::Worktrees);
+    }
 }

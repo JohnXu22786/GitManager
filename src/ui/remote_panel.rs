@@ -22,7 +22,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                     ui.label(
                         egui::RichText::new(&remote.url)
                             .color(egui::Color32::GRAY)
-                            .size(11.0),
+                            .text_style(egui::TextStyle::Small),
                     );
                 });
             });
