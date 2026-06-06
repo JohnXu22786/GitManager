@@ -90,6 +90,7 @@ fn test_diff_content_through_channel() {
     }
 
     #[derive(Clone, Debug, PartialEq)]
+    #[allow(dead_code)]
     enum TestOpResult {
         Success(String),
         Error(String),
@@ -123,6 +124,7 @@ fn test_diff_content_through_channel() {
 #[test]
 fn test_pending_op_tracking() {
     #[derive(Clone)]
+    #[allow(dead_code)]
     struct PendingOp {
         description: String,
         finished: bool,
@@ -197,6 +199,7 @@ fn test_operation_description_tracking() {
 #[test]
 fn test_concurrent_operation_limit() {
     #[derive(Clone)]
+    #[allow(dead_code)]
     struct PendingOp {
         description: String,
     }

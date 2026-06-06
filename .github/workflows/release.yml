@@ -109,16 +109,15 @@ jobs:
           path: ${{ steps.package.outputs.archive }}
           if-no-files-found: error
 
-  create-release:
-    name: Create GitHub Release
-    # ── Phase 2: Collect & Publish ──
+  upload-artifacts:
+    name: Upload Artifacts to Release
+    # ── Phase 2: Upload Artifacts to Existing Release ──
     # After ALL builds succeed, this job downloads all platform artifacts and
     # uploads them to the GitHub Release that the user created on the web UI.
     #
-    # This is NOT redundant with Phase 1. Phase 1 builds the binaries,
-    # Phase 2 publishes them to the existing release. The release was already
-    # created by GitHub when the user clicked "Publish Release" — this job
-    # only populates it with the built artifacts.
+    # IMPORTANT: This does NOT create a new release. The user already created
+    # the release on GitHub's web UI. This job only uploads the built binaries
+    # to that existing release via tag_name matching.
     needs: [build]
     runs-on: ubuntu-latest
     steps:
@@ -142,7 +141,7 @@ jobs:
       - name: List artifacts
         run: ls -lh release-artifacts/
 
-      - name: Create Release
+      - name: Upload Artifacts to Existing Release
         uses: softprops/action-gh-release@v2
         with:
           name: Git Manager ${{ steps.version.outputs.version }}
