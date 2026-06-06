@@ -422,6 +422,18 @@ impl App {
         self.success_message = msg;
     }
 
+    /// Returns the project folder name extracted from the repo path.
+    /// e.g. "/home/user/projects/my-repo" → "my-repo"
+    pub fn repo_name(&self) -> String {
+        if self.repo_path.is_empty() {
+            return String::new();
+        }
+        std::path::Path::new(&self.repo_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| self.repo_path.clone())
+    }
+
     /// Format elapsed seconds into a human-readable string.
     /// <60s → "Just updated", <3600s → "Updated Xm ago", ≥3600s → "Updated Xh ago"
     pub fn format_elapsed(elapsed_secs: u64) -> String {
@@ -584,7 +596,7 @@ impl eframe::App for App {
                             .color(egui::Color32::GRAY)
                             .text_style(egui::TextStyle::Small),
                     );
-                        if crate::ui::ellipsis_button(ui, "ⓘ").clicked() {
+                    if crate::ui::ellipsis_button(ui, "ℹ").clicked() {
                         self.show_about = !self.show_about;
                     }
                 });
@@ -627,9 +639,6 @@ impl eframe::App for App {
                         // Disable refresh button while busy
                         if crate::ui::add_enabled_ellipsis(ui, !self.is_busy(), "🔄").clicked() {
                             self.refresh_all();
-                        }
-                        if crate::ui::ellipsis_button(ui, "ⓘ").clicked() {
-                            self.show_about = !self.show_about;
                         }
                     });
                 }
@@ -814,7 +823,7 @@ impl eframe::App for App {
                     (Tab::Status, "📊 Status"),
                     (Tab::Branches, "🔀 Branches"),
                     (Tab::Worktrees, "📂 Worktrees"),
-                    (Tab::Log, "⏰ Log"),
+                    (Tab::Log, "📋 Log"),
                     (Tab::Stash, "📦 Stash"),
                     (Tab::Remotes, "🌐 Remotes"),
                 ];
@@ -832,6 +841,19 @@ impl eframe::App for App {
                         self.current_tab = tab.clone();
                     }
                 }
+
+                // Show current project name on the right side of the tab bar
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(8.0);
+                    let project_name = self.repo_name();
+                    if !project_name.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!("📁 {}", project_name))
+                                .color(egui::Color32::from_rgb(100, 200, 100))
+                                .text_style(egui::TextStyle::Body),
+                        );
+                    }
+                });
             });
 
             ui.separator();
@@ -1080,11 +1102,68 @@ mod tests {
     }
 
     #[test]
+    fn test_log_tab_uses_clipboard_emoji_not_alarm_clock() {
+        let tabs = [
+            (Tab::Status, "📊 Status"),
+            (Tab::Branches, "🔀 Branches"),
+            (Tab::Worktrees, "📂 Worktrees"),
+            (Tab::Log, "📋 Log"),
+            (Tab::Stash, "📦 Stash"),
+            (Tab::Remotes, "🌐 Remotes"),
+        ];
+        let log_label = tabs.iter().find(|(t, _)| *t == Tab::Log).map(|(_, l)| *l).unwrap();
+        assert!(
+            !log_label.contains('\u{23F0}'),
+            "Log tab must NOT use ⏰ (alarm clock) which renders as a box. Found: {}",
+            log_label
+        );
+        assert!(
+            log_label.contains("📋"),
+            "Log tab should use 📋 (clipboard) emoji. Found: {}",
+            log_label
+        );
+    }
+
+    #[test]
+    fn test_about_button_does_not_use_circled_i() {
+        let bad_char = '\u{24D8}';
+        let about_labels = ["ℹ", "About"];
+        for label in &about_labels {
+            assert!(
+                !label.contains(bad_char),
+                "About button label '{}' must NOT use ⓘ which renders as a box",
+                label
+            );
+        }
+    }
+
+    #[test]
+    fn test_repo_name_extracts_last_path_component() {
+        let cases = [
+            ("C:\\Users\\me\\projects\\my-project", "my-project"),
+            ("/home/user/projects/my-repo", "my-repo"),
+            ("/a/b/c", "c"),
+            ("just-a-name", "just-a-name"),
+            ("", ""),
+        ];
+        for (path, expected) in &cases {
+            let mut app = App::new();
+            app.repo_path = path.to_string();
+            assert_eq!(app.repo_name(), *expected, "repo_name() for path '{}'", path);
+        }
+    }
+
+    #[test]
+    fn test_repo_name_empty_when_no_repo_open() {
+        let app = App::new();
+        assert_eq!(app.repo_name(), "", "repo_name should be empty when no repo is open");
+    }
+
+    #[test]
     fn test_pending_op_progress_sharing() {
         use std::sync::{Arc, Mutex};
         let progress = Arc::new(Mutex::new(String::new()));
 
-        // Simulate background thread updating progress
         {
             let p = progress.clone();
             std::thread::spawn(move || {
@@ -1133,7 +1212,6 @@ mod tests {
 
     #[test]
     fn test_format_elapsed_no_panic_on_large_values() {
-        // Should handle very large values without panicking
         let result = App::format_elapsed(u64::MAX);
         assert!(!result.is_empty());
         assert!(result.contains("h ago"));
