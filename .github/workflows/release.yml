@@ -49,11 +49,18 @@ jobs:
       - name: Install cross-compilation dependencies (Linux ARM64)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
-          sudo dpkg --add-architecture arm64
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu libssl-dev:arm64
+          sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
           echo "PKG_CONFIG_ALLOW_CROSS=1" >> $GITHUB_ENV
+          # Download and install aarch64 OpenSSL for cross-compilation
+          wget -qO- https://github.com/openssl/openssl/releases/download/openssl-3.0.15/openssl-3.0.15.tar.gz | sudo tar xz -C /opt
+          pushd /opt/openssl-3.0.15
+          CC=aarch64-linux-gnu-gcc ./Configure linux-aarch64 --prefix=/usr/aarch64-linux-gnu --libdir=lib
+          make -j$(nproc) -s
+          sudo make install_sw -s
+          popd
+          echo "AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_DIR=/usr/aarch64-linux-gnu" >> $GITHUB_ENV
 
       - name: Install Linux system dependencies
         if: startsWith(matrix.os, 'ubuntu')
@@ -66,6 +73,20 @@ jobs:
         run: |
           # macOS typically has required libraries, but ensure Xcode CLT
           xcode-select -p || xcode-select --install
+
+      - name: Install OpenSSL for macOS cross-compilation (x86_64 on ARM64)
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: |
+          # Build OpenSSL from source for x86_64 (host is ARM64, target is x86_64)
+          wget -qO- https://github.com/openssl/openssl/releases/download/openssl-3.0.15/openssl-3.0.15.tar.gz | tar xz
+          cd openssl-3.0.15
+          ./Configure darwin64-x86_64-cc no-zlib no-asm --prefix=/usr/local/openssl-x86_64
+          make -j$(sysctl -n hw.ncpu) -s
+          sudo make install_sw -s
+          cd ..
+          rm -rf openssl-3.0.15
+          echo "OPENSSL_DIR=/usr/local/openssl-x86_64" >> $GITHUB_ENV
+          echo "PKG_CONFIG_ALLOW_CROSS=1" >> $GITHUB_ENV
 
       - name: Extract version from tag
         id: version
