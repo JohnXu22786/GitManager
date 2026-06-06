@@ -142,7 +142,7 @@ fn show_branch_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, branch
                 ui.label(
                     egui::RichText::new(format!("→ {} {}", upstream, tracking))
                         .color(egui::Color32::GRAY)
-                        .size(12.0),
+                        .text_style(egui::TextStyle::Small),
                 );
             }
         }
@@ -152,7 +152,7 @@ fn show_branch_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, branch
                 ui.label(
                     egui::RichText::new(msg)
                         .color(egui::Color32::GRAY)
-                        .size(11.0),
+                        .text_style(egui::TextStyle::Small),
                 );
             }
         }

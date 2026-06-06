@@ -35,12 +35,12 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 ui.label(
                     egui::RichText::new(&commit.author)
                         .color(egui::Color32::from_rgb(100, 200, 255))
-                        .size(12.0),
+                        .text_style(egui::TextStyle::Small),
                 );
                 ui.label(
                     egui::RichText::new(&commit.time)
                         .color(egui::Color32::GRAY)
-                        .size(11.0),
+                        .text_style(egui::TextStyle::Small),
                 );
                 ui.label(
                     egui::RichText::new(&commit.summary)

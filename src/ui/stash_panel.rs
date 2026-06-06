@@ -56,7 +56,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 ui.label(
                     egui::RichText::new(&stash.time)
                         .color(egui::Color32::GRAY)
-                        .size(11.0),
+                        .text_style(egui::TextStyle::Small),
                 );
                 if ui.add_enabled(!busy, egui::Button::new("Drop")).clicked() {
                     app.start_operation(ctx, &format!("Drop stash@{{{}}}", index), GitOperation::StashDrop(index));

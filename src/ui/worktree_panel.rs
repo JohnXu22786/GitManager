@@ -115,7 +115,7 @@ fn show_worktree_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, wt: 
         ui.label(
             egui::RichText::new(wt.path.to_string_lossy())
                 .color(egui::Color32::GRAY)
-                .size(12.0),
+                .text_style(egui::TextStyle::Small),
         );
 
         if !wt.is_main {

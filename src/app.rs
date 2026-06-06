@@ -14,7 +14,7 @@ struct PendingOp {
     started_at: Instant,
 }
 
-#[derive(PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum Tab {
     Status,
     Branches,
@@ -67,6 +67,7 @@ pub struct App {
     pub last_refresh: std::time::Instant,
 
     pub show_about: bool,
+    pub font_size: f32,
 
     pub update_state: Arc<Mutex<UpdateState>>,
     pub show_update_dialog: bool,
@@ -84,6 +85,9 @@ pub struct App {
 }
 
 impl App {
+    const MIN_FONT_SIZE: f32 = 10.0;
+    const MAX_FONT_SIZE: f32 = 24.0;
+
     pub fn new() -> Self {
         Self {
             git: GitRepo::new(),
@@ -128,6 +132,7 @@ impl App {
             last_refresh: std::time::Instant::now(),
 
             show_about: false,
+            font_size: 14.0,
 
             update_state: Arc::new(Mutex::new(UpdateState::Idle)),
             show_update_dialog: false,
@@ -408,12 +413,22 @@ impl eframe::App for App {
             ctx.set_visuals(egui::Visuals::light());
         }
 
+        // Apply font size via text styles
+        let fs = self.font_size;
+        ctx.style_mut(|style| {
+            style.text_styles = [
+                (egui::TextStyle::Body, egui::FontId::proportional(fs)),
+                (egui::TextStyle::Button, egui::FontId::proportional(fs)),
+                (egui::TextStyle::Heading, egui::FontId::proportional(fs + 4.0)),
+                (egui::TextStyle::Small, egui::FontId::proportional(fs - 2.0)),
+                (egui::TextStyle::Monospace, egui::FontId::monospace(fs)),
+            ].into();
+        });
+
         // --- Top Bar ---
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label("📂");
-                let open_btn = egui::Button::new("Open Repo...");
-                if ui.add_enabled(!self.is_busy(), open_btn).clicked() {
+                if ui.add_enabled(!self.is_busy(), egui::Button::new("📂")).clicked() {
                     let path = crate::native_file_dialog();
                     if let Some(p) = path {
                         self.open_repo(&p);
@@ -463,9 +478,9 @@ impl eframe::App for App {
                     ui.label(
                         egui::RichText::new(format!("v{}", crate::version_info::VERSION))
                             .color(egui::Color32::GRAY)
-                            .size(12.0),
+                            .text_style(egui::TextStyle::Small),
                     );
-                    if ui.button("ℹ️").clicked() {
+                    if ui.button("ⓘ").clicked() {
                         self.show_about = !self.show_about;
                     }
                 });
@@ -508,6 +523,9 @@ impl eframe::App for App {
                         // Disable refresh button while busy
                         if ui.add_enabled(!self.is_busy(), egui::Button::new("🔄")).clicked() {
                             self.refresh_all();
+                        }
+                        if ui.button("ⓘ").clicked() {
+                            self.show_about = !self.show_about;
                         }
                     });
                 }
@@ -583,13 +601,19 @@ impl eframe::App for App {
                                         self.success_message.clear();
                                     }
                                 }
+                                ui.separator();
+                                ui.label("Font:");
+                                ui.add(
+                                    egui::Slider::new(&mut self.font_size, Self::MIN_FONT_SIZE..=Self::MAX_FONT_SIZE)
+                                        .show_value(false),
+                                );
                                 let elapsed = self.last_refresh.elapsed().as_secs();
                                 ui.label(format!("Updated {}s ago", elapsed));
                             },
                         );
                     });
                 });
-        }
+            }
 
         // --- Central Panel ---
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -663,7 +687,7 @@ impl eframe::App for App {
                     (Tab::Status, "📊 Status"),
                     (Tab::Branches, "🔀 Branches"),
                     (Tab::Worktrees, "📂 Worktrees"),
-                    (Tab::Log, "📜 Log"),
+                    (Tab::Log, "⏰ Log"),
                     (Tab::Stash, "📦 Stash"),
                     (Tab::Remotes, "🌐 Remotes"),
                 ];
@@ -798,5 +822,54 @@ impl eframe::App for App {
         if self.is_busy() {
             ctx.request_repaint();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_app_new_defaults() {
+        let app = App::new();
+        assert_eq!(app.font_size, 14.0);
+        assert!(!app.show_about);
+        assert!(!app.git.is_open());
+        assert_eq!(app.current_tab, Tab::Status);
+    }
+
+    #[test]
+    fn test_font_size_default_in_range() {
+        let app = App::new();
+        assert!(app.font_size >= App::MIN_FONT_SIZE);
+        assert!(app.font_size <= App::MAX_FONT_SIZE);
+    }
+
+    #[test]
+    fn test_status_color_by_type_known() {
+        assert_eq!(App::status_color_by_type('M'), egui::Color32::GREEN);
+        assert_eq!(App::status_color_by_type('A'), egui::Color32::GREEN);
+        assert_eq!(App::status_color_by_type('R'), egui::Color32::GREEN);
+        assert_eq!(App::status_color_by_type('D'), egui::Color32::RED);
+        assert_eq!(App::status_color_by_type('?'), egui::Color32::GRAY);
+        assert_eq!(App::status_color_by_type('!'), egui::Color32::GRAY);
+        assert_eq!(App::status_color_by_type('U'), egui::Color32::YELLOW);
+    }
+
+    #[test]
+    fn test_status_color_by_type_unknown() {
+        assert_eq!(App::status_color_by_type('X'), egui::Color32::GRAY);
+    }
+
+    #[test]
+    fn test_tab_partial_eq() {
+        assert_eq!(Tab::Status, Tab::Status);
+        assert_eq!(Tab::Log, Tab::Log);
+        assert_ne!(Tab::Status, Tab::Branches);
+    }
+
+    #[test]
+    fn test_tab_clone() {
+        assert_eq!(Tab::Worktrees.clone(), Tab::Worktrees);
     }
 }
