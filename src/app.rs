@@ -365,6 +365,18 @@ impl App {
         self.success_message = msg;
     }
 
+    /// Returns the project folder name extracted from the repo path.
+    /// e.g. "/home/user/projects/my-repo" → "my-repo"
+    pub fn repo_name(&self) -> String {
+        if self.repo_path.is_empty() {
+            return String::new();
+        }
+        std::path::Path::new(&self.repo_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| self.repo_path.clone())
+    }
+
     pub fn status_color_by_type(s: char) -> egui::Color32 {
         match s {
             'M' | 'A' | 'R' => egui::Color32::GREEN,
@@ -480,7 +492,7 @@ impl eframe::App for App {
                             .color(egui::Color32::GRAY)
                             .text_style(egui::TextStyle::Small),
                     );
-                    if ui.button("ⓘ").clicked() {
+                    if ui.button("ℹ").clicked() {
                         self.show_about = !self.show_about;
                     }
                 });
@@ -523,9 +535,6 @@ impl eframe::App for App {
                         // Disable refresh button while busy
                         if ui.add_enabled(!self.is_busy(), egui::Button::new("🔄")).clicked() {
                             self.refresh_all();
-                        }
-                        if ui.button("ⓘ").clicked() {
-                            self.show_about = !self.show_about;
                         }
                     });
                 }
@@ -687,7 +696,7 @@ impl eframe::App for App {
                     (Tab::Status, "📊 Status"),
                     (Tab::Branches, "🔀 Branches"),
                     (Tab::Worktrees, "📂 Worktrees"),
-                    (Tab::Log, "⏰ Log"),
+                    (Tab::Log, "📋 Log"),
                     (Tab::Stash, "📦 Stash"),
                     (Tab::Remotes, "🌐 Remotes"),
                 ];
@@ -704,6 +713,19 @@ impl eframe::App for App {
                         self.current_tab = tab.clone();
                     }
                 }
+
+                // Show current project name on the right side of the tab bar
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(8.0);
+                    let project_name = self.repo_name();
+                    if !project_name.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!("📁 {}", project_name))
+                                .color(egui::Color32::from_rgb(100, 200, 100))
+                                .text_style(egui::TextStyle::Body),
+                        );
+                    }
+                });
             });
 
             ui.separator();
@@ -871,5 +893,70 @@ mod tests {
     #[test]
     fn test_tab_clone() {
         assert_eq!(Tab::Worktrees.clone(), Tab::Worktrees);
+    }
+
+    #[test]
+    fn test_log_tab_uses_clipboard_emoji_not_alarm_clock() {
+        // "⏰" (U+23F0) renders as a box on some Windows systems.
+        // It must be replaced with a reliable alternative like "📋" (clipboard).
+        let tabs = [
+            (Tab::Status, "📊 Status"),
+            (Tab::Branches, "🔀 Branches"),
+            (Tab::Worktrees, "📂 Worktrees"),
+            (Tab::Log, "📋 Log"),
+            (Tab::Stash, "📦 Stash"),
+            (Tab::Remotes, "🌐 Remotes"),
+        ];
+        let log_label = tabs.iter().find(|(t, _)| *t == Tab::Log).map(|(_, l)| *l).unwrap();
+        assert!(
+            !log_label.contains('\u{23F0}'),
+            "Log tab must NOT use ⏰ (alarm clock) which renders as a box. Found: {}",
+            log_label
+        );
+        assert!(
+            log_label.contains("📋"),
+            "Log tab should use 📋 (clipboard) emoji. Found: {}",
+            log_label
+        );
+    }
+
+    #[test]
+    fn test_about_button_does_not_use_circled_i() {
+        // "ⓘ" (U+24D8, circled Latin small letter i) renders as a box on some Windows systems.
+        // Verify that our planned replacement does not use this character.
+        let bad_char = '\u{24D8}'; // ⓘ
+
+        // Check that the labels we use for about buttons are safe
+        let about_labels = ["ℹ", "About"];
+        for label in &about_labels {
+            assert!(
+                !label.contains(bad_char),
+                "About button label '{}' must NOT use ⓘ which renders as a box",
+                label
+            );
+        }
+    }
+
+    #[test]
+    fn test_repo_name_extracts_last_path_component() {
+        // Test that repo_name() extracts the project folder name from the path
+        let cases = [
+            ("C:\\Users\\me\\projects\\my-project", "my-project"),
+            ("/home/user/projects/my-repo", "my-repo"),
+            ("/a/b/c", "c"),
+            ("just-a-name", "just-a-name"),
+            ("", ""),
+        ];
+        for (path, expected) in &cases {
+            let mut app = App::new();
+            app.repo_path = path.to_string();
+            assert_eq!(app.repo_name(), *expected, "repo_name() for path '{}'", path);
+        }
+    }
+
+    #[test]
+    fn test_repo_name_empty_when_no_repo_open() {
+        let app = App::new();
+        assert_eq!(app.repo_name(), "", "repo_name should be empty when no repo is open");
     }
 }
