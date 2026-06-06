@@ -2,6 +2,7 @@
 
 mod app;
 mod git_ops;
+mod recent;
 mod ui;
 
 use eframe::egui;
