@@ -1,11 +1,12 @@
 use crate::app::App;
+use crate::git_ops::GitOperation;
 use eframe::egui;
 
-pub fn show(app: &mut App, ui: &mut egui::Ui) {
+pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     ui.horizontal(|ui| {
         ui.heading("Remotes");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("🔄 Refresh").clicked() {
+            if ui.add_enabled(!app.is_busy(), egui::Button::new("🔄 Refresh")).clicked() {
                 app.refresh_all();
             }
         });
@@ -22,7 +23,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                     ui.label(
                         egui::RichText::new(&remote.url)
                             .color(egui::Color32::GRAY)
-                            .size(11.0),
+                            .text_style(egui::TextStyle::Small),
                     );
                 });
             });
@@ -44,6 +45,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         app.remote_name = default_remote.clone();
     }
 
+    let busy = app.is_busy();
+
     ui.heading("Push");
     ui.horizontal(|ui| {
         ui.label("Remote:");
@@ -54,19 +57,17 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         ui.text_edit_singleline(&mut app.push_branch);
     });
     ui.checkbox(&mut app.push_force, "Force Push");
-    if ui.button("Push").clicked() {
+    if ui.add_enabled(!busy, egui::Button::new("Push")).clicked() {
         let remote = app.remote_name.trim().to_string();
         let branch = app.push_branch.trim().to_string();
         if remote.is_empty() || branch.is_empty() {
             app.show_error("Remote and branch required".into());
         } else {
-            match app.git.push(&remote, &branch, app.push_force) {
-                Ok(progress) => {
-                    app.show_success(progress);
-                    app.refresh_all();
-                }
-                Err(e) => app.show_error(e),
-            }
+            app.start_operation(ctx, &format!("Push to {}/{}", remote, branch), GitOperation::Push {
+                remote,
+                branch,
+                force: app.push_force,
+            });
         }
     }
 
@@ -74,37 +75,29 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     ui.separator();
     ui.heading("Pull");
     ui.checkbox(&mut app.pull_rebase, "Rebase instead of merge");
-    if ui.button("Pull").clicked() {
+    if ui.add_enabled(!busy, egui::Button::new("Pull")).clicked() {
         let remote = app.remote_name.trim().to_string();
         let branch = app.push_branch.trim().to_string();
         if remote.is_empty() || branch.is_empty() {
             app.show_error("Remote and branch required".into());
         } else {
-            match app.git.pull(&remote, &branch, app.pull_rebase) {
-                Ok(msg) => {
-                    app.show_success(msg);
-                    app.refresh_all();
-                }
-                Err(e) => app.show_error(e),
-            }
+            app.start_operation(ctx, &format!("Pull from {}/{}", remote, branch), GitOperation::Pull {
+                remote,
+                branch,
+                rebase: app.pull_rebase,
+            });
         }
     }
 
     ui.add_space(10.0);
     ui.separator();
     ui.heading("Fetch");
-    if ui.button("Fetch").clicked() {
+    if ui.add_enabled(!busy, egui::Button::new("Fetch")).clicked() {
         let remote = app.remote_name.trim().to_string();
         if remote.is_empty() {
             app.show_error("Remote required".into());
         } else {
-            match app.git.fetch(&remote) {
-                Ok(progress) => {
-                    app.show_success(progress);
-                    app.refresh_all();
-                }
-                Err(e) => app.show_error(e),
-            }
+            app.start_operation(ctx, &format!("Fetch from {}", remote), GitOperation::Fetch(remote));
         }
     }
 }

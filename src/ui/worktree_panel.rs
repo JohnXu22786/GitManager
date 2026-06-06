@@ -1,23 +1,24 @@
 use crate::app::App;
-use eframe::egui;
+use crate::git_ops::GitOperation;
 use crate::git_ops::WorktreeInfo;
+use eframe::egui;
 
-pub fn show(app: &mut App, ui: &mut egui::Ui) {
+pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     ui.horizontal(|ui| {
         ui.heading("Worktrees");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("🔄 Refresh").clicked() {
+            let busy = app.is_busy();
+            if ui.add_enabled(!busy, egui::Button::new("🔄 Refresh")).clicked() {
                 app.refresh_all();
             }
-            if ui.button("Prune").clicked() {
+            if ui.add_enabled(!busy, egui::Button::new("Prune")).clicked() {
                 let worktrees = app.worktrees.clone();
                 for wt in worktrees {
                     if !wt.is_main {
-                        let _ = app.git.remove_worktree(&wt.path, true);
+                        app.start_operation(ctx, &format!("Prune {:?}", wt.path), GitOperation::RemoveWorktree { path: wt.path, force: true });
                     }
                 }
-                app.refresh_all();
-                app.show_success("Pruned stale worktrees".into());
+                app.show_success("Pruning worktrees...".into());
             }
         });
     });
@@ -32,7 +33,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         if !main_wts.is_empty() {
             ui.label(egui::RichText::new("Main Worktree").strong());
             for wt in &main_wts {
-                show_worktree_row(app, ui, wt);
+                show_worktree_row(app, ui, ctx, wt);
             }
         }
 
@@ -41,7 +42,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             ui.separator();
             ui.label(egui::RichText::new("Linked Worktrees").strong());
             for wt in &linked_wts {
-                show_worktree_row(app, ui, wt);
+                show_worktree_row(app, ui, ctx, wt);
             }
         }
     });
@@ -65,7 +66,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         ui.checkbox(&mut app.new_worktree_create_branch, "Create new branch");
     });
 
-    if ui.button("Add Worktree").clicked() {
+    let busy = app.is_busy();
+    if ui.add_enabled(!busy, egui::Button::new("Add Worktree")).clicked() {
         let name = app.new_worktree_name.trim().to_string();
         if name.is_empty() {
             app.show_error("Worktree name required".into());
@@ -83,27 +85,25 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 Some(app.new_worktree_branch.trim().to_string())
             };
 
-            match app.git.create_worktree(
-                &name,
-                &path,
-                branch.as_deref(),
-                app.new_worktree_create_branch,
-            ) {
-                Ok(()) => {
-                    app.show_success(format!("Created worktree '{}' at {:?}", name, path));
-                    app.new_worktree_name.clear();
-                    app.new_worktree_path.clear();
-                    app.new_worktree_branch.clear();
-                    app.new_worktree_create_branch = false;
-                    app.refresh_all();
-                }
-                Err(e) => app.show_error(e),
-            }
+            app.start_operation(
+                ctx,
+                &format!("Create worktree '{}'", name),
+                GitOperation::CreateWorktree {
+                    name,
+                    path,
+                    branch,
+                    new_branch: app.new_worktree_create_branch,
+                },
+            );
+            app.new_worktree_name.clear();
+            app.new_worktree_path.clear();
+            app.new_worktree_branch.clear();
+            app.new_worktree_create_branch = false;
         }
     }
 }
 
-fn show_worktree_row(app: &mut App, ui: &mut egui::Ui, wt: &WorktreeInfo) {
+fn show_worktree_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, wt: &WorktreeInfo) {
     let wt_path = wt.path.clone();
     ui.horizontal(|ui| {
         let icon = if wt.is_main { "★" } else { "○" };
@@ -115,28 +115,17 @@ fn show_worktree_row(app: &mut App, ui: &mut egui::Ui, wt: &WorktreeInfo) {
         ui.label(
             egui::RichText::new(wt.path.to_string_lossy())
                 .color(egui::Color32::GRAY)
-                .size(12.0),
+                .text_style(egui::TextStyle::Small),
         );
 
         if !wt.is_main {
+            let busy = app.is_busy();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Remove").clicked() {
-                    match app.git.remove_worktree(&wt_path, false) {
-                        Ok(()) => {
-                            app.show_success(format!("Removed worktree at {:?}", wt_path));
-                            app.refresh_all();
-                        }
-                        Err(e) => app.show_error(e),
-                    }
+                if ui.add_enabled(!busy, egui::Button::new("Remove")).clicked() {
+                    app.start_operation(ctx, &format!("Remove {:?}", wt_path), GitOperation::RemoveWorktree { path: wt_path.clone(), force: false });
                 }
-                if ui.button("Force Remove").clicked() {
-                    match app.git.remove_worktree(&wt_path, true) {
-                        Ok(()) => {
-                            app.show_success(format!("Force removed worktree at {:?}", wt_path));
-                            app.refresh_all();
-                        }
-                        Err(e) => app.show_error(e),
-                    }
+                if ui.add_enabled(!busy, egui::Button::new("Force Remove")).clicked() {
+                    app.start_operation(ctx, &format!("Force remove {:?}", wt_path), GitOperation::RemoveWorktree { path: wt_path.clone(), force: true });
                 }
             });
         }

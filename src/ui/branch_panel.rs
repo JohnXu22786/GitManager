@@ -1,12 +1,13 @@
 use crate::app::App;
-use eframe::egui;
 use crate::git_ops::BranchInfo;
+use crate::git_ops::GitOperation;
+use eframe::egui;
 
-pub fn show(app: &mut App, ui: &mut egui::Ui) {
+pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     ui.horizontal(|ui| {
         ui.heading("Branches");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("🔄 Refresh").clicked() {
+            if ui.add_enabled(!app.is_busy(), egui::Button::new("🔄 Refresh")).clicked() {
                 app.refresh_all();
             }
         });
@@ -34,7 +35,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     egui::ScrollArea::vertical().show(ui, |ui| {
         ui.label(egui::RichText::new("Local Branches").strong());
         for branch in &locals {
-            show_branch_row(app, ui, branch);
+            show_branch_row(app, ui, ctx, branch);
         }
 
         if !remotes.is_empty() {
@@ -42,7 +43,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             ui.separator();
             ui.label(egui::RichText::new("Remote Branches").strong());
             for branch in &remotes {
-                show_branch_row(app, ui, branch);
+                show_branch_row(app, ui, ctx, branch);
             }
         }
     });
@@ -59,7 +60,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         ui.text_edit_singleline(&mut app.new_branch_base);
         ui.label("(leave empty for current HEAD)");
     });
-    if ui.button("Create Branch").clicked() {
+    let busy = app.is_busy();
+    if ui.add_enabled(!busy, egui::Button::new("Create Branch")).clicked() {
         let name = app.new_branch_name.trim().to_string();
         if name.is_empty() {
             app.show_error("Branch name required".into());
@@ -69,15 +71,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             } else {
                 Some(app.new_branch_base.trim().to_string())
             };
-            match app.git.create_branch(&name, base.as_deref()) {
-                Ok(()) => {
-                    app.show_success(format!("Created branch '{}'", name));
-                    app.new_branch_name.clear();
-                    app.new_branch_base.clear();
-                    app.refresh_all();
-                }
-                Err(e) => app.show_error(e),
-            }
+            app.start_operation(ctx, &format!("Create branch '{}'", name), GitOperation::CreateBranch { name, base });
+            app.new_branch_name.clear();
+            app.new_branch_base.clear();
         }
     }
 
@@ -87,19 +83,13 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         ui.label("From:");
         ui.text_edit_singleline(&mut app.merge_branch_name);
     });
-    if ui.button("Merge").clicked() {
+    if ui.add_enabled(!busy, egui::Button::new("Merge")).clicked() {
         let name = app.merge_branch_name.trim().to_string();
         if name.is_empty() {
             app.show_error("Branch name required".into());
         } else {
-            match app.git.merge_branch(&name) {
-                Ok(msg) => {
-                    app.show_success(msg);
-                    app.merge_branch_name.clear();
-                    app.refresh_all();
-                }
-                Err(e) => app.show_error(e),
-            }
+            app.start_operation(ctx, &format!("Merge '{}'", name), GitOperation::MergeBranch(name));
+            app.merge_branch_name.clear();
         }
     }
 
@@ -113,26 +103,20 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         ui.label("To:");
         ui.text_edit_singleline(&mut app.rename_branch_new);
     });
-    if ui.button("Rename").clicked() {
+    if ui.add_enabled(!busy, egui::Button::new("Rename")).clicked() {
         let old = app.rename_branch_old.trim().to_string();
         let new = app.rename_branch_new.trim().to_string();
         if old.is_empty() || new.is_empty() {
             app.show_error("Both names required".into());
         } else {
-            match app.git.rename_branch(&old, &new) {
-                Ok(()) => {
-                    app.show_success(format!("Renamed '{}' -> '{}'", old, new));
-                    app.rename_branch_old.clear();
-                    app.rename_branch_new.clear();
-                    app.refresh_all();
-                }
-                Err(e) => app.show_error(e),
-            }
+            app.start_operation(ctx, &format!("Rename '{}'", old), GitOperation::RenameBranch { old, new: new.clone() });
+            app.rename_branch_old.clear();
+            app.rename_branch_new.clear();
         }
     }
 }
 
-fn show_branch_row(app: &mut App, ui: &mut egui::Ui, branch: &BranchInfo) {
+fn show_branch_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, branch: &BranchInfo) {
     let name = branch.name.clone();
     let is_remote = branch.is_remote;
     let is_head = branch.is_head;
@@ -158,7 +142,7 @@ fn show_branch_row(app: &mut App, ui: &mut egui::Ui, branch: &BranchInfo) {
                 ui.label(
                     egui::RichText::new(format!("→ {} {}", upstream, tracking))
                         .color(egui::Color32::GRAY)
-                        .size(12.0),
+                        .text_style(egui::TextStyle::Small),
                 );
             }
         }
@@ -168,45 +152,29 @@ fn show_branch_row(app: &mut App, ui: &mut egui::Ui, branch: &BranchInfo) {
                 ui.label(
                     egui::RichText::new(msg)
                         .color(egui::Color32::GRAY)
-                        .size(11.0),
+                        .text_style(egui::TextStyle::Small),
                 );
             }
         }
 
+        let busy = app.is_busy();
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if !is_head && !is_remote {
-                if ui.button("Copy").clicked() {
+                if ui.add_enabled(!busy, egui::Button::new("Copy")).clicked() {
                     ui.ctx().copy_text(name.clone());
                     app.show_success(format!("Copied {}", name));
                 }
-                if ui.button("Delete").clicked() {
-                    match app.git.delete_branch(&name, false) {
-                        Ok(()) => {
-                            app.show_success(format!("Deleted '{}'", name));
-                            app.refresh_all();
-                        }
-                        Err(e) => app.show_error(e),
-                    }
+                if ui.add_enabled(!busy, egui::Button::new("Delete")).clicked() {
+                    app.start_operation(ctx, &format!("Delete '{}'", name), GitOperation::DeleteBranch { name: name.clone(), force: false });
                 }
-                if ui.button("Force Del").clicked() {
-                    match app.git.delete_branch(&name, false) {
-                        Ok(()) => {
-                            app.show_success(format!("Force deleted '{}'", name));
-                            app.refresh_all();
-                        }
-                        Err(e) => app.show_error(e),
-                    }
+                if ui.add_enabled(!busy, egui::Button::new("Force Del")).clicked() {
+                    // FIX: Pass force=true for Force Del, and try reference deletion
+                    app.start_operation(ctx, &format!("Force delete '{}'", name), GitOperation::DeleteBranch { name: name.clone(), force: true });
                 }
             }
             if !is_head {
-                if ui.button("Checkout").clicked() {
-                    match app.git.checkout_branch(&name) {
-                        Ok(()) => {
-                            app.show_success(format!("Switched to '{}'", name));
-                            app.refresh_all();
-                        }
-                        Err(e) => app.show_error(e),
-                    }
+                if ui.add_enabled(!busy, egui::Button::new("Checkout")).clicked() {
+                    app.start_operation(ctx, &format!("Checkout '{}'", name), GitOperation::CheckoutBranch(name));
                 }
             }
         });
