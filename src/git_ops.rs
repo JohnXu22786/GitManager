@@ -5,12 +5,201 @@ use std::path::{Path, PathBuf};
 
 pub type GitResult<T> = Result<T, String>;
 
+/// Describes a Git operation to be executed in a background thread.
+pub enum GitOperation {
+    StageAll,
+    UnstageAll,
+    RestoreAll,
+    StageFile(String),
+    UnstageFile(String),
+    RestoreFile(String),
+    Commit { message: String, amend: bool },
+    Uncommit,
+    CreateBranch { name: String, base: Option<String> },
+    DeleteBranch { name: String, force: bool },
+    RenameBranch { old: String, new: String },
+    CheckoutBranch(String),
+    MergeBranch(String),
+    RemoveWorktree { path: PathBuf, force: bool },
+    CreateWorktree { name: String, path: PathBuf, branch: Option<String>, new_branch: bool },
+    StashAll(Option<String>),
+    StashPop,
+    StashApply(usize),
+    StashDrop(usize),
+    Push { remote: String, branch: String, force: bool },
+    Pull { remote: String, branch: String, rebase: bool },
+    Fetch(String),
+    GetDiff { path: String, staged: bool },
+    /// Search commits in the log.
+    LogSearch(String),
+    /// Refresh all cached data from the repository.
+    RefreshAll,
+}
+
+/// Result of a Git operation executed in a background thread.
+#[derive(Debug, Clone)]
+pub enum OpResult {
+    /// Operation succeeded with a message.
+    Success(String),
+    /// Operation failed with an error message.
+    Error(String),
+    /// Diff content for a file.
+    DiffContent {
+        path: String,
+        lines: Vec<DiffLine>,
+    },
+    /// Search results for commit log.
+    SearchResults(Vec<CommitInfo>),
+    /// Refreshed data from the repository, with optional errors.
+    RefreshData {
+        status_entries: Vec<StatusEntry>,
+        branches: Vec<BranchInfo>,
+        worktrees: Vec<WorktreeInfo>,
+        commits: Vec<CommitInfo>,
+        stashes: Vec<StashEntry>,
+        remote_list: Vec<RemoteInfo>,
+        errors: Vec<String>,
+    },
+}
+
+/// Execute a GitOperation in the current process (blocking).
+/// This function opens the repository at `path` and runs the operation.
+pub fn execute_operation(path: &Path, op: GitOperation) -> OpResult {
+    let mut repo = GitRepo::new();
+    match repo.open(path) {
+        Ok(()) => op.dispatch(&repo),
+        Err(e) => OpResult::Error(format!("Failed to open repo: {}", e)),
+    }
+}
+
+impl GitOperation {
+    fn dispatch(self, repo: &GitRepo) -> OpResult {
+        match self {
+            GitOperation::StageAll => Self::simple(repo.stage_all(), "Staged all"),
+            GitOperation::UnstageAll => Self::simple(repo.unstage_all(), "Unstaged all"),
+            GitOperation::RestoreAll => Self::simple(repo.restore_all(), "Restored all"),
+            GitOperation::StageFile(p) => Self::simple(repo.stage_file(&p), format!("Staged {}", p)),
+            GitOperation::UnstageFile(p) => Self::simple(repo.unstage_file(&p), format!("Unstaged {}", p)),
+            GitOperation::RestoreFile(p) => Self::simple(repo.restore_file(&p), format!("Restored {}", p)),
+            GitOperation::Commit { message, amend } => match repo.commit(&message, amend) {
+                Ok(sha) => OpResult::Success(format!("Committed: {}", &sha[..sha.len().min(7)])),
+                Err(e) => OpResult::Error(e),
+            },
+            GitOperation::Uncommit => match repo.uncommit() {
+                Ok(sha) => OpResult::Success(format!("Uncommitted to {}", &sha[..sha.len().min(7)])),
+                Err(e) => OpResult::Error(e),
+            },
+            GitOperation::CreateBranch { name, base } => {
+                Self::simple(repo.create_branch(&name, base.as_deref()), format!("Created branch '{}'", name))
+            }
+            GitOperation::DeleteBranch { name, force } => {
+                // When force is true, we first try regular delete, and if that fails
+                // we delete the branch reference directly
+                match repo.delete_branch(&name, false) {
+                    Ok(()) => OpResult::Success(format!("Deleted '{}'", name)),
+                    Err(first_err) => {
+                        if force {
+                            // Force delete: try to delete reference directly
+                            match repo.delete_branch_ref(&name) {
+                                Ok(()) => OpResult::Success(format!("Force deleted '{}'", name)),
+                                Err(_) => OpResult::Error(format!("Failed to delete '{}': {}", name, first_err)),
+                            }
+                        } else {
+                            OpResult::Error(first_err)
+                        }
+                    }
+                }
+            }
+            GitOperation::RenameBranch { old, new } => {
+                Self::simple(repo.rename_branch(&old, &new), format!("Renamed '{}' -> '{}'", old, new))
+            }
+            GitOperation::CheckoutBranch(name) => {
+                Self::simple(repo.checkout_branch(&name), format!("Switched to '{}'", name))
+            }
+            GitOperation::MergeBranch(name) => match repo.merge_branch(&name) {
+                Ok(msg) => OpResult::Success(msg),
+                Err(e) => OpResult::Error(e),
+            },
+            GitOperation::RemoveWorktree { path, force } => {
+                Self::simple(repo.remove_worktree(&path, force), {
+                    if force { format!("Force removed worktree at {:?}", path) }
+                    else { format!("Removed worktree at {:?}", path) }
+                })
+            }
+            GitOperation::CreateWorktree { name, path, branch, new_branch } => {
+                match repo.create_worktree(&name, &path, branch.as_deref(), new_branch) {
+                    Ok(()) => OpResult::Success(format!("Created worktree '{}' at {:?}", name, path)),
+                    Err(e) => OpResult::Error(e),
+                }
+            }
+            GitOperation::StashAll(msg) => {
+                Self::simple(repo.stash_all(msg.as_deref()), "Stashed changes")
+            }
+            GitOperation::StashPop => Self::simple(repo.stash_pop(), "Stash popped"),
+            GitOperation::StashApply(index) => match repo.stash_apply_at(index) {
+                Ok(()) => OpResult::Success(format!("Applied stash@{{{}}}", index)),
+                Err(e) => OpResult::Error(e),
+            },
+            GitOperation::StashDrop(index) => {
+                Self::simple(repo.stash_drop(index), format!("Dropped stash@{{{}}}", index))
+            }
+            GitOperation::Push { remote, branch, force } => match repo.push(&remote, &branch, force) {
+                Ok(msg) => OpResult::Success(msg),
+                Err(e) => OpResult::Error(e),
+            },
+            GitOperation::Pull { remote, branch, rebase } => match repo.pull(&remote, &branch, rebase) {
+                Ok(msg) => OpResult::Success(msg),
+                Err(e) => OpResult::Error(e),
+            },
+            GitOperation::Fetch(remote) => match repo.fetch(&remote) {
+                Ok(msg) => OpResult::Success(msg),
+                Err(e) => OpResult::Error(e),
+            },
+            GitOperation::GetDiff { path, staged } => match repo.get_diff(&path, staged) {
+                Ok(lines) => OpResult::DiffContent { path, lines },
+                Err(e) => OpResult::Error(format!("Diff error: {}", e)),
+            },
+            GitOperation::LogSearch(filter) => {
+                let commits = repo.log(100).unwrap_or_default();
+                let filtered: Vec<CommitInfo> = if filter.is_empty() {
+                    commits
+                } else {
+                    let f = filter.to_lowercase();
+                    commits.into_iter().filter(|c| {
+                        c.message.to_lowercase().contains(&f)
+                            || c.author.to_lowercase().contains(&f)
+                            || c.short_sha.contains(&f)
+                    }).collect()
+                };
+                OpResult::SearchResults(filtered)
+            }
+            GitOperation::RefreshAll => {
+                let mut errors: Vec<String> = Vec::new();
+                let status_entries = repo.get_status().unwrap_or_else(|e| { errors.push(format!("Status: {}", e)); Vec::new() });
+                let branches = repo.branches().unwrap_or_else(|e| { errors.push(format!("Branches: {}", e)); Vec::new() });
+                let worktrees = repo.worktrees().unwrap_or_else(|e| { errors.push(format!("Worktrees: {}", e)); Vec::new() });
+                let commits = repo.log(100).unwrap_or_else(|e| { errors.push(format!("Log: {}", e)); Vec::new() });
+                let stashes = repo.stash_list().unwrap_or_else(|e| { errors.push(format!("Stash: {}", e)); Vec::new() });
+                let remote_list = repo.remotes().unwrap_or_else(|e| { errors.push(format!("Remotes: {}", e)); Vec::new() });
+                OpResult::RefreshData { status_entries, branches, worktrees, commits, stashes, remote_list, errors }
+            }
+        }
+    }
+
+    fn simple(result: GitResult<()>, msg: impl Into<String>) -> OpResult {
+        match result {
+            Ok(()) => OpResult::Success(msg.into()),
+            Err(e) => OpResult::Error(e),
+        }
+    }
+}
+
 pub struct GitRepo {
     repo: RefCell<Option<Repository>>,
     path: Option<PathBuf>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct BranchInfo {
     pub name: String,
     pub is_head: bool,
@@ -22,7 +211,7 @@ pub struct BranchInfo {
     pub last_commit_time: Option<String>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct WorktreeInfo {
     pub path: PathBuf,
     pub branch: Option<String>,
@@ -30,14 +219,14 @@ pub struct WorktreeInfo {
     pub is_main: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct StatusEntry {
     pub path: String,
     pub status: char,
     pub staged: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct CommitInfo {
     pub sha: String,
     pub short_sha: String,
@@ -47,20 +236,20 @@ pub struct CommitInfo {
     pub summary: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct StashEntry {
     pub index: usize,
     pub message: String,
     pub time: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RemoteInfo {
     pub name: String,
     pub url: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct DiffLine {
     pub origin: char,
     pub content: String,
@@ -194,6 +383,22 @@ impl GitRepo {
         let mut b = repo.find_branch(name, bt)
             .map_err(|e| format!("Find '{}': {}", name, e))?;
         b.delete().map_err(|e| format!("Delete: {}", e))?;
+        Ok(())
+    }
+
+    /// Force delete a branch by removing its reference directly.
+    /// Used when regular delete fails (e.g., unmerged changes).
+    pub fn delete_branch_ref(&self, name: &str) -> GitResult<()> {
+        let repo = self.repo()?;
+        let ref_name = if name.starts_with("refs/") {
+            name.to_string()
+        } else {
+            format!("refs/heads/{}", name)
+        };
+        repo.find_reference(&ref_name)
+            .map_err(|e| format!("Find ref '{}': {}", name, e))?
+            .delete()
+            .map_err(|e| format!("Delete ref '{}': {}", name, e))?;
         Ok(())
     }
 
@@ -486,6 +691,11 @@ impl GitRepo {
     pub fn stash_apply(&self) -> GitResult<()> {
         let mut repo = self.repo_mut()?;
         repo.stash_apply(0, None).map_err(|e| format!("Apply: {}", e))
+    }
+
+    pub fn stash_apply_at(&self, index: usize) -> GitResult<()> {
+        let mut repo = self.repo_mut()?;
+        repo.stash_apply(index, None).map_err(|e| format!("Apply stash@{}: {}", index, e))
     }
 
     pub fn stash_drop(&self, index: usize) -> GitResult<()> {

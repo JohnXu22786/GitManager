@@ -1,6 +1,15 @@
 use crate::git_ops::*;
 use eframe::egui;
 use std::path::Path;
+use std::sync::mpsc;
+use std::time::Instant;
+
+/// Tracks a Git operation running in a background thread.
+struct PendingOp {
+    description: String,
+    receiver: mpsc::Receiver<OpResult>,
+    started_at: Instant,
+}
 
 #[derive(PartialEq, Clone)]
 pub enum Tab {
@@ -18,7 +27,6 @@ pub struct App {
     pub repo_path: String,
     pub error_message: String,
     pub success_message: String,
-    pub refreshing: bool,
 
     pub status_entries: Vec<StatusEntry>,
     pub branches: Vec<BranchInfo>,
@@ -56,6 +64,15 @@ pub struct App {
     pub last_refresh: std::time::Instant,
 
     pub show_about: bool,
+
+    /// Pending Git operations running in background threads.
+    pending_ops: Vec<PendingOp>,
+    /// Accumulated error messages from background operations.
+    pending_errors: Vec<String>,
+    /// Accumulated success messages from background operations.
+    pending_successes: Vec<String>,
+    /// Whether to auto-refresh after a mutation operation completes.
+    needs_refresh: bool,
 }
 
 impl App {
@@ -66,7 +83,6 @@ impl App {
             repo_path: String::new(),
             error_message: String::new(),
             success_message: String::new(),
-            refreshing: false,
 
             status_entries: Vec::new(),
             branches: Vec::new(),
@@ -104,6 +120,11 @@ impl App {
             last_refresh: std::time::Instant::now(),
 
             show_about: false,
+
+            pending_ops: Vec::new(),
+            pending_errors: Vec::new(),
+            pending_successes: Vec::new(),
+            needs_refresh: false,
         }
     }
 
@@ -122,23 +143,188 @@ impl App {
         }
     }
 
+    /// Checks if there are any pending background operations.
+    pub fn is_busy(&self) -> bool {
+        !self.pending_ops.is_empty()
+    }
+
+    /// Returns the description of the current/last operation.
+    pub fn current_operation(&self) -> String {
+        self.pending_ops.first()
+            .map(|op| op.description.clone())
+            .unwrap_or_default()
+    }
+
+    /// Spawn a Git operation in a background thread.
+    /// Returns immediately. Results will be processed in `process_pending_ops()`.
+    pub fn start_operation(&mut self, ctx: &egui::Context, description: &str, op: GitOperation) {
+        // Get the repo path to pass to the thread
+        let repo_path = match self.git.path() {
+            Some(p) => p.to_path_buf(),
+            None => {
+                self.show_error("No repository open".into());
+                return;
+            }
+        };
+
+        let (tx, rx) = mpsc::channel::<OpResult>();
+        let desc = description.to_string();
+
+        std::thread::spawn(move || {
+            let result = execute_operation(&repo_path, op);
+            let _ = tx.send(result);
+        });
+
+        self.pending_ops.push(PendingOp {
+            description: desc,
+            receiver: rx,
+            started_at: Instant::now(),
+        });
+
+        ctx.request_repaint();
+    }
+
+    /// Process completed background operations.
+    /// Must be called at the start of each `update()` frame.
+    pub fn process_pending_ops(&mut self, ctx: &egui::Context) {
+        let mut i = 0;
+        while i < self.pending_ops.len() {
+            let op = &self.pending_ops[i];
+            // Check if the operation has timed out (60 seconds)
+            if op.started_at.elapsed().as_secs() > 60 {
+                self.pending_errors
+                    .push(format!("Operation '{}' timed out", op.description));
+                self.pending_ops.swap_remove(i);
+                continue;
+            }
+
+            match op.receiver.try_recv() {
+                Ok(result) => {
+                    let op = self.pending_ops.swap_remove(i);
+                    self.handle_op_result(op.description, result);
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    i += 1; // Still pending
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // Thread panicked or channel broken
+                    self.pending_errors.push(format!(
+                        "Operation '{}' failed unexpectedly",
+                        op.description
+                    ));
+                    self.pending_ops.swap_remove(i);
+                }
+            }
+        }
+
+        // Trigger async refresh after mutation operations complete
+        if self.needs_refresh && self.pending_ops.is_empty() {
+            self.needs_refresh = false;
+            if self.git.is_open() {
+                self.start_operation(ctx, "Refreshing", GitOperation::RefreshAll);
+            }
+        }
+    }
+
+    fn handle_op_result(&mut self, description: String, result: OpResult) {
+        match result {
+            OpResult::Success(msg) => {
+                self.pending_successes.push(msg);
+                // Auto-refresh after mutation operations
+                self.needs_refresh = true;
+            }
+            OpResult::Error(e) => {
+                self.pending_errors.push(format!("{}: {}", description, e));
+            }
+            OpResult::DiffContent { path, lines } => {
+                self.diff_path = path;
+                self.diff_content = lines;
+                self.show_diff = true;
+            }
+            OpResult::SearchResults(commits) => {
+                self.commits = commits;
+            }
+            OpResult::RefreshData {
+                status_entries,
+                branches,
+                worktrees,
+                commits,
+                stashes,
+                remote_list,
+                errors,
+            } => {
+                self.status_entries = status_entries;
+                self.branches = branches;
+                self.worktrees = worktrees;
+                self.commits = commits;
+                self.stashes = stashes;
+                self.remote_list = remote_list;
+                self.last_refresh = Instant::now();
+                if !errors.is_empty() {
+                    self.pending_errors.push(errors.join("; "));
+                }
+            }
+        }
+    }
+
+    /// Flush accumulated messages from background operations into the UI message bar.
+    pub fn flush_messages(&mut self) {
+        if !self.pending_successes.is_empty() {
+            self.success_message = self.pending_successes.join(" | ");
+            self.pending_successes.clear();
+        }
+        if !self.pending_errors.is_empty() {
+            let msg = self.pending_errors.join(" | ");
+            self.pending_errors.clear();
+            // Prepend to existing error if any
+            if self.error_message.is_empty() {
+                self.error_message = msg;
+            } else {
+                self.error_message = format!("{} | {}", self.error_message, msg);
+            }
+        }
+    }
+
     pub fn refresh_all(&mut self) {
         if !self.git.is_open() {
             return;
         }
-        self.refreshing = true;
         self.error_message.clear();
         self.success_message.clear();
 
-        self.status_entries = self.git.get_status().unwrap_or_default();
-        self.branches = self.git.branches().unwrap_or_default();
-        self.worktrees = self.git.worktrees().unwrap_or_default();
-        self.commits = self.git.log(100).unwrap_or_default();
-        self.stashes = self.git.stash_list().unwrap_or_default();
-        self.remote_list = self.git.remotes().unwrap_or_default();
+        // Perform each operation with error reporting instead of silent swallowing
+        let mut errors: Vec<String> = Vec::new();
+
+        self.status_entries = self.git.get_status().unwrap_or_else(|e| {
+            errors.push(format!("Status: {}", e));
+            Vec::new()
+        });
+        self.branches = self.git.branches().unwrap_or_else(|e| {
+            errors.push(format!("Branches: {}", e));
+            Vec::new()
+        });
+        self.worktrees = self.git.worktrees().unwrap_or_else(|e| {
+            errors.push(format!("Worktrees: {}", e));
+            Vec::new()
+        });
+        self.commits = self.git.log(100).unwrap_or_else(|e| {
+            errors.push(format!("Log: {}", e));
+            Vec::new()
+        });
+        self.stashes = self.git.stash_list().unwrap_or_else(|e| {
+            errors.push(format!("Stash: {}", e));
+            Vec::new()
+        });
+        self.remote_list = self.git.remotes().unwrap_or_else(|e| {
+            errors.push(format!("Remotes: {}", e));
+            Vec::new()
+        });
+
+        if !errors.is_empty() {
+            self.show_error(errors.join("; "));
+        }
 
         self.last_refresh = std::time::Instant::now();
-        self.refreshing = false;
     }
 
     pub fn show_error(&mut self, msg: String) {
@@ -192,6 +378,10 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // --- Phase 1: Process any completed background operations ---
+        self.process_pending_ops(ctx);
+        self.flush_messages();
+
         let dark = ctx.style().visuals.dark_mode;
         if dark {
             ctx.set_visuals(egui::Visuals::dark());
@@ -199,10 +389,12 @@ impl eframe::App for App {
             ctx.set_visuals(egui::Visuals::light());
         }
 
+        // --- Top Bar ---
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label("📂");
-                if ui.button("Open Repo...").clicked() {
+                let open_btn = egui::Button::new("Open Repo...");
+                if ui.add_enabled(!self.is_busy(), open_btn).clicked() {
                     let path = native_dialog_path();
                     if let Some(p) = path {
                         self.open_repo(&p);
@@ -240,7 +432,8 @@ impl eframe::App for App {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("🔄").clicked() {
+                        // Disable refresh button while busy
+                        if ui.add_enabled(!self.is_busy(), egui::Button::new("🔄")).clicked() {
                             self.refresh_all();
                         }
                         if ui.button("ℹ️").clicked() {
@@ -251,9 +444,19 @@ impl eframe::App for App {
             });
         });
 
+        // --- Bottom Bar (messages + status) ---
         if self.git.is_open() {
             egui::TopBottomPanel::bottom("bottom_bar").show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    // Loading indicator when operations are in progress
+                    if self.is_busy() {
+                        ui.label(
+                            egui::RichText::new(format!("⏳ {}...", self.current_operation()))
+                                .color(egui::Color32::YELLOW)
+                                .size(13.0),
+                        );
+                    }
+
                     if !self.error_message.is_empty() {
                         ui.label(
                             egui::RichText::new(&self.error_message)
@@ -280,6 +483,7 @@ impl eframe::App for App {
             });
         }
 
+        // --- Central Panel ---
         egui::CentralPanel::default().show(ctx, |ui| {
             if !self.git.is_open() {
                 ui.vertical_centered(|ui| {
@@ -287,7 +491,8 @@ impl eframe::App for App {
                     ui.heading("Git Manager");
                     ui.label("Open a Git repository to get started.");
                     ui.add_space(20.0);
-                    if ui.button("📂 Open Repository").clicked() {
+                    let open_btn = egui::Button::new("📂 Open Repository");
+                    if ui.add_enabled(!self.is_busy(), open_btn).clicked() {
                         let path = native_dialog_path();
                         if let Some(p) = path {
                             self.open_repo(&p);
@@ -302,6 +507,7 @@ impl eframe::App for App {
                 return;
             }
 
+            // Tab bar
             ui.horizontal(|ui| {
                 let tabs = [
                     (Tab::Status, "📊 Status"),
@@ -328,16 +534,18 @@ impl eframe::App for App {
 
             ui.separator();
 
+            // Render the active tab panel
             match self.current_tab {
-                Tab::Status => crate::ui::status_panel::show(self, ui),
-                Tab::Branches => crate::ui::branch_panel::show(self, ui),
-                Tab::Worktrees => crate::ui::worktree_panel::show(self, ui),
-                Tab::Log => crate::ui::log_panel::show(self, ui),
-                Tab::Stash => crate::ui::stash_panel::show(self, ui),
-                Tab::Remotes => crate::ui::remote_panel::show(self, ui),
+                Tab::Status => crate::ui::status_panel::show(self, ui, ctx),
+                Tab::Branches => crate::ui::branch_panel::show(self, ui, ctx),
+                Tab::Worktrees => crate::ui::worktree_panel::show(self, ui, ctx),
+                Tab::Log => crate::ui::log_panel::show(self, ui, ctx),
+                Tab::Stash => crate::ui::stash_panel::show(self, ui, ctx),
+                Tab::Remotes => crate::ui::remote_panel::show(self, ui, ctx),
             }
         });
 
+        // About window
         if self.show_about {
             egui::Window::new("About Git Manager")
                 .collapsible(false)
@@ -361,7 +569,8 @@ impl eframe::App for App {
                 });
         }
 
-        if self.refreshing {
+        // Keep repainting while operations are in progress
+        if self.is_busy() {
             ctx.request_repaint();
         }
     }
