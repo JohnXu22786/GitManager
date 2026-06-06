@@ -13,6 +13,10 @@ env:
 jobs:
   build:
     name: Build (${{ matrix.target }})
+    # ── Phase 1: Build ──
+    # Builds the binary for each target platform in parallel using a build matrix.
+    # Each build runs independently on its own runner (ubuntu, windows, macos).
+    # Artifacts are uploaded as workflow artifacts for the next phase.
     strategy:
       fail-fast: false
       matrix:
@@ -107,6 +111,14 @@ jobs:
 
   create-release:
     name: Create GitHub Release
+    # ── Phase 2: Collect & Publish ──
+    # After ALL builds succeed, this job downloads all platform artifacts and
+    # uploads them to the GitHub Release that the user created on the web UI.
+    #
+    # This is NOT redundant with Phase 1. Phase 1 builds the binaries,
+    # Phase 2 publishes them to the existing release. The release was already
+    # created by GitHub when the user clicked "Publish Release" — this job
+    # only populates it with the built artifacts.
     needs: [build]
     runs-on: ubuntu-latest
     steps:

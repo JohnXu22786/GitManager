@@ -85,7 +85,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
 
     let commit_msg = &mut app.commit_msg;
     egui::ScrollArea::vertical()
-        .id_source("commit_scroll")
+        .id_salt("commit_scroll")
         .show(ui, |ui| {
             ui.add_sized(
                 egui::vec2(ui.available_width(), 80.0),
