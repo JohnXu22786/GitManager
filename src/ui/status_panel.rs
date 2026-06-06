@@ -1,27 +1,20 @@
 use crate::app::App;
+use crate::git_ops::GitOperation;
 use eframe::egui;
 
-pub fn show(app: &mut App, ui: &mut egui::Ui) {
+pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     ui.horizontal(|ui| {
         ui.heading("Changes");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("Stage All").clicked() {
-                match app.git.stage_all() {
-                    Ok(()) => { app.show_success("Staged all".into()); app.refresh_all(); }
-                    Err(e) => app.show_error(e),
-                }
+            let busy = app.is_busy();
+            if ui.add_enabled(!busy, egui::Button::new("Stage All")).clicked() {
+                app.start_operation(ctx, "Staging all", GitOperation::StageAll);
             }
-            if ui.button("Unstage All").clicked() {
-                match app.git.unstage_all() {
-                    Ok(()) => { app.show_success("Unstaged all".into()); app.refresh_all(); }
-                    Err(e) => app.show_error(e),
-                }
+            if ui.add_enabled(!busy, egui::Button::new("Unstage All")).clicked() {
+                app.start_operation(ctx, "Unstaging all", GitOperation::UnstageAll);
             }
-            if ui.button("Discard All").clicked() {
-                match app.git.restore_all() {
-                    Ok(()) => { app.show_success("Restored all".into()); app.refresh_all(); }
-                    Err(e) => app.show_error(e),
-                }
+            if ui.add_enabled(!busy, egui::Button::new("Discard All")).clicked() {
+                app.start_operation(ctx, "Discarding all", GitOperation::RestoreAll);
             }
         });
     });
@@ -36,18 +29,14 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         for entry in &staged {
             let path = entry.path.clone();
             ui.horizontal(|ui| {
+                let busy = app.is_busy();
                 let color = crate::app::App::status_color_by_type(entry.status);
                 ui.label(egui::RichText::new(format!("[{}]", entry.status)).color(color).monospace());
-                if ui.button("Unstage").clicked() {
-                    match app.git.unstage_file(&path) {
-                        Ok(()) => { app.show_success(format!("Unstaged {}", path)); app.refresh_all(); }
-                        Err(e) => app.show_error(e),
-                    }
+                if ui.add_enabled(!busy, egui::Button::new("Unstage")).clicked() {
+                    app.start_operation(ctx, &format!("Unstage {}", path), GitOperation::UnstageFile(path.clone()));
                 }
-                if ui.button("Diff").clicked() {
-                    app.diff_content = app.git.get_diff(&path, true).unwrap_or_default();
-                    app.diff_path = path.clone();
-                    app.show_diff = true;
+                if ui.add_enabled(!busy, egui::Button::new("Diff")).clicked() {
+                    app.start_operation(ctx, &format!("Diff {}", path), GitOperation::GetDiff { path: path.clone(), staged: true });
                 }
                 ui.label(&path);
             });
@@ -60,29 +49,22 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         for entry in &unstaged {
             let path = entry.path.clone();
             ui.horizontal(|ui| {
+                let busy = app.is_busy();
                 let color = crate::app::App::status_color_by_type(entry.status);
                 ui.label(egui::RichText::new(format!("[{}]", entry.status)).color(color).monospace());
 
                 if entry.status != 'D' && entry.status != '?' && entry.status != '!' {
-                    if ui.button("Stage").clicked() {
-                        match app.git.stage_file(&path) {
-                            Ok(()) => { app.show_success(format!("Staged {}", path)); app.refresh_all(); }
-                            Err(e) => app.show_error(e),
-                        }
+                    if ui.add_enabled(!busy, egui::Button::new("Stage")).clicked() {
+                        app.start_operation(ctx, &format!("Stage {}", path), GitOperation::StageFile(path.clone()));
                     }
                 }
                 if entry.status != '?' && entry.status != '!' {
-                    if ui.button("Discard").clicked() {
-                        match app.git.restore_file(&path) {
-                            Ok(()) => { app.show_success(format!("Restored {}", path)); app.refresh_all(); }
-                            Err(e) => app.show_error(e),
-                        }
+                    if ui.add_enabled(!busy, egui::Button::new("Discard")).clicked() {
+                        app.start_operation(ctx, &format!("Restore {}", path), GitOperation::RestoreFile(path.clone()));
                     }
                 }
-                if ui.button("Diff").clicked() {
-                    app.diff_content = app.git.get_diff(&path, false).unwrap_or_default();
-                    app.diff_path = path.clone();
-                    app.show_diff = true;
+                if ui.add_enabled(!busy, egui::Button::new("Diff")).clicked() {
+                    app.start_operation(ctx, &format!("Diff {}", path), GitOperation::GetDiff { path: path.clone(), staged: false });
                 }
                 ui.label(&path);
             });
@@ -103,36 +85,28 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
 
     let commit_msg = &mut app.commit_msg;
     egui::ScrollArea::vertical()
-        .id_source("commit_scroll")
+        .id_salt("commit_scroll")
         .show(ui, |ui| {
             ui.add_sized(
                 egui::vec2(ui.available_width(), 80.0),
                 egui::TextEdit::multiline(commit_msg).hint_text("Commit message"),
             );
         });
-    if ui.button("Commit").clicked() {
+
+    let busy = app.is_busy();
+    if ui.add_enabled(!busy, egui::Button::new("Commit")).clicked() {
         if app.commit_msg.trim().is_empty() {
             app.show_error("Commit message cannot be empty".into());
         } else {
-            match app.git.commit(app.commit_msg.trim(), app.commit_amend) {
-                Ok(sha) => {
-                    app.show_success(format!("Committed: {}", &sha[..sha.len().min(7)]));
-                    app.commit_msg.clear();
-                    app.commit_amend = false;
-                    app.refresh_all();
-                }
-                Err(e) => app.show_error(e),
-            }
+            let msg = app.commit_msg.trim().to_string();
+            let amend = app.commit_amend;
+            app.start_operation(ctx, "Committing", GitOperation::Commit { message: msg, amend });
+            app.commit_msg.clear();
+            app.commit_amend = false;
         }
     }
-    if ui.button("Uncommit").clicked() {
-        match app.git.uncommit() {
-            Ok(sha) => {
-                app.show_success(format!("Uncommitted to {}", &sha[..sha.len().min(7)]));
-                app.refresh_all();
-            }
-            Err(e) => app.show_error(e),
-        }
+    if ui.add_enabled(!busy, egui::Button::new("Uncommit")).clicked() {
+        app.start_operation(ctx, "Uncommitting", GitOperation::Uncommit);
     }
 
     if app.show_diff && !app.diff_content.is_empty() {
