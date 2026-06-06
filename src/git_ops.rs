@@ -2,6 +2,7 @@ use chrono::DateTime;
 use git2::{BranchType, DiffOptions, Repository, Status, WorktreeAddOptions, WorktreePruneOptions};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 pub type GitResult<T> = Result<T, String>;
 
@@ -64,16 +65,17 @@ pub enum OpResult {
 
 /// Execute a GitOperation in the current process (blocking).
 /// This function opens the repository at `path` and runs the operation.
-pub fn execute_operation(path: &Path, op: GitOperation) -> OpResult {
+/// `progress` is a shared string that the operation can update in real-time for UI display.
+pub fn execute_operation(path: &Path, op: GitOperation, progress: Arc<Mutex<String>>) -> OpResult {
     let mut repo = GitRepo::new();
     match repo.open(path) {
-        Ok(()) => op.dispatch(&repo),
+        Ok(()) => op.dispatch_with_progress(&repo, progress),
         Err(e) => OpResult::Error(format!("Failed to open repo: {}", e)),
     }
 }
 
 impl GitOperation {
-    fn dispatch(self, repo: &GitRepo) -> OpResult {
+    fn dispatch_with_progress(self, repo: &GitRepo, progress: Arc<Mutex<String>>) -> OpResult {
         match self {
             GitOperation::StageAll => Self::simple(repo.stage_all(), "Staged all"),
             GitOperation::UnstageAll => Self::simple(repo.unstage_all(), "Unstaged all"),
@@ -143,15 +145,15 @@ impl GitOperation {
             GitOperation::StashDrop(index) => {
                 Self::simple(repo.stash_drop(index), format!("Dropped stash@{{{}}}", index))
             }
-            GitOperation::Push { remote, branch, force } => match repo.push(&remote, &branch, force) {
+            GitOperation::Push { remote, branch, force } => match repo.push(&remote, &branch, force, progress) {
                 Ok(msg) => OpResult::Success(msg),
                 Err(e) => OpResult::Error(e),
             },
-            GitOperation::Pull { remote, branch, rebase } => match repo.pull(&remote, &branch, rebase) {
+            GitOperation::Pull { remote, branch, rebase } => match repo.pull(&remote, &branch, rebase, progress) {
                 Ok(msg) => OpResult::Success(msg),
                 Err(e) => OpResult::Error(e),
             },
-            GitOperation::Fetch(remote) => match repo.fetch(&remote) {
+            GitOperation::Fetch(remote) => match repo.fetch(&remote, progress) {
                 Ok(msg) => OpResult::Success(msg),
                 Err(e) => OpResult::Error(e),
             },
@@ -819,9 +821,16 @@ impl GitRepo {
         Ok(commits)
     }
 
-    pub fn push(&self, remote: &str, branch: &str, force: bool) -> GitResult<String> {
+    pub fn push(&self, remote: &str, branch: &str, force: bool, progress: Arc<Mutex<String>>) -> GitResult<String> {
         let repo = self.repo_mut()?;
-        let cb = git2::RemoteCallbacks::new();
+        let prog = progress.clone();
+        let mut cb = git2::RemoteCallbacks::new();
+        cb.sideband_progress(move |data| {
+            if let Ok(mut p) = prog.lock() {
+                *p = String::from_utf8_lossy(data).to_string();
+            }
+            true
+        });
         let mut fo = git2::PushOptions::new();
         fo.remote_callbacks(cb);
         let rs = if force { format!("+refs/heads/{}:refs/heads/{}", branch, branch) }
@@ -831,9 +840,16 @@ impl GitRepo {
         Ok(format!("Pushed {}", branch))
     }
 
-    pub fn fetch(&self, remote: &str) -> GitResult<String> {
+    pub fn fetch(&self, remote: &str, progress: Arc<Mutex<String>>) -> GitResult<String> {
         let repo = self.repo_mut()?;
-        let cb = git2::RemoteCallbacks::new();
+        let prog = progress.clone();
+        let mut cb = git2::RemoteCallbacks::new();
+        cb.sideband_progress(move |data| {
+            if let Ok(mut p) = prog.lock() {
+                *p = String::from_utf8_lossy(data).to_string();
+            }
+            true
+        });
         let mut fo = git2::FetchOptions::new();
         fo.remote_callbacks(cb);
         let mut rm = repo.find_remote(remote).map_err(|e| format!("Remote: {}", e))?;
@@ -842,9 +858,16 @@ impl GitRepo {
         Ok(format!("Fetched from {}", remote))
     }
 
-    pub fn pull(&self, remote: &str, branch: &str, rebase: bool) -> GitResult<String> {
+    pub fn pull(&self, remote: &str, branch: &str, rebase: bool, progress: Arc<Mutex<String>>) -> GitResult<String> {
         let repo = self.repo_mut()?;
-        let cb = git2::RemoteCallbacks::new();
+        let prog = progress.clone();
+        let mut cb = git2::RemoteCallbacks::new();
+        cb.sideband_progress(move |data| {
+            if let Ok(mut p) = prog.lock() {
+                *p = String::from_utf8_lossy(data).to_string();
+            }
+            true
+        });
         let mut fo = git2::FetchOptions::new();
         fo.remote_callbacks(cb);
         let rs = format!("+refs/heads/{}:refs/remotes/{}/{}", branch, remote, branch);
@@ -953,7 +976,7 @@ mod tests {
 
         // Create worktree
         let wt_name = "test-wt";
-        let sig = repo.signature().expect("sig");
+        let _sig = repo.signature().expect("sig");
         let head = repo.head().expect("head");
         let commit = head.peel_to_commit().expect("commit");
         let _branch = repo.branch(wt_name, &commit, false).expect("branch");
