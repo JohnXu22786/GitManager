@@ -5,12 +5,201 @@ use std::path::{Path, PathBuf};
 
 pub type GitResult<T> = Result<T, String>;
 
+/// Describes a Git operation to be executed in a background thread.
+pub enum GitOperation {
+    StageAll,
+    UnstageAll,
+    RestoreAll,
+    StageFile(String),
+    UnstageFile(String),
+    RestoreFile(String),
+    Commit { message: String, amend: bool },
+    Uncommit,
+    CreateBranch { name: String, base: Option<String> },
+    DeleteBranch { name: String, force: bool },
+    RenameBranch { old: String, new: String },
+    CheckoutBranch(String),
+    MergeBranch(String),
+    RemoveWorktree { path: PathBuf, force: bool },
+    CreateWorktree { name: String, path: PathBuf, branch: Option<String>, new_branch: bool },
+    StashAll(Option<String>),
+    StashPop,
+    StashApply(usize),
+    StashDrop(usize),
+    Push { remote: String, branch: String, force: bool },
+    Pull { remote: String, branch: String, rebase: bool },
+    Fetch(String),
+    GetDiff { path: String, staged: bool },
+    /// Search commits in the log.
+    LogSearch(String),
+    /// Refresh all cached data from the repository.
+    RefreshAll,
+}
+
+/// Result of a Git operation executed in a background thread.
+#[derive(Debug, Clone)]
+pub enum OpResult {
+    /// Operation succeeded with a message.
+    Success(String),
+    /// Operation failed with an error message.
+    Error(String),
+    /// Diff content for a file.
+    DiffContent {
+        path: String,
+        lines: Vec<DiffLine>,
+    },
+    /// Search results for commit log.
+    SearchResults(Vec<CommitInfo>),
+    /// Refreshed data from the repository, with optional errors.
+    RefreshData {
+        status_entries: Vec<StatusEntry>,
+        branches: Vec<BranchInfo>,
+        worktrees: Vec<WorktreeInfo>,
+        commits: Vec<CommitInfo>,
+        stashes: Vec<StashEntry>,
+        remote_list: Vec<RemoteInfo>,
+        errors: Vec<String>,
+    },
+}
+
+/// Execute a GitOperation in the current process (blocking).
+/// This function opens the repository at `path` and runs the operation.
+pub fn execute_operation(path: &Path, op: GitOperation) -> OpResult {
+    let mut repo = GitRepo::new();
+    match repo.open(path) {
+        Ok(()) => op.dispatch(&repo),
+        Err(e) => OpResult::Error(format!("Failed to open repo: {}", e)),
+    }
+}
+
+impl GitOperation {
+    fn dispatch(self, repo: &GitRepo) -> OpResult {
+        match self {
+            GitOperation::StageAll => Self::simple(repo.stage_all(), "Staged all"),
+            GitOperation::UnstageAll => Self::simple(repo.unstage_all(), "Unstaged all"),
+            GitOperation::RestoreAll => Self::simple(repo.restore_all(), "Restored all"),
+            GitOperation::StageFile(p) => Self::simple(repo.stage_file(&p), format!("Staged {}", p)),
+            GitOperation::UnstageFile(p) => Self::simple(repo.unstage_file(&p), format!("Unstaged {}", p)),
+            GitOperation::RestoreFile(p) => Self::simple(repo.restore_file(&p), format!("Restored {}", p)),
+            GitOperation::Commit { message, amend } => match repo.commit(&message, amend) {
+                Ok(sha) => OpResult::Success(format!("Committed: {}", &sha[..sha.len().min(7)])),
+                Err(e) => OpResult::Error(e),
+            },
+            GitOperation::Uncommit => match repo.uncommit() {
+                Ok(sha) => OpResult::Success(format!("Uncommitted to {}", &sha[..sha.len().min(7)])),
+                Err(e) => OpResult::Error(e),
+            },
+            GitOperation::CreateBranch { name, base } => {
+                Self::simple(repo.create_branch(&name, base.as_deref()), format!("Created branch '{}'", name))
+            }
+            GitOperation::DeleteBranch { name, force } => {
+                // When force is true, we first try regular delete, and if that fails
+                // we delete the branch reference directly
+                match repo.delete_branch(&name, false) {
+                    Ok(()) => OpResult::Success(format!("Deleted '{}'", name)),
+                    Err(first_err) => {
+                        if force {
+                            // Force delete: try to delete reference directly
+                            match repo.delete_branch_ref(&name) {
+                                Ok(()) => OpResult::Success(format!("Force deleted '{}'", name)),
+                                Err(_) => OpResult::Error(format!("Failed to delete '{}': {}", name, first_err)),
+                            }
+                        } else {
+                            OpResult::Error(first_err)
+                        }
+                    }
+                }
+            }
+            GitOperation::RenameBranch { old, new } => {
+                Self::simple(repo.rename_branch(&old, &new), format!("Renamed '{}' -> '{}'", old, new))
+            }
+            GitOperation::CheckoutBranch(name) => {
+                Self::simple(repo.checkout_branch(&name), format!("Switched to '{}'", name))
+            }
+            GitOperation::MergeBranch(name) => match repo.merge_branch(&name) {
+                Ok(msg) => OpResult::Success(msg),
+                Err(e) => OpResult::Error(e),
+            },
+            GitOperation::RemoveWorktree { path, force } => {
+                Self::simple(repo.remove_worktree(&path, force), {
+                    if force { format!("Force removed worktree at {:?}", path) }
+                    else { format!("Removed worktree at {:?}", path) }
+                })
+            }
+            GitOperation::CreateWorktree { name, path, branch, new_branch } => {
+                match repo.create_worktree(&name, &path, branch.as_deref(), new_branch) {
+                    Ok(()) => OpResult::Success(format!("Created worktree '{}' at {:?}", name, path)),
+                    Err(e) => OpResult::Error(e),
+                }
+            }
+            GitOperation::StashAll(msg) => {
+                Self::simple(repo.stash_all(msg.as_deref()), "Stashed changes")
+            }
+            GitOperation::StashPop => Self::simple(repo.stash_pop(), "Stash popped"),
+            GitOperation::StashApply(index) => match repo.stash_apply_at(index) {
+                Ok(()) => OpResult::Success(format!("Applied stash@{{{}}}", index)),
+                Err(e) => OpResult::Error(e),
+            },
+            GitOperation::StashDrop(index) => {
+                Self::simple(repo.stash_drop(index), format!("Dropped stash@{{{}}}", index))
+            }
+            GitOperation::Push { remote, branch, force } => match repo.push(&remote, &branch, force) {
+                Ok(msg) => OpResult::Success(msg),
+                Err(e) => OpResult::Error(e),
+            },
+            GitOperation::Pull { remote, branch, rebase } => match repo.pull(&remote, &branch, rebase) {
+                Ok(msg) => OpResult::Success(msg),
+                Err(e) => OpResult::Error(e),
+            },
+            GitOperation::Fetch(remote) => match repo.fetch(&remote) {
+                Ok(msg) => OpResult::Success(msg),
+                Err(e) => OpResult::Error(e),
+            },
+            GitOperation::GetDiff { path, staged } => match repo.get_diff(&path, staged) {
+                Ok(lines) => OpResult::DiffContent { path, lines },
+                Err(e) => OpResult::Error(format!("Diff error: {}", e)),
+            },
+            GitOperation::LogSearch(filter) => {
+                let commits = repo.log(100).unwrap_or_default();
+                let filtered: Vec<CommitInfo> = if filter.is_empty() {
+                    commits
+                } else {
+                    let f = filter.to_lowercase();
+                    commits.into_iter().filter(|c| {
+                        c.message.to_lowercase().contains(&f)
+                            || c.author.to_lowercase().contains(&f)
+                            || c.short_sha.contains(&f)
+                    }).collect()
+                };
+                OpResult::SearchResults(filtered)
+            }
+            GitOperation::RefreshAll => {
+                let mut errors: Vec<String> = Vec::new();
+                let status_entries = repo.get_status().unwrap_or_else(|e| { errors.push(format!("Status: {}", e)); Vec::new() });
+                let branches = repo.branches().unwrap_or_else(|e| { errors.push(format!("Branches: {}", e)); Vec::new() });
+                let worktrees = repo.worktrees().unwrap_or_else(|e| { errors.push(format!("Worktrees: {}", e)); Vec::new() });
+                let commits = repo.log(100).unwrap_or_else(|e| { errors.push(format!("Log: {}", e)); Vec::new() });
+                let stashes = repo.stash_list().unwrap_or_else(|e| { errors.push(format!("Stash: {}", e)); Vec::new() });
+                let remote_list = repo.remotes().unwrap_or_else(|e| { errors.push(format!("Remotes: {}", e)); Vec::new() });
+                OpResult::RefreshData { status_entries, branches, worktrees, commits, stashes, remote_list, errors }
+            }
+        }
+    }
+
+    fn simple(result: GitResult<()>, msg: impl Into<String>) -> OpResult {
+        match result {
+            Ok(()) => OpResult::Success(msg.into()),
+            Err(e) => OpResult::Error(e),
+        }
+    }
+}
+
 pub struct GitRepo {
     repo: RefCell<Option<Repository>>,
     path: Option<PathBuf>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct BranchInfo {
     pub name: String,
     pub is_head: bool,
@@ -19,10 +208,11 @@ pub struct BranchInfo {
     pub ahead: i32,
     pub behind: i32,
     pub last_commit: Option<String>,
+    #[allow(dead_code)]
     pub last_commit_time: Option<String>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct WorktreeInfo {
     pub path: PathBuf,
     pub branch: Option<String>,
@@ -30,15 +220,16 @@ pub struct WorktreeInfo {
     pub is_main: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct StatusEntry {
     pub path: String,
     pub status: char,
     pub staged: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct CommitInfo {
+    #[allow(dead_code)]
     pub sha: String,
     pub short_sha: String,
     pub author: String,
@@ -47,23 +238,39 @@ pub struct CommitInfo {
     pub summary: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct StashEntry {
     pub index: usize,
     pub message: String,
     pub time: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RemoteInfo {
     pub name: String,
     pub url: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct DiffLine {
     pub origin: char,
     pub content: String,
+}
+
+/// Compare two paths for equality, handling case-insensitivity and separator normalization on Windows.
+fn paths_match(a: &Path, b: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        // Normalize both paths: lowercase, replace / with \
+        fn normalize(p: &Path) -> String {
+            p.to_string_lossy().to_lowercase().replace('/', "\\")
+        }
+        normalize(a) == normalize(b)
+    }
+    #[cfg(not(windows))]
+    {
+        a == b
+    }
 }
 
 impl GitRepo {
@@ -82,7 +289,7 @@ impl GitRepo {
     pub fn is_open(&self) -> bool { self.repo.borrow().is_some() }
     pub fn path(&self) -> Option<&Path> { self.path.as_deref() }
 
-    fn repo(&self) -> GitResult<std::cell::Ref<Repository>> {
+    fn repo(&self) -> GitResult<std::cell::Ref<'_, Repository>> {
         let r = self.repo.borrow();
         if r.is_some() {
             Ok(std::cell::Ref::map(r, |o| o.as_ref().unwrap()))
@@ -91,7 +298,7 @@ impl GitRepo {
         }
     }
 
-    fn repo_mut(&self) -> GitResult<std::cell::RefMut<Repository>> {
+    fn repo_mut(&self) -> GitResult<std::cell::RefMut<'_, Repository>> {
         let r = self.repo.borrow_mut();
         if r.is_some() {
             Ok(std::cell::RefMut::map(r, |o| o.as_mut().unwrap()))
@@ -197,6 +404,22 @@ impl GitRepo {
         Ok(())
     }
 
+    /// Force delete a branch by removing its reference directly.
+    /// Used when regular delete fails (e.g., unmerged changes).
+    pub fn delete_branch_ref(&self, name: &str) -> GitResult<()> {
+        let repo = self.repo()?;
+        let ref_name = if name.starts_with("refs/") {
+            name.to_string()
+        } else {
+            format!("refs/heads/{}", name)
+        };
+        repo.find_reference(&ref_name)
+            .map_err(|e| format!("Find ref '{}': {}", name, e))?
+            .delete()
+            .map_err(|e| format!("Delete ref '{}': {}", name, e))?;
+        Ok(())
+    }
+
     pub fn merge_branch(&self, branch_name: &str) -> GitResult<String> {
         let repo = self.repo()?;
         let their = repo.revparse_single(branch_name)
@@ -291,17 +514,65 @@ impl GitRepo {
     pub fn remove_worktree(&self, path: &Path, force: bool) -> GitResult<()> {
         let repo = self.repo()?;
         let wname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if let Ok(wt) = repo.find_worktree(wname) {
-            if force {
-                let mut opts = WorktreePruneOptions::new();
-                opts.valid(true);
-                wt.prune(Some(&mut opts)).map_err(|e| format!("Prune: {}", e))?;
-            } else {
-                wt.prune(None).map_err(|e| format!("Remove: {}", e))?;
+        let mut errors = Vec::new();
+
+        // Try to find worktree by name (fast path)
+        let mut found_wt = repo.find_worktree(wname).ok();
+        
+        // Fallback: if name-based lookup fails, iterate through all worktrees
+        if found_wt.is_none() {
+            if let Ok(names) = repo.worktrees() {
+                for name in names.iter().flatten() {
+                    if let Ok(wt) = repo.find_worktree(name) {
+                        if paths_match(wt.path(), path) {
+                            found_wt = Some(wt);
+                            break;
+                        }
+                    }
+                }
             }
         }
-        if path.exists() { std::fs::remove_dir_all(path).map_err(|e| format!("Rm dir: {}", e))?; }
-        Ok(())
+
+        // Attempt pruning with manual fallback for metadata cleanup
+        if let Some(ref wt) = found_wt {
+            let prune_result = if force {
+                let mut opts = WorktreePruneOptions::new();
+                opts.valid(true);       // Prune even if the worktree is valid
+                opts.locked(true);      // Prune even if locked
+                opts.working_tree(true); // Recursively remove the working tree directory
+                wt.prune(Some(&mut opts))
+            } else {
+                wt.prune(None)
+            };
+
+            if let Err(e) = prune_result {
+                errors.push(if force { format!("Prune: {}", e) } else { format!("Remove: {}", e) });
+                // Fallback: clean up git metadata manually since prune refused
+                if let Some(name) = wt.name() {
+                    let wt_gitdir = repo.path().join("worktrees").join(name);
+                    if wt_gitdir.exists() {
+                        if let Err(e) = std::fs::remove_dir_all(&wt_gitdir) {
+                            errors.push(format!("Remove git metadata: {}", e));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Always try to remove the worktree directory from filesystem
+        if path.exists() {
+            if let Err(e) = std::fs::remove_dir_all(path) {
+                errors.push(format!("Rm dir: {}", e));
+            }
+        }
+
+        // If worktree directory is gone, consider it a success (primary user concern)
+        let dir_gone = !path.exists();
+        if errors.is_empty() || dir_gone {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
     }
 
     pub fn get_status(&self) -> GitResult<Vec<StatusEntry>> {
@@ -483,9 +754,15 @@ impl GitRepo {
         repo.stash_pop(0, None).map_err(|e| format!("Pop: {}", e))
     }
 
+    #[allow(dead_code)]
     pub fn stash_apply(&self) -> GitResult<()> {
         let mut repo = self.repo_mut()?;
         repo.stash_apply(0, None).map_err(|e| format!("Apply: {}", e))
+    }
+
+    pub fn stash_apply_at(&self, index: usize) -> GitResult<()> {
+        let mut repo = self.repo_mut()?;
+        repo.stash_apply(index, None).map_err(|e| format!("Apply stash@{}: {}", index, e))
     }
 
     pub fn stash_drop(&self, index: usize) -> GitResult<()> {
@@ -543,8 +820,8 @@ impl GitRepo {
     }
 
     pub fn push(&self, remote: &str, branch: &str, force: bool) -> GitResult<String> {
-        let mut repo = self.repo_mut()?;
-        let mut cb = git2::RemoteCallbacks::new();
+        let repo = self.repo_mut()?;
+        let cb = git2::RemoteCallbacks::new();
         let mut fo = git2::PushOptions::new();
         fo.remote_callbacks(cb);
         let rs = if force { format!("+refs/heads/{}:refs/heads/{}", branch, branch) }
@@ -555,8 +832,8 @@ impl GitRepo {
     }
 
     pub fn fetch(&self, remote: &str) -> GitResult<String> {
-        let mut repo = self.repo_mut()?;
-        let mut cb = git2::RemoteCallbacks::new();
+        let repo = self.repo_mut()?;
+        let cb = git2::RemoteCallbacks::new();
         let mut fo = git2::FetchOptions::new();
         fo.remote_callbacks(cb);
         let mut rm = repo.find_remote(remote).map_err(|e| format!("Remote: {}", e))?;
@@ -566,8 +843,8 @@ impl GitRepo {
     }
 
     pub fn pull(&self, remote: &str, branch: &str, rebase: bool) -> GitResult<String> {
-        let mut repo = self.repo_mut()?;
-        let mut cb = git2::RemoteCallbacks::new();
+        let repo = self.repo_mut()?;
+        let cb = git2::RemoteCallbacks::new();
         let mut fo = git2::FetchOptions::new();
         fo.remote_callbacks(cb);
         let rs = format!("+refs/heads/{}:refs/remotes/{}/{}", branch, remote, branch);
@@ -636,5 +913,201 @@ impl GitRepo {
             }
         }
         Ok(list)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper to create a temporary git repo with an initial commit
+    fn create_repo_with_commit(dir: &Path) -> Repository {
+        let repo = Repository::init(dir).expect("init repo");
+        let sig = repo.signature().expect("signature");
+        let tree_oid = {
+            let mut idx = repo.index().expect("index");
+            idx.write_tree().expect("write tree")
+        };
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+        repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
+            .expect("initial commit");
+        drop(tree);
+        repo
+    }
+
+    /// Helper: create a GitRepo (our wrapper) from a temp directory path
+    fn open_git_repo(repo_dir: &Path) -> GitRepo {
+        let mut git = GitRepo::new();
+        git.open(repo_dir).expect("open repo");
+        git
+    }
+
+    #[test]
+    fn test_force_remove_valid_worktree() {
+        let main_dir = tempfile::tempdir().expect("temp dir");
+        let wt_root = tempfile::tempdir().expect("temp dir");
+        let wt_path = wt_root.path().join("test-wt");
+
+        // Create main repo with commit
+        let repo = create_repo_with_commit(main_dir.path());
+
+        // Create worktree
+        let wt_name = "test-wt";
+        let sig = repo.signature().expect("sig");
+        let head = repo.head().expect("head");
+        let commit = head.peel_to_commit().expect("commit");
+        let _branch = repo.branch(wt_name, &commit, false).expect("branch");
+        let reference = repo.find_reference(&format!("refs/heads/{}", wt_name)).ok();
+        let mut opts = git2::WorktreeAddOptions::new();
+        if let Some(ref r) = reference {
+            opts.reference(Some(r));
+        }
+        repo.worktree(wt_name, &wt_path, Some(&opts)).expect("create worktree");
+
+        // Now remove it with force
+        let git = open_git_repo(main_dir.path());
+        let result = git.remove_worktree(&wt_path, true);
+        assert!(result.is_ok(), "Force remove should succeed: {:?}", result);
+
+        // Verify worktree directory is gone
+        assert!(!wt_path.exists(), "Worktree dir should be removed");
+
+        // Verify git metadata is removed
+        let wt_gitdir = repo.path().join("worktrees").join(wt_name);
+        assert!(!wt_gitdir.exists(), "Git worktree metadata should be removed");
+
+        // Verify worktree is no longer listed
+        let after_wts = git.worktrees().unwrap();
+        assert_eq!(after_wts.len(), 1, "Only main worktree should remain");
+        assert!(after_wts[0].is_main, "Remaining worktree should be main");
+    }
+
+    #[test]
+    fn test_normal_remove_valid_with_fallback_succeeds() {
+        let main_dir = tempfile::tempdir().expect("temp dir");
+        let wt_root = tempfile::tempdir().expect("temp dir");
+        let wt_path = wt_root.path().join("test-wt-normal");
+
+        let repo = create_repo_with_commit(main_dir.path());
+
+        let wt_name = "test-wt-normal";
+        let _branch = repo.branch(wt_name, &repo.head().unwrap().peel_to_commit().unwrap(), false).unwrap();
+        let reference = repo.find_reference(&format!("refs/heads/{}", wt_name)).ok();
+        let mut opts = git2::WorktreeAddOptions::new();
+        if let Some(ref r) = reference {
+            opts.reference(Some(r));
+        }
+        repo.worktree(wt_name, &wt_path, Some(&opts)).expect("create worktree");
+
+        let wt_gitdir = repo.path().join("worktrees").join(wt_name);
+
+        // Normal remove should succeed now with our improved implementation
+        // (it falls back to manual cleanup when prune refuses)
+        let git = open_git_repo(main_dir.path());
+        let result = git.remove_worktree(&wt_path, false);
+        assert!(result.is_ok(), "Normal remove should succeed with fallback: {:?}", result);
+        assert!(!wt_path.exists(), "Worktree dir should be gone");
+        assert!(!wt_gitdir.exists(), "Git worktree metadata should be cleaned up");
+    }
+
+    #[test]
+    fn test_force_remove_missing_worktree_dir() {
+        let main_dir = tempfile::tempdir().expect("temp dir");
+        let wt_root = tempfile::tempdir().expect("temp dir");
+        let wt_path = wt_root.path().join("test-wt-missing");
+
+        let repo = create_repo_with_commit(main_dir.path());
+
+        let wt_name = "test-wt-missing";
+        let _branch = repo.branch(wt_name, &repo.head().unwrap().peel_to_commit().unwrap(), false).unwrap();
+        let reference = repo.find_reference(&format!("refs/heads/{}", wt_name)).ok();
+        let mut opts = git2::WorktreeAddOptions::new();
+        if let Some(ref r) = reference {
+            opts.reference(Some(r));
+        }
+        repo.worktree(wt_name, &wt_path, Some(&opts)).expect("create worktree");
+
+        // Manually remove the worktree directory first
+        std::fs::remove_dir_all(&wt_path).expect("remove wt dir");
+
+        // Force remove should still clean up git metadata
+        let git = open_git_repo(main_dir.path());
+        let result = git.remove_worktree(&wt_path, true);
+        assert!(result.is_ok(), "Force remove with missing dir should succeed: {:?}", result);
+
+        // Verify git metadata is gone
+        let wt_gitdir = repo.path().join("worktrees").join(wt_name);
+        assert!(!wt_gitdir.exists(), "Git worktree metadata should be removed");
+    }
+
+    #[test]
+    fn test_force_remove_already_gone() {
+        let main_dir = tempfile::tempdir().expect("temp dir");
+        let wt_root = tempfile::tempdir().expect("temp dir");
+        let wt_path = wt_root.path().join("test-wt-gone");
+
+        let repo = create_repo_with_commit(main_dir.path());
+
+        let wt_name = "test-wt-gone";
+        let _branch = repo.branch(wt_name, &repo.head().unwrap().peel_to_commit().unwrap(), false).unwrap();
+        let reference = repo.find_reference(&format!("refs/heads/{}", wt_name)).ok();
+        let mut opts = git2::WorktreeAddOptions::new();
+        if let Some(ref r) = reference {
+            opts.reference(Some(r));
+        }
+        repo.worktree(wt_name, &wt_path, Some(&opts)).expect("create worktree");
+
+        // Remove both directory and git metadata manually
+        std::fs::remove_dir_all(&wt_path).ok();
+        let wt_gitdir = repo.path().join("worktrees").join(wt_name);
+        std::fs::remove_dir_all(&wt_gitdir).ok();
+
+        // Force remove on already-removed worktree should be a no-op success
+        let git = open_git_repo(main_dir.path());
+        let result = git.remove_worktree(&wt_path, true);
+        assert!(result.is_ok(), "Remove already-gone worktree should succeed: {:?}", result);
+    }
+
+    #[test]
+    fn test_remove_nonexistent_worktree() {
+        let main_dir = tempfile::tempdir().expect("temp dir");
+        create_repo_with_commit(main_dir.path());
+
+        // Try to remove a worktree that was never created
+        let nonexistent_path = main_dir.path().join("nonexistent-wt");
+        let git = open_git_repo(main_dir.path());
+        let result = git.remove_worktree(&nonexistent_path, true);
+        assert!(result.is_ok(), "Remove nonexistent worktree should be ok: {:?}", result);
+    }
+
+    #[test]
+    fn test_force_remove_worktree_wt_name_mismatch() {
+        // Test: worktree with a different name than directory name
+        let main_dir = tempfile::tempdir().expect("temp dir");
+        let wt_root = tempfile::tempdir().expect("temp dir");
+        let custom_dir_name = "my-custom-dir";
+        let wt_path = wt_root.path().join(custom_dir_name);
+
+        let repo = create_repo_with_commit(main_dir.path());
+
+        // Create worktree with name "test-name" but at path ending in "my-custom-dir"
+        let wt_name = "test-name";
+        let _branch = repo.branch(wt_name, &repo.head().unwrap().peel_to_commit().unwrap(), false).unwrap();
+        let reference = repo.find_reference(&format!("refs/heads/{}", wt_name)).ok();
+        let mut opts = git2::WorktreeAddOptions::new();
+        if let Some(ref r) = reference {
+            opts.reference(Some(r));
+        }
+        repo.worktree(wt_name, &wt_path, Some(&opts)).expect("create worktree");
+
+        // The path's file_name is "my-custom-dir", but the worktree name is "test-name"
+        // Our implementation should still find it via the path-based fallback
+        let git = open_git_repo(main_dir.path());
+        let result = git.remove_worktree(&wt_path, true);
+        assert!(result.is_ok(), "Force remove with name mismatch should succeed: {:?}", result);
+
+        assert!(!wt_path.exists(), "Worktree dir should be removed");
+        let wt_gitdir = repo.path().join("worktrees").join(wt_name);
+        assert!(!wt_gitdir.exists(), "Git worktree metadata should be removed");
     }
 }

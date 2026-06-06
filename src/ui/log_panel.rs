@@ -1,37 +1,31 @@
 use crate::app::App;
+use crate::git_ops::GitOperation;
 use eframe::egui;
-use crate::git_ops::CommitInfo;
 
-pub fn show(app: &mut App, ui: &mut egui::Ui) {
+pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     ui.horizontal(|ui| {
         ui.heading("Commit Log");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("🔄 Refresh").clicked() { app.refresh_all(); }
+            if ui.add_enabled(!app.is_busy(), egui::Button::new("🔄 Refresh")).clicked() {
+                app.refresh_all();
+            }
         });
     });
 
     ui.horizontal(|ui| {
         ui.label("Search:");
         if ui.text_edit_singleline(&mut app.log_search).changed() {
-            app.commits = app.git.log(100).unwrap_or_default();
+            let filter = app.log_search.clone();
+            app.start_operation(ctx, "Searching commits", GitOperation::LogSearch(filter));
         }
     });
 
     ui.separator();
 
-    let filter = app.log_search.to_lowercase();
     let commits = app.commits.clone();
 
     egui::ScrollArea::vertical().show(ui, |ui| {
         for commit in &commits {
-            if !filter.is_empty()
-                && !commit.message.to_lowercase().contains(&filter)
-                && !commit.author.to_lowercase().contains(&filter)
-                && !commit.short_sha.contains(&filter)
-            {
-                continue;
-            }
-
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new(&commit.short_sha)
