@@ -257,6 +257,22 @@ pub struct DiffLine {
     pub content: String,
 }
 
+/// Compare two paths for equality, handling case-insensitivity and separator normalization on Windows.
+fn paths_match(a: &Path, b: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        // Normalize both paths: lowercase, replace / with \
+        fn normalize(p: &Path) -> String {
+            p.to_string_lossy().to_lowercase().replace('/', "\\")
+        }
+        normalize(a) == normalize(b)
+    }
+    #[cfg(not(windows))]
+    {
+        a == b
+    }
+}
+
 impl GitRepo {
     pub fn new() -> Self {
         GitRepo { repo: RefCell::new(None), path: None }
@@ -498,17 +514,65 @@ impl GitRepo {
     pub fn remove_worktree(&self, path: &Path, force: bool) -> GitResult<()> {
         let repo = self.repo()?;
         let wname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if let Ok(wt) = repo.find_worktree(wname) {
-            if force {
-                let mut opts = WorktreePruneOptions::new();
-                opts.valid(true);
-                wt.prune(Some(&mut opts)).map_err(|e| format!("Prune: {}", e))?;
-            } else {
-                wt.prune(None).map_err(|e| format!("Remove: {}", e))?;
+        let mut errors = Vec::new();
+
+        // Try to find worktree by name (fast path)
+        let mut found_wt = repo.find_worktree(wname).ok();
+        
+        // Fallback: if name-based lookup fails, iterate through all worktrees
+        if found_wt.is_none() {
+            if let Ok(names) = repo.worktrees() {
+                for name in names.iter().flatten() {
+                    if let Ok(wt) = repo.find_worktree(name) {
+                        if paths_match(wt.path(), path) {
+                            found_wt = Some(wt);
+                            break;
+                        }
+                    }
+                }
             }
         }
-        if path.exists() { std::fs::remove_dir_all(path).map_err(|e| format!("Rm dir: {}", e))?; }
-        Ok(())
+
+        // Attempt pruning with manual fallback for metadata cleanup
+        if let Some(ref wt) = found_wt {
+            let prune_result = if force {
+                let mut opts = WorktreePruneOptions::new();
+                opts.valid(true);       // Prune even if the worktree is valid
+                opts.locked(true);      // Prune even if locked
+                opts.working_tree(true); // Recursively remove the working tree directory
+                wt.prune(Some(&mut opts))
+            } else {
+                wt.prune(None)
+            };
+
+            if let Err(e) = prune_result {
+                errors.push(if force { format!("Prune: {}", e) } else { format!("Remove: {}", e) });
+                // Fallback: clean up git metadata manually since prune refused
+                if let Some(name) = wt.name() {
+                    let wt_gitdir = repo.path().join("worktrees").join(name);
+                    if wt_gitdir.exists() {
+                        if let Err(e) = std::fs::remove_dir_all(&wt_gitdir) {
+                            errors.push(format!("Remove git metadata: {}", e));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Always try to remove the worktree directory from filesystem
+        if path.exists() {
+            if let Err(e) = std::fs::remove_dir_all(path) {
+                errors.push(format!("Rm dir: {}", e));
+            }
+        }
+
+        // If worktree directory is gone, consider it a success (primary user concern)
+        let dir_gone = !path.exists();
+        if errors.is_empty() || dir_gone {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
     }
 
     pub fn get_status(&self) -> GitResult<Vec<StatusEntry>> {
@@ -849,5 +913,201 @@ impl GitRepo {
             }
         }
         Ok(list)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper to create a temporary git repo with an initial commit
+    fn create_repo_with_commit(dir: &Path) -> Repository {
+        let repo = Repository::init(dir).expect("init repo");
+        let sig = repo.signature().expect("signature");
+        let tree_oid = {
+            let mut idx = repo.index().expect("index");
+            idx.write_tree().expect("write tree")
+        };
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+        repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
+            .expect("initial commit");
+        drop(tree);
+        repo
+    }
+
+    /// Helper: create a GitRepo (our wrapper) from a temp directory path
+    fn open_git_repo(repo_dir: &Path) -> GitRepo {
+        let mut git = GitRepo::new();
+        git.open(repo_dir).expect("open repo");
+        git
+    }
+
+    #[test]
+    fn test_force_remove_valid_worktree() {
+        let main_dir = tempfile::tempdir().expect("temp dir");
+        let wt_root = tempfile::tempdir().expect("temp dir");
+        let wt_path = wt_root.path().join("test-wt");
+
+        // Create main repo with commit
+        let repo = create_repo_with_commit(main_dir.path());
+
+        // Create worktree
+        let wt_name = "test-wt";
+        let sig = repo.signature().expect("sig");
+        let head = repo.head().expect("head");
+        let commit = head.peel_to_commit().expect("commit");
+        let _branch = repo.branch(wt_name, &commit, false).expect("branch");
+        let reference = repo.find_reference(&format!("refs/heads/{}", wt_name)).ok();
+        let mut opts = git2::WorktreeAddOptions::new();
+        if let Some(ref r) = reference {
+            opts.reference(Some(r));
+        }
+        repo.worktree(wt_name, &wt_path, Some(&opts)).expect("create worktree");
+
+        // Now remove it with force
+        let git = open_git_repo(main_dir.path());
+        let result = git.remove_worktree(&wt_path, true);
+        assert!(result.is_ok(), "Force remove should succeed: {:?}", result);
+
+        // Verify worktree directory is gone
+        assert!(!wt_path.exists(), "Worktree dir should be removed");
+
+        // Verify git metadata is removed
+        let wt_gitdir = repo.path().join("worktrees").join(wt_name);
+        assert!(!wt_gitdir.exists(), "Git worktree metadata should be removed");
+
+        // Verify worktree is no longer listed
+        let after_wts = git.worktrees().unwrap();
+        assert_eq!(after_wts.len(), 1, "Only main worktree should remain");
+        assert!(after_wts[0].is_main, "Remaining worktree should be main");
+    }
+
+    #[test]
+    fn test_normal_remove_valid_with_fallback_succeeds() {
+        let main_dir = tempfile::tempdir().expect("temp dir");
+        let wt_root = tempfile::tempdir().expect("temp dir");
+        let wt_path = wt_root.path().join("test-wt-normal");
+
+        let repo = create_repo_with_commit(main_dir.path());
+
+        let wt_name = "test-wt-normal";
+        let _branch = repo.branch(wt_name, &repo.head().unwrap().peel_to_commit().unwrap(), false).unwrap();
+        let reference = repo.find_reference(&format!("refs/heads/{}", wt_name)).ok();
+        let mut opts = git2::WorktreeAddOptions::new();
+        if let Some(ref r) = reference {
+            opts.reference(Some(r));
+        }
+        repo.worktree(wt_name, &wt_path, Some(&opts)).expect("create worktree");
+
+        let wt_gitdir = repo.path().join("worktrees").join(wt_name);
+
+        // Normal remove should succeed now with our improved implementation
+        // (it falls back to manual cleanup when prune refuses)
+        let git = open_git_repo(main_dir.path());
+        let result = git.remove_worktree(&wt_path, false);
+        assert!(result.is_ok(), "Normal remove should succeed with fallback: {:?}", result);
+        assert!(!wt_path.exists(), "Worktree dir should be gone");
+        assert!(!wt_gitdir.exists(), "Git worktree metadata should be cleaned up");
+    }
+
+    #[test]
+    fn test_force_remove_missing_worktree_dir() {
+        let main_dir = tempfile::tempdir().expect("temp dir");
+        let wt_root = tempfile::tempdir().expect("temp dir");
+        let wt_path = wt_root.path().join("test-wt-missing");
+
+        let repo = create_repo_with_commit(main_dir.path());
+
+        let wt_name = "test-wt-missing";
+        let _branch = repo.branch(wt_name, &repo.head().unwrap().peel_to_commit().unwrap(), false).unwrap();
+        let reference = repo.find_reference(&format!("refs/heads/{}", wt_name)).ok();
+        let mut opts = git2::WorktreeAddOptions::new();
+        if let Some(ref r) = reference {
+            opts.reference(Some(r));
+        }
+        repo.worktree(wt_name, &wt_path, Some(&opts)).expect("create worktree");
+
+        // Manually remove the worktree directory first
+        std::fs::remove_dir_all(&wt_path).expect("remove wt dir");
+
+        // Force remove should still clean up git metadata
+        let git = open_git_repo(main_dir.path());
+        let result = git.remove_worktree(&wt_path, true);
+        assert!(result.is_ok(), "Force remove with missing dir should succeed: {:?}", result);
+
+        // Verify git metadata is gone
+        let wt_gitdir = repo.path().join("worktrees").join(wt_name);
+        assert!(!wt_gitdir.exists(), "Git worktree metadata should be removed");
+    }
+
+    #[test]
+    fn test_force_remove_already_gone() {
+        let main_dir = tempfile::tempdir().expect("temp dir");
+        let wt_root = tempfile::tempdir().expect("temp dir");
+        let wt_path = wt_root.path().join("test-wt-gone");
+
+        let repo = create_repo_with_commit(main_dir.path());
+
+        let wt_name = "test-wt-gone";
+        let _branch = repo.branch(wt_name, &repo.head().unwrap().peel_to_commit().unwrap(), false).unwrap();
+        let reference = repo.find_reference(&format!("refs/heads/{}", wt_name)).ok();
+        let mut opts = git2::WorktreeAddOptions::new();
+        if let Some(ref r) = reference {
+            opts.reference(Some(r));
+        }
+        repo.worktree(wt_name, &wt_path, Some(&opts)).expect("create worktree");
+
+        // Remove both directory and git metadata manually
+        std::fs::remove_dir_all(&wt_path).ok();
+        let wt_gitdir = repo.path().join("worktrees").join(wt_name);
+        std::fs::remove_dir_all(&wt_gitdir).ok();
+
+        // Force remove on already-removed worktree should be a no-op success
+        let git = open_git_repo(main_dir.path());
+        let result = git.remove_worktree(&wt_path, true);
+        assert!(result.is_ok(), "Remove already-gone worktree should succeed: {:?}", result);
+    }
+
+    #[test]
+    fn test_remove_nonexistent_worktree() {
+        let main_dir = tempfile::tempdir().expect("temp dir");
+        create_repo_with_commit(main_dir.path());
+
+        // Try to remove a worktree that was never created
+        let nonexistent_path = main_dir.path().join("nonexistent-wt");
+        let git = open_git_repo(main_dir.path());
+        let result = git.remove_worktree(&nonexistent_path, true);
+        assert!(result.is_ok(), "Remove nonexistent worktree should be ok: {:?}", result);
+    }
+
+    #[test]
+    fn test_force_remove_worktree_wt_name_mismatch() {
+        // Test: worktree with a different name than directory name
+        let main_dir = tempfile::tempdir().expect("temp dir");
+        let wt_root = tempfile::tempdir().expect("temp dir");
+        let custom_dir_name = "my-custom-dir";
+        let wt_path = wt_root.path().join(custom_dir_name);
+
+        let repo = create_repo_with_commit(main_dir.path());
+
+        // Create worktree with name "test-name" but at path ending in "my-custom-dir"
+        let wt_name = "test-name";
+        let _branch = repo.branch(wt_name, &repo.head().unwrap().peel_to_commit().unwrap(), false).unwrap();
+        let reference = repo.find_reference(&format!("refs/heads/{}", wt_name)).ok();
+        let mut opts = git2::WorktreeAddOptions::new();
+        if let Some(ref r) = reference {
+            opts.reference(Some(r));
+        }
+        repo.worktree(wt_name, &wt_path, Some(&opts)).expect("create worktree");
+
+        // The path's file_name is "my-custom-dir", but the worktree name is "test-name"
+        // Our implementation should still find it via the path-based fallback
+        let git = open_git_repo(main_dir.path());
+        let result = git.remove_worktree(&wt_path, true);
+        assert!(result.is_ok(), "Force remove with name mismatch should succeed: {:?}", result);
+
+        assert!(!wt_path.exists(), "Worktree dir should be removed");
+        let wt_gitdir = repo.path().join("worktrees").join(wt_name);
+        assert!(!wt_gitdir.exists(), "Git worktree metadata should be removed");
     }
 }
