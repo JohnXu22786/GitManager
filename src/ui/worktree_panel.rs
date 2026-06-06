@@ -104,10 +104,11 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
 }
 
 fn show_worktree_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, wt: &WorktreeInfo) {
+    let dark = ctx.style().visuals.dark_mode;
     let wt_path = wt.path.clone();
     ui.horizontal(|ui| {
         let icon = if wt.is_main { "★" } else { "○" };
-        ui.label(egui::RichText::new(icon).color(egui::Color32::GOLD));
+        ui.label(egui::RichText::new(icon).color(App::adaptive_gold(dark)));
 
         let branch_display = wt.branch.as_deref().unwrap_or("detached");
         let sha_short = wt.sha.get(..7).unwrap_or(&wt.sha);

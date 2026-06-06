@@ -3,6 +3,7 @@ use crate::git_ops::GitOperation;
 use eframe::egui;
 
 pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
+    let dark = ctx.style().visuals.dark_mode;
     ui.horizontal(|ui| {
         ui.heading("Stash");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -49,7 +50,11 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 let busy = app.is_busy();
                 ui.label(
                     egui::RichText::new(format!("stash@{{{}}}", stash.index))
-                        .color(egui::Color32::from_rgb(200, 150, 100))
+                        .color(if dark {
+                            egui::Color32::from_rgb(240, 190, 120)
+                        } else {
+                            egui::Color32::from_rgb(180, 120, 50)
+                        })
                         .monospace(),
                 );
                 ui.label(&stash.message);

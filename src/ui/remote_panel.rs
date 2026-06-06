@@ -3,6 +3,7 @@ use crate::git_ops::GitOperation;
 use eframe::egui;
 
 pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
+    let dark = ctx.style().visuals.dark_mode;
     ui.horizontal(|ui| {
         ui.heading("Remotes");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -19,7 +20,11 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         for remote in &app.remote_list {
             ui.group(|ui| {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(&remote.name).color(egui::Color32::from_rgb(100, 200, 255)).strong());
+                    ui.label(egui::RichText::new(&remote.name).color(if dark {
+                        egui::Color32::from_rgb(120, 220, 255)
+                    } else {
+                        egui::Color32::from_rgb(0, 120, 200)
+                    }).strong());
                     ui.label(
                         egui::RichText::new(&remote.url)
                             .color(egui::Color32::GRAY)

@@ -3,6 +3,7 @@ use crate::git_ops::GitOperation;
 use eframe::egui;
 
 pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
+    let dark = ctx.style().visuals.dark_mode;
     ui.horizontal(|ui| {
         ui.heading("Changes");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -25,12 +26,12 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     let unstaged: Vec<_> = app.status_entries.iter().filter(|e| !e.staged).cloned().collect();
 
     if !staged.is_empty() {
-        ui.label(egui::RichText::new("Staged").color(egui::Color32::GREEN).strong());
+        ui.label(egui::RichText::new("Staged").color(App::adaptive_green(dark)).strong());
         for entry in &staged {
             let path = entry.path.clone();
             ui.horizontal(|ui| {
                 let busy = app.is_busy();
-                let color = crate::app::App::status_color_by_type(entry.status);
+                let color = crate::app::App::status_color_by_type(entry.status, dark);
                 ui.label(egui::RichText::new(format!("[{}]", entry.status)).color(color).monospace());
                 if crate::ui::add_enabled_ellipsis(ui, !busy, "Unstage").clicked() {
                     app.start_operation(ctx, &format!("Unstage {}", path), GitOperation::UnstageFile(path.clone()));
@@ -45,12 +46,12 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     }
 
     if !unstaged.is_empty() {
-        ui.label(egui::RichText::new("Unstaged").color(egui::Color32::YELLOW).strong());
+        ui.label(egui::RichText::new("Unstaged").color(App::adaptive_yellow(dark)).strong());
         for entry in &unstaged {
             let path = entry.path.clone();
             ui.horizontal(|ui| {
                 let busy = app.is_busy();
-                let color = crate::app::App::status_color_by_type(entry.status);
+                let color = crate::app::App::status_color_by_type(entry.status, dark);
                 ui.label(egui::RichText::new(format!("[{}]", entry.status)).color(color).monospace());
 
                 if entry.status != 'D' && entry.status != '?' && entry.status != '!' {
@@ -116,8 +117,16 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             for line in &diff_content {
                 let color = match line.origin {
-                    '+' => egui::Color32::from_rgb(40, 180, 40),
-                    '-' => egui::Color32::from_rgb(180, 40, 40),
+                    '+' => if dark {
+                        egui::Color32::from_rgb(60, 200, 60)
+                    } else {
+                        egui::Color32::from_rgb(0, 130, 0)
+                    },
+                    '-' => if dark {
+                        egui::Color32::from_rgb(220, 60, 60)
+                    } else {
+                        egui::Color32::from_rgb(170, 30, 30)
+                    },
                     _ => egui::Color32::GRAY,
                 };
                 let prefix = match line.origin {
