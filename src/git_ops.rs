@@ -208,6 +208,7 @@ pub struct BranchInfo {
     pub ahead: i32,
     pub behind: i32,
     pub last_commit: Option<String>,
+    #[allow(dead_code)]
     pub last_commit_time: Option<String>,
 }
 
@@ -228,6 +229,7 @@ pub struct StatusEntry {
 
 #[derive(Clone, Debug)]
 pub struct CommitInfo {
+    #[allow(dead_code)]
     pub sha: String,
     pub short_sha: String,
     pub author: String,
@@ -271,7 +273,7 @@ impl GitRepo {
     pub fn is_open(&self) -> bool { self.repo.borrow().is_some() }
     pub fn path(&self) -> Option<&Path> { self.path.as_deref() }
 
-    fn repo(&self) -> GitResult<std::cell::Ref<Repository>> {
+    fn repo(&self) -> GitResult<std::cell::Ref<'_, Repository>> {
         let r = self.repo.borrow();
         if r.is_some() {
             Ok(std::cell::Ref::map(r, |o| o.as_ref().unwrap()))
@@ -280,7 +282,7 @@ impl GitRepo {
         }
     }
 
-    fn repo_mut(&self) -> GitResult<std::cell::RefMut<Repository>> {
+    fn repo_mut(&self) -> GitResult<std::cell::RefMut<'_, Repository>> {
         let r = self.repo.borrow_mut();
         if r.is_some() {
             Ok(std::cell::RefMut::map(r, |o| o.as_mut().unwrap()))
@@ -688,6 +690,7 @@ impl GitRepo {
         repo.stash_pop(0, None).map_err(|e| format!("Pop: {}", e))
     }
 
+    #[allow(dead_code)]
     pub fn stash_apply(&self) -> GitResult<()> {
         let mut repo = self.repo_mut()?;
         repo.stash_apply(0, None).map_err(|e| format!("Apply: {}", e))
@@ -753,8 +756,8 @@ impl GitRepo {
     }
 
     pub fn push(&self, remote: &str, branch: &str, force: bool) -> GitResult<String> {
-        let mut repo = self.repo_mut()?;
-        let mut cb = git2::RemoteCallbacks::new();
+        let repo = self.repo_mut()?;
+        let cb = git2::RemoteCallbacks::new();
         let mut fo = git2::PushOptions::new();
         fo.remote_callbacks(cb);
         let rs = if force { format!("+refs/heads/{}:refs/heads/{}", branch, branch) }
@@ -765,8 +768,8 @@ impl GitRepo {
     }
 
     pub fn fetch(&self, remote: &str) -> GitResult<String> {
-        let mut repo = self.repo_mut()?;
-        let mut cb = git2::RemoteCallbacks::new();
+        let repo = self.repo_mut()?;
+        let cb = git2::RemoteCallbacks::new();
         let mut fo = git2::FetchOptions::new();
         fo.remote_callbacks(cb);
         let mut rm = repo.find_remote(remote).map_err(|e| format!("Remote: {}", e))?;
@@ -776,8 +779,8 @@ impl GitRepo {
     }
 
     pub fn pull(&self, remote: &str, branch: &str, rebase: bool) -> GitResult<String> {
-        let mut repo = self.repo_mut()?;
-        let mut cb = git2::RemoteCallbacks::new();
+        let repo = self.repo_mut()?;
+        let cb = git2::RemoteCallbacks::new();
         let mut fo = git2::FetchOptions::new();
         fo.remote_callbacks(cb);
         let rs = format!("+refs/heads/{}:refs/remotes/{}/{}", branch, remote, branch);

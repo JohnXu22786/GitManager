@@ -31,6 +31,7 @@ impl RecentRepos {
     }
 
     /// Loads from a specific path (for testing).
+    #[allow(dead_code)]
     pub fn load_from(path: PathBuf) -> Self {
         let entries = load_entries(&path);
         RecentRepos {
@@ -80,6 +81,7 @@ impl RecentRepos {
     }
 
     /// Returns the number of entries.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }

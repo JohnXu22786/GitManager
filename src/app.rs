@@ -339,36 +339,6 @@ impl App {
         self.success_message = msg;
     }
 
-    fn status_label(origin: char) -> &'static str {
-        match origin {
-            ' ' | '+' => "",
-            '-' => "del",
-            _ => "mod",
-        }
-    }
-
-    fn status_color(origin: char) -> egui::Color32 {
-        match origin {
-            '+' => egui::Color32::GREEN,
-            '-' => egui::Color32::RED,
-            _ => egui::Color32::GRAY,
-        }
-    }
-
-    pub fn status_icon(s: char) -> &'static str {
-        match s {
-            'M' => "M",
-            'A' => "A",
-            'D' => "D",
-            'R' => "R",
-            'C' => "C",
-            '?' => "?",
-            '!' => "!",
-            'U' => "U",
-            _ => " ",
-        }
-    }
-
     pub fn status_color_by_type(s: char) -> egui::Color32 {
         match s {
             'M' | 'A' | 'R' => egui::Color32::GREEN,

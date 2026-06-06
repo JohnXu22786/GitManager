@@ -13,6 +13,10 @@ env:
 jobs:
   build:
     name: Build (${{ matrix.target }})
+    # ── Phase 1: Build ──
+    # Builds the binary for each target platform in parallel using a build matrix.
+    # Each build runs independently on its own runner (ubuntu, windows, macos).
+    # Artifacts are uploaded as workflow artifacts for the next phase.
     strategy:
       fail-fast: false
       matrix:
@@ -46,8 +50,17 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          echo "PKG_CONFIG_ALLOW_CROSS=1" >> $GITHUB_ENV
+          # Download and install aarch64 OpenSSL for cross-compilation
+          wget -qO- https://github.com/openssl/openssl/releases/download/openssl-3.0.15/openssl-3.0.15.tar.gz | sudo tar xz -C /opt
+          pushd /opt/openssl-3.0.15
+          CC=aarch64-linux-gnu-gcc ./Configure linux-aarch64 --prefix=/usr/aarch64-linux-gnu --libdir=lib
+          make -j$(nproc) -s
+          sudo make install_sw -s
+          popd
+          echo "AARCH64_UNKNOWN_LINUX_GNU_OPENSSL_DIR=/usr/aarch64-linux-gnu" >> $GITHUB_ENV
 
       - name: Install Linux system dependencies
         if: startsWith(matrix.os, 'ubuntu')
@@ -61,6 +74,20 @@ jobs:
           # macOS typically has required libraries, but ensure Xcode CLT
           xcode-select -p || xcode-select --install
 
+      - name: Install OpenSSL for macOS cross-compilation (x86_64 on ARM64)
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: |
+          # Build OpenSSL from source for x86_64 (host is ARM64, target is x86_64)
+          wget -qO- https://github.com/openssl/openssl/releases/download/openssl-3.0.15/openssl-3.0.15.tar.gz | tar xz
+          cd openssl-3.0.15
+          ./Configure darwin64-x86_64-cc no-zlib no-asm --prefix=/usr/local/openssl-x86_64
+          make -j$(sysctl -n hw.ncpu) -s
+          sudo make install_sw -s
+          cd ..
+          rm -rf openssl-3.0.15
+          echo "OPENSSL_DIR=/usr/local/openssl-x86_64" >> $GITHUB_ENV
+          echo "PKG_CONFIG_ALLOW_CROSS=1" >> $GITHUB_ENV
+
       - name: Extract version from tag
         id: version
         shell: bash
@@ -72,6 +99,8 @@ jobs:
           # Update Cargo.toml version so the binary embeds the tag version
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             powershell -Command "(Get-Content Cargo.toml) -replace '^version = \".*\"', 'version = \"$ver\"' | Set-Content Cargo.toml"
+          elif [[ "${{ runner.os }}" == "macOS" ]]; then
+            sed -i '' "s/^version = \".*\"/version = \"$ver\"/" Cargo.toml
           else
             sed -i "s/^version = \".*\"/version = \"$ver\"/" Cargo.toml
           fi
@@ -105,8 +134,15 @@ jobs:
           path: ${{ steps.package.outputs.archive }}
           if-no-files-found: error
 
-  create-release:
-    name: Create GitHub Release
+  upload-artifacts:
+    name: Upload Artifacts to Release
+    # ── Phase 2: Upload Artifacts to Existing Release ──
+    # After ALL builds succeed, this job downloads all platform artifacts and
+    # uploads them to the GitHub Release that the user created on the web UI.
+    #
+    # IMPORTANT: This does NOT create a new release. The user already created
+    # the release on GitHub's web UI. This job only uploads the built binaries
+    # to that existing release via tag_name matching.
     needs: [build]
     runs-on: ubuntu-latest
     steps:
@@ -130,7 +166,7 @@ jobs:
       - name: List artifacts
         run: ls -lh release-artifacts/
 
-      - name: Create Release
+      - name: Upload Artifacts to Existing Release
         uses: softprops/action-gh-release@v2
         with:
           name: Git Manager ${{ steps.version.outputs.version }}
