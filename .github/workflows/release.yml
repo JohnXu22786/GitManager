@@ -1,8 +1,9 @@
 name: Release
 
 on:
-  release:
-    types: [published]
+  push:
+    tags:
+      - 'v*'
 
 permissions:
   contents: write
@@ -13,10 +14,8 @@ env:
 jobs:
   build:
     name: Build (${{ matrix.target }})
-    # ── Phase 1: Build ──
     # Builds the binary for each target platform in parallel using a build matrix.
     # Each build runs independently on its own runner (ubuntu, windows, macos).
-    # Artifacts are uploaded as workflow artifacts for the next phase.
     strategy:
       fail-fast: false
       matrix:
@@ -71,7 +70,6 @@ jobs:
       - name: Install macOS system dependencies
         if: startsWith(matrix.os, 'macos')
         run: |
-          # macOS typically has required libraries, but ensure Xcode CLT
           xcode-select -p || xcode-select --install
 
       - name: Install OpenSSL for macOS cross-compilation (x86_64 on ARM64)
@@ -134,15 +132,13 @@ jobs:
           path: ${{ steps.package.outputs.archive }}
           if-no-files-found: error
 
-  upload-artifacts:
-    name: Upload Artifacts to Release
-    # ── Phase 2: Upload Artifacts to Existing Release ──
-    # After ALL builds succeed, this job downloads all platform artifacts and
-    # uploads them to the GitHub Release that the user created on the web UI.
+  release:
+    name: Create Release
+    # After ALL builds succeed, create the GitHub Release and upload all
+    # platform binaries. This runs only once, triggered by a git tag push.
     #
-    # IMPORTANT: This does NOT create a new release. The user already created
-    # the release on GitHub's web UI. This job only uploads the built binaries
-    # to that existing release via tag_name matching.
+    # Workflow: user pushes tag (v*) → matrix builds → this job creates release.
+    # No manual web UI step needed.
     needs: [build]
     runs-on: ubuntu-latest
     steps:
@@ -166,7 +162,7 @@ jobs:
       - name: List artifacts
         run: ls -lh release-artifacts/
 
-      - name: Upload Artifacts to Existing Release
+      - name: Create Release and Upload Assets
         uses: softprops/action-gh-release@v2
         with:
           name: Git Manager ${{ steps.version.outputs.version }}
@@ -197,3 +193,5 @@ jobs:
             | macOS | Intel | `git-manager-${{ steps.version.outputs.version }}-macos-x86_64.tar.gz` |
             | macOS | Apple Silicon | `git-manager-${{ steps.version.outputs.version }}-macos-aarch64.tar.gz` |
           files: release-artifacts/*
+          draft: false
+          prerelease: false
