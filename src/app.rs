@@ -1,4 +1,5 @@
 use crate::git_ops::*;
+use crate::recent::RecentRepos;
 use eframe::egui;
 use std::path::Path;
 use std::sync::mpsc;
@@ -73,6 +74,7 @@ pub struct App {
     pending_successes: Vec<String>,
     /// Whether to auto-refresh after a mutation operation completes.
     needs_refresh: bool,
+    pub recent_repos: RecentRepos,
 }
 
 impl App {
@@ -125,6 +127,7 @@ impl App {
             pending_errors: Vec::new(),
             pending_successes: Vec::new(),
             needs_refresh: false,
+            recent_repos: RecentRepos::load(),
         }
     }
 
@@ -135,6 +138,7 @@ impl App {
             Ok(()) => {
                 self.repo_path = path.to_string();
                 self.success_message = format!("Opened repository at {}", path);
+                self.recent_repos.add(path);
                 self.refresh_all();
             }
             Err(e) => {
@@ -395,13 +399,57 @@ impl eframe::App for App {
                 ui.label("📂");
                 let open_btn = egui::Button::new("Open Repo...");
                 if ui.add_enabled(!self.is_busy(), open_btn).clicked() {
-                    let path = native_dialog_path();
+                    let path = crate::native_file_dialog();
                     if let Some(p) = path {
                         self.open_repo(&p);
                     }
                 }
 
+                // Recent repos dropdown
+                egui::menu::menu_button(ui, "▼", |ui| {
+                    if self.recent_repos.is_empty() {
+                        ui.label("No recent repositories");
+                    } else {
+                        let mut to_delete: Option<usize> = None;
+                        let entries = self.recent_repos.entries().to_vec();
+                        ui.label(
+                            egui::RichText::new("Recent Repositories")
+                                .strong()
+                                .size(14.0),
+                        );
+                        ui.separator();
+                        for (i, entry) in entries.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.set_min_width(300.0);
+                                if ui
+                                    .selectable_label(false, &entry.name)
+                                    .clicked()
+                                {
+                                    self.open_repo(&entry.path);
+                                    ui.close_menu();
+                                }
+                                ui.label(
+                                    egui::RichText::new(&entry.path)
+                                        .size(10.0)
+                                        .color(egui::Color32::GRAY),
+                                );
+                                if ui.button("🗑").clicked() {
+                                    to_delete = Some(i);
+                                }
+                            });
+                        }
+                        if let Some(idx) = to_delete {
+                            self.recent_repos.remove(idx);
+                        }
+                    }
+                });
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(format!("v{}", crate::version_info::VERSION))
+                            .color(egui::Color32::GRAY)
+                            .size(12.0),
+                    );
                     if ui.button("ℹ️").clicked() {
                         self.show_about = !self.show_about;
                     }
@@ -435,9 +483,6 @@ impl eframe::App for App {
                         // Disable refresh button while busy
                         if ui.add_enabled(!self.is_busy(), egui::Button::new("🔄")).clicked() {
                             self.refresh_all();
-                        }
-                        if ui.button("ℹ️").clicked() {
-                            self.show_about = !self.show_about;
                         }
                     });
                 }
@@ -493,7 +538,7 @@ impl eframe::App for App {
                     ui.add_space(20.0);
                     let open_btn = egui::Button::new("📂 Open Repository");
                     if ui.add_enabled(!self.is_busy(), open_btn).clicked() {
-                        let path = native_dialog_path();
+                        let path = crate::native_file_dialog();
                         if let Some(p) = path {
                             self.open_repo(&p);
                         }
@@ -502,6 +547,48 @@ impl eframe::App for App {
                     ui.label("Or drag & drop a folder");
                     if ui.button("Clone Repository...").clicked() {
                         self.current_tab = Tab::Remotes;
+                    }
+
+                    // Recent repositories section
+                    if !self.recent_repos.is_empty() {
+                        ui.add_space(30.0);
+                        ui.separator();
+                        ui.add_space(10.0);
+                        ui.label(
+                            egui::RichText::new("📁 Recent Repositories")
+                                .heading(),
+                        );
+                        ui.add_space(5.0);
+
+                        let mut to_delete: Option<usize> = None;
+                        let entries = self.recent_repos.entries().to_vec();
+                        egui::ScrollArea::vertical()
+                            .max_height(300.0)
+                            .show(ui, |ui| {
+                                for (i, entry) in entries.iter().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        ui.set_min_width(400.0);
+                                        let repo_name = format!("📂 {}", entry.name);
+                                        if ui
+                                            .selectable_label(false, egui::RichText::new(&repo_name).size(14.0))
+                                            .clicked()
+                                        {
+                                            self.open_repo(&entry.path);
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(&entry.path)
+                                                .size(10.0)
+                                                .color(egui::Color32::GRAY),
+                                        );
+                                        if ui.button("🗑 Delete").clicked() {
+                                            to_delete = Some(i);
+                                        }
+                                    });
+                                }
+                            });
+                        if let Some(idx) = to_delete {
+                            self.recent_repos.remove(idx);
+                        }
                     }
                 });
                 return;
@@ -554,7 +641,11 @@ impl eframe::App for App {
                 .show(ctx, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.heading("Git Manager");
-                        ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+                        ui.add_space(4.0);
+                        ui.label(format!("Version: {}", crate::version_info::VERSION));
+                        ui.label(format!("Commit: {}", crate::version_info::GIT_HASH));
+                        ui.label(format!("Tag: {}", crate::version_info::GIT_DESCRIBE));
+                        ui.label(format!("Build: {}", crate::version_info::BUILD_DATE));
                         ui.add_space(8.0);
                         ui.hyperlink("https://github.com/JohnXu22786/GitManager");
                         ui.add_space(8.0);
@@ -574,29 +665,4 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
     }
-}
-
-fn native_dialog_path() -> Option<String> {
-    use std::os::windows::process::CommandExt;
-    use std::process::Command;
-
-    let script = r#"
-Add-Type -AssemblyName System.Windows.Forms
-$f = New-Object System.Windows.Forms.FolderBrowserDialog
-$f.Description = "Select a Git repository"
-$f.ShowNewFolderButton = $false
-$result = $f.ShowDialog()
-if ($result -eq 'OK') { Write-Output $f.SelectedPath }
-"#;
-
-    let output = Command::new("powershell")
-        .creation_flags(0x08000000)
-        .arg("-NoProfile")
-        .arg("-Command")
-        .arg(script)
-        .output()
-        .ok()?;
-
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if path.is_empty() { None } else { Some(path) }
 }
