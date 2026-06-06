@@ -3,18 +3,17 @@ use crate::git_ops::GitOperation;
 use eframe::egui;
 
 pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
-    let dark = ctx.style().visuals.dark_mode;
     ui.horizontal(|ui| {
         ui.heading("Changes");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let busy = app.is_busy();
-            if ui.add_enabled(!busy, egui::Button::new("Stage All")).clicked() {
+            if crate::ui::add_enabled_ellipsis(ui, !busy, "Stage All").clicked() {
                 app.start_operation(ctx, "Staging all", GitOperation::StageAll);
             }
-            if ui.add_enabled(!busy, egui::Button::new("Unstage All")).clicked() {
+            if crate::ui::add_enabled_ellipsis(ui, !busy, "Unstage All").clicked() {
                 app.start_operation(ctx, "Unstaging all", GitOperation::UnstageAll);
             }
-            if ui.add_enabled(!busy, egui::Button::new("Discard All")).clicked() {
+            if crate::ui::add_enabled_ellipsis(ui, !busy, "Discard All").clicked() {
                 app.start_operation(ctx, "Discarding all", GitOperation::RestoreAll);
             }
         });
@@ -26,17 +25,17 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     let unstaged: Vec<_> = app.status_entries.iter().filter(|e| !e.staged).cloned().collect();
 
     if !staged.is_empty() {
-        ui.label(egui::RichText::new("Staged").color(App::adaptive_green(dark)).strong());
+        ui.label(egui::RichText::new("Staged").color(egui::Color32::GREEN).strong());
         for entry in &staged {
             let path = entry.path.clone();
             ui.horizontal(|ui| {
                 let busy = app.is_busy();
-                let color = crate::app::App::status_color_by_type(entry.status, dark);
+                let color = crate::app::App::status_color_by_type(entry.status);
                 ui.label(egui::RichText::new(format!("[{}]", entry.status)).color(color).monospace());
-                if ui.add_enabled(!busy, egui::Button::new("Unstage")).clicked() {
+                if crate::ui::add_enabled_ellipsis(ui, !busy, "Unstage").clicked() {
                     app.start_operation(ctx, &format!("Unstage {}", path), GitOperation::UnstageFile(path.clone()));
                 }
-                if ui.add_enabled(!busy, egui::Button::new("Diff")).clicked() {
+                if crate::ui::add_enabled_ellipsis(ui, !busy, "Diff").clicked() {
                     app.start_operation(ctx, &format!("Diff {}", path), GitOperation::GetDiff { path: path.clone(), staged: true });
                 }
                 ui.label(&path);
@@ -46,25 +45,25 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     }
 
     if !unstaged.is_empty() {
-        ui.label(egui::RichText::new("Unstaged").color(App::adaptive_yellow(dark)).strong());
+        ui.label(egui::RichText::new("Unstaged").color(egui::Color32::YELLOW).strong());
         for entry in &unstaged {
             let path = entry.path.clone();
             ui.horizontal(|ui| {
                 let busy = app.is_busy();
-                let color = crate::app::App::status_color_by_type(entry.status, dark);
+                let color = crate::app::App::status_color_by_type(entry.status);
                 ui.label(egui::RichText::new(format!("[{}]", entry.status)).color(color).monospace());
 
                 if entry.status != 'D' && entry.status != '?' && entry.status != '!' {
-                    if ui.add_enabled(!busy, egui::Button::new("Stage")).clicked() {
+                    if crate::ui::add_enabled_ellipsis(ui, !busy, "Stage").clicked() {
                         app.start_operation(ctx, &format!("Stage {}", path), GitOperation::StageFile(path.clone()));
                     }
                 }
                 if entry.status != '?' && entry.status != '!' {
-                    if ui.add_enabled(!busy, egui::Button::new("Discard")).clicked() {
+                    if crate::ui::add_enabled_ellipsis(ui, !busy, "Discard").clicked() {
                         app.start_operation(ctx, &format!("Restore {}", path), GitOperation::RestoreFile(path.clone()));
                     }
                 }
-                if ui.add_enabled(!busy, egui::Button::new("Diff")).clicked() {
+                if crate::ui::add_enabled_ellipsis(ui, !busy, "Diff").clicked() {
                     app.start_operation(ctx, &format!("Diff {}", path), GitOperation::GetDiff { path: path.clone(), staged: false });
                 }
                 ui.label(&path);
@@ -95,7 +94,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         });
 
     let busy = app.is_busy();
-    if ui.add_enabled(!busy, egui::Button::new("Commit")).clicked() {
+    if crate::ui::add_enabled_ellipsis(ui, !busy, "Commit").clicked() {
         if app.commit_msg.trim().is_empty() {
             app.show_error("Commit message cannot be empty".into());
         } else {
@@ -106,7 +105,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             app.commit_amend = false;
         }
     }
-    if ui.add_enabled(!busy, egui::Button::new("Uncommit")).clicked() {
+    if crate::ui::add_enabled_ellipsis(ui, !busy, "Uncommit").clicked() {
         app.start_operation(ctx, "Uncommitting", GitOperation::Uncommit);
     }
 
@@ -117,16 +116,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             for line in &diff_content {
                 let color = match line.origin {
-                    '+' => if dark {
-                        egui::Color32::from_rgb(60, 200, 60)
-                    } else {
-                        egui::Color32::from_rgb(0, 130, 0)
-                    },
-                    '-' => if dark {
-                        egui::Color32::from_rgb(220, 60, 60)
-                    } else {
-                        egui::Color32::from_rgb(170, 30, 30)
-                    },
+                    '+' => egui::Color32::from_rgb(40, 180, 40),
+                    '-' => egui::Color32::from_rgb(180, 40, 40),
                     _ => egui::Color32::GRAY,
                 };
                 let prefix = match line.origin {
