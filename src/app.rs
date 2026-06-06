@@ -1,4 +1,5 @@
 use crate::git_ops::*;
+use crate::recent::RecentRepos;
 use eframe::egui;
 use std::path::Path;
 
@@ -56,6 +57,7 @@ pub struct App {
     pub last_refresh: std::time::Instant,
 
     pub show_about: bool,
+    pub recent_repos: RecentRepos,
 }
 
 impl App {
@@ -104,6 +106,7 @@ impl App {
             last_refresh: std::time::Instant::now(),
 
             show_about: false,
+            recent_repos: RecentRepos::load(),
         }
     }
 
@@ -114,6 +117,7 @@ impl App {
             Ok(()) => {
                 self.repo_path = path.to_string();
                 self.success_message = format!("Opened repository at {}", path);
+                self.recent_repos.add(path);
                 self.refresh_all();
             }
             Err(e) => {
@@ -209,6 +213,45 @@ impl eframe::App for App {
                     }
                 }
 
+                // Recent repos dropdown
+                egui::menu::menu_button(ui, "▼", |ui| {
+                    if self.recent_repos.is_empty() {
+                        ui.label("No recent repositories");
+                    } else {
+                        let mut to_delete: Option<usize> = None;
+                        let entries = self.recent_repos.entries().to_vec();
+                        ui.label(
+                            egui::RichText::new("Recent Repositories")
+                                .strong()
+                                .size(14.0),
+                        );
+                        ui.separator();
+                        for (i, entry) in entries.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.set_min_width(300.0);
+                                if ui
+                                    .selectable_label(false, &entry.name)
+                                    .clicked()
+                                {
+                                    self.open_repo(&entry.path);
+                                    ui.close_menu();
+                                }
+                                ui.label(
+                                    egui::RichText::new(&entry.path)
+                                        .size(10.0)
+                                        .color(egui::Color32::GRAY),
+                                );
+                                if ui.button("🗑").clicked() {
+                                    to_delete = Some(i);
+                                }
+                            });
+                        }
+                        if let Some(idx) = to_delete {
+                            self.recent_repos.remove(idx);
+                        }
+                    }
+                });
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("ℹ️").clicked() {
                         self.show_about = !self.show_about;
@@ -297,6 +340,48 @@ impl eframe::App for App {
                     ui.label("Or drag & drop a folder");
                     if ui.button("Clone Repository...").clicked() {
                         self.current_tab = Tab::Remotes;
+                    }
+
+                    // Recent repositories section
+                    if !self.recent_repos.is_empty() {
+                        ui.add_space(30.0);
+                        ui.separator();
+                        ui.add_space(10.0);
+                        ui.label(
+                            egui::RichText::new("📁 Recent Repositories")
+                                .heading(),
+                        );
+                        ui.add_space(5.0);
+
+                        let mut to_delete: Option<usize> = None;
+                        let entries = self.recent_repos.entries().to_vec();
+                        egui::ScrollArea::vertical()
+                            .max_height(300.0)
+                            .show(ui, |ui| {
+                                for (i, entry) in entries.iter().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        ui.set_min_width(400.0);
+                                        let repo_name = format!("📂 {}", entry.name);
+                                        if ui
+                                            .selectable_label(false, egui::RichText::new(&repo_name).size(14.0))
+                                            .clicked()
+                                        {
+                                            self.open_repo(&entry.path);
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(&entry.path)
+                                                .size(10.0)
+                                                .color(egui::Color32::GRAY),
+                                        );
+                                        if ui.button("🗑 Delete").clicked() {
+                                            to_delete = Some(i);
+                                        }
+                                    });
+                                }
+                            });
+                        if let Some(idx) = to_delete {
+                            self.recent_repos.remove(idx);
+                        }
                     }
                 });
                 return;
