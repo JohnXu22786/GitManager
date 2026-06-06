@@ -75,6 +75,7 @@ pub struct App {
     /// Whether to auto-refresh after a mutation operation completes.
     needs_refresh: bool,
     pub recent_repos: RecentRepos,
+    pub status_expanded: bool,
 }
 
 impl App {
@@ -128,6 +129,7 @@ impl App {
             pending_successes: Vec::new(),
             needs_refresh: false,
             recent_repos: RecentRepos::load(),
+            status_expanded: false,
         }
     }
 
@@ -461,41 +463,79 @@ impl eframe::App for App {
 
         // --- Bottom Bar (messages + status) ---
         if self.git.is_open() {
-            egui::TopBottomPanel::bottom("bottom_bar").show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    // Loading indicator when operations are in progress
-                    if self.is_busy() {
-                        ui.label(
-                            egui::RichText::new(format!("⏳ {}...", self.current_operation()))
-                                .color(egui::Color32::YELLOW)
-                                .size(13.0),
-                        );
-                    }
+            egui::TopBottomPanel::bottom("bottom_bar")
+                .resizable(false)
+                .min_height(24.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        // Loading indicator when operations are in progress
+                        if self.is_busy() {
+                            ui.label(
+                                egui::RichText::new(format!("⏳ {}...", self.current_operation()))
+                                    .color(egui::Color32::YELLOW)
+                                    .size(13.0),
+                            );
+                        }
 
-                    if !self.error_message.is_empty() {
-                        ui.label(
-                            egui::RichText::new(&self.error_message)
-                                .color(egui::Color32::RED),
-                        );
-                        if ui.button("x").clicked() {
-                            self.error_message.clear();
+                        let has_message =
+                            !self.error_message.is_empty() || !self.success_message.is_empty();
+                        if has_message && !self.is_busy() {
+                            if !self.error_message.is_empty() {
+                                if self.status_expanded {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&self.error_message)
+                                                .color(egui::Color32::RED),
+                                        )
+                                        .wrap(),
+                                    );
+                                } else {
+                                    ui.label(
+                                        egui::RichText::new(&self.error_message)
+                                            .color(egui::Color32::RED),
+                                    );
+                                }
+                            }
+                            if !self.success_message.is_empty() {
+                                if self.status_expanded {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&self.success_message)
+                                                .color(egui::Color32::GREEN),
+                                        )
+                                        .wrap(),
+                                    );
+                                } else {
+                                    ui.label(
+                                        egui::RichText::new(&self.success_message)
+                                            .color(egui::Color32::GREEN),
+                                    );
+                                }
+                            }
                         }
-                    }
-                    if !self.success_message.is_empty() {
-                        ui.label(
-                            egui::RichText::new(&self.success_message)
-                                .color(egui::Color32::GREEN),
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if has_message && !self.is_busy() {
+                                    let expand_label = if self.status_expanded {
+                                        "▼"
+                                    } else {
+                                        "▲"
+                                    };
+                                    if ui.button(expand_label).clicked() {
+                                        self.status_expanded = !self.status_expanded;
+                                    }
+                                    if ui.button("x").clicked() {
+                                        self.error_message.clear();
+                                        self.success_message.clear();
+                                    }
+                                }
+                                let elapsed = self.last_refresh.elapsed().as_secs();
+                                ui.label(format!("Updated {}s ago", elapsed));
+                            },
                         );
-                        if ui.button("x").clicked() {
-                            self.success_message.clear();
-                        }
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let elapsed = self.last_refresh.elapsed().as_secs();
-                        ui.label(format!("Updated {}s ago", elapsed));
                     });
                 });
-            });
         }
 
         // --- Central Panel ---
