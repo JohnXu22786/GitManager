@@ -203,13 +203,18 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.label("📂");
                 if ui.button("Open Repo...").clicked() {
-                    let path = native_dialog_path();
+                    let path = crate::native_file_dialog();
                     if let Some(p) = path {
                         self.open_repo(&p);
                     }
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(format!("v{}", crate::version_info::VERSION))
+                            .color(egui::Color32::GRAY)
+                            .size(12.0),
+                    );
                     if ui.button("ℹ️").clicked() {
                         self.show_about = !self.show_about;
                     }
@@ -242,9 +247,6 @@ impl eframe::App for App {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("🔄").clicked() {
                             self.refresh_all();
-                        }
-                        if ui.button("ℹ️").clicked() {
-                            self.show_about = !self.show_about;
                         }
                     });
                 }
@@ -288,7 +290,7 @@ impl eframe::App for App {
                     ui.label("Open a Git repository to get started.");
                     ui.add_space(20.0);
                     if ui.button("📂 Open Repository").clicked() {
-                        let path = native_dialog_path();
+                        let path = crate::native_file_dialog();
                         if let Some(p) = path {
                             self.open_repo(&p);
                         }
@@ -346,7 +348,11 @@ impl eframe::App for App {
                 .show(ctx, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.heading("Git Manager");
-                        ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+                        ui.add_space(4.0);
+                        ui.label(format!("Version: {}", crate::version_info::VERSION));
+                        ui.label(format!("Commit: {}", crate::version_info::GIT_HASH));
+                        ui.label(format!("Tag: {}", crate::version_info::GIT_DESCRIBE));
+                        ui.label(format!("Build: {}", crate::version_info::BUILD_DATE));
                         ui.add_space(8.0);
                         ui.hyperlink("https://github.com/JohnXu22786/GitManager");
                         ui.add_space(8.0);
@@ -365,29 +371,4 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
     }
-}
-
-fn native_dialog_path() -> Option<String> {
-    use std::os::windows::process::CommandExt;
-    use std::process::Command;
-
-    let script = r#"
-Add-Type -AssemblyName System.Windows.Forms
-$f = New-Object System.Windows.Forms.FolderBrowserDialog
-$f.Description = "Select a Git repository"
-$f.ShowNewFolderButton = $false
-$result = $f.ShowDialog()
-if ($result -eq 'OK') { Write-Output $f.SelectedPath }
-"#;
-
-    let output = Command::new("powershell")
-        .creation_flags(0x08000000)
-        .arg("-NoProfile")
-        .arg("-Command")
-        .arg(script)
-        .output()
-        .ok()?;
-
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if path.is_empty() { None } else { Some(path) }
 }
