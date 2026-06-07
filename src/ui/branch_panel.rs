@@ -5,11 +5,11 @@ use eframe::egui;
 
 pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     ui.horizontal(|ui| {
+        ui.add(egui::Label::new(egui::RichText::new("Branches").heading()).truncate()).on_hover_text("Branches");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if crate::ui::add_enabled_ellipsis(ui, !app.is_busy(), "🔄 Refresh").clicked() {
                 app.refresh_all();
             }
-            ui.add(egui::Label::new(egui::RichText::new("Branches").heading()).truncate()).on_hover_text("Branches");
         });
     });
 
@@ -133,9 +133,9 @@ fn show_branch_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, branch
         ui.label(egui::RichText::new(icon).color(name_color).strong());
 
         let busy = app.is_busy();
-        // right_to_left: buttons on right edge, text on left, text truncates when overlapped
+        // right_to_left: buttons on right edge, text on left
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // Buttons first (placed rightmost → going left)
+            // --- Buttons first (rightmost, never compressed) ---
             if !is_head && !is_remote {
                 if crate::ui::add_enabled_ellipsis(ui, !busy, "Copy").clicked() {
                     ui.ctx().copy_text(name.clone());
@@ -150,30 +150,17 @@ fn show_branch_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, branch
             }
             if !is_head {
                 if crate::ui::add_enabled_ellipsis(ui, !busy, "Checkout").clicked() {
-                    app.start_operation(ctx, &format!("Checkout '{}'", name), GitOperation::CheckoutBranch(name));
+                    app.start_operation(ctx, &format!("Checkout '{}'", name), GitOperation::CheckoutBranch(name.clone()));
                 }
             }
 
-            // Text after buttons: in right_to_left, LAST added = LEFTMOST
-            // Add text in display order: left to right
+            // --- Available space for text (after buttons placed) ---
+            let text_avail = ui.available_width().max(40.0);
 
-            // Last commit message (leftmost text)
-            if let Some(msg) = &branch.last_commit {
-                if !msg.is_empty() {
-                    let msg_clone = msg.clone();
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(msg)
-                                .color(egui::Color32::GRAY)
-                                .text_style(egui::TextStyle::Small),
-                        )
-                        .truncate(),
-                    )
-                    .on_hover_text(msg_clone);
-                }
-            }
+            // --- Build middle info (upstream + commit msg) ---
+            let mut middle_job = egui::text::LayoutJob::default();
+            let mut middle_hover: Vec<String> = Vec::new();
 
-            // Upstream info (middle text, to the right of commit msg)
             if let Some(upstream) = &branch.upstream {
                 if !upstream.is_empty() {
                     let tracking = if branch.ahead > 0 || branch.behind > 0 {
@@ -181,27 +168,78 @@ fn show_branch_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, branch
                     } else {
                         String::new()
                     };
-                    let upstream_text = format!("→ {} {}", upstream, tracking);
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(&upstream_text)
-                                .color(egui::Color32::GRAY)
-                                .text_style(egui::TextStyle::Small),
-                        )
-                        .truncate(),
-                    )
-                    .on_hover_text(upstream_text);
+                    let upstream_text = format!("→ {}{}", upstream, tracking);
+                    middle_hover.push(upstream_text.clone());
+                    middle_job.append(
+                        &upstream_text,
+                        0.0,
+                        egui::TextFormat {
+                            font_id: egui::FontId::proportional(13.0),
+                            color: egui::Color32::GRAY,
+                            ..Default::default()
+                        },
+                    );
                 }
             }
 
-            // Branch name (rightmost text, closest to buttons)
-            ui.add(
+            if let Some(msg) = &branch.last_commit {
+                if !msg.is_empty() {
+                    let prefix = if middle_hover.is_empty() { "" } else { "  " };
+                    let commit_text = format!("{}{}", prefix, msg);
+                    middle_hover.push(msg.clone());
+                    middle_job.append(
+                        &commit_text,
+                        0.0,
+                        egui::TextFormat {
+                            font_id: egui::FontId::proportional(13.0),
+                            color: egui::Color32::GRAY,
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+
+            // --- Compute widths: natural when fits, compressed otherwise ---
+            let middle_full_text = middle_hover.join("  ");
+            let name_nat = (name.len() as f32 * 9.0).min(300.0);
+            let middle_nat = if middle_hover.is_empty() {
+                0.0
+            } else {
+                (middle_full_text.len() as f32 * 8.0).min(300.0)
+            };
+
+            let (name_w, middle_w) = if middle_hover.is_empty() {
+                // No middle info → name takes all text space
+                (text_avail, 0.0)
+            } else if name_nat + middle_nat <= text_avail {
+                // Both fit naturally → pack left (贴左)
+                (name_nat, (text_avail - name_nat).min(middle_nat))
+            } else if name_nat <= text_avail * 0.55 {
+                // Name fits, compress middle
+                (name_nat, text_avail - name_nat)
+            } else {
+                // Both need compression → roughly 50/50
+                let half = (text_avail / 2.0).max(50.0);
+                (half, (text_avail - half).max(0.0))
+            };
+
+            if !middle_hover.is_empty() {
+                ui.add_sized(
+                    [middle_w, ui.available_height()],
+                    egui::Label::new(middle_job).truncate(),
+                )
+                .on_hover_text(middle_full_text);
+            }
+
+            // --- Branch name (leftmost, less compressible) ---
+            ui.add_sized(
+                [name_w, ui.available_height()],
                 egui::Label::new(
-                    egui::RichText::new(&branch.name).color(name_color),
+                    egui::RichText::new(&name).color(name_color),
                 )
                 .truncate(),
             )
-            .on_hover_text(&branch.name);
+            .on_hover_text(&name);
         });
     });
 }

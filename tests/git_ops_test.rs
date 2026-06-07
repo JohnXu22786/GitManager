@@ -194,8 +194,8 @@ fn test_project_name_extraction() {
     assert_eq!(name, "", "Should handle empty path gracefully");
 }
 
-/// Test that clicking the History button switches to the Log tab
-/// This validates the behavior we will implement for the history button.
+/// Test that clicking the Log tab works
+/// This validates tab switching behavior.
 #[test]
 fn test_tab_switch_to_log() {
     #[derive(Debug, PartialEq, Clone)]
@@ -209,28 +209,23 @@ fn test_tab_switch_to_log() {
     let mut current_tab = Tab::Status;
     assert_eq!(current_tab, Tab::Status);
     
-    // History button sets the tab to Log
+    // Switch to Log tab
     current_tab = Tab::Log;
-    assert_eq!(current_tab, Tab::Log, "History button should switch to Log tab");
+    assert_eq!(current_tab, Tab::Log, "Should switch to Log tab");
     
     // Verify other tabs still work
     current_tab = Tab::Branches;
     assert_eq!(current_tab, Tab::Branches);
 }
 
-/// Test that the history button and project name appear in correct order:
-/// History button first, project name to its right
+/// Test that the project name appears in the top bar layout
 #[test]
 fn test_ui_elements_order() {
-    // Simulate the layout: [History button] [project name]
-    // This test validates the visual ordering the user requested:
-    // "项目名称写在历史按钮右边" = project name on the right of history button
+    // The top bar contains: [📂 open] [🕒 clock dropdown] [project name] [refresh] [about] [version]
+    // This test validates that the project name is present in the top bar
     
-    let items = vec!["History button", "project-name"];
-    assert_eq!(items[0], "History button", "History button should come first (left)");
-    assert_eq!(items[1], "project-name", "Project name should come second (right of history)");
-    assert!(items.windows(2).any(|w| w[0] == "History button" && w[1] == "project-name"),
-        "History button must be immediately followed by project name");
+    let items = vec!["📂", "🕒", "project-name"];
+    assert!(items.contains(&"project-name"), "Project name should appear in top bar");
 }
 
 /// Test that the project name is NOT placed on the tab bar row

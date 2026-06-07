@@ -5,11 +5,11 @@ use eframe::egui;
 pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     let dark = ctx.style().visuals.dark_mode;
     ui.horizontal(|ui| {
+        ui.add(egui::Label::new(egui::RichText::new("Stash").heading()).truncate()).on_hover_text("Stash");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if crate::ui::add_enabled_ellipsis(ui, !app.is_busy(), "🔄 Refresh").clicked() {
                 app.refresh_all();
             }
-            ui.add(egui::Label::new(egui::RichText::new("Stash").heading()).truncate()).on_hover_text("Stash");
         });
     });
 
