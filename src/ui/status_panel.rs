@@ -3,8 +3,9 @@ use crate::git_ops::GitOperation;
 use eframe::egui;
 
 pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
-    // Heading row: heading text truncates, buttons stay anchored to right edge
+    // Heading row: heading text on the left, buttons anchored to right edge
     ui.horizontal(|ui| {
+        ui.add(egui::Label::new(egui::RichText::new("Changes").heading()).truncate()).on_hover_text("Changes");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let busy = app.is_busy();
             if crate::ui::add_enabled_ellipsis(ui, !busy, "Stage All").clicked() {
@@ -16,7 +17,6 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             if crate::ui::add_enabled_ellipsis(ui, !busy, "Discard All").clicked() {
                 app.start_operation(ctx, "Discarding all", GitOperation::RestoreAll);
             }
-            ui.add(egui::Label::new(egui::RichText::new("Changes").heading()).truncate()).on_hover_text("Changes");
         });
     });
 

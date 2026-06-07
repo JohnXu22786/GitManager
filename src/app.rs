@@ -669,7 +669,7 @@ impl eframe::App for App {
                 }
 
                 // Recent repos dropdown
-                egui::menu::menu_button(ui, "▼", |ui| {
+                egui::menu::menu_button(ui, "🕒", |ui| {
                     if self.recent_repos.is_empty() {
                         ui.label("No recent repositories");
                     } else {
@@ -710,17 +710,37 @@ impl eframe::App for App {
                 if self.git.is_open() {
                     ui.separator();
                     let project_name = self.repo_name();
-                    if ui.button("⏰ History").clicked() {
-                        self.current_tab = Tab::Log;
-                    }
-                    ui.label(
-                        egui::RichText::new(project_name)
-                            .color(egui::Color32::from_rgb(100, 150, 255))
-                            .strong(),
-                    );
-                    ui.separator();
 
-                    // Right-side elements anchored to right edge: version, about, refresh, update indicator
+                    let mut job = egui::text::LayoutJob::default();
+                    job.append(
+                        &project_name,
+                        0.0,
+                        egui::TextFormat {
+                            font_id: egui::FontId::proportional(14.0),
+                            color: egui::Color32::from_rgb(100, 150, 255),
+                            ..Default::default()
+                        },
+                    );
+                    job.append(
+                        "  ",
+                        0.0,
+                        egui::TextFormat::default(),
+                    );
+                    job.append(
+                        &self.repo_path,
+                        0.0,
+                        egui::TextFormat {
+                            font_id: egui::FontId::proportional(11.0),
+                            color: egui::Color32::GRAY,
+                            ..Default::default()
+                        },
+                    );
+                    ui.add(
+                        egui::Label::new(job).truncate(),
+                    )
+                    .on_hover_text(format!("{}\n{}", project_name, self.repo_path));
+
+                    // Right-side elements anchored to right edge: version, about, update indicator
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // Show update indicator if an update is available
                         {
@@ -731,10 +751,6 @@ impl eframe::App for App {
                                         .color(App::adaptive_yellow(dark)),
                                 );
                             }
-                        }
-                        // Disable refresh button while busy
-                        if crate::ui::add_enabled_ellipsis(ui, !self.is_busy(), "🔄").clicked() {
-                            self.refresh_all();
                         }
                         // About button
                         if ui.button("ⓘ").clicked() {
@@ -1707,7 +1723,5 @@ mod tests {
         assert!(!app.show_message_popup);
         assert_eq!(app.error_message, "detailed error message");
         assert_eq!(app.success_message, "detailed success message");
-    }
-}
     }
 }

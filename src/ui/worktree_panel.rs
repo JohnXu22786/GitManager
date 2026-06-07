@@ -5,6 +5,7 @@ use eframe::egui;
 
 pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     ui.horizontal(|ui| {
+        ui.add(egui::Label::new(egui::RichText::new("Worktrees").heading()).truncate()).on_hover_text("Worktrees");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let busy = app.is_busy();
             if crate::ui::add_enabled_ellipsis(ui, !busy, "🔄 Refresh").clicked() {
@@ -19,7 +20,6 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 }
                 app.show_success("Pruning worktrees...".into());
             }
-            ui.add(egui::Label::new(egui::RichText::new("Worktrees").heading()).truncate()).on_hover_text("Worktrees");
         });
     });
 
@@ -110,9 +110,14 @@ fn show_worktree_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, wt: 
         let icon = if wt.is_main { "★" } else { "○" };
         ui.label(egui::RichText::new(icon).color(App::adaptive_gold(dark)));
 
+        let branch_display = wt.branch.as_deref().unwrap_or("detached");
+        let sha_short = wt.sha.get(..7).unwrap_or(&wt.sha);
+        let branch_sha_text = format!("{} [{}]", branch_display, sha_short);
+        let path_display = wt.path.to_string_lossy().to_string();
+
         if !wt.is_main {
             let busy = app.is_busy();
-            // Buttons on the right edge, text on the left, truncates when overlapped
+            // Buttons on the right, branch/sha (left) + path (compresses first)
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if crate::ui::add_enabled_ellipsis(ui, !busy, "Remove").clicked() {
                     app.start_operation(ctx, &format!("Remove {:?}", wt_path), GitOperation::RemoveWorktree { path: wt_path.clone(), force: false });
@@ -121,9 +126,28 @@ fn show_worktree_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, wt: 
                     app.start_operation(ctx, &format!("Force remove {:?}", wt_path), GitOperation::RemoveWorktree { path: wt_path.clone(), force: true });
                 }
 
-                // Path (left text - truncatable)
-                let path_display = wt.path.to_string_lossy().to_string();
-                ui.add(
+                // --- Available space for text (after buttons) ---
+                let text_avail = ui.available_width().max(40.0);
+
+                // Natural width estimates
+                let info_nat = (branch_sha_text.len() as f32 * 9.0).min(300.0);
+                let path_nat = (path_display.len() as f32 * 8.0).min(300.0);
+
+                let (path_w, info_w) = if info_nat + path_nat <= text_avail {
+                    // Both fit → pack left
+                    (path_nat.min(text_avail - info_nat), info_nat)
+                } else if info_nat <= text_avail * 0.5 {
+                    // Branch info fits, compress path
+                    (text_avail - info_nat, info_nat)
+                } else {
+                    // Both need compression → ~50/50
+                    let half = (text_avail / 2.0).max(50.0);
+                    (half, text_avail - half)
+                };
+
+                // Path (compresses first)
+                ui.add_sized(
+                    [path_w, ui.available_height()],
                     egui::Label::new(
                         egui::RichText::new(&path_display)
                             .color(egui::Color32::GRAY)
@@ -131,30 +155,50 @@ fn show_worktree_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, wt: 
                     )
                     .truncate(),
                 )
-                .on_hover_text(path_display);
+                .on_hover_text(&path_display);
 
-                // Branch + SHA info (rightmost text, closest to buttons)
-                let branch_display = wt.branch.as_deref().unwrap_or("detached");
-                let sha_short = wt.sha.get(..7).unwrap_or(&wt.sha);
-                let branch_text = format!("{} [{}]", branch_display, sha_short);
-                ui.add(
-                    egui::Label::new(&branch_text)
-                        .truncate(),
+                // Branch/SHA (leftmost, less compressible)
+                ui.add_sized(
+                    [info_w, ui.available_height()],
+                    egui::Label::new(
+                        egui::RichText::new(&branch_sha_text)
+                            .color(ui.style().visuals.text_color()),
+                    )
+                    .truncate(),
                 )
-                .on_hover_text(branch_text);
+                .on_hover_text(&branch_sha_text);
             });
         } else {
-            // Main worktree: just text, no buttons needed
-            let branch_display = wt.branch.as_deref().unwrap_or("detached");
-            let sha_short = wt.sha.get(..7).unwrap_or(&wt.sha);
-            let branch_text = format!("{} [{}]", branch_display, sha_short);
-            ui.add(
-                egui::Label::new(&branch_text)
-                    .truncate(),
+            // Main worktree: just text, no buttons
+            let branch_sha_hover = branch_sha_text.clone();
+            let path_hover = path_display.clone();
+
+            // Natural width estimates
+            let info_nat = (branch_sha_text.len() as f32 * 9.0).min(300.0);
+            let path_nat = (path_display.len() as f32 * 8.0).min(300.0);
+            let text_avail = ui.available_width().max(40.0);
+
+            let (path_w, info_w) = if info_nat + path_nat <= text_avail {
+                (path_nat.min(text_avail - info_nat), info_nat)
+            } else if info_nat <= text_avail * 0.5 {
+                (text_avail - info_nat, info_nat)
+            } else {
+                let half = (text_avail / 2.0).max(50.0);
+                (half, text_avail - half)
+            };
+
+            ui.add_sized(
+                [info_w, ui.available_height()],
+                egui::Label::new(
+                    egui::RichText::new(&branch_sha_text)
+                        .color(ui.style().visuals.text_color()),
+                )
+                .truncate(),
             )
-            .on_hover_text(&branch_text);
-            let path_display = wt.path.to_string_lossy().to_string();
-            ui.add(
+            .on_hover_text(branch_sha_hover);
+
+            ui.add_sized(
+                [path_w, ui.available_height()],
                 egui::Label::new(
                     egui::RichText::new(&path_display)
                         .color(egui::Color32::GRAY)
@@ -162,7 +206,7 @@ fn show_worktree_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, wt: 
                 )
                 .truncate(),
             )
-            .on_hover_text(path_display);
+            .on_hover_text(path_hover);
         }
     });
 }

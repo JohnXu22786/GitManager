@@ -4,12 +4,14 @@ use eframe::egui;
 
 pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     ui.horizontal(|ui| {
+        ui.add(egui::Label::new(egui::RichText::new("Commit Log").heading()).truncate())
+            .on_hover_text("Commit Log");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if crate::ui::add_enabled_ellipsis(ui, !app.is_busy(), "🔄 Refresh").clicked() {
                 app.refresh_all();
             }
-            ui.add(egui::Label::new(egui::RichText::new("Commit Log").heading()).truncate()).on_hover_text("Commit Log");
-        });
+    });
+
     });
 
     ui.horizontal(|ui| {
