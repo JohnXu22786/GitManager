@@ -36,6 +36,9 @@ pub struct App {
     pub repo_path: String,
     pub error_message: String,
     pub success_message: String,
+    /// Accumulated real-time log of the latest operation (progress + final result).
+    /// Used in the expandable bottom panel so users see detailed CLI-like output.
+    pub last_operation_log: String,
 
     pub status_entries: Vec<StatusEntry>,
     pub branches: Vec<BranchInfo>,
@@ -104,6 +107,7 @@ impl App {
             repo_path: String::new(),
             error_message: String::new(),
             success_message: String::new(),
+            last_operation_log: String::new(),
 
             status_entries: Vec::new(),
             branches: Vec::new(),
@@ -344,6 +348,11 @@ impl App {
             last_seen_progress: String::new(),
         });
 
+        // Initialize the operation log with description
+        self.last_operation_log = format!("▶ Operation: {}\n", description);
+        // Ensure log has a trailing placeholder so progress can accumulate
+        self.last_operation_log += "  (waiting for progress...)\n";
+
         ctx.request_repaint();
     }
 
@@ -366,31 +375,38 @@ impl App {
                 (description, started_at, current_progress, last_seen_progress, last_progress_update)
             };
 
-            // If progress text changed, reset the watchdog timer
+            // If progress text changed, reset the watchdog timer and accumulate to log
             if current_progress != last_seen_progress {
                 if let Some(mut_op) = self.pending_ops.get_mut(i) {
                     mut_op.last_progress_update = Instant::now();
                     mut_op.last_seen_progress = current_progress.clone();
+                }
+                if !current_progress.is_empty() {
+                    self.last_operation_log += &format!("  {}\n", current_progress);
                 }
             } else {
                 let stall_secs = last_progress_update.elapsed().as_secs();
                 if current_progress.is_empty() {
                     // No progress ever received: give 60 seconds total
                     if started_at.elapsed().as_secs() > 60 {
-                        self.pending_errors.push(format!(
+                        let msg = format!(
                             "Operation '{}' timed out (no progress in 60s)",
                             description
-                        ));
+                        );
+                        self.pending_errors.push(msg.clone());
+                        self.last_operation_log += &format!("  ✗ {}\n", msg);
                         self.pending_ops.swap_remove(i);
                         continue;
                     }
                 } else {
                     // Progress was received but stopped: 30 second stall threshold
                     if stall_secs > 30 {
-                        self.pending_errors.push(format!(
+                        let msg = format!(
                             "Operation '{}' timed out (stalled {}s)\nLast: {}",
                             description, stall_secs, current_progress
-                        ));
+                        );
+                        self.pending_errors.push(msg.clone());
+                        self.last_operation_log += &format!("  ✗ {}\n", msg);
                         self.pending_ops.swap_remove(i);
                         continue;
                     }
@@ -401,6 +417,11 @@ impl App {
             match op.receiver.try_recv() {
                 Ok(result) => {
                     let op = self.pending_ops.swap_remove(i);
+                    // Append final progress to log before handling result
+                    let final_progress = current_progress.clone();
+                    if !final_progress.is_empty() {
+                        self.last_operation_log += &format!("  {}\n", final_progress);
+                    }
                     self.handle_op_result(op.description, result);
                 }
                 Err(mpsc::TryRecvError::Empty) => {
@@ -413,7 +434,8 @@ impl App {
                     } else {
                         format!("Operation '{}' failed unexpectedly\nLast progress: {}", op.description, last_prog)
                     };
-                    self.pending_errors.push(fail_msg);
+                    self.pending_errors.push(fail_msg.clone());
+                    self.last_operation_log += &format!("  ✗ {}\n", fail_msg);
                     self.pending_ops.swap_remove(i);
                 }
             }
@@ -431,12 +453,15 @@ impl App {
     fn handle_op_result(&mut self, description: String, result: OpResult) {
         match result {
             OpResult::Success(msg) => {
+                self.last_operation_log += &format!("  ✓ {}\n", msg);
                 self.pending_successes.push(msg);
                 // Auto-refresh after mutation operations
                 self.needs_refresh = true;
             }
             OpResult::Error(e) => {
-                self.pending_errors.push(format!("{}: {}", description, e));
+                let err_msg = format!("{}: {}", description, e);
+                self.last_operation_log += &format!("  ✗ {}\n", err_msg);
+                self.pending_errors.push(err_msg);
             }
             OpResult::DiffContent { path, lines } => {
                 self.diff_path = path;
@@ -834,7 +859,7 @@ impl eframe::App for App {
 
         // --- Bottom Bar (messages + status) ---
         if self.git.is_open() {
-            let bottom_height = if self.is_busy() && self.status_expanded { 160.0 } else { 24.0 };
+            let bottom_height = if self.status_expanded { 160.0 } else { 24.0 };
             egui::TopBottomPanel::bottom("bottom_bar")
                 .resizable(false)
                 .min_height(bottom_height)
@@ -849,25 +874,21 @@ impl eframe::App for App {
                                     .color(App::adaptive_yellow(dark))
                                     .size(13.0),
                             );
-                            let expand_label = if self.status_expanded { "▲" } else { "▼" };
-                            if ui.button(expand_label).clicked() {
-                                self.status_expanded = !self.status_expanded;
-                            }
                         }
 
-                        // Single right_to_left layout: buttons on the right, messages on the left.
-                        // Messages get remaining space and truncate with ellipsis BEFORE overlapping buttons.
+                        // Expand button always visible
+                        let expand_label = if self.status_expanded { "▲" } else { "▼" };
+                        if ui.button(expand_label).clicked() {
+                            self.status_expanded = !self.status_expanded;
+                        }
+
+                        // Right side: refresh timestamp + messages (no close button, no auto-dismiss)
                         let has_message =
                             !self.error_message.is_empty() || !self.success_message.is_empty();
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
-                                if has_message && !self.is_busy() {
-                                    if crate::ui::ellipsis_button(ui, "x").clicked() {
-                                        self.error_message.clear();
-                                        self.success_message.clear();
-                                    }
-                                }
+                                // No close button — messages persist, latest only
                                 ui.separator();
                                 let elapsed = self.last_refresh.elapsed().as_secs();
                                 let elapsed_text = App::format_elapsed(elapsed);
@@ -877,7 +898,7 @@ impl eframe::App for App {
                                 )
                                 .on_hover_text(elapsed_text);
 
-                                if has_message && !self.is_busy() {
+                                if has_message {
                                     if !self.error_message.is_empty() {
                                         let msg_text = self.error_message.clone();
                                         let resp = ui.add(
@@ -913,10 +934,14 @@ impl eframe::App for App {
                         );
                     });
 
-                    // Expandable command output area when an operation is running
-                    if self.is_busy() && self.status_expanded {
+                    // Expandable command output area (visible whenever expanded)
+                    if self.status_expanded {
                         ui.separator();
-                        let output_text = self.current_operation();
+                        let output_text = if self.is_busy() {
+                            self.current_operation()
+                        } else {
+                            self.last_operation_log.clone()
+                        };
                         egui::ScrollArea::vertical()
                             .max_height(120.0)
                             .auto_shrink([false, false])
