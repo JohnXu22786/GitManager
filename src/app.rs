@@ -67,8 +67,6 @@ pub struct App {
     pub last_refresh: std::time::Instant,
 
     pub show_about: bool,
-    pub font_size: f32,
-
     pub update_state: Arc<Mutex<UpdateState>>,
     pub show_update_dialog: bool,
     pub auto_check_done: bool,
@@ -85,8 +83,7 @@ pub struct App {
 }
 
 impl App {
-    const MIN_FONT_SIZE: f32 = 10.0;
-    const MAX_FONT_SIZE: f32 = 24.0;
+    const FONT_SIZE: f32 = 14.0;
 
     pub fn new() -> Self {
         Self {
@@ -132,7 +129,6 @@ impl App {
             last_refresh: std::time::Instant::now(),
 
             show_about: false,
-            font_size: 14.0,
 
             update_state: Arc::new(Mutex::new(UpdateState::Idle)),
             show_update_dialog: false,
@@ -414,7 +410,7 @@ impl eframe::App for App {
         }
 
         // Apply font size via text styles
-        let fs = self.font_size;
+        let fs = Self::FONT_SIZE;
         ctx.style_mut(|style| {
             style.text_styles = [
                 (egui::TextStyle::Body, egui::FontId::proportional(fs)),
@@ -602,11 +598,6 @@ impl eframe::App for App {
                                     }
                                 }
                                 ui.separator();
-                                ui.label("Font:");
-                                ui.add(
-                                    egui::Slider::new(&mut self.font_size, Self::MIN_FONT_SIZE..=Self::MAX_FONT_SIZE)
-                                        .show_value(false),
-                                );
                                 let elapsed = self.last_refresh.elapsed().as_secs();
                                 ui.label(format!("Updated {}s ago", elapsed));
                             },
@@ -830,19 +821,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_app_new_defaults() {
-        let app = App::new();
-        assert_eq!(app.font_size, 14.0);
-        assert!(!app.show_about);
-        assert!(!app.git.is_open());
-        assert_eq!(app.current_tab, Tab::Status);
+    fn test_font_size_constant_is_14() {
+        assert_eq!(App::FONT_SIZE, 14.0);
     }
 
     #[test]
-    fn test_font_size_default_in_range() {
+    fn test_app_new_defaults() {
         let app = App::new();
-        assert!(app.font_size >= App::MIN_FONT_SIZE);
-        assert!(app.font_size <= App::MAX_FONT_SIZE);
+        assert!(!app.show_about);
+        assert!(!app.git.is_open());
+        assert_eq!(app.current_tab, Tab::Status);
     }
 
     #[test]
