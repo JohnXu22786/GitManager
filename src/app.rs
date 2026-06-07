@@ -588,10 +588,7 @@ impl eframe::App for App {
 
                 if self.git.is_open() {
                     ui.separator();
-                    let project_name = Path::new(&self.repo_path)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| self.repo_path.clone());
+                    let project_name = self.repo_name();
                     if ui.button("⏰ History").clicked() {
                         self.current_tab = Tab::Log;
                     }
@@ -786,7 +783,7 @@ impl eframe::App for App {
                                 }
                                 ui.separator();
                                 let elapsed = self.last_refresh.elapsed().as_secs();
-                                let elapsed_text = format!("Updated {}s ago", elapsed);
+                                let elapsed_text = App::format_elapsed(elapsed);
                                 ui.add(
                                     egui::Label::new(&elapsed_text)
                                         .truncate(),
@@ -1323,5 +1320,4 @@ mod tests {
         assert!(!result.is_empty());
         assert!(result.contains("h ago"));
     }
-}
 }
