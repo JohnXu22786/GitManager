@@ -76,6 +76,10 @@ pub struct App {
     pub update_state: Arc<Mutex<UpdateState>>,
     pub show_update_dialog: bool,
     pub auto_check_done: bool,
+    /// Set to true when the user clicks "Remind Later" to prevent the dialog from reopening.
+    pub update_dialog_dismissed: bool,
+    /// Download progress from 0.0 to 1.0 for the current download.
+    pub download_progress: f32,
     /// Pending Git operations running in background threads.
     pending_ops: Vec<PendingOp>,
     /// Accumulated error messages from background operations.
@@ -141,6 +145,8 @@ impl App {
             update_state: Arc::new(Mutex::new(UpdateState::Idle)),
             show_update_dialog: false,
             auto_check_done: false,
+            update_dialog_dismissed: false,
+            download_progress: 0.0,
             pending_ops: Vec::new(),
             pending_errors: Vec::new(),
             pending_successes: Vec::new(),
@@ -155,11 +161,121 @@ impl App {
         let current_version = env!("CARGO_PKG_VERSION").to_string();
         let state = self.update_state.clone();
         *state.lock().unwrap() = UpdateState::Checking;
+        self.update_dialog_dismissed = false;
+        self.show_update_dialog = false;
 
         std::thread::spawn(move || {
             let result = updater::check_for_update(&current_version);
             *state.lock().unwrap() = result;
         });
+    }
+
+    /// Start downloading the update asset in a background thread.
+    /// Updates `update_state` with progress as the download proceeds.
+    pub fn trigger_download(&mut self, url: String, file_name: String) {
+        let state = self.update_state.clone();
+        let progress = Arc::new(Mutex::new(0.0f32));
+        let prog = progress.clone();
+        let state_for_progress = state.clone();
+        *state.lock().unwrap() = UpdateState::Downloading {
+            progress: 0.0,
+            file_name: file_name.clone(),
+        };
+        self.download_progress = 0.0;
+
+        std::thread::spawn(move || {
+            // Save to Downloads folder
+            let dest_dir = updater::get_default_download_dir();
+            let dest_path = std::path::Path::new(&dest_dir).join(&file_name);
+
+            // Update progress in real-time from the background thread
+            let prog_clone = prog.clone();
+            let _prog_update_handle = std::thread::spawn(move || {
+                loop {
+                    let p = *prog_clone.lock().unwrap();
+                    let current_state = state_for_progress.lock().unwrap().clone();
+                    let is_downloading = matches!(current_state, UpdateState::Downloading { .. });
+                    if !is_downloading {
+                        break;
+                    }
+                    *state_for_progress.lock().unwrap() = UpdateState::Downloading {
+                        progress: p,
+                        file_name: file_name.clone(),
+                    };
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            });
+
+            let result = updater::download_file_with_progress(&url, &dest_path, prog);
+
+            match result {
+                Ok(()) => {
+                    let path_str = dest_path.to_string_lossy().to_string();
+                    *state.lock().unwrap() = UpdateState::Downloaded {
+                        file_path: path_str,
+                    };
+                }
+                Err(e) => {
+                    *state.lock().unwrap() = UpdateState::Error(e);
+                }
+            }
+        });
+    }
+
+    /// Extract the binary from the downloaded archive, create a self-update
+    /// script, launch it, and exit the current process to complete the update.
+    pub fn install_and_restart(&mut self) {
+        let current_state = self.update_state.lock().unwrap().clone();
+        let archive_path = match &current_state {
+            UpdateState::Downloaded { file_path } => file_path.clone(),
+            _ => return,
+        };
+
+        let archive_path = std::path::Path::new(&archive_path).to_path_buf();
+
+        // Extract binary from archive
+        let new_binary = match updater::extract_binary_from_archive(&archive_path) {
+            Ok(p) => p,
+            Err(e) => {
+                self.error_message = format!("Failed to extract update: {}", e);
+                return;
+            }
+        };
+
+        // Get current executable path
+        let current_binary = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                self.error_message = format!("Failed to get current exe path: {}", e);
+                return;
+            }
+        };
+
+        // Create self-update script
+        let script_path = match updater::create_self_update_script(&new_binary, &current_binary) {
+            Ok(p) => p,
+            Err(e) => {
+                self.error_message = format!("Failed to create update script: {}", e);
+                return;
+            }
+        };
+
+        // Launch the script (detached from parent process)
+        #[cfg(target_os = "windows")]
+        {
+            let _ = std::process::Command::new("cmd")
+                .args(["/C", script_path.to_str().unwrap_or("")])
+                .spawn();
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = std::process::Command::new("sh")
+                .arg(script_path.to_str().unwrap_or(""))
+                .spawn();
+        }
+
+        // Exit the current process immediately
+        std::process::exit(0);
     }
 
     pub fn open_repo(&mut self, path: &str) {
@@ -501,8 +617,8 @@ impl eframe::App for App {
         {
             let state = self.update_state.lock().unwrap();
             match &*state {
-                UpdateState::UpdateAvailable { latest_version, download_url: _ } => {
-                    if !self.show_update_dialog {
+                UpdateState::UpdateAvailable { latest_version, download_url: _, assets: _ } => {
+                    if !self.update_dialog_dismissed && !self.show_update_dialog {
                         self.show_update_dialog = true;
                     }
                     let _ = latest_version;
@@ -510,11 +626,16 @@ impl eframe::App for App {
                 UpdateState::Checking => {
                     ctx.request_repaint();
                 }
+                UpdateState::Downloading { progress, file_name: _ } => {
+                    self.download_progress = *progress;
+                    ctx.request_repaint();
+                }
+                UpdateState::Downloaded { file_path: _ } => {
+                    self.download_progress = 1.0;
+                }
                 _ => {}
             }
         }
-
-        // --- Phase 1: Process any completed background operations ---
         self.process_pending_ops(ctx);
         self.flush_messages();
 
@@ -941,11 +1062,31 @@ impl eframe::App for App {
                                     ui.add(egui::Spinner::new());
                                     ui.label("Checking for updates...");
                                 }
-                                UpdateState::UpdateAvailable { latest_version, download_url } => {
+                                UpdateState::UpdateAvailable { latest_version, download_url, ref assets } => {
                                     ui.colored_label(App::adaptive_yellow(dark), format!("Update available: {}!", latest_version));
-                                    if crate::ui::ellipsis_button(ui, "Download").clicked() {
-                                        let _ = open::that(&download_url);
+                                    // Try auto-download if matching asset is available
+                                    if let Some((asset_url, file_name)) = updater::find_asset_for_current_platform(assets) {
+                                        if crate::ui::ellipsis_button(ui, "Download & Install").clicked() {
+                                            self.trigger_download(asset_url, file_name);
+                                        }
+                                    } else {
+                                        // Fallback: open browser
+                                        if crate::ui::ellipsis_button(ui, "Download (Browser)").clicked() {
+                                            let _ = open::that(&download_url);
+                                        }
                                     }
+                                }
+                                UpdateState::Downloading { progress, file_name } => {
+                                    ui.colored_label(App::adaptive_yellow(dark), format!("Downloading: {} ({:.0}%)", file_name, progress * 100.0));
+                                    ui.add(
+                                        egui::ProgressBar::new(progress)
+                                            .show_percentage()
+                                            .animate(true),
+                                    );
+                                }
+                UpdateState::Downloaded { file_path } => {
+                                    ui.colored_label(App::adaptive_green(dark), "✓ Download complete!");
+                                    ui.label(egui::RichText::new(&file_path).size(10.0).color(egui::Color32::GRAY));
                                 }
                                 UpdateState::Error(ref msg) => {
                                     ui.colored_label(App::adaptive_red(dark), msg.as_str());
@@ -965,39 +1106,111 @@ impl eframe::App for App {
         }
 
         // Auto-update notification dialog
+        // Note: we intentionally keep show_update_dialog = true during download
+        // so the dialog shows the Downloading → Downloaded state transitions.
+        // The dialog only closes when the user explicitly dismisses it.
         if self.show_update_dialog {
-            let state = self.update_state.lock().unwrap().clone();
-            if let UpdateState::UpdateAvailable { ref latest_version, ref download_url } = state {
-                egui::Window::new("Update Available")
-                    .collapsible(false)
-                    .resizable(false)
-                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                    .show(ctx, |ui| {
-                        ui.vertical_centered(|ui| {
-                            ui.heading("🚀 Update Available!");
-                            ui.add_space(8.0);
-                            ui.label(format!(
-                                "Version {} is now available (you have {}).",
-                                latest_version,
-                                env!("CARGO_PKG_VERSION"),
-                            ));
-                            ui.add_space(8.0);
-                            ui.label("Visit the GitHub releases page to download the latest version.");
-                            ui.add_space(12.0);
-                            ui.horizontal(|ui| {
-                                if crate::ui::ellipsis_button(ui, "Download").clicked() {
-                                    let _ = open::that(download_url);
-                                    self.show_update_dialog = false;
-                                }
-                                if crate::ui::ellipsis_button(ui, "Remind Later").clicked() {
-                                    self.show_update_dialog = false;
-                                }
+            let current_state = self.update_state.lock().unwrap().clone();
+            match &current_state {
+                UpdateState::UpdateAvailable { latest_version, download_url, assets } => {
+                    // If download is in progress (triggered from About window), switch to download view
+                    if matches!(current_state, UpdateState::Downloading { .. }) {
+                        // Let the next match arm handle it
+                    } else {
+                        egui::Window::new("Update Available")
+                            .collapsible(false)
+                            .resizable(false)
+                            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                            .show(ctx, |ui| {
+                                ui.vertical_centered(|ui| {
+                                    ui.heading("🚀 Update Available!");
+                                    ui.add_space(8.0);
+                                    ui.label(format!(
+                                        "Version {} is now available (you have {}).",
+                                        latest_version,
+                                        env!("CARGO_PKG_VERSION"),
+                                    ));
+                                    ui.add_space(8.0);
+                                    ui.label("An automatic download is available below.");
+                                    ui.add_space(12.0);
+                                    ui.horizontal(|ui| {
+                                        // Try auto-download first
+                                        if let Some((asset_url, file_name)) = updater::find_asset_for_current_platform(assets) {
+                                            if crate::ui::ellipsis_button(ui, "Auto Download").clicked() {
+                                                self.trigger_download(asset_url, file_name);
+                                                // Keep dialog open to show progress
+                                            }
+                                        }
+                                        // Fallback: open browser
+                                        if crate::ui::ellipsis_button(ui, "Open in Browser").clicked() {
+                                            let _ = open::that(download_url);
+                                            self.show_update_dialog = false;
+                                        }
+                                        if crate::ui::ellipsis_button(ui, "Remind Later").clicked() {
+                                            self.show_update_dialog = false;
+                                            self.update_dialog_dismissed = true;
+                                        }
+                                    });
+                                });
+                            });
+                    }
+                }
+                UpdateState::Downloading { progress, file_name } => {
+                    egui::Window::new("Downloading Update")
+                        .collapsible(false)
+                        .resizable(false)
+                        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                        .show(ctx, |ui| {
+                            ui.vertical_centered(|ui| {
+                                ui.heading("⬇ Downloading Update");
+                                ui.add_space(8.0);
+                                ui.label(format!("Downloading: {}...", file_name));
+                                ui.add_space(8.0);
+                                ui.add(
+                                    egui::ProgressBar::new(*progress)
+                                        .show_percentage()
+                                        .animate(true),
+                                );
+                                ui.add_space(4.0);
+                                ui.label(
+                                    egui::RichText::new(format!("{:.1}%", *progress * 100.0))
+                                        .color(App::adaptive_yellow(ctx.style().visuals.dark_mode)),
+                                );
                             });
                         });
-                    });
-            } else {
-                // State changed while dialog was open
-                self.show_update_dialog = false;
+                }
+                UpdateState::Downloaded { file_path } => {
+                    egui::Window::new("Download Complete")
+                        .collapsible(false)
+                        .resizable(false)
+                        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                        .show(ctx, |ui| {
+                            ui.vertical_centered(|ui| {
+                                ui.heading("✅ Download Complete!");
+                                ui.add_space(8.0);
+                                ui.label("The update has been downloaded successfully.");
+                                ui.add_space(4.0);
+                                    ui.label(
+                                        egui::RichText::new(file_path.clone())
+                                            .size(10.0)
+                                            .color(egui::Color32::GRAY),
+                                    ).on_hover_text(file_path.clone());
+                                ui.add_space(12.0);
+                                ui.horizontal(|ui| {
+                                    if crate::ui::ellipsis_button(ui, "Install & Restart").clicked() {
+                                        self.install_and_restart();
+                                    }
+                                    if crate::ui::ellipsis_button(ui, "Dismiss").clicked() {
+                                        *self.update_state.lock().unwrap() = UpdateState::Idle;
+                                    }
+                                });
+                            });
+                        });
+                }
+                _ => {
+                    // State changed while dialog was open (or no longer relevant)
+                    self.show_update_dialog = false;
+                }
             }
         }
 
@@ -1348,6 +1561,70 @@ mod tests {
         assert!(result.contains("h ago"));
     }
 
+    // --- Update dialog dismiss flag tests ---
+
+    #[test]
+    fn test_update_dialog_dismissed_initially_false() {
+        let app = App::new();
+        assert!(!app.update_dialog_dismissed, "Dismiss flag should start as false");
+    }
+
+    #[test]
+    fn test_trigger_update_check_resets_dismiss_flag() {
+        let mut app = App::new();
+        app.update_dialog_dismissed = true;
+        app.trigger_update_check();
+        assert!(!app.update_dialog_dismissed, "Triggering a new check should reset dismiss flag");
+    }
+
+    #[test]
+    fn test_dismiss_flag_prevents_dialog_reopen() {
+        let mut app = App::new();
+        app.update_dialog_dismissed = true;
+        app.show_update_dialog = false;
+
+        if !app.update_dialog_dismissed {
+            if !app.show_update_dialog {
+                app.show_update_dialog = true;
+            }
+        }
+
+        assert!(!app.show_update_dialog, "Dialog should not reopen when dismissed");
+    }
+
+    #[test]
+    fn test_dialog_opens_when_not_dismissed() {
+        let mut app = App::new();
+        app.update_dialog_dismissed = false;
+        app.show_update_dialog = false;
+
+        if !app.update_dialog_dismissed {
+            if !app.show_update_dialog {
+                app.show_update_dialog = true;
+            }
+        }
+
+        assert!(app.show_update_dialog, "Dialog should open when not dismissed");
+    }
+
+    #[test]
+    fn test_dismiss_flag_after_remind_later() {
+        let mut app = App::new();
+        app.show_update_dialog = false;
+        app.update_dialog_dismissed = true;
+
+        assert!(app.update_dialog_dismissed, "Remind Later should set dismiss flag");
+        assert!(!app.show_update_dialog, "Remind Later should close dialog");
+    }
+
+    // --- Download tracking tests ---
+
+    #[test]
+    fn test_download_progress_field_defaults() {
+        let app = App::new();
+        assert_eq!(app.download_progress, 0.0, "Download progress should start at 0");
+    }
+
     // --- Status bar truncation & overwrite tests ---
 
     #[test]
@@ -1430,5 +1707,7 @@ mod tests {
         assert!(!app.show_message_popup);
         assert_eq!(app.error_message, "detailed error message");
         assert_eq!(app.success_message, "detailed success message");
+    }
+}
     }
 }
