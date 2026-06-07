@@ -588,10 +588,7 @@ impl eframe::App for App {
 
                 if self.git.is_open() {
                     ui.separator();
-                    let project_name = Path::new(&self.repo_path)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| self.repo_path.clone());
+                    let project_name = self.repo_name();
                     if ui.button("⏰ History").clicked() {
                         self.current_tab = Tab::Log;
                     }
@@ -736,7 +733,7 @@ impl eframe::App for App {
                                 }
                                 ui.separator();
                                 let elapsed = self.last_refresh.elapsed().as_secs();
-                                let elapsed_text = format!("Updated {}s ago", elapsed);
+                                let elapsed_text = App::format_elapsed(elapsed);
                                 ui.add(
                                     egui::Label::new(&elapsed_text)
                                         .truncate(),
@@ -1362,13 +1359,11 @@ mod tests {
     #[test]
     fn test_flush_messages_overwrites_error() {
         let mut app = App::new();
-        // Simulate pending errors from background ops
         app.pending_errors.push("first error".into());
         app.flush_messages();
         assert_eq!(app.error_message, "first error");
         assert!(app.pending_errors.is_empty());
 
-        // Now push a second error and flush — should OVERWRITE, not append
         app.pending_errors.push("second error".into());
         app.flush_messages();
         assert_eq!(
@@ -1383,10 +1378,8 @@ mod tests {
         app.pending_errors.push("error one".into());
         app.pending_errors.push("error two".into());
         app.flush_messages();
-        // Multiple pending errors should be joined
         assert_eq!(app.error_message, "error one | error two");
 
-        // New flush should overwrite, not append to existing
         app.pending_errors.push("fresh error".into());
         app.flush_messages();
         assert_eq!(
@@ -1409,7 +1402,6 @@ mod tests {
         let mut app = App::new();
         app.error_message = "existing error".into();
         app.flush_messages();
-        // Should not be cleared since there are no pending errors
         assert_eq!(app.error_message, "existing error");
     }
 
@@ -1435,9 +1427,7 @@ mod tests {
         let mut app = App::new();
         app.show_error("detailed error message".into());
         app.show_success("detailed success message".into());
-        // show_message_popup should only toggle when a message is visible
         assert!(!app.show_message_popup);
-        // Verify the full text is stored
         assert_eq!(app.error_message, "detailed error message");
         assert_eq!(app.success_message, "detailed success message");
     }
