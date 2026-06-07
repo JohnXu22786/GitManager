@@ -1,14 +1,29 @@
 /// Auto-update module for Git Manager.
 ///
 /// Checks GitHub Releases API for newer versions and notifies the user.
+/// Also provides automatic download of update assets.
 
 use serde::Deserialize;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+/// A release asset from GitHub Releases API.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ReleaseAsset {
+    pub name: String,
+    pub browser_download_url: String,
+    #[serde(default)]
+    pub content_type: String,
+}
 
 /// GitHub release response (only fields we need).
 #[derive(Debug, Deserialize)]
 pub struct GitHubRelease {
     pub tag_name: String,
     pub html_url: String,
+    #[serde(default)]
+    pub assets: Vec<ReleaseAsset>,
 }
 
 /// Parsed version number for comparison.
@@ -29,7 +44,11 @@ pub enum UpdateState {
     /// Check completed, no update available.
     UpToDate,
     /// Check completed, an update is available.
-    UpdateAvailable { latest_version: String, download_url: String },
+    UpdateAvailable { latest_version: String, download_url: String, assets: Vec<ReleaseAsset> },
+    /// Download is in progress with progress percentage (0.0 to 1.0).
+    Downloading { progress: f32, file_name: String },
+    /// Download completed successfully.
+    Downloaded { file_path: String },
     /// Check failed with an error.
     Error(String),
 }
@@ -89,10 +108,276 @@ pub fn check_for_update(current_version: &str) -> UpdateState {
         UpdateState::UpdateAvailable {
             latest_version: release.tag_name,
             download_url: release.html_url,
+            assets: release.assets,
         }
     } else {
         UpdateState::UpToDate
     }
+}
+
+/// Detect the current platform suffix used in release asset names.
+/// Matches the naming convention from `.github/workflows/release.yml`.
+fn get_platform_suffix() -> &'static str {
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        "windows-x86_64"
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        "linux-x86_64"
+    }
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        "linux-aarch64"
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        "macos-x86_64"
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        "macos-aarch64"
+    }
+}
+
+/// Find the download asset that matches the current platform.
+/// Returns (download_url, file_name) if found.
+pub fn find_asset_for_current_platform(assets: &[ReleaseAsset]) -> Option<(String, String)> {
+    let suffix = get_platform_suffix();
+    find_asset_by_suffix(assets, suffix)
+}
+
+/// Find a release asset whose name contains the given suffix.
+/// Returns (download_url, file_name) if found.
+fn find_asset_by_suffix(assets: &[ReleaseAsset], suffix: &str) -> Option<(String, String)> {
+    for asset in assets {
+        if asset.name.contains(suffix) {
+            return Some((asset.browser_download_url.clone(), asset.name.clone()));
+        }
+    }
+    None
+}
+
+/// The name of the binary inside the archive (platform-dependent).
+fn binary_name() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "git_manager.exe"
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        "git_manager"
+    }
+}
+
+/// Extract the binary (`git_manager` or `git_manager.exe`) from a downloaded
+/// release archive (.zip on Windows, .tar.gz on Unix).  The CI stores the
+/// binary at an arbitrary depth inside the archive, so we search by file name.
+/// Returns the path to the extracted binary (in a temp directory).
+pub fn extract_binary_from_archive(archive_path: &Path) -> Result<PathBuf, String> {
+    let name = archive_path.to_string_lossy().to_lowercase();
+    if name.ends_with(".zip") {
+        extract_binary_from_zip(archive_path)
+    } else if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+        extract_binary_from_tar_gz(archive_path)
+    } else {
+        Err(format!("Unsupported archive format: {}", archive_path.display()))
+    }
+}
+
+fn extract_binary_from_zip(zip_path: &Path) -> Result<PathBuf, String> {
+    let file = std::fs::File::open(zip_path)
+        .map_err(|e| format!("Failed to open zip: {}", e))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| format!("Failed to read zip: {}", e))?;
+    let target_name = binary_name();
+
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i)
+            .map_err(|e| format!("Failed to read zip entry {}: {}", i, e))?;
+        let entry_path = entry.name().to_string();
+        // Match by file name (ignore directory nesting)
+        if entry_path.ends_with(target_name) {
+            // Create a temp file for the extracted binary
+            let temp_dir = std::env::temp_dir();
+            let dest_path = temp_dir.join(target_name);
+            let mut dest_file = std::fs::File::create(&dest_path)
+                .map_err(|e| format!("Failed to create temp file: {}", e))?;
+            std::io::copy(&mut entry, &mut dest_file)
+                .map_err(|e| format!("Failed to extract binary: {}", e))?;
+            return Ok(dest_path);
+        }
+    }
+
+    Err(format!("Binary '{}' not found in zip archive", target_name))
+}
+
+fn extract_binary_from_tar_gz(tar_gz_path: &Path) -> Result<PathBuf, String> {
+    let file = std::fs::File::open(tar_gz_path)
+        .map_err(|e| format!("Failed to open tar.gz: {}", e))?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    let target_name = binary_name();
+
+    for entry in archive.entries()
+        .map_err(|e| format!("Failed to read tar entries: {}", e))?
+    {
+        let mut entry = entry
+            .map_err(|e| format!("Failed to read tar entry: {}", e))?;
+        let entry_path = entry.path()
+            .map_err(|e| format!("Failed to get entry path: {}", e))?
+            .to_string_lossy()
+            .to_string();
+        // Match by file name (ignore directory nesting)
+        if entry_path.ends_with(target_name) {
+            let temp_dir = std::env::temp_dir();
+            let dest_path = temp_dir.join(target_name);
+            let mut dest_file = std::fs::File::create(&dest_path)
+                .map_err(|e| format!("Failed to create temp file: {}", e))?;
+            std::io::copy(&mut entry, &mut dest_file)
+                .map_err(|e| format!("Failed to extract binary: {}", e))?;
+            return Ok(dest_path);
+        }
+    }
+
+    Err(format!("Binary '{}' not found in tar.gz archive", target_name))
+}
+
+/// Create a self-update script that replaces the running binary, cleans up
+/// temp files, and restarts.  Returns the path to the created script.
+///
+/// - **Windows**: writes a batch file that waits for the process to exit,
+///   copies the new exe over the current one, deletes temp files, then starts.
+/// - **Unix** (Linux/macOS): writes a shell script with the same logic.
+pub fn create_self_update_script(new_binary: &Path, current_binary: &Path) -> Result<PathBuf, String> {
+    let temp_dir = std::env::temp_dir();
+    #[cfg(target_os = "windows")]
+    {
+        let script_path = temp_dir.join("update_git_manager.bat");
+        let mut script = std::fs::File::create(&script_path)
+            .map_err(|e| format!("Failed to create update script: {}", e))?;
+        write!(script, r#"@echo off
+ping 127.0.0.1 -n 3 > nul
+copy /Y "{}" "{}"
+del /F /Q "{}"
+start "" "{}"
+del "%~f0"
+"#,
+            new_binary.display(),
+            current_binary.display(),
+            new_binary.display(),
+            current_binary.display(),
+        ).map_err(|e| format!("Failed to write update script: {}", e))?;
+        Ok(script_path)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let script_path = temp_dir.join("update_git_manager.sh");
+        let mut script = std::fs::File::create(&script_path)
+            .map_err(|e| format!("Failed to create update script: {}", e))?;
+        write!(script, r#"#!/bin/sh
+sleep 2
+cp -f "{}" "{}"
+chmod +x "{}"
+rm -f "{}"
+"{}" &
+rm -- "$0"
+"#,
+            new_binary.display(),
+            current_binary.display(),
+            current_binary.display(),
+            new_binary.display(),
+            current_binary.display(),
+        ).map_err(|e| format!("Failed to write update script: {}", e))?;
+        // Mark script as executable on Unix
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("Failed to make script executable: {}", e))?;
+        Ok(script_path)
+    }
+}
+
+/// Get the default download directory path.
+/// On Windows, uses %USERPROFILE%\Downloads. On Unix, uses ~/Downloads.
+/// Falls back to current directory.
+pub fn get_default_download_dir() -> String {
+    #[cfg(windows)]
+    {
+        if let Ok(profile) = std::env::var("USERPROFILE") {
+            let path = Path::new(&profile).join("Downloads");
+            if path.exists() || std::fs::create_dir_all(&path).is_ok() {
+                return path.to_string_lossy().to_string();
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            let path = Path::new(&home).join("Downloads");
+            if path.exists() || std::fs::create_dir_all(&path).is_ok() {
+                return path.to_string_lossy().to_string();
+            }
+        }
+    }
+    std::env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| ".".to_string())
+}
+
+/// Download a file from a URL to the specified path with progress tracking.
+/// `progress` is updated from 0.0 to 1.0 as the download progresses.
+/// Returns Ok(()) on success.
+pub fn download_file_with_progress(
+    url: &str,
+    dest_path: &Path,
+    progress: Arc<Mutex<f32>>,
+) -> Result<(), String> {
+    let response = ureq::get(url)
+        .set("User-Agent", "GitManager")
+        .call()
+        .map_err(|e| format!("Download request failed: {}", e))?;
+
+    // Get total content length for progress calculation
+    let total_size: u64 = response
+        .header("Content-Length")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
+    // Read response body with progress tracking
+    let mut reader = response.into_reader();
+    let mut buffer = Vec::new();
+    let mut downloaded: u64 = 0;
+    let mut chunk = [0u8; 8192];
+
+    loop {
+        let bytes_read = reader
+            .read(&mut chunk)
+            .map_err(|e| format!("Download read error: {}", e))?;
+        if bytes_read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..bytes_read]);
+        downloaded += bytes_read as u64;
+
+        // Update progress
+        if total_size > 0 {
+            let p = downloaded as f32 / total_size as f32;
+            if let Ok(mut prog) = progress.lock() {
+                *prog = p.min(1.0);
+            }
+        }
+    }
+
+    // Write downloaded data to file
+    std::fs::write(dest_path, &buffer)
+        .map_err(|e| format!("Failed to write download to file: {}", e))?;
+
+    // Mark as complete
+    if let Ok(mut prog) = progress.lock() {
+        *prog = 1.0;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -231,5 +516,204 @@ mod tests {
             UpdateState::Error(msg) => assert!(msg.contains("Invalid current version")),
             _ => panic!("Expected Error state for invalid version"),
         }
+    }
+
+    // --- ReleaseAsset deserialization tests ---
+
+    #[test]
+    fn test_release_asset_deserialize() {
+        let json = r#"{
+            "name": "git-manager-0.2.0-windows-x86_64.zip",
+            "browser_download_url": "https://github.com/JohnXu22786/GitManager/releases/download/v0.2.0/git-manager-0.2.0-windows-x86_64.zip",
+            "content_type": "application/zip",
+            "size": 1234567
+        }"#;
+        let asset: ReleaseAsset = serde_json::from_str(json).unwrap();
+        assert_eq!(asset.name, "git-manager-0.2.0-windows-x86_64.zip");
+        assert_eq!(asset.browser_download_url, "https://github.com/JohnXu22786/GitManager/releases/download/v0.2.0/git-manager-0.2.0-windows-x86_64.zip");
+        assert_eq!(asset.content_type, "application/zip");
+    }
+
+    #[test]
+    fn test_release_asset_deserialize_with_optional_size() {
+        let json = r#"{
+            "name": "git-manager-0.2.0-linux-x86_64.tar.gz",
+            "browser_download_url": "https://github.com/JohnXu22786/GitManager/releases/download/v0.2.0/git-manager-0.2.0-linux-x86_64.tar.gz",
+            "content_type": "application/gzip"
+        }"#;
+        let asset: ReleaseAsset = serde_json::from_str(json).unwrap();
+        assert_eq!(asset.name, "git-manager-0.2.0-linux-x86_64.tar.gz");
+        assert_eq!(asset.content_type, "application/gzip");
+    }
+
+    // --- find_asset_by_suffix tests ---
+
+    #[test]
+    fn test_find_asset_by_suffix_found() {
+        let assets = vec![
+            ReleaseAsset {
+                name: "git-manager-0.2.0-linux-x86_64.tar.gz".to_string(),
+                browser_download_url: "https://example.com/linux.tar.gz".to_string(),
+                content_type: "application/gzip".to_string(),
+            },
+            ReleaseAsset {
+                name: "git-manager-0.2.0-windows-x86_64.zip".to_string(),
+                browser_download_url: "https://example.com/windows.zip".to_string(),
+                content_type: "application/zip".to_string(),
+            },
+            ReleaseAsset {
+                name: "git-manager-0.2.0-macos-x86_64.tar.gz".to_string(),
+                browser_download_url: "https://example.com/macos.tar.gz".to_string(),
+                content_type: "application/gzip".to_string(),
+            },
+        ];
+        let result = find_asset_by_suffix(&assets, "windows-x86_64");
+        assert!(result.is_some());
+        let (url, name) = result.unwrap();
+        assert_eq!(url, "https://example.com/windows.zip");
+        assert_eq!(name, "git-manager-0.2.0-windows-x86_64.zip");
+    }
+
+    #[test]
+    fn test_find_asset_by_suffix_macos() {
+        let assets = vec![
+            ReleaseAsset {
+                name: "git-manager-0.2.0-linux-x86_64.tar.gz".to_string(),
+                browser_download_url: "https://example.com/linux.tar.gz".to_string(),
+                content_type: "application/gzip".to_string(),
+            },
+            ReleaseAsset {
+                name: "git-manager-0.2.0-macos-x86_64.tar.gz".to_string(),
+                browser_download_url: "https://example.com/macos.tar.gz".to_string(),
+                content_type: "application/gzip".to_string(),
+            },
+        ];
+        let result = find_asset_by_suffix(&assets, "macos-x86_64");
+        assert!(result.is_some());
+        let (url, name) = result.unwrap();
+        assert_eq!(url, "https://example.com/macos.tar.gz");
+        assert_eq!(name, "git-manager-0.2.0-macos-x86_64.tar.gz");
+    }
+
+    #[test]
+    fn test_find_asset_by_suffix_not_found() {
+        let assets = vec![
+            ReleaseAsset {
+                name: "git-manager-0.2.0-linux-x86_64.tar.gz".to_string(),
+                browser_download_url: "https://example.com/linux.tar.gz".to_string(),
+                content_type: "application/gzip".to_string(),
+            },
+        ];
+        let result = find_asset_by_suffix(&assets, "windows-x86_64");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_asset_by_suffix_empty() {
+        let assets = vec![];
+        let result = find_asset_by_suffix(&assets, "windows-x86_64");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_asset_by_suffix_linux_aarch64() {
+        let assets = vec![
+            ReleaseAsset {
+                name: "git-manager-0.2.0-linux-aarch64.tar.gz".to_string(),
+                browser_download_url: "https://example.com/linux-arm64.tar.gz".to_string(),
+                content_type: "application/gzip".to_string(),
+            },
+            ReleaseAsset {
+                name: "git-manager-0.2.0-linux-x86_64.tar.gz".to_string(),
+                browser_download_url: "https://example.com/linux-x64.tar.gz".to_string(),
+                content_type: "application/gzip".to_string(),
+            },
+        ];
+        let result = find_asset_by_suffix(&assets, "linux-aarch64");
+        assert!(result.is_some());
+        let (url, _) = result.unwrap();
+        assert_eq!(url, "https://example.com/linux-arm64.tar.gz");
+    }
+
+    // --- UpdateState Downloading / Downloaded tests ---
+
+    #[test]
+    fn test_update_state_downloading() {
+        let state = UpdateState::Downloading { progress: 0.5, file_name: "test.zip".to_string() };
+        match state {
+            UpdateState::Downloading { progress, file_name } => {
+                assert!((progress - 0.5).abs() < f32::EPSILON);
+                assert_eq!(file_name, "test.zip");
+            }
+            _ => panic!("Expected Downloading variant"),
+        }
+    }
+
+    #[test]
+    fn test_update_state_downloaded() {
+        let state = UpdateState::Downloaded { file_path: "C:\\Downloads\\test.zip".to_string() };
+        match state {
+            UpdateState::Downloaded { file_path } => {
+                assert_eq!(file_path, "C:\\Downloads\\test.zip");
+            }
+            _ => panic!("Expected Downloaded variant"),
+        }
+    }
+
+    #[test]
+    fn test_update_state_downloading_full_progress() {
+        let state = UpdateState::Downloading { progress: 1.0, file_name: "update.zip".to_string() };
+        match state {
+            UpdateState::Downloading { progress, .. } => {
+                assert!((progress - 1.0).abs() < f32::EPSILON);
+            }
+            _ => panic!("Expected Downloading variant"),
+        }
+    }
+
+    // --- GitHubRelease with assets deserialization test ---
+
+    #[test]
+    fn test_github_release_deserialize_with_assets() {
+        let json = r#"{
+            "tag_name": "v0.2.0",
+            "html_url": "https://github.com/JohnXu22786/GitManager/releases/tag/v0.2.0",
+            "assets": [
+                {
+                    "name": "git-manager-0.2.0-windows-x86_64.zip",
+                    "browser_download_url": "https://github.com/JohnXu22786/GitManager/releases/download/v0.2.0/git-manager-0.2.0-windows-x86_64.zip",
+                    "content_type": "application/zip",
+                    "size": 1234567
+                }
+            ]
+        }"#;
+        let release: GitHubRelease = serde_json::from_str(json).unwrap();
+        assert_eq!(release.tag_name, "v0.2.0");
+        assert_eq!(release.assets.len(), 1);
+        assert_eq!(release.assets[0].name, "git-manager-0.2.0-windows-x86_64.zip");
+        assert!(release.assets[0].browser_download_url.contains("windows-x86_64"));
+    }
+
+    #[test]
+    fn test_github_release_deserialize_without_assets() {
+        // old-style response with no assets field should still work
+        let json = r#"{
+            "tag_name": "v0.1.0",
+            "html_url": "https://github.com/JohnXu22786/GitManager/releases/tag/v0.1.0"
+        }"#;
+        let release: GitHubRelease = serde_json::from_str(json).unwrap();
+        assert_eq!(release.tag_name, "v0.1.0");
+        assert!(release.assets.is_empty(), "Should have empty assets when field is missing");
+    }
+
+    // --- get_default_download_dir tests ---
+
+    #[test]
+    fn test_get_default_download_dir_format() {
+        let dir = get_default_download_dir();
+        assert!(!dir.is_empty(), "Download dir should not be empty");
+        // On any platform, should end with a meaningful name
+        let path = std::path::Path::new(&dir);
+        assert!(path.components().count() > 0, "Should be a valid path");
     }
 }

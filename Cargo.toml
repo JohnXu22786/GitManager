@@ -16,6 +16,9 @@ chrono = "0.4"
 ureq = { version = "2", features = ["json"] }
 open = "5"
 rfd = "0.15"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+tar = "0.4"
+flate2 = "1"
 
 [dev-dependencies]
 tempfile = "3"
