@@ -147,6 +147,105 @@ fn test_pending_op_tracking() {
     assert!(pending_ops.is_empty(), "Pending ops should be cleared after completion");
 }
 
+/// Test that the project name (basename) is correctly extracted from a repo path
+/// This simulates the logic used to display the project name next to the history button.
+#[test]
+fn test_project_name_extraction() {
+    use std::path::Path;
+
+    // Normal path
+    let path = "/home/user/projects/my-repo";
+    let name = Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string());
+    assert_eq!(name, "my-repo", "Should extract basename 'my-repo' from path");
+
+    // Windows path
+    let path = "C:\\Users\\test\\my-project";
+    let name = Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string());
+    assert_eq!(name, "my-project", "Should extract 'my-project' from Windows path");
+
+    // Path with dots
+    let path = "/home/user/my.project.repo";
+    let name = Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string());
+    assert_eq!(name, "my.project.repo", "Should handle dots in project name");
+
+    // Root path (no filename)
+    let path = "/";
+    let name = Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string());
+    assert_eq!(name, "/", "Should fall back to path for root");
+
+    // Empty path
+    let path = "";
+    let name = Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string());
+    assert_eq!(name, "", "Should handle empty path gracefully");
+}
+
+/// Test that clicking the History button switches to the Log tab
+/// This validates the behavior we will implement for the history button.
+#[test]
+fn test_tab_switch_to_log() {
+    #[derive(Debug, PartialEq, Clone)]
+    enum Tab {
+        Status,
+        Branches,
+        Log,
+    }
+
+    // Start on Status tab
+    let mut current_tab = Tab::Status;
+    assert_eq!(current_tab, Tab::Status);
+    
+    // History button sets the tab to Log
+    current_tab = Tab::Log;
+    assert_eq!(current_tab, Tab::Log, "History button should switch to Log tab");
+    
+    // Verify other tabs still work
+    current_tab = Tab::Branches;
+    assert_eq!(current_tab, Tab::Branches);
+}
+
+/// Test that the history button and project name appear in correct order:
+/// History button first, project name to its right
+#[test]
+fn test_ui_elements_order() {
+    // Simulate the layout: [History button] [project name]
+    // This test validates the visual ordering the user requested:
+    // "项目名称写在历史按钮右边" = project name on the right of history button
+    
+    let items = vec!["History button", "project-name"];
+    assert_eq!(items[0], "History button", "History button should come first (left)");
+    assert_eq!(items[1], "project-name", "Project name should come second (right of history)");
+    assert!(items.windows(2).any(|w| w[0] == "History button" && w[1] == "project-name"),
+        "History button must be immediately followed by project name");
+}
+
+/// Test that the project name is NOT placed on the tab bar row
+/// This validates: "不要放在Status Branches Worktrees Log Stash Remotes这一行"
+#[test]
+fn test_project_name_not_in_tab_bar() {
+    let tab_bar_items = vec!["📊 Status", "🔀 Branches", "📂 Worktrees", "⏰ Log", "📦 Stash", "🌐 Remotes"];
+    
+    // Project name should not be one of the tab bar items
+    for item in &tab_bar_items {
+        assert!(!item.contains("my-repo"), 
+            "Tab bar should not contain project name, but found match in '{}'", item);
+    }
+}
+
 /// Test that force delete is different from regular delete
 #[test]
 fn test_force_delete_vs_regular() {

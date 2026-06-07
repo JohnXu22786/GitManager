@@ -75,7 +75,6 @@ pub fn add_enabled_ellipsis(
     ui.add_enabled(enabled, egui::Button::new(widget_text).truncate())
         .on_hover_text(full_text)
 }
-}
 
 #[cfg(test)]
 mod tests {

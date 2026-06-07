@@ -591,6 +591,21 @@ impl eframe::App for App {
                 });
 
                 if self.git.is_open() {
+                    ui.separator();
+                    let project_name = Path::new(&self.repo_path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| self.repo_path.clone());
+                    if ui.button("⏰ History").clicked() {
+                        self.current_tab = Tab::Log;
+                    }
+                    ui.label(
+                        egui::RichText::new(project_name)
+                            .color(egui::Color32::from_rgb(100, 150, 255))
+                            .strong(),
+                    );
+                    ui.separator();
+
                     // Right-side elements anchored to right edge: version, about, refresh, update indicator
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // Show update indicator if an update is available
@@ -683,7 +698,6 @@ impl eframe::App for App {
                         )
                         .on_hover_text(version_text);
                     });
-                }
                 }
             });
         });
