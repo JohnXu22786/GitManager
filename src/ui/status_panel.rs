@@ -24,56 +24,60 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     let staged: Vec<_> = app.status_entries.iter().filter(|e| e.staged).cloned().collect();
     let unstaged: Vec<_> = app.status_entries.iter().filter(|e| !e.staged).cloned().collect();
 
-    if !staged.is_empty() {
-        ui.label(egui::RichText::new("Staged").color(egui::Color32::GREEN).strong());
-        for entry in &staged {
-            let path = entry.path.clone();
-            ui.horizontal(|ui| {
-                let busy = app.is_busy();
-                let color = crate::app::App::status_color_by_type(entry.status);
-                ui.label(egui::RichText::new(format!("[{}]", entry.status)).color(color).monospace());
-                if ui.add_enabled(!busy, egui::Button::new("Unstage")).clicked() {
-                    app.start_operation(ctx, &format!("Unstage {}", path), GitOperation::UnstageFile(path.clone()));
+    egui::ScrollArea::vertical()
+        .id_salt("status_files")
+        .show(ui, |ui| {
+            if !staged.is_empty() {
+                ui.label(egui::RichText::new("Staged").color(egui::Color32::GREEN).strong());
+                for entry in &staged {
+                    let path = entry.path.clone();
+                    ui.horizontal(|ui| {
+                        let busy = app.is_busy();
+                        let color = crate::app::App::status_color_by_type(entry.status);
+                        ui.label(egui::RichText::new(format!("[{}]", entry.status)).color(color).monospace());
+                        if ui.add_enabled(!busy, egui::Button::new("Unstage")).clicked() {
+                            app.start_operation(ctx, &format!("Unstage {}", path), GitOperation::UnstageFile(path.clone()));
+                        }
+                        if ui.add_enabled(!busy, egui::Button::new("Diff")).clicked() {
+                            app.start_operation(ctx, &format!("Diff {}", path), GitOperation::GetDiff { path: path.clone(), staged: true });
+                        }
+                        ui.label(&path);
+                    });
                 }
-                if ui.add_enabled(!busy, egui::Button::new("Diff")).clicked() {
-                    app.start_operation(ctx, &format!("Diff {}", path), GitOperation::GetDiff { path: path.clone(), staged: true });
-                }
-                ui.label(&path);
-            });
-        }
-        ui.separator();
-    }
+                ui.separator();
+            }
 
-    if !unstaged.is_empty() {
-        ui.label(egui::RichText::new("Unstaged").color(egui::Color32::YELLOW).strong());
-        for entry in &unstaged {
-            let path = entry.path.clone();
-            ui.horizontal(|ui| {
-                let busy = app.is_busy();
-                let color = crate::app::App::status_color_by_type(entry.status);
-                ui.label(egui::RichText::new(format!("[{}]", entry.status)).color(color).monospace());
+            if !unstaged.is_empty() {
+                ui.label(egui::RichText::new("Unstaged").color(egui::Color32::YELLOW).strong());
+                for entry in &unstaged {
+                    let path = entry.path.clone();
+                    ui.horizontal(|ui| {
+                        let busy = app.is_busy();
+                        let color = crate::app::App::status_color_by_type(entry.status);
+                        ui.label(egui::RichText::new(format!("[{}]", entry.status)).color(color).monospace());
 
-                if entry.status != 'D' && entry.status != '?' && entry.status != '!' {
-                    if ui.add_enabled(!busy, egui::Button::new("Stage")).clicked() {
-                        app.start_operation(ctx, &format!("Stage {}", path), GitOperation::StageFile(path.clone()));
-                    }
+                        if entry.status != 'D' && entry.status != '?' && entry.status != '!' {
+                            if ui.add_enabled(!busy, egui::Button::new("Stage")).clicked() {
+                                app.start_operation(ctx, &format!("Stage {}", path), GitOperation::StageFile(path.clone()));
+                            }
+                        }
+                        if entry.status != '?' && entry.status != '!' {
+                            if ui.add_enabled(!busy, egui::Button::new("Discard")).clicked() {
+                                app.start_operation(ctx, &format!("Restore {}", path), GitOperation::RestoreFile(path.clone()));
+                            }
+                        }
+                        if ui.add_enabled(!busy, egui::Button::new("Diff")).clicked() {
+                            app.start_operation(ctx, &format!("Diff {}", path), GitOperation::GetDiff { path: path.clone(), staged: false });
+                        }
+                        ui.label(&path);
+                    });
                 }
-                if entry.status != '?' && entry.status != '!' {
-                    if ui.add_enabled(!busy, egui::Button::new("Discard")).clicked() {
-                        app.start_operation(ctx, &format!("Restore {}", path), GitOperation::RestoreFile(path.clone()));
-                    }
-                }
-                if ui.add_enabled(!busy, egui::Button::new("Diff")).clicked() {
-                    app.start_operation(ctx, &format!("Diff {}", path), GitOperation::GetDiff { path: path.clone(), staged: false });
-                }
-                ui.label(&path);
-            });
-        }
-    }
+            }
 
-    if staged.is_empty() && unstaged.is_empty() {
-        ui.label("No changes - working tree clean");
-    }
+            if staged.is_empty() && unstaged.is_empty() {
+                ui.label("No changes - working tree clean");
+            }
+        });
 
     ui.separator();
     ui.add_space(10.0);
@@ -133,5 +137,129 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 );
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::App;
+    use crate::git_ops::StatusEntry;
+
+    /// Helper: run the status panel `show` function in a test context.
+    fn run_status_panel(app: &mut App) {
+        egui::__run_test_ctx(|ctx| {
+                egui::Area::new("test_status_panel".into())
+                .show(ctx, |ui| {
+                    show(app, ui, ctx);
+                });
+        });
+    }
+
+    #[test]
+    fn test_show_empty_entries() {
+        let mut app = App::new();
+        // No entries added - should show "No changes" without panic
+        run_status_panel(&mut app);
+        // No assertion needed; the test passes if no panic occurs
+    }
+
+    #[test]
+    fn test_show_with_staged_entries() {
+        let mut app = App::new();
+        app.status_entries.push(StatusEntry {
+            path: "src/main.rs".into(),
+            status: 'M',
+            staged: true,
+        });
+        app.status_entries.push(StatusEntry {
+            path: "Cargo.toml".into(),
+            status: 'A',
+            staged: true,
+        });
+        run_status_panel(&mut app);
+    }
+
+    #[test]
+    fn test_show_with_unstaged_entries() {
+        let mut app = App::new();
+        app.status_entries.push(StatusEntry {
+            path: "src/lib.rs".into(),
+            status: 'M',
+            staged: false,
+        });
+        app.status_entries.push(StatusEntry {
+            path: "README.md".into(),
+            status: '?',
+            staged: false,
+        });
+        app.status_entries.push(StatusEntry {
+            path: "old_file.txt".into(),
+            status: 'D',
+            staged: false,
+        });
+        run_status_panel(&mut app);
+    }
+
+    #[test]
+    fn test_show_with_both_staged_and_unstaged() {
+        let mut app = App::new();
+        app.status_entries.push(StatusEntry {
+            path: "src/main.rs".into(),
+            status: 'M',
+            staged: true,
+        });
+        app.status_entries.push(StatusEntry {
+            path: "src/main.rs".into(),
+            status: 'M',
+            staged: false,
+        });
+        app.status_entries.push(StatusEntry {
+            path: "new_file.py".into(),
+            status: '?',
+            staged: false,
+        });
+        run_status_panel(&mut app);
+    }
+
+    #[test]
+    fn test_show_with_large_number_of_entries() {
+        let mut app = App::new();
+        // Add 100 entries - this reproduces the scrolling issue
+        // (many entries cause overflow without ScrollArea)
+        for i in 0..100 {
+            app.status_entries.push(StatusEntry {
+                path: format!("src/file_{:03}.rs", i),
+                status: 'M',
+                staged: i % 2 == 0,
+            });
+        }
+        // Should not panic even with many entries
+        run_status_panel(&mut app);
+    }
+
+    #[test]
+    fn test_show_with_conflict_status() {
+        let mut app = App::new();
+        app.status_entries.push(StatusEntry {
+            path: "conflict.txt".into(),
+            status: 'U',
+            staged: false,
+        });
+        run_status_panel(&mut app);
+    }
+
+    #[test]
+    fn test_show_with_all_status_types() {
+        let mut app = App::new();
+        // Test all possible status characters
+        for (i, status) in ['M', 'A', 'D', '?', '!', 'U', 'R'].iter().enumerate() {
+            app.status_entries.push(StatusEntry {
+                path: format!("file_{}.txt", i),
+                status: *status,
+                staged: i % 2 == 0,
+            });
+        }
+        run_status_panel(&mut app);
     }
 }
