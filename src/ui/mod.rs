@@ -52,6 +52,31 @@ pub fn heading_with_buttons(
     });
 }
 
+use eframe::egui;
+
+/// Creates a button whose text is truncated with ellipsis when it exceeds available width.
+/// Hovering over the button shows the full text in a tooltip.
+pub fn ellipsis_button(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) -> egui::Response {
+    let widget_text = text.into();
+    let full_text: String = widget_text.text().to_string();
+    ui.add(egui::Button::new(widget_text).truncate())
+        .on_hover_text(full_text)
+}
+
+/// Creates a conditionally-enabled button with text truncated to ellipsis
+/// when it exceeds available width. Hovering shows the full text in a tooltip.
+pub fn add_enabled_ellipsis(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    text: impl Into<egui::WidgetText>,
+) -> egui::Response {
+    let widget_text = text.into();
+    let full_text: String = widget_text.text().to_string();
+    ui.add_enabled(enabled, egui::Button::new(widget_text).truncate())
+        .on_hover_text(full_text)
+}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,4 +202,5 @@ mod tests {
         assert!(!clicked, "No mouse input in test, button should not be clicked");
     }
 }
+
 
