@@ -257,6 +257,37 @@ pub struct DiffLine {
     pub content: String,
 }
 
+/// Extract a branch name with lossy UTF-8 handling.
+/// Falls back to `from_utf8_lossy` if the name contains invalid UTF-8 bytes.
+/// This ensures branch names with non-UTF-8 encodings (common on Windows with
+/// non-English locales) still display rather than being silently dropped.
+fn safe_branch_name(branch: &git2::Branch) -> String {
+    // Try the standard UTF-8 name first (returns shorthand like "main")
+    if let Ok(Some(name)) = branch.name() {
+        return name.to_string();
+    }
+    // Fall back to raw shorthand bytes with lossy conversion
+    // NOTE: use shorthand_bytes() not name_bytes():
+    //   name_bytes() returns full ref name ("refs/heads/main")
+    //   shorthand_bytes() returns short name ("main")
+    let bytes = branch.get().shorthand_bytes();
+    String::from_utf8_lossy(bytes).to_string()
+}
+
+/// Safely convert an optional `&str` to `String`, falling back to lossy UTF-8
+/// conversion from raw bytes when the `&str` is `None` (which happens when
+/// git2 encounters non-UTF-8 encoded data).
+fn safe_str_lossy(text: Option<&str>, bytes: Option<&[u8]>) -> String {
+    text.map(|s| s.to_string())
+        .or_else(|| bytes.map(|b| String::from_utf8_lossy(b).to_string()))
+        .unwrap_or_default()
+}
+
+/// Convenience wrapper for `safe_str_lossy` when bytes are infallible (&[u8]).
+fn safe_str_lossy_infallible(text: Option<&str>, bytes: &[u8]) -> String {
+    safe_str_lossy(text, Some(bytes))
+}
+
 /// Compare two paths for equality, handling case-insensitivity and separator normalization on Windows.
 fn paths_match(a: &Path, b: &Path) -> bool {
     #[cfg(windows)]
@@ -311,7 +342,17 @@ impl GitRepo {
         let repo = self.repo()?;
         let head = repo.head().map_err(|e| format!("Get HEAD: {}", e))?;
         if head.is_branch() {
-            Ok(head.shorthand().unwrap_or("HEAD").to_string())
+            match head.shorthand() {
+                Some(s) => Ok(s.to_string()),
+                None => {
+                    let bytes = head.shorthand_bytes();
+                    if bytes.is_empty() {
+                        Ok("HEAD".to_string())
+                    } else {
+                        Ok(String::from_utf8_lossy(bytes).to_string())
+                    }
+                }
+            }
         } else {
             let oid = head.target().map(|o| o.to_string()).unwrap_or_default();
             Ok(format!("detached at {}", &oid[..oid.len().min(7)]))
@@ -329,7 +370,7 @@ impl GitRepo {
             let iter = repo.branches(Some(*bt)).map_err(|e| format!("List branches: {}", e))?;
             for b in iter {
                 let (branch, _) = b.map_err(|e| format!("Branch: {}", e))?;
-                let name = branch.name().ok().flatten().unwrap_or("").to_string();
+                let name = safe_branch_name(&branch);
                 let is_remote = *bt == BranchType::Remote;
                 let is_head = !is_remote && Some(name.as_str()) == head_branch.as_deref();
 
@@ -808,11 +849,11 @@ impl GitRepo {
                 commits.push(CommitInfo {
                     sha: oid.to_string(),
                     short_sha: oid.to_string().get(..7).unwrap_or("").to_string(),
-                    author: c.author().name().unwrap_or("").to_string(),
+                    author: safe_str_lossy_infallible(c.author().name(), c.author().name_bytes()),
                     time: DateTime::from_timestamp(c.time().seconds(), 0)
                         .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string()).unwrap_or_default(),
-                    message: c.message().unwrap_or("").to_string(),
-                    summary: c.summary().unwrap_or("").to_string(),
+                    message: safe_str_lossy_infallible(c.message(), c.message_bytes()),
+                    summary: safe_str_lossy(c.summary(), c.summary_bytes()),
                 });
             }
         }
@@ -919,6 +960,7 @@ impl GitRepo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use git2::Repository;
 
     /// Helper to create a temporary git repo with an initial commit
     fn create_repo_with_commit(dir: &Path) -> Repository {
@@ -1109,5 +1151,77 @@ mod tests {
         assert!(!wt_path.exists(), "Worktree dir should be removed");
         let wt_gitdir = repo.path().join("worktrees").join(wt_name);
         assert!(!wt_gitdir.exists(), "Git worktree metadata should be removed");
+    }
+
+    // --- Encoding / UTF-8 tests ---
+
+    #[test]
+    fn test_safe_branch_name_utf8() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(dir.path());
+        // Get the actual default branch name (may be 'master' or 'main' depending on git config)
+        let head = repo.head().expect("HEAD");
+        let expected_name = head.shorthand().expect("branch name").to_string();
+        let branch = repo.find_branch(&expected_name, BranchType::Local).expect("find branch");
+        let name = safe_branch_name(&branch);
+        assert_eq!(name, expected_name, "Regular UTF-8 branch name '{}' should be preserved", expected_name);
+    }
+
+    #[test]
+    fn test_safe_str_lossy_valid_utf8() {
+        let text = "Hello, 世界!";
+        let result = safe_str_lossy(Some(text), Some(text.as_bytes()));
+        assert_eq!(result, text, "Valid UTF-8 text should be preserved");
+    }
+
+    #[test]
+    fn test_safe_str_lossy_fallback_to_bytes() {
+        let bytes: &[u8] = &[0x48, 0x65, 0x6c, 0x6c, 0x6f];
+        // When text is None but bytes are valid UTF-8, should still work
+        let result = safe_str_lossy(None, Some(bytes));
+        assert_eq!(result, "Hello", "Should fall back to bytes when text is None");
+    }
+
+    #[test]
+    fn test_safe_str_lossy_non_utf8_bytes() {
+        let invalid_bytes: &[u8] = &[0x48, 0x65, 0xFF, 0xFE, 0x6c]; // invalid UTF-8
+        let result = safe_str_lossy(None, Some(invalid_bytes));
+        // Should use replacement characters for invalid bytes
+        assert!(result.starts_with("He"), "Should preserve valid prefix");
+        assert!(result.ends_with("l"), "Should preserve valid suffix");
+    }
+
+    #[test]
+    fn test_safe_str_lossy_both_none() {
+        let result = safe_str_lossy(None, None);
+        assert_eq!(result, "", "Should return empty string when both are None");
+    }
+
+    #[test]
+    fn test_safe_str_lossy_prefers_text_over_bytes() {
+        let text = "preferred";
+        let bytes: &[u8] = b"not_used";
+        let result = safe_str_lossy(Some(text), Some(bytes));
+        assert_eq!(result, "preferred", "Should prefer &str over bytes when both available");
+    }
+
+    #[test]
+    fn test_safe_str_lossy_unicode_text() {
+        let result = safe_str_lossy(Some("↑1 ↓0 — 分支 历史"), Some("↑1 ↓0 — 分支 历史".as_bytes()));
+        assert_eq!(result, "↑1 ↓0 — 分支 历史", "Unicode characters should be preserved");
+    }
+
+    #[test]
+    fn test_safe_str_lossy_infallible_valid() {
+        let text = "Hello";
+        let result = safe_str_lossy_infallible(Some(text), text.as_bytes());
+        assert_eq!(result, "Hello", "Infallible wrapper should work with valid text");
+    }
+
+    #[test]
+    fn test_safe_str_lossy_infallible_fallback() {
+        let bytes: &[u8] = &[0x57, 0x6f, 0x72, 0x6c, 0x64];
+        let result = safe_str_lossy_infallible(None, bytes);
+        assert_eq!(result, "World", "Infallible wrapper should fall back to bytes");
     }
 }

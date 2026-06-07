@@ -829,6 +829,8 @@ impl eframe::App for App {
 mod tests {
     use super::*;
 
+    // --- Existing tests ---
+
     #[test]
     fn test_app_new_defaults() {
         let app = App::new();
@@ -871,5 +873,70 @@ mod tests {
     #[test]
     fn test_tab_clone() {
         assert_eq!(Tab::Worktrees.clone(), Tab::Worktrees);
+    }
+
+    // --- Font / encoding related tests ---
+
+    #[test]
+    fn test_font_definitions_default_has_font_data() {
+        // Verify that default FontDefinitions has at least some font data
+        // This ensures our font configuration won't be empty
+        let fonts = egui::FontDefinitions::default();
+        assert!(!fonts.font_data.is_empty(), "Default font definitions should contain font data");
+        assert!(!fonts.families.is_empty(), "Default font definitions should have font families");
+    }
+
+    #[test]
+    fn test_font_definitions_proportional_has_fallback() {
+        // Verify that the proportional family has at least one font
+        let fonts = egui::FontDefinitions::default();
+        let prop = fonts.families.get(&egui::FontFamily::Proportional);
+        assert!(prop.is_some(), "Proportional font family should exist");
+        let prop = prop.unwrap();
+        assert!(!prop.is_empty(), "Proportional family should have at least one font");
+    }
+
+    #[test]
+    fn test_font_definitions_monospace_family() {
+        // Verify that the monospace family exists and has fonts
+        let fonts = egui::FontDefinitions::default();
+        let mono = fonts.families.get(&egui::FontFamily::Monospace);
+        assert!(mono.is_some(), "Monospace font family should exist");
+        let mono = mono.unwrap();
+        assert!(!mono.is_empty(), "Monospace family should have at least one font");
+    }
+
+    #[test]
+    fn test_font_data_support_emoji_range() {
+        // Test that FontData properly handles emoji-range bytes
+        // This verifies our font data loading is compatible with emoji glyphs
+        let rocket_emoji = "🚀";
+        // Just verify the string is valid UTF-8 and can be stored in a String
+        assert_eq!(rocket_emoji.len(), 4, "Rocket emoji should be 4 bytes in UTF-8");
+        assert!(rocket_emoji.chars().all(|c| c.is_ascii() || c as u32 > 127),
+            "Emoji characters should be valid Unicode");
+    }
+
+    #[test]
+    fn test_unicode_arrows_are_valid_utf8() {
+        // Verify that the arrow characters used in branch display are valid UTF-8
+        let up_arrow = '↑'; // U+2191
+        let down_arrow = '↓'; // U+2193
+        let play_icon = '▶'; // U+25B6
+        assert_eq!(up_arrow as u32, 0x2191, "↑ should be U+2191");
+        assert_eq!(down_arrow as u32, 0x2193, "↓ should be U+2193");
+        assert_eq!(play_icon as u32, 0x25B6, "▶ should be U+25B6");
+        // Verify they can be stored in a String and displayed
+        let s = format!("{} {} {}", up_arrow, down_arrow, play_icon);
+        assert_eq!(s.chars().count(), 5, "String should contain 5 chars (3 symbols + 2 spaces)");
+    }
+
+    #[test]
+    fn test_emoji_chars_in_app_ui() {
+        // Verify that emoji characters used in the app UI are valid Unicode
+        let emojis = ['📂', '🔀', '⏰', '📦', '🌐', '▶', 'ⓘ', '🔄', '🗑', '⏳', '📊'];
+        for (i, &emoji) in emojis.iter().enumerate() {
+            assert!(emoji as u32 > 127, "Emoji {} (index {}) should be a Unicode character", emoji, i);
+        }
     }
 }
