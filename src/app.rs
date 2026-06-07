@@ -86,6 +86,8 @@ pub struct App {
     needs_refresh: bool,
     pub recent_repos: RecentRepos,
     pub status_expanded: bool,
+    /// When true, shows a popup window with the full status message.
+    pub show_message_popup: bool,
 }
 
 impl App {
@@ -145,6 +147,7 @@ impl App {
             needs_refresh: false,
             recent_repos: RecentRepos::load(),
             status_expanded: false,
+            show_message_popup: false,
         }
     }
 
@@ -351,6 +354,7 @@ impl App {
     }
 
     /// Flush accumulated messages from background operations into the UI message bar.
+    /// New errors OVERWRITE old ones (requirement: "no persistent display, new info overwrites").
     pub fn flush_messages(&mut self) {
         if !self.pending_successes.is_empty() {
             self.success_message = self.pending_successes.join(" | ");
@@ -359,12 +363,8 @@ impl App {
         if !self.pending_errors.is_empty() {
             let msg = self.pending_errors.join(" | ");
             self.pending_errors.clear();
-            // Prepend to existing error if any
-            if self.error_message.is_empty() {
-                self.error_message = msg;
-            } else {
-                self.error_message = format!("{} | {}", self.error_message, msg);
-            }
+            // Overwrite: new errors replace old ones (do not append)
+            self.error_message = msg;
         }
     }
 
@@ -718,64 +718,14 @@ impl eframe::App for App {
                             }
                         }
 
+                        // Single right_to_left layout: buttons on the right, messages on the left.
+                        // Messages get remaining space and truncate with ellipsis BEFORE overlapping buttons.
                         let has_message =
                             !self.error_message.is_empty() || !self.success_message.is_empty();
-                        if has_message && !self.is_busy() {
-                            if !self.error_message.is_empty() {
-                                if self.status_expanded {
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(&self.error_message)
-                                                .color(App::adaptive_red(dark)),
-                                        )
-                                        .wrap(),
-                                    );
-                                } else {
-                                    let err = self.error_message.clone();
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(&err)
-                                                .color(egui::Color32::RED),
-                                        )
-                                        .truncate(),
-                                    )
-                                    .on_hover_text(err);
-                                }
-                            }
-                            if !self.success_message.is_empty() {
-                                if self.status_expanded {
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(&self.success_message)
-                                                .color(App::adaptive_green(dark)),
-                                        )
-                                        .wrap(),
-                                    );
-                                } else {
-                                    let msg = self.success_message.clone();
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(&msg)
-                                                .color(egui::Color32::GREEN),
-                                        )
-                                        .truncate(),
-                                    )
-                                    .on_hover_text(msg);
-                                }
-                            }
-                        }
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
                                 if has_message && !self.is_busy() {
-                                    let expand_label = if self.status_expanded {
-                                        "▼"
-                                    } else {
-                                        "▲"
-                                    };
-                                    if crate::ui::ellipsis_button(ui, expand_label).clicked() {
-                                        self.status_expanded = !self.status_expanded;
-                                    }
                                     if crate::ui::ellipsis_button(ui, "x").clicked() {
                                         self.error_message.clear();
                                         self.success_message.clear();
@@ -789,6 +739,39 @@ impl eframe::App for App {
                                         .truncate(),
                                 )
                                 .on_hover_text(elapsed_text);
+
+                                if has_message && !self.is_busy() {
+                                    if !self.error_message.is_empty() {
+                                        let msg_text = self.error_message.clone();
+                                        let resp = ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(&msg_text)
+                                                    .color(App::adaptive_red(dark)),
+                                            )
+                                            .truncate()
+                                            .sense(egui::Sense::click()),
+                                        )
+                                        .on_hover_text(msg_text);
+                                        if resp.clicked() {
+                                            self.show_message_popup = true;
+                                        }
+                                    }
+                                    if !self.success_message.is_empty() {
+                                        let msg_text = self.success_message.clone();
+                                        let resp = ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(&msg_text)
+                                                    .color(App::adaptive_green(dark)),
+                                            )
+                                            .truncate()
+                                            .sense(egui::Sense::click()),
+                                        )
+                                        .on_hover_text(msg_text);
+                                        if resp.clicked() {
+                                            self.show_message_popup = true;
+                                        }
+                                    }
+                                }
                             },
                         );
                     });
@@ -1021,6 +1004,50 @@ impl eframe::App for App {
         // Keep repainting while operations are in progress
         if self.is_busy() {
             ctx.request_repaint();
+        }
+
+        // --- Message popup window (clicking a truncated status message opens this) ---
+        if self.show_message_popup {
+            let has_error = !self.error_message.is_empty();
+            let has_success = !self.success_message.is_empty();
+            let popup_title = if has_error {
+                "Error Details"
+            } else if has_success {
+                "Success Details"
+            } else {
+                "Message"
+            };
+            let popup_content = if has_error {
+                self.error_message.clone()
+            } else if has_success {
+                self.success_message.clone()
+            } else {
+                String::new()
+            };
+
+            egui::Window::new(popup_title)
+                .resizable(true)
+                .default_size([500.0, 200.0])
+                .min_width(250.0)
+                .min_height(100.0)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .open(&mut self.show_message_popup)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let color = if has_error {
+                                App::adaptive_red(dark)
+                            } else {
+                                App::adaptive_green(dark)
+                            };
+                            ui.label(
+                                egui::RichText::new(&popup_content)
+                                    .color(color)
+                                    .size(14.0),
+                            );
+                        });
+                });
         }
     }
 }
@@ -1319,5 +1346,89 @@ mod tests {
         let result = App::format_elapsed(u64::MAX);
         assert!(!result.is_empty());
         assert!(result.contains("h ago"));
+    }
+
+    // --- Status bar truncation & overwrite tests ---
+
+    #[test]
+    fn test_show_message_popup_initially_false() {
+        let app = App::new();
+        assert!(!app.show_message_popup);
+    }
+
+    #[test]
+    fn test_flush_messages_overwrites_error() {
+        let mut app = App::new();
+        app.pending_errors.push("first error".into());
+        app.flush_messages();
+        assert_eq!(app.error_message, "first error");
+        assert!(app.pending_errors.is_empty());
+
+        app.pending_errors.push("second error".into());
+        app.flush_messages();
+        assert_eq!(
+            app.error_message, "second error",
+            "flush_messages should overwrite, not append, old error_message"
+        );
+    }
+
+    #[test]
+    fn test_flush_messages_overwrites_multiple_errors_with_single_message() {
+        let mut app = App::new();
+        app.pending_errors.push("error one".into());
+        app.pending_errors.push("error two".into());
+        app.flush_messages();
+        assert_eq!(app.error_message, "error one | error two");
+
+        app.pending_errors.push("fresh error".into());
+        app.flush_messages();
+        assert_eq!(
+            app.error_message, "fresh error",
+            "After overwrite, should only contain the new error, not accumulated"
+        );
+    }
+
+    #[test]
+    fn test_flush_messages_success_works_independently() {
+        let mut app = App::new();
+        app.pending_successes.push("success!".into());
+        app.flush_messages();
+        assert_eq!(app.success_message, "success!");
+        assert!(app.error_message.is_empty());
+    }
+
+    #[test]
+    fn test_flush_messages_does_not_clear_error_when_no_pending_errors() {
+        let mut app = App::new();
+        app.error_message = "existing error".into();
+        app.flush_messages();
+        assert_eq!(app.error_message, "existing error");
+    }
+
+    #[test]
+    fn test_flush_messages_success_multiple_joined() {
+        let mut app = App::new();
+        app.pending_successes.push("done".into());
+        app.pending_successes.push("pushed".into());
+        app.flush_messages();
+        assert_eq!(app.success_message, "done | pushed");
+    }
+
+    #[test]
+    fn test_show_error_overwrites() {
+        let mut app = App::new();
+        app.error_message = "old error".into();
+        app.show_error("new error".into());
+        assert_eq!(app.error_message, "new error");
+    }
+
+    #[test]
+    fn test_message_popup_store_full_text() {
+        let mut app = App::new();
+        app.show_error("detailed error message".into());
+        app.show_success("detailed success message".into());
+        assert!(!app.show_message_popup);
+        assert_eq!(app.error_message, "detailed error message");
+        assert_eq!(app.success_message, "detailed success message");
     }
 }
