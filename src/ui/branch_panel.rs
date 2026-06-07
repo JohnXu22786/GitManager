@@ -5,11 +5,11 @@ use eframe::egui;
 
 pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     ui.horizontal(|ui| {
-        ui.heading("Branches");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if crate::ui::add_enabled_ellipsis(ui, !app.is_busy(), "🔄 Refresh").clicked() {
                 app.refresh_all();
             }
+            ui.add(egui::Label::new(egui::RichText::new("Branches").heading()).truncate()).on_hover_text("Branches");
         });
     });
 
@@ -131,35 +131,11 @@ fn show_branch_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, branch
         };
 
         ui.label(egui::RichText::new(icon).color(name_color).strong());
-        ui.label(egui::RichText::new(&branch.name).color(name_color));
-
-        if let Some(upstream) = &branch.upstream {
-            if !upstream.is_empty() {
-                let tracking = if branch.ahead > 0 || branch.behind > 0 {
-                    format!(" (↑{} ↓{})", branch.ahead, branch.behind)
-                } else {
-                    String::new()
-                };
-                ui.label(
-                    egui::RichText::new(format!("→ {} {}", upstream, tracking))
-                        .color(egui::Color32::GRAY)
-                        .text_style(egui::TextStyle::Small),
-                );
-            }
-        }
-
-        if let Some(msg) = &branch.last_commit {
-            if !msg.is_empty() {
-                ui.label(
-                    egui::RichText::new(msg)
-                        .color(egui::Color32::GRAY)
-                        .text_style(egui::TextStyle::Small),
-                );
-            }
-        }
 
         let busy = app.is_busy();
+        // right_to_left: buttons on right edge, text on left, text truncates when overlapped
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Buttons first (placed rightmost → going left)
             if !is_head && !is_remote {
                 if crate::ui::add_enabled_ellipsis(ui, !busy, "Copy").clicked() {
                     ui.ctx().copy_text(name.clone());
@@ -168,8 +144,7 @@ fn show_branch_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, branch
                 if crate::ui::add_enabled_ellipsis(ui, !busy, "Delete").clicked() {
                     app.start_operation(ctx, &format!("Delete '{}'", name), GitOperation::DeleteBranch { name: name.clone(), force: false });
                 }
-                if crate::ui::add_enabled_ellipsis(ui, !busy, "Force Del").clicked() {
-                    // FIX: Pass force=true for Force Del, and try reference deletion
+                if ui.add_enabled(!busy, egui::Button::new("Force Del")).clicked() {
                     app.start_operation(ctx, &format!("Force delete '{}'", name), GitOperation::DeleteBranch { name: name.clone(), force: true });
                 }
             }
@@ -178,6 +153,55 @@ fn show_branch_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, branch
                     app.start_operation(ctx, &format!("Checkout '{}'", name), GitOperation::CheckoutBranch(name));
                 }
             }
+
+            // Text after buttons: in right_to_left, LAST added = LEFTMOST
+            // Add text in display order: left to right
+
+            // Last commit message (leftmost text)
+            if let Some(msg) = &branch.last_commit {
+                if !msg.is_empty() {
+                    let msg_clone = msg.clone();
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(msg)
+                                .color(egui::Color32::GRAY)
+                                .text_style(egui::TextStyle::Small),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(msg_clone);
+                }
+            }
+
+            // Upstream info (middle text, to the right of commit msg)
+            if let Some(upstream) = &branch.upstream {
+                if !upstream.is_empty() {
+                    let tracking = if branch.ahead > 0 || branch.behind > 0 {
+                        format!(" (↑{} ↓{})", branch.ahead, branch.behind)
+                    } else {
+                        String::new()
+                    };
+                    let upstream_text = format!("→ {} {}", upstream, tracking);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&upstream_text)
+                                .color(egui::Color32::GRAY)
+                                .text_style(egui::TextStyle::Small),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(upstream_text);
+                }
+            }
+
+            // Branch name (rightmost text, closest to buttons)
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(&branch.name).color(name_color),
+                )
+                .truncate(),
+            )
+            .on_hover_text(&branch.name);
         });
     });
 }

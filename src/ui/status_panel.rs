@@ -3,9 +3,8 @@ use crate::git_ops::GitOperation;
 use eframe::egui;
 
 pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
-    let dark = ctx.style().visuals.dark_mode;
+    // Heading row: heading text truncates, buttons stay anchored to right edge
     ui.horizontal(|ui| {
-        ui.heading("Changes");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let busy = app.is_busy();
             if crate::ui::add_enabled_ellipsis(ui, !busy, "Stage All").clicked() {
@@ -17,6 +16,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             if crate::ui::add_enabled_ellipsis(ui, !busy, "Discard All").clicked() {
                 app.start_operation(ctx, "Discarding all", GitOperation::RestoreAll);
             }
+            ui.add(egui::Label::new(egui::RichText::new("Changes").heading()).truncate()).on_hover_text("Changes");
         });
     });
 
@@ -33,13 +33,17 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 let busy = app.is_busy();
                 let color = crate::app::App::status_color_by_type(entry.status, dark);
                 ui.label(egui::RichText::new(format!("[{}]", entry.status)).color(color).monospace());
-                if crate::ui::add_enabled_ellipsis(ui, !busy, "Unstage").clicked() {
-                    app.start_operation(ctx, &format!("Unstage {}", path), GitOperation::UnstageFile(path.clone()));
-                }
-                if crate::ui::add_enabled_ellipsis(ui, !busy, "Diff").clicked() {
-                    app.start_operation(ctx, &format!("Diff {}", path), GitOperation::GetDiff { path: path.clone(), staged: true });
-                }
-                ui.label(&path);
+                // Buttons anchored to right edge, path truncates in between
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add_enabled(!busy, egui::Button::new("Unstage")).clicked() {
+                        app.start_operation(ctx, &format!("Unstage {}", path), GitOperation::UnstageFile(path.clone()));
+                    }
+                    if ui.add_enabled(!busy, egui::Button::new("Diff")).clicked() {
+                        app.start_operation(ctx, &format!("Diff {}", path), GitOperation::GetDiff { path: path.clone(), staged: true });
+                    }
+                    let path_clone = path.clone();
+                    ui.add(egui::Label::new(&path).truncate()).on_hover_text(path_clone);
+                });
             });
         }
         ui.separator();
@@ -54,20 +58,23 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 let color = crate::app::App::status_color_by_type(entry.status, dark);
                 ui.label(egui::RichText::new(format!("[{}]", entry.status)).color(color).monospace());
 
-                if entry.status != 'D' && entry.status != '?' && entry.status != '!' {
-                    if crate::ui::add_enabled_ellipsis(ui, !busy, "Stage").clicked() {
-                        app.start_operation(ctx, &format!("Stage {}", path), GitOperation::StageFile(path.clone()));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if entry.status != 'D' && entry.status != '?' && entry.status != '!' {
+                        if ui.add_enabled(!busy, egui::Button::new("Stage")).clicked() {
+                            app.start_operation(ctx, &format!("Stage {}", path), GitOperation::StageFile(path.clone()));
+                        }
                     }
-                }
-                if entry.status != '?' && entry.status != '!' {
-                    if crate::ui::add_enabled_ellipsis(ui, !busy, "Discard").clicked() {
-                        app.start_operation(ctx, &format!("Restore {}", path), GitOperation::RestoreFile(path.clone()));
+                    if entry.status != '?' && entry.status != '!' {
+                        if ui.add_enabled(!busy, egui::Button::new("Discard")).clicked() {
+                            app.start_operation(ctx, &format!("Restore {}", path), GitOperation::RestoreFile(path.clone()));
+                        }
                     }
-                }
-                if crate::ui::add_enabled_ellipsis(ui, !busy, "Diff").clicked() {
-                    app.start_operation(ctx, &format!("Diff {}", path), GitOperation::GetDiff { path: path.clone(), staged: false });
-                }
-                ui.label(&path);
+                    if ui.add_enabled(!busy, egui::Button::new("Diff")).clicked() {
+                        app.start_operation(ctx, &format!("Diff {}", path), GitOperation::GetDiff { path: path.clone(), staged: false });
+                    }
+                    let path_clone = path.clone();
+                    ui.add(egui::Label::new(&path).truncate()).on_hover_text(path_clone);
+                });
             });
         }
     }
