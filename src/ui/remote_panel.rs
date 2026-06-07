@@ -51,9 +51,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     let current_branch = app.git.current_branch().unwrap_or_default();
     let default_remote = app.remote_list.first().map(|r| r.name.clone()).unwrap_or_default();
 
-    if app.push_branch.is_empty() {
-        app.push_branch = current_branch.clone();
-    }
+    app.push_branch = current_branch.clone();
     if app.remote_name.is_empty() {
         app.remote_name = default_remote.clone();
     }
