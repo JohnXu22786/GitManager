@@ -474,41 +474,8 @@ impl eframe::App for App {
                     }
                 });
 
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        egui::RichText::new(format!("v{}", crate::version_info::VERSION))
-                            .color(egui::Color32::GRAY)
-                            .text_style(egui::TextStyle::Small),
-                    );
-                    if ui.button("ⓘ").clicked() {
-                        self.show_about = !self.show_about;
-                    }
-                });
-
                 if self.git.is_open() {
-                    ui.separator();
-                    ui.label(
-                        egui::RichText::new(&self.repo_path)
-                            .color(egui::Color32::from_rgb(100, 150, 255)),
-                    );
-                    ui.separator();
-
-                    let branch = self.git.current_branch().unwrap_or_default();
-                    ui.label(format!("🔀 {}", branch));
-
-                    let status_count = self.status_entries.len();
-                    if status_count > 0 {
-                        ui.label(
-                            egui::RichText::new(format!("{} changes", status_count))
-                                .color(egui::Color32::YELLOW),
-                        );
-                    }
-
-                    if !self.remote_list.is_empty() {
-                        let remote = &self.remote_list[0];
-                        ui.label(format!("🌐 {}", remote.name));
-                    }
-
+                    // Right-side elements anchored to right edge: version, about, refresh, update indicator
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // Show update indicator if an update is available
                         {
@@ -524,9 +491,81 @@ impl eframe::App for App {
                         if ui.add_enabled(!self.is_busy(), egui::Button::new("🔄")).clicked() {
                             self.refresh_all();
                         }
+                        // About button
                         if ui.button("ⓘ").clicked() {
                             self.show_about = !self.show_about;
                         }
+                        // Version label (truncatable so it doesn't push buttons off-screen)
+                        let version_text = format!("v{}", crate::version_info::VERSION);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&version_text)
+                                    .color(egui::Color32::GRAY)
+                                    .text_style(egui::TextStyle::Small),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(version_text);
+                    });
+
+                    ui.separator();
+                    // Make repo path label truncatable when window is too narrow
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&self.repo_path)
+                                .color(egui::Color32::from_rgb(100, 150, 255)),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(&self.repo_path);
+                    ui.separator();
+
+                    let branch = self.git.current_branch().unwrap_or_default();
+                    let branch_text = format!("🔀 {}", branch);
+                    ui.add(
+                        egui::Label::new(&branch_text)
+                            .truncate(),
+                    )
+                    .on_hover_text(&branch_text);
+
+                    let status_count = self.status_entries.len();
+                    if status_count > 0 {
+                        let status_text = format!("{} changes", status_count);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&status_text)
+                                    .color(egui::Color32::YELLOW),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(&status_text);
+                    }
+
+                    if !self.remote_list.is_empty() {
+                        let remote = &self.remote_list[0];
+                        let remote_text = format!("🌐 {}", remote.name);
+                        ui.add(
+                            egui::Label::new(&remote_text)
+                                .truncate(),
+                        )
+                        .on_hover_text(&remote_text);
+                    }
+                } else {
+                    // No repo open: show version + about on the right
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("ⓘ").clicked() {
+                            self.show_about = !self.show_about;
+                        }
+                        let version_text = format!("v{}", crate::version_info::VERSION);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&version_text)
+                                    .color(egui::Color32::GRAY)
+                                    .text_style(egui::TextStyle::Small),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(version_text);
                     });
                 }
             });
@@ -561,10 +600,15 @@ impl eframe::App for App {
                                         .wrap(),
                                     );
                                 } else {
-                                    ui.label(
-                                        egui::RichText::new(&self.error_message)
-                                            .color(egui::Color32::RED),
-                                    );
+                                    let err = self.error_message.clone();
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&err)
+                                                .color(egui::Color32::RED),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(err);
                                 }
                             }
                             if !self.success_message.is_empty() {
@@ -577,10 +621,15 @@ impl eframe::App for App {
                                         .wrap(),
                                     );
                                 } else {
-                                    ui.label(
-                                        egui::RichText::new(&self.success_message)
-                                            .color(egui::Color32::GREEN),
-                                    );
+                                    let msg = self.success_message.clone();
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&msg)
+                                                .color(egui::Color32::GREEN),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(msg);
                                 }
                             }
                         }
@@ -602,13 +651,22 @@ impl eframe::App for App {
                                     }
                                 }
                                 ui.separator();
-                                ui.label("Font:");
+                                ui.add(
+                                    egui::Label::new("Font:")
+                                        .truncate(),
+                                )
+                                .on_hover_text("Font size");
                                 ui.add(
                                     egui::Slider::new(&mut self.font_size, Self::MIN_FONT_SIZE..=Self::MAX_FONT_SIZE)
                                         .show_value(false),
                                 );
                                 let elapsed = self.last_refresh.elapsed().as_secs();
-                                ui.label(format!("Updated {}s ago", elapsed));
+                                let elapsed_text = format!("Updated {}s ago", elapsed);
+                                ui.add(
+                                    egui::Label::new(&elapsed_text)
+                                        .truncate(),
+                                )
+                                .on_hover_text(elapsed_text);
                             },
                         );
                     });
@@ -681,30 +739,34 @@ impl eframe::App for App {
                 return;
             }
 
-            // Tab bar
-            ui.horizontal(|ui| {
-                let tabs = [
-                    (Tab::Status, "📊 Status"),
-                    (Tab::Branches, "🔀 Branches"),
-                    (Tab::Worktrees, "📂 Worktrees"),
-                    (Tab::Log, "⏰ Log"),
-                    (Tab::Stash, "📦 Stash"),
-                    (Tab::Remotes, "🌐 Remotes"),
-                ];
+            // Tab bar — wrapped in horizontal ScrollArea so tabs don't overflow when window is narrow
+            egui::ScrollArea::horizontal()
+                .id_salt("tab_bar_scroll")
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let tabs = [
+                            (Tab::Status, "📊 Status"),
+                            (Tab::Branches, "🔀 Branches"),
+                            (Tab::Worktrees, "📂 Worktrees"),
+                            (Tab::Log, "⏰ Log"),
+                            (Tab::Stash, "📦 Stash"),
+                            (Tab::Remotes, "🌐 Remotes"),
+                        ];
 
-                for (tab, label) in &tabs {
-                    let selected = self.current_tab == *tab;
-                    let btn = egui::Button::new(*label)
-                        .fill(if selected {
-                            ui.style().visuals.selection.bg_fill
-                        } else {
-                            egui::Color32::TRANSPARENT
-                        });
-                    if ui.add(btn).clicked() {
-                        self.current_tab = tab.clone();
-                    }
-                }
-            });
+                        for (tab, label) in &tabs {
+                            let selected = self.current_tab == *tab;
+                            let btn = egui::Button::new(*label)
+                                .fill(if selected {
+                                    ui.style().visuals.selection.bg_fill
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                });
+                            if ui.add(btn).clicked() {
+                                self.current_tab = tab.clone();
+                            }
+                        }
+                    });
+                });
 
             ui.separator();
 

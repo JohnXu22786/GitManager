@@ -4,11 +4,11 @@ use eframe::egui;
 
 pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     ui.horizontal(|ui| {
-        ui.heading("Remotes");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.add_enabled(!app.is_busy(), egui::Button::new("🔄 Refresh")).clicked() {
                 app.refresh_all();
             }
+            ui.add(egui::Label::new(egui::RichText::new("Remotes").heading()).truncate()).on_hover_text("Remotes");
         });
     });
 
@@ -19,12 +19,24 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         for remote in &app.remote_list {
             ui.group(|ui| {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(&remote.name).color(egui::Color32::from_rgb(100, 200, 255)).strong());
-                    ui.label(
-                        egui::RichText::new(&remote.url)
-                            .color(egui::Color32::GRAY)
-                            .text_style(egui::TextStyle::Small),
-                    );
+                    let name_clone = remote.name.clone();
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&remote.name).color(egui::Color32::from_rgb(100, 200, 255)).strong(),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(name_clone);
+                    let url_clone = remote.url.clone();
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&remote.url)
+                                .color(egui::Color32::GRAY)
+                                .text_style(egui::TextStyle::Small),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(url_clone);
                 });
             });
         }

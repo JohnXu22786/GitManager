@@ -5,7 +5,6 @@ use eframe::egui;
 
 pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     ui.horizontal(|ui| {
-        ui.heading("Worktrees");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let busy = app.is_busy();
             if ui.add_enabled(!busy, egui::Button::new("🔄 Refresh")).clicked() {
@@ -20,6 +19,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 }
                 app.show_success("Pruning worktrees...".into());
             }
+            ui.add(egui::Label::new(egui::RichText::new("Worktrees").heading()).truncate()).on_hover_text("Worktrees");
         });
     });
 
@@ -109,17 +109,9 @@ fn show_worktree_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, wt: 
         let icon = if wt.is_main { "★" } else { "○" };
         ui.label(egui::RichText::new(icon).color(egui::Color32::GOLD));
 
-        let branch_display = wt.branch.as_deref().unwrap_or("detached");
-        let sha_short = wt.sha.get(..7).unwrap_or(&wt.sha);
-        ui.label(format!("{} [{}]", branch_display, sha_short));
-        ui.label(
-            egui::RichText::new(wt.path.to_string_lossy())
-                .color(egui::Color32::GRAY)
-                .text_style(egui::TextStyle::Small),
-        );
-
         if !wt.is_main {
             let busy = app.is_busy();
+            // Buttons on the right edge, text on the left, truncates when overlapped
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.add_enabled(!busy, egui::Button::new("Remove")).clicked() {
                     app.start_operation(ctx, &format!("Remove {:?}", wt_path), GitOperation::RemoveWorktree { path: wt_path.clone(), force: false });
@@ -127,7 +119,49 @@ fn show_worktree_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, wt: 
                 if ui.add_enabled(!busy, egui::Button::new("Force Remove")).clicked() {
                     app.start_operation(ctx, &format!("Force remove {:?}", wt_path), GitOperation::RemoveWorktree { path: wt_path.clone(), force: true });
                 }
+
+                // Path (left text - truncatable)
+                let path_display = wt.path.to_string_lossy().to_string();
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&path_display)
+                            .color(egui::Color32::GRAY)
+                            .text_style(egui::TextStyle::Small),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(path_display);
+
+                // Branch + SHA info (rightmost text, closest to buttons)
+                let branch_display = wt.branch.as_deref().unwrap_or("detached");
+                let sha_short = wt.sha.get(..7).unwrap_or(&wt.sha);
+                let branch_text = format!("{} [{}]", branch_display, sha_short);
+                ui.add(
+                    egui::Label::new(&branch_text)
+                        .truncate(),
+                )
+                .on_hover_text(branch_text);
             });
+        } else {
+            // Main worktree: just text, no buttons needed
+            let branch_display = wt.branch.as_deref().unwrap_or("detached");
+            let sha_short = wt.sha.get(..7).unwrap_or(&wt.sha);
+            let branch_text = format!("{} [{}]", branch_display, sha_short);
+            ui.add(
+                egui::Label::new(&branch_text)
+                    .truncate(),
+            )
+            .on_hover_text(&branch_text);
+            let path_display = wt.path.to_string_lossy().to_string();
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(&path_display)
+                        .color(egui::Color32::GRAY)
+                        .text_style(egui::TextStyle::Small),
+                )
+                .truncate(),
+            )
+            .on_hover_text(path_display);
         }
     });
 }
