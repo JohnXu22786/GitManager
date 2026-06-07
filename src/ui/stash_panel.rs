@@ -3,12 +3,13 @@ use crate::git_ops::GitOperation;
 use eframe::egui;
 
 pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
+    let dark = ctx.style().visuals.dark_mode;
     ui.horizontal(|ui| {
-        ui.heading("Stash");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.add_enabled(!app.is_busy(), egui::Button::new("🔄 Refresh")).clicked() {
+            if crate::ui::add_enabled_ellipsis(ui, !app.is_busy(), "🔄 Refresh").clicked() {
                 app.refresh_all();
             }
+            ui.add(egui::Label::new(egui::RichText::new("Stash").heading()).truncate()).on_hover_text("Stash");
         });
     });
 
@@ -19,7 +20,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.text_edit_singleline(&mut app.stash_message);
     });
     let busy = app.is_busy();
-    if ui.add_enabled(!busy, egui::Button::new("Stash All")).clicked() {
+    if crate::ui::add_enabled_ellipsis(ui, !busy, "Stash All").clicked() {
         let msg = if app.stash_message.trim().is_empty() {
             None
         } else {
@@ -31,10 +32,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
 
     ui.separator();
 
-    if ui.add_enabled(!busy, egui::Button::new("Pop Stash")).clicked() {
+    if crate::ui::add_enabled_ellipsis(ui, !busy, "Pop Stash").clicked() {
         app.start_operation(ctx, "Popping stash", GitOperation::StashPop);
     }
-    if ui.add_enabled(!busy, egui::Button::new("Apply Stash")).clicked() {
+    if crate::ui::add_enabled_ellipsis(ui, !busy, "Apply Stash").clicked() {
         app.start_operation(ctx, "Applying stash", GitOperation::StashApply(0));
     }
 
@@ -49,22 +50,41 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 let busy = app.is_busy();
                 ui.label(
                     egui::RichText::new(format!("stash@{{{}}}", stash.index))
-                        .color(egui::Color32::from_rgb(200, 150, 100))
+                        .color(if dark {
+                            egui::Color32::from_rgb(240, 190, 120)
+                        } else {
+                            egui::Color32::from_rgb(180, 120, 50)
+                        })
                         .monospace(),
                 );
-                ui.label(&stash.message);
-                ui.label(
-                    egui::RichText::new(&stash.time)
-                        .color(egui::Color32::GRAY)
-                        .text_style(egui::TextStyle::Small),
-                );
-                if ui.add_enabled(!busy, egui::Button::new("Drop")).clicked() {
-                    app.start_operation(ctx, &format!("Drop stash@{{{}}}", index), GitOperation::StashDrop(index));
-                }
-                if ui.add_enabled(!busy, egui::Button::new("Apply")).clicked() {
-                    // FIX: Pass the specific stash index instead of always applying index 0
-                    app.start_operation(ctx, &format!("Apply stash@{{{}}}", index), GitOperation::StashApply(index));
-                }
+                // Buttons on the right edge, message text truncates in between
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add_enabled(!busy, egui::Button::new("Drop")).clicked() {
+                        app.start_operation(ctx, &format!("Drop stash@{{{}}}", index), GitOperation::StashDrop(index));
+                    }
+                    if ui.add_enabled(!busy, egui::Button::new("Apply")).clicked() {
+                        app.start_operation(ctx, &format!("Apply stash@{{{}}}", index), GitOperation::StashApply(index));
+                    }
+                    // Timestamp (leftmost text)
+                    let time_clone = stash.time.clone();
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&stash.time)
+                                .color(egui::Color32::GRAY)
+                                .text_style(egui::TextStyle::Small),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(time_clone);
+                    // Message (rightmost text, closest to buttons)
+                    let msg_clone = stash.message.clone();
+                    ui.add(
+                        egui::Label::new(&stash.message)
+                            .truncate(),
+                    )
+                    .on_hover_text(msg_clone);
+                });
+
             });
         }
     } else {
