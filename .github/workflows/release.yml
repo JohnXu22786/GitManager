@@ -11,12 +11,31 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # ── Phase 1: Extract version once for all build jobs ──
+  # Stroom pattern: a lightweight prepare job extracts the version and
+  # exposes it as a job output that all platform jobs can reference.
+  prepare-version:
+    runs-on: ubuntu-latest
+    outputs:
+      app_version: ${{ steps.extract-version.outputs.app_version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: extract-version
+        shell: bash
+        run: |
+          TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
+          echo "app_version=$VERSION" >> $GITHUB_OUTPUT
+
+  # ── Phase 2: Build + Upload per platform ──
+  # Stroom pattern: each platform builds AND uploads its artifact directly
+  # to the GitHub Release. No intermediate workflow artifacts.
+  # No `body` or `name` is set, so the user's release notes are preserved.
   build:
     name: Build (${{ matrix.target }})
-    # ── Phase 1: Build ──
-    # Builds the binary for each target platform in parallel using a build matrix.
-    # Each build runs independently on its own runner (ubuntu, windows, macos).
-    # Artifacts are uploaded as workflow artifacts for the next phase.
+    needs: [prepare-version]
     strategy:
       fail-fast: false
       matrix:
@@ -88,21 +107,16 @@ jobs:
           echo "OPENSSL_DIR=/usr/local/openssl-x86_64" >> $GITHUB_ENV
           echo "PKG_CONFIG_ALLOW_CROSS=1" >> $GITHUB_ENV
 
-      - name: Extract version from tag
-        id: version
+      - name: Set version in Cargo.toml
         shell: bash
         run: |
-          tag="${{ github.ref_name }}"
-          ver="${tag#v}"
-          echo "version=$ver" >> $GITHUB_OUTPUT
-
-          # Update Cargo.toml version so the binary embeds the tag version
+          VERSION="${{ needs.prepare-version.outputs.app_version }}"
           if [[ "${{ runner.os }}" == "Windows" ]]; then
-            powershell -Command "(Get-Content Cargo.toml) -replace '^version = \".*\"', 'version = \"$ver\"' | Set-Content Cargo.toml"
+            powershell -Command "(Get-Content Cargo.toml) -replace '^version = \".*\"', 'version = \"$VERSION\"' | Set-Content Cargo.toml"
           elif [[ "${{ runner.os }}" == "macOS" ]]; then
-            sed -i '' "s/^version = \".*\"/version = \"$ver\"/" Cargo.toml
+            sed -i '' "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
           else
-            sed -i "s/^version = \".*\"/version = \"$ver\"/" Cargo.toml
+            sed -i "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
           fi
 
       - name: Build release
@@ -112,88 +126,26 @@ jobs:
         id: package
         shell: bash
         run: |
-          version="${{ steps.version.outputs.version }}"
-          suffix="${{ matrix.artifact_suffix }}"
+          VERSION="${{ needs.prepare-version.outputs.app_version }}"
+          SUFFIX="${{ matrix.artifact_suffix }}"
 
           if [[ "${{ matrix.target }}" == *"windows"* ]]; then
-            binary="target/${{ matrix.target }}/release/git_manager.exe"
-            archive="git-manager-${version}-${suffix}.zip"
-            7z a -tzip "$archive" "$binary"
+            BINARY="target/${{ matrix.target }}/release/git_manager.exe"
+            ARCHIVE="git-manager-${VERSION}-${SUFFIX}.zip"
+            7z a -tzip "$ARCHIVE" "$BINARY"
           else
-            binary="target/${{ matrix.target }}/release/git_manager"
-            archive="git-manager-${version}-${suffix}.tar.gz"
-            tar czf "$archive" -C "$(dirname "$binary")" "$(basename "$binary")"
+            BINARY="target/${{ matrix.target }}/release/git_manager"
+            ARCHIVE="git-manager-${VERSION}-${SUFFIX}.tar.gz"
+            tar czf "$ARCHIVE" -C "$(dirname "$BINARY")" "$(basename "$BINARY")"
           fi
 
-          echo "archive=$archive" >> $GITHUB_OUTPUT
+          echo "archive=$ARCHIVE" >> $GITHUB_OUTPUT
 
-      - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: git-manager-${{ steps.version.outputs.version }}-${{ matrix.artifact_suffix }}
-          path: ${{ steps.package.outputs.archive }}
-          if-no-files-found: error
-
-  upload-artifacts:
-    name: Upload Artifacts to Release
-    # ── Phase 2: Upload Artifacts to Existing Release ──
-    # After ALL builds succeed, this job downloads all platform artifacts and
-    # uploads them to the GitHub Release that the user created on the web UI.
-    #
-    # IMPORTANT: This does NOT create a new release. The user already created
-    # the release on GitHub's web UI. This job only uploads the built binaries
-    # to that existing release via tag_name matching.
-    needs: [build]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Extract version from tag
-        id: version
-        shell: bash
-        run: |
-          tag="${{ github.ref_name }}"
-          ver="${tag#v}"
-          echo "version=$ver" >> $GITHUB_OUTPUT
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: git-manager-${{ steps.version.outputs.version }}-*
-          merge-multiple: true
-          path: release-artifacts
-
-      - name: List artifacts
-        run: ls -lh release-artifacts/
-
-      - name: Upload Artifacts to Existing Release
+      # Stroom pattern: each platform uploads directly to the GitHub Release.
+      # No `body` or `name` is set, so the release notes the user wrote
+      # when creating the release on GitHub's web UI are preserved intact.
+      - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
-          name: Git Manager ${{ steps.version.outputs.version }}
           tag_name: ${{ github.ref_name }}
-          body: |
-            ## Git Manager v${{ steps.version.outputs.version }}
-
-            A dedicated Git branch & worktree manager GUI built with Rust + egui.
-
-            > **Note**: The Windows `.exe` uses `windows_subsystem = "windows"` (no console window).  
-            > On Linux/macOS, run from terminal or create a desktop shortcut.
-
-            ### Features
-            - Branch management (create, rename, delete, switch, merge)
-            - Worktree management (add, remove, prune)
-            - Status & commit (stage/unstage, diff, commit, amend, uncommit)
-            - Commit log viewer
-            - Stash management
-            - Push/Pull/Fetch with remotes
-            - System dark/light theme following
-
-            ### Assets
-            | Platform | Architecture | File |
-            |----------|-------------|------|
-            | Linux | x86_64 | `git-manager-${{ steps.version.outputs.version }}-linux-x86_64.tar.gz` |
-            | Linux | ARM64 | `git-manager-${{ steps.version.outputs.version }}-linux-aarch64.tar.gz` |
-            | Windows | x86_64 | `git-manager-${{ steps.version.outputs.version }}-windows-x86_64.zip` |
-            | macOS | Intel | `git-manager-${{ steps.version.outputs.version }}-macos-x86_64.tar.gz` |
-            | macOS | Apple Silicon | `git-manager-${{ steps.version.outputs.version }}-macos-aarch64.tar.gz` |
-          files: release-artifacts/*
+          files: ${{ steps.package.outputs.archive }}

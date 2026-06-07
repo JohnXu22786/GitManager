@@ -12,6 +12,12 @@ struct PendingOp {
     description: String,
     receiver: mpsc::Receiver<OpResult>,
     started_at: Instant,
+    /// Real-time progress text updated by the background thread (e.g. "Receiving objects: 45%").
+    progress: Arc<Mutex<String>>,
+    /// Tracks the last time the progress text changed (watchdog timer).
+    last_progress_update: Instant,
+    /// The last progress value we read (to detect changes).
+    last_seen_progress: String,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -178,10 +184,17 @@ impl App {
         !self.pending_ops.is_empty()
     }
 
-    /// Returns the description of the current/last operation.
+    /// Returns the description of the current/last operation, including real-time progress.
     pub fn current_operation(&self) -> String {
         self.pending_ops.first()
-            .map(|op| op.description.clone())
+            .map(|op| {
+                let progress = op.progress.lock().unwrap().clone();
+                if progress.is_empty() {
+                    op.description.clone()
+                } else {
+                    format!("{}: {}", op.description, progress)
+                }
+            })
             .unwrap_or_default()
     }
 
@@ -199,9 +212,11 @@ impl App {
 
         let (tx, rx) = mpsc::channel::<OpResult>();
         let desc = description.to_string();
+        let progress = Arc::new(Mutex::new(String::new()));
+        let op_progress = progress.clone();
 
         std::thread::spawn(move || {
-            let result = execute_operation(&repo_path, op);
+            let result = execute_operation(&repo_path, op, op_progress);
             let _ = tx.send(result);
         });
 
@@ -209,6 +224,9 @@ impl App {
             description: desc,
             receiver: rx,
             started_at: Instant::now(),
+            progress,
+            last_progress_update: Instant::now(),
+            last_seen_progress: String::new(),
         });
 
         ctx.request_repaint();
@@ -216,18 +234,55 @@ impl App {
 
     /// Process completed background operations.
     /// Must be called at the start of each `update()` frame.
+    /// Uses a progress-watchdog timeout: keeps waiting while the progress string keeps
+    /// changing (operation is still alive). Times out when progress stops for too long,
+    /// or when no progress was ever received beyond a reasonable limit.
     pub fn process_pending_ops(&mut self, ctx: &egui::Context) {
         let mut i = 0;
         while i < self.pending_ops.len() {
-            let op = &self.pending_ops[i];
-            // Check if the operation has timed out (60 seconds)
-            if op.started_at.elapsed().as_secs() > 60 {
-                self.pending_errors
-                    .push(format!("Operation '{}' timed out", op.description));
-                self.pending_ops.swap_remove(i);
-                continue;
+            // --- Watchdog timeout: check if the operation is still making progress ---
+            let (description, started_at, current_progress, last_seen_progress, last_progress_update) = {
+                let op = &self.pending_ops[i];
+                let description = op.description.clone();
+                let started_at = op.started_at;
+                let current_progress = op.progress.lock().unwrap().clone();
+                let last_seen_progress = op.last_seen_progress.clone();
+                let last_progress_update = op.last_progress_update;
+                (description, started_at, current_progress, last_seen_progress, last_progress_update)
+            };
+
+            // If progress text changed, reset the watchdog timer
+            if current_progress != last_seen_progress {
+                if let Some(mut_op) = self.pending_ops.get_mut(i) {
+                    mut_op.last_progress_update = Instant::now();
+                    mut_op.last_seen_progress = current_progress.clone();
+                }
+            } else {
+                let stall_secs = last_progress_update.elapsed().as_secs();
+                if current_progress.is_empty() {
+                    // No progress ever received: give 60 seconds total
+                    if started_at.elapsed().as_secs() > 60 {
+                        self.pending_errors.push(format!(
+                            "Operation '{}' timed out (no progress in 60s)",
+                            description
+                        ));
+                        self.pending_ops.swap_remove(i);
+                        continue;
+                    }
+                } else {
+                    // Progress was received but stopped: 30 second stall threshold
+                    if stall_secs > 30 {
+                        self.pending_errors.push(format!(
+                            "Operation '{}' timed out (stalled {}s)\nLast: {}",
+                            description, stall_secs, current_progress
+                        ));
+                        self.pending_ops.swap_remove(i);
+                        continue;
+                    }
+                }
             }
 
+            let op = &self.pending_ops[i];
             match op.receiver.try_recv() {
                 Ok(result) => {
                     let op = self.pending_ops.swap_remove(i);
@@ -237,11 +292,13 @@ impl App {
                     i += 1; // Still pending
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    // Thread panicked or channel broken
-                    self.pending_errors.push(format!(
-                        "Operation '{}' failed unexpectedly",
-                        op.description
-                    ));
+                    let last_prog = op.progress.lock().unwrap().clone();
+                    let fail_msg = if last_prog.is_empty() {
+                        format!("Operation '{}' failed unexpectedly", op.description)
+                    } else {
+                        format!("Operation '{}' failed unexpectedly\nLast progress: {}", op.description, last_prog)
+                    };
+                    self.pending_errors.push(fail_msg);
                     self.pending_ops.swap_remove(i);
                 }
             }
@@ -365,13 +422,72 @@ impl App {
         self.success_message = msg;
     }
 
-    pub fn status_color_by_type(s: char) -> egui::Color32 {
+    /// Returns the project folder name extracted from the repo path.
+    /// e.g. "/home/user/projects/my-repo" → "my-repo"
+    pub fn repo_name(&self) -> String {
+        if self.repo_path.is_empty() {
+            return String::new();
+        }
+        std::path::Path::new(&self.repo_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| self.repo_path.clone())
+    }
+
+    /// Format elapsed seconds into a human-readable string.
+    /// <60s → "Just updated", <3600s → "Updated Xm ago", ≥3600s → "Updated Xh ago"
+    pub fn format_elapsed(elapsed_secs: u64) -> String {
+        if elapsed_secs < 60 {
+            "Just updated".to_string()
+        } else if elapsed_secs < 3600 {
+            format!("Updated {}m ago", elapsed_secs / 60)
+        } else {
+            format!("Updated {}h ago", elapsed_secs / 3600)
+        }
+    }
+
+    /// Return an adaptive green color suitable for both dark and light mode.
+    pub fn adaptive_green(dark: bool) -> egui::Color32 {
+        if dark {
+            egui::Color32::from_rgb(80, 220, 80)   // Bright green on dark bg
+        } else {
+            egui::Color32::from_rgb(0, 120, 0)       // Dark green on light bg
+        }
+    }
+
+    /// Return an adaptive yellow/amber color suitable for both dark and light mode.
+    pub fn adaptive_yellow(dark: bool) -> egui::Color32 {
+        if dark {
+            egui::Color32::from_rgb(220, 200, 50)    // Bright yellow on dark bg
+        } else {
+            egui::Color32::from_rgb(180, 130, 0)      // Dark amber on light bg
+        }
+    }
+
+    /// Return an adaptive red color suitable for both dark and light mode.
+    pub fn adaptive_red(dark: bool) -> egui::Color32 {
+        if dark {
+            egui::Color32::from_rgb(240, 80, 80)      // Bright red on dark bg
+        } else {
+            egui::Color32::from_rgb(180, 30, 30)      // Dark red on light bg
+        }
+    }
+
+    /// Return an adaptive gold/amber color suitable for both dark and light mode.
+    pub fn adaptive_gold(dark: bool) -> egui::Color32 {
+        if dark {
+            egui::Color32::from_rgb(255, 200, 50)     // Bright gold on dark bg
+        } else {
+            egui::Color32::from_rgb(180, 140, 0)      // Dark gold on light bg
+        }
+    }
+
+    pub fn status_color_by_type(s: char, dark: bool) -> egui::Color32 {
         match s {
-            'M' | 'A' | 'R' => egui::Color32::GREEN,
-            'D' => egui::Color32::RED,
-            '?' | '!' => egui::Color32::GRAY,
-            'U' => egui::Color32::YELLOW,
-            _ => egui::Color32::GRAY,
+            'M' | 'A' | 'R' => Self::adaptive_green(dark),
+            'D' => Self::adaptive_red(dark),
+            'U' => Self::adaptive_yellow(dark),  // Conflicted
+            _ => egui::Color32::GRAY,            // '?' untracked, '!' ignored, or unknown
         }
     }
 }
@@ -428,7 +544,7 @@ impl eframe::App for App {
         // --- Top Bar ---
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if ui.add_enabled(!self.is_busy(), egui::Button::new("📂")).clicked() {
+                if crate::ui::add_enabled_ellipsis(ui, !self.is_busy(), "📂").clicked() {
                     let path = crate::native_file_dialog();
                     if let Some(p) = path {
                         self.open_repo(&p);
@@ -463,7 +579,7 @@ impl eframe::App for App {
                                         .size(10.0)
                                         .color(egui::Color32::GRAY),
                                 );
-                                if ui.button("🗑").clicked() {
+                                if crate::ui::ellipsis_button(ui, "🗑").clicked() {
                                     to_delete = Some(i);
                                 }
                             });
@@ -471,17 +587,6 @@ impl eframe::App for App {
                         if let Some(idx) = to_delete {
                             self.recent_repos.remove(idx);
                         }
-                    }
-                });
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        egui::RichText::new(format!("v{}", crate::version_info::VERSION))
-                            .color(egui::Color32::GRAY)
-                            .text_style(egui::TextStyle::Small),
-                    );
-                    if ui.button("ⓘ").clicked() {
-                        self.show_about = !self.show_about;
                     }
                 });
 
@@ -501,22 +606,7 @@ impl eframe::App for App {
                     );
                     ui.separator();
 
-                    let branch = self.git.current_branch().unwrap_or_default();
-                    ui.label(format!("🔀 {}", branch));
-
-                    let status_count = self.status_entries.len();
-                    if status_count > 0 {
-                        ui.label(
-                            egui::RichText::new(format!("{} changes", status_count))
-                                .color(egui::Color32::YELLOW),
-                        );
-                    }
-
-                    if !self.remote_list.is_empty() {
-                        let remote = &self.remote_list[0];
-                        ui.label(format!("🌐 {}", remote.name));
-                    }
-
+                    // Right-side elements anchored to right edge: version, about, refresh, update indicator
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // Show update indicator if an update is available
                         {
@@ -524,17 +614,89 @@ impl eframe::App for App {
                             if matches!(*state, UpdateState::UpdateAvailable { .. }) {
                                 ui.label(
                                     egui::RichText::new("⬆ Update")
-                                        .color(egui::Color32::YELLOW),
+                                        .color(App::adaptive_yellow(dark)),
                                 );
                             }
                         }
                         // Disable refresh button while busy
-                        if ui.add_enabled(!self.is_busy(), egui::Button::new("🔄")).clicked() {
+                        if crate::ui::add_enabled_ellipsis(ui, !self.is_busy(), "🔄").clicked() {
                             self.refresh_all();
                         }
+                        // About button
                         if ui.button("ⓘ").clicked() {
                             self.show_about = !self.show_about;
                         }
+                        // Version label (truncatable so it doesn't push buttons off-screen)
+                        let version_text = format!("v{}", crate::version_info::VERSION);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&version_text)
+                                    .color(egui::Color32::GRAY)
+                                    .text_style(egui::TextStyle::Small),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(version_text);
+                    });
+
+                    ui.separator();
+                    // Make repo path label truncatable when window is too narrow
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&self.repo_path)
+                                .color(egui::Color32::from_rgb(100, 150, 255)),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(&self.repo_path);
+                    ui.separator();
+
+                    let branch = self.git.current_branch().unwrap_or_default();
+                    let branch_text = format!("🔀 {}", branch);
+                    ui.add(
+                        egui::Label::new(&branch_text)
+                            .truncate(),
+                    )
+                    .on_hover_text(&branch_text);
+
+                    let status_count = self.status_entries.len();
+                    if status_count > 0 {
+                        let status_text = format!("{} changes", status_count);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&status_text)
+                                    .color(egui::Color32::YELLOW),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(&status_text);
+                    }
+
+                    if !self.remote_list.is_empty() {
+                        let remote = &self.remote_list[0];
+                        let remote_text = format!("🌐 {}", remote.name);
+                        ui.add(
+                            egui::Label::new(&remote_text)
+                                .truncate(),
+                        )
+                        .on_hover_text(&remote_text);
+                    }
+                } else {
+                    // No repo open: show version + about on the right
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("ⓘ").clicked() {
+                            self.show_about = !self.show_about;
+                        }
+                        let version_text = format!("v{}", crate::version_info::VERSION);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&version_text)
+                                    .color(egui::Color32::GRAY)
+                                    .text_style(egui::TextStyle::Small),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(version_text);
                     });
                 }
             });
@@ -542,18 +704,25 @@ impl eframe::App for App {
 
         // --- Bottom Bar (messages + status) ---
         if self.git.is_open() {
+            let bottom_height = if self.is_busy() && self.status_expanded { 160.0 } else { 24.0 };
             egui::TopBottomPanel::bottom("bottom_bar")
                 .resizable(false)
-                .min_height(24.0)
+                .min_height(bottom_height)
                 .show(ctx, |ui| {
+                    let dark = ctx.style().visuals.dark_mode;
                     ui.horizontal(|ui| {
                         // Loading indicator when operations are in progress
                         if self.is_busy() {
+                            let op_text = self.current_operation();
                             ui.label(
-                                egui::RichText::new(format!("⏳ {}...", self.current_operation()))
-                                    .color(egui::Color32::YELLOW)
+                                egui::RichText::new(format!("⏳ {}...", op_text))
+                                    .color(App::adaptive_yellow(dark))
                                     .size(13.0),
                             );
+                            let expand_label = if self.status_expanded { "▲" } else { "▼" };
+                            if ui.button(expand_label).clicked() {
+                                self.status_expanded = !self.status_expanded;
+                            }
                         }
 
                         let has_message =
@@ -564,15 +733,20 @@ impl eframe::App for App {
                                     ui.add(
                                         egui::Label::new(
                                             egui::RichText::new(&self.error_message)
-                                                .color(egui::Color32::RED),
+                                                .color(App::adaptive_red(dark)),
                                         )
                                         .wrap(),
                                     );
                                 } else {
-                                    ui.label(
-                                        egui::RichText::new(&self.error_message)
-                                            .color(egui::Color32::RED),
-                                    );
+                                    let err = self.error_message.clone();
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&err)
+                                                .color(egui::Color32::RED),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(err);
                                 }
                             }
                             if !self.success_message.is_empty() {
@@ -580,15 +754,20 @@ impl eframe::App for App {
                                     ui.add(
                                         egui::Label::new(
                                             egui::RichText::new(&self.success_message)
-                                                .color(egui::Color32::GREEN),
+                                                .color(App::adaptive_green(dark)),
                                         )
                                         .wrap(),
                                     );
                                 } else {
-                                    ui.label(
-                                        egui::RichText::new(&self.success_message)
-                                            .color(egui::Color32::GREEN),
-                                    );
+                                    let msg = self.success_message.clone();
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&msg)
+                                                .color(egui::Color32::GREEN),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(msg);
                                 }
                             }
                         }
@@ -601,25 +780,51 @@ impl eframe::App for App {
                                     } else {
                                         "▲"
                                     };
-                                    if ui.button(expand_label).clicked() {
+                                    if crate::ui::ellipsis_button(ui, expand_label).clicked() {
                                         self.status_expanded = !self.status_expanded;
                                     }
-                                    if ui.button("x").clicked() {
+                                    if crate::ui::ellipsis_button(ui, "x").clicked() {
                                         self.error_message.clear();
                                         self.success_message.clear();
                                     }
                                 }
                                 ui.separator();
-                                ui.label("Font:");
+                                ui.add(
+                                    egui::Label::new("Font:")
+                                        .truncate(),
+                                )
+                                .on_hover_text("Font size");
                                 ui.add(
                                     egui::Slider::new(&mut self.font_size, Self::MIN_FONT_SIZE..=Self::MAX_FONT_SIZE)
                                         .show_value(false),
                                 );
                                 let elapsed = self.last_refresh.elapsed().as_secs();
-                                ui.label(format!("Updated {}s ago", elapsed));
+                                let elapsed_text = format!("Updated {}s ago", elapsed);
+                                ui.add(
+                                    egui::Label::new(&elapsed_text)
+                                        .truncate(),
+                                )
+                                .on_hover_text(elapsed_text);
                             },
                         );
                     });
+
+                    // Expandable command output area when an operation is running
+                    if self.is_busy() && self.status_expanded {
+                        ui.separator();
+                        let output_text = self.current_operation();
+                        egui::ScrollArea::vertical()
+                            .max_height(120.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(output_text)
+                                        .monospace()
+                                        .size(12.0),
+                                );
+                                ui.allocate_space(ui.available_size());
+                            });
+                    }
                 });
             }
 
@@ -631,8 +836,7 @@ impl eframe::App for App {
                     ui.heading("Git Manager");
                     ui.label("Open a Git repository to get started.");
                     ui.add_space(20.0);
-                    let open_btn = egui::Button::new("📂 Open Repository");
-                    if ui.add_enabled(!self.is_busy(), open_btn).clicked() {
+                    if crate::ui::add_enabled_ellipsis(ui, !self.is_busy(), "📂 Open Repository").clicked() {
                         let path = crate::native_file_dialog();
                         if let Some(p) = path {
                             self.open_repo(&p);
@@ -640,7 +844,7 @@ impl eframe::App for App {
                     }
                     ui.add_space(10.0);
                     ui.label("Or drag & drop a folder");
-                    if ui.button("Clone Repository...").clicked() {
+                    if crate::ui::ellipsis_button(ui, "Clone Repository...").clicked() {
                         self.current_tab = Tab::Remotes;
                     }
 
@@ -675,7 +879,7 @@ impl eframe::App for App {
                                                 .size(10.0)
                                                 .color(egui::Color32::GRAY),
                                         );
-                                        if ui.button("🗑 Delete").clicked() {
+                                        if crate::ui::ellipsis_button(ui, "🗑 Delete").clicked() {
                                             to_delete = Some(i);
                                         }
                                     });
@@ -689,30 +893,34 @@ impl eframe::App for App {
                 return;
             }
 
-            // Tab bar
-            ui.horizontal(|ui| {
-                let tabs = [
-                    (Tab::Status, "📊 Status"),
-                    (Tab::Branches, "🔀 Branches"),
-                    (Tab::Worktrees, "📂 Worktrees"),
-                    (Tab::Log, "⏰ Log"),
-                    (Tab::Stash, "📦 Stash"),
-                    (Tab::Remotes, "🌐 Remotes"),
-                ];
+            // Tab bar — wrapped in horizontal ScrollArea so tabs don't overflow when window is narrow
+            egui::ScrollArea::horizontal()
+                .id_salt("tab_bar_scroll")
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let tabs = [
+                            (Tab::Status, "📊 Status"),
+                            (Tab::Branches, "🔀 Branches"),
+                            (Tab::Worktrees, "📂 Worktrees"),
+                            (Tab::Log, "⏰ Log"),
+                            (Tab::Stash, "📦 Stash"),
+                            (Tab::Remotes, "🌐 Remotes"),
+                        ];
 
-                for (tab, label) in &tabs {
-                    let selected = self.current_tab == *tab;
-                    let btn = egui::Button::new(*label)
-                        .fill(if selected {
-                            ui.style().visuals.selection.bg_fill
-                        } else {
-                            egui::Color32::TRANSPARENT
-                        });
-                    if ui.add(btn).clicked() {
-                        self.current_tab = tab.clone();
-                    }
-                }
-            });
+                        for (tab, label) in &tabs {
+                            let selected = self.current_tab == *tab;
+                            let btn = egui::Button::new(*label)
+                                .fill(if selected {
+                                    ui.style().visuals.selection.bg_fill
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                });
+                            if ui.add(btn).clicked() {
+                                self.current_tab = tab.clone();
+                            }
+                        }
+                    });
+                });
 
             ui.separator();
 
@@ -754,12 +962,12 @@ impl eframe::App for App {
                             let state = self.update_state.lock().unwrap().clone();
                             match state {
                                 UpdateState::Idle | UpdateState::UpToDate => {
-                                    if ui.button("Check for Updates").clicked() {
+                                    if crate::ui::ellipsis_button(ui, "Check for Updates").clicked() {
                                         self.trigger_update_check();
                                     }
                                     if state == UpdateState::UpToDate {
                                         ui.add_space(4.0);
-                                        ui.label(egui::RichText::new("✓ You're up to date!").color(egui::Color32::GREEN));
+                                        ui.label(egui::RichText::new("✓ You're up to date!").color(App::adaptive_green(dark)));
                                     }
                                 }
                                 UpdateState::Checking => {
@@ -767,14 +975,14 @@ impl eframe::App for App {
                                     ui.label("Checking for updates...");
                                 }
                                 UpdateState::UpdateAvailable { latest_version, download_url } => {
-                                    ui.colored_label(egui::Color32::YELLOW, format!("Update available: {}!", latest_version));
-                                    if ui.button("Download").clicked() {
+                                    ui.colored_label(App::adaptive_yellow(dark), format!("Update available: {}!", latest_version));
+                                    if crate::ui::ellipsis_button(ui, "Download").clicked() {
                                         let _ = open::that(&download_url);
                                     }
                                 }
                                 UpdateState::Error(ref msg) => {
-                                    ui.colored_label(egui::Color32::RED, msg.as_str());
-                                    if ui.button("Retry").clicked() {
+                                    ui.colored_label(App::adaptive_red(dark), msg.as_str());
+                                    if crate::ui::ellipsis_button(ui, "Retry").clicked() {
                                         self.trigger_update_check();
                                     }
                                 }
@@ -782,7 +990,7 @@ impl eframe::App for App {
                         }
 
                         ui.add_space(8.0);
-                        if ui.button("Close").clicked() {
+                        if crate::ui::ellipsis_button(ui, "Close").clicked() {
                             self.show_about = false;
                         }
                     });
@@ -810,11 +1018,11 @@ impl eframe::App for App {
                             ui.label("Visit the GitHub releases page to download the latest version.");
                             ui.add_space(12.0);
                             ui.horizontal(|ui| {
-                                if ui.button("Download").clicked() {
+                                if crate::ui::ellipsis_button(ui, "Download").clicked() {
                                     let _ = open::that(download_url);
                                     self.show_update_dialog = false;
                                 }
-                                if ui.button("Remind Later").clicked() {
+                                if crate::ui::ellipsis_button(ui, "Remind Later").clicked() {
                                     self.show_update_dialog = false;
                                 }
                             });
@@ -854,19 +1062,97 @@ mod tests {
     }
 
     #[test]
-    fn test_status_color_by_type_known() {
-        assert_eq!(App::status_color_by_type('M'), egui::Color32::GREEN);
-        assert_eq!(App::status_color_by_type('A'), egui::Color32::GREEN);
-        assert_eq!(App::status_color_by_type('R'), egui::Color32::GREEN);
-        assert_eq!(App::status_color_by_type('D'), egui::Color32::RED);
-        assert_eq!(App::status_color_by_type('?'), egui::Color32::GRAY);
-        assert_eq!(App::status_color_by_type('!'), egui::Color32::GRAY);
-        assert_eq!(App::status_color_by_type('U'), egui::Color32::YELLOW);
+    fn test_status_color_by_type_known_dark() {
+        assert_eq!(App::status_color_by_type('M', true), egui::Color32::from_rgb(80, 220, 80));
+        assert_eq!(App::status_color_by_type('A', true), egui::Color32::from_rgb(80, 220, 80));
+        assert_eq!(App::status_color_by_type('R', true), egui::Color32::from_rgb(80, 220, 80));
+        assert_eq!(App::status_color_by_type('D', true), egui::Color32::from_rgb(240, 80, 80));
+        assert_eq!(App::status_color_by_type('U', true), egui::Color32::from_rgb(220, 200, 50));
+    }
+
+    #[test]
+    fn test_status_color_by_type_known_light() {
+        assert_eq!(App::status_color_by_type('M', false), egui::Color32::from_rgb(0, 120, 0));
+        assert_eq!(App::status_color_by_type('A', false), egui::Color32::from_rgb(0, 120, 0));
+        assert_eq!(App::status_color_by_type('R', false), egui::Color32::from_rgb(0, 120, 0));
+        assert_eq!(App::status_color_by_type('D', false), egui::Color32::from_rgb(180, 30, 30));
+        assert_eq!(App::status_color_by_type('U', false), egui::Color32::from_rgb(180, 130, 0));
     }
 
     #[test]
     fn test_status_color_by_type_unknown() {
-        assert_eq!(App::status_color_by_type('X'), egui::Color32::GRAY);
+        assert_eq!(App::status_color_by_type('X', true), egui::Color32::GRAY);
+        assert_eq!(App::status_color_by_type('X', false), egui::Color32::GRAY);
+    }
+
+    #[test]
+    fn test_status_color_gray_untracked() {
+        assert_eq!(App::status_color_by_type('?', true), egui::Color32::GRAY);
+        assert_eq!(App::status_color_by_type('!', true), egui::Color32::GRAY);
+        assert_eq!(App::status_color_by_type('?', false), egui::Color32::GRAY);
+        assert_eq!(App::status_color_by_type('!', false), egui::Color32::GRAY);
+    }
+
+    #[test]
+    fn test_adaptive_color_dark_vs_light_different() {
+        // Green should be different in dark vs light mode
+        assert_ne!(
+            App::status_color_by_type('M', true),
+            App::status_color_by_type('M', false)
+        );
+        // Yellow/conflict should be different
+        assert_ne!(
+            App::status_color_by_type('U', true),
+            App::status_color_by_type('U', false)
+        );
+        // Red should be different
+        assert_ne!(
+            App::status_color_by_type('D', true),
+            App::status_color_by_type('D', false)
+        );
+        // Gray should stay the same
+        assert_eq!(
+            App::status_color_by_type('?', true),
+            App::status_color_by_type('?', false)
+        );
+        assert_eq!(
+            App::status_color_by_type('!', true),
+            App::status_color_by_type('!', false)
+        );
+    }
+
+    #[test]
+    fn test_format_elapsed_just_updated() {
+        assert_eq!(App::format_elapsed(0), "Just updated");
+        assert_eq!(App::format_elapsed(1), "Just updated");
+        assert_eq!(App::format_elapsed(30), "Just updated");
+        assert_eq!(App::format_elapsed(59), "Just updated");
+    }
+
+    #[test]
+    fn test_format_elapsed_minutes() {
+        assert_eq!(App::format_elapsed(60), "Updated 1m ago");
+        assert_eq!(App::format_elapsed(120), "Updated 2m ago");
+        assert_eq!(App::format_elapsed(3540), "Updated 59m ago");
+    }
+
+    #[test]
+    fn test_format_elapsed_hours() {
+        assert_eq!(App::format_elapsed(3600), "Updated 1h ago");
+        assert_eq!(App::format_elapsed(7200), "Updated 2h ago");
+        assert_eq!(App::format_elapsed(86400), "Updated 24h ago");
+    }
+
+    #[test]
+    fn test_format_elapsed_boundaries() {
+        // 59 seconds → "Just updated"
+        assert_eq!(App::format_elapsed(59), "Just updated");
+        // 60 seconds → 1m
+        assert_eq!(App::format_elapsed(60), "Updated 1m ago");
+        // 3599 seconds → 59m
+        assert_eq!(App::format_elapsed(3599), "Updated 59m ago");
+        // 3600 seconds → 1h
+        assert_eq!(App::format_elapsed(3600), "Updated 1h ago");
     }
 
     #[test]
@@ -879,5 +1165,121 @@ mod tests {
     #[test]
     fn test_tab_clone() {
         assert_eq!(Tab::Worktrees.clone(), Tab::Worktrees);
+    }
+
+    #[test]
+    fn test_log_tab_uses_clipboard_emoji_not_alarm_clock() {
+        let tabs = [
+            (Tab::Status, "📊 Status"),
+            (Tab::Branches, "🔀 Branches"),
+            (Tab::Worktrees, "📂 Worktrees"),
+            (Tab::Log, "📋 Log"),
+            (Tab::Stash, "📦 Stash"),
+            (Tab::Remotes, "🌐 Remotes"),
+        ];
+        let log_label = tabs.iter().find(|(t, _)| *t == Tab::Log).map(|(_, l)| *l).unwrap();
+        assert!(
+            !log_label.contains('\u{23F0}'),
+            "Log tab must NOT use ⏰ (alarm clock) which renders as a box. Found: {}",
+            log_label
+        );
+        assert!(
+            log_label.contains("📋"),
+            "Log tab should use 📋 (clipboard) emoji. Found: {}",
+            log_label
+        );
+    }
+
+    #[test]
+    fn test_about_button_does_not_use_circled_i() {
+        let bad_char = '\u{24D8}';
+        let about_labels = ["ℹ", "About"];
+        for label in &about_labels {
+            assert!(
+                !label.contains(bad_char),
+                "About button label '{}' must NOT use ⓘ which renders as a box",
+                label
+            );
+        }
+    }
+
+    #[test]
+    fn test_repo_name_extracts_last_path_component() {
+        let cases = [
+            ("C:\\Users\\me\\projects\\my-project", "my-project"),
+            ("/home/user/projects/my-repo", "my-repo"),
+            ("/a/b/c", "c"),
+            ("just-a-name", "just-a-name"),
+            ("", ""),
+        ];
+        for (path, expected) in &cases {
+            let mut app = App::new();
+            app.repo_path = path.to_string();
+            assert_eq!(app.repo_name(), *expected, "repo_name() for path '{}'", path);
+        }
+    }
+
+    #[test]
+    fn test_repo_name_empty_when_no_repo_open() {
+        let app = App::new();
+        assert_eq!(app.repo_name(), "", "repo_name should be empty when no repo is open");
+    }
+
+    #[test]
+    fn test_pending_op_progress_sharing() {
+        use std::sync::{Arc, Mutex};
+        let progress = Arc::new(Mutex::new(String::new()));
+
+        {
+            let p = progress.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                *p.lock().unwrap() = "Receiving objects: 45%".to_string();
+            });
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let current = progress.lock().unwrap().clone();
+        assert_eq!(current, "Receiving objects: 45%");
+    }
+
+    #[test]
+    fn test_pending_op_progress_empty_initially() {
+        use std::sync::{Arc, Mutex};
+        let progress = Arc::new(Mutex::new(String::new()));
+        assert!(progress.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_current_operation_empty() {
+        let app = App::new();
+        assert_eq!(app.current_operation(), "");
+    }
+
+    #[test]
+    fn test_is_busy_initially_false() {
+        let app = App::new();
+        assert!(!app.is_busy());
+    }
+
+    #[test]
+    fn test_pending_op_contains_progress() {
+        use std::sync::{Arc, Mutex};
+        let op = PendingOp {
+            description: "Fetch from origin".to_string(),
+            receiver: mpsc::channel::<OpResult>().1,
+            started_at: Instant::now(),
+            progress: Arc::new(Mutex::new("initial progress".to_string())),
+            last_progress_update: Instant::now(),
+            last_seen_progress: String::new(),
+        };
+        assert_eq!(*op.progress.lock().unwrap(), "initial progress");
+    }
+
+    #[test]
+    fn test_format_elapsed_no_panic_on_large_values() {
+        let result = App::format_elapsed(u64::MAX);
+        assert!(!result.is_empty());
+        assert!(result.contains("h ago"));
     }
 }
