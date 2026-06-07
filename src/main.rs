@@ -20,6 +20,7 @@ mod version_info {
 /// (e.g., Segoe UI Emoji, Segoe UI Symbol on Windows) and adds them as fallbacks
 /// so that all Unicode characters used in the UI render correctly instead of as boxes.
 fn configure_fonts(cc: &eframe::CreationContext) {
+    #[allow(unused_mut)]
     let mut fonts = egui::FontDefinitions::default();
 
     // Try to load system fonts for Unicode/emoji coverage, gracefully ignoring failures
@@ -39,6 +40,7 @@ fn configure_fonts(cc: &eframe::CreationContext) {
 
 /// Try to load a font from `path` and add it as a fallback for all font families.
 /// Silently ignores failures (file not found, invalid font, etc.).
+#[cfg(windows)]
 fn try_add_font(fonts: &mut egui::FontDefinitions, path: &str, name: &str) {
     if let Ok(data) = std::fs::read(path) {
         fonts
