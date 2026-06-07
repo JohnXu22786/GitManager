@@ -496,6 +496,12 @@ impl GitRepo {
         let msg = format!("Merge branch '{}'", branch_name);
         repo.commit(Some("HEAD"), &sig, &sig, &msg, &t, &[&head, &their])
             .map_err(|e| format!("Commit: {}", e))?;
+
+        let mut co = git2::build::CheckoutBuilder::new();
+        co.force();
+        repo.checkout_tree(t.as_object(), Some(&mut co))
+            .map_err(|e| format!("Checkout after merge: {}", e))?;
+
         Ok(msg)
     }
 
@@ -881,7 +887,7 @@ impl GitRepo {
         Ok(format!("Pushed {}", branch))
     }
 
-    pub fn fetch(&self, remote: &str, progress: Arc<Mutex<String>>) -> GitResult<String> {
+        pub fn fetch(&self, remote: &str, progress: Arc<Mutex<String>>) -> GitResult<String> {
         let repo = self.repo_mut()?;
         let prog = progress.clone();
         let mut cb = git2::RemoteCallbacks::new();
@@ -893,8 +899,9 @@ impl GitRepo {
         });
         let mut fo = git2::FetchOptions::new();
         fo.remote_callbacks(cb);
+        let spec = format!("+refs/heads/*:refs/remotes/{}/*", remote);
         let mut rm = repo.find_remote(remote).map_err(|e| format!("Remote: {}", e))?;
-        rm.fetch(&["+refs/heads/*:refs/remotes/origin/*"], Some(&mut fo), None)
+        rm.fetch(&[&spec], Some(&mut fo), None)
             .map_err(|e| format!("Fetch: {}", e))?;
         Ok(format!("Fetched from {}", remote))
     }
@@ -961,6 +968,12 @@ impl GitRepo {
             repo.commit(Some("HEAD"), &sg, &sg,
                 &format!("Merge '{}'", remote), &t, &[&hc, &fc])
                 .map_err(|e| format!("Merge commit: {}", e))?;
+
+            let mut co = git2::build::CheckoutBuilder::new();
+            co.force();
+            repo.checkout_tree(t.as_object(), Some(&mut co))
+                .map_err(|e| format!("Checkout after merge: {}", e))?;
+
             Ok("Merge complete".into())
         }
     }
