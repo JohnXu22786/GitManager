@@ -684,7 +684,6 @@ impl eframe::App for App {
                         .on_hover_text(version_text);
                     });
                 }
-                }
             });
         });
 
