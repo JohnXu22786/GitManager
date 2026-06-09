@@ -1,6 +1,7 @@
 use crate::app::App;
 use crate::git_ops::BranchInfo;
 use crate::git_ops::GitOperation;
+use crate::ui::{column_cell, column_header, column_separator};
 use eframe::egui;
 
 pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -32,6 +33,40 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         .cloned()
         .collect();
 
+    // ── Column header row (left-to-right: Name, Commit, sep, Actions) ─
+    ui.horizontal(|ui| {
+        let cw = &mut app.column_widths;
+        let avail = ui.available_width();
+        // Reserve ~40px for separator + "Actions" label
+        let max_cols = (avail - 40.0).max(120.0);
+
+        // Name header (resizable, capped)
+        let mut name_w = cw.get("branch_name", 260.0);
+        // Commit header (resizable, capped)
+        let mut commit_w = cw.get("branch_commit", 220.0);
+        // Cap total to not overflow past Actions
+        if name_w + commit_w > max_cols {
+            name_w = max_cols - commit_w;
+        }
+        name_w = name_w.max(60.0);
+        commit_w = commit_w.max(60.0);
+
+        column_header(ui, "Name", &mut name_w, 60.0, "branch_name_hdr");
+        cw.set("branch_name", name_w);
+        column_header(ui, "Last Commit", &mut commit_w, 60.0, "branch_commit_hdr");
+        cw.set("branch_commit", commit_w);
+
+        column_separator(ui);
+
+        // Actions (rightmost)
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add(egui::Label::new(egui::RichText::new("Actions").strong()));
+        });
+    });
+
+    ui.separator();
+
+    // ── Content rows ─────────────────────────────────────────────────
     egui::ScrollArea::vertical().show(ui, |ui| {
         ui.label(egui::RichText::new("Local Branches").strong());
         for branch in &locals {
@@ -48,6 +83,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         }
     });
 
+    // ── Create / Merge / Rename sections (unchanged) ────────────────
     ui.add_space(10.0);
     ui.separator();
     ui.heading("Create Branch");
@@ -121,125 +157,84 @@ fn show_branch_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, branch
     let name = branch.name.clone();
     let is_remote = branch.is_remote;
     let is_head = branch.is_head;
+    let busy = app.is_busy();
 
-    ui.horizontal(|ui| {
-        let icon = if is_head { "▶" } else { " " };
-        let name_color = if is_head {
-            App::adaptive_green(dark)
+    // Copy widths before layout (avoids borrow conflict)
+    let mut name_w = app.column_widths.get("branch_name", 260.0);
+    let mut commit_w = app.column_widths.get("branch_commit", 220.0);
+
+    let name_color = if is_head {
+        App::adaptive_green(dark)
+    } else {
+        ui.style().visuals.text_color()
+    };
+
+    // Build name display text with icon merged in
+    let icon_prefix = if is_head { "▶ " } else { "  " };
+    let name_display = if branch.is_head && !is_remote {
+        if let Some(upstream) = &branch.upstream {
+            let tracking = if branch.ahead > 0 || branch.behind > 0 {
+                format!(" (↑{} ↓{})", branch.ahead, branch.behind)
+            } else {
+                String::new()
+            };
+            format!("{}{} → {}{}", icon_prefix, name, upstream, tracking)
         } else {
-            ui.style().visuals.text_color()
-        };
+            format!("{}{}", icon_prefix, name)
+        }
+    } else {
+        format!("{}{}", icon_prefix, name)
+    };
 
-        ui.label(egui::RichText::new(icon).color(name_color).strong());
+    let commit_text: Option<String> = branch.last_commit.as_ref()
+        .filter(|m| !m.is_empty())
+        .cloned();
 
-        let busy = app.is_busy();
-        // right_to_left: buttons on right edge, text on left
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // --- Buttons first (rightmost, never compressed) ---
-            if !is_head && !is_remote {
-                if crate::ui::add_enabled_ellipsis(ui, !busy, "Copy").clicked() {
-                    ui.ctx().copy_text(name.clone());
-                    app.show_success(format!("Copied {}", name));
-                }
-                if crate::ui::add_enabled_ellipsis(ui, !busy, "Delete").clicked() {
-                    app.start_operation(ctx, &format!("Delete '{}'", name), GitOperation::DeleteBranch { name: name.clone(), force: false });
-                }
-                if ui.add_enabled(!busy, egui::Button::new("Force Del")).clicked() {
-                    app.start_operation(ctx, &format!("Force delete '{}'", name), GitOperation::DeleteBranch { name: name.clone(), force: true });
-                }
-            }
-            if !is_head {
-                if crate::ui::add_enabled_ellipsis(ui, !busy, "Checkout").clicked() {
-                    app.start_operation(ctx, &format!("Checkout '{}'", name), GitOperation::CheckoutBranch(name.clone()));
-                }
-            }
+    // Cap column widths to not overflow past "…" button
+    let avail = ui.available_width();
+    let sep = 4.0;
+    let btn = 35.0;
+    let max_cols = (avail - btn - sep).max(120.0);
+    if name_w + commit_w > max_cols {
+        name_w = max_cols - commit_w;
+    }
+    name_w = name_w.max(60.0);
+    commit_w = commit_w.max(60.0);
 
-            // --- Available space for text (after buttons placed) ---
-            let text_avail = ui.available_width().max(40.0);
+    // Left-to-right flow: Name, Commit, sep, "…" menu
+    ui.horizontal(|ui| {
+        column_cell(ui, name_w, &name_display, name_color);
 
-            // --- Build middle info (upstream + commit msg) ---
-            let mut middle_job = egui::text::LayoutJob::default();
-            let mut middle_hover: Vec<String> = Vec::new();
+        column_cell(ui, commit_w, commit_text.as_deref().unwrap_or(""), egui::Color32::GRAY);
 
-            if let Some(upstream) = &branch.upstream {
-                if !upstream.is_empty() {
-                    let tracking = if branch.ahead > 0 || branch.behind > 0 {
-                        format!(" (↑{} ↓{})", branch.ahead, branch.behind)
-                    } else {
-                        String::new()
-                    };
-                    let upstream_text = format!("→ {}{}", upstream, tracking);
-                    middle_hover.push(upstream_text.clone());
-                    middle_job.append(
-                        &upstream_text,
-                        0.0,
-                        egui::TextFormat {
-                            font_id: egui::FontId::proportional(13.0),
-                            color: egui::Color32::GRAY,
-                            ..Default::default()
-                        },
-                    );
-                }
-            }
+        if !is_head || (!is_head && !is_remote) {
+            column_separator(ui);
 
-            if let Some(msg) = &branch.last_commit {
-                if !msg.is_empty() {
-                    let prefix = if middle_hover.is_empty() { "" } else { "  " };
-                    let commit_text = format!("{}{}", prefix, msg);
-                    middle_hover.push(msg.clone());
-                    middle_job.append(
-                        &commit_text,
-                        0.0,
-                        egui::TextFormat {
-                            font_id: egui::FontId::proportional(13.0),
-                            color: egui::Color32::GRAY,
-                            ..Default::default()
-                        },
-                    );
-                }
-            }
-
-            // --- Compute widths: natural when fits, compressed otherwise ---
-            let middle_full_text = middle_hover.join("  ");
-            let name_nat = (name.len() as f32 * 9.0).min(300.0);
-            let middle_nat = if middle_hover.is_empty() {
-                0.0
-            } else {
-                (middle_full_text.len() as f32 * 8.0).min(300.0)
-            };
-
-            let (name_w, middle_w) = if middle_hover.is_empty() {
-                // No middle info → name takes all text space
-                (text_avail, 0.0)
-            } else if name_nat + middle_nat <= text_avail {
-                // Both fit naturally → pack left (贴左)
-                (name_nat, (text_avail - name_nat).min(middle_nat))
-            } else if name_nat <= text_avail * 0.55 {
-                // Name fits, compress middle
-                (name_nat, text_avail - name_nat)
-            } else {
-                // Both need compression → roughly 50/50
-                let half = (text_avail / 2.0).max(50.0);
-                (half, (text_avail - half).max(0.0))
-            };
-
-            if !middle_hover.is_empty() {
-                ui.add_sized(
-                    [middle_w, ui.available_height()],
-                    egui::Label::new(middle_job).truncate(),
-                )
-                .on_hover_text(middle_full_text);
-            }
-
-            // --- Branch name (leftmost, less compressible) ---
-            ui.add_sized(
-                [name_w, ui.available_height()],
-                egui::Label::new(
-                    egui::RichText::new(&name).color(name_color),
-                )
-                .truncate(),
-            )
-            .on_hover_text(&name);
-        });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.menu_button("…", |ui| {
+                    if !is_head {
+                        if ui.add_enabled(!busy, egui::Button::new("Checkout")).clicked() {
+                            app.start_operation(ctx, &format!("Checkout '{}'", name), GitOperation::CheckoutBranch(name.clone()));
+                            ui.close_menu();
+                        }
+                    }
+                    if !is_head && !is_remote {
+                        if ui.add_enabled(!busy, egui::Button::new("Copy")).clicked() {
+                            ui.ctx().copy_text(name.clone());
+                            app.show_success(format!("Copied {}", name));
+                            ui.close_menu();
+                        }
+                        if ui.add_enabled(!busy, egui::Button::new("Delete")).clicked() {
+                            app.start_operation(ctx, &format!("Delete '{}'", name), GitOperation::DeleteBranch { name: name.clone(), force: false });
+                            ui.close_menu();
+                        }
+                        if ui.add_enabled(!busy, egui::Button::new("Force Del")).clicked() {
+                            app.start_operation(ctx, &format!("Force delete '{}'", name), GitOperation::DeleteBranch { name: name.clone(), force: true });
+                            ui.close_menu();
+                        }
+                    }
+                });
+            });
+        }
     });
 }

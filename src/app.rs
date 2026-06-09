@@ -95,6 +95,8 @@ pub struct App {
     pub status_expanded: bool,
     /// When true, shows a popup window with the full status message.
     pub show_message_popup: bool,
+    /// Excel-style resizable column widths for tables.
+    pub column_widths: crate::ui::ColumnWidthStore,
 }
 
 impl App {
@@ -158,6 +160,7 @@ impl App {
             recent_repos: RecentRepos::load(),
             status_expanded: false,
             show_message_popup: false,
+            column_widths: crate::ui::init_column_widths(),
         }
     }
 
