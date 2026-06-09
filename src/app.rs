@@ -92,6 +92,8 @@ pub struct App {
     needs_refresh: bool,
     pub recent_repos: RecentRepos,
     pub status_expanded: bool,
+    /// Excel-style resizable column widths for tables.
+    pub column_widths: crate::ui::ColumnWidthStore,
 }
 
 impl App {
@@ -152,6 +154,7 @@ impl App {
             needs_refresh: false,
             recent_repos: RecentRepos::load(),
             status_expanded: false,
+            column_widths: crate::ui::init_column_widths(),
         }
     }
 
