@@ -306,6 +306,73 @@ fn paths_match(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Forcefully remove a directory, with OS-level fallback.
+///
+/// Used ONLY by Force Remove — regular Remove uses a single gentle attempt.
+///
+/// Strategy:
+/// 1. Try `std::fs::remove_dir_all` (standard recursive delete, blocks until done)
+/// 2. On Windows, if that fails, try `cmd.exe /c rmdir /s /q` (bypasses many file locks)
+/// 3. If both fail, try one more full round — no sleep between attempts because
+///    the delete commands themselves are synchronous and take as long as needed
+/// 4. If the path no longer exists at the end, consider it success
+fn force_remove_dir(path: &Path) -> std::io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let mut last_err = None;
+
+    for _ in 0..2 {
+        // Try standard remove_dir_all (synchronous — blocks until files are deleted)
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+            }
+        }
+
+        // On Windows, try OS-level force delete as fallback.
+        // rmdir /s /q is more aggressive and can bypass locks that Rust's std cannot.
+        // This command is also synchronous — it runs until the directory is gone or fails.
+        #[cfg(windows)]
+        {
+            if path.exists() {
+                let _ = std::process::Command::new("cmd.exe")
+                    .args(["/c", "rmdir", "/s", "/q", &path.to_string_lossy()])
+                    .output();
+            }
+        }
+
+        // Check if it's gone after the fallback
+        if !path.exists() {
+            return Ok(());
+        }
+        // No sleep — the delete commands are already synchronous and may take
+        // significant time for large worktrees.
+    }
+
+    // Return the last error if path still exists
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to remove {:?}", path))
+    }))
+}
+
+/// Check if a path exists and contains any files (not just the directory entry itself).
+/// Returns true only if the directory actually has content.
+fn dir_has_content(path: &Path) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    // read_dir succeeds and has at least one entry → has content
+    if let Ok(mut entries) = std::fs::read_dir(path) {
+        entries.next().is_some()
+    } else {
+        // Can't even read the directory, treat as "has content" to be safe
+        true
+    }
+}
+
 impl GitRepo {
     pub fn new() -> Self {
         GitRepo { repo: RefCell::new(None), path: None }
@@ -608,20 +675,35 @@ impl GitRepo {
             }
         }
 
-        // Always try to remove the worktree directory from filesystem
-        if path.exists() {
-            if let Err(e) = std::fs::remove_dir_all(path) {
-                errors.push(format!("Rm dir: {}", e));
+        // --- Directory cleanup: different strategy for Remove vs Force Remove ---
+        if force {
+            // Force Remove: aggressive — retries + OS-level fallback
+            if path.exists() {
+                if let Err(e) = force_remove_dir(path) {
+                    errors.push(format!("Rm dir: {}", e));
+                }
+            }
+        } else {
+            // Regular Remove: gentle — one attempt, no force fallback
+            if path.exists() {
+                if let Err(e) = std::fs::remove_dir_all(path) {
+                    errors.push(format!("Rm dir: {}", e));
+                }
+            }
+            // If directory still has content after gentle attempt, tell the user
+            if dir_has_content(path) {
+                errors.push("Directory still contains files. Use Force Remove to delete it.".into());
             }
         }
 
-        // If worktree directory is gone, consider it a success (primary user concern)
-        let dir_gone = !path.exists();
-        if errors.is_empty() || dir_gone {
-            Ok(())
-        } else {
-            Err(errors.join("; "))
+        // If directory no longer has content, consider it a success
+        // (primary user concern is getting rid of the files on disk)
+        if !dir_has_content(path) {
+            return Ok(());
         }
+
+        // Everything we tried failed — report all errors
+        Err(errors.join("; "))
     }
 
     pub fn get_status(&self) -> GitResult<Vec<StatusEntry>> {
@@ -1231,6 +1313,84 @@ mod tests {
     fn test_safe_str_lossy_both_none() {
         let result = safe_str_lossy(None, None);
         assert_eq!(result, "", "Should return empty string when both are None");
+    }
+
+    // --- force_remove_dir tests ---
+
+    #[test]
+    fn test_force_remove_dir_normal() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let sub = dir.path().join("subdir");
+        std::fs::create_dir_all(&sub).expect("create subdir");
+        let file = sub.join("test.txt");
+        std::fs::write(&file, "hello").expect("write file");
+
+        assert!(dir.path().exists());
+        force_remove_dir(dir.path()).expect("force_remove_dir should succeed");
+        assert!(!dir.path().exists(), "Directory should be deleted");
+    }
+
+    #[test]
+    fn test_force_remove_dir_nonexistent() {
+        let path = std::path::Path::new("C:\\this_path_should_not_exist_xyz_12345");
+        // Should succeed even if path doesn't exist
+        let result = force_remove_dir(path);
+        assert!(result.is_ok(), "Removing nonexistent path should be ok: {:?}", result);
+    }
+
+    #[test]
+    fn test_remove_worktree_force_false_deletes_directory() {
+        let main_dir = tempfile::tempdir().expect("temp dir");
+        let wt_root = tempfile::tempdir().expect("temp dir");
+        let wt_path = wt_root.path().join("test-wt-normal-del");
+
+        let repo = create_repo_with_commit(main_dir.path());
+
+        let wt_name = "test-wt-normal-del";
+        let _branch = repo.branch(wt_name, &repo.head().unwrap().peel_to_commit().unwrap(), false).unwrap();
+        let reference = repo.find_reference(&format!("refs/heads/{}", wt_name)).ok();
+        let mut opts = git2::WorktreeAddOptions::new();
+        if let Some(ref r) = reference {
+            opts.reference(Some(r));
+        }
+        repo.worktree(wt_name, &wt_path, Some(&opts)).expect("create worktree");
+
+        // Verify directory exists
+        assert!(wt_path.exists(), "Worktree directory should exist before remove");
+
+        let git = open_git_repo(main_dir.path());
+        let result = git.remove_worktree(&wt_path, false);
+        assert!(result.is_ok(), "Normal remove should succeed: {:?}", result);
+
+        // Directory should be gone
+        assert!(!wt_path.exists(), "Worktree dir should be deleted after remove");
+    }
+
+    #[test]
+    fn test_remove_worktree_force_true_deletes_directory() {
+        let main_dir = tempfile::tempdir().expect("temp dir");
+        let wt_root = tempfile::tempdir().expect("temp dir");
+        let wt_path = wt_root.path().join("test-wt-force-del");
+
+        let repo = create_repo_with_commit(main_dir.path());
+
+        let wt_name = "test-wt-force-del";
+        let _branch = repo.branch(wt_name, &repo.head().unwrap().peel_to_commit().unwrap(), false).unwrap();
+        let reference = repo.find_reference(&format!("refs/heads/{}", wt_name)).ok();
+        let mut opts = git2::WorktreeAddOptions::new();
+        if let Some(ref r) = reference {
+            opts.reference(Some(r));
+        }
+        repo.worktree(wt_name, &wt_path, Some(&opts)).expect("create worktree");
+
+        assert!(wt_path.exists(), "Worktree directory should exist before remove");
+
+        let git = open_git_repo(main_dir.path());
+        let result = git.remove_worktree(&wt_path, true);
+        assert!(result.is_ok(), "Force remove should succeed: {:?}", result);
+
+        // Directory should be gone
+        assert!(!wt_path.exists(), "Worktree dir should be deleted after force remove");
     }
 
     #[test]
