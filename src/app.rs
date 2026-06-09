@@ -603,15 +603,6 @@ impl App {
         }
     }
 
-    /// Return an adaptive gold/amber color suitable for both dark and light mode.
-    pub fn adaptive_gold(dark: bool) -> egui::Color32 {
-        if dark {
-            egui::Color32::from_rgb(255, 200, 50)     // Bright gold on dark bg
-        } else {
-            egui::Color32::from_rgb(180, 140, 0)      // Dark gold on light bg
-        }
-    }
-
     pub fn status_color_by_type(s: char, dark: bool) -> egui::Color32 {
         match s {
             'M' | 'A' | 'R' => Self::adaptive_green(dark),
