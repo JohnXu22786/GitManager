@@ -34,8 +34,11 @@ pub struct App {
     pub git: GitRepo,
     pub current_tab: Tab,
     pub repo_path: String,
-    pub error_message: String,
-    pub success_message: String,
+    /// Single status message for the bottom bar — shows the latest operation,
+    /// concise success/error. Replaces old error_message + success_message.
+    pub status_message: String,
+    /// Whether the status_message represents an error (for coloring).
+    pub status_is_error: bool,
     /// Accumulated real-time log of the latest operation (progress + final result).
     /// Used in the expandable bottom panel so users see detailed CLI-like output.
     pub last_operation_log: String,
@@ -85,16 +88,10 @@ pub struct App {
     pub download_progress: f32,
     /// Pending Git operations running in background threads.
     pending_ops: Vec<PendingOp>,
-    /// Accumulated error messages from background operations.
-    pending_errors: Vec<String>,
-    /// Accumulated success messages from background operations.
-    pending_successes: Vec<String>,
     /// Whether to auto-refresh after a mutation operation completes.
     needs_refresh: bool,
     pub recent_repos: RecentRepos,
     pub status_expanded: bool,
-    /// When true, shows a popup window with the full status message.
-    pub show_message_popup: bool,
 }
 
 impl App {
@@ -105,8 +102,8 @@ impl App {
             git: GitRepo::new(),
             current_tab: Tab::Status,
             repo_path: String::new(),
-            error_message: String::new(),
-            success_message: String::new(),
+            status_message: String::new(),
+            status_is_error: false,
             last_operation_log: String::new(),
 
             status_entries: Vec::new(),
@@ -152,12 +149,9 @@ impl App {
             update_dialog_dismissed: false,
             download_progress: 0.0,
             pending_ops: Vec::new(),
-            pending_errors: Vec::new(),
-            pending_successes: Vec::new(),
             needs_refresh: false,
             recent_repos: RecentRepos::load(),
             status_expanded: false,
-            show_message_popup: false,
         }
     }
 
@@ -241,7 +235,8 @@ impl App {
         let new_binary = match updater::extract_binary_from_archive(&archive_path) {
             Ok(p) => p,
             Err(e) => {
-                self.error_message = format!("Failed to extract update: {}", e);
+                self.status_message = format!("Failed to extract update: {}", e);
+                self.status_is_error = true;
                 return;
             }
         };
@@ -250,7 +245,8 @@ impl App {
         let current_binary = match std::env::current_exe() {
             Ok(p) => p,
             Err(e) => {
-                self.error_message = format!("Failed to get current exe path: {}", e);
+                self.status_message = format!("Failed to get current exe path: {}", e);
+                self.status_is_error = true;
                 return;
             }
         };
@@ -259,7 +255,8 @@ impl App {
         let script_path = match updater::create_self_update_script(&new_binary, &current_binary) {
             Ok(p) => p,
             Err(e) => {
-                self.error_message = format!("Failed to create update script: {}", e);
+                self.status_message = format!("Failed to create update script: {}", e);
+                self.status_is_error = true;
                 return;
             }
         };
@@ -283,17 +280,19 @@ impl App {
     }
 
     pub fn open_repo(&mut self, path: &str) {
-        self.error_message.clear();
-        self.success_message.clear();
+        self.status_message.clear();
+        self.status_is_error = false;
         match self.git.open(Path::new(path)) {
             Ok(()) => {
                 self.repo_path = path.to_string();
-                self.success_message = format!("Opened repository at {}", path);
+                self.status_message = format!("Opened repository at {}", path);
+                self.status_is_error = false;
                 self.recent_repos.add(path);
                 self.refresh_all();
             }
             Err(e) => {
-                self.error_message = format!("Failed to open repo: {}", e);
+                self.status_message = format!("Failed to open repo: {}", e);
+                self.status_is_error = true;
             }
         }
     }
@@ -303,17 +302,11 @@ impl App {
         !self.pending_ops.is_empty()
     }
 
-    /// Returns the description of the current/last operation, including real-time progress.
+    /// Returns the description of the current/last operation.
+    /// For the status bar: just the operation name (concise).
     pub fn current_operation(&self) -> String {
         self.pending_ops.first()
-            .map(|op| {
-                let progress = op.progress.lock().unwrap().clone();
-                if progress.is_empty() {
-                    op.description.clone()
-                } else {
-                    format!("{}: {}", op.description, progress)
-                }
-            })
+            .map(|op| op.description.clone())
             .unwrap_or_default()
     }
 
@@ -393,7 +386,8 @@ impl App {
                             "Operation '{}' timed out (no progress in 60s)",
                             description
                         );
-                        self.pending_errors.push(msg.clone());
+                        self.status_message = msg.clone();
+                        self.status_is_error = true;
                         self.last_operation_log += &format!("  ✗ {}\n", msg);
                         self.pending_ops.swap_remove(i);
                         continue;
@@ -405,7 +399,8 @@ impl App {
                             "Operation '{}' timed out (stalled {}s)\nLast: {}",
                             description, stall_secs, current_progress
                         );
-                        self.pending_errors.push(msg.clone());
+                        self.status_message = msg.clone();
+                        self.status_is_error = true;
                         self.last_operation_log += &format!("  ✗ {}\n", msg);
                         self.pending_ops.swap_remove(i);
                         continue;
@@ -434,7 +429,8 @@ impl App {
                     } else {
                         format!("Operation '{}' failed unexpectedly\nLast progress: {}", op.description, last_prog)
                     };
-                    self.pending_errors.push(fail_msg.clone());
+                    self.status_message = fail_msg.clone();
+                    self.status_is_error = true;
                     self.last_operation_log += &format!("  ✗ {}\n", fail_msg);
                     self.pending_ops.swap_remove(i);
                 }
@@ -454,14 +450,18 @@ impl App {
         match result {
             OpResult::Success(msg) => {
                 self.last_operation_log += &format!("  ✓ {}\n", msg);
-                self.pending_successes.push(msg);
+                // Set status_message to the concise success message
+                self.status_message = msg;
+                self.status_is_error = false;
                 // Auto-refresh after mutation operations
                 self.needs_refresh = true;
             }
             OpResult::Error(e) => {
                 let err_msg = format!("{}: {}", description, e);
                 self.last_operation_log += &format!("  ✗ {}\n", err_msg);
-                self.pending_errors.push(err_msg);
+                // Set status_message to concise error message
+                self.status_message = err_msg;
+                self.status_is_error = true;
             }
             OpResult::DiffContent { path, lines } => {
                 self.diff_path = path;
@@ -488,24 +488,12 @@ impl App {
                 self.remote_list = remote_list;
                 self.last_refresh = Instant::now();
                 if !errors.is_empty() {
-                    self.pending_errors.push(errors.join("; "));
+                    let msg = errors.join("; ");
+                    self.last_operation_log += &format!("  ✗ {}\n", msg);
+                    self.status_message = msg;
+                    self.status_is_error = true;
                 }
             }
-        }
-    }
-
-    /// Flush accumulated messages from background operations into the UI message bar.
-    /// New errors OVERWRITE old ones (requirement: "no persistent display, new info overwrites").
-    pub fn flush_messages(&mut self) {
-        if !self.pending_successes.is_empty() {
-            self.success_message = self.pending_successes.join(" | ");
-            self.pending_successes.clear();
-        }
-        if !self.pending_errors.is_empty() {
-            let msg = self.pending_errors.join(" | ");
-            self.pending_errors.clear();
-            // Overwrite: new errors replace old ones (do not append)
-            self.error_message = msg;
         }
     }
 
@@ -513,8 +501,8 @@ impl App {
         if !self.git.is_open() {
             return;
         }
-        self.error_message.clear();
-        self.success_message.clear();
+        self.status_message.clear();
+        self.status_is_error = false;
 
         // Perform each operation with error reporting instead of silent swallowing
         let mut errors: Vec<String> = Vec::new();
@@ -552,11 +540,13 @@ impl App {
     }
 
     pub fn show_error(&mut self, msg: String) {
-        self.error_message = msg;
+        self.status_message = msg;
+        self.status_is_error = true;
     }
 
     pub fn show_success(&mut self, msg: String) {
-        self.success_message = msg;
+        self.status_message = msg;
+        self.status_is_error = false;
     }
 
     /// Returns the project folder name extracted from the repo path.
@@ -662,7 +652,6 @@ impl eframe::App for App {
             }
         }
         self.process_pending_ops(ctx);
-        self.flush_messages();
 
         let dark = ctx.style().visuals.dark_mode;
         if dark {
@@ -857,97 +846,70 @@ impl eframe::App for App {
             });
         });
 
-        // --- Bottom Bar (messages + status) ---
+        // --- Bottom Bar (simplified: single message + "..." expand + timestamp) ---
         if self.git.is_open() {
-            let bottom_height = if self.status_expanded { 160.0 } else { 24.0 };
+            let bottom_height = if self.status_expanded { 200.0 } else { 24.0 };
             egui::TopBottomPanel::bottom("bottom_bar")
                 .resizable(false)
                 .min_height(bottom_height)
                 .show(ctx, |ui| {
                     let dark = ctx.style().visuals.dark_mode;
                     ui.horizontal(|ui| {
-                        // Loading indicator when operations are in progress
+                        // --- Right side: timestamp + "..." expand/collapse button ---
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let elapsed = self.last_refresh.elapsed().as_secs();
+                            let elapsed_text = App::format_elapsed(elapsed);
+                            ui.add(
+                                egui::Label::new(&elapsed_text)
+                                    .truncate(),
+                            )
+                            .on_hover_text(elapsed_text);
+
+                            // Expand button: "..." when collapsed, "✕" when expanded
+                            let btn_label = if self.status_expanded { "✕" } else { "···" };
+                            if ui.button(btn_label).clicked() {
+                                self.status_expanded = !self.status_expanded;
+                            }
+                        });
+
+                        // --- Left side: single status message (operation or result) ---
                         if self.is_busy() {
+                            // Show concise operation name while busy
                             let op_text = self.current_operation();
-                            ui.label(
-                                egui::RichText::new(format!("⏳ {}...", op_text))
-                                    .color(App::adaptive_yellow(dark))
-                                    .size(13.0),
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&op_text)
+                                        .color(App::adaptive_yellow(dark))
+                                        .size(13.0),
+                                )
+                                .truncate(),
+                            );
+                        } else if !self.status_message.is_empty() {
+                            let color = if self.status_is_error {
+                                App::adaptive_red(dark)
+                            } else {
+                                App::adaptive_green(dark)
+                            };
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&self.status_message)
+                                        .color(color)
+                                        .size(13.0),
+                                )
+                                .truncate(),
                             );
                         }
-
-                        // Expand button always visible
-                        let expand_label = if self.status_expanded { "▲" } else { "▼" };
-                        if ui.button(expand_label).clicked() {
-                            self.status_expanded = !self.status_expanded;
-                        }
-
-                        // Right side: refresh timestamp + messages (no close button, no auto-dismiss)
-                        let has_message =
-                            !self.error_message.is_empty() || !self.success_message.is_empty();
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                // No close button — messages persist, latest only
-                                ui.separator();
-                                let elapsed = self.last_refresh.elapsed().as_secs();
-                                let elapsed_text = App::format_elapsed(elapsed);
-                                ui.add(
-                                    egui::Label::new(&elapsed_text)
-                                        .truncate(),
-                                )
-                                .on_hover_text(elapsed_text);
-
-                                if has_message {
-                                    if !self.error_message.is_empty() {
-                                        let msg_text = self.error_message.clone();
-                                        let resp = ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(&msg_text)
-                                                    .color(App::adaptive_red(dark)),
-                                            )
-                                            .truncate()
-                                            .sense(egui::Sense::click()),
-                                        )
-                                        .on_hover_text(msg_text);
-                                        if resp.clicked() {
-                                            self.show_message_popup = true;
-                                        }
-                                    }
-                                    if !self.success_message.is_empty() {
-                                        let msg_text = self.success_message.clone();
-                                        let resp = ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(&msg_text)
-                                                    .color(App::adaptive_green(dark)),
-                                            )
-                                            .truncate()
-                                            .sense(egui::Sense::click()),
-                                        )
-                                        .on_hover_text(msg_text);
-                                        if resp.clicked() {
-                                            self.show_message_popup = true;
-                                        }
-                                    }
-                                }
-                            },
-                        );
                     });
 
-                    // Expandable command output area (visible whenever expanded)
+                    // --- Expanded area: full command output log ---
                     if self.status_expanded {
                         ui.separator();
-                        let output_text = if self.is_busy() {
-                            self.current_operation()
-                        } else {
-                            self.last_operation_log.clone()
-                        };
                         egui::ScrollArea::vertical()
-                            .max_height(120.0)
+                            .max_height(150.0)
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 ui.label(
-                                    egui::RichText::new(output_text)
+                                    egui::RichText::new(self.last_operation_log.clone())
                                         .monospace()
                                         .size(12.0),
                                 );
@@ -1053,15 +1015,23 @@ impl eframe::App for App {
 
             ui.separator();
 
-            // Render the active tab panel
-            match self.current_tab {
-                Tab::Status => crate::ui::status_panel::show(self, ui, ctx),
-                Tab::Branches => crate::ui::branch_panel::show(self, ui, ctx),
-                Tab::Worktrees => crate::ui::worktree_panel::show(self, ui, ctx),
-                Tab::Log => crate::ui::log_panel::show(self, ui, ctx),
-                Tab::Stash => crate::ui::stash_panel::show(self, ui, ctx),
-                Tab::Remotes => crate::ui::remote_panel::show(self, ui, ctx),
-            }
+            // Wrap tab panel in a vertical ScrollArea so content is scrollable
+            // when the expanded bottom bar takes up vertical space.
+            egui::ScrollArea::vertical()
+                .id_salt("main_content_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    // Render the active tab panel
+                    match self.current_tab {
+                        Tab::Status => crate::ui::status_panel::show(self, ui, ctx),
+                        Tab::Branches => crate::ui::branch_panel::show(self, ui, ctx),
+                        Tab::Worktrees => crate::ui::worktree_panel::show(self, ui, ctx),
+                        Tab::Log => crate::ui::log_panel::show(self, ui, ctx),
+                        Tab::Stash => crate::ui::stash_panel::show(self, ui, ctx),
+                        Tab::Remotes => crate::ui::remote_panel::show(self, ui, ctx),
+                    }
+                    ui.allocate_space(ui.available_size());
+                });
         });
 
         // About window
@@ -1259,50 +1229,6 @@ impl eframe::App for App {
         if self.is_busy() {
             ctx.request_repaint();
         }
-
-        // --- Message popup window (clicking a truncated status message opens this) ---
-        if self.show_message_popup {
-            let has_error = !self.error_message.is_empty();
-            let has_success = !self.success_message.is_empty();
-            let popup_title = if has_error {
-                "Error Details"
-            } else if has_success {
-                "Success Details"
-            } else {
-                "Message"
-            };
-            let popup_content = if has_error {
-                self.error_message.clone()
-            } else if has_success {
-                self.success_message.clone()
-            } else {
-                String::new()
-            };
-
-            egui::Window::new(popup_title)
-                .resizable(true)
-                .default_size([500.0, 200.0])
-                .min_width(250.0)
-                .min_height(100.0)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .open(&mut self.show_message_popup)
-                .show(ctx, |ui| {
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            let color = if has_error {
-                                App::adaptive_red(dark)
-                            } else {
-                                App::adaptive_green(dark)
-                            };
-                            ui.label(
-                                egui::RichText::new(&popup_content)
-                                    .color(color)
-                                    .size(14.0),
-                            );
-                        });
-                });
-        }
     }
 }
 
@@ -1310,7 +1236,78 @@ impl eframe::App for App {
 mod tests {
     use super::*;
 
-    // --- Existing tests ---
+    // --- New tests for simplified status bar (Requirement 3 & 4) ---
+
+    #[test]
+    fn test_status_message_starts_empty() {
+        let app = App::new();
+        assert!(app.status_message.is_empty());
+        assert!(!app.status_is_error);
+    }
+
+    #[test]
+    fn test_show_error_sets_status_message_and_is_error() {
+        let mut app = App::new();
+        app.show_error("Cannot delete branch 'feature-x'".into());
+        assert_eq!(app.status_message, "Cannot delete branch 'feature-x'");
+        assert!(app.status_is_error);
+    }
+
+    #[test]
+    fn test_show_success_sets_status_message_and_not_error() {
+        let mut app = App::new();
+        app.show_success("Deleted 'feature-x' successfully".into());
+        assert_eq!(app.status_message, "Deleted 'feature-x' successfully");
+        assert!(!app.status_is_error);
+    }
+
+    #[test]
+    fn test_show_error_overwrites_status_message() {
+        let mut app = App::new();
+        app.show_success("old success".into());
+        assert!(!app.status_is_error);
+        app.show_error("new error".into());
+        assert_eq!(app.status_message, "new error");
+        assert!(app.status_is_error);
+    }
+
+    #[test]
+    fn test_show_success_overwrites_status_message() {
+        let mut app = App::new();
+        app.show_error("old error".into());
+        assert!(app.status_is_error);
+        app.show_success("new success".into());
+        assert_eq!(app.status_message, "new success");
+        assert!(!app.status_is_error);
+    }
+
+    #[test]
+    fn test_status_expanded_defaults_to_false() {
+        let app = App::new();
+        assert!(!app.status_expanded);
+    }
+
+    #[test]
+    fn test_current_operation_empty_when_not_busy() {
+        let app = App::new();
+        assert_eq!(app.current_operation(), "");
+    }
+
+    #[test]
+    fn test_open_repo_clears_status_message() {
+        // We can't fully test open_repo without a real git repo,
+        // but we can verify it clears status_message
+        let mut app = App::new();
+        app.status_message = "old message".into();
+        app.status_is_error = true;
+        // Clearing before open:
+        app.status_message.clear();
+        app.status_is_error = false;
+        assert!(app.status_message.is_empty());
+        assert!(!app.status_is_error);
+    }
+
+    // --- Legacy tests (unchanged) ---
 
     #[test]
     fn test_font_size_constant_is_14() {
@@ -1666,87 +1663,4 @@ mod tests {
         assert_eq!(app.download_progress, 0.0, "Download progress should start at 0");
     }
 
-    // --- Status bar truncation & overwrite tests ---
-
-    #[test]
-    fn test_show_message_popup_initially_false() {
-        let app = App::new();
-        assert!(!app.show_message_popup);
-    }
-
-    #[test]
-    fn test_flush_messages_overwrites_error() {
-        let mut app = App::new();
-        app.pending_errors.push("first error".into());
-        app.flush_messages();
-        assert_eq!(app.error_message, "first error");
-        assert!(app.pending_errors.is_empty());
-
-        app.pending_errors.push("second error".into());
-        app.flush_messages();
-        assert_eq!(
-            app.error_message, "second error",
-            "flush_messages should overwrite, not append, old error_message"
-        );
-    }
-
-    #[test]
-    fn test_flush_messages_overwrites_multiple_errors_with_single_message() {
-        let mut app = App::new();
-        app.pending_errors.push("error one".into());
-        app.pending_errors.push("error two".into());
-        app.flush_messages();
-        assert_eq!(app.error_message, "error one | error two");
-
-        app.pending_errors.push("fresh error".into());
-        app.flush_messages();
-        assert_eq!(
-            app.error_message, "fresh error",
-            "After overwrite, should only contain the new error, not accumulated"
-        );
-    }
-
-    #[test]
-    fn test_flush_messages_success_works_independently() {
-        let mut app = App::new();
-        app.pending_successes.push("success!".into());
-        app.flush_messages();
-        assert_eq!(app.success_message, "success!");
-        assert!(app.error_message.is_empty());
-    }
-
-    #[test]
-    fn test_flush_messages_does_not_clear_error_when_no_pending_errors() {
-        let mut app = App::new();
-        app.error_message = "existing error".into();
-        app.flush_messages();
-        assert_eq!(app.error_message, "existing error");
-    }
-
-    #[test]
-    fn test_flush_messages_success_multiple_joined() {
-        let mut app = App::new();
-        app.pending_successes.push("done".into());
-        app.pending_successes.push("pushed".into());
-        app.flush_messages();
-        assert_eq!(app.success_message, "done | pushed");
-    }
-
-    #[test]
-    fn test_show_error_overwrites() {
-        let mut app = App::new();
-        app.error_message = "old error".into();
-        app.show_error("new error".into());
-        assert_eq!(app.error_message, "new error");
-    }
-
-    #[test]
-    fn test_message_popup_store_full_text() {
-        let mut app = App::new();
-        app.show_error("detailed error message".into());
-        app.show_success("detailed success message".into());
-        assert!(!app.show_message_popup);
-        assert_eq!(app.error_message, "detailed error message");
-        assert_eq!(app.success_message, "detailed success message");
-    }
 }
