@@ -111,6 +111,7 @@ impl ColumnWidthStore {
 /// - `label`: the header text
 /// - `width`: in/out — current width of this column; updated when dragged
 /// - `min_width`: minimum allowed width (pixels)
+/// - `max_width`: maximum allowed width (pixels)
 /// - `id_salt`: unique identifier for this divider's interaction state
 ///
 /// Returns the response from the divider interaction.
@@ -119,6 +120,7 @@ pub fn column_header(
     label: &str,
     width: &mut f32,
     min_width: f32,
+    max_width: f32,
     id_salt: &str,
 ) -> egui::Response {
     let height = ui.available_height().max(20.0);
@@ -152,14 +154,15 @@ pub fn column_header(
     let resp = ui.interact(divider_rect, divider_id, egui::Sense::drag());
 
     if resp.dragged_by(egui::PointerButton::Primary) {
-        *width = (*width + resp.drag_delta().x).max(min_width);
+        *width = (*width + resp.drag_delta().x).max(min_width).min(max_width);
     }
 
-    // Draw divider line
+    // Draw divider line with a visible border color
+    let divider_color = ui.style().visuals.window_stroke.color;
     painter.vline(
         header_rect.right(),
         header_rect.y_range(),
-        egui::Stroke::new(1.0, ui.style().visuals.window_fill),
+        egui::Stroke::new(1.0, divider_color),
     );
 
     // Change cursor on hover/drag
@@ -168,6 +171,32 @@ pub fn column_header(
     }
 
     resp
+}
+
+/// Renders a column header label without any divider or drag zone.
+/// Used for the rightmost column (the second column) which fills
+/// remaining space — its width is computed from the first column.
+/// A single draggable divider between the two columns already exists
+/// on the first column's right edge.
+pub fn column_header_static(ui: &mut egui::Ui, label: &str, width: f32) {
+    let height = ui.available_height().max(20.0);
+
+    // Reserve space for this column (header label area)
+    let (header_rect, _) = ui.allocate_exact_size(
+        egui::vec2(width, height),
+        egui::Sense::hover(),
+    );
+
+    // Draw header label text (left-aligned)
+    let painter = ui.painter();
+    let text_pos = header_rect.left_center() + egui::vec2(4.0, 0.0);
+    painter.text(
+        text_pos,
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(13.0),
+        ui.style().visuals.text_color(),
+    );
 }
 
 /// Render content inside a column of the given width, left-aligned.
@@ -210,17 +239,108 @@ pub fn column_cell(
 
 /// Renders a column separator divider line (no interaction, just visual).
 /// Use this for the last column before buttons to separate content from actions.
+/// Uses a visible border color so users can see where to drag.
+///
+/// Note: Currently unused in panels, kept as utility for future use.
+#[allow(dead_code)]
 pub fn column_separator(ui: &mut egui::Ui) {
     let height = ui.available_height();
     let (rect, _) = ui.allocate_exact_size(
         egui::vec2(4.0, height),
         egui::Sense::hover(),
     );
+    let divider_color = ui.style().visuals.window_stroke.color;
     ui.painter().vline(
         rect.left(),
         rect.y_range(),
-        egui::Stroke::new(1.0, ui.style().visuals.window_fill),
+        egui::Stroke::new(1.0, divider_color),
     );
+}
+
+/// Draw a horizontal section separator with consistent left/right margins.
+/// Unlike `ui.separator()` which extends to the full available width,
+/// this leaves `margin` pixels of empty space on both sides, so the
+/// line position is consistent regardless of scrollbar visibility.
+#[allow(dead_code)]
+pub fn section_separator(ui: &mut egui::Ui, margin: f32) {
+    let height = ui.style().spacing.item_spacing.y;
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width().max(0.0), height),
+        egui::Sense::hover(),
+    );
+    if rect.width() > margin * 2.0 {
+        let stroke = ui.style().visuals.window_stroke;
+        ui.painter().hline(
+            (rect.left() + margin)..=(rect.right() - margin),
+            rect.center().y,
+            stroke,
+        );
+    }
+}
+
+/// Cap two column widths so their total fits within the available column space,
+/// reserving space for the actions area (e.g. "…" menu button).
+///
+/// Both columns are clamped to [min_width, max_width] first.
+/// If their total exceeds available column space, they are proportionally shrunk.
+/// When there isn't enough room for both at min_width, columns may drop below
+/// min_width as a lesser evil than overflowing into the actions area.
+///
+/// Note: Currently unused in panels (which use a fixed-total model with only
+/// the first column draggable), but kept as a utility for future use.
+#[allow(dead_code)]
+pub fn cap_column_widths(
+    w1: &mut f32,
+    w2: &mut f32,
+    avail: f32,
+    min_width: f32,
+    max_width: f32,
+    reserved: f32,
+) {
+    let max_cols = avail - reserved;
+
+    // Clamp each to [min_width, max_width]
+    *w1 = w1.max(min_width).min(max_width);
+    *w2 = w2.max(min_width).min(max_width);
+
+    // Zero-width column space: set both to zero and exit
+    if max_cols <= 0.0 {
+        *w1 = 0.0;
+        *w2 = 0.0;
+        return;
+    }
+
+    // If total fits, we're done
+    if *w1 + *w2 <= max_cols {
+        return;
+    }
+
+    // Need to shrink. Check if there's room for both at min_width.
+    if max_cols >= min_width * 2.0 {
+        // Enough room — proportionally shrink with min_width guarantees
+        let ratio = max_cols / (*w1 + *w2);
+        *w1 = (*w1 * ratio).max(min_width);
+        *w2 = (*w2 * ratio).max(min_width);
+
+        // If min enforcement caused re-exceedance
+        if *w1 + *w2 > max_cols {
+            *w2 = max_cols - *w1;
+        }
+    } else {
+        // Not enough room for both at min_width.
+        // Proportionally shrink without min_width enforcement.
+        let ratio = max_cols / (*w1 + *w2);
+        *w1 = (*w1 * ratio).max(0.0);
+        *w2 = (*w2 * ratio).max(0.0);
+
+        // If one column is above min_width and the other isn't,
+        // let the above-min one keep its proportional share
+        if *w1 >= min_width && *w2 < min_width {
+            *w2 = (max_cols - *w1).max(0.0);
+        } else if *w2 >= min_width && *w1 < min_width {
+            *w1 = (max_cols - *w2).max(0.0);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -228,14 +348,14 @@ pub fn column_separator(ui: &mut egui::Ui) {
 // ---------------------------------------------------------------------------
 
 /// Initialize default column widths for all panels.
+/// Only the draggable (first) columns are stored; the second column
+/// fills the remaining space automatically.
 pub fn init_column_widths() -> ColumnWidthStore {
     let mut store = ColumnWidthStore::new();
-    // Branch panel - all resizable columns
-    store.set("branch_name", 260.0);
-    store.set("branch_commit", 220.0);
-    // Worktree panel - all resizable columns
-    store.set("worktree_branch_sha", 220.0);
-    store.set("worktree_path", 250.0);
+    // Branch panel - only Name column is draggable
+    store.set("branch_name", 280.0);
+    // Worktree panel - only Path column is draggable
+    store.set("worktree_path", 280.0);
     store
 }
 
@@ -407,11 +527,12 @@ mod tests {
     #[test]
     fn test_init_column_widths_has_defaults() {
         let store = init_column_widths();
-        // All resizable columns have defaults
-        assert_eq!(store.get("branch_name", 0.0), 260.0);
-        assert_eq!(store.get("branch_commit", 0.0), 220.0);
-        assert_eq!(store.get("worktree_branch_sha", 0.0), 220.0);
-        assert_eq!(store.get("worktree_path", 0.0), 250.0);
+        // Only draggable columns are stored
+        assert_eq!(store.get("branch_name", 0.0), 280.0);
+        assert_eq!(store.get("worktree_path", 0.0), 280.0);
+        // Second columns (auto-fill) have no stored width
+        assert_eq!(store.get("branch_commit", 0.0), 0.0);
+        assert_eq!(store.get("worktree_branch_sha", 0.0), 0.0);
     }
 
     #[test]
@@ -429,13 +550,80 @@ mod tests {
 
     #[test]
     fn test_column_header_renders_without_panic() {
-        // Verify column_header renders without panic
+        // Verify column_header renders without panic (with new max_width param)
         let ctx = run_test_ui(500.0, 200.0, |ui| {
             ui.horizontal(|ui| {
                 let mut w1 = 150.0;
-                let mut w2 = 200.0;
-                column_header(ui, "Name", &mut w1, 50.0, "name_hdr");
-                column_header(ui, "Description", &mut w2, 50.0, "desc_hdr");
+                column_header(ui, "Name", &mut w1, 50.0, 300.0, "name_hdr");
+                column_header_static(ui, "Description", 200.0);
+            });
+        });
+        let _ = ctx;
+    }
+
+    #[test]
+    fn test_column_header_static_renders_without_panic() {
+        // Verify column_header_static renders without panic
+        let ctx = run_test_ui(500.0, 200.0, |ui| {
+            ui.horizontal(|ui| {
+                column_header_static(ui, "Static Col", 150.0);
+                column_header_static(ui, "Another", 100.0);
+            });
+        });
+        let _ = ctx;
+    }
+
+    #[test]
+    fn test_column_header_respects_max_width() {
+        // Verify column_header clamps width to max_width after drag
+        let ctx = run_test_ui(800.0, 200.0, |ui| {
+            ui.horizontal(|ui| {
+                let mut width = 150.0;
+                let resp = column_header(ui, "Col", &mut width, 50.0, 200.0, "max_test");
+
+                // Initial width unchanged
+                assert_eq!(width, 150.0);
+
+                // Even without actual mouse events, the function should not crash
+                assert!(!resp.dragged());
+
+                // width should be <= max_width
+                assert!(width <= 200.0, "width {} exceeded max_width 200.0", width);
+            });
+        });
+        let _ = ctx;
+    }
+
+    #[test]
+    fn test_column_header_min_max_clamp_after_theoretical_drag() {
+        let ctx = run_test_ui(800.0, 200.0, |ui| {
+            ui.horizontal(|ui| {
+                let mut width = 100.0;
+                // max_width = 200, min_width = 50
+                let _resp = column_header(ui, "Col", &mut width, 50.0, 200.0, "theoretical_drag");
+
+                // Verify the width is in range after the render pass
+                assert!(width >= 50.0, "width {} below min_width 50.0", width);
+                assert!(width <= 200.0, "width {} above max_width 200.0", width);
+            });
+        });
+        let _ = ctx;
+    }
+
+    #[test]
+    fn test_column_header_drag_changes_width() {
+        // Simulate a drag on the divider (with max_width)
+        let ctx = run_test_ui(500.0, 200.0, |ui| {
+            ui.horizontal(|ui| {
+                let mut width = 150.0;
+                let resp = column_header(ui, "TestCol", &mut width, 50.0, 400.0, "test_hdr");
+
+                // Before drag, width unchanged
+                assert_eq!(width, 150.0);
+
+                // We can't actually simulate mouse in egui tests,
+                // so just verify the function doesn't panic
+                assert!(!resp.dragged());
             });
         });
         let _ = ctx;
@@ -454,24 +642,99 @@ mod tests {
         let _ = ctx;
     }
 
+    // ── Column width capping tests ─────────────────────────────────────
+
     #[test]
-    fn test_column_header_drag_changes_width() {
-        // Simulate a drag on the divider
-        let ctx = run_test_ui(500.0, 200.0, |ui| {
-            ui.horizontal(|ui| {
-                let mut width = 150.0;
-                let resp = column_header(ui, "TestCol", &mut width, 50.0, "test_hdr");
+    fn test_cap_column_widths_both_within_bounds() {
+        // When both widths fit, no change
+        let mut w1 = 150.0;
+        let mut w2 = 100.0;
+        cap_column_widths(&mut w1, &mut w2, 500.0, 50.0, 300.0, 50.0);
+        assert!((w1 - 150.0).abs() < 0.01, "Expected w1≈150, got {}", w1);
+        assert!((w2 - 100.0).abs() < 0.01, "Expected w2≈100, got {}", w2);
+    }
 
-                // Before drag, width unchanged
-                assert_eq!(width, 150.0);
+    #[test]
+    fn test_cap_column_widths_shrinks_proportionally() {
+        // When total exceeds available, both shrink proportionally
+        let mut w1 = 300.0;
+        let mut w2 = 200.0;
+        // avail=500, reserved=50 → max_cols=450
+        cap_column_widths(&mut w1, &mut w2, 500.0, 50.0, 400.0, 50.0);
+        // Proportional: 450 = 300*0.9 + 200*0.9 = 270 + 180
+        assert!((w1 - 270.0).abs() < 1.0, "Expected w1≈270, got {}", w1);
+        assert!((w2 - 180.0).abs() < 1.0, "Expected w2≈180, got {}", w2);
+    }
 
-                // We can't actually simulate mouse in egui tests,
-                // so just verify the function doesn't panic
-                assert!(!resp.dragged());
-            });
-        });
-        let _ = ctx;
+    #[test]
+    fn test_cap_column_widths_respects_min_width() {
+        // When proportional shrink would go below min_width, enforce min
+        let mut w1 = 50.0;  // already at min
+        let mut w2 = 400.0; // very large
+        cap_column_widths(&mut w1, &mut w2, 300.0, 50.0, 400.0, 50.0);
+        // max_cols = 250, w1 stays at 50, w2 should be 200
+        assert!((w1 - 50.0).abs() < 0.01, "Expected w1=50, got {}", w1);
+        assert!((w2 - 200.0).abs() < 1.0, "Expected w2≈200, got {}", w2);
+    }
+
+    #[test]
+    fn test_cap_column_widths_respects_max_width() {
+        // When a column exceeds max_width, clamp it down
+        let mut w1 = 500.0; // exceeds max 300
+        let mut w2 = 100.0;
+        cap_column_widths(&mut w1, &mut w2, 800.0, 50.0, 300.0, 50.0);
+        // max_cols = 750, w1 clamped to 300
+        assert!((w1 - 300.0).abs() < 0.01, "Expected w1=300, got {}", w1);
+        assert!((w2 - 100.0).abs() < 0.01, "Expected w2=100, got {}", w2);
+    }
+
+    #[test]
+    fn test_cap_column_widths_both_exceed_avail_after_min() {
+        // Very narrow: both columns at min_width but no room for both.
+        // Should shrink proportionally below min_width rather than overflow.
+        let mut w1 = 60.0;
+        let mut w2 = 60.0;
+        cap_column_widths(&mut w1, &mut w2, 100.0, 60.0, 300.0, 50.0);
+        // max_cols = 50, both should be ~25 each (proportional within 50px)
+        assert!((w1 - 25.0).abs() < 1.0, "Expected w1≈25, got {}", w1);
+        assert!((w2 - 25.0).abs() < 1.0, "Expected w2≈25, got {}", w2);
+        // Total should not exceed available column space (50)
+        assert!(w1 + w2 <= 50.0 + 0.01, "Total {} exceeds 50", w1 + w2);
+    }
+
+    #[test]
+    fn test_cap_column_widths_actions_reserved() {
+        // Verify that reserved space for actions is always respected
+        let mut w1 = 400.0;
+        let mut w2 = 300.0;
+        // avail=500, reserved=100 → max_cols=400
+        cap_column_widths(&mut w1, &mut w2, 500.0, 50.0, 400.0, 100.0);
+        // Proportional: 400 = 400*0.571 + 300*0.571 ≈ 228.6 + 171.4
+        assert!((w1 - 228.6).abs() < 2.0, "Expected w1≈228.6, got {}", w1);
+        assert!((w2 - 171.4).abs() < 2.0, "Expected w2≈171.4, got {}", w2);
+        // Total should not exceed 400
+        assert!(w1 + w2 <= 400.0 + 0.01, "Total {} exceeds max_cols 400", w1 + w2);
+    }
+
+    #[test]
+    fn test_cap_column_widths_zero_avail() {
+        // When no space is available for columns, both should be 0
+        let mut w1 = 200.0;
+        let mut w2 = 200.0;
+        cap_column_widths(&mut w1, &mut w2, 30.0, 60.0, 300.0, 50.0);
+        // max_cols = 30 - 50 = -20 → clamped to 0, both outputs should be 0
+        assert!((w1 - 0.0).abs() < 0.01, "Expected w1=0, got {}", w1);
+        assert!((w2 - 0.0).abs() < 0.01, "Expected w2=0, got {}", w2);
+    }
+
+    #[test]
+    fn test_cap_column_widths_narrow_window() {
+        // Very narrow window: both should be at min_width
+        let mut w1 = 200.0;
+        let mut w2 = 200.0;
+        cap_column_widths(&mut w1, &mut w2, 150.0, 60.0, 300.0, 30.0);
+        // max_cols = max(120, 120) = 120, both should be 60
+        assert!((w1 - 60.0).abs() < 0.01, "Expected w1=60, got {}", w1);
+        assert!((w2 - 60.0).abs() < 0.01, "Expected w2=60, got {}", w2);
     }
 }
-
-

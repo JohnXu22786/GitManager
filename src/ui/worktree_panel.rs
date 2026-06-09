@@ -1,7 +1,7 @@
 use crate::app::App;
 use crate::git_ops::GitOperation;
 use crate::git_ops::WorktreeInfo;
-use crate::ui::{column_cell, column_header, column_separator};
+use crate::ui::{column_cell, column_header, column_header_static};
 use eframe::egui;
 
 pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -30,31 +30,27 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     let main_wts: Vec<WorktreeInfo> = worktrees.iter().filter(|w| w.is_main).cloned().collect();
     let linked_wts: Vec<WorktreeInfo> = worktrees.iter().filter(|w| !w.is_main).cloned().collect();
 
-    // ── Column header row (left-to-right: Path, Branch/SHA, sep, Actions) ─
+    // ── Column header row (left-to-right: Path | Branch/SHA, Actions) ─
     ui.horizontal(|ui| {
         let cw = &mut app.column_widths;
         let avail = ui.available_width();
-        let max_cols = (avail - 40.0).max(120.0);
+        // Reserve 50px for "Actions" label
+        let reserved = 50.0;
+        let max_cols = (avail - reserved).max(120.0);
 
-        // Path header (resizable, capped)
-        let mut path_w = cw.get("worktree_path", 250.0);
-        // Branch/SHA header (resizable, capped)
-        let mut bs_w = cw.get("worktree_branch_sha", 220.0);
-        if path_w + bs_w > max_cols {
-            path_w = max_cols - bs_w;
-        }
-        path_w = path_w.max(60.0);
-        bs_w = bs_w.max(60.0);
+        // Only Path column is draggable (divider between Path and Branch/SHA).
+        // Branch/SHA fills remaining width automatically.
+        let mut path_w = cw.get("worktree_path", 280.0);
+        path_w = path_w.clamp(60.0, max_cols - 60.0);
+        let bs_w = max_cols - path_w;
 
-        column_header(ui, "Path", &mut path_w, 60.0, "wt_path_hdr");
+        column_header(ui, "Path", &mut path_w, 60.0, max_cols - 60.0, "wt_path_hdr");
         cw.set("worktree_path", path_w);
-        column_header(ui, "Branch/SHA", &mut bs_w, 60.0, "wt_bs_hdr");
-        cw.set("worktree_branch_sha", bs_w);
-
-        column_separator(ui);
+        column_header_static(ui, "Branch/SHA", bs_w);
 
         // Actions (rightmost)
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_space(4.0);
             ui.add(egui::Label::new(egui::RichText::new("Actions").strong()));
         });
     });
@@ -62,27 +58,47 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     ui.separator();
 
     // ── Content ──────────────────────────────────────────────────────
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        if !main_wts.is_empty() {
+    let max_list_height = (ui.available_height() * 0.67).max(150.0);
+
+    // Main Worktree (scrollable)
+    if !main_wts.is_empty() {
+        egui::ScrollArea::vertical()
+            .id_salt("wt_main_list")
+            .max_height(max_list_height)
+            .show(ui, |ui| {
             ui.label(egui::RichText::new("Main Worktree").strong());
             for wt in &main_wts {
                 show_worktree_row(app, ui, ctx, wt);
             }
-        }
+        });
+    }
 
-        if !linked_wts.is_empty() {
-            ui.add_space(5.0);
-            ui.separator();
+    // Separator between Main and Linked (outside ScrollArea)
+    if !linked_wts.is_empty() {
+        if !main_wts.is_empty() {
+            ui.add_space(10.0);
+        }
+        ui.separator();
+    }
+
+    // Linked Worktrees (scrollable)
+    if !linked_wts.is_empty() {
+        egui::ScrollArea::vertical()
+            .id_salt("wt_linked_list")
+            .max_height(max_list_height)
+            .show(ui, |ui| {
             ui.label(egui::RichText::new("Linked Worktrees").strong());
             for wt in &linked_wts {
                 show_worktree_row(app, ui, ctx, wt);
             }
-        }
-    });
+        });
+    }
 
-    // ── Add Worktree section (unchanged) ─────────────────────────────
-    ui.add_space(10.0);
-    ui.separator();
+    // Separator after Linked / before Add Worktree (outside ScrollArea)
+    if !linked_wts.is_empty() || !main_wts.is_empty() {
+        ui.add_space(10.0);
+        ui.separator();
+    }
     ui.heading("Add Worktree");
 
     ui.horizontal(|ui| {
@@ -142,36 +158,29 @@ fn show_worktree_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, wt: 
     let busy = app.is_busy();
     let icon = if wt.is_main { "★ " } else { "○ " };
 
-    // Copy widths before layout (avoids borrow conflict)
-    let mut path_w = app.column_widths.get("worktree_path", 250.0);
-    let mut bs_w = app.column_widths.get("worktree_branch_sha", 220.0);
-
     let branch_display = wt.branch.as_deref().unwrap_or("detached");
     let sha_short = wt.sha.get(..7).unwrap_or(&wt.sha);
     let branch_sha_text = format!("{}{} [{}]", icon, branch_display, sha_short);
     let path_display = wt.path.to_string_lossy().to_string();
 
-    // Cap column widths to not overflow past "…" button
+    // Path column is draggable; Branch/SHA fills remaining space.
+    // For main worktree rows (no actions), reserved=0; for linked, reserve 39px for "…" button.
     let avail = ui.available_width();
-    let sep = if !wt.is_main { 4.0 } else { 0.0 };
-    let btn = if !wt.is_main { 35.0 } else { 0.0 };
-    let max_cols = (avail - btn - sep).max(120.0);
-    if path_w + bs_w > max_cols {
-        path_w = max_cols - bs_w;
-    }
-    path_w = path_w.max(60.0);
-    bs_w = bs_w.max(60.0);
+    let reserved = if !wt.is_main { 39.0 } else { 0.0 };
+    let max_cols = (avail - reserved).max(120.0);
+    let mut path_w = app.column_widths.get("worktree_path", 280.0);
+    path_w = path_w.clamp(60.0, max_cols - 60.0);
+    let bs_w = max_cols - path_w;
 
-    // Left-to-right flow: Path, Branch/SHA, sep, "…" menu
+    // Left-to-right flow: Path, Branch/SHA, "…" menu
     ui.horizontal(|ui| {
         column_cell(ui, path_w, &path_display, egui::Color32::GRAY);
 
         column_cell(ui, bs_w, &branch_sha_text, ui.style().visuals.text_color());
 
         if !wt.is_main {
-            column_separator(ui);
-
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(4.0);
                 ui.menu_button("…", |ui| {
                     if ui.add_enabled(!busy, egui::Button::new("Remove")).clicked() {
                         app.start_operation(ctx, &format!("Remove {:?}", wt_path), GitOperation::RemoveWorktree { path: wt_path.clone(), force: false });

@@ -1,7 +1,7 @@
 use crate::app::App;
 use crate::git_ops::BranchInfo;
 use crate::git_ops::GitOperation;
-use crate::ui::{column_cell, column_header, column_separator};
+use crate::ui::{column_cell, column_header, column_header_static};
 use eframe::egui;
 
 pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -33,33 +33,27 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         .cloned()
         .collect();
 
-    // ── Column header row (left-to-right: Name, Commit, sep, Actions) ─
+    // ── Column header row (left-to-right: Name | Commit, Actions) ─
     ui.horizontal(|ui| {
         let cw = &mut app.column_widths;
         let avail = ui.available_width();
-        // Reserve ~40px for separator + "Actions" label
-        let max_cols = (avail - 40.0).max(120.0);
+        // Reserve 50px for separator + "Actions" label
+        let reserved = 50.0;
+        let max_cols = (avail - reserved).max(120.0);
 
-        // Name header (resizable, capped)
-        let mut name_w = cw.get("branch_name", 260.0);
-        // Commit header (resizable, capped)
-        let mut commit_w = cw.get("branch_commit", 220.0);
-        // Cap total to not overflow past Actions
-        if name_w + commit_w > max_cols {
-            name_w = max_cols - commit_w;
-        }
-        name_w = name_w.max(60.0);
-        commit_w = commit_w.max(60.0);
+        // Only Name column is draggable (divider between Name and Commit).
+        // Commit fills remaining width automatically.
+        let mut name_w = cw.get("branch_name", 280.0);
+        name_w = name_w.clamp(60.0, max_cols - 60.0);
+        let commit_w = max_cols - name_w;
 
-        column_header(ui, "Name", &mut name_w, 60.0, "branch_name_hdr");
+        column_header(ui, "Name", &mut name_w, 60.0, max_cols - 60.0, "branch_name_hdr");
         cw.set("branch_name", name_w);
-        column_header(ui, "Last Commit", &mut commit_w, 60.0, "branch_commit_hdr");
-        cw.set("branch_commit", commit_w);
-
-        column_separator(ui);
+        column_header_static(ui, "Last Commit", commit_w);
 
         // Actions (rightmost)
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_space(4.0);
             ui.add(egui::Label::new(egui::RichText::new("Actions").strong()));
         });
     });
@@ -67,7 +61,13 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     ui.separator();
 
     // ── Content rows ─────────────────────────────────────────────────
-    egui::ScrollArea::vertical().show(ui, |ui| {
+    // Limit to ~2/3 of available height so create/merge/rename sections
+    // stay visible and the outer ScrollArea in app.rs rarely triggers.
+    let max_list_height = (ui.available_height() * 0.67).max(150.0);
+    egui::ScrollArea::vertical()
+        .id_salt("branch_list")
+        .max_height(max_list_height)
+        .show(ui, |ui| {
         ui.label(egui::RichText::new("Local Branches").strong());
         for branch in &locals {
             show_branch_row(app, ui, ctx, branch);
@@ -159,10 +159,6 @@ fn show_branch_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, branch
     let is_head = branch.is_head;
     let busy = app.is_busy();
 
-    // Copy widths before layout (avoids borrow conflict)
-    let mut name_w = app.column_widths.get("branch_name", 260.0);
-    let mut commit_w = app.column_widths.get("branch_commit", 220.0);
-
     let name_color = if is_head {
         App::adaptive_green(dark)
     } else {
@@ -190,27 +186,23 @@ fn show_branch_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, branch
         .filter(|m| !m.is_empty())
         .cloned();
 
-    // Cap column widths to not overflow past "…" button
+    // Name column is draggable; Commit fills remaining space.
+    // Reserve 39px for sep (4px) + "…" menu button (~35px).
     let avail = ui.available_width();
-    let sep = 4.0;
-    let btn = 35.0;
-    let max_cols = (avail - btn - sep).max(120.0);
-    if name_w + commit_w > max_cols {
-        name_w = max_cols - commit_w;
-    }
-    name_w = name_w.max(60.0);
-    commit_w = commit_w.max(60.0);
+    let max_cols = (avail - 39.0).max(120.0);
+    let mut name_w = app.column_widths.get("branch_name", 280.0);
+    name_w = name_w.clamp(60.0, max_cols - 60.0);
+    let commit_w = max_cols - name_w;
 
-    // Left-to-right flow: Name, Commit, sep, "…" menu
+    // Left-to-right flow: Name, Commit, "…" menu
     ui.horizontal(|ui| {
         column_cell(ui, name_w, &name_display, name_color);
 
         column_cell(ui, commit_w, commit_text.as_deref().unwrap_or(""), egui::Color32::GRAY);
 
         if !is_head || (!is_head && !is_remote) {
-            column_separator(ui);
-
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(4.0);
                 ui.menu_button("…", |ui| {
                     if !is_head {
                         if ui.add_enabled(!busy, egui::Button::new("Checkout")).clicked() {
