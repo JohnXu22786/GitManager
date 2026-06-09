@@ -1,6 +1,7 @@
 use crate::app::App;
 use crate::git_ops::GitOperation;
 use crate::git_ops::WorktreeInfo;
+use crate::ui::{column_cell, column_header, column_separator};
 use eframe::egui;
 
 pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -29,6 +30,38 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     let main_wts: Vec<WorktreeInfo> = worktrees.iter().filter(|w| w.is_main).cloned().collect();
     let linked_wts: Vec<WorktreeInfo> = worktrees.iter().filter(|w| !w.is_main).cloned().collect();
 
+    // ── Column header row (left-to-right: Path, Branch/SHA, sep, Actions) ─
+    ui.horizontal(|ui| {
+        let cw = &mut app.column_widths;
+        let avail = ui.available_width();
+        let max_cols = (avail - 40.0).max(120.0);
+
+        // Path header (resizable, capped)
+        let mut path_w = cw.get("worktree_path", 250.0);
+        // Branch/SHA header (resizable, capped)
+        let mut bs_w = cw.get("worktree_branch_sha", 220.0);
+        if path_w + bs_w > max_cols {
+            path_w = max_cols - bs_w;
+        }
+        path_w = path_w.max(60.0);
+        bs_w = bs_w.max(60.0);
+
+        column_header(ui, "Path", &mut path_w, 60.0, "wt_path_hdr");
+        cw.set("worktree_path", path_w);
+        column_header(ui, "Branch/SHA", &mut bs_w, 60.0, "wt_bs_hdr");
+        cw.set("worktree_branch_sha", bs_w);
+
+        column_separator(ui);
+
+        // Actions (rightmost)
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add(egui::Label::new(egui::RichText::new("Actions").strong()));
+        });
+    });
+
+    ui.separator();
+
+    // ── Content ──────────────────────────────────────────────────────
     egui::ScrollArea::vertical().show(ui, |ui| {
         if !main_wts.is_empty() {
             ui.label(egui::RichText::new("Main Worktree").strong());
@@ -47,6 +80,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         }
     });
 
+    // ── Add Worktree section (unchanged) ─────────────────────────────
     ui.add_space(10.0);
     ui.separator();
     ui.heading("Add Worktree");
@@ -104,109 +138,51 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
 }
 
 fn show_worktree_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, wt: &WorktreeInfo) {
-    let dark = ctx.style().visuals.dark_mode;
     let wt_path = wt.path.clone();
-    ui.horizontal(|ui| {
-        let icon = if wt.is_main { "★" } else { "○" };
-        ui.label(egui::RichText::new(icon).color(App::adaptive_gold(dark)));
+    let busy = app.is_busy();
+    let icon = if wt.is_main { "★ " } else { "○ " };
 
-        let branch_display = wt.branch.as_deref().unwrap_or("detached");
-        let sha_short = wt.sha.get(..7).unwrap_or(&wt.sha);
-        let branch_sha_text = format!("{} [{}]", branch_display, sha_short);
-        let path_display = wt.path.to_string_lossy().to_string();
+    // Copy widths before layout (avoids borrow conflict)
+    let mut path_w = app.column_widths.get("worktree_path", 250.0);
+    let mut bs_w = app.column_widths.get("worktree_branch_sha", 220.0);
+
+    let branch_display = wt.branch.as_deref().unwrap_or("detached");
+    let sha_short = wt.sha.get(..7).unwrap_or(&wt.sha);
+    let branch_sha_text = format!("{}{} [{}]", icon, branch_display, sha_short);
+    let path_display = wt.path.to_string_lossy().to_string();
+
+    // Cap column widths to not overflow past "…" button
+    let avail = ui.available_width();
+    let sep = if !wt.is_main { 4.0 } else { 0.0 };
+    let btn = if !wt.is_main { 35.0 } else { 0.0 };
+    let max_cols = (avail - btn - sep).max(120.0);
+    if path_w + bs_w > max_cols {
+        path_w = max_cols - bs_w;
+    }
+    path_w = path_w.max(60.0);
+    bs_w = bs_w.max(60.0);
+
+    // Left-to-right flow: Path, Branch/SHA, sep, "…" menu
+    ui.horizontal(|ui| {
+        column_cell(ui, path_w, &path_display, egui::Color32::GRAY);
+
+        column_cell(ui, bs_w, &branch_sha_text, ui.style().visuals.text_color());
 
         if !wt.is_main {
-            let busy = app.is_busy();
-            // Buttons on the right, branch/sha (left) + path (compresses first)
+            column_separator(ui);
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if crate::ui::add_enabled_ellipsis(ui, !busy, "Remove").clicked() {
-                    app.start_operation(ctx, &format!("Remove {:?}", wt_path), GitOperation::RemoveWorktree { path: wt_path.clone(), force: false });
-                }
-                if crate::ui::add_enabled_ellipsis(ui, !busy, "Force Remove").clicked() {
-                    app.start_operation(ctx, &format!("Force remove {:?}", wt_path), GitOperation::RemoveWorktree { path: wt_path.clone(), force: true });
-                }
-
-                // --- Available space for text (after buttons) ---
-                let text_avail = ui.available_width().max(40.0);
-
-                // Natural width estimates
-                let info_nat = (branch_sha_text.len() as f32 * 9.0).min(300.0);
-                let path_nat = (path_display.len() as f32 * 8.0).min(300.0);
-
-                let (path_w, info_w) = if info_nat + path_nat <= text_avail {
-                    // Both fit → pack left
-                    (path_nat.min(text_avail - info_nat), info_nat)
-                } else if info_nat <= text_avail * 0.5 {
-                    // Branch info fits, compress path
-                    (text_avail - info_nat, info_nat)
-                } else {
-                    // Both need compression → ~50/50
-                    let half = (text_avail / 2.0).max(50.0);
-                    (half, text_avail - half)
-                };
-
-                // Path (compresses first)
-                ui.add_sized(
-                    [path_w, ui.available_height()],
-                    egui::Label::new(
-                        egui::RichText::new(&path_display)
-                            .color(egui::Color32::GRAY)
-                            .text_style(egui::TextStyle::Small),
-                    )
-                    .truncate(),
-                )
-                .on_hover_text(&path_display);
-
-                // Branch/SHA (leftmost, less compressible)
-                ui.add_sized(
-                    [info_w, ui.available_height()],
-                    egui::Label::new(
-                        egui::RichText::new(&branch_sha_text)
-                            .color(ui.style().visuals.text_color()),
-                    )
-                    .truncate(),
-                )
-                .on_hover_text(&branch_sha_text);
+                ui.menu_button("…", |ui| {
+                    if ui.add_enabled(!busy, egui::Button::new("Remove")).clicked() {
+                        app.start_operation(ctx, &format!("Remove {:?}", wt_path), GitOperation::RemoveWorktree { path: wt_path.clone(), force: false });
+                        ui.close_menu();
+                    }
+                    if ui.add_enabled(!busy, egui::Button::new("Force Remove")).clicked() {
+                        app.start_operation(ctx, &format!("Force remove {:?}", wt_path), GitOperation::RemoveWorktree { path: wt_path.clone(), force: true });
+                        ui.close_menu();
+                    }
+                });
             });
-        } else {
-            // Main worktree: just text, no buttons
-            let branch_sha_hover = branch_sha_text.clone();
-            let path_hover = path_display.clone();
-
-            // Natural width estimates
-            let info_nat = (branch_sha_text.len() as f32 * 9.0).min(300.0);
-            let path_nat = (path_display.len() as f32 * 8.0).min(300.0);
-            let text_avail = ui.available_width().max(40.0);
-
-            let (path_w, info_w) = if info_nat + path_nat <= text_avail {
-                (path_nat.min(text_avail - info_nat), info_nat)
-            } else if info_nat <= text_avail * 0.5 {
-                (text_avail - info_nat, info_nat)
-            } else {
-                let half = (text_avail / 2.0).max(50.0);
-                (half, text_avail - half)
-            };
-
-            ui.add_sized(
-                [info_w, ui.available_height()],
-                egui::Label::new(
-                    egui::RichText::new(&branch_sha_text)
-                        .color(ui.style().visuals.text_color()),
-                )
-                .truncate(),
-            )
-            .on_hover_text(branch_sha_hover);
-
-            ui.add_sized(
-                [path_w, ui.available_height()],
-                egui::Label::new(
-                    egui::RichText::new(&path_display)
-                        .color(egui::Color32::GRAY)
-                        .text_style(egui::TextStyle::Small),
-                )
-                .truncate(),
-            )
-            .on_hover_text(path_hover);
         }
     });
 }
