@@ -190,7 +190,6 @@ pub fn column_header_static(ui: &mut egui::Ui, label: &str, width: f32) {
     // Draw header label text (left-aligned and truncated to the column width)
     let painter = ui.painter();
     let text_color = ui.style().visuals.text_color();
-    let text_pos = header_rect.left_center() + egui::vec2(4.0, 0.0);
     let wrap_width = (header_rect.width() - 8.0).max(0.0);
     let mut job = egui::text::LayoutJob::default();
     job.wrap = egui::text::TextWrapping::truncate_at_width(wrap_width);
@@ -200,6 +199,10 @@ pub fn column_header_static(ui: &mut egui::Ui, label: &str, width: f32) {
         egui::TextFormat::simple(egui::FontId::proportional(13.0), text_color),
     );
     let galley = painter.layout_job(job);
+    let text_pos = egui::pos2(
+        header_rect.left() + 4.0,
+        header_rect.center().y - galley.rect.center().y,
+    );
     painter
         .with_clip_rect(header_rect)
         .galley(text_pos, galley, text_color);
@@ -621,6 +624,13 @@ mod tests {
             text_shape.clip_rect.width() <= 60.0,
             "header text clip width {} exceeded the 60px column",
             text_shape.clip_rect.width()
+        );
+        let text_center_y = text.pos.y + text.galley.rect.center().y;
+        assert!(
+            (text_center_y - text_shape.clip_rect.center().y).abs() <= 0.5,
+            "header text center {} was not aligned with column center {}",
+            text_center_y,
+            text_shape.clip_rect.center().y
         );
     }
 
