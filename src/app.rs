@@ -68,6 +68,8 @@ pub struct App {
     pub stash_message: String,
     pub remote_name: String,
     pub push_branch: String,
+    /// Whether the push branch field has been edited by the user.
+    pub(crate) push_branch_user_edited: bool,
     pub push_force: bool,
     pub pull_rebase: bool,
 
@@ -133,6 +135,7 @@ impl App {
             stash_message: String::new(),
             remote_name: String::new(),
             push_branch: String::new(),
+            push_branch_user_edited: false,
             push_force: false,
             pull_rebase: false,
 
@@ -288,6 +291,8 @@ impl App {
         match self.git.open(Path::new(path)) {
             Ok(()) => {
                 self.repo_path = path.to_string();
+                self.push_branch.clear();
+                self.push_branch_user_edited = false;
                 self.status_message = format!("Opened repository at {}", path);
                 self.status_is_error = false;
                 self.recent_repos.add(path);
