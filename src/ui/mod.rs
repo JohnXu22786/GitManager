@@ -187,16 +187,22 @@ pub fn column_header_static(ui: &mut egui::Ui, label: &str, width: f32) {
         egui::Sense::hover(),
     );
 
-    // Draw header label text (left-aligned)
+    // Draw header label text (left-aligned and truncated to the column width)
     let painter = ui.painter();
+    let text_color = ui.style().visuals.text_color();
     let text_pos = header_rect.left_center() + egui::vec2(4.0, 0.0);
-    painter.text(
-        text_pos,
-        egui::Align2::LEFT_CENTER,
+    let wrap_width = (header_rect.width() - 8.0).max(0.0);
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap = egui::text::TextWrapping::truncate_at_width(wrap_width);
+    job.append(
         label,
-        egui::FontId::proportional(13.0),
-        ui.style().visuals.text_color(),
+        0.0,
+        egui::TextFormat::simple(egui::FontId::proportional(13.0), text_color),
     );
+    let galley = painter.layout_job(job);
+    painter
+        .with_clip_rect(header_rect)
+        .galley(text_pos, galley, text_color);
 }
 
 /// Render content inside a column of the given width, left-aligned.
@@ -571,6 +577,51 @@ mod tests {
             });
         });
         let _ = ctx;
+    }
+
+    #[test]
+    fn test_column_header_static_truncates_and_clips_long_label() {
+        let ctx = egui::Context::default();
+        ctx.options_mut(|o| o.max_passes = 1.try_into().unwrap());
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(200.0, 200.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    column_header_static(ui, "Last Commit", 60.0);
+                });
+            },
+        );
+
+        let text_shape = output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.job.text == "Last Commit" => Some(clipped),
+                _ => None,
+            })
+            .expect("static column header should paint a text shape");
+
+        let egui::Shape::Text(text) = &text_shape.shape else {
+            unreachable!("shape was checked above");
+        };
+
+        assert!(text.galley.elided, "long static header should be elided");
+        assert!(
+            text.galley.rect.width() <= 52.0,
+            "header galley width {} exceeded its 52px text budget",
+            text.galley.rect.width()
+        );
+        assert!(
+            text_shape.clip_rect.width() <= 60.0,
+            "header text clip width {} exceeded the 60px column",
+            text_shape.clip_rect.width()
+        );
     }
 
     #[test]
