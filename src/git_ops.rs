@@ -380,7 +380,7 @@ impl GitRepo {
 
     pub fn open(&mut self, path: &Path) -> GitResult<()> {
         let r = Repository::open(path).map_err(|e| format!("Open repo: {}", e))?;
-        let p = r.path().parent().unwrap().to_path_buf();
+        let p = r.workdir().map(Path::to_path_buf).unwrap_or_else(|| path.to_path_buf());
         *self.repo.borrow_mut() = Some(r);
         self.path = Some(p);
         Ok(())
@@ -1100,6 +1100,40 @@ mod tests {
         let mut git = GitRepo::new();
         git.open(repo_dir).expect("open repo");
         git
+    }
+
+    #[test]
+    fn test_open_linked_worktree_preserves_path_for_background_reopen() {
+        let main_dir = tempfile::tempdir().expect("temp dir");
+        let wt_root = tempfile::tempdir().expect("temp dir");
+        let wt_path = wt_root.path().join("linked-wt");
+
+        let repo = create_repo_with_commit(main_dir.path());
+        let head = repo.head().expect("head");
+        let commit = head.peel_to_commit().expect("commit");
+        let wt_name = "linked-wt";
+        let _branch = repo.branch(wt_name, &commit, false).expect("branch");
+        let reference = repo.find_reference(&format!("refs/heads/{}", wt_name)).expect("reference");
+        let mut opts = git2::WorktreeAddOptions::new();
+        opts.reference(Some(&reference));
+        repo.worktree(wt_name, &wt_path, Some(&opts)).expect("create worktree");
+
+        std::fs::write(wt_path.join("staged.txt"), "change").expect("write worktree file");
+
+        let git = open_git_repo(&wt_path);
+        let reopened_path = git.path().expect("opened repo path").to_path_buf();
+        assert_eq!(reopened_path, wt_path, "reopened operations must use the linked worktree");
+
+        let progress = Arc::new(Mutex::new(String::new()));
+        let result = execute_operation(&reopened_path, GitOperation::StageAll, progress);
+        assert!(matches!(result, OpResult::Success(_)), "staging failed: {:?}", result);
+
+        let linked_repo = Repository::open(&wt_path).expect("reopen linked worktree");
+        let index = linked_repo.index().expect("linked worktree index");
+        assert!(
+            index.get_path(Path::new("staged.txt"), 0).is_some(),
+            "background operation should update the linked worktree index"
+        );
     }
 
     #[test]
