@@ -2,9 +2,9 @@ use crate::app::App;
 use crate::git_ops::GitOperation;
 use eframe::egui;
 
-fn initialize_push_branch(push_branch: &mut String, current_branch: &str) {
-    if push_branch.is_empty() {
-        push_branch.push_str(current_branch);
+fn initialize_push_branch(push_branch: &mut String, current_branch: &str, user_edited: bool) {
+    if !user_edited {
+        *push_branch = current_branch.to_owned();
     }
 }
 
@@ -57,7 +57,11 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     let current_branch = app.git.current_branch().unwrap_or_default();
     let default_remote = app.remote_list.first().map(|r| r.name.clone()).unwrap_or_default();
 
-    initialize_push_branch(&mut app.push_branch, &current_branch);
+    initialize_push_branch(
+        &mut app.push_branch,
+        &current_branch,
+        app.push_branch_user_edited,
+    );
     if app.remote_name.is_empty() {
         app.remote_name = default_remote.clone();
     }
@@ -71,7 +75,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     });
     ui.horizontal(|ui| {
         ui.label("Branch:");
-        ui.text_edit_singleline(&mut app.push_branch);
+        if ui.text_edit_singleline(&mut app.push_branch).changed() {
+            app.push_branch_user_edited = true;
+        }
     });
     ui.checkbox(&mut app.push_force, "Force Push");
     if crate::ui::add_enabled_ellipsis(ui, !busy, "Push").clicked() {
@@ -121,23 +127,86 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
 
 #[cfg(test)]
 mod tests {
+    use super::show;
+    use crate::app::App;
+    use eframe::egui;
+    use git2::Repository;
+    use std::path::Path;
     use super::initialize_push_branch;
 
-    #[test]
-    fn initializes_empty_push_branch_from_current_branch() {
-        let mut push_branch = String::new();
+    fn create_repo_with_commit(dir: &Path) -> Repository {
+        let repo = Repository::init(dir).expect("init repo");
+        let signature = repo.signature().expect("signature");
+        let tree_oid = {
+            let mut index = repo.index().expect("index");
+            index.write_tree().expect("write tree")
+        };
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+        repo.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+            .expect("initial commit");
+        drop(tree);
+        repo
+    }
 
-        initialize_push_branch(&mut push_branch, "main");
-
-        assert_eq!(push_branch, "main");
+    fn show_panel(app: &mut App, ctx: &egui::Context) {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(app, ui, ctx);
+                });
+            },
+        );
     }
 
     #[test]
-    fn preserves_custom_push_branch_across_repaint_initialization() {
-        let mut push_branch = String::from("release/v1");
+    fn follows_current_branch_until_push_branch_is_edited() {
+        let mut push_branch = String::new();
 
-        initialize_push_branch(&mut push_branch, "main");
+        initialize_push_branch(&mut push_branch, "main", false);
+        assert_eq!(push_branch, "main");
+
+        initialize_push_branch(&mut push_branch, "feature", false);
+        assert_eq!(push_branch, "feature");
+
+        push_branch = String::from("release/v1");
+        initialize_push_branch(&mut push_branch, "hotfix", true);
 
         assert_eq!(push_branch, "release/v1");
+    }
+
+    #[test]
+    fn panel_updates_untouched_default_after_branch_change() {
+        let repo_dir = tempfile::tempdir_in(".").expect("temp dir");
+        let repo = create_repo_with_commit(repo_dir.path());
+        let initial_branch = repo
+            .head()
+            .expect("HEAD")
+            .shorthand()
+            .expect("initial branch")
+            .to_owned();
+        let initial_commit = repo.head().expect("HEAD").peel_to_commit().expect("commit");
+        repo.branch("feature", &initial_commit, false)
+            .expect("create feature branch");
+        drop(initial_commit);
+        drop(repo);
+
+        let mut app = App::new();
+        app.git.open(repo_dir.path()).expect("open repo");
+        let ctx = egui::Context::default();
+
+        show_panel(&mut app, &ctx);
+        assert_eq!(app.push_branch, initial_branch);
+
+        app.git.checkout_branch("feature").expect("checkout feature");
+        show_panel(&mut app, &ctx);
+
+        assert_eq!(app.push_branch, "feature");
     }
 }
