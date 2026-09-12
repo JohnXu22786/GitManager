@@ -2,6 +2,12 @@ use crate::app::App;
 use crate::git_ops::GitOperation;
 use eframe::egui;
 
+fn initialize_push_branch(push_branch: &mut String, current_branch: &str) {
+    if push_branch.is_empty() {
+        push_branch.push_str(current_branch);
+    }
+}
+
 pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     ui.horizontal(|ui| {
         ui.add(egui::Label::new(egui::RichText::new("Remotes").heading()).truncate()).on_hover_text("Remotes");
@@ -51,7 +57,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     let current_branch = app.git.current_branch().unwrap_or_default();
     let default_remote = app.remote_list.first().map(|r| r.name.clone()).unwrap_or_default();
 
-    app.push_branch = current_branch.clone();
+    initialize_push_branch(&mut app.push_branch, &current_branch);
     if app.remote_name.is_empty() {
         app.remote_name = default_remote.clone();
     }
@@ -110,5 +116,28 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         } else {
             app.start_operation(ctx, &format!("Fetch from {}", remote), GitOperation::Fetch(remote));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::initialize_push_branch;
+
+    #[test]
+    fn initializes_empty_push_branch_from_current_branch() {
+        let mut push_branch = String::new();
+
+        initialize_push_branch(&mut push_branch, "main");
+
+        assert_eq!(push_branch, "main");
+    }
+
+    #[test]
+    fn preserves_custom_push_branch_across_repaint_initialization() {
+        let mut push_branch = String::from("release/v1");
+
+        initialize_push_branch(&mut push_branch, "main");
+
+        assert_eq!(push_branch, "release/v1");
     }
 }
