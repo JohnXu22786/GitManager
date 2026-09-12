@@ -649,6 +649,26 @@ impl GitRepo {
             }
         }
 
+        // Regular removal must not discard uncommitted work. Check the
+        // worktree before pruning metadata or deleting its directory.
+        if !force && path.exists() {
+            let worktree_repo = Repository::open(path)
+                .map_err(|e| format!("Check worktree status: {}", e))?;
+            let mut status_opts = git2::StatusOptions::new();
+            status_opts
+                .include_untracked(true)
+                .recurse_untracked_dirs(true)
+                .include_ignored(true)
+                .recurse_ignored_dirs(true);
+            let statuses = worktree_repo
+                .statuses(Some(&mut status_opts))
+                .map_err(|e| format!("Check worktree status: {}", e))?;
+
+            if !statuses.is_empty() {
+                return Err("Cannot remove worktree with uncommitted changes. Use Force Remove to delete it.".into());
+            }
+        }
+
         // Attempt pruning with manual fallback for metadata cleanup
         if let Some(ref wt) = found_wt {
             let prune_result = if force {
@@ -1398,6 +1418,79 @@ mod tests {
 
         // Directory should be gone
         assert!(!wt_path.exists(), "Worktree dir should be deleted after remove");
+    }
+
+    #[test]
+    fn test_normal_remove_dirty_worktree_preserves_directory() {
+        let main_dir = tempfile::tempdir().expect("temp dir");
+        let wt_root = tempfile::tempdir().expect("temp dir");
+        let wt_path = wt_root.path().join("test-wt-dirty");
+
+        let repo = create_repo_with_commit(main_dir.path());
+
+        let wt_name = "test-wt-dirty";
+        let _branch = repo.branch(wt_name, &repo.head().unwrap().peel_to_commit().unwrap(), false).unwrap();
+        let reference = repo.find_reference(&format!("refs/heads/{}", wt_name)).ok();
+        let mut opts = git2::WorktreeAddOptions::new();
+        if let Some(ref r) = reference {
+            opts.reference(Some(r));
+        }
+        repo.worktree(wt_name, &wt_path, Some(&opts)).expect("create worktree");
+
+        let uncommitted_file = wt_path.join("important.txt");
+        std::fs::write(&uncommitted_file, "keep this change").expect("write uncommitted file");
+        let wt_gitdir = repo.path().join("worktrees").join(wt_name);
+
+        let git = open_git_repo(main_dir.path());
+        let result = git.remove_worktree(&wt_path, false);
+        assert!(result.is_err(), "Normal remove must refuse a dirty worktree");
+        assert!(wt_path.exists(), "Dirty worktree directory must be preserved");
+        assert_eq!(
+            std::fs::read_to_string(&uncommitted_file).expect("read preserved file"),
+            "keep this change"
+        );
+        assert!(wt_gitdir.exists(), "Git worktree metadata must be preserved");
+    }
+
+    #[test]
+    fn test_normal_remove_ignored_worktree_file_preserves_directory() {
+        let main_dir = tempfile::tempdir().expect("temp dir");
+        let wt_root = tempfile::tempdir().expect("temp dir");
+        let wt_path = wt_root.path().join("test-wt-ignored");
+
+        let repo = create_repo_with_commit(main_dir.path());
+        let exclude_path = main_dir.path().join(".git").join("info").join("exclude");
+        std::fs::write(&exclude_path, "target/\n").expect("ignore target directory");
+
+        let wt_name = "test-wt-ignored";
+        let _branch = repo
+            .branch(
+                wt_name,
+                &repo.head().unwrap().peel_to_commit().unwrap(),
+                false,
+            )
+            .unwrap();
+        let reference = repo.find_reference(&format!("refs/heads/{}", wt_name)).ok();
+        let mut opts = git2::WorktreeAddOptions::new();
+        if let Some(ref r) = reference {
+            opts.reference(Some(r));
+        }
+        repo.worktree(wt_name, &wt_path, Some(&opts)).expect("create worktree");
+
+        let ignored_file = wt_path.join("target").join("important.txt");
+        std::fs::create_dir_all(ignored_file.parent().unwrap()).expect("create ignored directory");
+        std::fs::write(&ignored_file, "keep this ignored change").expect("write ignored file");
+        let wt_gitdir = repo.path().join("worktrees").join(wt_name);
+
+        let git = open_git_repo(main_dir.path());
+        let result = git.remove_worktree(&wt_path, false);
+        assert!(result.is_err(), "Normal remove must refuse an ignored dirty file");
+        assert!(wt_path.exists(), "Worktree directory with ignored files must be preserved");
+        assert_eq!(
+            std::fs::read_to_string(&ignored_file).expect("read preserved ignored file"),
+            "keep this ignored change"
+        );
+        assert!(wt_gitdir.exists(), "Git worktree metadata must be preserved");
     }
 
     #[test]
