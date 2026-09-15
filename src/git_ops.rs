@@ -564,7 +564,10 @@ impl GitRepo {
 
         // Checkout while HEAD still points to the pre-merge tree. Safe checkout
         // then updates clean merge paths without overwriting unrelated changes.
+        // Continue when dirty paths are reported as conflicts so unrelated
+        // local changes do not prevent the merge. Never overwrite ignored files.
         let mut co = git2::build::CheckoutBuilder::new();
+        co.allow_conflicts(true).overwrite_ignored(false);
         repo.checkout_tree(t.as_object(), Some(&mut co))
             .map_err(|e| format!("Checkout before merge commit: {}", e))?;
 
@@ -1192,6 +1195,7 @@ mod tests {
         std::fs::write(&local_path, "local change").expect("modify unrelated local file");
 
         let git = open_git_repo(dir.path());
+        git.stage_file("local.txt").expect("stage unrelated local file");
         git.merge_branch("feature").expect("merge feature branch");
 
         assert_eq!(
@@ -1208,6 +1212,74 @@ mod tests {
             git.current_branch().expect("current branch"),
             current_branch,
             "merge must leave HEAD on the current branch"
+        );
+    }
+
+    #[test]
+    fn test_merge_branch_preserves_ignored_worktree_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(dir.path());
+        let signature = repo.signature().expect("signature");
+        let initial_commit = repo.head().expect("head").peel_to_commit().expect("commit");
+
+        std::fs::write(dir.path().join(".gitignore"), "ignored.txt\n")
+            .expect("write ignore file");
+        let base_tree_oid = {
+            let mut index = repo.index().expect("index");
+            index.add_path(Path::new(".gitignore")).expect("stage ignore file");
+            index.write().expect("write index");
+            index.write_tree().expect("write base tree")
+        };
+        let base_tree = repo.find_tree(base_tree_oid).expect("find base tree");
+        let base_commit_oid = repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "add ignore rule",
+                &base_tree,
+                &[&initial_commit],
+            )
+            .expect("commit ignore rule");
+        drop(base_tree);
+        drop(initial_commit);
+
+        let base_commit = repo.find_commit(base_commit_oid).expect("find base commit");
+        repo.branch("feature", &base_commit, false).expect("create feature branch");
+        let feature_blob = repo.blob(b"feature").expect("write feature blob");
+        let base_tree = base_commit.tree().expect("get base tree");
+        let feature_tree_oid = {
+            let mut builder = repo.treebuilder(Some(&base_tree)).expect("create tree builder");
+            builder
+                .insert("ignored.txt", feature_blob, 0o100644)
+                .expect("add ignored path to feature");
+            builder.write().expect("write feature tree")
+        };
+        let feature_tree = repo.find_tree(feature_tree_oid).expect("find feature tree");
+        repo.commit(
+            Some("refs/heads/feature"),
+            &signature,
+            &signature,
+            "add feature file",
+            &feature_tree,
+            &[&base_commit],
+        )
+        .expect("commit feature file");
+        drop(feature_tree);
+        drop(base_tree);
+        drop(base_commit);
+        drop(repo);
+
+        let ignored_path = dir.path().join("ignored.txt");
+        std::fs::write(&ignored_path, "keep this local file").expect("write ignored file");
+
+        let git = open_git_repo(dir.path());
+        git.merge_branch("feature").expect("merge feature branch");
+
+        assert_eq!(
+            std::fs::read_to_string(&ignored_path).expect("read ignored file"),
+            "keep this local file",
+            "merging must not overwrite an ignored local file"
         );
     }
 
