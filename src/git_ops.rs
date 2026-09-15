@@ -561,13 +561,15 @@ impl GitRepo {
         let t = repo.find_tree(toid).map_err(|e| format!("Find tree: {}", e))?;
 
         let msg = format!("Merge branch '{}'", branch_name);
+
+        // Checkout while HEAD still points to the pre-merge tree. Safe checkout
+        // then updates clean merge paths without overwriting unrelated changes.
+        let mut co = git2::build::CheckoutBuilder::new();
+        repo.checkout_tree(t.as_object(), Some(&mut co))
+            .map_err(|e| format!("Checkout before merge commit: {}", e))?;
+
         repo.commit(Some("HEAD"), &sig, &sig, &msg, &t, &[&head, &their])
             .map_err(|e| format!("Commit: {}", e))?;
-
-        let mut co = git2::build::CheckoutBuilder::new();
-        co.force();
-        repo.checkout_tree(t.as_object(), Some(&mut co))
-            .map_err(|e| format!("Checkout after merge: {}", e))?;
 
         Ok(msg)
     }
@@ -1127,6 +1129,86 @@ mod tests {
         let mut git = GitRepo::new();
         git.open(repo_dir).expect("open repo");
         git
+    }
+
+    #[test]
+    fn test_merge_branch_preserves_unrelated_dirty_worktree_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(dir.path());
+        let signature = repo.signature().expect("signature");
+        let initial_commit = repo.head().expect("head").peel_to_commit().expect("commit");
+        let current_branch = repo.head().expect("head").shorthand().expect("branch").to_string();
+
+        std::fs::write(dir.path().join("merged.txt"), "base").expect("write merge file");
+        std::fs::write(dir.path().join("local.txt"), "base-local").expect("write local file");
+        let main_tree_oid = {
+            let mut index = repo.index().expect("index");
+            index.add_path(Path::new("merged.txt")).expect("stage merge file");
+            index.add_path(Path::new("local.txt")).expect("stage local file");
+            index.write().expect("write main index");
+            index.write_tree().expect("write main tree")
+        };
+        let main_tree = repo.find_tree(main_tree_oid).expect("find main tree");
+        let main_commit_oid = repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "add merge files",
+                &main_tree,
+                &[&initial_commit],
+            )
+            .expect("commit merge files");
+        drop(main_tree);
+        drop(initial_commit);
+
+        let main_commit = repo.find_commit(main_commit_oid).expect("find main commit");
+        repo.branch("feature", &main_commit, false).expect("create feature branch");
+        let feature_blob = repo.blob(b"feature").expect("write feature blob");
+        let main_tree = main_commit.tree().expect("get main tree");
+        let feature_tree_oid = {
+            let mut builder = repo.treebuilder(Some(&main_tree)).expect("create tree builder");
+            builder
+                .insert("merged.txt", feature_blob, 0o100644)
+                .expect("update merge file");
+            builder.write().expect("write feature tree")
+        };
+        let feature_tree = repo.find_tree(feature_tree_oid).expect("find feature tree");
+        repo.commit(
+            Some("refs/heads/feature"),
+            &signature,
+            &signature,
+            "update merge file",
+            &feature_tree,
+            &[&main_commit],
+        )
+        .expect("commit feature change");
+        drop(feature_tree);
+        drop(main_tree);
+        drop(main_commit);
+        drop(repo);
+
+        let local_path = dir.path().join("local.txt");
+        std::fs::write(&local_path, "local change").expect("modify unrelated local file");
+
+        let git = open_git_repo(dir.path());
+        git.merge_branch("feature").expect("merge feature branch");
+
+        assert_eq!(
+            std::fs::read_to_string(&local_path).expect("read local file"),
+            "local change",
+            "merging must preserve unrelated dirty working-tree content"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("merged.txt")).expect("read merged file"),
+            "feature",
+            "the merged file must still be checked out"
+        );
+        assert_eq!(
+            git.current_branch().expect("current branch"),
+            current_branch,
+            "merge must leave HEAD on the current branch"
+        );
     }
 
     #[test]
