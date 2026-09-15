@@ -306,6 +306,75 @@ fn paths_match(a: &Path, b: &Path) -> bool {
     }
 }
 
+fn collect_diff_paths(diff: &git2::Diff<'_>) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for delta in diff.deltas() {
+        for path in [delta.old_file().path(), delta.new_file().path()].into_iter().flatten() {
+            if !paths.iter().any(|existing: &PathBuf| existing == path) {
+                paths.push(path.to_path_buf());
+            }
+        }
+    }
+    paths
+}
+
+fn paths_overlap(a: &Path, b: &Path) -> bool {
+    a == b || a.starts_with(b) || b.starts_with(a)
+}
+
+fn rollback_merge_checkout(
+    repo: &Repository,
+    old_tree: &git2::Tree<'_>,
+    merge_tree: &git2::Tree<'_>,
+    index_path: &Path,
+    original_index: &[u8],
+    clean_paths: &[PathBuf],
+) -> GitResult<()> {
+    let mut errors = Vec::new();
+
+    let mut diff_options = DiffOptions::new();
+    diff_options
+        .include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_ignored(true)
+        .recurse_ignored_dirs(true);
+    let paths_to_restore = match repo.diff_tree_to_workdir(Some(merge_tree), Some(&mut diff_options)) {
+        Ok(diff) => {
+            let dirty_after = collect_diff_paths(&diff);
+            clean_paths
+                .iter()
+                .filter(|path| !dirty_after.iter().any(|dirty| paths_overlap(path, dirty)))
+                .cloned()
+                .collect()
+        }
+        Err(e) => {
+            errors.push(format!("Inspect worktree for rollback: {}", e));
+            clean_paths.to_vec()
+        }
+    };
+
+    if !paths_to_restore.is_empty() {
+        let mut checkout = git2::build::CheckoutBuilder::new();
+        checkout.force().update_index(false).overwrite_ignored(false);
+        for path in &paths_to_restore {
+            checkout.path(path);
+        }
+        if let Err(e) = repo.checkout_tree(old_tree.as_object(), Some(&mut checkout)) {
+            errors.push(format!("Restore worktree: {}", e));
+        }
+    }
+
+    if let Err(e) = std::fs::write(index_path, original_index) {
+        errors.push(format!("Restore index: {}", e));
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
 /// Forcefully remove a directory, with OS-level fallback.
 ///
 /// Used ONLY by Force Remove — regular Remove uses a single gentle attempt.
@@ -532,11 +601,16 @@ impl GitRepo {
 
     pub fn merge_branch(&self, branch_name: &str) -> GitResult<String> {
         let repo = self.repo()?;
+        let head_ref = repo.head().map_err(|e| format!("HEAD: {}", e))?;
+        let original_head_name = head_ref.name_bytes().to_vec();
+        let original_head_symbolic_target = head_ref.symbolic_target_bytes().map(|target| target.to_vec());
+        let mut update_ref = head_ref.resolve().map_err(|e| format!("Resolve HEAD: {}", e))?;
+        let update_ref_name = update_ref.name_bytes().to_vec();
+        let head = head_ref.peel_to_commit().map_err(|_| "No commit".to_string())?;
+
         let their = repo.revparse_single(branch_name)
             .map_err(|e| format!("Find '{}': {}", branch_name, e))?
             .peel_to_commit().map_err(|_| "Not a commit".to_string())?;
-        let head = repo.head().map_err(|e| format!("HEAD: {}", e))?
-            .peel_to_commit().map_err(|_| "No commit".to_string())?;
 
         let base = repo.merge_base(head.id(), their.id())
             .ok()
@@ -556,23 +630,151 @@ impl GitRepo {
 
         if idx.has_conflicts() { return Err("Merge conflicts".into()); }
 
+        let original_index = repo.index().map_err(|e| format!("Index: {}", e))?;
+        if original_index.has_conflicts() {
+            return Err("Index has conflicts".into());
+        }
+        let index_path = original_index
+            .path()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "Index path unavailable".to_string())?;
+        let original_index_bytes = std::fs::read(&index_path)
+            .map_err(|e| format!("Read index: {}", e))?;
+
+        let staged_diff = repo
+            .diff_tree_to_index(Some(&ours), Some(&original_index), None)
+            .map_err(|e| format!("Inspect staged changes: {}", e))?;
+        let staged_paths = collect_diff_paths(&staged_diff);
+        drop(staged_diff);
+        let staged_entries = staged_paths
+            .iter()
+            .map(|path| (path.clone(), original_index.get_path(path, 0)))
+            .collect::<Vec<_>>();
+        drop(original_index);
+
         let sig = repo.signature().map_err(|e| format!("Sig: {}", e))?;
         let toid = idx.write_tree_to(&*repo).map_err(|e| format!("Write tree: {}", e))?;
         let t = repo.find_tree(toid).map_err(|e| format!("Find tree: {}", e))?;
 
         let msg = format!("Merge branch '{}'", branch_name);
 
+        let merge_diff = repo
+            .diff_tree_to_tree(Some(&ours), Some(&t), None)
+            .map_err(|e| format!("Inspect merge changes: {}", e))?;
+        let changed_paths = collect_diff_paths(&merge_diff);
+        drop(merge_diff);
+
+        let mut workdir_diff_options = DiffOptions::new();
+        workdir_diff_options
+            .include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .include_ignored(true)
+            .recurse_ignored_dirs(true);
+        let workdir_diff = repo
+            .diff_tree_to_workdir(Some(&ours), Some(&mut workdir_diff_options))
+            .map_err(|e| format!("Inspect worktree changes: {}", e))?;
+        let dirty_workdir_paths = collect_diff_paths(&workdir_diff);
+        drop(workdir_diff);
+        let clean_paths = changed_paths
+            .iter()
+            .filter(|path| !dirty_workdir_paths.iter().any(|dirty| paths_overlap(path, dirty)))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        // Create the commit object without moving HEAD. This keeps all
+        // ref-update failures after checkout recoverable.
+        let commit_oid = repo
+            .commit(None, &sig, &sig, &msg, &t, &[&head, &their])
+            .map_err(|e| format!("Create merge commit: {}", e))?;
+
         // Checkout while HEAD still points to the pre-merge tree. Safe checkout
         // then updates clean merge paths without overwriting unrelated changes.
         // Continue when dirty paths are reported as conflicts so unrelated
         // local changes do not prevent the merge. Never overwrite ignored files.
         let mut co = git2::build::CheckoutBuilder::new();
-        co.allow_conflicts(true).overwrite_ignored(false);
-        repo.checkout_tree(t.as_object(), Some(&mut co))
-            .map_err(|e| format!("Checkout before merge commit: {}", e))?;
+        co.allow_conflicts(true).overwrite_ignored(false).update_index(false);
+        if let Err(e) = repo.checkout_tree(t.as_object(), Some(&mut co)) {
+            let checkout_error = format!("Checkout before merge commit: {}", e);
+            return match rollback_merge_checkout(
+                &repo,
+                &ours,
+                &t,
+                &index_path,
+                &original_index_bytes,
+                &clean_paths,
+            ) {
+                Ok(()) => Err(checkout_error),
+                Err(rollback_error) => Err(format!("{}; {}", checkout_error, rollback_error)),
+            };
+        }
 
-        repo.commit(Some("HEAD"), &sig, &sig, &msg, &t, &[&head, &their])
-            .map_err(|e| format!("Commit: {}", e))?;
+        let sync_index_result = (|| -> GitResult<()> {
+            let mut index = repo.index().map_err(|e| format!("Index: {}", e))?;
+            // The commit tree is the new baseline. Reapply any staged paths
+            // from before the merge so local staged work remains staged.
+            index.read_tree(&t).map_err(|e| format!("Read merge tree into index: {}", e))?;
+            for (path, entry) in &staged_entries {
+                if let Some(entry) = entry {
+                    index.add(entry).map_err(|e| format!("Preserve staged '{}': {}", path.display(), e))?;
+                } else if index.get_path(path, 0).is_some() {
+                    index.remove(path, 0).map_err(|e| format!("Preserve deletion '{}': {}", path.display(), e))?;
+                }
+            }
+            index.write().map_err(|e| format!("Write merge index: {}", e))?;
+            Ok(())
+        })();
+        if let Err(e) = sync_index_result {
+            let sync_error = format!("Synchronize merge index: {}", e);
+            return match rollback_merge_checkout(
+                &repo,
+                &ours,
+                &t,
+                &index_path,
+                &original_index_bytes,
+                &clean_paths,
+            ) {
+                Ok(()) => Err(sync_error),
+                Err(rollback_error) => Err(format!("{}; {}", sync_error, rollback_error)),
+            };
+        }
+
+        let current_head = repo.head().map_err(|e| format!("Re-read HEAD: {}", e));
+        let ref_update_result = match current_head {
+            Ok(current_head) => {
+                let current_resolved = current_head.resolve().map_err(|e| format!("Resolve current HEAD: {}", e));
+                match current_resolved {
+                    Ok(current_resolved)
+                        if current_head.name_bytes() == original_head_name.as_slice()
+                            && current_head.symbolic_target_bytes().map(|target| target.to_vec())
+                                == original_head_symbolic_target
+                            && current_resolved.name_bytes() == update_ref_name.as_slice()
+                            && current_resolved.target() == Some(head.id()) =>
+                    {
+                        update_ref
+                            .set_target(commit_oid, &msg)
+                            .map(|_| ())
+                            .map_err(|e| format!("Update HEAD: {}", e))
+                    }
+                    Ok(_) => Err("HEAD changed while merging".into()),
+                    Err(e) => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        };
+        if let Err(e) = ref_update_result {
+            let ref_error = format!("{}", e);
+            return match rollback_merge_checkout(
+                &repo,
+                &ours,
+                &t,
+                &index_path,
+                &original_index_bytes,
+                &clean_paths,
+            ) {
+                Ok(()) => Err(ref_error),
+                Err(rollback_error) => Err(format!("{}; {}", ref_error, rollback_error)),
+            };
+        }
 
         Ok(msg)
     }
@@ -1213,6 +1415,20 @@ mod tests {
             current_branch,
             "merge must leave HEAD on the current branch"
         );
+
+        let final_repo = Repository::open(dir.path()).expect("reopen merged repo");
+        let final_index = final_repo.index().expect("read merged index");
+        let local_entry = final_index
+            .get_path(Path::new("local.txt"), 0)
+            .expect("preserved staged file in index");
+        assert_eq!(
+            final_repo
+                .find_blob(local_entry.id)
+                .expect("find staged local blob")
+                .content(),
+            b"local change",
+            "merging must preserve the staged unrelated index entry"
+        );
     }
 
     #[test]
@@ -1280,6 +1496,125 @@ mod tests {
             std::fs::read_to_string(&ignored_path).expect("read ignored file"),
             "keep this local file",
             "merging must not overwrite an ignored local file"
+        );
+
+        let final_repo = Repository::open(dir.path()).expect("reopen merged repo");
+        let final_index = final_repo.index().expect("read merged index");
+        let ignored_entry = final_index
+            .get_path(Path::new("ignored.txt"), 0)
+            .expect("merged ignored path in index");
+        assert_eq!(
+            final_repo
+                .find_blob(ignored_entry.id)
+                .expect("find merged ignored blob")
+                .content(),
+            b"feature",
+            "the index must match the merged tree for a preserved ignored file"
+        );
+    }
+
+    #[test]
+    fn test_merge_branch_rolls_back_checkout_when_head_update_fails() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(dir.path());
+        let signature = repo.signature().expect("signature");
+        let initial_commit = repo.head().expect("head").peel_to_commit().expect("commit");
+
+        std::fs::write(dir.path().join("merged.txt"), "base").expect("write merge file");
+        let base_tree_oid = {
+            let mut index = repo.index().expect("index");
+            index.add_path(Path::new("merged.txt")).expect("stage merge file");
+            index.write().expect("write index");
+            index.write_tree().expect("write base tree")
+        };
+        let base_tree = repo.find_tree(base_tree_oid).expect("find base tree");
+        let base_commit_oid = repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "add merge file",
+                &base_tree,
+                &[&initial_commit],
+            )
+            .expect("commit merge file");
+        drop(base_tree);
+        drop(initial_commit);
+
+        let base_commit = repo.find_commit(base_commit_oid).expect("find base commit");
+        repo.branch("feature", &base_commit, false).expect("create feature branch");
+        let feature_blob = repo.blob(b"feature").expect("write feature blob");
+        let base_tree = base_commit.tree().expect("get base tree");
+        let feature_tree_oid = {
+            let mut builder = repo.treebuilder(Some(&base_tree)).expect("create tree builder");
+            builder
+                .insert("merged.txt", feature_blob, 0o100644)
+                .expect("update merge file");
+            builder.write().expect("write feature tree")
+        };
+        let feature_tree = repo.find_tree(feature_tree_oid).expect("find feature tree");
+        repo.commit(
+            Some("refs/heads/feature"),
+            &signature,
+            &signature,
+            "update merge file",
+            &feature_tree,
+            &[&base_commit],
+        )
+        .expect("commit feature change");
+        let original_head = repo
+            .head()
+            .expect("head")
+            .resolve()
+            .expect("resolve head");
+        let original_head_oid = original_head.target().expect("head target");
+        let original_head_name = original_head.name().expect("head name").to_string();
+        drop(feature_tree);
+        drop(base_tree);
+        drop(base_commit);
+        drop(original_head);
+        drop(repo);
+
+        let ref_lock = dir
+            .path()
+            .join(".git")
+            .join(format!("{}.lock", original_head_name));
+        std::fs::write(&ref_lock, "lock").expect("lock head reference");
+
+        let git = open_git_repo(dir.path());
+        let result = git.merge_branch("feature");
+        std::fs::remove_file(&ref_lock).expect("remove head reference lock");
+
+        assert!(result.is_err(), "a locked HEAD reference must fail the merge");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("merged.txt")).expect("read merge file"),
+            "base",
+            "a failed ref update must restore the pre-merge working tree"
+        );
+
+        let final_repo = Repository::open(dir.path()).expect("reopen failed merge repo");
+        assert_eq!(
+            final_repo
+                .head()
+                .expect("head")
+                .resolve()
+                .expect("resolve head")
+                .target()
+                .expect("head target"),
+            original_head_oid,
+            "a failed ref update must leave HEAD unchanged"
+        );
+        let final_index = final_repo.index().expect("read restored index");
+        let merged_entry = final_index
+            .get_path(Path::new("merged.txt"), 0)
+            .expect("merged file in restored index");
+        assert_eq!(
+            final_repo
+                .find_blob(merged_entry.id)
+                .expect("find restored merge blob")
+                .content(),
+            b"base",
+            "a failed ref update must restore the pre-merge index"
         );
     }
 
