@@ -814,7 +814,10 @@ impl GitRepo {
         let repo = self.repo()?;
         let hc = repo.head().map_err(|e| format!("HEAD: {}", e))?
             .peel_to_commit().map_err(|e| format!("Peel: {}", e))?;
-        repo.checkout_tree(hc.as_object(), None).map_err(|e| format!("Checkout: {}", e))?;
+        let mut cb = git2::build::CheckoutBuilder::new();
+        cb.force();
+        repo.checkout_tree(hc.as_object(), Some(&mut cb))
+            .map_err(|e| format!("Checkout: {}", e))?;
         Ok(())
     }
 
@@ -1245,6 +1248,39 @@ mod tests {
             std::fs::read_to_string(dir.path().join("new.txt")).expect("read working tree"),
             "new file",
             "unstage all must not modify the working tree"
+        );
+    }
+
+    #[test]
+    fn test_restore_all_discards_dirty_worktree_content() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(dir.path());
+        let tracked_path = dir.path().join("tracked.txt");
+
+        std::fs::write(&tracked_path, "committed").expect("write tracked file");
+        let parent = repo.head().expect("head").peel_to_commit().expect("parent commit");
+        let signature = repo.signature().expect("signature");
+        let tree_oid = {
+            let mut index = repo.index().expect("index");
+            index.add_path(Path::new("tracked.txt")).expect("stage tracked file");
+            index.write_tree().expect("write tree")
+        };
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+        repo.commit(Some("HEAD"), &signature, &signature, "add tracked file", &tree, &[&parent])
+            .expect("commit tracked file");
+        drop(tree);
+        drop(parent);
+        drop(repo);
+
+        std::fs::write(&tracked_path, "dirty").expect("modify tracked file");
+
+        let git = open_git_repo(dir.path());
+        git.restore_all().expect("restore all");
+
+        assert_eq!(
+            std::fs::read_to_string(&tracked_path).expect("read restored file"),
+            "committed",
+            "restore all must discard dirty working-tree content"
         );
     }
 
