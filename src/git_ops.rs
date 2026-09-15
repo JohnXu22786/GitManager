@@ -787,10 +787,16 @@ impl GitRepo {
 
     pub fn unstage_all(&self) -> GitResult<()> {
         let repo = self.repo()?;
-        let mut idx = repo.index().map_err(|e| format!("Index: {}", e))?;
-        idx.remove_all(["*"].iter(), None).map_err(|e| format!("Unstage all: {}", e))?;
-        idx.write().map_err(|e| format!("Write: {}", e))?;
-        Ok(())
+        let target = match repo.head() {
+            Ok(head) => Some(
+                head.peel_to_commit()
+                    .map_err(|e| format!("HEAD commit: {}", e))?,
+            ),
+            Err(e) if e.code() == git2::ErrorCode::UnbornBranch => None,
+            Err(e) => return Err(format!("HEAD: {}", e)),
+        };
+        repo.reset_default(target.as_ref().map(|commit| commit.as_object()), ["*"])
+            .map_err(|e| format!("Unstage all: {}", e))
     }
 
     pub fn restore_file(&self, path: &str) -> GitResult<()> {
@@ -1153,6 +1159,92 @@ mod tests {
         assert!(
             index.get_path(Path::new("staged.txt"), 0).is_some(),
             "background operation should update the linked worktree index"
+        );
+    }
+
+    #[test]
+    fn test_unstage_all_preserves_index_entries() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(dir.path());
+
+        std::fs::write(dir.path().join("tracked.txt"), "committed").expect("write tracked file");
+        std::fs::write(dir.path().join("unchanged.txt"), "unchanged").expect("write unchanged file");
+        {
+            let mut index = repo.index().expect("index");
+            index.add_path(Path::new("tracked.txt")).expect("stage tracked file");
+            index.add_path(Path::new("unchanged.txt")).expect("stage unchanged file");
+            index.write().expect("write index");
+        }
+
+        let parent = repo.head().expect("head").peel_to_commit().expect("parent commit");
+        let signature = repo.signature().expect("signature");
+        let tree_oid = {
+            let mut index = repo.index().expect("index");
+            index.write_tree().expect("write tree")
+        };
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+        repo.commit(Some("HEAD"), &signature, &signature, "add tracked files", &tree, &[&parent])
+            .expect("commit tracked files");
+        drop(tree);
+        drop(parent);
+        drop(repo);
+
+        let git = open_git_repo(dir.path());
+        std::fs::write(dir.path().join("tracked.txt"), "working tree change")
+            .expect("modify tracked file");
+        git.stage_file("tracked.txt").expect("stage tracked change");
+        git.unstage_all().expect("unstage all");
+
+        let repo = Repository::open(dir.path()).expect("reopen repo");
+        let index = repo.index().expect("index");
+        assert_eq!(index.len(), 2, "unstage all must keep tracked index entries");
+        assert!(
+            index.get_path(Path::new("tracked.txt"), 0).is_some(),
+            "modified tracked file must remain in the index"
+        );
+        assert!(
+            index.get_path(Path::new("unchanged.txt"), 0).is_some(),
+            "unchanged tracked file must remain in the index"
+        );
+        let statuses = git.get_status().expect("get status");
+        assert!(
+            statuses.iter().any(|entry| entry.path == "tracked.txt" && !entry.staged),
+            "tracked change must be unstaged; statuses: {:?}",
+            statuses
+        );
+        assert!(
+            statuses.iter().all(|entry| entry.path != "tracked.txt" || !entry.staged),
+            "tracked change must not remain staged"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("tracked.txt")).expect("read working tree"),
+            "working tree change",
+            "unstage all must not modify the working tree"
+        );
+    }
+
+    #[test]
+    fn test_unstage_all_on_unborn_head_clears_index() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+        std::fs::write(dir.path().join("new.txt"), "new file").expect("write new file");
+        {
+            let mut index = repo.index().expect("index");
+            index.add_path(Path::new("new.txt")).expect("stage new file");
+            index.write().expect("write index");
+        }
+        drop(repo);
+
+        let git = open_git_repo(dir.path());
+        git.unstage_all().expect("unstage all");
+
+        let repo = Repository::open(dir.path()).expect("reopen repo");
+        let index = repo.index().expect("index");
+        assert!(index.is_empty(), "unstage all must clear staged entries without a HEAD");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("new.txt")).expect("read working tree"),
+            "new file",
+            "unstage all must not modify the working tree"
         );
     }
 
