@@ -801,11 +801,9 @@ impl GitRepo {
 
     pub fn restore_file(&self, path: &str) -> GitResult<()> {
         let repo = self.repo()?;
-        let t = repo.head().map_err(|e| format!("HEAD: {}", e))?
-            .peel_to_tree().map_err(|e| format!("Tree: {}", e))?;
         let mut cb = git2::build::CheckoutBuilder::new();
         cb.force().path(Path::new(path));
-        repo.checkout_tree(t.as_object(), Some(&mut cb))
+        repo.checkout_index(None, Some(&mut cb))
             .map_err(|e| format!("Restore: {}", e))?;
         Ok(())
     }
@@ -1281,6 +1279,53 @@ mod tests {
             std::fs::read_to_string(&tracked_path).expect("read restored file"),
             "committed",
             "restore all must discard dirty working-tree content"
+        );
+    }
+
+    #[test]
+    fn test_restore_file_preserves_staged_changes() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(dir.path());
+
+        std::fs::write(dir.path().join("tracked.txt"), "HEAD").expect("write tracked file");
+        let parent = repo.head().expect("HEAD").peel_to_commit().expect("parent commit");
+        let signature = repo.signature().expect("signature");
+        let tree_oid = {
+            let mut index = repo.index().expect("index");
+            index.add_path(Path::new("tracked.txt")).expect("stage tracked file");
+            index.write_tree().expect("write tree")
+        };
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+        repo.commit(Some("HEAD"), &signature, &signature, "add tracked file", &tree, &[&parent])
+            .expect("commit tracked file");
+        drop(tree);
+        drop(parent);
+        drop(repo);
+
+        let git = open_git_repo(dir.path());
+        std::fs::write(dir.path().join("tracked.txt"), "staged")
+            .expect("write staged version");
+        git.stage_file("tracked.txt").expect("stage tracked change");
+        std::fs::write(dir.path().join("tracked.txt"), "unstaged")
+            .expect("write unstaged version");
+
+        git.restore_file("tracked.txt").expect("restore file");
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("tracked.txt")).expect("read working tree"),
+            "staged",
+            "discarding unstaged changes must restore the index version"
+        );
+        let statuses = git.get_status().expect("get status");
+        assert!(
+            statuses.iter().any(|entry| entry.path == "tracked.txt" && entry.staged),
+            "the staged change must remain staged; statuses: {:?}",
+            statuses
+        );
+        assert!(
+            statuses.iter().all(|entry| entry.path != "tracked.txt" || entry.staged),
+            "restoring unstaged changes must leave no unstaged portion; statuses: {:?}",
+            statuses
         );
     }
 
