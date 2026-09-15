@@ -770,9 +770,19 @@ impl GitRepo {
 
     pub fn unstage_file(&self, path: &str) -> GitResult<()> {
         let repo = self.repo()?;
-        let mut idx = repo.index().map_err(|e| format!("Index: {}", e))?;
-        idx.remove_path(Path::new(path)).map_err(|e| format!("Unstage: {}", e))?;
-        idx.write().map_err(|e| format!("Write: {}", e))?;
+        match repo.head() {
+            Ok(head) => {
+                let head = head.peel_to_commit().map_err(|e| format!("Peel: {}", e))?;
+                repo.reset_default(Some(head.as_object()), [path])
+                    .map_err(|e| format!("Unstage: {}", e))?;
+            }
+            Err(e) if e.code() == git2::ErrorCode::UnbornBranch => {
+                let mut idx = repo.index().map_err(|e| format!("Index: {}", e))?;
+                idx.remove_path(Path::new(path)).map_err(|e| format!("Unstage: {}", e))?;
+                idx.write().map_err(|e| format!("Write: {}", e))?;
+            }
+            Err(e) => return Err(format!("HEAD: {}", e)),
+        }
         Ok(())
     }
 
@@ -1153,6 +1163,50 @@ mod tests {
         assert!(
             index.get_path(Path::new("staged.txt"), 0).is_some(),
             "background operation should update the linked worktree index"
+        );
+    }
+
+    #[test]
+    fn test_unstage_file_restores_head_entry_for_tracked_change() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(dir.path());
+        let path = Path::new("tracked.txt");
+
+        std::fs::write(dir.path().join(path), "HEAD version\n").expect("write tracked file");
+        let sig = repo.signature().expect("signature");
+        let tree_oid = {
+            let mut index = repo.index().expect("index");
+            index.add_path(path).expect("add tracked file");
+            index.write_tree().expect("write tree")
+        };
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+        let parent = repo.head().expect("HEAD").peel_to_commit().expect("parent commit");
+        repo.commit(Some("HEAD"), &sig, &sig, "add tracked file", &tree, &[&parent])
+            .expect("commit tracked file");
+        drop(tree);
+
+        std::fs::write(dir.path().join(path), "working tree version\n").expect("modify tracked file");
+        let git = open_git_repo(dir.path());
+        git.stage_file(path.to_str().expect("UTF-8 path")).expect("stage file");
+        git.unstage_file(path.to_str().expect("UTF-8 path")).expect("unstage file");
+
+        let statuses = git.get_status().expect("get status");
+        assert_eq!(statuses.len(), 1, "tracked change should remain a single unstaged entry");
+        assert_eq!(statuses[0].path, "tracked.txt");
+        assert_eq!(statuses[0].status, 'M');
+        assert!(!statuses[0].staged, "tracked change should no longer be staged");
+
+        let reopened = Repository::open(dir.path()).expect("reopen repo");
+        let head_tree = reopened.head().expect("HEAD").peel_to_tree().expect("HEAD tree");
+        let head_entry = head_tree.get_path(path).expect("HEAD entry");
+        let index = reopened.index().expect("index");
+        let index_entry = index.get_path(path, 0).expect("index entry");
+
+        assert_eq!(index_entry.id, head_entry.id(), "unstaging must restore the HEAD index entry");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(path)).expect("read working tree file"),
+            "working tree version\n",
+            "unstaging must preserve the working tree change"
         );
     }
 
