@@ -769,16 +769,95 @@ impl GitRepo {
     }
 
     pub fn unstage_file(&self, path: &str) -> GitResult<()> {
+        if path.is_empty() {
+            return Err("Unstage: path must not be empty".into());
+        }
+        if path.as_bytes().contains(&0) {
+            return Err("Unstage: path must not contain NUL bytes".into());
+        }
+        let has_invalid_component = |separator| {
+            path.split(separator)
+                .any(|component| component.is_empty() || matches!(component, "." | ".."))
+        };
+        if has_invalid_component('/') || (cfg!(windows) && has_invalid_component('\\')) {
+            return Err("Unstage: path must be repository-relative".into());
+        }
+
+        let path = Path::new(path);
+        if path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err("Unstage: path must be repository-relative".into());
+        }
+
         let repo = self.repo()?;
+        let ignore_case = repo
+            .config()
+            .ok()
+            .and_then(|config| config.get_bool("core.ignorecase").ok())
+            .unwrap_or(false);
+        let path_text = path.to_str().ok_or_else(|| "Unstage: path must be valid UTF-8".to_string())?;
+        let normalized_path = if cfg!(windows) {
+            path_text.replace('\\', "/")
+        } else {
+            path_text.to_string()
+        };
+        let directory_prefix = format!("{normalized_path}/");
+        let matches_path = |entry_path: &str| {
+            if ignore_case {
+                entry_path.eq_ignore_ascii_case(&normalized_path)
+                    || entry_path
+                        .get(..directory_prefix.len())
+                        .map(|prefix| prefix.eq_ignore_ascii_case(&directory_prefix))
+                        .unwrap_or(false)
+            } else {
+                entry_path == normalized_path || entry_path.starts_with(&directory_prefix)
+            }
+        };
+        let matching_index_paths = |idx: &git2::Index| {
+            let mut paths: Vec<_> = idx
+                .iter()
+                .filter_map(|entry| {
+                    let entry_path = std::str::from_utf8(&entry.path).ok()?;
+                    matches_path(entry_path).then(|| PathBuf::from(entry_path))
+                })
+                .collect();
+            paths.sort_unstable();
+            paths.dedup();
+            paths
+        };
+
         match repo.head() {
             Ok(head) => {
                 let head = head.peel_to_commit().map_err(|e| format!("Peel: {}", e))?;
-                repo.reset_default(Some(head.as_object()), [path])
-                    .map_err(|e| format!("Unstage: {}", e))?;
+                let head_tree = head.tree().map_err(|e| format!("Tree: {}", e))?;
+                let mut head_index = git2::Index::new().map_err(|e| format!("Index: {}", e))?;
+                head_index.read_tree(&head_tree).map_err(|e| format!("Read HEAD index: {}", e))?;
+                let head_entries: Vec<_> = head_index
+                    .iter()
+                    .filter(|entry| {
+                        let Ok(entry_path) = std::str::from_utf8(&entry.path) else {
+                            return false;
+                        };
+                        matches_path(entry_path)
+                    })
+                    .collect();
+
+                let mut idx = repo.index().map_err(|e| format!("Index: {}", e))?;
+                for index_path in matching_index_paths(&idx) {
+                    idx.remove_path(&index_path).map_err(|e| format!("Unstage: {}", e))?;
+                }
+                for entry in head_entries {
+                    idx.add(&entry).map_err(|e| format!("Unstage: {}", e))?;
+                }
+                idx.write().map_err(|e| format!("Write: {}", e))?;
             }
             Err(e) if e.code() == git2::ErrorCode::UnbornBranch => {
                 let mut idx = repo.index().map_err(|e| format!("Index: {}", e))?;
-                idx.remove_path(Path::new(path)).map_err(|e| format!("Unstage: {}", e))?;
+                for index_path in matching_index_paths(&idx) {
+                    idx.remove_path(&index_path).map_err(|e| format!("Unstage: {}", e))?;
+                }
                 idx.write().map_err(|e| format!("Write: {}", e))?;
             }
             Err(e) => return Err(format!("HEAD: {}", e)),
@@ -1208,6 +1287,187 @@ mod tests {
             "working tree version\n",
             "unstaging must preserve the working tree change"
         );
+    }
+
+    #[test]
+    fn test_unstage_file_treats_path_as_literal() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(dir.path());
+
+        let literal_path = Path::new("file[ab].txt");
+        let other_path = Path::new("filea.txt");
+        std::fs::write(dir.path().join(literal_path), "literal HEAD\n").expect("write literal file");
+        std::fs::write(dir.path().join(other_path), "other HEAD\n").expect("write other file");
+        let sig = repo.signature().expect("signature");
+        let tree_oid = {
+            let mut index = repo.index().expect("index");
+            index.add_path(literal_path).expect("add literal file");
+            index.add_path(other_path).expect("add other file");
+            index.write_tree().expect("write tree")
+        };
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+        let parent = repo.head().expect("HEAD").peel_to_commit().expect("parent commit");
+        repo.commit(Some("HEAD"), &sig, &sig, "add literal files", &tree, &[&parent])
+            .expect("commit literal files");
+        drop(tree);
+
+        std::fs::write(dir.path().join(literal_path), "literal changed\n").expect("modify literal file");
+        std::fs::write(dir.path().join(other_path), "other changed\n").expect("modify other file");
+
+        let git = open_git_repo(dir.path());
+        git.stage_file(literal_path.to_str().expect("UTF-8 path")).expect("stage literal file");
+        git.stage_file(other_path.to_str().expect("UTF-8 path")).expect("stage other file");
+        git.unstage_file(literal_path.to_str().expect("UTF-8 path")).expect("unstage literal file");
+
+        let reopened = Repository::open(dir.path()).expect("reopen repo");
+        let index = reopened.index().expect("index");
+        let head_tree = reopened.head().expect("HEAD").peel_to_tree().expect("HEAD tree");
+        let head_entry = head_tree.get_path(literal_path).expect("HEAD literal entry");
+        let literal_entry = index.get_path(literal_path, 0).expect("literal index entry");
+        assert!(
+            literal_entry.id == head_entry.id(),
+            "the requested literal path should be restored from HEAD"
+        );
+        assert!(
+            index.get_path(other_path, 0).is_some(),
+            "a path matched by the literal path text must remain staged"
+        );
+
+        let statuses = git.get_status().expect("get status");
+        assert!(
+            statuses.iter().any(|entry| entry.path == literal_path.to_str().unwrap() && !entry.staged),
+            "the literal path should remain as an unstaged working-tree change"
+        );
+        assert!(
+            statuses.iter().any(|entry| entry.path == other_path.to_str().unwrap() && entry.staged),
+            "the path matched by the literal text should remain staged"
+        );
+    }
+
+    #[test]
+    fn test_unstage_file_rejects_invalid_paths_without_changing_index() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        create_repo_with_commit(dir.path());
+
+        let staged_path = Path::new("staged.txt");
+        std::fs::write(dir.path().join(staged_path), "staged\n").expect("write staged file");
+
+        let git = open_git_repo(dir.path());
+        git.stage_file(staged_path.to_str().expect("UTF-8 path")).expect("stage file");
+        for invalid_path in [
+            "",
+            "../staged.txt",
+            "/absolute/staged.txt",
+            "dir/../staged.txt",
+            "dir/./staged.txt",
+            "bad\0path",
+        ] {
+            let error = git.unstage_file(invalid_path).expect_err("invalid path should be rejected");
+            assert!(error.starts_with("Unstage: path"));
+        }
+
+        let reopened = Repository::open(dir.path()).expect("reopen repo");
+        let index = reopened.index().expect("index");
+        assert!(
+            index.get_path(staged_path, 0).is_some(),
+            "rejecting an empty path must not change the index"
+        );
+    }
+
+    #[test]
+    fn test_unstage_file_restores_file_directory_replacement() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(dir.path());
+        let path = Path::new("dir");
+
+        std::fs::write(dir.path().join(path), "HEAD file\n").expect("write HEAD file");
+        let sig = repo.signature().expect("signature");
+        let tree_oid = {
+            let mut index = repo.index().expect("index");
+            index.add_path(path).expect("add HEAD file");
+            index.write_tree().expect("write tree")
+        };
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+        let parent = repo.head().expect("HEAD").peel_to_commit().expect("parent commit");
+        repo.commit(Some("HEAD"), &sig, &sig, "add directory replacement file", &tree, &[&parent])
+            .expect("commit HEAD file");
+        drop(tree);
+
+        std::fs::remove_file(dir.path().join(path)).expect("remove HEAD file");
+        std::fs::create_dir(dir.path().join(path)).expect("create replacement directory");
+        let child_path = path.join("child.txt");
+        std::fs::write(dir.path().join(&child_path), "staged child\n").expect("write staged child");
+
+        let replacement_repo = Repository::open(dir.path()).expect("reopen repo");
+        let mut index = replacement_repo.index().expect("index");
+        index.remove_path(path).expect("remove HEAD file from index");
+        index.add_path(&child_path).expect("stage replacement child");
+        index.write().expect("write replacement index");
+
+        let git = open_git_repo(dir.path());
+        git.unstage_file(path.to_str().expect("UTF-8 path")).expect("unstage replacement");
+
+        let reopened = Repository::open(dir.path()).expect("reopen repo");
+        let index = reopened.index().expect("index");
+        assert!(index.get_path(path, 0).is_some(), "HEAD file should be restored");
+        assert!(index.get_path(&child_path, 0).is_none(), "replacement child should be removed");
+    }
+
+    #[test]
+    fn test_unstage_file_restores_directory_file_replacement() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(dir.path());
+        let path = Path::new("dir");
+        let child_path = path.join("child.txt");
+
+        std::fs::create_dir(dir.path().join(path)).expect("create HEAD directory");
+        std::fs::write(dir.path().join(&child_path), "HEAD child\n").expect("write HEAD child");
+        let sig = repo.signature().expect("signature");
+        let tree_oid = {
+            let mut index = repo.index().expect("index");
+            index.add_path(&child_path).expect("add HEAD child");
+            index.write_tree().expect("write tree")
+        };
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+        let parent = repo.head().expect("HEAD").peel_to_commit().expect("parent commit");
+        repo.commit(Some("HEAD"), &sig, &sig, "add directory replacement directory", &tree, &[&parent])
+            .expect("commit HEAD directory");
+        drop(tree);
+
+        std::fs::remove_file(dir.path().join(&child_path)).expect("remove HEAD child");
+        std::fs::remove_dir(dir.path().join(path)).expect("remove HEAD directory");
+        std::fs::write(dir.path().join(path), "staged file\n").expect("write staged file");
+
+        let replacement_repo = Repository::open(dir.path()).expect("reopen repo");
+        let mut index = replacement_repo.index().expect("index");
+        index.remove_path(&child_path).expect("remove HEAD child from index");
+        index.add_path(path).expect("stage replacement file");
+        index.write().expect("write replacement index");
+
+        let git = open_git_repo(dir.path());
+        git.unstage_file(path.to_str().expect("UTF-8 path")).expect("unstage replacement");
+
+        let reopened = Repository::open(dir.path()).expect("reopen repo");
+        let index = reopened.index().expect("index");
+        assert!(index.get_path(path, 0).is_none(), "replacement file should be removed");
+        assert!(index.get_path(&child_path, 0).is_some(), "HEAD child should be restored");
+    }
+
+    #[test]
+    fn test_unstage_file_removes_directory_descendants_on_unborn_branch() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        Repository::init(dir.path()).expect("init repo");
+        let child_path = Path::new("dir/child.txt");
+        std::fs::create_dir(dir.path().join("dir")).expect("create directory");
+        std::fs::write(dir.path().join(child_path), "staged child\n").expect("write child");
+
+        let git = open_git_repo(dir.path());
+        git.stage_file(child_path.to_str().expect("UTF-8 path")).expect("stage child");
+        git.unstage_file("dir").expect("unstage directory");
+
+        let reopened = Repository::open(dir.path()).expect("reopen repo");
+        let index = reopened.index().expect("index");
+        assert!(index.get_path(child_path, 0).is_none(), "directory child should be removed");
     }
 
     #[test]
