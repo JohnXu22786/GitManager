@@ -825,13 +825,13 @@ impl GitRepo {
         let tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
         let mut dopts = DiffOptions::new();
         dopts.pathspec(path);
+        let idx = repo.index().map_err(|e| format!("Index: {}", e))?;
 
         let diff = if staged {
-            let idx = repo.index().map_err(|e| format!("Index: {}", e))?;
             repo.diff_tree_to_index(tree.as_ref(), Some(&idx), Some(&mut dopts))
                 .map_err(|e| format!("Diff: {}", e))?
         } else {
-            repo.diff_tree_to_workdir(tree.as_ref(), Some(&mut dopts))
+            repo.diff_index_to_workdir(Some(&idx), Some(&mut dopts))
                 .map_err(|e| format!("Diff: {}", e))?
         };
 
@@ -1127,6 +1127,48 @@ mod tests {
         let mut git = GitRepo::new();
         git.open(repo_dir).expect("open repo");
         git
+    }
+
+    #[test]
+    fn test_unstaged_diff_compares_index_to_worktree() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(dir.path());
+        let tracked_path = dir.path().join("tracked.txt");
+
+        std::fs::write(&tracked_path, "line 1\nline 2\nline 3\n").expect("write tracked file");
+        let parent = repo.head().expect("HEAD").peel_to_commit().expect("parent commit");
+        let signature = repo.signature().expect("signature");
+        let tree_oid = {
+            let mut index = repo.index().expect("index");
+            index.add_path(Path::new("tracked.txt")).expect("stage tracked file");
+            index.write_tree().expect("write tree")
+        };
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+        repo.commit(Some("HEAD"), &signature, &signature, "add tracked file", &tree, &[&parent])
+            .expect("commit tracked file");
+        drop(tree);
+        drop(parent);
+        drop(repo);
+
+        let git = open_git_repo(dir.path());
+        std::fs::write(&tracked_path, "staged line 1\nline 2\nline 3\n")
+            .expect("write staged version");
+        git.stage_file("tracked.txt").expect("stage tracked change");
+        std::fs::write(&tracked_path, "staged line 1\nline 2\nunstaged line 3\n")
+            .expect("write unstaged version");
+
+        let diff = git.get_diff("tracked.txt", false).expect("get unstaged diff");
+
+        assert_eq!(
+            diff.iter().map(|line| (line.origin, line.content.as_str())).collect::<Vec<_>>(),
+            vec![
+                (' ', "staged line 1\n"),
+                (' ', "line 2\n"),
+                ('-', "line 3\n"),
+                ('+', "unstaged line 3\n"),
+            ],
+            "unstaged diff must compare the index with the worktree"
+        );
     }
 
     #[test]
