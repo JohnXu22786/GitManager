@@ -1037,15 +1037,24 @@ impl GitRepo {
                 .map_err(|e| format!("Annotated: {}", e))?;
             let mut ropts = git2::RebaseOptions::new();
             ropts.checkout_options(git2::build::CheckoutBuilder::new());
-            let mut reb = repo.rebase(Some(&ac), None, None, Some(&mut ropts))
+            let mut reb = repo.rebase(None, Some(&ac), None, Some(&mut ropts))
                 .map_err(|e| format!("Rebase: {}", e))?;
-            while let Some(op) = reb.next() {
-                let _ = op.map_err(|e| format!("Op: {}", e))?;
-                let sg = repo.signature().map_err(|e| format!("Sig: {}", e))?;
-                reb.commit(None, &sg, None).map_err(|e| format!("Rebase commit: {}", e))?;
+            let result = (|| -> GitResult<()> {
+                while let Some(op) = reb.next() {
+                    let _ = op.map_err(|e| format!("Op: {}", e))?;
+                    let sg = repo.signature().map_err(|e| format!("Sig: {}", e))?;
+                    reb.commit(None, &sg, None).map_err(|e| format!("Rebase commit: {}", e))?;
+                }
+                reb.finish(None).map_err(|e| format!("Finish: {}", e))?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => Ok("Rebase complete".into()),
+                Err(e) => {
+                    let _ = reb.abort();
+                    Err(e)
+                }
             }
-            reb.finish(None).map_err(|e| format!("Finish: {}", e))?;
-            Ok("Rebase complete".into())
         } else {
             let hc = repo.head().map_err(|e| format!("HEAD: {}", e))?
                 .peel_to_commit().map_err(|e| format!("Peel: {}", e))?;
@@ -1123,6 +1132,150 @@ mod tests {
         let mut git = GitRepo::new();
         git.open(repo_dir).expect("open repo");
         git
+    }
+
+    fn commit_file(repo: &Repository, path: &str, contents: &str, message: &str) -> git2::Oid {
+        std::fs::write(repo.workdir().expect("workdir").join(path), contents)
+            .expect("write file");
+        let tree_oid = {
+            let mut index = repo.index().expect("index");
+            index.add_path(Path::new(path)).expect("stage file");
+            let tree_oid = index.write_tree().expect("write tree");
+            index.write().expect("write index");
+            tree_oid
+        };
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+        let signature = repo.signature().expect("signature");
+        let parent = repo
+            .head()
+            .ok()
+            .and_then(|head| head.target())
+            .map(|oid| repo.find_commit(oid).expect("parent commit"));
+        let parents = parent.as_ref().map(|commit| vec![commit]).unwrap_or_default();
+        let oid = repo
+            .commit(Some("HEAD"), &signature, &signature, message, &tree, &parents)
+            .expect("commit file");
+        drop(tree);
+        drop(parent);
+        oid
+    }
+
+    fn setup_rebase_repositories(
+        initial_file: Option<(&str, &str)>,
+        local_file: (&str, &str),
+        remote_file: (&str, &str),
+    ) -> (tempfile::TempDir, tempfile::TempDir, String, git2::Oid, git2::Oid) {
+        let local_dir = tempfile::tempdir().expect("local temp dir");
+        let local_repo = create_repo_with_commit(local_dir.path());
+        if let Some((path, contents)) = initial_file {
+            commit_file(&local_repo, path, contents, "base");
+        }
+        let branch = local_repo
+            .head()
+            .expect("HEAD")
+            .shorthand()
+            .expect("branch name")
+            .to_string();
+
+        let remote_dir = tempfile::tempdir().expect("remote temp dir");
+        let remote_repo = Repository::init_bare(remote_dir.path()).expect("init bare repo");
+        remote_repo
+            .reference_symbolic(
+                "HEAD",
+                &format!("refs/heads/{}", branch),
+                true,
+                "set remote HEAD",
+            )
+            .expect("set remote HEAD");
+        let remote_url = format!("file://{}", remote_dir.path().to_string_lossy());
+        let mut origin = local_repo.remote("origin", &remote_url).expect("add origin");
+        let refspec = format!(
+            "refs/heads/{0}:refs/heads/{0}",
+            branch
+        );
+        origin.push(&[refspec.as_str()], None).expect("push base");
+        drop(origin);
+        drop(remote_repo);
+
+        let local_commit = commit_file(&local_repo, local_file.0, local_file.1, "local");
+        drop(local_repo);
+
+        let remote_work_dir = tempfile::tempdir().expect("remote work temp dir");
+        let remote_work_path = remote_work_dir.path().join("clone");
+        let remote_work_repo =
+            Repository::clone(&remote_url, &remote_work_path).expect("clone remote repo");
+        let remote_commit = commit_file(&remote_work_repo, remote_file.0, remote_file.1, "remote");
+        let mut remote_origin = remote_work_repo.find_remote("origin").expect("find origin");
+        remote_origin
+            .push(&[refspec.as_str()], None)
+            .expect("push remote commit");
+
+        (local_dir, remote_dir, branch, local_commit, remote_commit)
+    }
+
+    #[test]
+    fn test_pull_rebase_places_local_commit_on_top_of_remote_commit() {
+        let (local_dir, _remote_dir, branch, local_commit, remote_commit) = setup_rebase_repositories(
+            None,
+            ("local.txt", "local\n"),
+            ("remote.txt", "remote\n"),
+        );
+        let git = open_git_repo(local_dir.path());
+        let status = git.get_status().expect("status");
+        assert!(status.is_empty(), "local setup must be clean: {:?}", status);
+        let progress = Arc::new(Mutex::new(String::new()));
+
+        git.pull("origin", &branch, true, progress)
+            .expect("rebase pull");
+
+        let repo = Repository::open(local_dir.path()).expect("reopen local repo");
+        let head = repo.head().expect("HEAD").peel_to_commit().expect("HEAD commit");
+        assert_ne!(head.id(), local_commit, "rebase should create a new local commit");
+        assert_eq!(head.parent_id(0).expect("rebased parent"), remote_commit);
+        assert_eq!(
+            std::fs::read_to_string(local_dir.path().join("local.txt")).expect("read local file"),
+            "local\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(local_dir.path().join("remote.txt")).expect("read remote file"),
+            "remote\n"
+        );
+    }
+
+    #[test]
+    fn test_pull_rebase_aborts_after_conflict() {
+        let (local_dir, _remote_dir, branch, local_commit, _remote_commit) = setup_rebase_repositories(
+            Some(("conflict.txt", "base\n")),
+            ("conflict.txt", "local\n"),
+            ("conflict.txt", "remote\n"),
+        );
+        let git = open_git_repo(local_dir.path());
+        let progress = Arc::new(Mutex::new(String::new()));
+
+        let result = git.pull("origin", &branch, true, progress);
+        assert!(result.is_err(), "conflicting rebase pull should fail");
+        drop(git);
+
+        let repo = Repository::open(local_dir.path()).expect("reopen local repo");
+        assert!(
+            repo.open_rebase(None).is_err(),
+            "failed rebase pull must not leave an in-progress rebase"
+        );
+        assert_eq!(
+            repo.head().expect("HEAD").target(),
+            Some(local_commit),
+            "abort should restore the original HEAD"
+        );
+        assert_eq!(
+            std::fs::read_to_string(local_dir.path().join("conflict.txt"))
+                .expect("read conflict file"),
+            "local\n",
+            "abort should restore the pre-rebase working tree"
+        );
+        assert!(
+            !repo.index().expect("index").has_conflicts(),
+            "abort should clear rebase conflicts"
+        );
     }
 
     #[test]
