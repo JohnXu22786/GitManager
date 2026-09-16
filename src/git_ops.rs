@@ -574,7 +574,7 @@ impl GitRepo {
 
     pub fn worktrees(&self) -> GitResult<Vec<WorktreeInfo>> {
         let repo = self.repo()?;
-        let mp = repo.path().parent().unwrap().to_path_buf();
+        let mp = repo.commondir().parent().unwrap().to_path_buf();
         let mut list = Vec::new();
         list.push(WorktreeInfo {
             path: mp, branch: Some(self.current_branch().unwrap_or_default()),
@@ -1203,6 +1203,35 @@ mod tests {
             index.get_path(Path::new("staged.txt"), 0).is_some(),
             "background operation should update the linked worktree index"
         );
+    }
+
+    #[test]
+    fn test_worktrees_from_linked_worktree_identifies_main_path() {
+        let main_dir = tempfile::tempdir().expect("temp dir");
+        let wt_root = tempfile::tempdir().expect("temp dir");
+        let wt_path = wt_root.path().join("linked-wt");
+
+        let repo = create_repo_with_commit(main_dir.path());
+        let head = repo.head().expect("head");
+        let commit = head.peel_to_commit().expect("commit");
+        let wt_name = "linked-wt";
+        let _branch = repo.branch(wt_name, &commit, false).expect("branch");
+        let reference = repo
+            .find_reference(&format!("refs/heads/{}", wt_name))
+            .expect("reference");
+        let mut opts = git2::WorktreeAddOptions::new();
+        opts.reference(Some(&reference));
+        repo.worktree(wt_name, &wt_path, Some(&opts))
+            .expect("create worktree");
+
+        let git = open_git_repo(&wt_path);
+        let worktrees = git.worktrees().expect("list worktrees");
+        let main = worktrees
+            .iter()
+            .find(|worktree| worktree.is_main)
+            .expect("main worktree");
+
+        assert_eq!(main.path, main_dir.path());
     }
 
     #[test]
