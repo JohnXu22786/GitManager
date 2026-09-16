@@ -637,8 +637,12 @@ impl GitRepo {
         let wname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let mut errors = Vec::new();
 
-        // Try to find worktree by name (fast path)
-        let mut found_wt = repo.find_worktree(wname).ok();
+        // Try to find worktree by name (fast path), but verify its path first.
+        // A different worktree may have the same basename as the requested path.
+        let mut found_wt = repo
+            .find_worktree(wname)
+            .ok()
+            .filter(|wt| paths_match(wt.path(), path));
         
         // Fallback: if name-based lookup fails, iterate through all worktrees
         if found_wt.is_none() {
@@ -1631,6 +1635,49 @@ mod tests {
         assert!(!wt_path.exists(), "Worktree dir should be removed");
         let wt_gitdir = repo.path().join("worktrees").join(wt_name);
         assert!(!wt_gitdir.exists(), "Git worktree metadata should be removed");
+    }
+
+    #[test]
+    fn test_remove_worktree_with_basename_collision_preserves_other_metadata() {
+        let main_dir = tempfile::tempdir().expect("temp dir");
+        let first_root = tempfile::tempdir().expect("temp dir");
+        let target_root = tempfile::tempdir().expect("temp dir");
+        let first_path = first_root.path().join("collision-wt");
+        let target_path = target_root.path().join("collision-wt");
+
+        let repo = create_repo_with_commit(main_dir.path());
+        let commit = repo.head().expect("head").peel_to_commit().expect("commit");
+
+        let first_name = "collision-wt";
+        let _first_branch = repo.branch(first_name, &commit, false).expect("first branch");
+        let first_reference = repo
+            .find_reference(&format!("refs/heads/{}", first_name))
+            .expect("first reference");
+        let mut first_opts = git2::WorktreeAddOptions::new();
+        first_opts.reference(Some(&first_reference));
+        repo.worktree(first_name, &first_path, Some(&first_opts))
+            .expect("create first worktree");
+
+        let target_name = "target-wt";
+        let _target_branch = repo.branch(target_name, &commit, false).expect("target branch");
+        let target_reference = repo
+            .find_reference(&format!("refs/heads/{}", target_name))
+            .expect("target reference");
+        let mut target_opts = git2::WorktreeAddOptions::new();
+        target_opts.reference(Some(&target_reference));
+        repo.worktree(target_name, &target_path, Some(&target_opts))
+            .expect("create target worktree");
+
+        let first_gitdir = repo.path().join("worktrees").join(first_name);
+        let target_gitdir = repo.path().join("worktrees").join(target_name);
+        let git = open_git_repo(main_dir.path());
+        git.remove_worktree(&target_path, true)
+            .expect("remove target worktree");
+
+        assert!(!target_path.exists(), "Target worktree directory should be removed");
+        assert!(first_path.exists(), "Other worktree directory must be preserved");
+        assert!(first_gitdir.exists(), "Other worktree metadata must be preserved");
+        assert!(!target_gitdir.exists(), "Target worktree metadata should be removed");
     }
 
     // --- Encoding / UTF-8 tests ---
