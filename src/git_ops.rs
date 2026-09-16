@@ -489,10 +489,15 @@ impl GitRepo {
 
     pub fn checkout_branch(&self, name: &str) -> GitResult<()> {
         let repo = self.repo()?;
-        let obj = repo.revparse_single(name).map_err(|e| format!("Find '{}': {}", name, e))?;
+        let (obj, reference) = repo.revparse_ext(name).map_err(|e| format!("Find '{}': {}", name, e))?;
+        let resolved_ref = reference.as_ref()
+            .and_then(|r| r.name())
+            .map(str::to_owned);
         repo.checkout_tree(&obj, None)
             .map_err(|e| format!("Checkout: {}", e))?;
-        let rf = if name.starts_with("refs/") { name.to_string() } else { format!("refs/heads/{}", name) };
+        let rf = resolved_ref.unwrap_or_else(|| {
+            if name.starts_with("refs/") { name.to_string() } else { format!("refs/heads/{}", name) }
+        });
         repo.set_head(&rf).map_err(|e| format!("Set HEAD: {}", e))?;
         Ok(())
     }
@@ -1127,6 +1132,30 @@ mod tests {
         let mut git = GitRepo::new();
         git.open(repo_dir).expect("open repo");
         git
+    }
+
+    #[test]
+    fn test_checkout_remote_branch_uses_remote_tracking_ref() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(dir.path());
+        let remote_oid = repo.head().expect("HEAD").target().expect("remote target");
+        repo.reference(
+            "refs/remotes/origin/feature",
+            remote_oid,
+            true,
+            "create remote tracking ref",
+        )
+        .expect("create remote tracking ref");
+        drop(repo);
+
+        let git = open_git_repo(dir.path());
+        git.checkout_branch("origin/feature")
+            .expect("checkout remote branch");
+
+        let checked_out = Repository::open(dir.path()).expect("reopen repo");
+        let head = checked_out.head().expect("HEAD");
+        assert!(checked_out.head_detached().expect("HEAD state"));
+        assert_eq!(head.target(), Some(remote_oid));
     }
 
     #[test]
