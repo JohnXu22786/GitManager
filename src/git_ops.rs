@@ -1070,14 +1070,14 @@ impl GitRepo {
             let sg = repo.signature().map_err(|e| format!("Sig: {}", e))?;
             let toid = idx.write_tree_to(&*repo).map_err(|e| format!("Write tree: {}", e))?;
             let t = repo.find_tree(toid).map_err(|e| format!("Find tree: {}", e))?;
+
+            let mut co = git2::build::CheckoutBuilder::new();
+            repo.checkout_tree(t.as_object(), Some(&mut co))
+                .map_err(|e| format!("Checkout before merge: {}", e))?;
+
             repo.commit(Some("HEAD"), &sg, &sg,
                 &format!("Merge '{}'", remote), &t, &[&hc, &fc])
                 .map_err(|e| format!("Merge commit: {}", e))?;
-
-            let mut co = git2::build::CheckoutBuilder::new();
-            co.force();
-            repo.checkout_tree(t.as_object(), Some(&mut co))
-                .map_err(|e| format!("Checkout after merge: {}", e))?;
 
             Ok("Merge complete".into())
         }
@@ -1147,6 +1147,89 @@ mod tests {
         let head = checked_out.head().expect("HEAD");
         assert!(checked_out.head_detached().expect("HEAD state"));
         assert_eq!(head.target(), Some(remote_oid));
+    }
+
+    #[test]
+    fn test_pull_does_not_overwrite_dirty_worktree() {
+        let remote_dir = tempfile::tempdir().expect("remote temp dir");
+        let remote_repo = create_repo_with_commit(remote_dir.path());
+        let branch = remote_repo
+            .head()
+            .expect("remote HEAD")
+            .shorthand()
+            .expect("remote branch")
+            .to_string();
+        let tracked_path = remote_dir.path().join("tracked.txt");
+
+        std::fs::write(&tracked_path, "base\n").expect("write base file");
+        let parent = remote_repo
+            .head()
+            .expect("remote HEAD")
+            .peel_to_commit()
+            .expect("remote parent");
+        let signature = remote_repo.signature().expect("signature");
+        let tree_oid = {
+            let mut index = remote_repo.index().expect("index");
+            index.add_path(Path::new("tracked.txt")).expect("stage base file");
+            index.write_tree().expect("write base tree")
+        };
+        let tree = remote_repo.find_tree(tree_oid).expect("find base tree");
+        remote_repo
+            .commit(Some("HEAD"), &signature, &signature, "add tracked file", &tree, &[&parent])
+            .expect("commit base file");
+        drop(tree);
+        drop(parent);
+        let initial_id = remote_repo.head().expect("remote HEAD").target().expect("initial id");
+        drop(remote_repo);
+
+        let local_dir = tempfile::tempdir().expect("local temp dir");
+        let local_repo = Repository::clone(
+            remote_dir.path().to_str().expect("remote path"),
+            local_dir.path(),
+        )
+        .expect("clone remote");
+        drop(local_repo);
+
+        let remote_repo = Repository::open(remote_dir.path()).expect("reopen remote");
+        std::fs::write(&tracked_path, "remote\n").expect("write remote change");
+        let parent = remote_repo
+            .head()
+            .expect("remote HEAD")
+            .peel_to_commit()
+            .expect("remote parent");
+        let signature = remote_repo.signature().expect("signature");
+        let tree_oid = {
+            let mut index = remote_repo.index().expect("index");
+            index.add_path(Path::new("tracked.txt")).expect("stage remote change");
+            index.write_tree().expect("write remote tree")
+        };
+        let tree = remote_repo.find_tree(tree_oid).expect("find remote tree");
+        remote_repo
+            .commit(Some("HEAD"), &signature, &signature, "remote change", &tree, &[&parent])
+            .expect("commit remote change");
+        drop(tree);
+        drop(parent);
+        drop(remote_repo);
+
+        let local_tracked_path = local_dir.path().join("tracked.txt");
+        std::fs::write(&local_tracked_path, "local\n").expect("write local change");
+
+        let git = open_git_repo(local_dir.path());
+        let result = git.pull("origin", &branch, false, Arc::new(Mutex::new(String::new())));
+
+        assert!(result.is_err(), "pull should reject an overwrite of local changes: {:?}", result);
+        assert_eq!(
+            std::fs::read_to_string(&local_tracked_path).expect("read local file"),
+            "local\n",
+            "pull must preserve the dirty working-tree content"
+        );
+
+        let local_repo = Repository::open(local_dir.path()).expect("reopen local");
+        assert_eq!(
+            local_repo.head().expect("local HEAD").target(),
+            Some(initial_id),
+            "a rejected pull must not advance HEAD"
+        );
     }
 
     #[test]
