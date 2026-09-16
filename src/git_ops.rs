@@ -879,24 +879,15 @@ impl GitRepo {
         let repo = self.repo()?;
         let hc = repo.head().map_err(|e| format!("HEAD: {}", e))?
             .peel_to_commit().map_err(|e| format!("Peel: {}", e))?;
-        let parent_id = hc.parent(0).ok().map(|p| p.id());
-        drop(hc);
-        drop(repo);
+        let parent = hc.parent(0).map_err(|_| "No parent commit".to_string())?;
+        let parent_id = parent.id();
 
-        if let Some(pid) = parent_id {
-            let repo = self.repo()?;
-            let parent = repo.find_commit(pid).map_err(|e| format!("Find parent: {}", e))?;
-            let tree = parent.tree().map_err(|e| format!("Tree: {}", e))?;
-            let mut cb = git2::build::CheckoutBuilder::new();
-            cb.force();
-            repo.checkout_tree(tree.as_object(), Some(&mut cb))
-                .map_err(|e| format!("Checkout: {}", e))?;
-            repo.set_head(pid.to_string().as_str())
-                .map_err(|e| format!("Set HEAD: {}", e))?;
-            Ok(pid.to_string())
-        } else {
-            Err("No parent commit".into())
-        }
+        // A soft reset moves the current branch ref while leaving both the
+        // index and working tree untouched, preserving all local changes.
+        repo.reset(parent.as_object(), git2::ResetType::Soft, None)
+            .map_err(|e| format!("Reset: {}", e))?;
+
+        Ok(parent_id.to_string())
     }
 
     pub fn stash_all(&self, message: Option<&str>) -> GitResult<()> {
@@ -1169,6 +1160,79 @@ mod tests {
             ],
             "unstaged diff must compare the index with the worktree"
         );
+    }
+
+    #[test]
+    fn test_uncommit_preserves_changes_and_current_branch_head() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(dir.path());
+        let branch_name = repo
+            .head()
+            .expect("HEAD")
+            .shorthand()
+            .expect("branch name")
+            .to_string();
+
+        let tracked_path = dir.path().join("tracked.txt");
+        std::fs::write(&tracked_path, "base\n").expect("write base file");
+        let parent_id = repo.head().expect("HEAD").target().expect("parent id");
+        let signature = repo.signature().expect("signature");
+        let tree_oid = {
+            let mut index = repo.index().expect("index");
+            index.add_path(Path::new("tracked.txt")).expect("stage base file");
+            index.write_tree().expect("write tree")
+        };
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+        let parent = repo.find_commit(parent_id).expect("parent commit");
+        let feature_id = repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "feature commit",
+                &tree,
+                &[&parent],
+            )
+            .expect("create feature commit");
+        drop(parent);
+        drop(tree);
+        drop(repo);
+
+        let git = open_git_repo(dir.path());
+        std::fs::write(&tracked_path, "feature\nstaged local change\n")
+            .expect("write staged change");
+        git.stage_file("tracked.txt").expect("stage local change");
+        std::fs::write(&tracked_path, "feature\nstaged local change\nunstaged local change\n")
+            .expect("write unstaged change");
+
+        let result = git.uncommit().expect("uncommit");
+        assert_eq!(result, parent_id.to_string(), "uncommit should return the parent id");
+        assert_eq!(
+            std::fs::read_to_string(&tracked_path).expect("read working tree"),
+            "feature\nstaged local change\nunstaged local change\n",
+            "uncommit must preserve both staged and unstaged working-tree changes"
+        );
+
+        let repo = Repository::open(dir.path()).expect("reopen repo");
+        let head = repo.head().expect("HEAD");
+        assert!(head.is_branch(), "uncommit must keep HEAD attached to the current branch");
+        assert_eq!(head.shorthand(), Some(branch_name.as_str()));
+        assert_eq!(head.target(), Some(parent_id), "HEAD should move to the previous commit");
+        assert_eq!(
+            repo.find_branch(&branch_name, BranchType::Local)
+                .expect("current branch")
+                .get()
+                .target(),
+            Some(parent_id),
+            "the current branch ref should move to the previous commit"
+        );
+
+        let index = repo.index().expect("index");
+        assert!(
+            index.get_path(Path::new("tracked.txt"), 0).is_some(),
+            "the removed commit's changes should remain staged"
+        );
+        assert_ne!(feature_id, parent_id, "the feature commit should have a distinct parent");
     }
 
     #[test]
