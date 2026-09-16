@@ -694,7 +694,7 @@ impl GitRepo {
                 errors.push(if force { format!("Prune: {}", e) } else { format!("Remove: {}", e) });
                 // Fallback: clean up git metadata manually since prune refused
                 if let Some(name) = wt.name() {
-                    let wt_gitdir = repo.path().join("worktrees").join(name);
+                    let wt_gitdir = repo.commondir().join("worktrees").join(name);
                     if wt_gitdir.exists() {
                         if let Err(e) = std::fs::remove_dir_all(&wt_gitdir) {
                             errors.push(format!("Remove git metadata: {}", e));
@@ -1534,6 +1534,31 @@ mod tests {
         assert!(result.is_ok(), "Normal remove should succeed with fallback: {:?}", result);
         assert!(!wt_path.exists(), "Worktree dir should be gone");
         assert!(!wt_gitdir.exists(), "Git worktree metadata should be cleaned up");
+    }
+
+    #[test]
+    fn test_normal_remove_from_linked_worktree_cleans_shared_metadata() {
+        let main_dir = tempfile::tempdir().expect("temp dir");
+        let wt_root = tempfile::tempdir().expect("temp dir");
+        let wt_path = wt_root.path().join("test-wt-linked-open");
+
+        let repo = create_repo_with_commit(main_dir.path());
+        let wt_name = "test-wt-linked-open";
+        let _branch = repo
+            .branch(wt_name, &repo.head().unwrap().peel_to_commit().unwrap(), false)
+            .unwrap();
+        let reference = repo.find_reference(&format!("refs/heads/{}", wt_name)).unwrap();
+        let mut opts = git2::WorktreeAddOptions::new();
+        opts.reference(Some(&reference));
+        repo.worktree(wt_name, &wt_path, Some(&opts)).expect("create worktree");
+
+        let wt_gitdir = repo.commondir().join("worktrees").join(wt_name);
+        let git = open_git_repo(&wt_path);
+        let result = git.remove_worktree(&wt_path, false);
+
+        assert!(result.is_ok(), "Normal remove should succeed: {:?}", result);
+        assert!(!wt_path.exists(), "Worktree dir should be gone");
+        assert!(!wt_gitdir.exists(), "Linked worktree metadata should be cleaned up");
     }
 
     #[test]
