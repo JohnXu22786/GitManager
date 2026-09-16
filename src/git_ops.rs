@@ -607,8 +607,8 @@ impl GitRepo {
             if new_branch {
                 let bc = repo.head().map_err(|e| format!("HEAD: {}", e))?
                     .peel_to_commit().map_err(|_| "No commit".to_string())?;
-                repo.branch(name, &bc, false).map_err(|e| format!("Create branch: {}", e))?;
-                format!("refs/heads/{}", name)
+                repo.branch(b, &bc, false).map_err(|e| format!("Create branch: {}", e))?;
+                format!("refs/heads/{}", b)
             } else if b.starts_with("refs/") { b.to_string() }
             else { format!("refs/heads/{}", b) }
         } else { return Err("Branch required".into()); };
@@ -1127,6 +1127,30 @@ mod tests {
         let mut git = GitRepo::new();
         git.open(repo_dir).expect("open repo");
         git
+    }
+
+    #[test]
+    fn test_create_worktree_uses_requested_new_branch_name() {
+        let main_dir = tempfile::tempdir().expect("temp dir");
+        let worktree_root = tempfile::tempdir().expect("temp dir");
+        let worktree_path = worktree_root.path().join("worktree-directory");
+        create_repo_with_commit(main_dir.path());
+
+        let git = open_git_repo(main_dir.path());
+        git.create_worktree(
+            "worktree-name",
+            &worktree_path,
+            Some("user-selected-branch"),
+            true,
+        )
+        .expect("create worktree");
+
+        let worktree_repo = Repository::open(&worktree_path).expect("open worktree");
+        assert_eq!(
+            worktree_repo.head().expect("worktree HEAD").shorthand(),
+            Some("user-selected-branch"),
+            "new worktree should use the branch name entered by the user"
+        );
     }
 
     #[test]
