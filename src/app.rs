@@ -491,8 +491,10 @@ impl App {
                 self.diff_content = lines;
                 self.show_diff = true;
             }
-            OpResult::SearchResults(commits) => {
-                self.commits = commits;
+            OpResult::SearchResults { filter, commits } => {
+                if filter == self.log_search {
+                    self.commits = commits;
+                }
             }
             OpResult::RefreshData {
                 status_entries,
@@ -506,7 +508,7 @@ impl App {
                 self.status_entries = status_entries;
                 self.branches = branches;
                 self.worktrees = worktrees;
-                self.commits = commits;
+                self.commits = filter_commits(commits, &self.log_search);
                 self.stashes = stashes;
                 self.remote_list = remote_list;
                 self.last_refresh = Instant::now();
@@ -1293,6 +1295,60 @@ mod tests {
         app.show_success("new success".into());
         assert_eq!(app.status_message, "new success");
         assert!(!app.status_is_error);
+    }
+
+    fn test_commit(message: &str, author: &str) -> CommitInfo {
+        CommitInfo {
+            sha: format!("{message}-sha"),
+            short_sha: "1234567".to_string(),
+            author: author.to_string(),
+            time: "2026-01-01 00:00:00".to_string(),
+            message: message.to_string(),
+            summary: message.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_refresh_preserves_active_log_filter() {
+        let mut app = App::new();
+        app.log_search = "alice".to_string();
+
+        app.handle_op_result(
+            "Refreshing".to_string(),
+            OpResult::RefreshData {
+                status_entries: Vec::new(),
+                branches: Vec::new(),
+                worktrees: Vec::new(),
+                commits: vec![
+                    test_commit("alice changed the parser", "alice"),
+                    test_commit("unrelated change", "bob"),
+                ],
+                stashes: Vec::new(),
+                remote_list: Vec::new(),
+                errors: Vec::new(),
+            },
+        );
+
+        assert_eq!(app.commits.len(), 1);
+        assert_eq!(app.commits[0].author, "alice");
+    }
+
+    #[test]
+    fn test_stale_search_results_do_not_replace_current_log() {
+        let mut app = App::new();
+        app.log_search = "alice".to_string();
+        app.commits = vec![test_commit("alice changed the parser", "alice")];
+
+        app.handle_op_result(
+            "Searching commits".to_string(),
+            OpResult::SearchResults {
+                filter: "bob".to_string(),
+                commits: vec![test_commit("bob changed the parser", "bob")],
+            },
+        );
+
+        assert_eq!(app.commits.len(), 1);
+        assert_eq!(app.commits[0].author, "alice");
     }
 
     #[test]

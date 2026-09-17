@@ -49,8 +49,11 @@ pub enum OpResult {
         path: String,
         lines: Vec<DiffLine>,
     },
-    /// Search results for commit log.
-    SearchResults(Vec<CommitInfo>),
+    /// Search results for commit log, tagged with the query that produced them.
+    SearchResults {
+        filter: String,
+        commits: Vec<CommitInfo>,
+    },
     /// Refreshed data from the repository, with optional errors.
     RefreshData {
         status_entries: Vec<StatusEntry>,
@@ -163,17 +166,8 @@ impl GitOperation {
             },
             GitOperation::LogSearch(filter) => {
                 let commits = repo.log(100).unwrap_or_default();
-                let filtered: Vec<CommitInfo> = if filter.is_empty() {
-                    commits
-                } else {
-                    let f = filter.to_lowercase();
-                    commits.into_iter().filter(|c| {
-                        c.message.to_lowercase().contains(&f)
-                            || c.author.to_lowercase().contains(&f)
-                            || c.short_sha.contains(&f)
-                    }).collect()
-                };
-                OpResult::SearchResults(filtered)
+                let filtered = filter_commits(commits, &filter);
+                OpResult::SearchResults { filter, commits: filtered }
             }
             GitOperation::RefreshAll => {
                 let mut errors: Vec<String> = Vec::new();
@@ -238,6 +232,23 @@ pub struct CommitInfo {
     pub time: String,
     pub message: String,
     pub summary: String,
+}
+
+/// Filter commits using the same fields exposed by the log search UI.
+pub fn filter_commits(commits: Vec<CommitInfo>, filter: &str) -> Vec<CommitInfo> {
+    if filter.is_empty() {
+        return commits;
+    }
+
+    let filter = filter.to_lowercase();
+    commits
+        .into_iter()
+        .filter(|commit| {
+            commit.message.to_lowercase().contains(&filter)
+                || commit.author.to_lowercase().contains(&filter)
+                || commit.short_sha.contains(&filter)
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug)]
