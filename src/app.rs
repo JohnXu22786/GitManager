@@ -174,6 +174,23 @@ impl App {
         });
     }
 
+    fn update_download_progress_if_active(
+        state: &Mutex<UpdateState>,
+        progress: f32,
+        file_name: &str,
+    ) -> bool {
+        let mut current_state = state.lock().unwrap();
+        if !matches!(*current_state, UpdateState::Downloading { .. }) {
+            return false;
+        }
+
+        *current_state = UpdateState::Downloading {
+            progress,
+            file_name: file_name.to_string(),
+        };
+        true
+    }
+
     /// Start downloading the update asset in a background thread.
     /// Updates `update_state` with progress as the download proceeds.
     pub fn trigger_download(&mut self, url: String, file_name: String) {
@@ -197,15 +214,13 @@ impl App {
             let _prog_update_handle = std::thread::spawn(move || {
                 loop {
                     let p = *prog_clone.lock().unwrap();
-                    let current_state = state_for_progress.lock().unwrap().clone();
-                    let is_downloading = matches!(current_state, UpdateState::Downloading { .. });
-                    if !is_downloading {
+                    if !App::update_download_progress_if_active(
+                        &state_for_progress,
+                        p,
+                        &file_name,
+                    ) {
                         break;
                     }
-                    *state_for_progress.lock().unwrap() = UpdateState::Downloading {
-                        progress: p,
-                        file_name: file_name.clone(),
-                    };
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
             });
@@ -1660,6 +1675,25 @@ mod tests {
     fn test_download_progress_field_defaults() {
         let app = App::new();
         assert_eq!(app.download_progress, 0.0, "Download progress should start at 0");
+    }
+
+    #[test]
+    fn test_stale_download_progress_cannot_overwrite_completed_download() {
+        let state = Arc::new(Mutex::new(UpdateState::Downloaded {
+            file_path: "/tmp/update.zip".to_string(),
+        }));
+
+        assert!(!App::update_download_progress_if_active(
+            &state,
+            0.5,
+            "update.zip",
+        ));
+        assert_eq!(
+            *state.lock().unwrap(),
+            UpdateState::Downloaded {
+                file_path: "/tmp/update.zip".to_string(),
+            }
+        );
     }
 
 }
