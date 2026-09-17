@@ -13,6 +13,7 @@ const ABOUT_BUTTON_LABEL: &str = "ℹ";
 struct PendingOp {
     description: String,
     receiver: mpsc::Receiver<OpResult>,
+    repo_generation: u64,
     started_at: Instant,
     /// Real-time progress text updated by the background thread (e.g. "Receiving objects: 45%").
     progress: Arc<Mutex<String>>,
@@ -83,6 +84,8 @@ pub struct App {
     pub log_search: String,
     /// Monotonic identity of the newest log search request.
     log_search_request_id: u64,
+    /// Monotonic identity of the currently open repository.
+    repo_generation: u64,
 
     pub last_refresh: std::time::Instant,
 
@@ -150,6 +153,7 @@ impl App {
             show_diff: false,
             log_search: String::new(),
             log_search_request_id: 0,
+            repo_generation: 0,
 
             last_refresh: std::time::Instant::now(),
 
@@ -318,6 +322,7 @@ impl App {
         match self.git.open(Path::new(path)) {
             Ok(()) => {
                 self.log_search_request_id = self.log_search_request_id.wrapping_add(1);
+                self.repo_generation = self.repo_generation.wrapping_add(1);
                 self.repo_path = path.to_string();
                 self.push_branch.clear();
                 self.push_branch_user_edited = false;
@@ -360,6 +365,7 @@ impl App {
 
         let (tx, rx) = mpsc::channel::<OpResult>();
         let desc = description.to_string();
+        let repo_generation = self.repo_generation;
         let progress = Arc::new(Mutex::new(String::new()));
         let op_progress = progress.clone();
 
@@ -371,6 +377,7 @@ impl App {
         self.pending_ops.push(PendingOp {
             description: desc,
             receiver: rx,
+            repo_generation,
             started_at: Instant::now(),
             progress,
             last_progress_update: Instant::now(),
@@ -470,6 +477,11 @@ impl App {
                         if matches!(&result, OpResult::Success(_)) {
                             self.needs_refresh = true;
                         }
+                        continue;
+                    }
+                    if op.repo_generation != self.repo_generation
+                        && matches!(&result, OpResult::RefreshData { .. })
+                    {
                         continue;
                     }
                     // Append final progress to log before handling result
@@ -1395,6 +1407,60 @@ mod tests {
     }
 
     #[test]
+    fn test_stale_refresh_result_does_not_replace_data_after_repo_switch() {
+        fn init_repo(path: &std::path::Path, message: &str) {
+            let repo = git2::Repository::init(path).expect("init repo");
+            let signature = git2::Signature::now("test", "test@example.com").expect("signature");
+            let tree_oid = {
+                let mut index = repo.index().expect("index");
+                index.write_tree().expect("write tree")
+            };
+            let tree = repo.find_tree(tree_oid).expect("tree");
+            repo.commit(Some("HEAD"), &signature, &signature, message, &tree, &[])
+                .expect("commit");
+        }
+
+        let old_repo = tempfile::tempdir().expect("old repo dir");
+        let new_repo = tempfile::tempdir().expect("new repo dir");
+        init_repo(old_repo.path(), "old repository commit");
+        init_repo(new_repo.path(), "new repository commit");
+
+        let recent_file = tempfile::NamedTempFile::new().expect("recent repos file");
+        let mut app = App::new();
+        app.recent_repos = RecentRepos::load_from(recent_file.path().to_path_buf());
+        app.open_repo(old_repo.path().to_str().expect("old repo path"));
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(OpResult::RefreshData {
+            status_entries: Vec::new(),
+            branches: Vec::new(),
+            worktrees: Vec::new(),
+            commits: vec![test_commit("stale old repository data", "old")],
+            stashes: Vec::new(),
+            remote_list: Vec::new(),
+            errors: Vec::new(),
+        })
+        .expect("send stale refresh result");
+        app.pending_ops.push(PendingOp {
+            description: "Refreshing".to_string(),
+            receiver: rx,
+            repo_generation: app.repo_generation,
+            started_at: Instant::now(),
+            progress: Arc::new(Mutex::new(String::new())),
+            last_progress_update: Instant::now(),
+            last_seen_progress: String::new(),
+            timed_out: false,
+        });
+
+        app.open_repo(new_repo.path().to_str().expect("new repo path"));
+        app.process_pending_ops(&egui::Context::default());
+
+        assert_eq!(app.repo_path, new_repo.path().to_string_lossy());
+        assert_eq!(app.commits.len(), 1);
+        assert_eq!(app.commits[0].summary, "new repository commit");
+    }
+
+    #[test]
     fn test_refresh_all_preserves_active_log_filter() {
         let dir = tempfile::tempdir().expect("temp dir");
         let repo = git2::Repository::init(dir.path()).expect("init repo");
@@ -1825,6 +1891,7 @@ mod tests {
         app.pending_ops.push(PendingOp {
             description: "Timed operation".to_string(),
             receiver: rx,
+            repo_generation: app.repo_generation,
             started_at: Instant::now() - Duration::from_secs(61),
             progress: Arc::new(Mutex::new(String::new())),
             last_progress_update: Instant::now(),
@@ -1855,6 +1922,7 @@ mod tests {
         let op = PendingOp {
             description: "Fetch from origin".to_string(),
             receiver: mpsc::channel::<OpResult>().1,
+            repo_generation: 0,
             started_at: Instant::now(),
             progress: Arc::new(Mutex::new("initial progress".to_string())),
             last_progress_update: Instant::now(),
