@@ -77,6 +77,8 @@ pub struct App {
     pub diff_path: String,
     pub show_diff: bool,
     pub log_search: String,
+    /// Monotonic identity of the newest log search request.
+    log_search_request_id: u64,
 
     pub last_refresh: std::time::Instant,
 
@@ -143,6 +145,7 @@ impl App {
             diff_path: String::new(),
             show_diff: false,
             log_search: String::new(),
+            log_search_request_id: 0,
 
             last_refresh: std::time::Instant::now(),
 
@@ -305,6 +308,7 @@ impl App {
         self.status_is_error = false;
         match self.git.open(Path::new(path)) {
             Ok(()) => {
+                self.log_search_request_id = self.log_search_request_id.wrapping_add(1);
                 self.repo_path = path.to_string();
                 self.push_branch.clear();
                 self.push_branch_user_edited = false;
@@ -370,6 +374,17 @@ impl App {
         self.last_operation_log += "  (waiting for progress...)\n";
 
         ctx.request_repaint();
+    }
+
+    /// Start a log search with a request identity so out-of-order responses can be ignored.
+    pub fn start_log_search(&mut self, ctx: &egui::Context, filter: String) {
+        self.log_search_request_id = self.log_search_request_id.wrapping_add(1);
+        let request_id = self.log_search_request_id;
+        self.start_operation(
+            ctx,
+            "Searching commits",
+            GitOperation::LogSearch { filter, request_id },
+        );
     }
 
     /// Process completed background operations.
@@ -491,8 +506,8 @@ impl App {
                 self.diff_content = lines;
                 self.show_diff = true;
             }
-            OpResult::SearchResults { filter, commits } => {
-                if filter == self.log_search {
+            OpResult::SearchResults { request_id, filter, commits } => {
+                if request_id == self.log_search_request_id && filter == self.log_search {
                     self.commits = commits;
                 }
             }
@@ -544,10 +559,11 @@ impl App {
             errors.push(format!("Worktrees: {}", e));
             Vec::new()
         });
-        self.commits = self.git.log(100).unwrap_or_else(|e| {
+        let commits = self.git.log(100).unwrap_or_else(|e| {
             errors.push(format!("Log: {}", e));
             Vec::new()
         });
+        self.commits = filter_commits(commits, &self.log_search);
         self.stashes = self.git.stash_list().unwrap_or_else(|e| {
             errors.push(format!("Stash: {}", e));
             Vec::new()
@@ -1312,11 +1328,13 @@ mod tests {
     fn test_stale_search_results_do_not_replace_current_log() {
         let mut app = App::new();
         app.log_search = "alice".to_string();
+        app.log_search_request_id = 1;
         app.commits = vec![test_commit("alice changed the parser", "alice")];
 
         app.handle_op_result(
             "Searching commits".to_string(),
             OpResult::SearchResults {
+                request_id: 0,
                 filter: "bob".to_string(),
                 commits: vec![test_commit("bob changed the parser", "bob")],
             },
@@ -1349,6 +1367,77 @@ mod tests {
 
         assert_eq!(app.commits.len(), 1);
         assert_eq!(app.commits[0].author, "alice");
+    }
+
+    #[test]
+    fn test_refresh_all_preserves_active_log_filter() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = git2::Repository::init(dir.path()).expect("init repo");
+        let alice = git2::Signature::now("alice", "alice@example.com").expect("signature");
+        let bob = git2::Signature::now("bob", "bob@example.com").expect("signature");
+        let tree_oid = {
+            let mut index = repo.index().expect("index");
+            index.write_tree().expect("write tree")
+        };
+        let tree = repo.find_tree(tree_oid).expect("tree");
+        let first_oid = repo
+            .commit(Some("HEAD"), &alice, &alice, "alice change", &tree, &[])
+            .expect("alice commit");
+        let first = repo.find_commit(first_oid).expect("first commit");
+        repo.commit(Some("HEAD"), &bob, &bob, "bob change", &tree, &[&first])
+            .expect("bob commit");
+        drop(first);
+        drop(tree);
+        drop(repo);
+
+        let mut app = App::new();
+        app.git.open(dir.path()).expect("open repo");
+        app.log_search = "alice".to_string();
+        app.refresh_all();
+
+        assert_eq!(app.commits.len(), 1);
+        assert_eq!(app.commits[0].author, "alice");
+    }
+
+    #[test]
+    fn test_repeated_search_query_rejects_stale_response() {
+        let mut app = App::new();
+        let ctx = egui::Context::default();
+
+        app.log_search = "alice".to_string();
+        let filter = app.log_search.clone();
+        app.start_log_search(&ctx, filter);
+        let first_a_request_id = app.log_search_request_id;
+        app.log_search = "bob".to_string();
+        let filter = app.log_search.clone();
+        app.start_log_search(&ctx, filter);
+        app.log_search = "alice".to_string();
+        let filter = app.log_search.clone();
+        app.start_log_search(&ctx, filter);
+        let second_a_request_id = app.log_search_request_id;
+        app.commits = vec![test_commit("latest alice result", "alice")];
+
+        app.handle_op_result(
+            "Searching commits".to_string(),
+            OpResult::SearchResults {
+                request_id: first_a_request_id,
+                filter: "alice".to_string(),
+                commits: vec![test_commit("stale alice result", "alice")],
+            },
+        );
+
+        assert_eq!(app.commits[0].message, "latest alice result");
+
+        app.handle_op_result(
+            "Searching commits".to_string(),
+            OpResult::SearchResults {
+                request_id: second_a_request_id,
+                filter: "alice".to_string(),
+                commits: vec![test_commit("current alice result", "alice")],
+            },
+        );
+
+        assert_eq!(app.commits[0].message, "current alice result");
     }
 
     #[test]
