@@ -88,7 +88,7 @@ pub struct App {
     pub update_state: Arc<Mutex<UpdateState>>,
     pub show_update_dialog: bool,
     pub auto_check_done: bool,
-    /// Set to true when the user clicks "Remind Later" to prevent the dialog from reopening.
+    /// Set to true when the user dismisses the update dialog to prevent it from reopening.
     pub update_dialog_dismissed: bool,
     /// Download progress from 0.0 to 1.0 for the current download.
     pub download_progress: f32,
@@ -177,6 +177,11 @@ impl App {
             let result = updater::check_for_update(&current_version);
             *state.lock().unwrap() = result;
         });
+    }
+
+    fn dismiss_update_dialog(&mut self) {
+        self.show_update_dialog = false;
+        self.update_dialog_dismissed = true;
     }
 
     fn update_download_progress_if_active(
@@ -1189,11 +1194,10 @@ impl eframe::App for App {
                                         // Fallback: open browser
                                         if crate::ui::ellipsis_button(ui, "Open in Browser").clicked() {
                                             let _ = open::that(download_url);
-                                            self.show_update_dialog = false;
+                                            self.dismiss_update_dialog();
                                         }
                                         if crate::ui::ellipsis_button(ui, "Remind Later").clicked() {
-                                            self.show_update_dialog = false;
-                                            self.update_dialog_dismissed = true;
+                                            self.dismiss_update_dialog();
                                         }
                                     });
                                 });
@@ -1857,6 +1861,29 @@ mod tests {
 
         assert!(app.update_dialog_dismissed, "Remind Later should set dismiss flag");
         assert!(!app.show_update_dialog, "Remind Later should close dialog");
+    }
+
+    #[test]
+    fn test_open_in_browser_dismisses_dialog_for_next_frame() {
+        let mut app = App::new();
+        app.show_update_dialog = true;
+        app.update_dialog_dismissed = false;
+
+        app.dismiss_update_dialog();
+
+        assert!(!app.show_update_dialog, "Opening the browser should close the dialog");
+        assert!(
+            app.update_dialog_dismissed,
+            "Opening the browser should prevent the dialog from reopening"
+        );
+
+        if !app.update_dialog_dismissed && !app.show_update_dialog {
+            app.show_update_dialog = true;
+        }
+        assert!(
+            !app.show_update_dialog,
+            "The dialog should stay closed on the next frame after opening the browser"
+        );
     }
 
     // --- Download tracking tests ---
