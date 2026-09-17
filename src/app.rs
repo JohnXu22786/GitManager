@@ -1676,6 +1676,51 @@ mod tests {
             "About button label '{}' must NOT use ⓘ which renders as a box",
             ABOUT_BUTTON_LABEL
         );
+
+        let ctx = egui::Context::default();
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(200.0, 100.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = ui.button(ABOUT_BUTTON_LABEL);
+                });
+            },
+        );
+        let text_shape = output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.job.text == ABOUT_BUTTON_LABEL => {
+                    Some(text)
+                }
+                _ => None,
+            })
+            .expect("About button should paint a text shape");
+        let font_id = text_shape
+            .galley
+            .job
+            .sections
+            .first()
+            .expect("About button text should have a font section")
+            .format
+            .font_id
+            .clone();
+        assert!(
+            ctx.fonts(|fonts| fonts.has_glyph(&font_id, 'ℹ')),
+            "About button font should provide an actual ℹ glyph"
+        );
+        assert!(text_shape
+            .galley
+            .rows
+            .iter()
+            .flat_map(|row| row.glyphs.iter())
+            .any(|glyph| glyph.chr == 'ℹ'));
     }
 
     #[test]

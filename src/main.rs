@@ -288,10 +288,15 @@ mod tests {
         let ctx = egui::Context::default();
         ctx.set_fonts(fonts);
         ctx.begin_pass(egui::RawInput::default());
+        let font_id = egui::FontId::proportional(16.0);
+        assert!(
+            ctx.fonts(|fonts| fonts.has_glyph(&font_id, '🚀')),
+            "loaded fallback font should provide an actual 🚀 glyph"
+        );
         let galley = ctx.fonts(|fonts| {
             fonts.layout_no_wrap(
                 "🚀".to_owned(),
-                egui::FontId::proportional(16.0),
+                font_id,
                 egui::Color32::WHITE,
             )
         });
