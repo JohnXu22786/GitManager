@@ -20,6 +20,8 @@ struct PendingOp {
     last_progress_update: Instant,
     /// The last progress value we read (to detect changes).
     last_seen_progress: String,
+    /// Whether the watchdog timed out while the worker was still running.
+    timed_out: bool,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -368,6 +370,7 @@ impl App {
             progress,
             last_progress_update: Instant::now(),
             last_seen_progress: String::new(),
+            timed_out: false,
         });
 
         // Initialize the operation log with description
@@ -398,18 +401,19 @@ impl App {
         let mut i = 0;
         while i < self.pending_ops.len() {
             // --- Watchdog timeout: check if the operation is still making progress ---
-            let (description, started_at, current_progress, last_seen_progress, last_progress_update) = {
+            let (description, started_at, current_progress, last_seen_progress, last_progress_update, timed_out) = {
                 let op = &self.pending_ops[i];
                 let description = op.description.clone();
                 let started_at = op.started_at;
                 let current_progress = op.progress.lock().unwrap().clone();
                 let last_seen_progress = op.last_seen_progress.clone();
                 let last_progress_update = op.last_progress_update;
-                (description, started_at, current_progress, last_seen_progress, last_progress_update)
+                let timed_out = op.timed_out;
+                (description, started_at, current_progress, last_seen_progress, last_progress_update, timed_out)
             };
 
             // If progress text changed, reset the watchdog timer and accumulate to log
-            if current_progress != last_seen_progress {
+            if !timed_out && current_progress != last_seen_progress {
                 if let Some(mut_op) = self.pending_ops.get_mut(i) {
                     mut_op.last_progress_update = Instant::now();
                     mut_op.last_seen_progress = current_progress.clone();
@@ -417,7 +421,7 @@ impl App {
                 if !current_progress.is_empty() {
                     self.last_operation_log += &format!("  {}\n", current_progress);
                 }
-            } else {
+            } else if !timed_out {
                 let stall_secs = last_progress_update.elapsed().as_secs();
                 if current_progress.is_empty() {
                     // No progress ever received: give 60 seconds total
@@ -429,7 +433,8 @@ impl App {
                         self.status_message = msg.clone();
                         self.status_is_error = true;
                         self.last_operation_log += &format!("  ✗ {}\n", msg);
-                        self.pending_ops.swap_remove(i);
+                        self.pending_ops[i].timed_out = true;
+                        i += 1;
                         continue;
                     }
                 } else {
@@ -442,7 +447,8 @@ impl App {
                         self.status_message = msg.clone();
                         self.status_is_error = true;
                         self.last_operation_log += &format!("  ✗ {}\n", msg);
-                        self.pending_ops.swap_remove(i);
+                        self.pending_ops[i].timed_out = true;
+                        i += 1;
                         continue;
                     }
                 }
@@ -452,6 +458,15 @@ impl App {
             match op.receiver.try_recv() {
                 Ok(result) => {
                     let op = self.pending_ops.swap_remove(i);
+                    if op.timed_out {
+                        // Keep the UI blocked until the timed-out worker has finished. A
+                        // successful late result may have mutated Git state, so refresh it
+                        // before allowing another operation to start.
+                        if matches!(&result, OpResult::Success(_)) {
+                            self.needs_refresh = true;
+                        }
+                        continue;
+                    }
                     // Append final progress to log before handling result
                     let final_progress = current_progress.clone();
                     if !final_progress.is_empty() {
@@ -463,6 +478,10 @@ impl App {
                     i += 1; // Still pending
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    if self.pending_ops[i].timed_out {
+                        self.pending_ops.swap_remove(i);
+                        continue;
+                    }
                     let last_prog = op.progress.lock().unwrap().clone();
                     let fail_msg = if last_prog.is_empty() {
                         format!("Operation '{}' failed unexpectedly", op.description)
@@ -1783,6 +1802,50 @@ mod tests {
     }
 
     #[test]
+    fn test_timed_out_operation_stays_busy_until_worker_finishes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let mut app = App::new();
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::channel();
+        let worker_finished = Arc::new(AtomicBool::new(false));
+        let worker_finished_clone = worker_finished.clone();
+
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            tx.send(OpResult::Success("late mutation".to_string())).unwrap();
+            worker_finished_clone.store(true, Ordering::SeqCst);
+        });
+
+        app.pending_ops.push(PendingOp {
+            description: "Timed operation".to_string(),
+            receiver: rx,
+            started_at: Instant::now() - Duration::from_secs(61),
+            progress: Arc::new(Mutex::new(String::new())),
+            last_progress_update: Instant::now(),
+            last_seen_progress: String::new(),
+            timed_out: false,
+        });
+
+        app.process_pending_ops(&ctx);
+
+        assert!(app.is_busy(), "a timed-out worker must still block new operations");
+        assert!(app.status_message.contains("timed out"));
+
+        while !worker_finished.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        app.process_pending_ops(&ctx);
+
+        assert!(!app.is_busy(), "the operation can be released after its worker exits");
+        assert!(
+            app.status_message.contains("timed out"),
+            "a late result must not replace the timeout status"
+        );
+    }
+
+    #[test]
     fn test_pending_op_contains_progress() {
         use std::sync::{Arc, Mutex};
         let op = PendingOp {
@@ -1792,6 +1855,7 @@ mod tests {
             progress: Arc::new(Mutex::new("initial progress".to_string())),
             last_progress_update: Instant::now(),
             last_seen_progress: String::new(),
+            timed_out: false,
         };
         assert_eq!(*op.progress.lock().unwrap(), "initial progress");
     }
