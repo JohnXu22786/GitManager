@@ -62,7 +62,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         &current_branch,
         app.push_branch_user_edited,
     );
-    if app.remote_name.is_empty() {
+    if !app.remote_list.iter().any(|remote| remote.name == app.remote_name) {
         app.remote_name = default_remote.clone();
     }
 
@@ -129,6 +129,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
 mod tests {
     use super::show;
     use crate::app::App;
+    use crate::git_ops::RemoteInfo;
     use eframe::egui;
     use git2::Repository;
     use std::path::Path;
@@ -208,5 +209,26 @@ mod tests {
         show_panel(&mut app, &ctx);
 
         assert_eq!(app.push_branch, "feature");
+    }
+
+    #[test]
+    fn panel_replaces_stale_remote_after_repository_switch() {
+        let mut app = App::new();
+        let ctx = egui::Context::default();
+
+        app.remote_list = vec![RemoteInfo {
+            name: "upstream".to_string(),
+            url: "https://example.com/upstream.git".to_string(),
+        }];
+        show_panel(&mut app, &ctx);
+        assert_eq!(app.remote_name, "upstream");
+
+        app.remote_list = vec![RemoteInfo {
+            name: "origin".to_string(),
+            url: "https://example.com/origin.git".to_string(),
+        }];
+        show_panel(&mut app, &ctx);
+
+        assert_eq!(app.remote_name, "origin");
     }
 }
