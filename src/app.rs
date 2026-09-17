@@ -1866,10 +1866,71 @@ mod tests {
     #[test]
     fn test_open_in_browser_dismisses_dialog_for_next_frame() {
         let mut app = App::new();
+        let repo_dir = tempfile::tempdir().expect("create temporary repository directory");
+        git2::Repository::init(repo_dir.path()).expect("initialize temporary repository");
+        app.git.open(repo_dir.path()).expect("open temporary repository");
+        assert!(app.git.is_open());
+        app.auto_check_done = true;
         app.show_update_dialog = true;
         app.update_dialog_dismissed = false;
+        *app.update_state.lock().unwrap() = UpdateState::UpdateAvailable {
+            latest_version: "0.2.0".to_string(),
+            download_url: String::new(),
+            assets: Vec::new(),
+        };
 
-        app.dismiss_update_dialog();
+        let ctx = egui::Context::default();
+        let screen_rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(800.0, 600.0),
+        );
+        let mut frame = eframe::Frame::_new_kittest();
+        // Give egui one frame to initialize the update window before locating its button.
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ctx| eframe::App::update(&mut app, ctx, &mut frame),
+        );
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ctx| eframe::App::update(&mut app, ctx, &mut frame),
+        );
+        let browser_button_pos = output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.job.text == "Open in Browser" => {
+                    Some(text.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .expect("Update dialog should render an Open in Browser button");
+
+        let pointer_input = |pressed| egui::RawInput {
+            screen_rect: Some(screen_rect),
+            events: vec![
+                egui::Event::PointerMoved(browser_button_pos),
+                egui::Event::PointerButton {
+                    pos: browser_button_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let _ = ctx.run(pointer_input(true), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+        let _ = ctx.run(pointer_input(false), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
 
         assert!(!app.show_update_dialog, "Opening the browser should close the dialog");
         assert!(
@@ -1877,9 +1938,13 @@ mod tests {
             "Opening the browser should prevent the dialog from reopening"
         );
 
-        if !app.update_dialog_dismissed && !app.show_update_dialog {
-            app.show_update_dialog = true;
-        }
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ctx| eframe::App::update(&mut app, ctx, &mut frame),
+        );
         assert!(
             !app.show_update_dialog,
             "The dialog should stay closed on the next frame after opening the browser"
