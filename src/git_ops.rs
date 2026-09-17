@@ -22,6 +22,7 @@ pub enum GitOperation {
     CheckoutBranch(String),
     MergeBranch(String),
     RemoveWorktree { path: PathBuf, force: bool },
+    PruneWorktrees,
     CreateWorktree { name: String, path: PathBuf, branch: Option<String>, new_branch: bool },
     StashAll(Option<String>),
     StashPop,
@@ -132,6 +133,10 @@ impl GitOperation {
                     else { format!("Removed worktree at {:?}", path) }
                 })
             }
+            GitOperation::PruneWorktrees => match repo.prune_worktrees() {
+                Ok(count) => OpResult::Success(format!("Pruned {} stale worktree(s)", count)),
+                Err(e) => OpResult::Error(e),
+            },
             GitOperation::CreateWorktree { name, path, branch, new_branch } => {
                 match repo.create_worktree(&name, &path, branch.as_deref(), new_branch) {
                     Ok(()) => OpResult::Success(format!("Created worktree '{}' at {:?}", name, path)),
@@ -646,6 +651,32 @@ impl GitRepo {
             if let Ok(wr) = Repository::open(wt.path()) { let _ = wr.set_head(&branch_ref); }
         }
         Ok(())
+    }
+
+    /// Remove only stale worktree metadata, matching `git worktree prune`.
+    ///
+    /// The default libgit2 prune options preserve valid and locked worktrees
+    /// and never delete working-tree files.
+    pub fn prune_worktrees(&self) -> GitResult<usize> {
+        let repo = self.repo()?;
+        let names = repo.worktrees().map_err(|e| format!("Worktrees: {}", e))?;
+        let mut pruned = 0;
+
+        for name in names.iter().flatten() {
+            let wt = repo
+                .find_worktree(name)
+                .map_err(|e| format!("Find worktree '{}': {}", name, e))?;
+            if wt
+                .is_prunable(None)
+                .map_err(|e| format!("Check worktree '{}': {}", name, e))?
+            {
+                wt.prune(None)
+                    .map_err(|e| format!("Prune worktree '{}': {}", name, e))?;
+                pruned += 1;
+            }
+        }
+
+        Ok(pruned)
     }
 
     pub fn remove_worktree(&self, path: &Path, force: bool) -> GitResult<()> {
@@ -1571,6 +1602,59 @@ mod tests {
         let after_wts = git.worktrees().unwrap();
         assert_eq!(after_wts.len(), 1, "Only main worktree should remain");
         assert!(after_wts[0].is_main, "Remaining worktree should be main");
+    }
+
+    #[test]
+    fn test_prune_preserves_valid_clean_and_dirty_worktrees() {
+        let main_dir = tempfile::tempdir().expect("temp dir");
+        let wt_root = tempfile::tempdir().expect("temp dir");
+        let clean_path = wt_root.path().join("clean-wt");
+        let dirty_path = wt_root.path().join("dirty-wt");
+        let stale_path = wt_root.path().join("stale-wt");
+
+        let repo = create_repo_with_commit(main_dir.path());
+        let commit = repo.head().expect("head").peel_to_commit().expect("commit");
+
+        for (name, path) in [
+            ("clean-wt", &clean_path),
+            ("dirty-wt", &dirty_path),
+            ("stale-wt", &stale_path),
+        ] {
+            let branch = repo.branch(name, &commit, false).expect("branch");
+            let reference = repo
+                .find_reference(&format!("refs/heads/{}", name))
+                .expect("reference");
+            let mut opts = git2::WorktreeAddOptions::new();
+            opts.reference(Some(&reference));
+            repo.worktree(name, path, Some(&opts)).expect("create worktree");
+            drop(reference);
+            drop(branch);
+        }
+
+        let dirty_file = dirty_path.join("important.txt");
+        std::fs::write(&dirty_file, "keep this change").expect("write dirty file");
+        let stale_gitdir = repo.path().join("worktrees").join("stale-wt");
+        std::fs::remove_dir_all(&stale_path).expect("remove stale worktree directory");
+        drop(commit);
+        drop(repo);
+
+        let git = open_git_repo(main_dir.path());
+        let pruned = git.prune_worktrees().expect("prune stale worktrees");
+
+        assert_eq!(pruned, 1, "only the stale worktree should be pruned");
+        assert!(clean_path.exists(), "valid clean worktree must be preserved");
+        assert!(dirty_path.exists(), "valid dirty worktree must be preserved");
+        assert_eq!(
+            std::fs::read_to_string(&dirty_file).expect("read preserved dirty file"),
+            "keep this change"
+        );
+        assert!(!stale_path.exists(), "stale worktree directory should remain absent");
+        assert!(!stale_gitdir.exists(), "stale worktree metadata should be pruned");
+
+        let remaining = git.worktrees().expect("list worktrees");
+        assert_eq!(remaining.len(), 3, "main and both valid worktrees should remain");
+        assert!(remaining.iter().any(|wt| wt.path == clean_path));
+        assert!(remaining.iter().any(|wt| wt.path == dirty_path));
     }
 
     #[test]
