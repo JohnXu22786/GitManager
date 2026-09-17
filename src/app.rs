@@ -301,6 +301,12 @@ impl App {
     }
 
     pub fn open_repo(&mut self, path: &str) {
+        // Pending operations publish results back into this App, so changing
+        // repositories before they finish could apply stale data to the new one.
+        if self.is_busy() {
+            return;
+        }
+
         self.status_message.clear();
         self.status_is_error = false;
         match self.git.open(Path::new(path)) {
@@ -697,42 +703,45 @@ impl eframe::App for App {
                 }
 
                 // Recent repos dropdown
-                egui::menu::menu_button(ui, "🕒", |ui| {
-                    if self.recent_repos.is_empty() {
-                        ui.label("No recent repositories");
-                    } else {
-                        let mut to_delete: Option<usize> = None;
-                        let entries = self.recent_repos.entries().to_vec();
-                        ui.label(
-                            egui::RichText::new("Recent Repositories")
-                                .strong()
-                                .size(14.0),
-                        );
-                        ui.separator();
-                        for (i, entry) in entries.iter().enumerate() {
-                            ui.horizontal(|ui| {
-                                ui.set_min_width(300.0);
-                                if ui
-                                    .selectable_label(false, &entry.name)
-                                    .clicked()
-                                {
-                                    self.open_repo(&entry.path);
-                                    ui.close_menu();
-                                }
-                                ui.label(
-                                    egui::RichText::new(&entry.path)
-                                        .size(10.0)
-                                        .color(egui::Color32::GRAY),
-                                );
-                                if crate::ui::ellipsis_button(ui, "🗑").clicked() {
-                                    to_delete = Some(i);
-                                }
-                            });
+                let recent_repos_enabled = !self.is_busy();
+                ui.add_enabled_ui(recent_repos_enabled, |ui| {
+                    egui::menu::menu_button(ui, "🕒", |ui| {
+                        if self.recent_repos.is_empty() {
+                            ui.label("No recent repositories");
+                        } else {
+                            let mut to_delete: Option<usize> = None;
+                            let entries = self.recent_repos.entries().to_vec();
+                            ui.label(
+                                egui::RichText::new("Recent Repositories")
+                                    .strong()
+                                    .size(14.0),
+                            );
+                            ui.separator();
+                            for (i, entry) in entries.iter().enumerate() {
+                                ui.horizontal(|ui| {
+                                    ui.set_min_width(300.0);
+                                    if ui
+                                        .selectable_label(false, &entry.name)
+                                        .clicked()
+                                    {
+                                        self.open_repo(&entry.path);
+                                        ui.close_menu();
+                                    }
+                                    ui.label(
+                                        egui::RichText::new(&entry.path)
+                                            .size(10.0)
+                                            .color(egui::Color32::GRAY),
+                                    );
+                                    if crate::ui::ellipsis_button(ui, "🗑").clicked() {
+                                        to_delete = Some(i);
+                                    }
+                                });
+                            }
+                            if let Some(idx) = to_delete {
+                                self.recent_repos.remove(idx);
+                            }
                         }
-                        if let Some(idx) = to_delete {
-                            self.recent_repos.remove(idx);
-                        }
-                    }
+                    });
                 });
 
                 if self.git.is_open() {
@@ -1319,6 +1328,36 @@ mod tests {
         app.status_is_error = false;
         assert!(app.status_message.is_empty());
         assert!(!app.status_is_error);
+    }
+
+    #[test]
+    fn test_open_repo_is_ignored_while_operation_is_pending() {
+        let first_repo = tempfile::tempdir().unwrap();
+        let second_repo = tempfile::tempdir().unwrap();
+        git2::Repository::init(first_repo.path()).unwrap();
+        git2::Repository::init(second_repo.path()).unwrap();
+
+        let mut app = App::new();
+        let recent_repos_dir = tempfile::tempdir().unwrap();
+        app.recent_repos = RecentRepos::load_from(recent_repos_dir.path().join("recent.json"));
+        let first_path = first_repo.path().to_string_lossy().to_string();
+        let second_path = second_repo.path().to_string_lossy().to_string();
+        app.open_repo(&first_path);
+
+        let (_tx, receiver) = mpsc::channel::<OpResult>();
+        app.pending_ops.push(PendingOp {
+            description: "Fetching".to_string(),
+            receiver,
+            started_at: Instant::now(),
+            progress: Arc::new(Mutex::new(String::new())),
+            last_progress_update: Instant::now(),
+            last_seen_progress: String::new(),
+        });
+
+        app.open_repo(&second_path);
+
+        assert_eq!(app.repo_path, first_path);
+        assert_eq!(app.git.path().unwrap(), first_repo.path());
     }
 
     // --- Legacy tests (unchanged) ---
