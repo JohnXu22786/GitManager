@@ -31,8 +31,8 @@ pub enum GitOperation {
     Pull { remote: String, branch: String, rebase: bool },
     Fetch(String),
     GetDiff { path: String, staged: bool },
-    /// Search commits in the log.
-    LogSearch(String),
+    /// Search commits in the log, identified by the request that started it.
+    LogSearch { filter: String, request_id: u64 },
     /// Refresh all cached data from the repository.
     RefreshAll,
 }
@@ -49,8 +49,12 @@ pub enum OpResult {
         path: String,
         lines: Vec<DiffLine>,
     },
-    /// Search results for commit log.
-    SearchResults(Vec<CommitInfo>),
+    /// Search results for commit log, tagged with the query and request that produced them.
+    SearchResults {
+        request_id: u64,
+        filter: String,
+        commits: Vec<CommitInfo>,
+    },
     /// Refreshed data from the repository, with optional errors.
     RefreshData {
         status_entries: Vec<StatusEntry>,
@@ -161,19 +165,14 @@ impl GitOperation {
                 Ok(lines) => OpResult::DiffContent { path, lines },
                 Err(e) => OpResult::Error(format!("Diff error: {}", e)),
             },
-            GitOperation::LogSearch(filter) => {
+            GitOperation::LogSearch { filter, request_id } => {
                 let commits = repo.log(100).unwrap_or_default();
-                let filtered: Vec<CommitInfo> = if filter.is_empty() {
-                    commits
-                } else {
-                    let f = filter.to_lowercase();
-                    commits.into_iter().filter(|c| {
-                        c.message.to_lowercase().contains(&f)
-                            || c.author.to_lowercase().contains(&f)
-                            || c.short_sha.contains(&f)
-                    }).collect()
-                };
-                OpResult::SearchResults(filtered)
+                let filtered = filter_commits(commits, &filter);
+                OpResult::SearchResults {
+                    request_id,
+                    filter,
+                    commits: filtered,
+                }
             }
             GitOperation::RefreshAll => {
                 let mut errors: Vec<String> = Vec::new();
@@ -238,6 +237,23 @@ pub struct CommitInfo {
     pub time: String,
     pub message: String,
     pub summary: String,
+}
+
+/// Filter commits using the same fields exposed by the log search UI.
+pub fn filter_commits(commits: Vec<CommitInfo>, filter: &str) -> Vec<CommitInfo> {
+    if filter.is_empty() {
+        return commits;
+    }
+
+    let filter = filter.to_lowercase();
+    commits
+        .into_iter()
+        .filter(|commit| {
+            commit.message.to_lowercase().contains(&filter)
+                || commit.author.to_lowercase().contains(&filter)
+                || commit.short_sha.contains(&filter)
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -1300,6 +1316,31 @@ mod tests {
             index.get_path(Path::new("staged.txt"), 0).is_some(),
             "background operation should update the linked worktree index"
         );
+    }
+
+    #[test]
+    fn test_log_search_result_preserves_request_id() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(dir.path());
+        drop(repo);
+
+        let result = execute_operation(
+            dir.path(),
+            GitOperation::LogSearch {
+                filter: "initial".to_string(),
+                request_id: 42,
+            },
+            Arc::new(Mutex::new(String::new())),
+        );
+
+        match result {
+            OpResult::SearchResults { request_id, filter, commits } => {
+                assert_eq!(request_id, 42);
+                assert_eq!(filter, "initial");
+                assert_eq!(commits.len(), 1);
+            }
+            other => panic!("expected search results, got {:?}", other),
+        }
     }
 
     #[test]
