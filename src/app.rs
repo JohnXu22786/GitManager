@@ -268,21 +268,22 @@ impl App {
         };
 
         // Launch the script (detached from parent process)
-        #[cfg(target_os = "windows")]
-        {
-            let _ = std::process::Command::new("cmd")
-                .args(["/C", script_path.to_str().unwrap_or("")])
-                .spawn();
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = std::process::Command::new("sh")
-                .arg(script_path.to_str().unwrap_or(""))
-                .spawn();
+        if !self.try_launch_update_script(&script_path) {
+            return;
         }
 
         // Exit the current process immediately
         std::process::exit(0);
+    }
+
+    fn try_launch_update_script(&mut self, script_path: &Path) -> bool {
+        match updater::launch_self_update_script(script_path) {
+            Ok(()) => true,
+            Err(e) => {
+                self.show_error(e);
+                false
+            }
+        }
     }
 
     pub fn open_repo(&mut self, path: &str) {
@@ -1660,6 +1661,18 @@ mod tests {
     fn test_download_progress_field_defaults() {
         let app = App::new();
         assert_eq!(app.download_progress, 0.0, "Download progress should start at 0");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_update_script_launch_failure_is_reported() {
+        let mut app = App::new();
+
+        assert!(!app.try_launch_update_script(Path::new(
+            "/path/that/does/not/exist/update_git_manager.sh",
+        )));
+        assert!(app.status_is_error);
+        assert!(app.status_message.contains("Failed to launch update script"));
     }
 
 }
