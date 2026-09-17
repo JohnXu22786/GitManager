@@ -850,6 +850,12 @@ impl GitRepo {
         let tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
         let mut dopts = DiffOptions::new();
         dopts.pathspec(path);
+        if !staged {
+            dopts
+                .include_untracked(true)
+                .recurse_untracked_dirs(true)
+                .show_untracked_content(true);
+        }
         let idx = repo.index().map_err(|e| format!("Index: {}", e))?;
 
         let diff = if staged {
@@ -1208,6 +1214,24 @@ mod tests {
                 ('+', "unstaged line 3\n"),
             ],
             "unstaged diff must compare the index with the worktree"
+        );
+    }
+
+    #[test]
+    fn test_untracked_diff_includes_file_content() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(dir.path());
+        let untracked_path = dir.path().join("new.txt");
+        std::fs::write(&untracked_path, "first line\nsecond line\n").expect("write untracked file");
+        drop(repo);
+
+        let git = open_git_repo(dir.path());
+        let diff = git.get_diff("new.txt", false).expect("get untracked diff");
+
+        assert_eq!(
+            diff.iter().map(|line| (line.origin, line.content.as_str())).collect::<Vec<_>>(),
+            vec![('+', "first line\n"), ('+', "second line\n")],
+            "untracked diff must expose the file content as added lines"
         );
     }
 
