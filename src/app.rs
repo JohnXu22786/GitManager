@@ -7,6 +7,8 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+const ABOUT_BUTTON_LABEL: &str = "ℹ";
+
 /// Tracks a Git operation running in a background thread.
 struct PendingOp {
     description: String,
@@ -799,7 +801,7 @@ impl eframe::App for App {
                             }
                         }
                         // About button
-                        if ui.button("ⓘ").clicked() {
+                        if ui.button(ABOUT_BUTTON_LABEL).clicked() {
                             self.show_about = !self.show_about;
                         }
                         // Version label (truncatable so it doesn't push buttons off-screen)
@@ -860,7 +862,7 @@ impl eframe::App for App {
                 } else {
                     // No repo open: show version + about on the right
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("ⓘ").clicked() {
+                        if ui.button(ABOUT_BUTTON_LABEL).clicked() {
                             self.show_about = !self.show_about;
                         }
                         let version_text = format!("v{}", crate::version_info::VERSION);
@@ -1636,7 +1638,7 @@ mod tests {
 
     #[test]
     fn test_emoji_chars_in_app_ui() {
-        let emojis = ['📂', '🔀', '📋', '📦', '🌐', '▶', 'ⓘ', '🔄', '🗑', '⏳', '📊'];
+        let emojis = ['📂', '🔀', '📋', '📦', '🌐', '▶', 'ℹ', '🔄', '🗑', '⏳', '📊'];
         for (i, &emoji) in emojis.iter().enumerate() {
             assert!(emoji as u32 > 127, "Emoji {} (index {}) should be a Unicode character", emoji, i);
         }
@@ -1668,14 +1670,12 @@ mod tests {
     #[test]
     fn test_about_button_does_not_use_circled_i() {
         let bad_char = '\u{24D8}';
-        let about_labels = ["ℹ", "About"];
-        for label in &about_labels {
-            assert!(
-                !label.contains(bad_char),
-                "About button label '{}' must NOT use ⓘ which renders as a box",
-                label
-            );
-        }
+        assert_eq!(ABOUT_BUTTON_LABEL, "ℹ");
+        assert!(
+            !ABOUT_BUTTON_LABEL.contains(bad_char),
+            "About button label '{}' must NOT use ⓘ which renders as a box",
+            ABOUT_BUTTON_LABEL
+        );
     }
 
     #[test]

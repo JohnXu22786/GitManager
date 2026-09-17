@@ -7,6 +7,7 @@ mod ui;
 mod updater;
 
 use eframe::egui;
+use std::path::{Path, PathBuf};
 
 /// Included via build.rs — provides VERSION, GIT_HASH, GIT_DESCRIBE, BUILD_DATE constants.
 mod version_info {
@@ -15,43 +16,124 @@ mod version_info {
 
 /// Configure fonts with system font fallbacks for broad Unicode/emoji coverage.
 ///
-/// egui's default fonts (Ubuntu-Light, Hack) do not include emoji glyphs or many
-/// Unicode symbols (↑ ↓ ▶ 📂 🔀 🗑 etc.). This function tries to load system fonts
-/// (e.g., Segoe UI Emoji, Segoe UI Symbol on Windows) and adds them as fallbacks
-/// so that all Unicode characters used in the UI render correctly instead of as boxes.
+/// egui's default fonts do not include every emoji glyph or Unicode symbol used by
+/// the UI (↑ ↓ ▶ 📂 🔀 🗑 etc.). This function tries to load platform system fonts
+/// and adds them as fallbacks so missing characters render instead of as boxes.
 fn configure_fonts(cc: &eframe::CreationContext) {
-    #[allow(unused_mut)]
     let mut fonts = egui::FontDefinitions::default();
+    let mut loaded_fonts = std::collections::HashSet::new();
 
-    // Try to load system fonts for Unicode/emoji coverage, gracefully ignoring failures
-    #[cfg(windows)]
-    {
-        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
-        let font_dir = format!("{}\\Fonts\\", system_root);
-
-        // Segoe UI Emoji — provides emoji glyphs (Windows 8.1+)
-        try_add_font(&mut fonts, &format!("{}seguiemj.ttf", font_dir), "SegoeUIEmoji");
-        // Segoe UI Symbol — provides Unicode symbols/arrows (Windows 7+)
-        try_add_font(&mut fonts, &format!("{}seguisym.ttf", font_dir), "SegoeUISymbol");
+    // Try to load system fonts for Unicode/emoji coverage, gracefully ignoring failures.
+    // The default egui fonts are bundled with the application, but their glyph coverage
+    // differs from the fonts users have available on each supported platform.
+    for (path, name) in system_font_candidates() {
+        if loaded_fonts.contains(name) {
+            continue;
+        }
+        if try_add_font(&mut fonts, &path, name) {
+            loaded_fonts.insert(name);
+        }
     }
 
     cc.egui_ctx.set_fonts(fonts);
 }
 
+/// Return common Unicode-capable fonts for the supported desktop platforms.
+///
+/// The paths are candidates rather than requirements: installations may omit any
+/// of these fonts, and `configure_fonts` simply skips paths that are unavailable.
+fn system_font_candidates() -> Vec<(PathBuf, &'static str)> {
+    let mut candidates = Vec::new();
+
+    #[cfg(windows)]
+    {
+        let system_root = std::env::var_os("SystemRoot")
+            .or_else(|| std::env::var_os("WINDIR"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        let system_font_dir = system_root.join("Fonts");
+
+        candidates.push((system_font_dir.join("seguiemj.ttf"), "SegoeUIEmoji"));
+        candidates.push((system_font_dir.join("seguisym.ttf"), "SegoeUISymbol"));
+
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        candidates.extend([
+            (
+                PathBuf::from("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
+                "ArialUnicode",
+            ),
+            (
+                PathBuf::from("/System/Library/Fonts/Apple Symbols.ttf"),
+                "AppleSymbols",
+            ),
+            (
+                PathBuf::from("/Library/Fonts/Arial Unicode.ttf"),
+                "ArialUnicode",
+            ),
+            (
+                PathBuf::from("/Library/Fonts/Arial.ttf"),
+                "Arial",
+            ),
+        ]);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        candidates.extend([
+            (
+                PathBuf::from("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+                "DejaVuSans",
+            ),
+            (
+                PathBuf::from("/usr/share/fonts/dejavu/DejaVuSans.ttf"),
+                "DejaVuSans",
+            ),
+            (
+                PathBuf::from("/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf"),
+                "NotoSansSymbols",
+            ),
+            (
+                PathBuf::from("/usr/share/fonts/opentype/noto/NotoSansSymbols2-Regular.ttf"),
+                "NotoSansSymbols",
+            ),
+            (
+                PathBuf::from("/usr/share/fonts/google-noto-vf/NotoSansSymbols[wght].ttf"),
+                "NotoSansSymbols",
+            ),
+            (
+                PathBuf::from("/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf"),
+                "NotoEmoji",
+            ),
+            (
+                PathBuf::from("/usr/share/fonts/google-noto-emoji/NotoEmoji-Regular.ttf"),
+                "NotoEmoji",
+            ),
+        ]);
+    }
+
+    candidates
+}
+
 /// Try to load a font from `path` and add it as a fallback for all font families.
 /// Silently ignores failures (file not found, invalid font, etc.).
-#[cfg(windows)]
-fn try_add_font(fonts: &mut egui::FontDefinitions, path: &str, name: &str) {
+fn try_add_font(fonts: &mut egui::FontDefinitions, path: &Path, name: &str) -> bool {
     if let Ok(data) = std::fs::read(path) {
+        let name = name.to_owned();
         fonts
             .font_data
-            .insert(name.to_owned(), std::sync::Arc::new(egui::FontData::from_owned(data)));
+            .insert(name.clone(), std::sync::Arc::new(egui::FontData::from_owned(data)));
         // Add as fallback for all font families
         for family in fonts.families.values_mut() {
-            if !family.contains(&name.to_owned()) {
-                family.push(name.to_owned());
+            if !family.contains(&name) {
+                family.push(name.clone());
             }
         }
+        true
+    } else {
+        false
     }
 }
 
@@ -81,4 +163,37 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(app::App::new()))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_font_candidates_include_platform_fallbacks() {
+        let candidates = system_font_candidates();
+        let names: Vec<&str> = candidates.iter().map(|(_, name)| *name).collect();
+
+        #[cfg(windows)]
+        {
+            assert!(names.contains(&"SegoeUIEmoji"));
+            assert!(names.contains(&"SegoeUISymbol"));
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            assert!(names.contains(&"ArialUnicode"));
+            assert!(names.contains(&"AppleSymbols"));
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            assert!(names.contains(&"DejaVuSans"));
+            assert!(names.contains(&"NotoSansSymbols"));
+            assert!(names.contains(&"NotoEmoji"));
+        }
+
+        #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+        assert!(names.is_empty(), "unsupported platforms should not assume font paths");
+    }
 }
