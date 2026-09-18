@@ -31,6 +31,7 @@ pub enum GitOperation {
         path: PathBuf,
         force: bool,
         expected_git_link: Option<WorktreeFileIdentity>,
+        require_git_link_identity: bool,
     },
     PruneWorktrees,
     CreateWorktree { name: String, path: PathBuf, branch: Option<String>, new_branch: bool },
@@ -137,11 +138,24 @@ impl GitOperation {
                 Ok(msg) => OpResult::Success(msg),
                 Err(e) => OpResult::Error(e),
             },
-            GitOperation::RemoveWorktree { path, force, expected_git_link } => {
-                Self::simple(repo.remove_worktree_with_identity(&path, force, expected_git_link), {
+            GitOperation::RemoveWorktree {
+                path,
+                force,
+                expected_git_link,
+                require_git_link_identity,
+            } => {
+                Self::simple(
+                    repo.remove_worktree_with_identity(
+                        &path,
+                        force,
+                        expected_git_link,
+                        require_git_link_identity,
+                    ),
+                    {
                     if force { format!("Force removed worktree at {:?}", path) }
                     else { format!("Removed worktree at {:?}", path) }
-                })
+                    },
+                )
             }
             GitOperation::PruneWorktrees => match repo.prune_worktrees() {
                 Ok(count) => OpResult::Success(format!("Pruned {} stale worktree(s)", count)),
@@ -730,7 +744,23 @@ fn remove_worktree_directory(
     worktree: &git2::Worktree,
     path: &Path,
     force: bool,
+    expected_git_link: Option<&WorktreeFileIdentity>,
+    require_git_link_identity: bool,
 ) -> std::io::Result<Option<WorktreeFileIdentity>> {
+    if require_git_link_identity && expected_git_link.is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "worktree identity was unavailable when the path was listed",
+        ));
+    }
+    if let Some(expected_git_link) = expected_git_link {
+        if !staged_worktree_link_matches(path, expected_git_link) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "directory identity changed since it was listed",
+            ));
+        }
+    }
     if !registered_worktree_path_matches(repo, worktree, path) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
@@ -771,7 +801,22 @@ fn remove_worktree_directory(
         }
 
         let staging_path = worktree_staging_path(path)?;
-        std::fs::rename(path, &staging_path)?;
+        if let Err(rename_error) = std::fs::rename(path, &staging_path) {
+            if force {
+                let is_safe = || staged_worktree_link_matches(path, &expected_git_link);
+                if let Err(force_error) = force_remove_dir_checked(path, is_safe) {
+                    return Err(std::io::Error::new(
+                        force_error.kind(),
+                        format!(
+                            "{}; force cleanup fallback failed: {}",
+                            rename_error, force_error
+                        ),
+                    ));
+                }
+                return Ok(());
+            }
+            return Err(rename_error);
+        }
 
         if !staged_worktree_link_matches(&staging_path, &expected_git_link) {
             if let Err(restore_error) = std::fs::rename(&staging_path, path) {
@@ -1464,7 +1509,7 @@ impl GitRepo {
     }
 
     pub fn remove_worktree(&self, path: &Path, force: bool) -> GitResult<()> {
-        self.remove_worktree_with_identity(path, force, None)
+        self.remove_worktree_with_identity(path, force, None, false)
     }
 
     fn remove_worktree_with_identity(
@@ -1472,6 +1517,7 @@ impl GitRepo {
         path: &Path,
         force: bool,
         expected_git_link: Option<WorktreeFileIdentity>,
+        require_git_link_identity: bool,
     ) -> GitResult<()> {
         let repo = self.repo()?;
         let wname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -1498,6 +1544,9 @@ impl GitRepo {
             }
         }
 
+        if require_git_link_identity && expected_git_link.is_none() && path_exists(path)? {
+            return Err("Cannot remove path because its worktree identity was unavailable when it was listed.".into());
+        }
         if let Some(ref expected_git_link) = expected_git_link {
             if path_exists(path)? && !staged_worktree_link_matches(path, expected_git_link) {
                 return Err("Cannot remove path because its worktree identity changed since it was listed.".into());
@@ -1550,7 +1599,14 @@ impl GitRepo {
             let worktree = found_wt
                 .as_ref()
                 .expect("registered worktree validated above");
-            match remove_worktree_directory(&repo, worktree, path, force) {
+            match remove_worktree_directory(
+                &repo,
+                worktree,
+                path,
+                force,
+                expected_git_link.as_ref(),
+                require_git_link_identity,
+            ) {
                 Ok(lock_identity) => (true, lock_identity),
                 Err(e) => {
                     errors.push(format!("Rm dir: {}", e));
@@ -1563,6 +1619,11 @@ impl GitRepo {
         } else {
             (true, None)
         };
+
+        if directory_removed && require_git_link_identity && expected_git_link.is_none() && path_exists(path)? {
+            errors.push("Cannot remove path because its worktree identity was unavailable when it was listed.".into());
+            directory_removed = false;
+        }
 
         if directory_removed && !force && lock_identity.is_none() {
             if let Some(ref wt) = found_wt {
@@ -3811,12 +3872,20 @@ mod tests {
         std::fs::write(wt_path.join(".git"), git_link_contents).expect("copy git link");
         std::fs::write(wt_path.join("important.txt"), "keep copied-link replacement")
             .expect("write replacement file");
-        let result = git.remove_worktree_with_identity(&wt_path, true, Some(expected_identity));
+        let result = git.remove_worktree_with_identity(&wt_path, true, Some(expected_identity), true);
 
         assert!(result.is_err(), "Removal must reject a copied .git link after selection");
         assert!(wt_path.exists(), "The copied-link replacement must be preserved");
         assert!(wt_path.join("important.txt").exists(), "Replacement files must be preserved");
         assert!(wt_gitdir.exists(), "Registered worktree metadata must be preserved");
+
+        let unavailable_snapshot_result =
+            git.remove_worktree_with_identity(&wt_path, true, None, true);
+        assert!(
+            unavailable_snapshot_result.is_err(),
+            "Removal must reject an existing path when the listed identity was unavailable"
+        );
+        assert!(wt_path.exists(), "The replacement must remain after an unavailable snapshot");
     }
 
     #[test]

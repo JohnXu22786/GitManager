@@ -181,6 +181,7 @@ fn show_worktree_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, wt: 
                             path: wt_path.clone(),
                             force: false,
                             expected_git_link: wt.git_link_identity.clone(),
+                            require_git_link_identity: true,
                         });
                         ui.close_menu();
                     }
@@ -189,6 +190,7 @@ fn show_worktree_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, wt: 
                             path: wt_path.clone(),
                             force: true,
                             expected_git_link: wt.git_link_identity.clone(),
+                            require_git_link_identity: true,
                         });
                         ui.close_menu();
                     }
