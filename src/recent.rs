@@ -2,6 +2,8 @@ use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+const DEFAULT_MAX_ENTRIES: usize = 20;
+
 /// A single entry in the recent open history.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct RecentEntry {
@@ -22,10 +24,10 @@ impl RecentRepos {
     /// Loads recent repos from the config file, or returns an empty list.
     pub fn load() -> Self {
         let file_path = get_config_path();
-        let entries = load_entries(&file_path);
+        let entries = load_entries(&file_path, DEFAULT_MAX_ENTRIES);
         RecentRepos {
             entries,
-            max_entries: 20,
+            max_entries: DEFAULT_MAX_ENTRIES,
             file_path,
         }
     }
@@ -33,17 +35,17 @@ impl RecentRepos {
     /// Loads from a specific path (for testing).
     #[allow(dead_code)]
     pub fn load_from(path: PathBuf) -> Self {
-        let entries = load_entries(&path);
+        let entries = load_entries(&path, DEFAULT_MAX_ENTRIES);
         RecentRepos {
             entries,
-            max_entries: 20,
+            max_entries: DEFAULT_MAX_ENTRIES,
             file_path: path,
         }
     }
 
     /// Adds a path to the recent list. Moves to front if already exists.
-    /// Automatically saves to disk.
-    pub fn add(&mut self, path: &str) {
+    /// Automatically saves to disk and returns any persistence error.
+    pub fn add(&mut self, path: &str) -> std::io::Result<()> {
         // Remove existing entry with same path (deduplicate)
         self.entries.retain(|e| e.path != path);
 
@@ -64,15 +66,17 @@ impl RecentRepos {
         );
 
         self.entries.truncate(self.max_entries);
-        self.save();
+        self.save()
     }
 
-    /// Removes an entry at the given index. Automatically saves to disk.
-    pub fn remove(&mut self, index: usize) {
+    /// Removes an entry at the given index. Automatically saves to disk and
+    /// returns any persistence error.
+    pub fn remove(&mut self, index: usize) -> std::io::Result<()> {
         if index < self.entries.len() {
             self.entries.remove(index);
-            self.save();
+            self.save()?
         }
+        Ok(())
     }
 
     /// Returns a reference to all entries (most recent first).
@@ -91,44 +95,104 @@ impl RecentRepos {
         self.entries.is_empty()
     }
 
-    /// Persists entries to the JSON file on disk.
-    pub fn save(&self) {
+    /// Persists entries to the JSON file on disk, returning any I/O error.
+    pub fn save(&self) -> std::io::Result<()> {
+        let content = serde_json::to_string_pretty(&self.entries).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+        })?;
+
         if let Some(parent) = self.file_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
         }
-        if let Ok(content) = serde_json::to_string_pretty(&self.entries) {
-            let _ = std::fs::write(&self.file_path, content);
-        }
+
+        std::fs::write(&self.file_path, content)
     }
 }
 
-fn load_entries(path: &PathBuf) -> Vec<RecentEntry> {
-    std::fs::read_to_string(path)
+fn load_entries(path: &PathBuf, max_entries: usize) -> Vec<RecentEntry> {
+    let mut entries: Vec<RecentEntry> = std::fs::read_to_string(path)
         .ok()
         .and_then(|content| serde_json::from_str(&content).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    entries.truncate(max_entries);
+    entries
 }
 
 fn get_config_path() -> PathBuf {
-    // Use %APPDATA% on Windows
-    if let Ok(appdata) = std::env::var("APPDATA") {
-        let mut path = PathBuf::from(appdata);
-        path.push("GitManager");
-        path.push("recent_repos.json");
-        path
-    } else {
-        // Fallback to a file in the working directory
-        PathBuf::from("recent_repos.json")
+    #[cfg(windows)]
+    {
+        let config_dir = std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .or_else(|| {
+                std::env::var_os("USERPROFILE")
+                    .map(PathBuf::from)
+                    .map(|path| path.join("AppData").join("Roaming"))
+                    .filter(|path| path.is_absolute())
+            })
+            .unwrap_or_else(std::env::temp_dir);
+        config_dir.join("GitManager").join("recent_repos.json")
+    }
+
+    #[cfg(not(windows))]
+    {
+        let config_dir = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .map(|path| path.join(".config"))
+                    .filter(|path| path.is_absolute())
+            })
+            .unwrap_or_else(std::env::temp_dir);
+        config_dir.join("GitManager").join("recent_repos.json")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(windows))]
+    use std::ffi::{OsStr, OsString};
     use std::fs;
+    #[cfg(not(windows))]
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
+    #[cfg(not(windows))]
+    static CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(not(windows))]
+    struct EnvVarGuard {
+        name: &'static str,
+        previous: Option<OsString>,
+    }
+
+    #[cfg(not(windows))]
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: Option<&OsStr>) -> Self {
+            let previous = std::env::var_os(name);
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+            Self { name, previous }
+        }
+    }
+
+    #[cfg(not(windows))]
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
 
     fn temp_path() -> PathBuf {
         let mut path = std::env::temp_dir();
@@ -143,9 +207,9 @@ mod tests {
         let _ = fs::remove_file(&p);
         let mut repos = RecentRepos::load_from(p.clone());
 
-        repos.add("/path/to/repo1");
-        repos.add("/path/to/repo2");
-        repos.add("/path/to/repo1"); // duplicate, should move to front
+        repos.add("/path/to/repo1").unwrap();
+        repos.add("/path/to/repo2").unwrap();
+        repos.add("/path/to/repo1").unwrap(); // duplicate, should move to front
 
         assert_eq!(repos.len(), 2);
         assert_eq!(repos.entries()[0].path, "/path/to/repo1");
@@ -160,7 +224,7 @@ mod tests {
         let _ = fs::remove_file(&p);
         let mut repos = RecentRepos::load_from(p.clone());
 
-        repos.add("/home/user/projects/my-repo");
+        repos.add("/home/user/projects/my-repo").unwrap();
 
         assert_eq!(repos.entries()[0].name, "my-repo");
         let _ = fs::remove_file(&p);
@@ -172,11 +236,11 @@ mod tests {
         let _ = fs::remove_file(&p);
         let mut repos = RecentRepos::load_from(p.clone());
 
-        repos.add("/path/repo_a");
-        repos.add("/path/repo_b");
-        repos.add("/path/repo_c");
+        repos.add("/path/repo_a").unwrap();
+        repos.add("/path/repo_b").unwrap();
+        repos.add("/path/repo_c").unwrap();
 
-        repos.remove(1); // remove repo_b
+        repos.remove(1).unwrap(); // remove repo_b
 
         assert_eq!(repos.len(), 2);
         assert_eq!(repos.entries()[0].path, "/path/repo_c");
@@ -190,10 +254,10 @@ mod tests {
         let _ = fs::remove_file(&p);
         {
             let mut repos = RecentRepos::load_from(p.clone());
-            repos.add("/path/repo_x");
-            repos.add("/path/repo_y");
-            repos.add("/path/repo_z");
-            repos.remove(1); // remove repo_y
+            repos.add("/path/repo_x").unwrap();
+            repos.add("/path/repo_y").unwrap();
+            repos.add("/path/repo_z").unwrap();
+            repos.remove(1).unwrap(); // remove repo_y
         } // save() was called inside remove(), drop scope
 
         {
@@ -212,8 +276,8 @@ mod tests {
         let _ = fs::remove_file(&p);
         let mut repos = RecentRepos::load_from(p.clone());
 
-        repos.add("/path/repo");
-        repos.remove(5); // should be no-op
+        repos.add("/path/repo").unwrap();
+        repos.remove(5).unwrap(); // should be no-op
 
         assert_eq!(repos.len(), 1);
         let _ = fs::remove_file(&p);
@@ -231,12 +295,86 @@ mod tests {
     }
 
     #[test]
+    fn test_load_limits_entries_to_default_maximum() {
+        let p = temp_path();
+        let _ = fs::remove_file(&p);
+        let entries: Vec<RecentEntry> = (0..25)
+            .map(|index| RecentEntry {
+                path: format!("/repo/{}", index),
+                name: format!("repo-{}", index),
+                last_opened: format!("2025-01-01 00:00:{:02}", index),
+            })
+            .collect();
+        fs::write(&p, serde_json::to_string(&entries).unwrap()).unwrap();
+
+        let repos = RecentRepos::load_from(p.clone());
+
+        assert_eq!(repos.len(), 20);
+        assert_eq!(repos.entries()[0].path, "/repo/0");
+        assert_eq!(repos.entries()[19].path, "/repo/19");
+
+        let _ = fs::remove_file(&p);
+    }
+
+    #[test]
+    fn test_save_reports_persistence_errors() {
+        let parent = temp_path();
+        let _ = fs::remove_file(&parent);
+        fs::write(&parent, "not a directory").unwrap();
+        let p = parent.join("recent_repos.json");
+        let mut repos = RecentRepos::load_from(p);
+
+        let error = repos
+            .add("/path/to/repo")
+            .expect_err("a failed save must be reported to the caller");
+
+        assert!(!error.to_string().is_empty());
+        let _ = fs::remove_file(&parent);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_unix_config_path_uses_xdg_config_home() {
+        let _lock = CONFIG_ENV_LOCK.lock().unwrap();
+        let config_home = tempfile::tempdir().unwrap();
+        let _appdata = EnvVarGuard::set("APPDATA", None);
+        let _xdg_config_home =
+            EnvVarGuard::set("XDG_CONFIG_HOME", Some(config_home.path().as_os_str()));
+
+        assert_eq!(
+            get_config_path(),
+            config_home
+                .path()
+                .join("GitManager")
+                .join("recent_repos.json")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_unix_config_path_falls_back_to_home_config() {
+        let _lock = CONFIG_ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _appdata = EnvVarGuard::set("APPDATA", None);
+        let _xdg_config_home = EnvVarGuard::set("XDG_CONFIG_HOME", None);
+        let _home = EnvVarGuard::set("HOME", Some(home.path().as_os_str()));
+
+        assert_eq!(
+            get_config_path(),
+            home.path()
+                .join(".config")
+                .join("GitManager")
+                .join("recent_repos.json")
+        );
+    }
+
+    #[test]
     fn test_persist_and_load() {
         let p = temp_path();
         let _ = fs::remove_file(&p);
         {
             let mut repos = RecentRepos::load_from(p.clone());
-            repos.add("/path/to/persisted-repo");
+            repos.add("/path/to/persisted-repo").unwrap();
         } // repos dropped, but file stayed
 
         {
@@ -254,7 +392,7 @@ mod tests {
         let _ = fs::remove_file(&p);
         {
             let mut repos = RecentRepos::load_from(p.clone());
-            repos.add("/valid/json/repo");
+            repos.add("/valid/json/repo").unwrap();
         }
 
         let content = fs::read_to_string(&p).expect("File should exist");
@@ -273,10 +411,10 @@ mod tests {
         let mut repos = RecentRepos::load_from(p.clone());
         repos.max_entries = 3;
 
-        repos.add("/repo/1");
-        repos.add("/repo/2");
-        repos.add("/repo/3");
-        repos.add("/repo/4"); // should evict /repo/1
+        repos.add("/repo/1").unwrap();
+        repos.add("/repo/2").unwrap();
+        repos.add("/repo/3").unwrap();
+        repos.add("/repo/4").unwrap(); // should evict /repo/1
 
         assert_eq!(repos.len(), 3);
         assert_eq!(repos.entries()[0].path, "/repo/4");
@@ -291,7 +429,7 @@ mod tests {
         let _ = fs::remove_file(&p);
         let mut repos = RecentRepos::load_from(p.clone());
 
-        repos.add(""); // edge case: empty path
+        repos.add("").unwrap(); // edge case: empty path
 
         assert_eq!(repos.len(), 1);
         assert_eq!(repos.entries()[0].name, "");
@@ -312,7 +450,7 @@ mod tests {
         {
             let mut repos = RecentRepos::load_from(p.clone());
             for path in &paths {
-                repos.add(path);
+                repos.add(path).unwrap();
             }
         }
 
