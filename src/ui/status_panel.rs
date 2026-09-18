@@ -2,6 +2,10 @@ use crate::app::App;
 use crate::git_ops::GitOperation;
 use eframe::egui;
 
+fn should_show_stage_action(status: char) -> bool {
+    status != 'D' && status != '!'
+}
+
 pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     // Heading row: heading text on the left, buttons anchored to right edge
     ui.horizontal(|ui| {
@@ -62,7 +66,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                         ui.label(egui::RichText::new(format!("[{}]", entry.status)).color(color).monospace());
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if entry.status != 'D' && entry.status != '?' && entry.status != '!' {
+                            if should_show_stage_action(entry.status) {
                                 if ui.add_enabled(!busy, egui::Button::new("Stage")).clicked() {
                                     app.start_operation(ctx, &format!("Stage {}", path), GitOperation::StageFile(path.clone()));
                                 }
@@ -277,5 +281,13 @@ mod tests {
             });
         }
         run_status_panel(&mut app);
+    }
+
+    #[test]
+    fn test_untracked_entries_can_be_staged_individually() {
+        assert!(should_show_stage_action('?'));
+        assert!(should_show_stage_action('M'));
+        assert!(!should_show_stage_action('D'));
+        assert!(!should_show_stage_action('!'));
     }
 }

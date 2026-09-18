@@ -206,7 +206,12 @@ fn show_branch_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, branch
                 ui.menu_button("…", |ui| {
                     if !is_head {
                         if ui.add_enabled(!busy, egui::Button::new("Checkout")).clicked() {
-                            app.start_operation(ctx, &format!("Checkout '{}'", name), GitOperation::CheckoutBranch(name.clone()));
+                            let checkout_ref = if is_remote {
+                                format!("refs/remotes/{}", name)
+                            } else {
+                                name.clone()
+                            };
+                            app.start_operation(ctx, &format!("Checkout '{}'", name), GitOperation::CheckoutBranch(checkout_ref));
                             ui.close_menu();
                         }
                     }
