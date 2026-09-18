@@ -1300,7 +1300,9 @@ impl GitRepo {
     pub fn restore_file(&self, path: &str) -> GitResult<()> {
         let repo = self.repo()?;
         let mut cb = git2::build::CheckoutBuilder::new();
-        cb.force().path(Path::new(path));
+        cb.force()
+            .disable_pathspec_match(true)
+            .path(Path::new(path));
         repo.checkout_index(None, Some(&mut cb))
             .map_err(|e| format!("Restore: {}", e))?;
         Ok(())
@@ -1322,7 +1324,7 @@ impl GitRepo {
         let mut lines = Vec::new();
         let tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
         let mut dopts = DiffOptions::new();
-        dopts.pathspec(path);
+        dopts.disable_pathspec_match(true).pathspec(path);
         if !staged {
             dopts
                 .include_untracked(true)
@@ -3002,6 +3004,154 @@ mod tests {
             statuses.iter().all(|entry| entry.path != "tracked.txt" || entry.staged),
             "restoring unstaged changes must leave no unstaged portion; statuses: {:?}",
             statuses
+        );
+    }
+
+    #[test]
+    fn test_restore_file_treats_path_as_literal() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(dir.path());
+        let literal_path = Path::new("file[ab].txt");
+        let other_path = Path::new("filea.txt");
+
+        std::fs::write(dir.path().join(literal_path), "literal HEAD\n").expect("write literal file");
+        std::fs::write(dir.path().join(other_path), "other HEAD\n").expect("write other file");
+        let signature = repo.signature().expect("signature");
+        let tree_oid = {
+            let mut index = repo.index().expect("index");
+            index.add_path(literal_path).expect("stage literal file");
+            index.add_path(other_path).expect("stage other file");
+            index.write_tree().expect("write tree")
+        };
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+        let parent = repo.head().expect("HEAD").peel_to_commit().expect("parent commit");
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "add literal files",
+            &tree,
+            &[&parent],
+        )
+        .expect("commit literal files");
+        drop(tree);
+        drop(parent);
+        drop(repo);
+
+        let git = open_git_repo(dir.path());
+        git.stage_file(literal_path.to_str().expect("UTF-8 path"))
+            .expect("stage literal HEAD");
+        git.stage_file(other_path.to_str().expect("UTF-8 path"))
+            .expect("stage other HEAD");
+        std::fs::write(dir.path().join(literal_path), "literal dirty\n").expect("modify literal file");
+        std::fs::write(dir.path().join(other_path), "other dirty\n").expect("modify other file");
+
+        git.restore_file(literal_path.to_str().expect("UTF-8 path"))
+            .expect("restore literal file");
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(literal_path)).expect("read literal file"),
+            "literal HEAD\n",
+            "restore must target the requested literal path"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(other_path)).expect("read other file"),
+            "other dirty\n",
+            "restore must not affect a path matched by the literal text as a glob"
+        );
+    }
+
+    #[test]
+    fn test_diff_treats_path_as_literal() {
+        for staged in [false, true] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let repo = create_repo_with_commit(dir.path());
+            let literal_path = Path::new("file[ab].txt");
+            let other_path = Path::new("filea.txt");
+
+            std::fs::write(dir.path().join(literal_path), "literal HEAD\n").expect("write literal file");
+            std::fs::write(dir.path().join(other_path), "other HEAD\n").expect("write other file");
+            let signature = repo.signature().expect("signature");
+            let tree_oid = {
+                let mut index = repo.index().expect("index");
+                index.add_path(literal_path).expect("stage literal file");
+                index.add_path(other_path).expect("stage other file");
+                index.write_tree().expect("write tree")
+            };
+            let tree = repo.find_tree(tree_oid).expect("find tree");
+            let parent = repo.head().expect("HEAD").peel_to_commit().expect("parent commit");
+            repo.commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "add literal files",
+                &tree,
+                &[&parent],
+            )
+            .expect("commit literal files");
+            drop(tree);
+            drop(parent);
+            drop(repo);
+
+            let git = open_git_repo(dir.path());
+            git.stage_file(literal_path.to_str().expect("UTF-8 path"))
+                .expect("stage literal HEAD");
+            git.stage_file(other_path.to_str().expect("UTF-8 path"))
+                .expect("stage other HEAD");
+            std::fs::write(dir.path().join(literal_path), "literal changed\n")
+                .expect("modify literal file");
+            std::fs::write(dir.path().join(other_path), "other changed\n")
+                .expect("modify other file");
+
+            if staged {
+                git.stage_file(literal_path.to_str().expect("UTF-8 path"))
+                    .expect("stage literal file");
+                git.stage_file(other_path.to_str().expect("UTF-8 path"))
+                    .expect("stage other file");
+            }
+
+            let diff = git
+                .get_diff(literal_path.to_str().expect("UTF-8 path"), staged)
+                .expect("get literal diff");
+
+            assert!(
+                diff.iter()
+                    .any(|line| line.origin == '+' && line.content == "literal changed\n"),
+                "literal diff should include the selected file (staged: {staged}): {:?}",
+                diff.iter().map(|line| (&line.origin, &line.content)).collect::<Vec<_>>()
+            );
+            assert!(
+                diff.iter().all(|line| line.content != "other changed\n"),
+                "literal diff should not include the glob-matched file (staged: {staged}): {:?}",
+                diff.iter().map(|line| (&line.origin, &line.content)).collect::<Vec<_>>()
+            );
+        }
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(dir.path());
+        let literal_path = Path::new("untracked[ab].txt");
+        let other_path = Path::new("untrackeda.txt");
+        std::fs::write(dir.path().join(literal_path), "literal untracked\n")
+            .expect("write literal untracked file");
+        std::fs::write(dir.path().join(other_path), "other untracked\n")
+            .expect("write other untracked file");
+        drop(repo);
+
+        let git = open_git_repo(dir.path());
+        let diff = git
+            .get_diff(literal_path.to_str().expect("UTF-8 path"), false)
+            .expect("get untracked literal diff");
+
+        assert!(
+            diff.iter()
+                .any(|line| line.origin == '+' && line.content == "literal untracked\n"),
+            "untracked literal diff should include the selected file: {:?}",
+            diff.iter().map(|line| (&line.origin, &line.content)).collect::<Vec<_>>()
+        );
+        assert!(
+            diff.iter().all(|line| line.content != "other untracked\n"),
+            "untracked literal diff should not include the glob-matched file: {:?}",
+            diff.iter().map(|line| (&line.origin, &line.content)).collect::<Vec<_>>()
         );
     }
 
