@@ -299,21 +299,22 @@ impl App {
         };
 
         // Launch the script (detached from parent process)
-        #[cfg(target_os = "windows")]
-        {
-            let _ = std::process::Command::new("cmd")
-                .args(["/C", script_path.to_str().unwrap_or("")])
-                .spawn();
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = std::process::Command::new("sh")
-                .arg(script_path.to_str().unwrap_or(""))
-                .spawn();
+        if !self.try_launch_update_script(&script_path) {
+            return;
         }
 
         // Exit the current process immediately
         std::process::exit(0);
+    }
+
+    fn try_launch_update_script(&mut self, script_path: &Path) -> bool {
+        match updater::launch_self_update_script(script_path) {
+            Ok(()) => true,
+            Err(e) => {
+                self.show_error(e);
+                false
+            }
+        }
     }
 
     pub fn open_repo(&mut self, path: &str) {
@@ -1439,6 +1440,9 @@ mod tests {
         app.recent_repos = RecentRepos::load_from(recent_file.path().to_path_buf());
         app.open_repo(old_repo.path().to_str().expect("old repo path"));
 
+        let old_generation = app.repo_generation;
+        app.open_repo(new_repo.path().to_str().expect("new repo path"));
+
         let (tx, rx) = mpsc::channel();
         tx.send(OpResult::RefreshData {
             status_entries: Vec::new(),
@@ -1453,7 +1457,7 @@ mod tests {
         app.pending_ops.push(PendingOp {
             description: "Refreshing".to_string(),
             receiver: rx,
-            repo_generation: app.repo_generation,
+            repo_generation: old_generation,
             started_at: Instant::now(),
             progress: Arc::new(Mutex::new(String::new())),
             last_progress_update: Instant::now(),
@@ -1461,7 +1465,6 @@ mod tests {
             timed_out: false,
         });
 
-        app.open_repo(new_repo.path().to_str().expect("new repo path"));
         app.process_pending_ops(&egui::Context::default());
 
         assert_eq!(app.repo_path, new_repo.path().to_string_lossy());
@@ -1584,16 +1587,30 @@ mod tests {
         app.pending_ops.push(PendingOp {
             description: "Fetching".to_string(),
             receiver,
+            repo_generation: app.repo_generation,
             started_at: Instant::now(),
             progress: Arc::new(Mutex::new(String::new())),
             last_progress_update: Instant::now(),
             last_seen_progress: String::new(),
+            timed_out: false,
         });
 
         app.open_repo(&second_path);
 
         assert_eq!(app.repo_path, first_path);
         assert_eq!(app.git.path().unwrap(), first_repo.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_update_script_launch_failure_is_reported() {
+        let mut app = App::new();
+
+        assert!(!app.try_launch_update_script(Path::new(
+            "/path/that/does/not/exist/update_git_manager.sh",
+        )));
+        assert!(app.status_is_error);
+        assert!(app.status_message.contains("Failed to launch update script"));
     }
 
     // --- Legacy tests (unchanged) ---
