@@ -22,6 +22,7 @@ pub enum GitOperation {
     CheckoutBranch(String),
     MergeBranch(String),
     RemoveWorktree { path: PathBuf, force: bool },
+    PruneWorktrees,
     CreateWorktree { name: String, path: PathBuf, branch: Option<String>, new_branch: bool },
     StashAll(Option<String>),
     StashPop,
@@ -31,8 +32,8 @@ pub enum GitOperation {
     Pull { remote: String, branch: String, rebase: bool },
     Fetch(String),
     GetDiff { path: String, staged: bool },
-    /// Search commits in the log.
-    LogSearch(String),
+    /// Search commits in the log, identified by the request that started it.
+    LogSearch { filter: String, request_id: u64 },
     /// Refresh all cached data from the repository.
     RefreshAll,
 }
@@ -49,8 +50,12 @@ pub enum OpResult {
         path: String,
         lines: Vec<DiffLine>,
     },
-    /// Search results for commit log.
-    SearchResults(Vec<CommitInfo>),
+    /// Search results for commit log, tagged with the query and request that produced them.
+    SearchResults {
+        request_id: u64,
+        filter: String,
+        commits: Vec<CommitInfo>,
+    },
     /// Refreshed data from the repository, with optional errors.
     RefreshData {
         status_entries: Vec<StatusEntry>,
@@ -128,6 +133,10 @@ impl GitOperation {
                     else { format!("Removed worktree at {:?}", path) }
                 })
             }
+            GitOperation::PruneWorktrees => match repo.prune_worktrees() {
+                Ok(count) => OpResult::Success(format!("Pruned {} stale worktree(s)", count)),
+                Err(e) => OpResult::Error(e),
+            },
             GitOperation::CreateWorktree { name, path, branch, new_branch } => {
                 match repo.create_worktree(&name, &path, branch.as_deref(), new_branch) {
                     Ok(()) => OpResult::Success(format!("Created worktree '{}' at {:?}", name, path)),
@@ -161,19 +170,14 @@ impl GitOperation {
                 Ok(lines) => OpResult::DiffContent { path, lines },
                 Err(e) => OpResult::Error(format!("Diff error: {}", e)),
             },
-            GitOperation::LogSearch(filter) => {
+            GitOperation::LogSearch { filter, request_id } => {
                 let commits = repo.log(100).unwrap_or_default();
-                let filtered: Vec<CommitInfo> = if filter.is_empty() {
-                    commits
-                } else {
-                    let f = filter.to_lowercase();
-                    commits.into_iter().filter(|c| {
-                        c.message.to_lowercase().contains(&f)
-                            || c.author.to_lowercase().contains(&f)
-                            || c.short_sha.contains(&f)
-                    }).collect()
-                };
-                OpResult::SearchResults(filtered)
+                let filtered = filter_commits(commits, &filter);
+                OpResult::SearchResults {
+                    request_id,
+                    filter,
+                    commits: filtered,
+                }
             }
             GitOperation::RefreshAll => {
                 let mut errors: Vec<String> = Vec::new();
@@ -238,6 +242,23 @@ pub struct CommitInfo {
     pub time: String,
     pub message: String,
     pub summary: String,
+}
+
+/// Filter commits using the same fields exposed by the log search UI.
+pub fn filter_commits(commits: Vec<CommitInfo>, filter: &str) -> Vec<CommitInfo> {
+    if filter.is_empty() {
+        return commits;
+    }
+
+    let filter = filter.to_lowercase();
+    commits
+        .into_iter()
+        .filter(|commit| {
+            commit.message.to_lowercase().contains(&filter)
+                || commit.author.to_lowercase().contains(&filter)
+                || commit.short_sha.contains(&filter)
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -632,6 +653,32 @@ impl GitRepo {
         Ok(())
     }
 
+    /// Remove only stale worktree metadata, matching `git worktree prune`.
+    ///
+    /// The default libgit2 prune options preserve valid and locked worktrees
+    /// and never delete working-tree files.
+    pub fn prune_worktrees(&self) -> GitResult<usize> {
+        let repo = self.repo()?;
+        let names = repo.worktrees().map_err(|e| format!("Worktrees: {}", e))?;
+        let mut pruned = 0;
+
+        for name in names.iter().flatten() {
+            let wt = repo
+                .find_worktree(name)
+                .map_err(|e| format!("Find worktree '{}': {}", name, e))?;
+            if wt
+                .is_prunable(None)
+                .map_err(|e| format!("Check worktree '{}': {}", name, e))?
+            {
+                wt.prune(None)
+                    .map_err(|e| format!("Prune worktree '{}': {}", name, e))?;
+                pruned += 1;
+            }
+        }
+
+        Ok(pruned)
+    }
+
     pub fn remove_worktree(&self, path: &Path, force: bool) -> GitResult<()> {
         let repo = self.repo()?;
         let wname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -834,6 +881,12 @@ impl GitRepo {
         let tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
         let mut dopts = DiffOptions::new();
         dopts.pathspec(path);
+        if !staged {
+            dopts
+                .include_untracked(true)
+                .recurse_untracked_dirs(true)
+                .show_untracked_content(true);
+        }
         let idx = repo.index().map_err(|e| format!("Index: {}", e))?;
 
         let diff = if staged {
@@ -1041,15 +1094,24 @@ impl GitRepo {
                 .map_err(|e| format!("Annotated: {}", e))?;
             let mut ropts = git2::RebaseOptions::new();
             ropts.checkout_options(git2::build::CheckoutBuilder::new());
-            let mut reb = repo.rebase(Some(&ac), None, None, Some(&mut ropts))
+            let mut reb = repo.rebase(None, Some(&ac), None, Some(&mut ropts))
                 .map_err(|e| format!("Rebase: {}", e))?;
-            while let Some(op) = reb.next() {
-                let _ = op.map_err(|e| format!("Op: {}", e))?;
-                let sg = repo.signature().map_err(|e| format!("Sig: {}", e))?;
-                reb.commit(None, &sg, None).map_err(|e| format!("Rebase commit: {}", e))?;
+            let result = (|| -> GitResult<()> {
+                while let Some(op) = reb.next() {
+                    let _ = op.map_err(|e| format!("Op: {}", e))?;
+                    let sg = repo.signature().map_err(|e| format!("Sig: {}", e))?;
+                    reb.commit(None, &sg, None).map_err(|e| format!("Rebase commit: {}", e))?;
+                }
+                reb.finish(None).map_err(|e| format!("Finish: {}", e))?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => Ok("Rebase complete".into()),
+                Err(e) => {
+                    let _ = reb.abort();
+                    Err(e)
+                }
             }
-            reb.finish(None).map_err(|e| format!("Finish: {}", e))?;
-            Ok("Rebase complete".into())
         } else {
             let hc = repo.head().map_err(|e| format!("HEAD: {}", e))?
                 .peel_to_commit().map_err(|e| format!("Peel: {}", e))?;
@@ -1074,14 +1136,14 @@ impl GitRepo {
             let sg = repo.signature().map_err(|e| format!("Sig: {}", e))?;
             let toid = idx.write_tree_to(&*repo).map_err(|e| format!("Write tree: {}", e))?;
             let t = repo.find_tree(toid).map_err(|e| format!("Find tree: {}", e))?;
+
+            let mut co = git2::build::CheckoutBuilder::new();
+            repo.checkout_tree(t.as_object(), Some(&mut co))
+                .map_err(|e| format!("Checkout before merge: {}", e))?;
+
             repo.commit(Some("HEAD"), &sg, &sg,
                 &format!("Merge '{}'", remote), &t, &[&hc, &fc])
                 .map_err(|e| format!("Merge commit: {}", e))?;
-
-            let mut co = git2::build::CheckoutBuilder::new();
-            co.force();
-            repo.checkout_tree(t.as_object(), Some(&mut co))
-                .map_err(|e| format!("Checkout after merge: {}", e))?;
 
             Ok("Merge complete".into())
         }
@@ -1129,6 +1191,150 @@ mod tests {
         git
     }
 
+    fn commit_file(repo: &Repository, path: &str, contents: &str, message: &str) -> git2::Oid {
+        std::fs::write(repo.workdir().expect("workdir").join(path), contents)
+            .expect("write file");
+        let tree_oid = {
+            let mut index = repo.index().expect("index");
+            index.add_path(Path::new(path)).expect("stage file");
+            let tree_oid = index.write_tree().expect("write tree");
+            index.write().expect("write index");
+            tree_oid
+        };
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+        let signature = repo.signature().expect("signature");
+        let parent = repo
+            .head()
+            .ok()
+            .and_then(|head| head.target())
+            .map(|oid| repo.find_commit(oid).expect("parent commit"));
+        let parents = parent.as_ref().map(|commit| vec![commit]).unwrap_or_default();
+        let oid = repo
+            .commit(Some("HEAD"), &signature, &signature, message, &tree, &parents)
+            .expect("commit file");
+        drop(tree);
+        drop(parent);
+        oid
+    }
+
+    fn setup_rebase_repositories(
+        initial_file: Option<(&str, &str)>,
+        local_file: (&str, &str),
+        remote_file: (&str, &str),
+    ) -> (tempfile::TempDir, tempfile::TempDir, String, git2::Oid, git2::Oid) {
+        let local_dir = tempfile::tempdir().expect("local temp dir");
+        let local_repo = create_repo_with_commit(local_dir.path());
+        if let Some((path, contents)) = initial_file {
+            commit_file(&local_repo, path, contents, "base");
+        }
+        let branch = local_repo
+            .head()
+            .expect("HEAD")
+            .shorthand()
+            .expect("branch name")
+            .to_string();
+
+        let remote_dir = tempfile::tempdir().expect("remote temp dir");
+        let remote_repo = Repository::init_bare(remote_dir.path()).expect("init bare repo");
+        remote_repo
+            .reference_symbolic(
+                "HEAD",
+                &format!("refs/heads/{}", branch),
+                true,
+                "set remote HEAD",
+            )
+            .expect("set remote HEAD");
+        let remote_url = format!("file://{}", remote_dir.path().to_string_lossy());
+        let mut origin = local_repo.remote("origin", &remote_url).expect("add origin");
+        let refspec = format!(
+            "refs/heads/{0}:refs/heads/{0}",
+            branch
+        );
+        origin.push(&[refspec.as_str()], None).expect("push base");
+        drop(origin);
+        drop(remote_repo);
+
+        let local_commit = commit_file(&local_repo, local_file.0, local_file.1, "local");
+        drop(local_repo);
+
+        let remote_work_dir = tempfile::tempdir().expect("remote work temp dir");
+        let remote_work_path = remote_work_dir.path().join("clone");
+        let remote_work_repo =
+            Repository::clone(&remote_url, &remote_work_path).expect("clone remote repo");
+        let remote_commit = commit_file(&remote_work_repo, remote_file.0, remote_file.1, "remote");
+        let mut remote_origin = remote_work_repo.find_remote("origin").expect("find origin");
+        remote_origin
+            .push(&[refspec.as_str()], None)
+            .expect("push remote commit");
+
+        (local_dir, remote_dir, branch, local_commit, remote_commit)
+    }
+
+    #[test]
+    fn test_pull_rebase_places_local_commit_on_top_of_remote_commit() {
+        let (local_dir, _remote_dir, branch, local_commit, remote_commit) = setup_rebase_repositories(
+            None,
+            ("local.txt", "local\n"),
+            ("remote.txt", "remote\n"),
+        );
+        let git = open_git_repo(local_dir.path());
+        let status = git.get_status().expect("status");
+        assert!(status.is_empty(), "local setup must be clean: {:?}", status);
+        let progress = Arc::new(Mutex::new(String::new()));
+
+        git.pull("origin", &branch, true, progress)
+            .expect("rebase pull");
+
+        let repo = Repository::open(local_dir.path()).expect("reopen local repo");
+        let head = repo.head().expect("HEAD").peel_to_commit().expect("HEAD commit");
+        assert_ne!(head.id(), local_commit, "rebase should create a new local commit");
+        assert_eq!(head.parent_id(0).expect("rebased parent"), remote_commit);
+        assert_eq!(
+            std::fs::read_to_string(local_dir.path().join("local.txt")).expect("read local file"),
+            "local\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(local_dir.path().join("remote.txt")).expect("read remote file"),
+            "remote\n"
+        );
+    }
+
+    #[test]
+    fn test_pull_rebase_aborts_after_conflict() {
+        let (local_dir, _remote_dir, branch, local_commit, _remote_commit) = setup_rebase_repositories(
+            Some(("conflict.txt", "base\n")),
+            ("conflict.txt", "local\n"),
+            ("conflict.txt", "remote\n"),
+        );
+        let git = open_git_repo(local_dir.path());
+        let progress = Arc::new(Mutex::new(String::new()));
+
+        let result = git.pull("origin", &branch, true, progress);
+        assert!(result.is_err(), "conflicting rebase pull should fail");
+        drop(git);
+
+        let repo = Repository::open(local_dir.path()).expect("reopen local repo");
+        assert!(
+            repo.open_rebase(None).is_err(),
+            "failed rebase pull must not leave an in-progress rebase"
+        );
+        assert_eq!(
+            repo.head().expect("HEAD").target(),
+            Some(local_commit),
+            "abort should restore the original HEAD"
+        );
+        assert_eq!(
+            std::fs::read_to_string(local_dir.path().join("conflict.txt"))
+                .expect("read conflict file"),
+            "local\n",
+            "abort should restore the pre-rebase working tree"
+        );
+        assert!(
+            !repo.index().expect("index").has_conflicts(),
+            "abort should clear rebase conflicts"
+        );
+    }
+
     #[test]
     fn test_checkout_remote_branch_uses_remote_tracking_ref() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -1151,6 +1357,89 @@ mod tests {
         let head = checked_out.head().expect("HEAD");
         assert!(checked_out.head_detached().expect("HEAD state"));
         assert_eq!(head.target(), Some(remote_oid));
+    }
+
+    #[test]
+    fn test_pull_does_not_overwrite_dirty_worktree() {
+        let remote_dir = tempfile::tempdir().expect("remote temp dir");
+        let remote_repo = create_repo_with_commit(remote_dir.path());
+        let branch = remote_repo
+            .head()
+            .expect("remote HEAD")
+            .shorthand()
+            .expect("remote branch")
+            .to_string();
+        let tracked_path = remote_dir.path().join("tracked.txt");
+
+        std::fs::write(&tracked_path, "base\n").expect("write base file");
+        let parent = remote_repo
+            .head()
+            .expect("remote HEAD")
+            .peel_to_commit()
+            .expect("remote parent");
+        let signature = remote_repo.signature().expect("signature");
+        let tree_oid = {
+            let mut index = remote_repo.index().expect("index");
+            index.add_path(Path::new("tracked.txt")).expect("stage base file");
+            index.write_tree().expect("write base tree")
+        };
+        let tree = remote_repo.find_tree(tree_oid).expect("find base tree");
+        remote_repo
+            .commit(Some("HEAD"), &signature, &signature, "add tracked file", &tree, &[&parent])
+            .expect("commit base file");
+        drop(tree);
+        drop(parent);
+        let initial_id = remote_repo.head().expect("remote HEAD").target().expect("initial id");
+        drop(remote_repo);
+
+        let local_dir = tempfile::tempdir().expect("local temp dir");
+        let local_repo = Repository::clone(
+            remote_dir.path().to_str().expect("remote path"),
+            local_dir.path(),
+        )
+        .expect("clone remote");
+        drop(local_repo);
+
+        let remote_repo = Repository::open(remote_dir.path()).expect("reopen remote");
+        std::fs::write(&tracked_path, "remote\n").expect("write remote change");
+        let parent = remote_repo
+            .head()
+            .expect("remote HEAD")
+            .peel_to_commit()
+            .expect("remote parent");
+        let signature = remote_repo.signature().expect("signature");
+        let tree_oid = {
+            let mut index = remote_repo.index().expect("index");
+            index.add_path(Path::new("tracked.txt")).expect("stage remote change");
+            index.write_tree().expect("write remote tree")
+        };
+        let tree = remote_repo.find_tree(tree_oid).expect("find remote tree");
+        remote_repo
+            .commit(Some("HEAD"), &signature, &signature, "remote change", &tree, &[&parent])
+            .expect("commit remote change");
+        drop(tree);
+        drop(parent);
+        drop(remote_repo);
+
+        let local_tracked_path = local_dir.path().join("tracked.txt");
+        std::fs::write(&local_tracked_path, "local\n").expect("write local change");
+
+        let git = open_git_repo(local_dir.path());
+        let result = git.pull("origin", &branch, false, Arc::new(Mutex::new(String::new())));
+
+        assert!(result.is_err(), "pull should reject an overwrite of local changes: {:?}", result);
+        assert_eq!(
+            std::fs::read_to_string(&local_tracked_path).expect("read local file"),
+            "local\n",
+            "pull must preserve the dirty working-tree content"
+        );
+
+        let local_repo = Repository::open(local_dir.path()).expect("reopen local");
+        assert_eq!(
+            local_repo.head().expect("local HEAD").target(),
+            Some(initial_id),
+            "a rejected pull must not advance HEAD"
+        );
     }
 
     #[test]
@@ -1192,6 +1481,24 @@ mod tests {
                 ('+', "unstaged line 3\n"),
             ],
             "unstaged diff must compare the index with the worktree"
+        );
+    }
+
+    #[test]
+    fn test_untracked_diff_includes_file_content() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(dir.path());
+        let untracked_path = dir.path().join("new.txt");
+        std::fs::write(&untracked_path, "first line\nsecond line\n").expect("write untracked file");
+        drop(repo);
+
+        let git = open_git_repo(dir.path());
+        let diff = git.get_diff("new.txt", false).expect("get untracked diff");
+
+        assert_eq!(
+            diff.iter().map(|line| (line.origin, line.content.as_str())).collect::<Vec<_>>(),
+            vec![('+', "first line\n"), ('+', "second line\n")],
+            "untracked diff must expose the file content as added lines"
         );
     }
 
@@ -1300,6 +1607,31 @@ mod tests {
             index.get_path(Path::new("staged.txt"), 0).is_some(),
             "background operation should update the linked worktree index"
         );
+    }
+
+    #[test]
+    fn test_log_search_result_preserves_request_id() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(dir.path());
+        drop(repo);
+
+        let result = execute_operation(
+            dir.path(),
+            GitOperation::LogSearch {
+                filter: "initial".to_string(),
+                request_id: 42,
+            },
+            Arc::new(Mutex::new(String::new())),
+        );
+
+        match result {
+            OpResult::SearchResults { request_id, filter, commits } => {
+                assert_eq!(request_id, 42);
+                assert_eq!(filter, "initial");
+                assert_eq!(commits.len(), 1);
+            }
+            other => panic!("expected search results, got {:?}", other),
+        }
     }
 
     #[test]
@@ -1506,6 +1838,59 @@ mod tests {
         let after_wts = git.worktrees().unwrap();
         assert_eq!(after_wts.len(), 1, "Only main worktree should remain");
         assert!(after_wts[0].is_main, "Remaining worktree should be main");
+    }
+
+    #[test]
+    fn test_prune_preserves_valid_clean_and_dirty_worktrees() {
+        let main_dir = tempfile::tempdir().expect("temp dir");
+        let wt_root = tempfile::tempdir().expect("temp dir");
+        let clean_path = wt_root.path().join("clean-wt");
+        let dirty_path = wt_root.path().join("dirty-wt");
+        let stale_path = wt_root.path().join("stale-wt");
+
+        let repo = create_repo_with_commit(main_dir.path());
+        let commit = repo.head().expect("head").peel_to_commit().expect("commit");
+
+        for (name, path) in [
+            ("clean-wt", &clean_path),
+            ("dirty-wt", &dirty_path),
+            ("stale-wt", &stale_path),
+        ] {
+            let branch = repo.branch(name, &commit, false).expect("branch");
+            let reference = repo
+                .find_reference(&format!("refs/heads/{}", name))
+                .expect("reference");
+            let mut opts = git2::WorktreeAddOptions::new();
+            opts.reference(Some(&reference));
+            repo.worktree(name, path, Some(&opts)).expect("create worktree");
+            drop(reference);
+            drop(branch);
+        }
+
+        let dirty_file = dirty_path.join("important.txt");
+        std::fs::write(&dirty_file, "keep this change").expect("write dirty file");
+        let stale_gitdir = repo.path().join("worktrees").join("stale-wt");
+        std::fs::remove_dir_all(&stale_path).expect("remove stale worktree directory");
+        drop(commit);
+        drop(repo);
+
+        let git = open_git_repo(main_dir.path());
+        let pruned = git.prune_worktrees().expect("prune stale worktrees");
+
+        assert_eq!(pruned, 1, "only the stale worktree should be pruned");
+        assert!(clean_path.exists(), "valid clean worktree must be preserved");
+        assert!(dirty_path.exists(), "valid dirty worktree must be preserved");
+        assert_eq!(
+            std::fs::read_to_string(&dirty_file).expect("read preserved dirty file"),
+            "keep this change"
+        );
+        assert!(!stale_path.exists(), "stale worktree directory should remain absent");
+        assert!(!stale_gitdir.exists(), "stale worktree metadata should be pruned");
+
+        let remaining = git.worktrees().expect("list worktrees");
+        assert_eq!(remaining.len(), 3, "main and both valid worktrees should remain");
+        assert!(remaining.iter().any(|wt| wt.path == clean_path));
+        assert!(remaining.iter().any(|wt| wt.path == dirty_path));
     }
 
     #[test]

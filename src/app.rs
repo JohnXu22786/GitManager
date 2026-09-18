@@ -7,10 +7,13 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+const ABOUT_BUTTON_LABEL: &str = "ℹ";
+
 /// Tracks a Git operation running in a background thread.
 struct PendingOp {
     description: String,
     receiver: mpsc::Receiver<OpResult>,
+    repo_generation: u64,
     started_at: Instant,
     /// Real-time progress text updated by the background thread (e.g. "Receiving objects: 45%").
     progress: Arc<Mutex<String>>,
@@ -18,6 +21,8 @@ struct PendingOp {
     last_progress_update: Instant,
     /// The last progress value we read (to detect changes).
     last_seen_progress: String,
+    /// Whether the watchdog timed out while the worker was still running.
+    timed_out: bool,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -77,6 +82,10 @@ pub struct App {
     pub diff_path: String,
     pub show_diff: bool,
     pub log_search: String,
+    /// Monotonic identity of the newest log search request.
+    log_search_request_id: u64,
+    /// Monotonic identity of the currently open repository.
+    repo_generation: u64,
 
     pub last_refresh: std::time::Instant,
 
@@ -84,7 +93,7 @@ pub struct App {
     pub update_state: Arc<Mutex<UpdateState>>,
     pub show_update_dialog: bool,
     pub auto_check_done: bool,
-    /// Set to true when the user clicks "Remind Later" to prevent the dialog from reopening.
+    /// Set to true when the user dismisses the update dialog to prevent it from reopening.
     pub update_dialog_dismissed: bool,
     /// Download progress from 0.0 to 1.0 for the current download.
     pub download_progress: f32,
@@ -143,6 +152,8 @@ impl App {
             diff_path: String::new(),
             show_diff: false,
             log_search: String::new(),
+            log_search_request_id: 0,
+            repo_generation: 0,
 
             last_refresh: std::time::Instant::now(),
 
@@ -174,6 +185,28 @@ impl App {
         });
     }
 
+    fn dismiss_update_dialog(&mut self) {
+        self.show_update_dialog = false;
+        self.update_dialog_dismissed = true;
+    }
+
+    fn update_download_progress_if_active(
+        state: &Mutex<UpdateState>,
+        progress: f32,
+        file_name: &str,
+    ) -> bool {
+        let mut current_state = state.lock().unwrap();
+        if !matches!(*current_state, UpdateState::Downloading { .. }) {
+            return false;
+        }
+
+        *current_state = UpdateState::Downloading {
+            progress,
+            file_name: file_name.to_string(),
+        };
+        true
+    }
+
     /// Start downloading the update asset in a background thread.
     /// Updates `update_state` with progress as the download proceeds.
     pub fn trigger_download(&mut self, url: String, file_name: String) {
@@ -197,15 +230,13 @@ impl App {
             let _prog_update_handle = std::thread::spawn(move || {
                 loop {
                     let p = *prog_clone.lock().unwrap();
-                    let current_state = state_for_progress.lock().unwrap().clone();
-                    let is_downloading = matches!(current_state, UpdateState::Downloading { .. });
-                    if !is_downloading {
+                    if !App::update_download_progress_if_active(
+                        &state_for_progress,
+                        p,
+                        &file_name,
+                    ) {
                         break;
                     }
-                    *state_for_progress.lock().unwrap() = UpdateState::Downloading {
-                        progress: p,
-                        file_name: file_name.clone(),
-                    };
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
             });
@@ -268,28 +299,37 @@ impl App {
         };
 
         // Launch the script (detached from parent process)
-        #[cfg(target_os = "windows")]
-        {
-            let _ = std::process::Command::new("cmd")
-                .args(["/C", script_path.to_str().unwrap_or("")])
-                .spawn();
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = std::process::Command::new("sh")
-                .arg(script_path.to_str().unwrap_or(""))
-                .spawn();
+        if !self.try_launch_update_script(&script_path) {
+            return;
         }
 
         // Exit the current process immediately
         std::process::exit(0);
     }
 
+    fn try_launch_update_script(&mut self, script_path: &Path) -> bool {
+        match updater::launch_self_update_script(script_path) {
+            Ok(()) => true,
+            Err(e) => {
+                self.show_error(e);
+                false
+            }
+        }
+    }
+
     pub fn open_repo(&mut self, path: &str) {
+        // Pending operations publish results back into this App, so changing
+        // repositories before they finish could apply stale data to the new one.
+        if self.is_busy() {
+            return;
+        }
+
         self.status_message.clear();
         self.status_is_error = false;
         match self.git.open(Path::new(path)) {
             Ok(()) => {
+                self.log_search_request_id = self.log_search_request_id.wrapping_add(1);
+                self.repo_generation = self.repo_generation.wrapping_add(1);
                 self.repo_path = path.to_string();
                 self.push_branch.clear();
                 self.push_branch_user_edited = false;
@@ -338,6 +378,7 @@ impl App {
 
         let (tx, rx) = mpsc::channel::<OpResult>();
         let desc = description.to_string();
+        let repo_generation = self.repo_generation;
         let progress = Arc::new(Mutex::new(String::new()));
         let op_progress = progress.clone();
 
@@ -349,10 +390,12 @@ impl App {
         self.pending_ops.push(PendingOp {
             description: desc,
             receiver: rx,
+            repo_generation,
             started_at: Instant::now(),
             progress,
             last_progress_update: Instant::now(),
             last_seen_progress: String::new(),
+            timed_out: false,
         });
 
         // Initialize the operation log with description
@@ -361,6 +404,17 @@ impl App {
         self.last_operation_log += "  (waiting for progress...)\n";
 
         ctx.request_repaint();
+    }
+
+    /// Start a log search with a request identity so out-of-order responses can be ignored.
+    pub fn start_log_search(&mut self, ctx: &egui::Context, filter: String) {
+        self.log_search_request_id = self.log_search_request_id.wrapping_add(1);
+        let request_id = self.log_search_request_id;
+        self.start_operation(
+            ctx,
+            "Searching commits",
+            GitOperation::LogSearch { filter, request_id },
+        );
     }
 
     /// Process completed background operations.
@@ -372,18 +426,19 @@ impl App {
         let mut i = 0;
         while i < self.pending_ops.len() {
             // --- Watchdog timeout: check if the operation is still making progress ---
-            let (description, started_at, current_progress, last_seen_progress, last_progress_update) = {
+            let (description, started_at, current_progress, last_seen_progress, last_progress_update, timed_out) = {
                 let op = &self.pending_ops[i];
                 let description = op.description.clone();
                 let started_at = op.started_at;
                 let current_progress = op.progress.lock().unwrap().clone();
                 let last_seen_progress = op.last_seen_progress.clone();
                 let last_progress_update = op.last_progress_update;
-                (description, started_at, current_progress, last_seen_progress, last_progress_update)
+                let timed_out = op.timed_out;
+                (description, started_at, current_progress, last_seen_progress, last_progress_update, timed_out)
             };
 
             // If progress text changed, reset the watchdog timer and accumulate to log
-            if current_progress != last_seen_progress {
+            if !timed_out && current_progress != last_seen_progress {
                 if let Some(mut_op) = self.pending_ops.get_mut(i) {
                     mut_op.last_progress_update = Instant::now();
                     mut_op.last_seen_progress = current_progress.clone();
@@ -391,7 +446,7 @@ impl App {
                 if !current_progress.is_empty() {
                     self.last_operation_log += &format!("  {}\n", current_progress);
                 }
-            } else {
+            } else if !timed_out {
                 let stall_secs = last_progress_update.elapsed().as_secs();
                 if current_progress.is_empty() {
                     // No progress ever received: give 60 seconds total
@@ -403,7 +458,8 @@ impl App {
                         self.status_message = msg.clone();
                         self.status_is_error = true;
                         self.last_operation_log += &format!("  ✗ {}\n", msg);
-                        self.pending_ops.swap_remove(i);
+                        self.pending_ops[i].timed_out = true;
+                        i += 1;
                         continue;
                     }
                 } else {
@@ -416,7 +472,8 @@ impl App {
                         self.status_message = msg.clone();
                         self.status_is_error = true;
                         self.last_operation_log += &format!("  ✗ {}\n", msg);
-                        self.pending_ops.swap_remove(i);
+                        self.pending_ops[i].timed_out = true;
+                        i += 1;
                         continue;
                     }
                 }
@@ -426,6 +483,20 @@ impl App {
             match op.receiver.try_recv() {
                 Ok(result) => {
                     let op = self.pending_ops.swap_remove(i);
+                    if op.timed_out {
+                        // Keep the UI blocked until the timed-out worker has finished. A
+                        // successful late result may have mutated Git state, so refresh it
+                        // before allowing another operation to start.
+                        if matches!(&result, OpResult::Success(_)) {
+                            self.needs_refresh = true;
+                        }
+                        continue;
+                    }
+                    if op.repo_generation != self.repo_generation
+                        && matches!(&result, OpResult::RefreshData { .. })
+                    {
+                        continue;
+                    }
                     // Append final progress to log before handling result
                     let final_progress = current_progress.clone();
                     if !final_progress.is_empty() {
@@ -437,6 +508,10 @@ impl App {
                     i += 1; // Still pending
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    if self.pending_ops[i].timed_out {
+                        self.pending_ops.swap_remove(i);
+                        continue;
+                    }
                     let last_prog = op.progress.lock().unwrap().clone();
                     let fail_msg = if last_prog.is_empty() {
                         format!("Operation '{}' failed unexpectedly", op.description)
@@ -482,8 +557,10 @@ impl App {
                 self.diff_content = lines;
                 self.show_diff = true;
             }
-            OpResult::SearchResults(commits) => {
-                self.commits = commits;
+            OpResult::SearchResults { request_id, filter, commits } => {
+                if request_id == self.log_search_request_id && filter == self.log_search {
+                    self.commits = commits;
+                }
             }
             OpResult::RefreshData {
                 status_entries,
@@ -497,7 +574,7 @@ impl App {
                 self.status_entries = status_entries;
                 self.branches = branches;
                 self.worktrees = worktrees;
-                self.commits = commits;
+                self.commits = filter_commits(commits, &self.log_search);
                 self.stashes = stashes;
                 self.remote_list = remote_list;
                 self.last_refresh = Instant::now();
@@ -533,10 +610,11 @@ impl App {
             errors.push(format!("Worktrees: {}", e));
             Vec::new()
         });
-        self.commits = self.git.log(100).unwrap_or_else(|e| {
+        let commits = self.git.log(100).unwrap_or_else(|e| {
             errors.push(format!("Log: {}", e));
             Vec::new()
         });
+        self.commits = filter_commits(commits, &self.log_search);
         self.stashes = self.git.stash_list().unwrap_or_else(|e| {
             errors.push(format!("Stash: {}", e));
             Vec::new()
@@ -688,38 +766,40 @@ impl eframe::App for App {
                 }
 
                 // Recent repos dropdown
-                egui::menu::menu_button(ui, "🕒", |ui| {
-                    if self.recent_repos.is_empty() {
-                        ui.label("No recent repositories");
-                    } else {
-                        let mut to_delete: Option<usize> = None;
-                        let entries = self.recent_repos.entries().to_vec();
-                        ui.label(
-                            egui::RichText::new("Recent Repositories")
-                                .strong()
-                                .size(14.0),
-                        );
-                        ui.separator();
-                        for (i, entry) in entries.iter().enumerate() {
-                            ui.horizontal(|ui| {
-                                ui.set_min_width(300.0);
-                                if ui
-                                    .selectable_label(false, &entry.name)
-                                    .clicked()
-                                {
-                                    self.open_repo(&entry.path);
-                                    ui.close_menu();
-                                }
-                                ui.label(
-                                    egui::RichText::new(&entry.path)
-                                        .size(10.0)
-                                        .color(egui::Color32::GRAY),
-                                );
-                                if crate::ui::ellipsis_button(ui, "🗑").clicked() {
-                                    to_delete = Some(i);
-                                }
-                            });
-                        }
+                let recent_repos_enabled = !self.is_busy();
+                ui.add_enabled_ui(recent_repos_enabled, |ui| {
+                    egui::menu::menu_button(ui, "🕒", |ui| {
+                        if self.recent_repos.is_empty() {
+                            ui.label("No recent repositories");
+                        } else {
+                            let mut to_delete: Option<usize> = None;
+                            let entries = self.recent_repos.entries().to_vec();
+                            ui.label(
+                                egui::RichText::new("Recent Repositories")
+                                    .strong()
+                                    .size(14.0),
+                            );
+                            ui.separator();
+                            for (i, entry) in entries.iter().enumerate() {
+                                ui.horizontal(|ui| {
+                                    ui.set_min_width(300.0);
+                                    if ui
+                                        .selectable_label(false, &entry.name)
+                                        .clicked()
+                                    {
+                                        self.open_repo(&entry.path);
+                                        ui.close_menu();
+                                    }
+                                    ui.label(
+                                        egui::RichText::new(&entry.path)
+                                            .size(10.0)
+                                            .color(egui::Color32::GRAY),
+                                    );
+                                    if crate::ui::ellipsis_button(ui, "🗑").clicked() {
+                                        to_delete = Some(i);
+                                    }
+                                });
+                            }
                         if let Some(idx) = to_delete {
                             if let Err(error) = self.recent_repos.remove(idx) {
                                 self.status_message =
@@ -727,7 +807,8 @@ impl eframe::App for App {
                                 self.status_is_error = true;
                             }
                         }
-                    }
+                        }
+                    });
                 });
 
                 if self.git.is_open() {
@@ -776,7 +857,7 @@ impl eframe::App for App {
                             }
                         }
                         // About button
-                        if ui.button("ⓘ").clicked() {
+                        if ui.button(ABOUT_BUTTON_LABEL).clicked() {
                             self.show_about = !self.show_about;
                         }
                         // Version label (truncatable so it doesn't push buttons off-screen)
@@ -837,7 +918,7 @@ impl eframe::App for App {
                 } else {
                     // No repo open: show version + about on the right
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("ⓘ").clicked() {
+                        if ui.button(ABOUT_BUTTON_LABEL).clicked() {
                             self.show_about = !self.show_about;
                         }
                         let version_text = format!("v{}", crate::version_info::VERSION);
@@ -1168,11 +1249,10 @@ impl eframe::App for App {
                                         // Fallback: open browser
                                         if crate::ui::ellipsis_button(ui, "Open in Browser").clicked() {
                                             let _ = open::that(download_url);
-                                            self.show_update_dialog = false;
+                                            self.dismiss_update_dialog();
                                         }
                                         if crate::ui::ellipsis_button(ui, "Remind Later").clicked() {
-                                            self.show_update_dialog = false;
-                                            self.update_dialog_dismissed = true;
+                                            self.dismiss_update_dialog();
                                         }
                                     });
                                 });
@@ -1294,6 +1374,189 @@ mod tests {
         assert!(!app.status_is_error);
     }
 
+    fn test_commit(message: &str, author: &str) -> CommitInfo {
+        CommitInfo {
+            sha: format!("{message}-sha"),
+            short_sha: "1234567".to_string(),
+            author: author.to_string(),
+            time: "2026-01-01 00:00:00".to_string(),
+            message: message.to_string(),
+            summary: message.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_stale_search_results_do_not_replace_current_log() {
+        let mut app = App::new();
+        app.log_search = "alice".to_string();
+        app.log_search_request_id = 1;
+        app.commits = vec![test_commit("alice changed the parser", "alice")];
+
+        app.handle_op_result(
+            "Searching commits".to_string(),
+            OpResult::SearchResults {
+                request_id: 0,
+                filter: "bob".to_string(),
+                commits: vec![test_commit("bob changed the parser", "bob")],
+            },
+        );
+
+        assert_eq!(app.commits.len(), 1);
+        assert_eq!(app.commits[0].author, "alice");
+    }
+
+    #[test]
+    fn test_refresh_preserves_active_log_filter() {
+        let mut app = App::new();
+        app.log_search = "alice".to_string();
+
+        app.handle_op_result(
+            "Refreshing".to_string(),
+            OpResult::RefreshData {
+                status_entries: Vec::new(),
+                branches: Vec::new(),
+                worktrees: Vec::new(),
+                commits: vec![
+                    test_commit("alice changed the parser", "alice"),
+                    test_commit("unrelated change", "bob"),
+                ],
+                stashes: Vec::new(),
+                remote_list: Vec::new(),
+                errors: Vec::new(),
+            },
+        );
+
+        assert_eq!(app.commits.len(), 1);
+        assert_eq!(app.commits[0].author, "alice");
+    }
+
+    #[test]
+    fn test_stale_refresh_result_does_not_replace_data_after_repo_switch() {
+        fn init_repo(path: &std::path::Path, message: &str) {
+            let repo = git2::Repository::init(path).expect("init repo");
+            let signature = git2::Signature::now("test", "test@example.com").expect("signature");
+            let tree_oid = {
+                let mut index = repo.index().expect("index");
+                index.write_tree().expect("write tree")
+            };
+            let tree = repo.find_tree(tree_oid).expect("tree");
+            repo.commit(Some("HEAD"), &signature, &signature, message, &tree, &[])
+                .expect("commit");
+        }
+
+        let old_repo = tempfile::tempdir().expect("old repo dir");
+        let new_repo = tempfile::tempdir().expect("new repo dir");
+        init_repo(old_repo.path(), "old repository commit");
+        init_repo(new_repo.path(), "new repository commit");
+
+        let recent_file = tempfile::NamedTempFile::new().expect("recent repos file");
+        let mut app = App::new();
+        app.recent_repos = RecentRepos::load_from(recent_file.path().to_path_buf());
+        app.open_repo(old_repo.path().to_str().expect("old repo path"));
+
+        let old_generation = app.repo_generation;
+        app.open_repo(new_repo.path().to_str().expect("new repo path"));
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(OpResult::RefreshData {
+            status_entries: Vec::new(),
+            branches: Vec::new(),
+            worktrees: Vec::new(),
+            commits: vec![test_commit("stale old repository data", "old")],
+            stashes: Vec::new(),
+            remote_list: Vec::new(),
+            errors: Vec::new(),
+        })
+        .expect("send stale refresh result");
+        app.pending_ops.push(PendingOp {
+            description: "Refreshing".to_string(),
+            receiver: rx,
+            repo_generation: old_generation,
+            started_at: Instant::now(),
+            progress: Arc::new(Mutex::new(String::new())),
+            last_progress_update: Instant::now(),
+            last_seen_progress: String::new(),
+            timed_out: false,
+        });
+
+        app.process_pending_ops(&egui::Context::default());
+
+        assert_eq!(app.repo_path, new_repo.path().to_string_lossy());
+        assert_eq!(app.commits.len(), 1);
+        assert_eq!(app.commits[0].summary, "new repository commit");
+    }
+
+    #[test]
+    fn test_refresh_all_preserves_active_log_filter() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = git2::Repository::init(dir.path()).expect("init repo");
+        let alice = git2::Signature::now("alice", "alice@example.com").expect("signature");
+        let bob = git2::Signature::now("bob", "bob@example.com").expect("signature");
+        let tree_oid = {
+            let mut index = repo.index().expect("index");
+            index.write_tree().expect("write tree")
+        };
+        let tree = repo.find_tree(tree_oid).expect("tree");
+        let first_oid = repo
+            .commit(Some("HEAD"), &alice, &alice, "alice change", &tree, &[])
+            .expect("alice commit");
+        let first = repo.find_commit(first_oid).expect("first commit");
+        repo.commit(Some("HEAD"), &bob, &bob, "bob change", &tree, &[&first])
+            .expect("bob commit");
+        drop(first);
+        drop(tree);
+        drop(repo);
+
+        let mut app = App::new();
+        app.git.open(dir.path()).expect("open repo");
+        app.log_search = "alice".to_string();
+        app.refresh_all();
+
+        assert_eq!(app.commits.len(), 1);
+        assert_eq!(app.commits[0].author, "alice");
+    }
+
+    #[test]
+    fn test_repeated_search_query_rejects_stale_response() {
+        let mut app = App::new();
+        let ctx = egui::Context::default();
+
+        app.log_search = "alice".to_string();
+        let filter = app.log_search.clone();
+        app.start_log_search(&ctx, filter);
+        let first_a_request_id = app.log_search_request_id;
+        app.log_search = "bob".to_string();
+        let filter = app.log_search.clone();
+        app.start_log_search(&ctx, filter);
+        app.log_search = "alice".to_string();
+        let filter = app.log_search.clone();
+        app.start_log_search(&ctx, filter);
+        let second_a_request_id = app.log_search_request_id;
+        app.commits = vec![test_commit("latest alice result", "alice")];
+
+        app.handle_op_result(
+            "Searching commits".to_string(),
+            OpResult::SearchResults {
+                request_id: first_a_request_id,
+                filter: "alice".to_string(),
+                commits: vec![test_commit("stale alice result", "alice")],
+            },
+        );
+
+        assert_eq!(app.commits[0].message, "latest alice result");
+
+        app.handle_op_result(
+            "Searching commits".to_string(),
+            OpResult::SearchResults {
+                request_id: second_a_request_id,
+                filter: "alice".to_string(),
+                commits: vec![test_commit("current alice result", "alice")],
+            },
+        );
+
+        assert_eq!(app.commits[0].message, "current alice result");
+    }
+
     #[test]
     fn test_status_expanded_defaults_to_false() {
         let app = App::new();
@@ -1318,6 +1581,50 @@ mod tests {
         app.status_is_error = false;
         assert!(app.status_message.is_empty());
         assert!(!app.status_is_error);
+    }
+
+    #[test]
+    fn test_open_repo_is_ignored_while_operation_is_pending() {
+        let first_repo = tempfile::tempdir().unwrap();
+        let second_repo = tempfile::tempdir().unwrap();
+        git2::Repository::init(first_repo.path()).unwrap();
+        git2::Repository::init(second_repo.path()).unwrap();
+
+        let mut app = App::new();
+        let recent_repos_dir = tempfile::tempdir().unwrap();
+        app.recent_repos = RecentRepos::load_from(recent_repos_dir.path().join("recent.json"));
+        let first_path = first_repo.path().to_string_lossy().to_string();
+        let second_path = second_repo.path().to_string_lossy().to_string();
+        app.open_repo(&first_path);
+
+        let (_tx, receiver) = mpsc::channel::<OpResult>();
+        app.pending_ops.push(PendingOp {
+            description: "Fetching".to_string(),
+            receiver,
+            repo_generation: app.repo_generation,
+            started_at: Instant::now(),
+            progress: Arc::new(Mutex::new(String::new())),
+            last_progress_update: Instant::now(),
+            last_seen_progress: String::new(),
+            timed_out: false,
+        });
+
+        app.open_repo(&second_path);
+
+        assert_eq!(app.repo_path, first_path);
+        assert_eq!(app.git.path().unwrap(), first_repo.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_update_script_launch_failure_is_reported() {
+        let mut app = App::new();
+
+        assert!(!app.try_launch_update_script(Path::new(
+            "/path/that/does/not/exist/update_git_manager.sh",
+        )));
+        assert!(app.status_is_error);
+        assert!(app.status_message.contains("Failed to launch update script"));
     }
 
     // --- Legacy tests (unchanged) ---
@@ -1490,7 +1797,7 @@ mod tests {
 
     #[test]
     fn test_emoji_chars_in_app_ui() {
-        let emojis = ['📂', '🔀', '📋', '📦', '🌐', '▶', 'ⓘ', '🔄', '🗑', '⏳', '📊'];
+        let emojis = ['📂', '🔀', '📋', '📦', '🌐', '▶', 'ℹ', '🔄', '🗑', '⏳', '📊'];
         for (i, &emoji) in emojis.iter().enumerate() {
             assert!(emoji as u32 > 127, "Emoji {} (index {}) should be a Unicode character", emoji, i);
         }
@@ -1522,14 +1829,57 @@ mod tests {
     #[test]
     fn test_about_button_does_not_use_circled_i() {
         let bad_char = '\u{24D8}';
-        let about_labels = ["ℹ", "About"];
-        for label in &about_labels {
-            assert!(
-                !label.contains(bad_char),
-                "About button label '{}' must NOT use ⓘ which renders as a box",
-                label
-            );
-        }
+        assert_eq!(ABOUT_BUTTON_LABEL, "ℹ");
+        assert!(
+            !ABOUT_BUTTON_LABEL.contains(bad_char),
+            "About button label '{}' must NOT use ⓘ which renders as a box",
+            ABOUT_BUTTON_LABEL
+        );
+
+        let ctx = egui::Context::default();
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(200.0, 100.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = ui.button(ABOUT_BUTTON_LABEL);
+                });
+            },
+        );
+        let text_shape = output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.job.text == ABOUT_BUTTON_LABEL => {
+                    Some(text)
+                }
+                _ => None,
+            })
+            .expect("About button should paint a text shape");
+        let font_id = text_shape
+            .galley
+            .job
+            .sections
+            .first()
+            .expect("About button text should have a font section")
+            .format
+            .font_id
+            .clone();
+        assert!(
+            ctx.fonts(|fonts| fonts.has_glyph(&font_id, 'ℹ')),
+            "About button font should provide an actual ℹ glyph"
+        );
+        assert!(text_shape
+            .galley
+            .rows
+            .iter()
+            .flat_map(|row| row.glyphs.iter())
+            .any(|glyph| glyph.chr == 'ℹ'));
     }
 
     #[test]
@@ -1592,15 +1942,62 @@ mod tests {
     }
 
     #[test]
+    fn test_timed_out_operation_stays_busy_until_worker_finishes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let mut app = App::new();
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::channel();
+        let worker_finished = Arc::new(AtomicBool::new(false));
+        let worker_finished_clone = worker_finished.clone();
+
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            tx.send(OpResult::Success("late mutation".to_string())).unwrap();
+            worker_finished_clone.store(true, Ordering::SeqCst);
+        });
+
+        app.pending_ops.push(PendingOp {
+            description: "Timed operation".to_string(),
+            receiver: rx,
+            repo_generation: app.repo_generation,
+            started_at: Instant::now() - Duration::from_secs(61),
+            progress: Arc::new(Mutex::new(String::new())),
+            last_progress_update: Instant::now(),
+            last_seen_progress: String::new(),
+            timed_out: false,
+        });
+
+        app.process_pending_ops(&ctx);
+
+        assert!(app.is_busy(), "a timed-out worker must still block new operations");
+        assert!(app.status_message.contains("timed out"));
+
+        while !worker_finished.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        app.process_pending_ops(&ctx);
+
+        assert!(!app.is_busy(), "the operation can be released after its worker exits");
+        assert!(
+            app.status_message.contains("timed out"),
+            "a late result must not replace the timeout status"
+        );
+    }
+
+    #[test]
     fn test_pending_op_contains_progress() {
         use std::sync::{Arc, Mutex};
         let op = PendingOp {
             description: "Fetch from origin".to_string(),
             receiver: mpsc::channel::<OpResult>().1,
+            repo_generation: 0,
             started_at: Instant::now(),
             progress: Arc::new(Mutex::new("initial progress".to_string())),
             last_progress_update: Instant::now(),
             last_seen_progress: String::new(),
+            timed_out: false,
         };
         assert_eq!(*op.progress.lock().unwrap(), "initial progress");
     }
@@ -1668,12 +2065,119 @@ mod tests {
         assert!(!app.show_update_dialog, "Remind Later should close dialog");
     }
 
+    #[test]
+    fn test_open_in_browser_dismisses_dialog_for_next_frame() {
+        let mut app = App::new();
+        let repo_dir = tempfile::tempdir().expect("create temporary repository directory");
+        git2::Repository::init(repo_dir.path()).expect("initialize temporary repository");
+        app.git.open(repo_dir.path()).expect("open temporary repository");
+        assert!(app.git.is_open());
+        app.auto_check_done = true;
+        app.show_update_dialog = true;
+        app.update_dialog_dismissed = false;
+        *app.update_state.lock().unwrap() = UpdateState::UpdateAvailable {
+            latest_version: "0.2.0".to_string(),
+            download_url: String::new(),
+            assets: Vec::new(),
+        };
+
+        let ctx = egui::Context::default();
+        let screen_rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(800.0, 600.0),
+        );
+        let mut frame = eframe::Frame::_new_kittest();
+        // Give egui one frame to initialize the update window before locating its button.
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ctx| eframe::App::update(&mut app, ctx, &mut frame),
+        );
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ctx| eframe::App::update(&mut app, ctx, &mut frame),
+        );
+        let browser_button_pos = output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.job.text == "Open in Browser" => {
+                    Some(text.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .expect("Update dialog should render an Open in Browser button");
+
+        let pointer_input = |pressed| egui::RawInput {
+            screen_rect: Some(screen_rect),
+            events: vec![
+                egui::Event::PointerMoved(browser_button_pos),
+                egui::Event::PointerButton {
+                    pos: browser_button_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let _ = ctx.run(pointer_input(true), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+        let _ = ctx.run(pointer_input(false), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+
+        assert!(!app.show_update_dialog, "Opening the browser should close the dialog");
+        assert!(
+            app.update_dialog_dismissed,
+            "Opening the browser should prevent the dialog from reopening"
+        );
+
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ctx| eframe::App::update(&mut app, ctx, &mut frame),
+        );
+        assert!(
+            !app.show_update_dialog,
+            "The dialog should stay closed on the next frame after opening the browser"
+        );
+    }
+
     // --- Download tracking tests ---
 
     #[test]
     fn test_download_progress_field_defaults() {
         let app = App::new();
         assert_eq!(app.download_progress, 0.0, "Download progress should start at 0");
+    }
+
+    #[test]
+    fn test_stale_download_progress_cannot_overwrite_completed_download() {
+        let state = Arc::new(Mutex::new(UpdateState::Downloaded {
+            file_path: "/tmp/update.zip".to_string(),
+        }));
+
+        assert!(!App::update_download_progress_if_active(
+            &state,
+            0.5,
+            "update.zip",
+        ));
+        assert_eq!(
+            *state.lock().unwrap(),
+            UpdateState::Downloaded {
+                file_path: "/tmp/update.zip".to_string(),
+            }
+        );
     }
 
 }

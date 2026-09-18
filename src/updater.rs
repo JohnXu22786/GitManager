@@ -258,15 +258,15 @@ pub fn create_self_update_script(new_binary: &Path, current_binary: &Path) -> Re
             .map_err(|e| format!("Failed to create update script: {}", e))?;
         write!(script, r#"@echo off
 ping 127.0.0.1 -n 3 > nul
-copy /Y "{}" "{}"
-del /F /Q "{}"
-start "" "{}"
+copy /Y {} {}
+del /F /Q {}
+start "" {}
 del "%~f0"
 "#,
-            new_binary.display(),
-            current_binary.display(),
-            new_binary.display(),
-            current_binary.display(),
+            windows_batch_quote_path(new_binary),
+            windows_batch_quote_path(current_binary),
+            windows_batch_quote_path(new_binary),
+            windows_batch_quote_path(current_binary),
         ).map_err(|e| format!("Failed to write update script: {}", e))?;
         Ok(script_path)
     }
@@ -277,17 +277,17 @@ del "%~f0"
             .map_err(|e| format!("Failed to create update script: {}", e))?;
         write!(script, r#"#!/bin/sh
 sleep 2
-cp -f "{}" "{}"
-chmod +x "{}"
-rm -f "{}"
-"{}" &
+cp -f {} {}
+chmod +x {}
+rm -f {}
+{} &
 rm -- "$0"
 "#,
-            new_binary.display(),
-            current_binary.display(),
-            current_binary.display(),
-            new_binary.display(),
-            current_binary.display(),
+            shell_quote_path(new_binary),
+            shell_quote_path(current_binary),
+            shell_quote_path(current_binary),
+            shell_quote_path(new_binary),
+            shell_quote_path(current_binary),
         ).map_err(|e| format!("Failed to write update script: {}", e))?;
         // Mark script as executable on Unix
         use std::os::unix::fs::PermissionsExt;
@@ -295,6 +295,49 @@ rm -- "$0"
             .map_err(|e| format!("Failed to make script executable: {}", e))?;
         Ok(script_path)
     }
+}
+
+fn shell_quote_path(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn windows_batch_quote_path(path: &Path) -> String {
+    let mut quoted = String::from('"');
+    for character in path.to_string_lossy().chars() {
+        match character {
+            '%' => quoted.push_str("%%"),
+            '^' => quoted.push_str("^^"),
+            '&' => quoted.push_str("^&"),
+            '|' => quoted.push_str("^|"),
+            '<' => quoted.push_str("^<"),
+            '>' => quoted.push_str("^>"),
+            '(' => quoted.push_str("^("),
+            ')' => quoted.push_str("^)"),
+            '!' => quoted.push_str("^!"),
+            _ => quoted.push(character),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
+/// Launch the generated self-update script and return any process-start error.
+pub fn launch_self_update_script(script_path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    let result = {
+        let command = format!("call {}", windows_batch_quote_path(script_path));
+        std::process::Command::new("cmd")
+            .args(["/C", &command])
+            .spawn()
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let result = std::process::Command::new(script_path).spawn();
+
+    result
+        .map(|_| ())
+        .map_err(|e| format!("Failed to launch update script: {}", e))
 }
 
 /// Get the default download directory path.
@@ -715,5 +758,38 @@ mod tests {
         // On any platform, should end with a meaningful name
         let path = std::path::Path::new(&dir);
         assert!(path.components().count() > 0, "Should be a valid path");
+    }
+
+    #[test]
+    fn test_shell_path_escaping_preserves_special_characters() {
+        let path = Path::new("/tmp/Update folder/it's $HOME/$(do-not-run).bin");
+
+        assert_eq!(
+            shell_quote_path(path),
+            "'/tmp/Update folder/it'\\''s $HOME/$(do-not-run).bin'"
+        );
+    }
+
+    #[test]
+    fn test_windows_batch_path_escaping_preserves_metacharacters() {
+        let path = Path::new(r"C:\Users\A & B\100% ready!\update.exe");
+
+        assert_eq!(
+            windows_batch_quote_path(path),
+            r#""C:\Users\A ^& B\100%% ready^!\update.exe""#
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_launch_self_update_script_reports_spawn_failure() {
+        let result = launch_self_update_script(Path::new(
+            "/path/that/does/not/exist/update_git_manager.sh",
+        ));
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("Failed to launch update script"));
     }
 }
