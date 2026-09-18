@@ -644,8 +644,17 @@ impl GitRepo {
         if let Some(ref r) = reference {
             opts.reference(Some(r));
         }
-        let wt = repo.worktree(name, path, Some(&opts))
-            .map_err(|e| format!("Create worktree: {}", e))?;
+        let wt = match repo.worktree(name, path, Some(&opts)) {
+            Ok(wt) => wt,
+            Err(e) => {
+                if new_branch {
+                    if let Ok(mut created_branch) = repo.find_reference(&branch_ref) {
+                        let _ = created_branch.delete();
+                    }
+                }
+                return Err(format!("Create worktree: {}", e));
+            }
+        };
 
         if new_branch {
             if let Ok(wr) = Repository::open(wt.path()) { let _ = wr.set_head(&branch_ref); }
@@ -1606,6 +1615,27 @@ mod tests {
         assert!(
             index.get_path(Path::new("staged.txt"), 0).is_some(),
             "background operation should update the linked worktree index"
+        );
+    }
+
+    #[test]
+    fn test_failed_new_worktree_creation_removes_created_branch() {
+        let main_dir = tempfile::tempdir().expect("temp dir");
+        let wt_root = tempfile::tempdir().expect("temp dir");
+        let wt_path = wt_root.path().join("existing");
+        std::fs::create_dir(&wt_path).expect("create existing worktree path");
+        std::fs::write(wt_path.join("blocker"), "not an empty worktree").expect("write blocker");
+
+        create_repo_with_commit(main_dir.path());
+        let git = open_git_repo(main_dir.path());
+
+        let result = git.create_worktree("orphaned-branch", &wt_path, Some("main"), true);
+
+        assert!(result.is_err(), "worktree creation should fail for a non-empty path");
+        let repo = Repository::open(main_dir.path()).expect("reopen repo");
+        assert!(
+            repo.find_branch("orphaned-branch", BranchType::Local).is_err(),
+            "failed worktree creation must not leave its newly created branch"
         );
     }
 
