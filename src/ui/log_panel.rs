@@ -1,5 +1,4 @@
 use crate::app::App;
-use crate::git_ops::GitOperation;
 use eframe::egui;
 
 pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -18,7 +17,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.label("Search:");
         if ui.text_edit_singleline(&mut app.log_search).changed() {
             let filter = app.log_search.clone();
-            app.start_operation(ctx, "Searching commits", GitOperation::LogSearch(filter));
+            app.start_log_search(ctx, filter);
         }
     });
 

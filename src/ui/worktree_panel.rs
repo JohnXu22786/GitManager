@@ -13,13 +13,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 app.refresh_all();
             }
             if crate::ui::add_enabled_ellipsis(ui, !busy, "Prune").clicked() {
-                let worktrees = app.worktrees.clone();
-                for wt in worktrees {
-                    if !wt.is_main {
-                        app.start_operation(ctx, &format!("Prune {:?}", wt.path), GitOperation::RemoveWorktree { path: wt.path, force: true });
-                    }
-                }
-                app.show_success("Pruning worktrees...".into());
+                app.start_operation(ctx, "Pruning stale worktrees", GitOperation::PruneWorktrees);
             }
         });
     });
