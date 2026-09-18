@@ -4,7 +4,11 @@ use eframe::egui;
 
 fn initialize_push_branch(push_branch: &mut String, current_branch: &str, user_edited: bool) {
     if !user_edited {
-        *push_branch = current_branch.to_owned();
+        if current_branch.starts_with("detached at ") {
+            push_branch.clear();
+        } else {
+            *push_branch = current_branch.to_owned();
+        }
     }
 }
 
@@ -180,6 +184,41 @@ mod tests {
         initialize_push_branch(&mut push_branch, "hotfix", true);
 
         assert_eq!(push_branch, "release/v1");
+    }
+
+    #[test]
+    fn panel_clears_default_after_head_is_detached() {
+        let repo_dir = tempfile::tempdir_in(".").expect("temp dir");
+        let repo = create_repo_with_commit(repo_dir.path());
+        let initial_branch = repo
+            .head()
+            .expect("HEAD")
+            .shorthand()
+            .expect("initial branch")
+            .to_owned();
+        let initial_oid = repo.head().expect("HEAD").target().expect("initial commit");
+        drop(repo);
+
+        let mut app = App::new();
+        app.git.open(repo_dir.path()).expect("open repo");
+        let ctx = egui::Context::default();
+
+        show_panel(&mut app, &ctx);
+        assert_eq!(app.push_branch, initial_branch);
+
+        let repo = Repository::open(repo_dir.path()).expect("reopen repo");
+        repo.set_head_detached(initial_oid).expect("detach HEAD");
+        drop(repo);
+
+        show_panel(&mut app, &ctx);
+
+        assert!(app.push_branch.is_empty());
+
+        app.push_branch = "release/v1".to_owned();
+        app.push_branch_user_edited = true;
+        show_panel(&mut app, &ctx);
+
+        assert_eq!(app.push_branch, "release/v1");
     }
 
     #[test]
