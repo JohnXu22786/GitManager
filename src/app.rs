@@ -72,6 +72,8 @@ pub struct App {
 
     pub stash_message: String,
     pub remote_name: String,
+    /// Whether the remote field has been edited by the user.
+    pub(crate) remote_name_user_edited: bool,
     pub push_branch: String,
     /// Whether the push branch field has been edited by the user.
     pub(crate) push_branch_user_edited: bool,
@@ -143,6 +145,7 @@ impl App {
 
             stash_message: String::new(),
             remote_name: String::new(),
+            remote_name_user_edited: false,
             push_branch: String::new(),
             push_branch_user_edited: false,
             push_force: false,
@@ -331,6 +334,7 @@ impl App {
                 self.log_search_request_id = self.log_search_request_id.wrapping_add(1);
                 self.repo_generation = self.repo_generation.wrapping_add(1);
                 self.repo_path = path.to_string();
+                self.remote_name_user_edited = false;
                 self.push_branch.clear();
                 self.push_branch_user_edited = false;
                 self.status_message = format!("Opened repository at {}", path);
