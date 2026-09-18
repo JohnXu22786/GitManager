@@ -2,9 +2,14 @@ use crate::app::App;
 use crate::git_ops::GitOperation;
 use eframe::egui;
 
-fn initialize_push_branch(push_branch: &mut String, current_branch: &str, user_edited: bool) {
+fn initialize_push_branch(
+    push_branch: &mut String,
+    current_branch: &str,
+    head_is_detached: bool,
+    user_edited: bool,
+) {
     if !user_edited {
-        if current_branch.starts_with("detached at ") {
+        if head_is_detached {
             push_branch.clear();
         } else {
             *push_branch = current_branch.to_owned();
@@ -59,11 +64,13 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     ui.separator();
 
     let current_branch = app.git.current_branch().unwrap_or_default();
+    let head_is_detached = app.git.head_is_detached().unwrap_or(false);
     let default_remote = app.remote_list.first().map(|r| r.name.clone()).unwrap_or_default();
 
     initialize_push_branch(
         &mut app.push_branch,
         &current_branch,
+        head_is_detached,
         app.push_branch_user_edited,
     );
     if !app.remote_list.iter().any(|remote| remote.name == app.remote_name) {
@@ -174,16 +181,25 @@ mod tests {
     fn follows_current_branch_until_push_branch_is_edited() {
         let mut push_branch = String::new();
 
-        initialize_push_branch(&mut push_branch, "main", false);
+        initialize_push_branch(&mut push_branch, "main", false, false);
         assert_eq!(push_branch, "main");
 
-        initialize_push_branch(&mut push_branch, "feature", false);
+        initialize_push_branch(&mut push_branch, "feature", false, false);
         assert_eq!(push_branch, "feature");
 
         push_branch = String::from("release/v1");
-        initialize_push_branch(&mut push_branch, "hotfix", true);
+        initialize_push_branch(&mut push_branch, "hotfix", false, true);
 
         assert_eq!(push_branch, "release/v1");
+    }
+
+    #[test]
+    fn preserves_attached_branch_named_like_detached_display() {
+        let mut push_branch = String::new();
+
+        initialize_push_branch(&mut push_branch, "detached at abc1234", false, false);
+
+        assert_eq!(push_branch, "detached at abc1234");
     }
 
     #[test]

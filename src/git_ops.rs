@@ -585,6 +585,16 @@ fn dir_has_content(path: &Path) -> bool {
     }
 }
 
+fn push_refspec(head_is_branch: bool, branch: &str, force: bool) -> String {
+    let source = if head_is_branch {
+        format!("refs/heads/{}", branch)
+    } else {
+        "HEAD".to_string()
+    };
+    let force_prefix = if force { "+" } else { "" };
+    format!("{}{}:refs/heads/{}", force_prefix, source, branch)
+}
+
 impl GitRepo {
     pub fn new() -> Self {
         GitRepo { repo: RefCell::new(None), path: None }
@@ -638,6 +648,11 @@ impl GitRepo {
             let oid = head.target().map(|o| o.to_string()).unwrap_or_default();
             Ok(format!("detached at {}", &oid[..oid.len().min(7)]))
         }
+    }
+
+    pub fn head_is_detached(&self) -> GitResult<bool> {
+        let repo = self.repo()?;
+        repo.head_detached().map_err(|e| format!("HEAD state: {}", e))
     }
 
     pub fn branches(&self) -> GitResult<Vec<BranchInfo>> {
@@ -1467,10 +1482,19 @@ impl GitRepo {
             }
             true
         });
+        cb.push_update_reference(|refname, status| {
+            if let Some(status) = status {
+                return Err(git2::Error::from_str(&format!(
+                    "Push {} rejected: {}",
+                    refname, status
+                )));
+            }
+            Ok(())
+        });
         let mut fo = git2::PushOptions::new();
         fo.remote_callbacks(cb);
-        let rs = if force { format!("+refs/heads/{}:refs/heads/{}", branch, branch) }
-                 else { format!("refs/heads/{}:refs/heads/{}", branch, branch) };
+        let head_is_branch = repo.head().map_err(|e| format!("HEAD: {}", e))?.is_branch();
+        let rs = push_refspec(head_is_branch, branch, force);
         let mut rm = repo.find_remote(remote).map_err(|e| format!("Remote: {}", e))?;
         rm.push(&[&rs], Some(&mut fo)).map_err(|e| format!("Push: {}", e))?;
         Ok(format!("Pushed {}", branch))
@@ -1618,6 +1642,12 @@ mod tests {
         git
     }
 
+    fn local_remote_url(path: &Path) -> String {
+        url::Url::from_file_path(path)
+            .expect("local remote path")
+            .to_string()
+    }
+
     fn commit_file(repo: &Repository, path: &str, contents: &str, message: &str) -> git2::Oid {
         std::fs::write(repo.workdir().expect("workdir").join(path), contents)
             .expect("write file");
@@ -1695,6 +1725,156 @@ mod tests {
             .expect("push remote commit");
 
         (local_dir, remote_dir, branch, local_commit, remote_commit)
+    }
+
+    fn setup_push_repository() -> (tempfile::TempDir, tempfile::TempDir, String, git2::Oid) {
+        let local_dir = tempfile::tempdir().expect("local temp dir");
+        let local_repo = create_repo_with_commit(local_dir.path());
+        let branch = local_repo
+            .head()
+            .expect("HEAD")
+            .shorthand()
+            .expect("branch name")
+            .to_string();
+        let initial_oid = local_repo.head().expect("HEAD").target().expect("initial commit");
+
+        let remote_dir = tempfile::tempdir().expect("remote temp dir");
+        Repository::init_bare(remote_dir.path()).expect("init bare remote");
+        let remote_url = local_remote_url(remote_dir.path());
+        local_repo.remote("origin", &remote_url).expect("add origin");
+        drop(local_repo);
+
+        (local_dir, remote_dir, branch, initial_oid)
+    }
+
+    fn create_divergent_remote_commit(remote_dir: &Path, branch: &str) -> git2::Oid {
+        let remote_repo = Repository::open_bare(remote_dir).expect("open bare remote");
+        remote_repo
+            .reference_symbolic(
+                "HEAD",
+                &format!("refs/heads/{}", branch),
+                true,
+                "set remote HEAD",
+            )
+            .expect("set remote HEAD");
+        drop(remote_repo);
+
+        let remote_clone_dir = tempfile::tempdir().expect("remote clone dir");
+        let remote_url = local_remote_url(remote_dir);
+        let remote_clone = Repository::clone(&remote_url, remote_clone_dir.path())
+            .expect("clone remote branch");
+        let remote_oid = commit_file(&remote_clone, "remote.txt", "remote\n", "remote change");
+        let mut remote_origin = remote_clone.find_remote("origin").expect("find origin");
+        let refspec = format!(
+            "refs/heads/{0}:refs/heads/{0}",
+            branch
+        );
+        remote_origin
+            .push(&[refspec.as_str()], None)
+            .expect("push divergent remote commit");
+        remote_oid
+    }
+
+    #[test]
+    fn push_uses_selected_branch_when_head_is_attached() {
+        let (local_dir, remote_dir, _branch, initial_oid) = setup_push_repository();
+        let destination = "release/v1";
+        let repo = Repository::open(local_dir.path()).expect("reopen local repo");
+        let selected_oid = {
+            let initial_commit = repo.find_commit(initial_oid).expect("initial commit");
+            repo.branch(destination, &initial_commit, false)
+                .expect("create selected branch");
+            let tree = initial_commit.tree().expect("initial tree");
+            let signature = repo.signature().expect("signature");
+            repo.commit(
+                Some(&format!("refs/heads/{}", destination)),
+                &signature,
+                &signature,
+                "selected branch commit",
+                &tree,
+                &[&initial_commit],
+            )
+            .expect("commit selected branch")
+        };
+        drop(repo);
+
+        let git = open_git_repo(local_dir.path());
+        let progress = Arc::new(Mutex::new(String::new()));
+
+        git.push("origin", destination, false, progress.clone())
+            .expect("push attached HEAD");
+        {
+            let remote_repo = Repository::open_bare(remote_dir.path()).expect("open bare remote");
+            let remote_ref = remote_repo
+                .find_reference(&format!("refs/heads/{}", destination))
+                .expect("pushed branch");
+            assert_eq!(remote_ref.target(), Some(selected_oid));
+        }
+
+        let divergent_oid = create_divergent_remote_commit(remote_dir.path(), destination);
+        assert!(
+            git.push("origin", destination, false, progress.clone()).is_err(),
+            "non-force attached push should reject a non-fast-forward update"
+        );
+        {
+            let remote_repo = Repository::open_bare(remote_dir.path()).expect("open bare remote");
+            let remote_ref = remote_repo
+                .find_reference(&format!("refs/heads/{}", destination))
+                .expect("divergent branch");
+            assert_eq!(remote_ref.target(), Some(divergent_oid));
+        }
+        git.push("origin", destination, true, progress)
+            .expect("force push attached HEAD");
+
+        let remote_repo = Repository::open_bare(remote_dir.path()).expect("open bare remote");
+        let remote_ref = remote_repo
+            .find_reference(&format!("refs/heads/{}", destination))
+            .expect("pushed branch");
+        assert_eq!(remote_ref.target(), Some(selected_oid));
+        assert_ne!(selected_oid, initial_oid);
+    }
+
+    #[test]
+    fn detached_push_uses_head_and_force_overwrites_remote_branch() {
+        let (local_dir, remote_dir, _branch, initial_oid) = setup_push_repository();
+        let destination = "release/v1";
+        let repo = Repository::open(local_dir.path()).expect("reopen local repo");
+        repo.set_head_detached(initial_oid).expect("detach HEAD");
+        drop(repo);
+
+        let git = open_git_repo(local_dir.path());
+        let progress = Arc::new(Mutex::new(String::new()));
+        git.push("origin", destination, false, progress.clone())
+            .expect("push detached HEAD");
+        {
+            let remote_repo = Repository::open_bare(remote_dir.path()).expect("open bare remote");
+            let remote_ref = remote_repo
+                .find_reference(&format!("refs/heads/{}", destination))
+                .expect("pushed destination branch");
+            assert_eq!(remote_ref.target(), Some(initial_oid));
+        }
+
+        let divergent_oid = create_divergent_remote_commit(remote_dir.path(), destination);
+
+        assert!(
+            git.push("origin", destination, false, progress.clone()).is_err(),
+            "non-force detached push should reject a non-fast-forward update"
+        );
+        {
+            let remote_repo = Repository::open_bare(remote_dir.path()).expect("open bare remote");
+            let remote_ref = remote_repo
+                .find_reference(&format!("refs/heads/{}", destination))
+                .expect("divergent branch");
+            assert_eq!(remote_ref.target(), Some(divergent_oid));
+        }
+        git.push("origin", destination, true, progress)
+            .expect("force push detached HEAD");
+
+        let remote_repo = Repository::open_bare(remote_dir.path()).expect("reopen bare remote");
+        let remote_ref = remote_repo
+            .find_reference(&format!("refs/heads/{}", destination))
+            .expect("pushed destination branch");
+        assert_eq!(remote_ref.target(), Some(initial_oid));
     }
 
     #[test]
