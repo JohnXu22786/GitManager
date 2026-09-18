@@ -327,6 +327,128 @@ fn paths_match(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Read the main worktree path from the common repository configuration.
+///
+/// A repository initialized with an external git directory can store this in
+/// `core.worktree` (or the main worktree's `config.worktree` file). Relative
+/// values are resolved from the common git directory, as Git does.
+fn configured_main_worktree_path(repo: &Repository) -> Option<PathBuf> {
+    let common_dir = repo.commondir();
+    let config_paths = [common_dir.join("config.worktree"), common_dir.join("config")];
+
+    for config_path in config_paths {
+        let Ok(config) = git2::Config::open(&config_path) else {
+            continue;
+        };
+        let Ok(path) = config.get_path("core.worktree") else {
+            continue;
+        };
+        if path.as_os_str().is_empty() {
+            continue;
+        }
+
+        let path = if path.is_absolute() {
+            path
+        } else {
+            common_dir.join(path)
+        };
+        return Some(std::fs::canonicalize(&path).unwrap_or(path));
+    }
+
+    None
+}
+
+/// Resolve the git directory referenced by a worktree's `.git` entry.
+fn worktree_git_dir(worktree_path: &Path) -> Option<PathBuf> {
+    let git_entry = worktree_path.join(".git");
+    if git_entry.is_dir() {
+        return Some(git_entry);
+    }
+
+    let contents = std::fs::read_to_string(&git_entry).ok()?;
+    let git_dir = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("gitdir:").map(str::trim))?;
+    let git_dir = PathBuf::from(git_dir);
+
+    if git_dir.is_absolute() {
+        Some(git_dir)
+    } else {
+        git_entry.parent().map(|parent| parent.join(git_dir))
+    }
+}
+
+/// Find a worktree whose `.git` entry points to the shared git directory.
+///
+/// This covers `--separate-git-dir` repositories, where the common git
+/// directory no longer identifies the main worktree by its parent. Git does
+/// not keep a reverse link for this layout, so inspect the current/common
+/// directory neighborhoods as a filesystem fallback.
+fn find_main_worktree_path(repo: &Repository) -> Option<PathBuf> {
+    let common_dir = std::fs::canonicalize(repo.commondir()).ok()?;
+    let current_worktree = repo.workdir();
+    let mut roots = Vec::new();
+
+    for start in [
+        common_dir.parent(),
+        current_worktree.and_then(Path::parent),
+    ] {
+        let mut path = start.map(Path::to_path_buf);
+        while let Some(current) = path {
+            if !roots.iter().any(|root| root == &current) {
+                roots.push(current.clone());
+            }
+            path = current.parent().map(Path::to_path_buf);
+        }
+    }
+
+    for root in roots {
+        let mut candidates = vec![root.clone()];
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            candidates.extend(entries.flatten().map(|entry| entry.path()));
+        }
+
+        for candidate in candidates {
+            if !candidate.is_dir() {
+                continue;
+            }
+            let Some(git_dir) = worktree_git_dir(&candidate) else {
+                continue;
+            };
+            let Ok(git_dir) = std::fs::canonicalize(git_dir) else {
+                continue;
+            };
+            if paths_match(&git_dir, &common_dir) {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+/// Determine the main worktree path without confusing an external git
+/// directory or linked-worktree metadata directory for the worktree itself.
+fn main_worktree_path(repo: &Repository) -> GitResult<PathBuf> {
+    if !repo.is_worktree() {
+        if let Some(path) = repo.workdir() {
+            return Ok(path.to_path_buf());
+        }
+        if repo.is_bare() {
+            return Ok(repo.commondir().to_path_buf());
+        }
+    }
+
+    if let Some(path) = configured_main_worktree_path(repo) {
+        return Ok(path);
+    }
+    if let Some(path) = find_main_worktree_path(repo) {
+        return Ok(path);
+    }
+
+    Err("Unable to determine the main worktree path".into())
+}
+
 /// Forcefully remove a directory, with OS-level fallback.
 ///
 /// Used ONLY by Force Remove — regular Remove uses a single gentle attempt.
@@ -600,7 +722,7 @@ impl GitRepo {
 
     pub fn worktrees(&self) -> GitResult<Vec<WorktreeInfo>> {
         let repo = self.repo()?;
-        let mp = repo.path().parent().unwrap().to_path_buf();
+        let mp = main_worktree_path(&repo)?;
         let mut list = Vec::new();
         list.push(WorktreeInfo {
             path: mp, branch: Some(self.current_branch().unwrap_or_default()),
@@ -1616,6 +1738,76 @@ mod tests {
             index.get_path(Path::new("staged.txt"), 0).is_some(),
             "background operation should update the linked worktree index"
         );
+    }
+
+    #[test]
+    fn test_worktrees_from_linked_worktree_identifies_main_path() {
+        let main_dir = tempfile::tempdir().expect("temp dir");
+        let wt_root = tempfile::tempdir().expect("temp dir");
+        let wt_path = wt_root.path().join("linked-wt");
+
+        let repo = create_repo_with_commit(main_dir.path());
+        let head = repo.head().expect("head");
+        let commit = head.peel_to_commit().expect("commit");
+        let wt_name = "linked-wt";
+        let _branch = repo.branch(wt_name, &commit, false).expect("branch");
+        let reference = repo
+            .find_reference(&format!("refs/heads/{}", wt_name))
+            .expect("reference");
+        let mut opts = git2::WorktreeAddOptions::new();
+        opts.reference(Some(&reference));
+        repo.worktree(wt_name, &wt_path, Some(&opts))
+            .expect("create worktree");
+
+        let git = open_git_repo(&wt_path);
+        let worktrees = git.worktrees().expect("list worktrees");
+        let main = worktrees
+            .iter()
+            .find(|worktree| worktree.is_main)
+            .expect("main worktree");
+
+        assert_eq!(main.path, main_dir.path());
+    }
+
+    #[test]
+    fn test_worktrees_from_linked_worktree_with_separate_git_dir_identifies_main_path() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let main_dir = root.path().join("main");
+        let git_dir = root.path().join("repo.git");
+        let wt_path = root.path().join("linked-wt");
+        std::fs::create_dir(&main_dir).expect("create main worktree");
+
+        let repo = create_repo_with_commit(&main_dir);
+        drop(repo);
+        std::fs::rename(main_dir.join(".git"), &git_dir)
+            .expect("move git directory outside worktree");
+        std::fs::write(
+            main_dir.join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .expect("write separate git dir link");
+
+        let repo = Repository::open(&main_dir).expect("open separate git dir repository");
+        let head = repo.head().expect("head");
+        let commit = head.peel_to_commit().expect("commit");
+        let wt_name = "linked-wt";
+        let _branch = repo.branch(wt_name, &commit, false).expect("branch");
+        let reference = repo
+            .find_reference(&format!("refs/heads/{}", wt_name))
+            .expect("reference");
+        let mut opts = git2::WorktreeAddOptions::new();
+        opts.reference(Some(&reference));
+        repo.worktree(wt_name, &wt_path, Some(&opts))
+            .expect("create worktree");
+
+        let git = open_git_repo(&wt_path);
+        let worktrees = git.worktrees().expect("list worktrees");
+        let main = worktrees
+            .iter()
+            .find(|worktree| worktree.is_main)
+            .expect("main worktree");
+
+        assert_eq!(main.path, main_dir);
     }
 
     #[test]
