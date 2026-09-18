@@ -602,6 +602,12 @@ fn staged_worktree_link_matches(
     same_file(&actual.metadata, &expected.metadata) && actual.contents == expected.contents
 }
 
+fn path_identity_matches(path: &Path, expected: &std::fs::Metadata) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|actual| same_file(&actual, expected))
+        .unwrap_or(false)
+}
+
 fn worktree_git_dir_from_link(worktree_path: &Path, relative_base: &Path) -> Option<PathBuf> {
     let contents = worktree_git_link(worktree_path)?;
     let value = gitdir_link_value(&contents)?;
@@ -803,7 +809,8 @@ fn remove_worktree_directory(
         let staging_path = worktree_staging_path(path)?;
         if let Err(rename_error) = std::fs::rename(path, &staging_path) {
             if force {
-                let is_safe = || staged_worktree_link_matches(path, &expected_git_link);
+                let path_metadata = std::fs::symlink_metadata(path)?;
+                let is_safe = || path_identity_matches(path, &path_metadata);
                 if let Err(force_error) = force_remove_dir_checked(path, is_safe) {
                     return Err(std::io::Error::new(
                         force_error.kind(),
@@ -3949,6 +3956,22 @@ mod tests {
         )
         .expect("write unrelated link");
         assert!(!registered_worktree_link_matches(&repo, &worktree, &staged_path, &wt_path));
+    }
+
+    #[test]
+    fn test_force_fallback_identity_survives_git_link_deletion() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let path = root.path().join("worktree");
+        std::fs::create_dir(&path).expect("create worktree directory");
+        std::fs::write(path.join(".git"), "gitdir: placeholder\n").expect("write git link");
+        let path_metadata = std::fs::symlink_metadata(&path).expect("capture directory identity");
+
+        std::fs::remove_file(path.join(".git")).expect("remove git link during cleanup");
+
+        assert!(
+            path_identity_matches(&path, &path_metadata),
+            "Directory identity must remain valid after recursive cleanup removes .git"
+        );
     }
 
     #[test]
