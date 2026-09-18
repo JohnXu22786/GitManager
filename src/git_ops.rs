@@ -327,6 +327,19 @@ fn paths_match(a: &Path, b: &Path) -> bool {
     }
 }
 
+fn path_entry_exists(path: &Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+fn path_exists(path: &Path) -> GitResult<bool> {
+    path_entry_exists(path)
+        .map_err(|e| format!("Check path '{}': {}", path.display(), e))
+}
+
 fn collect_diff_paths(diff: &git2::Diff<'_>) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for delta in diff.deltas() {
@@ -447,6 +460,119 @@ fn worktree_git_dir(worktree_path: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Confirm that an existing path still contains the linked worktree identified
+/// by its Git metadata, rather than merely matching the path recorded by Git.
+fn registered_worktree_path_matches(
+    repo: &Repository,
+    worktree: &git2::Worktree,
+    path: &Path,
+) -> bool {
+    if !paths_match(worktree.path(), path) {
+        return false;
+    }
+
+    let Some(name) = worktree.name() else {
+        return false;
+    };
+    let Ok(worktree_repo) = Repository::open(path) else {
+        return false;
+    };
+    let Ok(actual_git_dir) = std::fs::canonicalize(worktree_repo.path()) else {
+        return false;
+    };
+    let expected_git_dir = repo.commondir().join("worktrees").join(name);
+    let Ok(expected_git_dir) = std::fs::canonicalize(expected_git_dir) else {
+        return false;
+    };
+
+    paths_match(&actual_git_dir, &expected_git_dir) && worktree_git_link(path).is_some()
+}
+
+fn worktree_git_link(worktree_path: &Path) -> Option<Vec<u8>> {
+    let git_entry = worktree_path.join(".git");
+    let metadata = std::fs::symlink_metadata(&git_entry).ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    let contents = std::fs::read(git_entry).ok()?;
+    contents
+        .split(|byte| *byte == b'\n')
+        .any(|line| line.starts_with(b"gitdir:"))
+        .then_some(contents)
+}
+
+fn worktree_staging_path(path: &Path) -> std::io::Result<PathBuf> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "worktree".into());
+
+    for attempt in 0..100 {
+        let candidate = parent.join(format!(
+            ".{}.git-manager-removing-{}-{}",
+            name,
+            std::process::id(),
+            attempt
+        ));
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(candidate),
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not find an unused worktree staging path",
+    ))
+}
+
+fn remove_worktree_directory(
+    path: &Path,
+    force: bool,
+    expected_git_link: &[u8],
+) -> std::io::Result<()> {
+    let staging_path = worktree_staging_path(path)?;
+    std::fs::rename(path, &staging_path)?;
+
+    if worktree_git_link(&staging_path).as_deref() != Some(expected_git_link) {
+        let restore_result = std::fs::rename(&staging_path, path);
+        if let Err(restore_error) = restore_result {
+            return Err(std::io::Error::new(
+                restore_error.kind(),
+                format!(
+                    "directory identity changed before removal; restore failed: {}",
+                    restore_error
+                ),
+            ));
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "directory identity changed before removal",
+        ));
+    }
+
+    let is_registered = || worktree_git_link(&staging_path).as_deref() == Some(expected_git_link);
+    let result = if force {
+        force_remove_dir_checked(&staging_path, is_registered)
+    } else {
+        remove_dir_checked(&staging_path, is_registered)
+    };
+
+    if let Err(error) = result {
+        if let Err(restore_error) = std::fs::rename(&staging_path, path) {
+            return Err(std::io::Error::new(
+                restore_error.kind(),
+                format!("{}; restore failed: {}", error, restore_error),
+            ));
+        }
+        return Err(error);
+    }
+
+    Ok(())
+}
+
 /// Find a worktree whose `.git` entry points to the shared git directory.
 ///
 /// This covers `--separate-git-dir` repositories, where the common git
@@ -518,6 +644,22 @@ fn main_worktree_path(repo: &Repository) -> GitResult<PathBuf> {
     Err("Unable to determine the main worktree path".into())
 }
 
+fn remove_dir_checked<F>(path: &Path, is_safe: F) -> std::io::Result<()>
+where
+    F: Fn() -> bool,
+{
+    if !path_entry_exists(path)? {
+        return Ok(());
+    }
+    if !is_safe() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "directory identity changed before removal",
+        ));
+    }
+    std::fs::remove_dir_all(path)
+}
+
 /// Forcefully remove a directory, with OS-level fallback.
 ///
 /// Used ONLY by Force Remove — regular Remove uses a single gentle attempt.
@@ -529,13 +671,32 @@ fn main_worktree_path(repo: &Repository) -> GitResult<PathBuf> {
 ///    the delete commands themselves are synchronous and take as long as needed
 /// 4. If the path no longer exists at the end, consider it success
 fn force_remove_dir(path: &Path) -> std::io::Result<()> {
-    if !path.exists() {
+    force_remove_dir_checked(path, || true)
+}
+
+/// Forcefully remove a directory only while a caller-provided identity check
+/// continues to confirm that it is safe to remove.
+fn force_remove_dir_checked<F>(path: &Path, is_safe: F) -> std::io::Result<()>
+where
+    F: Fn() -> bool,
+{
+    if !path_entry_exists(path)? {
         return Ok(());
     }
 
     let mut last_err = None;
 
     for _ in 0..2 {
+        if !path_entry_exists(path)? {
+            return Ok(());
+        }
+        if !is_safe() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "directory identity changed before removal",
+            ));
+        }
+
         // Try standard remove_dir_all (synchronous — blocks until files are deleted)
         match std::fs::remove_dir_all(path) {
             Ok(()) => return Ok(()),
@@ -549,7 +710,13 @@ fn force_remove_dir(path: &Path) -> std::io::Result<()> {
         // This command is also synchronous — it runs until the directory is gone or fails.
         #[cfg(windows)]
         {
-            if path.exists() {
+            if path_entry_exists(path)? {
+                if !is_safe() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "directory identity changed before removal",
+                    ));
+                }
                 let _ = std::process::Command::new("cmd.exe")
                     .args(["/c", "rmdir", "/s", "/q", &path.to_string_lossy()])
                     .output();
@@ -557,11 +724,12 @@ fn force_remove_dir(path: &Path) -> std::io::Result<()> {
         }
 
         // Check if it's gone after the fallback
-        if !path.exists() {
+        if !path_entry_exists(path)? {
             return Ok(());
         }
         // No sleep — the delete commands are already synchronous and may take
-        // significant time for large worktrees.
+        // significant time for large worktrees. The next iteration rechecks
+        // the directory identity before trying again.
     }
 
     // Return the last error if path still exists
@@ -573,15 +741,13 @@ fn force_remove_dir(path: &Path) -> std::io::Result<()> {
 /// Check if a path exists and contains any files (not just the directory entry itself).
 /// Returns true only if the directory actually has content.
 fn dir_has_content(path: &Path) -> bool {
-    if !path.exists() {
-        return false;
-    }
-    // read_dir succeeds and has at least one entry → has content
-    if let Ok(mut entries) = std::fs::read_dir(path) {
-        entries.next().is_some()
-    } else {
-        // Can't even read the directory, treat as "has content" to be safe
-        true
+    match std::fs::read_dir(path) {
+        Ok(mut entries) => entries.next().is_some(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => {
+            // Can't read the directory, treat it as containing content to be safe.
+            true
+        }
     }
 }
 
@@ -1058,9 +1224,20 @@ impl GitRepo {
             }
         }
 
+        // Never delete an existing path unless Git confirms that it is a
+        // registered linked worktree. This protects the main repository,
+        // unrelated directories, and paths replaced after a stale selection.
+        if let Some(ref wt) = found_wt {
+            if path_exists(path)? && !registered_worktree_path_matches(&repo, wt, path) {
+                return Err("Cannot remove path because it is no longer the registered worktree.".into());
+            }
+        } else if path_exists(path)? {
+            return Err("Cannot remove path that is not a registered worktree.".into());
+        }
+
         // Regular removal must not discard uncommitted work. Check the
         // worktree before pruning metadata or deleting its directory.
-        if !force && path.exists() {
+        if !force && path_exists(path)? {
             let worktree_repo = Repository::open(path)
                 .map_err(|e| format!("Check worktree status: {}", e))?;
             let mut status_opts = git2::StatusOptions::new();
@@ -1078,57 +1255,81 @@ impl GitRepo {
             }
         }
 
-        // Attempt pruning with manual fallback for metadata cleanup
-        if let Some(ref wt) = found_wt {
-            let prune_result = if force {
-                let mut opts = WorktreePruneOptions::new();
-                opts.valid(true);       // Prune even if the worktree is valid
-                opts.locked(true);      // Prune even if locked
-                opts.working_tree(true); // Recursively remove the working tree directory
-                wt.prune(Some(&mut opts))
-            } else {
-                wt.prune(None)
-            };
+        // --- Directory cleanup: different strategy for Remove vs Force Remove ---
+        let directory_removed = if path_exists(path)? {
+            let path_is_registered = found_wt
+                .as_ref()
+                .map(|wt| registered_worktree_path_matches(&repo, wt, path))
+                .unwrap_or(false);
+            if !path_is_registered {
+                return Err("Cannot remove path because it is no longer a registered worktree.".into());
+            }
 
-            if let Err(e) = prune_result {
-                errors.push(if force { format!("Prune: {}", e) } else { format!("Remove: {}", e) });
-                // Fallback: clean up git metadata manually since prune refused
-                if let Some(name) = wt.name() {
-                    let wt_gitdir = repo.commondir().join("worktrees").join(name);
-                    if wt_gitdir.exists() {
-                        if let Err(e) = std::fs::remove_dir_all(&wt_gitdir) {
-                            errors.push(format!("Remove git metadata: {}", e));
+            let Some(expected_git_link) = worktree_git_link(path) else {
+                return Err("Cannot remove path because its worktree metadata link is unavailable.".into());
+            };
+            match remove_worktree_directory(path, force, &expected_git_link) {
+                Ok(()) => true,
+                Err(e) => {
+                    errors.push(format!("Rm dir: {}", e));
+                    if !force && dir_has_content(path) {
+                        errors.push("Directory still contains files. Use Force Remove to delete it.".into());
+                    }
+                    false
+                }
+            }
+        } else {
+            true
+        };
+
+        // Prune only Git's worktree metadata. The directory was removed above
+        // only after validating its .git link, so libgit2 must not recursively
+        // delete the working tree itself from stale metadata.
+        if directory_removed {
+            if let Some(ref wt) = found_wt {
+                let prune_result = if force {
+                    let mut opts = WorktreePruneOptions::new();
+                    opts.valid(true); // Prune even if the worktree is valid
+                    opts.locked(true); // Prune even if locked
+                    wt.prune(Some(&mut opts))
+                } else {
+                    wt.prune(None)
+                };
+
+                if let Err(e) = prune_result {
+                    if force {
+                        // Force removal may also remove locked metadata after
+                        // the working tree has been deleted successfully.
+                        if let Some(name) = wt.name() {
+                            let wt_gitdir = repo.commondir().join("worktrees").join(name);
+                            match path_entry_exists(&wt_gitdir) {
+                                Ok(true) => {
+                                    if let Err(fallback_error) = std::fs::remove_dir_all(&wt_gitdir) {
+                                        errors.push(format!("Prune: {}; Remove git metadata: {}", e, fallback_error));
+                                    }
+                                }
+                                Ok(false) => {}
+                                Err(check_error) => errors.push(format!("Prune: {}; Check git metadata: {}", e, check_error)),
+                            }
+                        } else {
+                            errors.push(format!("Prune: {}", e));
                         }
+                    } else {
+                        // A normal removal must respect Git's lock refusal;
+                        // do not delete metadata behind libgit2's back.
+                        errors.push(format!("Remove: {}", e));
                     }
                 }
             }
         }
 
-        // --- Directory cleanup: different strategy for Remove vs Force Remove ---
-        if force {
-            // Force Remove: aggressive — retries + OS-level fallback
-            if path.exists() {
-                if let Err(e) = force_remove_dir(path) {
-                    errors.push(format!("Rm dir: {}", e));
-                }
-            }
-        } else {
-            // Regular Remove: gentle — one attempt, no force fallback
-            if path.exists() {
-                if let Err(e) = std::fs::remove_dir_all(path) {
-                    errors.push(format!("Rm dir: {}", e));
-                }
-            }
-            // If directory still has content after gentle attempt, tell the user
-            if dir_has_content(path) {
-                errors.push("Directory still contains files. Use Force Remove to delete it.".into());
-            }
-        }
-
         // If directory no longer has content, consider it a success
         // (primary user concern is getting rid of the files on disk)
-        if !dir_has_content(path) {
+        if directory_removed && errors.is_empty() && !dir_has_content(path) {
             return Ok(());
+        }
+        if errors.is_empty() {
+            errors.push("Directory still exists after removal attempt.".into());
         }
 
         // Everything we tried failed — report all errors
@@ -3156,6 +3357,149 @@ mod tests {
     }
 
     #[test]
+    fn test_force_remove_rejects_unregistered_main_worktree() {
+        let main_dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(main_dir.path());
+        commit_file(&repo, "important.txt", "keep this repository", "add important file");
+        drop(repo);
+
+        let git = open_git_repo(main_dir.path());
+        let result = git.remove_worktree(main_dir.path(), true);
+
+        assert!(result.is_err(), "Force remove must reject an unregistered path");
+        assert!(main_dir.path().exists(), "The main repository directory must be preserved");
+        assert!(
+            main_dir.path().join("important.txt").exists(),
+            "Files in the main repository must be preserved"
+        );
+    }
+
+    #[test]
+    fn test_normal_remove_rejects_clean_unrelated_repository() {
+        let main_dir = tempfile::tempdir().expect("main temp dir");
+        create_repo_with_commit(main_dir.path());
+
+        let unrelated_dir = tempfile::tempdir().expect("unrelated temp dir");
+        let unrelated_repo = create_repo_with_commit(unrelated_dir.path());
+        commit_file(
+            &unrelated_repo,
+            "important.txt",
+            "keep this unrelated repository",
+            "add important file",
+        );
+        drop(unrelated_repo);
+
+        let git = open_git_repo(main_dir.path());
+        let result = git.remove_worktree(unrelated_dir.path(), false);
+
+        assert!(result.is_err(), "Normal remove must reject an unregistered path");
+        assert!(
+            unrelated_dir.path().exists(),
+            "The unrelated repository directory must be preserved"
+        );
+        assert!(
+            unrelated_dir.path().join("important.txt").exists(),
+            "Files in the unrelated repository must be preserved"
+        );
+    }
+
+    #[test]
+    fn test_remove_worktree_rejects_replaced_worktree_path() {
+        for force in [false, true] {
+            let main_dir = tempfile::tempdir().expect("main temp dir");
+            let wt_root = tempfile::tempdir().expect("worktree temp dir");
+            let wt_path = wt_root.path().join("replaced-wt");
+
+            let repo = create_repo_with_commit(main_dir.path());
+            let wt_name = "replaced-wt";
+            let commit = repo.head().expect("head").peel_to_commit().expect("commit");
+            let branch = repo.branch(wt_name, &commit, false).expect("branch");
+            let reference = repo
+                .find_reference(&format!("refs/heads/{}", wt_name))
+                .expect("reference");
+            let mut opts = git2::WorktreeAddOptions::new();
+            opts.reference(Some(&reference));
+            repo.worktree(wt_name, &wt_path, Some(&opts)).expect("create worktree");
+            drop(reference);
+            drop(branch);
+            drop(commit);
+
+            std::fs::remove_dir_all(&wt_path).expect("remove original worktree directory");
+            let replacement = create_repo_with_commit(&wt_path);
+            commit_file(
+                &replacement,
+                "important.txt",
+                "keep this replacement repository",
+                "add important file",
+            );
+            drop(replacement);
+            drop(repo);
+
+            let git = open_git_repo(main_dir.path());
+            let result = git.remove_worktree(&wt_path, force);
+
+            assert!(
+                result.is_err(),
+                "Removal must reject a path whose contents no longer identify the registered worktree"
+            );
+            assert!(wt_path.exists(), "The replacement repository must be preserved");
+            assert!(
+                wt_path.join("important.txt").exists(),
+                "Files in the replacement repository must be preserved"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_worktree_git_link_preserves_non_utf8_path_bytes() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let contents = b"gitdir: /tmp/g\xffit\n".to_vec();
+        std::fs::write(dir.path().join(".git"), &contents).expect("write gitdir file");
+
+        assert_eq!(worktree_git_link(dir.path()), Some(contents));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_remove_worktree_rejects_dangling_symlink_path() {
+        use std::os::unix::fs::symlink;
+
+        let main_dir = tempfile::tempdir().expect("main temp dir");
+        let wt_root = tempfile::tempdir().expect("worktree temp dir");
+        let wt_path = wt_root.path().join("dangling-wt");
+        let missing_target = wt_root.path().join("missing-target");
+
+        let repo = create_repo_with_commit(main_dir.path());
+        let wt_name = "dangling-wt";
+        let commit = repo.head().expect("head").peel_to_commit().expect("commit");
+        let branch = repo.branch(wt_name, &commit, false).expect("branch");
+        let reference = repo
+            .find_reference(&format!("refs/heads/{}", wt_name))
+            .expect("reference");
+        let mut opts = git2::WorktreeAddOptions::new();
+        opts.reference(Some(&reference));
+        repo.worktree(wt_name, &wt_path, Some(&opts)).expect("create worktree");
+        let wt_gitdir = repo.commondir().join("worktrees").join(wt_name);
+        drop(reference);
+        drop(branch);
+        drop(commit);
+        std::fs::remove_dir_all(&wt_path).expect("remove original worktree directory");
+        symlink(&missing_target, &wt_path).expect("create dangling symlink");
+        drop(repo);
+
+        let git = open_git_repo(main_dir.path());
+        let result = git.remove_worktree(&wt_path, true);
+
+        assert!(result.is_err(), "Removal must reject a dangling worktree path");
+        assert!(
+            std::fs::symlink_metadata(&wt_path).is_ok(),
+            "The dangling symlink must be preserved"
+        );
+        assert!(wt_gitdir.exists(), "Worktree metadata must be preserved");
+    }
+
+    #[test]
     fn test_force_remove_valid_worktree() {
         let main_dir = tempfile::tempdir().expect("temp dir");
         let wt_root = tempfile::tempdir().expect("temp dir");
@@ -3249,7 +3593,7 @@ mod tests {
     }
 
     #[test]
-    fn test_normal_remove_valid_with_fallback_succeeds() {
+    fn test_normal_remove_valid_succeeds() {
         let main_dir = tempfile::tempdir().expect("temp dir");
         let wt_root = tempfile::tempdir().expect("temp dir");
         let wt_path = wt_root.path().join("test-wt-normal");
@@ -3267,8 +3611,7 @@ mod tests {
 
         let wt_gitdir = repo.path().join("worktrees").join(wt_name);
 
-        // Normal remove should succeed now with our improved implementation
-        // (it falls back to manual cleanup when prune refuses)
+        // Normal remove should delete the directory before pruning its metadata.
         let git = open_git_repo(main_dir.path());
         let result = git.remove_worktree(&wt_path, false);
         assert!(result.is_ok(), "Normal remove should succeed with fallback: {:?}", result);
