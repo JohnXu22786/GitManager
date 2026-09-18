@@ -1,5 +1,5 @@
 use crate::app::App;
-use crate::git_ops::GitOperation;
+use crate::git_ops::{GitOperation, RemoteInfo};
 use eframe::egui;
 
 fn initialize_push_branch(
@@ -14,6 +14,17 @@ fn initialize_push_branch(
         } else {
             *push_branch = current_branch.to_owned();
         }
+    }
+}
+
+fn initialize_remote_name(
+    remote_name: &mut String,
+    default_remote: &str,
+    remote_list: &[RemoteInfo],
+    user_edited: bool,
+) {
+    if !user_edited && !remote_list.iter().any(|remote| remote.name == remote_name.as_str()) {
+        *remote_name = default_remote.to_owned();
     }
 }
 
@@ -73,16 +84,21 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         head_is_detached,
         app.push_branch_user_edited,
     );
-    if !app.remote_list.iter().any(|remote| remote.name == app.remote_name) {
-        app.remote_name = default_remote.clone();
-    }
+    initialize_remote_name(
+        &mut app.remote_name,
+        &default_remote,
+        &app.remote_list,
+        app.remote_name_user_edited,
+    );
 
     let busy = app.is_busy();
 
     ui.heading("Push");
     ui.horizontal(|ui| {
         ui.label("Remote:");
-        ui.text_edit_singleline(&mut app.remote_name);
+        if ui.text_edit_singleline(&mut app.remote_name).changed() {
+            app.remote_name_user_edited = true;
+        }
     });
     ui.horizontal(|ui| {
         ui.label("Branch:");
@@ -141,6 +157,7 @@ mod tests {
     use super::show;
     use crate::app::App;
     use crate::git_ops::RemoteInfo;
+    use crate::recent::RecentRepos;
     use eframe::egui;
     use git2::Repository;
     use std::path::Path;
@@ -148,7 +165,11 @@ mod tests {
 
     fn create_repo_with_commit(dir: &Path) -> Repository {
         let repo = Repository::init(dir).expect("init repo");
-        let signature = repo.signature().expect("signature");
+        let signature = git2::Signature::now(
+            "Git Manager Test",
+            "git-manager-test@example.com",
+        )
+        .expect("signature");
         let tree_oid = {
             let mut index = repo.index().expect("index");
             index.write_tree().expect("write tree")
@@ -161,17 +182,49 @@ mod tests {
     }
 
     fn show_panel(app: &mut App, ctx: &egui::Context) {
+        show_panel_with_events(app, ctx, Vec::new());
+    }
+
+    fn show_panel_with_events(
+        app: &mut App,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) {
         let _ = ctx.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::pos2(0.0, 0.0),
                     egui::vec2(800.0, 600.0),
                 )),
+                events,
                 ..Default::default()
             },
             |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    show(app, ui, ctx);
+                    egui::ScrollArea::horizontal()
+                        .id_salt("tab_bar_scroll")
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                for label in [
+                                    "📊 Status",
+                                    "🔀 Branches",
+                                    "📂 Worktrees",
+                                    "📋 Log",
+                                    "📦 Stash",
+                                    "🌐 Remotes",
+                                ] {
+                                    ui.add(egui::Button::new(label));
+                                }
+                            });
+                        });
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .id_salt("main_content_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            show(app, ui, ctx);
+                            ui.allocate_space(ui.available_size());
+                        });
                 });
             },
         );
@@ -238,6 +291,54 @@ mod tests {
     }
 
     #[test]
+    fn preserves_partially_typed_remote_name_when_user_edited() {
+        let mut app = App::new();
+        app.remote_list = vec![
+            RemoteInfo {
+                name: "origin".to_string(),
+                url: "https://example.com/origin.git".to_string(),
+            },
+            RemoteInfo {
+                name: "upstream".to_string(),
+                url: "https://example.com/upstream.git".to_string(),
+            },
+        ];
+        app.remote_name = String::from("origin");
+        let recent_repos_dir = tempfile::tempdir_in(".").expect("recent repos temp dir");
+        app.recent_repos = RecentRepos::load_from(recent_repos_dir.path().join("recent.json"));
+        let ctx = egui::Context::default();
+
+        for _ in 0..12 {
+            show_panel_with_events(
+                &mut app,
+                &ctx,
+                vec![egui::Event::Key {
+                    key: egui::Key::Tab,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            show_panel_with_events(
+                &mut app,
+                &ctx,
+                vec![egui::Event::Text("u".to_string())],
+            );
+            if app.remote_name_user_edited {
+                break;
+            }
+        }
+
+        assert!(app.remote_name_user_edited);
+        assert_eq!(app.remote_name, "originu");
+
+        show_panel(&mut app, &ctx);
+
+        assert_eq!(app.remote_name, "originu");
+    }
+
+    #[test]
     fn panel_updates_untouched_default_after_branch_change() {
         let repo_dir = tempfile::tempdir_in(".").expect("temp dir");
         let repo = create_repo_with_commit(repo_dir.path());
@@ -266,24 +367,69 @@ mod tests {
         assert_eq!(app.push_branch, "feature");
     }
 
+    fn create_repo_with_remote(dir: &Path, name: &str, url: &str) -> Repository {
+        let repo = create_repo_with_commit(dir);
+        repo.remote(name, url).expect("create remote");
+        repo
+    }
+
     #[test]
-    fn panel_replaces_stale_remote_after_repository_switch() {
+    fn panel_resets_remote_selection_after_repository_switch() {
+        let first_repo_dir = tempfile::tempdir_in(".").expect("first temp dir");
+        let first_repo = create_repo_with_remote(
+            first_repo_dir.path(),
+            "upstream",
+            "https://example.com/upstream.git",
+        );
+        drop(first_repo);
+
+        let second_repo_dir = tempfile::tempdir_in(".").expect("second temp dir");
+        let second_repo = create_repo_with_remote(
+            second_repo_dir.path(),
+            "origin",
+            "https://example.com/origin.git",
+        );
+        drop(second_repo);
+
         let mut app = App::new();
+        let recent_repos_dir = tempfile::tempdir_in(".").expect("recent repos temp dir");
+        app.recent_repos = RecentRepos::load_from(recent_repos_dir.path().join("recent.json"));
         let ctx = egui::Context::default();
 
-        app.remote_list = vec![RemoteInfo {
-            name: "upstream".to_string(),
-            url: "https://example.com/upstream.git".to_string(),
-        }];
+        app.open_repo(first_repo_dir.path().to_str().expect("first repo path"));
         show_panel(&mut app, &ctx);
         assert_eq!(app.remote_name, "upstream");
+        app.remote_name_user_edited = true;
 
-        app.remote_list = vec![RemoteInfo {
-            name: "origin".to_string(),
-            url: "https://example.com/origin.git".to_string(),
-        }];
+        app.open_repo(second_repo_dir.path().to_str().expect("second repo path"));
+        assert!(!app.remote_name_user_edited);
         show_panel(&mut app, &ctx);
 
         assert_eq!(app.remote_name, "origin");
+    }
+
+    #[test]
+    fn panel_preserves_edited_remote_name_after_refresh() {
+        let repo_dir = tempfile::tempdir_in(".").expect("temp dir");
+        let repo = create_repo_with_remote(
+            repo_dir.path(),
+            "origin",
+            "https://example.com/origin.git",
+        );
+        drop(repo);
+
+        let mut app = App::new();
+        let recent_repos_dir = tempfile::tempdir_in(".").expect("recent repos temp dir");
+        app.recent_repos = RecentRepos::load_from(recent_repos_dir.path().join("recent.json"));
+        app.open_repo(repo_dir.path().to_str().expect("repo path"));
+        let ctx = egui::Context::default();
+        show_panel(&mut app, &ctx);
+
+        app.remote_name = String::from("ori");
+        app.remote_name_user_edited = true;
+        app.refresh_all();
+        show_panel(&mut app, &ctx);
+
+        assert_eq!(app.remote_name, "ori");
     }
 }
