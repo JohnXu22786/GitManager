@@ -1440,6 +1440,9 @@ mod tests {
         app.recent_repos = RecentRepos::load_from(recent_file.path().to_path_buf());
         app.open_repo(old_repo.path().to_str().expect("old repo path"));
 
+        let old_generation = app.repo_generation;
+        app.open_repo(new_repo.path().to_str().expect("new repo path"));
+
         let (tx, rx) = mpsc::channel();
         tx.send(OpResult::RefreshData {
             status_entries: Vec::new(),
@@ -1454,7 +1457,7 @@ mod tests {
         app.pending_ops.push(PendingOp {
             description: "Refreshing".to_string(),
             receiver: rx,
-            repo_generation: app.repo_generation,
+            repo_generation: old_generation,
             started_at: Instant::now(),
             progress: Arc::new(Mutex::new(String::new())),
             last_progress_update: Instant::now(),
@@ -1462,7 +1465,6 @@ mod tests {
             timed_out: false,
         });
 
-        app.open_repo(new_repo.path().to_str().expect("new repo path"));
         app.process_pending_ops(&egui::Context::default());
 
         assert_eq!(app.repo_path, new_repo.path().to_string_lossy());
@@ -1585,10 +1587,12 @@ mod tests {
         app.pending_ops.push(PendingOp {
             description: "Fetching".to_string(),
             receiver,
+            repo_generation: app.repo_generation,
             started_at: Instant::now(),
             progress: Arc::new(Mutex::new(String::new())),
             last_progress_update: Instant::now(),
             last_seen_progress: String::new(),
+            timed_out: false,
         });
 
         app.open_repo(&second_path);
