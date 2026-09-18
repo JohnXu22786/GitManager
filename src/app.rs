@@ -335,8 +335,14 @@ impl App {
                 self.push_branch_user_edited = false;
                 self.status_message = format!("Opened repository at {}", path);
                 self.status_is_error = false;
-                self.recent_repos.add(path);
                 self.refresh_all();
+                if let Err(error) = self.recent_repos.add(path) {
+                    self.status_message = format!(
+                        "Opened repository at {} (failed to save recent history: {})",
+                        path, error
+                    );
+                    self.status_is_error = true;
+                }
             }
             Err(e) => {
                 self.status_message = format!("Failed to open repo: {}", e);
@@ -794,9 +800,13 @@ impl eframe::App for App {
                                     }
                                 });
                             }
-                            if let Some(idx) = to_delete {
-                                self.recent_repos.remove(idx);
+                        if let Some(idx) = to_delete {
+                            if let Err(error) = self.recent_repos.remove(idx) {
+                                self.status_message =
+                                    format!("Failed to save recent history: {}", error);
+                                self.status_is_error = true;
                             }
+                        }
                         }
                     });
                 });
@@ -1057,7 +1067,11 @@ impl eframe::App for App {
                                 }
                             });
                         if let Some(idx) = to_delete {
-                            self.recent_repos.remove(idx);
+                            if let Err(error) = self.recent_repos.remove(idx) {
+                                self.status_message =
+                                    format!("Failed to save recent history: {}", error);
+                                self.status_is_error = true;
+                            }
                         }
                     }
                 });
