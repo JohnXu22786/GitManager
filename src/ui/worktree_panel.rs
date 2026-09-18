@@ -177,11 +177,21 @@ fn show_worktree_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, wt: 
                 ui.add_space(4.0);
                 ui.menu_button("…", |ui| {
                     if ui.add_enabled(!busy, egui::Button::new("Remove")).clicked() {
-                        app.start_operation(ctx, &format!("Remove {:?}", wt_path), GitOperation::RemoveWorktree { path: wt_path.clone(), force: false });
+                        app.start_operation(ctx, &format!("Remove {:?}", wt_path), GitOperation::RemoveWorktree {
+                            path: wt_path.clone(),
+                            force: false,
+                            expected_git_link: wt.git_link_identity.clone(),
+                            require_git_link_identity: true,
+                        });
                         ui.close_menu();
                     }
                     if ui.add_enabled(!busy, egui::Button::new("Force Remove")).clicked() {
-                        app.start_operation(ctx, &format!("Force remove {:?}", wt_path), GitOperation::RemoveWorktree { path: wt_path.clone(), force: true });
+                        app.start_operation(ctx, &format!("Force remove {:?}", wt_path), GitOperation::RemoveWorktree {
+                            path: wt_path.clone(),
+                            force: true,
+                            expected_git_link: wt.git_link_identity.clone(),
+                            require_git_link_identity: true,
+                        });
                         ui.close_menu();
                     }
                 });
