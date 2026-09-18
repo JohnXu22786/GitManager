@@ -20,6 +20,29 @@ pub struct RecentRepos {
     file_path: PathBuf,
 }
 
+/// Return the final path component for either Unix or Windows-style paths.
+///
+/// Repository paths can be restored on a different platform than the one that
+/// created them, so `std::path::Path` alone cannot recognize every separator.
+pub(crate) fn path_name(path: &str) -> String {
+    if path.is_empty() {
+        return String::new();
+    }
+
+    let trimmed = path.trim_end_matches(|separator| {
+        separator == '/' || separator == '\\'
+    });
+    if trimmed.is_empty() {
+        return path.to_string();
+    }
+
+    trimmed
+        .rsplit(|separator| separator == '/' || separator == '\\')
+        .next()
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
 impl RecentRepos {
     /// Loads recent repos from the config file, or returns an empty list.
     pub fn load() -> Self {
@@ -49,10 +72,7 @@ impl RecentRepos {
         // Remove existing entry with same path (deduplicate)
         self.entries.retain(|e| e.path != path);
 
-        let name = PathBuf::from(path)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| path.to_string());
+        let name = path_name(path);
 
         let last_opened = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
@@ -225,8 +245,10 @@ mod tests {
         let mut repos = RecentRepos::load_from(p.clone());
 
         repos.add("/home/user/projects/my-repo").unwrap();
+        repos.add("C:\\Users\\test\\my-project\\").unwrap();
 
-        assert_eq!(repos.entries()[0].name, "my-repo");
+        assert_eq!(repos.entries()[0].name, "my-project");
+        assert_eq!(repos.entries()[1].name, "my-repo");
         let _ = fs::remove_file(&p);
     }
 

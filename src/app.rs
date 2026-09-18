@@ -1,5 +1,5 @@
 use crate::git_ops::*;
-use crate::recent::RecentRepos;
+use crate::recent::{path_name, RecentRepos};
 use crate::updater::{self, UpdateState};
 use eframe::egui;
 use std::path::Path;
@@ -644,13 +644,7 @@ impl App {
     /// Returns the project folder name extracted from the repo path.
     /// e.g. "/home/user/projects/my-repo" → "my-repo"
     pub fn repo_name(&self) -> String {
-        if self.repo_path.is_empty() {
-            return String::new();
-        }
-        std::path::Path::new(&self.repo_path)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| self.repo_path.clone())
+        path_name(&self.repo_path)
     }
 
     /// Format elapsed seconds into a human-readable string.
@@ -1886,7 +1880,9 @@ mod tests {
     fn test_repo_name_extracts_last_path_component() {
         let cases = [
             ("C:\\Users\\me\\projects\\my-project", "my-project"),
+            ("C:\\Users\\me\\projects\\my-project\\", "my-project"),
             ("/home/user/projects/my-repo", "my-repo"),
+            ("/home/user/projects/my-repo/", "my-repo"),
             ("/a/b/c", "c"),
             ("just-a-name", "just-a-name"),
             ("", ""),

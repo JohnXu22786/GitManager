@@ -151,46 +151,53 @@ fn test_pending_op_tracking() {
 /// This simulates the logic used to display the project name next to the history button.
 #[test]
 fn test_project_name_extraction() {
-    use std::path::Path;
+    fn project_name(path: &str) -> String {
+        if path.is_empty() {
+            return String::new();
+        }
+
+        let trimmed = path.trim_end_matches(|separator| {
+            separator == '/' || separator == '\\'
+        });
+        if trimmed.is_empty() {
+            return path.to_string();
+        }
+
+        trimmed
+            .rsplit(|separator| separator == '/' || separator == '\\')
+            .next()
+            .unwrap_or(trimmed)
+            .to_string()
+    }
 
     // Normal path
     let path = "/home/user/projects/my-repo";
-    let name = Path::new(path)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.to_string());
+    let name = project_name(path);
     assert_eq!(name, "my-repo", "Should extract basename 'my-repo' from path");
 
     // Windows path
     let path = "C:\\Users\\test\\my-project";
-    let name = Path::new(path)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.to_string());
+    let name = project_name(path);
     assert_eq!(name, "my-project", "Should extract 'my-project' from Windows path");
+
+    // Windows path with a trailing separator
+    let path = "C:\\Users\\test\\my-project\\";
+    let name = project_name(path);
+    assert_eq!(name, "my-project", "Should ignore a trailing Windows separator");
 
     // Path with dots
     let path = "/home/user/my.project.repo";
-    let name = Path::new(path)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.to_string());
+    let name = project_name(path);
     assert_eq!(name, "my.project.repo", "Should handle dots in project name");
 
     // Root path (no filename)
     let path = "/";
-    let name = Path::new(path)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.to_string());
+    let name = project_name(path);
     assert_eq!(name, "/", "Should fall back to path for root");
 
     // Empty path
     let path = "";
-    let name = Path::new(path)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.to_string());
+    let name = project_name(path);
     assert_eq!(name, "", "Should handle empty path gracefully");
 }
 
