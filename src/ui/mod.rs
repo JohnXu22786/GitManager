@@ -162,7 +162,7 @@ pub fn column_header(
     painter.vline(
         header_rect.right(),
         header_rect.y_range(),
-        egui::Stroke::new(1.0, divider_color),
+        egui::Stroke::new(1.0_f32, divider_color),
     );
 
     // Change cursor on hover/drag
@@ -262,7 +262,7 @@ pub fn column_separator(ui: &mut egui::Ui) {
     ui.painter().vline(
         rect.left(),
         rect.y_range(),
-        egui::Stroke::new(1.0, divider_color),
+        egui::Stroke::new(1.0_f32, divider_color),
     );
 }
 
