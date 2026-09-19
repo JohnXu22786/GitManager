@@ -9,6 +9,7 @@ pub type GitResult<T> = Result<T, String>;
 #[derive(Clone, Debug)]
 pub struct WorktreeFileIdentity {
     metadata: std::fs::Metadata,
+    parent_metadata: std::fs::Metadata,
     contents: Vec<u8>,
 }
 
@@ -557,13 +558,18 @@ fn gitdir_link_value(contents: &[u8]) -> Option<&[u8]> {
 
 fn worktree_git_link_identity(worktree_path: &Path) -> Option<WorktreeFileIdentity> {
     let git_entry = worktree_path.join(".git");
+    let parent_metadata = std::fs::symlink_metadata(worktree_path).ok()?;
     let metadata = std::fs::symlink_metadata(&git_entry).ok()?;
     let file_type = metadata.file_type();
     if !file_type.is_file() && !file_type.is_symlink() {
         return None;
     }
     let contents = worktree_git_link(worktree_path)?;
-    Some(WorktreeFileIdentity { metadata, contents })
+    Some(WorktreeFileIdentity {
+        metadata,
+        parent_metadata,
+        contents,
+    })
 }
 
 fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
@@ -599,7 +605,9 @@ fn staged_worktree_link_matches(
     let Some(actual) = worktree_git_link_identity(staged_path) else {
         return false;
     };
-    same_file(&actual.metadata, &expected.metadata) && actual.contents == expected.contents
+    same_file(&actual.metadata, &expected.metadata)
+        && same_file(&actual.parent_metadata, &expected.parent_metadata)
+        && actual.contents == expected.contents
 }
 
 fn path_identity_matches(path: &Path, expected: &std::fs::Metadata) -> bool {
@@ -689,7 +697,17 @@ fn worktree_lock_identity(
         return Err("Check worktree lock: lock entry is not a regular file".into());
     }
     let contents = std::fs::read(&lock_path).map_err(|error| format!("Check worktree lock: {}", error))?;
-    Ok(Some(WorktreeFileIdentity { metadata, contents }))
+    let parent_metadata = std::fs::symlink_metadata(
+        lock_path
+            .parent()
+            .ok_or_else(|| "Check worktree lock: lock parent is unavailable".to_string())?,
+    )
+    .map_err(|error| format!("Check worktree lock: {}", error))?;
+    Ok(Some(WorktreeFileIdentity {
+        metadata,
+        parent_metadata,
+        contents,
+    }))
 }
 
 fn worktree_lock_status(repo: &Repository, worktree: &git2::Worktree) -> GitResult<git2::WorktreeLockStatus> {
@@ -731,7 +749,9 @@ fn worktree_lock_identity_matches(
     let Ok(Some(actual)) = worktree_lock_identity(repo, worktree) else {
         return false;
     };
-    same_file(&actual.metadata, &expected.metadata) && actual.contents == expected.contents
+    same_file(&actual.metadata, &expected.metadata)
+        && same_file(&actual.parent_metadata, &expected.parent_metadata)
+        && actual.contents == expected.contents
 }
 
 fn unlock_worktree_if_owned(
@@ -773,12 +793,15 @@ fn remove_worktree_directory(
             "directory identity changed before removal",
         ));
     }
-    let expected_git_link = worktree_git_link_identity(path).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "worktree metadata link is unavailable",
-        )
-    })?;
+    let expected_git_link = expected_git_link
+        .cloned()
+        .or_else(|| worktree_git_link_identity(path))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "worktree metadata link is unavailable",
+            )
+        })?;
     if !registered_worktree_path_matches(repo, worktree, path) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
@@ -808,20 +831,6 @@ fn remove_worktree_directory(
 
         let staging_path = worktree_staging_path(path)?;
         if let Err(rename_error) = std::fs::rename(path, &staging_path) {
-            if force {
-                let path_metadata = std::fs::symlink_metadata(path)?;
-                let is_safe = || path_identity_matches(path, &path_metadata);
-                if let Err(force_error) = force_remove_dir_checked(path, is_safe) {
-                    return Err(std::io::Error::new(
-                        force_error.kind(),
-                        format!(
-                            "{}; force cleanup fallback failed: {}",
-                            rename_error, force_error
-                        ),
-                    ));
-                }
-                return Ok(());
-            }
             return Err(rename_error);
         }
 
@@ -841,7 +850,9 @@ fn remove_worktree_directory(
             ));
         }
 
-        let is_safe = || staged_worktree_link_matches(&staging_path, &expected_git_link);
+        // A partial cleanup may remove .git before a retry, so guard the
+        // selected worktree directory directly.
+        let is_safe = || path_identity_matches(&staging_path, &expected_git_link.parent_metadata);
         let result = if force {
             force_remove_dir_checked(&staging_path, is_safe)
         } else {
@@ -3893,6 +3904,58 @@ mod tests {
             "Removal must reject an existing path when the listed identity was unavailable"
         );
         assert!(wt_path.exists(), "The replacement must remain after an unavailable snapshot");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_remove_worktree_rejects_hard_linked_git_link_after_selection() {
+        let main_dir = tempfile::tempdir().expect("main temp dir");
+        let wt_root = tempfile::tempdir().expect("worktree temp dir");
+        let attacker_root = tempfile::tempdir().expect("attacker temp dir");
+        let wt_path = wt_root.path().join("hard-linked-wt");
+        let saved_git_link = attacker_root.path().join("saved.git");
+
+        let repo = create_repo_with_commit(main_dir.path());
+        let wt_name = "hard-linked-wt";
+        let commit = repo.head().expect("head").peel_to_commit().expect("commit");
+        let branch = repo.branch(wt_name, &commit, false).expect("branch");
+        let reference = repo
+            .find_reference(&format!("refs/heads/{}", wt_name))
+            .expect("reference");
+        let mut opts = git2::WorktreeAddOptions::new();
+        opts.reference(Some(&reference));
+        repo.worktree(wt_name, &wt_path, Some(&opts)).expect("create worktree");
+        let wt_gitdir = repo.commondir().join("worktrees").join(wt_name);
+        drop(reference);
+        drop(branch);
+        drop(commit);
+        drop(repo);
+
+        let git = open_git_repo(main_dir.path());
+        let expected_identity = git
+            .worktrees()
+            .expect("list worktrees")
+            .into_iter()
+            .find(|worktree| worktree.path == wt_path)
+            .and_then(|worktree| worktree.git_link_identity)
+            .expect("capture git link identity");
+
+        std::fs::hard_link(wt_path.join(".git"), &saved_git_link).expect("save original git link");
+        std::fs::remove_dir_all(&wt_path).expect("remove original worktree directory");
+        std::fs::create_dir(&wt_path).expect("create replacement directory");
+        std::fs::hard_link(&saved_git_link, wt_path.join(".git")).expect("hard-link original git link");
+        std::fs::write(wt_path.join("important.txt"), "keep hard-link replacement")
+            .expect("write replacement file");
+
+        let result = git.remove_worktree_with_identity(&wt_path, true, Some(expected_identity), true);
+
+        assert!(result.is_err(), "Removal must reject a hard-linked replacement directory");
+        assert!(wt_path.exists(), "The hard-linked replacement must be preserved");
+        assert!(
+            wt_path.join("important.txt").exists(),
+            "Replacement files must be preserved"
+        );
+        assert!(wt_gitdir.exists(), "Registered worktree metadata must be preserved");
     }
 
     #[test]
