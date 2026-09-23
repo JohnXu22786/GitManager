@@ -2162,6 +2162,32 @@ impl GitRepo {
             let hc = repo.head().map_err(|e| format!("HEAD: {}", e))?
                 .peel_to_commit().map_err(|e| format!("Peel: {}", e))?;
 
+            if hc.id() == fc.id()
+                || repo.graph_descendant_of(hc.id(), fc.id())
+                    .map_err(|e| format!("Check ancestry: {}", e))?
+            {
+                return Ok("Already up to date".into());
+            }
+
+            if repo.graph_descendant_of(fc.id(), hc.id())
+                .map_err(|e| format!("Check ancestry: {}", e))?
+            {
+                let mut co = git2::build::CheckoutBuilder::new();
+                repo.checkout_tree(fc.as_object(), Some(&mut co))
+                    .map_err(|e| format!("Checkout fast-forward: {}", e))?;
+
+                let mut update_ref = repo
+                    .head()
+                    .map_err(|e| format!("HEAD: {}", e))?
+                    .resolve()
+                    .map_err(|e| format!("Resolve HEAD: {}", e))?;
+                update_ref
+                    .set_target(fc.id(), "Fast-forward pull")
+                    .map_err(|e| format!("Fast-forward HEAD: {}", e))?;
+
+                return Ok("Fast-forward complete".into());
+            }
+
             let base = repo.merge_base(hc.id(), fc.id())
                 .ok()
                 .and_then(|oid| repo.find_commit(oid).ok())
@@ -2170,7 +2196,7 @@ impl GitRepo {
             let ours = hc.tree().map_err(|e| format!("Tree: {}", e))?;
             let theirs = fc.tree().map_err(|e| format!("Tree: {}", e))?;
 
-        let mut idx = if let Some(ancestor) = base.as_ref() {
+            let mut idx = if let Some(ancestor) = base.as_ref() {
                 repo.merge_trees(ancestor, &ours, &theirs, None::<&git2::MergeOptions>)
                     .map_err(|e| format!("Merge: {}", e))?
             } else {
@@ -2320,6 +2346,43 @@ mod tests {
             .expect("push remote commit");
 
         (local_dir, remote_dir, branch, local_commit, remote_commit)
+    }
+
+    fn setup_pull_repository() -> (tempfile::TempDir, tempfile::TempDir, String, git2::Oid) {
+        let local_dir = tempfile::tempdir().expect("local temp dir");
+        let local_repo = create_repo_with_commit(local_dir.path());
+        let branch = local_repo
+            .head()
+            .expect("HEAD")
+            .shorthand()
+            .expect("branch name")
+            .to_string();
+        let base_commit = local_repo
+            .head()
+            .expect("HEAD")
+            .target()
+            .expect("base commit");
+
+        let remote_dir = tempfile::tempdir().expect("remote temp dir");
+        let remote_repo = Repository::init_bare(remote_dir.path()).expect("init bare repo");
+        remote_repo
+            .reference_symbolic(
+                "HEAD",
+                &format!("refs/heads/{}", branch),
+                true,
+                "set remote HEAD",
+            )
+            .expect("set remote HEAD");
+        let remote_url = local_remote_url(remote_dir.path());
+        let mut origin = local_repo.remote("origin", &remote_url).expect("add origin");
+        let refspec = format!("refs/heads/{0}:refs/heads/{0}", branch);
+        origin.push(&[refspec.as_str()], None).expect("push base");
+
+        drop(origin);
+        drop(remote_repo);
+        drop(local_repo);
+
+        (local_dir, remote_dir, branch, base_commit)
     }
 
     fn setup_push_repository() -> (tempfile::TempDir, tempfile::TempDir, String, git2::Oid) {
@@ -2534,6 +2597,53 @@ mod tests {
         assert!(
             !repo.index().expect("index").has_conflicts(),
             "abort should clear rebase conflicts"
+        );
+    }
+
+    #[test]
+    fn test_pull_non_rebase_does_not_create_commit_when_already_up_to_date() {
+        let (local_dir, _remote_dir, branch, base_commit) = setup_pull_repository();
+        let git = open_git_repo(local_dir.path());
+
+        git.pull("origin", &branch, false, Arc::new(Mutex::new(String::new())))
+            .expect("no-op pull");
+
+        let repo = Repository::open(local_dir.path()).expect("reopen local repo");
+        let head = repo.head().expect("HEAD").peel_to_commit().expect("HEAD commit");
+        assert_eq!(head.id(), base_commit, "no-op pull must not create a commit");
+        assert_eq!(head.parent_count(), 0, "no-op pull must preserve the existing history");
+    }
+
+    #[test]
+    fn test_pull_non_rebase_fast_forwards_without_merge_commit() {
+        let (local_dir, remote_dir, branch, base_commit) = setup_pull_repository();
+        let remote_clone_dir = tempfile::tempdir().expect("remote clone dir");
+        let remote_clone = Repository::clone(
+            &local_remote_url(remote_dir.path()),
+            remote_clone_dir.path(),
+        )
+        .expect("clone remote");
+        let remote_commit = commit_file(&remote_clone, "remote.txt", "remote\n", "remote change");
+        let mut remote_origin = remote_clone.find_remote("origin").expect("find origin");
+        let refspec = format!("refs/heads/{0}:refs/heads/{0}", branch);
+        remote_origin
+            .push(&[refspec.as_str()], None)
+            .expect("push remote commit");
+        drop(remote_origin);
+        drop(remote_clone);
+
+        let git = open_git_repo(local_dir.path());
+        git.pull("origin", &branch, false, Arc::new(Mutex::new(String::new())))
+            .expect("fast-forward pull");
+
+        let repo = Repository::open(local_dir.path()).expect("reopen local repo");
+        let head = repo.head().expect("HEAD").peel_to_commit().expect("HEAD commit");
+        assert_eq!(head.id(), remote_commit, "fast-forward pull must advance to the remote tip");
+        assert_eq!(head.parent_id(0).expect("fast-forward parent"), base_commit);
+        assert_eq!(head.parent_count(), 1, "fast-forward pull must not create a merge commit");
+        assert_eq!(
+            std::fs::read_to_string(local_dir.path().join("remote.txt")).expect("read remote file"),
+            "remote\n",
         );
     }
 
