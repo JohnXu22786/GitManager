@@ -17,9 +17,9 @@ pub enum GitOperation {
     StageAll,
     UnstageAll,
     RestoreAll,
-    StageFile(String),
-    UnstageFile(String),
-    RestoreFile(String),
+    StageFile(PathBuf),
+    UnstageFile(PathBuf),
+    RestoreFile(PathBuf),
     Commit { message: String, amend: bool },
     Uncommit,
     CreateBranch { name: String, base: Option<String> },
@@ -42,7 +42,7 @@ pub enum GitOperation {
     Push { remote: String, branch: String, force: bool },
     Pull { remote: String, branch: String, rebase: bool },
     Fetch(String),
-    GetDiff { path: String, staged: bool },
+    GetDiff { path: PathBuf, staged: bool },
     /// Search commits in the log, identified by the request that started it.
     LogSearch { filter: String, request_id: u64 },
     /// Refresh all cached data from the repository.
@@ -96,9 +96,9 @@ impl GitOperation {
             GitOperation::StageAll => Self::simple(repo.stage_all(), "Staged all"),
             GitOperation::UnstageAll => Self::simple(repo.unstage_all(), "Unstaged all"),
             GitOperation::RestoreAll => Self::simple(repo.restore_all(), "Restored all"),
-            GitOperation::StageFile(p) => Self::simple(repo.stage_file(&p), format!("Staged {}", p)),
-            GitOperation::UnstageFile(p) => Self::simple(repo.unstage_file(&p), format!("Unstaged {}", p)),
-            GitOperation::RestoreFile(p) => Self::simple(repo.restore_file(&p), format!("Restored {}", p)),
+            GitOperation::StageFile(p) => Self::simple(repo.stage_file(&p), format!("Staged {}", p.display())),
+            GitOperation::UnstageFile(p) => Self::simple(repo.unstage_file(&p), format!("Unstaged {}", p.display())),
+            GitOperation::RestoreFile(p) => Self::simple(repo.restore_file(&p), format!("Restored {}", p.display())),
             GitOperation::Commit { message, amend } => match repo.commit(&message, amend) {
                 Ok(sha) => OpResult::Success(format!("Committed: {}", &sha[..sha.len().min(7)])),
                 Err(e) => OpResult::Error(e),
@@ -191,7 +191,7 @@ impl GitOperation {
                 Err(e) => OpResult::Error(e),
             },
             GitOperation::GetDiff { path, staged } => match repo.get_diff(&path, staged) {
-                Ok(lines) => OpResult::DiffContent { path, lines },
+                Ok(lines) => OpResult::DiffContent { path: path.to_string_lossy().into_owned(), lines },
                 Err(e) => OpResult::Error(format!("Diff error: {}", e)),
             },
             GitOperation::LogSearch { filter, request_id } => {
@@ -253,7 +253,7 @@ pub struct WorktreeInfo {
 
 #[derive(Clone, Debug)]
 pub struct StatusEntry {
-    pub path: String,
+    pub path: PathBuf,
     pub status: char,
     pub staged: bool,
 }
@@ -334,6 +334,33 @@ fn safe_str_lossy(text: Option<&str>, bytes: Option<&[u8]>) -> String {
 /// Convenience wrapper for `safe_str_lossy` when bytes are infallible (&[u8]).
 fn safe_str_lossy_infallible(text: Option<&str>, bytes: &[u8]) -> String {
     safe_str_lossy(text, Some(bytes))
+}
+
+fn path_from_git_bytes(bytes: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        PathBuf::from(OsString::from_vec(bytes.to_vec()))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
+fn repository_path_bytes(path: &Path) -> Option<Vec<u8>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        Some(path.as_os_str().as_bytes().to_vec())
+    }
+    #[cfg(not(unix))]
+    {
+        Some(path.to_str()?.replace('\\', "/").into_bytes())
+    }
 }
 
 /// Compare two paths for equality, handling case-insensitivity and separator normalization on Windows.
@@ -1756,7 +1783,7 @@ impl GitRepo {
         )).map_err(|e| format!("Status: {}", e))?;
 
         for e in ss.iter() {
-            let p = e.path().unwrap_or("").to_string();
+            let p = path_from_git_bytes(e.path_bytes());
             let f = e.status();
             let staged = f.intersects(Status::INDEX_NEW | Status::INDEX_MODIFIED | Status::INDEX_DELETED
                 | Status::INDEX_RENAMED | Status::INDEX_TYPECHANGE);
@@ -1781,30 +1808,30 @@ impl GitRepo {
         Ok(entries)
     }
 
-    pub fn stage_file(&self, path: &str) -> GitResult<()> {
+    pub fn stage_file<P: AsRef<Path>>(&self, path: P) -> GitResult<()> {
         let repo = self.repo()?;
         let mut idx = repo.index().map_err(|e| format!("Index: {}", e))?;
-        idx.add_path(Path::new(path)).map_err(|e| format!("Stage: {}", e))?;
+        idx.add_path(path.as_ref()).map_err(|e| format!("Stage: {}", e))?;
         idx.write().map_err(|e| format!("Write: {}", e))?;
         Ok(())
     }
 
-    pub fn unstage_file(&self, path: &str) -> GitResult<()> {
-        if path.is_empty() {
+    pub fn unstage_file<P: AsRef<Path>>(&self, path: P) -> GitResult<()> {
+        let path = path.as_ref();
+        let path_bytes = repository_path_bytes(path)
+            .ok_or_else(|| "Unstage: path must be valid UTF-8".to_string())?;
+        if path_bytes.is_empty() {
             return Err("Unstage: path must not be empty".into());
         }
-        if path.as_bytes().contains(&0) {
+        if path_bytes.contains(&0) {
             return Err("Unstage: path must not contain NUL bytes".into());
         }
-        let has_invalid_component = |separator| {
-            path.split(separator)
-                .any(|component| component.is_empty() || matches!(component, "." | ".."))
-        };
-        if has_invalid_component('/') || (cfg!(windows) && has_invalid_component('\\')) {
+        let has_invalid_component = path_bytes
+            .split(|byte| *byte == b'/')
+            .any(|component| component.is_empty() || component == b"." || component == b"..");
+        if has_invalid_component {
             return Err("Unstage: path must be repository-relative".into());
         }
-
-        let path = Path::new(path);
         if path
             .components()
             .any(|component| !matches!(component, std::path::Component::Normal(_)))
@@ -1818,14 +1845,10 @@ impl GitRepo {
             .ok()
             .and_then(|config| config.get_bool("core.ignorecase").ok())
             .unwrap_or(false);
-        let path_text = path.to_str().ok_or_else(|| "Unstage: path must be valid UTF-8".to_string())?;
-        let normalized_path = if cfg!(windows) {
-            path_text.replace('\\', "/")
-        } else {
-            path_text.to_string()
-        };
-        let directory_prefix = format!("{normalized_path}/");
-        let matches_path = |entry_path: &str| {
+        let normalized_path = path_bytes;
+        let mut directory_prefix = normalized_path.clone();
+        directory_prefix.push(b'/');
+        let matches_path = |entry_path: &[u8]| {
             if ignore_case {
                 entry_path.eq_ignore_ascii_case(&normalized_path)
                     || entry_path
@@ -1833,15 +1856,15 @@ impl GitRepo {
                         .map(|prefix| prefix.eq_ignore_ascii_case(&directory_prefix))
                         .unwrap_or(false)
             } else {
-                entry_path == normalized_path || entry_path.starts_with(&directory_prefix)
+                entry_path == normalized_path.as_slice()
+                    || entry_path.starts_with(&directory_prefix)
             }
         };
         let matching_index_paths = |idx: &git2::Index| {
             let mut paths: Vec<_> = idx
                 .iter()
                 .filter_map(|entry| {
-                    let entry_path = std::str::from_utf8(&entry.path).ok()?;
-                    matches_path(entry_path).then(|| PathBuf::from(entry_path))
+                    matches_path(&entry.path).then(|| path_from_git_bytes(&entry.path))
                 })
                 .collect();
             paths.sort_unstable();
@@ -1857,12 +1880,7 @@ impl GitRepo {
                 head_index.read_tree(&head_tree).map_err(|e| format!("Read HEAD index: {}", e))?;
                 let head_entries: Vec<_> = head_index
                     .iter()
-                    .filter(|entry| {
-                        let Ok(entry_path) = std::str::from_utf8(&entry.path) else {
-                            return false;
-                        };
-                        matches_path(entry_path)
-                    })
+                    .filter(|entry| matches_path(&entry.path))
                     .collect();
 
                 let mut idx = repo.index().map_err(|e| format!("Index: {}", e))?;
@@ -1909,12 +1927,12 @@ impl GitRepo {
             .map_err(|e| format!("Unstage all: {}", e))
     }
 
-    pub fn restore_file(&self, path: &str) -> GitResult<()> {
+    pub fn restore_file<P: AsRef<Path>>(&self, path: P) -> GitResult<()> {
         let repo = self.repo()?;
         let mut cb = git2::build::CheckoutBuilder::new();
         cb.force()
             .disable_pathspec_match(true)
-            .path(Path::new(path));
+            .path(path.as_ref());
         repo.checkout_index(None, Some(&mut cb))
             .map_err(|e| format!("Restore: {}", e))?;
         Ok(())
@@ -1931,7 +1949,8 @@ impl GitRepo {
         Ok(())
     }
 
-    pub fn get_diff(&self, path: &str, staged: bool) -> GitResult<Vec<DiffLine>> {
+    pub fn get_diff<P: AsRef<Path>>(&self, path: P, staged: bool) -> GitResult<Vec<DiffLine>> {
+        let path = path.as_ref();
         let repo = self.repo()?;
         let mut lines = Vec::new();
         let tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
@@ -3324,7 +3343,7 @@ mod tests {
 
         let statuses = git.get_status().expect("get status");
         assert_eq!(statuses.len(), 1, "tracked change should remain a single unstaged entry");
-        assert_eq!(statuses[0].path, "tracked.txt");
+        assert_eq!(statuses[0].path, Path::new("tracked.txt"));
         assert_eq!(statuses[0].status, 'M');
         assert!(!statuses[0].staged, "tracked change should no longer be staged");
 
@@ -3339,6 +3358,37 @@ mod tests {
             std::fs::read_to_string(dir.path().join(path)).expect("read working tree file"),
             "working tree version\n",
             "unstaging must preserve the working tree change"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_status_preserves_non_utf8_path_for_file_operations() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        create_repo_with_commit(dir.path());
+        let path_bytes = b"invalid-\xff.txt";
+        let path = PathBuf::from(OsString::from_vec(path_bytes.to_vec()));
+        std::fs::write(dir.path().join(&path), "untracked\n").expect("write non-UTF-8 file");
+
+        let git = open_git_repo(dir.path());
+        let statuses = git.get_status().expect("get status");
+        assert_eq!(statuses.len(), 1, "the non-UTF-8 file should be reported once");
+        assert_eq!(statuses[0].path.as_os_str().as_bytes(), path_bytes);
+        assert!(!statuses[0].path.as_os_str().is_empty());
+
+        git.stage_file(&statuses[0].path)
+            .expect("stage the path returned by status");
+        let reopened = Repository::open(dir.path()).expect("reopen repo");
+        assert!(
+            reopened
+                .index()
+                .expect("index")
+                .get_path(&path, 0)
+                .is_some(),
+            "staging must use the original non-UTF-8 path bytes"
         );
     }
 
@@ -3479,11 +3529,11 @@ mod tests {
 
         let statuses = git.get_status().expect("get status");
         assert!(
-            statuses.iter().any(|entry| entry.path == literal_path.to_str().unwrap() && !entry.staged),
+            statuses.iter().any(|entry| entry.path == literal_path && !entry.staged),
             "the literal path should remain as an unstaged working-tree change"
         );
         assert!(
-            statuses.iter().any(|entry| entry.path == other_path.to_str().unwrap() && entry.staged),
+            statuses.iter().any(|entry| entry.path == other_path && entry.staged),
             "the path matched by the literal text should remain staged"
         );
     }
@@ -3504,6 +3554,8 @@ mod tests {
             "/absolute/staged.txt",
             "dir/../staged.txt",
             "dir/./staged.txt",
+            "dir//staged.txt",
+            "dir///staged.txt",
             "bad\0path",
         ] {
             let error = git.unstage_file(invalid_path).expect_err("invalid path should be rejected");
@@ -3589,12 +3641,12 @@ mod tests {
         );
         let statuses = git.get_status().expect("get status");
         assert!(
-            statuses.iter().any(|entry| entry.path == "tracked.txt" && !entry.staged),
+            statuses.iter().any(|entry| entry.path == Path::new("tracked.txt") && !entry.staged),
             "tracked change must be unstaged; statuses: {:?}",
             statuses
         );
         assert!(
-            statuses.iter().all(|entry| entry.path != "tracked.txt" || !entry.staged),
+            statuses.iter().all(|entry| entry.path != Path::new("tracked.txt") || !entry.staged),
             "tracked change must not remain staged"
         );
         assert_eq!(
@@ -3794,12 +3846,12 @@ mod tests {
         );
         let statuses = git.get_status().expect("get status");
         assert!(
-            statuses.iter().any(|entry| entry.path == "tracked.txt" && entry.staged),
+            statuses.iter().any(|entry| entry.path == Path::new("tracked.txt") && entry.staged),
             "the staged change must remain staged; statuses: {:?}",
             statuses
         );
         assert!(
-            statuses.iter().all(|entry| entry.path != "tracked.txt" || entry.staged),
+            statuses.iter().all(|entry| entry.path != Path::new("tracked.txt") || entry.staged),
             "restoring unstaged changes must leave no unstaged portion; statuses: {:?}",
             statuses
         );

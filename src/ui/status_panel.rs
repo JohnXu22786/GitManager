@@ -37,19 +37,20 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 ui.label(egui::RichText::new("Staged").color(App::adaptive_green(dark)).strong());
                 for entry in &staged {
                     let path = entry.path.clone();
+                    let path_display = path.to_string_lossy().into_owned();
                     ui.horizontal(|ui| {
                         let busy = app.is_busy();
                         let color = crate::app::App::status_color_by_type(entry.status, dark);
                         ui.label(egui::RichText::new(format!("[{}]", entry.status)).color(color).monospace());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.add_enabled(!busy, egui::Button::new("Unstage")).clicked() {
-                                app.start_operation(ctx, &format!("Unstage {}", path), GitOperation::UnstageFile(path.clone()));
+                                app.start_operation(ctx, &format!("Unstage {}", path_display), GitOperation::UnstageFile(path.clone()));
                             }
                             if ui.add_enabled(!busy, egui::Button::new("Diff")).clicked() {
-                                app.start_operation(ctx, &format!("Diff {}", path), GitOperation::GetDiff { path: path.clone(), staged: true });
+                                app.start_operation(ctx, &format!("Diff {}", path_display), GitOperation::GetDiff { path: path.clone(), staged: true });
                             }
-                            let path_clone = path.clone();
-                            ui.add(egui::Label::new(&path).truncate()).on_hover_text(path_clone);
+                            let path_clone = path_display.clone();
+                            ui.add(egui::Label::new(&path_display).truncate()).on_hover_text(path_clone);
                         });
                     });
                 }
@@ -60,6 +61,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 ui.label(egui::RichText::new("Unstaged").color(App::adaptive_yellow(dark)).strong());
                 for entry in &unstaged {
                     let path = entry.path.clone();
+                    let path_display = path.to_string_lossy().into_owned();
                     ui.horizontal(|ui| {
                         let busy = app.is_busy();
                         let color = crate::app::App::status_color_by_type(entry.status, dark);
@@ -68,19 +70,19 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if should_show_stage_action(entry.status) {
                                 if ui.add_enabled(!busy, egui::Button::new("Stage")).clicked() {
-                                    app.start_operation(ctx, &format!("Stage {}", path), GitOperation::StageFile(path.clone()));
+                                    app.start_operation(ctx, &format!("Stage {}", path_display), GitOperation::StageFile(path.clone()));
                                 }
                             }
                             if entry.status != '?' && entry.status != '!' {
                                 if ui.add_enabled(!busy, egui::Button::new("Discard")).clicked() {
-                                    app.start_operation(ctx, &format!("Restore {}", path), GitOperation::RestoreFile(path.clone()));
+                                    app.start_operation(ctx, &format!("Restore {}", path_display), GitOperation::RestoreFile(path.clone()));
                                 }
                             }
                             if ui.add_enabled(!busy, egui::Button::new("Diff")).clicked() {
-                                app.start_operation(ctx, &format!("Diff {}", path), GitOperation::GetDiff { path: path.clone(), staged: false });
+                                app.start_operation(ctx, &format!("Diff {}", path_display), GitOperation::GetDiff { path: path.clone(), staged: false });
                             }
-                            let path_clone = path.clone();
-                            ui.add(egui::Label::new(&path).truncate()).on_hover_text(path_clone);
+                            let path_clone = path_display.clone();
+                            ui.add(egui::Label::new(&path_display).truncate()).on_hover_text(path_clone);
                         });
                     });
                 }
@@ -249,7 +251,7 @@ mod tests {
         // (many entries cause overflow without ScrollArea)
         for i in 0..100 {
             app.status_entries.push(StatusEntry {
-                path: format!("src/file_{:03}.rs", i),
+                path: format!("src/file_{:03}.rs", i).into(),
                 status: 'M',
                 staged: i % 2 == 0,
             });
@@ -275,7 +277,7 @@ mod tests {
         // Test all possible status characters
         for (i, status) in ['M', 'A', 'D', '?', '!', 'U', 'R'].iter().enumerate() {
             app.status_entries.push(StatusEntry {
-                path: format!("file_{}.txt", i),
+                path: format!("file_{}.txt", i).into(),
                 status: *status,
                 staged: i % 2 == 0,
             });
