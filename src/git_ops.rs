@@ -963,6 +963,27 @@ where
     std::fs::remove_dir_all(path)
 }
 
+#[cfg(windows)]
+fn force_remove_dir_windows(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+
+    // Delayed expansion occurs after cmd.exe parses command metacharacters, so
+    // the path remains a literal operand even when it contains &, |, %, or !.
+    const PATH_ENV: &str = "GIT_MANAGER_FORCE_REMOVE_PATH";
+    let mut command = std::process::Command::new("cmd.exe");
+    command.args(["/d", "/v:on"]).env(PATH_ENV, path);
+    command.raw_arg(format!(" /c rmdir /s /q \"!{}!\"", PATH_ENV));
+    let status = command.output()?.status;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("cmd.exe rmdir failed with status {}", status),
+        ))
+    }
+}
+
 /// Forcefully remove a directory, with OS-level fallback.
 ///
 /// Used ONLY by Force Remove — regular Remove uses a single gentle attempt.
@@ -1020,9 +1041,7 @@ where
                         "directory identity changed before removal",
                     ));
                 }
-                let _ = std::process::Command::new("cmd.exe")
-                    .args(["/c", "rmdir", "/s", "/q", &path.to_string_lossy()])
-                    .output();
+                let _ = force_remove_dir_windows(path);
             }
         }
 
@@ -4638,6 +4657,20 @@ mod tests {
         assert!(dir.path().exists());
         force_remove_dir(dir.path()).expect("force_remove_dir should succeed");
         assert!(!dir.path().exists(), "Directory should be deleted");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_force_remove_dir_fallback_handles_shell_metacharacters() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let path = root
+            .path()
+            .join("worktree&echo|preserved%literal!name^");
+        std::fs::create_dir_all(&path).expect("create directory");
+        std::fs::write(path.join("file.txt"), "content").expect("write file");
+
+        force_remove_dir_windows(&path).expect("Windows fallback should remove the directory");
+        assert!(!path.exists(), "Directory with shell metacharacters should be deleted");
     }
 
     #[test]
