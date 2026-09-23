@@ -2162,6 +2162,10 @@ impl GitRepo {
             let hc = repo.head().map_err(|e| format!("HEAD: {}", e))?
                 .peel_to_commit().map_err(|e| format!("Peel: {}", e))?;
 
+            if repo.index().map_err(|e| format!("Index: {}", e))?.has_conflicts() {
+                return Err("Pulling is not possible because you have unmerged files".into());
+            }
+
             if hc.id() == fc.id()
                 || repo.graph_descendant_of(hc.id(), fc.id())
                     .map_err(|e| format!("Check ancestry: {}", e))?
@@ -2644,6 +2648,78 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(local_dir.path().join("remote.txt")).expect("read remote file"),
             "remote\n",
+        );
+    }
+
+    #[test]
+    fn test_pull_non_rebase_rejects_unmerged_index_before_ancestry_fast_path() {
+        let (local_dir, _remote_dir, branch, base_commit) = setup_pull_repository();
+        let local_repo = Repository::open(local_dir.path()).expect("open local repo");
+        let local_commit = commit_file(&local_repo, "conflict.txt", "local\n", "local change");
+
+        let conflict_index = {
+            let base_tree = local_repo
+                .find_commit(base_commit)
+                .expect("find base commit")
+                .tree()
+                .expect("find base tree");
+            let ours_tree = local_repo
+                .find_commit(local_commit)
+                .expect("find local commit")
+                .tree()
+                .expect("find local tree");
+            let remote_blob = local_repo.blob(b"remote\n").expect("write remote blob");
+            let remote_tree_oid = {
+                let mut builder = local_repo
+                    .treebuilder(Some(&base_tree))
+                    .expect("create remote tree builder");
+                builder
+                    .insert("conflict.txt", remote_blob, 0o100644)
+                    .expect("add remote conflict");
+                builder.write().expect("write remote tree")
+            };
+            let remote_tree = local_repo
+                .find_tree(remote_tree_oid)
+                .expect("find remote tree");
+            local_repo
+                .merge_trees(
+                    &base_tree,
+                    &ours_tree,
+                    &remote_tree,
+                    None::<&git2::MergeOptions>,
+                )
+                .expect("create conflict index")
+        };
+        assert!(conflict_index.has_conflicts(), "test setup must create index conflicts");
+
+        {
+            let mut index = local_repo.index().expect("open repository index");
+            for entry in conflict_index.iter() {
+                index.add(&entry).expect("write conflict entry");
+            }
+            index.write().expect("persist conflicted index");
+        }
+        drop(conflict_index);
+        drop(local_repo);
+
+        let git = open_git_repo(local_dir.path());
+        let result = git.pull("origin", &branch, false, Arc::new(Mutex::new(String::new())));
+        let error = result.expect_err("pull must reject an unresolved index");
+        assert!(
+            error.contains("unmerged files"),
+            "pull should explain the unresolved index: {}",
+            error
+        );
+
+        let repo = Repository::open(local_dir.path()).expect("reopen local repo");
+        assert_eq!(
+            repo.head().expect("HEAD").target(),
+            Some(local_commit),
+            "rejecting the pull must preserve HEAD"
+        );
+        assert!(
+            repo.index().expect("index").has_conflicts(),
+            "rejecting the pull must preserve unresolved index entries"
         );
     }
 
