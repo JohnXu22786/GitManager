@@ -453,8 +453,13 @@ impl App {
                 if !current_progress.is_empty() {
                     self.last_operation_log += &format!("  {}\n", current_progress);
                 }
-            } else if !timed_out {
-                let stall_secs = last_progress_update.elapsed().as_secs();
+            }
+
+            let receive_result = self.pending_ops[i].receiver.try_recv();
+            if !timed_out
+                && current_progress == last_seen_progress
+                && receive_result.is_err()
+            {
                 if current_progress.is_empty() {
                     // No progress ever received: give 60 seconds total
                     if started_at.elapsed().as_secs() > 60 {
@@ -471,6 +476,7 @@ impl App {
                     }
                 } else {
                     // Progress was received but stopped: 30 second stall threshold
+                    let stall_secs = last_progress_update.elapsed().as_secs();
                     if stall_secs > 30 {
                         let msg = format!(
                             "Operation '{}' timed out (stalled {}s)\nLast: {}",
@@ -487,7 +493,7 @@ impl App {
             }
 
             let op = &self.pending_ops[i];
-            match op.receiver.try_recv() {
+            match receive_result {
                 Ok(result) => {
                     let op = self.pending_ops.swap_remove(i);
                     if op.timed_out {
@@ -2020,6 +2026,38 @@ mod tests {
             app.status_message.contains("timed out"),
             "a late result must not replace the timeout status"
         );
+    }
+
+    #[test]
+    fn test_queued_result_is_processed_before_timeout_classification() {
+        use std::time::Duration;
+
+        let mut app = App::new();
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::channel();
+        tx.send(OpResult::Success("completed mutation".to_string()))
+            .unwrap();
+
+        app.pending_ops.push(PendingOp {
+            description: "Completed operation".to_string(),
+            receiver: rx,
+            repo_generation: app.repo_generation,
+            started_at: Instant::now() - Duration::from_secs(61),
+            progress: Arc::new(Mutex::new(String::new())),
+            last_progress_update: Instant::now(),
+            last_seen_progress: String::new(),
+            timed_out: false,
+        });
+
+        app.process_pending_ops(&ctx);
+
+        assert!(
+            !app.is_busy(),
+            "a queued result should finish the operation"
+        );
+        assert_eq!(app.status_message, "completed mutation");
+        assert!(!app.status_is_error);
+        assert!(app.last_operation_log.contains("✓ completed mutation"));
     }
 
     #[test]
