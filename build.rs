@@ -3,6 +3,8 @@ use std::time::SystemTime;
 
 #[path = "build_support/git_metadata.rs"]
 mod git_metadata;
+#[path = "build_support/version_info.rs"]
+mod version_info;
 
 fn main() {
     // Capture git commit hash (if available)
@@ -43,16 +45,11 @@ fn main() {
 
     std::fs::write(
         &dest_path,
-        format!(
-            r#"pub const VERSION: &str = "{}";
-pub const GIT_HASH: &str = "{}";
-pub const GIT_DESCRIBE: &str = "{}";
-pub const BUILD_DATE: &str = "{}";
-"#,
+        version_info::generate(
             env!("CARGO_PKG_VERSION"),
-            git_hash,
-            git_describe,
-            build_date,
+            &git_hash,
+            &git_describe,
+            &build_date,
         ),
     )
     .unwrap();

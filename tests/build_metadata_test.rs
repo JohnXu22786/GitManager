@@ -1,5 +1,7 @@
 #[path = "../build_support/git_metadata.rs"]
 mod git_metadata;
+#[path = "../build_support/version_info.rs"]
+mod version_info;
 
 use std::fs;
 use std::path::Path;
@@ -66,4 +68,12 @@ fn watches_metadata_in_a_regular_git_directory() {
     assert_eq!(actual[1], git_dir.join("refs"));
     assert_eq!(actual[2], git_dir.join("packed-refs"));
     assert_eq!(actual[3], git_dir.join("reftable"));
+}
+
+#[test]
+fn generated_version_info_escapes_quotes_in_valid_tag_names() {
+    let unusual_tag = r#"v1.0.0"quoted"#;
+    let source = version_info::generate("0.1.0", "abc123", unusual_tag, "2025-01-01T00:00:00Z");
+
+    assert!(source.contains(r#"pub const GIT_DESCRIBE: &str = "v1.0.0\"quoted";"#));
 }
