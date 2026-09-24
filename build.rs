@@ -54,8 +54,10 @@ fn main() {
     )
     .unwrap();
 
-    // Track the per-worktree HEAD and shared refs used for commit and tag metadata.
-    for path in git_metadata::watch_paths(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))) {
+    // Track Git metadata and worktree inputs used to generate version information.
+    let package_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for path in git_metadata::watch_paths(package_root) {
+        let path = git_metadata::cargo_watch_path(package_root, &path);
         println!("cargo::rerun-if-changed={}", path.display());
     }
     // Also rerun if the version in Cargo.toml changes (Cargo does this automatically)
