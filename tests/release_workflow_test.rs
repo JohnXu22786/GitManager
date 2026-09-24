@@ -224,6 +224,65 @@ fn test_prepare_version_sets_app_version_output() {
     );
 }
 
+/// Release tags must remain data across the workflow's command interpreters.
+#[test]
+fn test_release_tag_is_not_interpolated_into_shell_source() {
+    let content = read_release_workflow();
+    let lines: Vec<&str> = content.lines().collect();
+    let run_line = lines
+        .iter()
+        .position(|line| line.trim() == "run: |")
+        .expect("The release tag extraction step must have a shell script");
+    let run_script = lines[run_line + 1..]
+        .iter()
+        .take_while(|line| line.trim().is_empty() || line.starts_with("          "))
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        run_script.contains("TAG=\"$GITHUB_REF_NAME\""),
+        "The release tag must be read from the GitHub-provided environment variable"
+    );
+    assert!(
+        !run_script.contains("${{"),
+        "GitHub expressions must not be interpolated into the release shell script"
+    );
+    assert!(
+        !content.contains("VERSION=\"${{ needs.prepare-version.outputs.app_version }}\""),
+        "The tag-derived version must not be interpolated into downstream shell source"
+    );
+    assert_eq!(
+        content
+            .matches("VERSION: ${{ needs.prepare-version.outputs.app_version }}")
+            .count(),
+        2,
+        "Both build steps must receive the tag-derived version through the environment"
+    );
+    assert!(
+        !content
+            .lines()
+            .any(|line| line.contains("sed") && line.contains("$VERSION")),
+        "The tag-derived version must not be interpolated into a sed program"
+    );
+    assert!(
+        content.contains(
+            r#"perl -i -pe 's/^version = ".*"/version = "$ENV{VERSION}"/' Cargo.toml"#
+        ),
+        "Unix version replacement must use a fixed Perl program and read VERSION from the environment"
+    );
+    let powershell_commands: Vec<&str> = content
+        .lines()
+        .filter(|line| line.contains("powershell -Command"))
+        .map(str::trim)
+        .collect();
+    assert_eq!(
+        powershell_commands,
+        [r##"powershell -Command "(Get-Content Cargo.toml) -replace '^version = \".*\"', ('version = \"' + \$env:VERSION + '\"') | Set-Content Cargo.toml""##],
+        "The Windows command must use the fixed PowerShell program and read VERSION at runtime"
+    );
+}
+
 /// Each build job should `need: [prepare-version]` (Stroom pattern).
 #[test]
 fn test_build_jobs_depend_on_prepare_version() {
