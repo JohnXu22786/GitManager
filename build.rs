@@ -1,6 +1,9 @@
 use std::process::Command;
 use std::time::SystemTime;
 
+#[path = "build_support/git_metadata.rs"]
+mod git_metadata;
+
 fn main() {
     // Capture git commit hash (if available)
     let git_hash = Command::new("git")
@@ -54,8 +57,10 @@ pub const BUILD_DATE: &str = "{}";
     )
     .unwrap();
 
-    // Tell Cargo to rerun this script when git HEAD changes
-    println!("cargo::rerun-if-changed=../.git/HEAD");
+    // Track the per-worktree HEAD and shared refs used for commit and tag metadata.
+    for path in git_metadata::watch_paths(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))) {
+        println!("cargo::rerun-if-changed={}", path.display());
+    }
     // Also rerun if the version in Cargo.toml changes (Cargo does this automatically)
     println!("cargo::rerun-if-env-changed=GIT_MANAGER_VERSION");
 }
