@@ -117,8 +117,20 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             app.show_error("Worktree name required".into());
         } else {
             let path = if app.new_worktree_path.trim().is_empty() {
-                let parent = app.git.path().unwrap().parent().unwrap();
-                parent.join(&name)
+                let Some(repo_path) = app.git.path() else {
+                    app.show_error(
+                        "Cannot determine the repository path for a default worktree".into(),
+                    );
+                    return;
+                };
+                let Some(path) = default_worktree_path(repo_path, &name) else {
+                    app.show_error(
+                        "Cannot choose a default worktree path because the repository has no parent directory"
+                            .into(),
+                    );
+                    return;
+                };
+                path
             } else {
                 std::path::PathBuf::from(app.new_worktree_path.trim())
             };
@@ -145,6 +157,13 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             app.new_worktree_create_branch = false;
         }
     }
+}
+
+fn default_worktree_path(
+    repo_path: &std::path::Path,
+    name: &str,
+) -> Option<std::path::PathBuf> {
+    repo_path.parent().map(|parent| parent.join(name))
 }
 
 fn show_worktree_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, wt: &WorktreeInfo) {
@@ -198,4 +217,30 @@ fn show_worktree_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, wt: 
             });
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_worktree_path;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn root_repository_has_no_default_worktree_path() {
+        #[cfg(windows)]
+        let root = Path::new(r"C:\");
+        #[cfg(not(windows))]
+        let root = Path::new("/");
+
+        assert_eq!(default_worktree_path(root, "feature"), None);
+    }
+
+    #[test]
+    fn default_worktree_path_is_sibling_of_repository() {
+        let repo_path = PathBuf::from("parent").join("repository");
+
+        assert_eq!(
+            default_worktree_path(&repo_path, "feature"),
+            Some(PathBuf::from("parent").join("feature"))
+        );
+    }
 }
