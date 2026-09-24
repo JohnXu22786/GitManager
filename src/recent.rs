@@ -18,6 +18,7 @@ pub struct RecentRepos {
     entries: Vec<RecentEntry>,
     max_entries: usize,
     file_path: PathBuf,
+    load_error: Option<std::io::Error>,
 }
 
 /// Return the final path component for either Unix or Windows-style paths.
@@ -47,22 +48,30 @@ impl RecentRepos {
     /// Loads recent repos from the config file, or returns an empty list.
     pub fn load() -> Self {
         let file_path = get_config_path();
-        let entries = load_entries(&file_path, DEFAULT_MAX_ENTRIES);
+        let (entries, load_error) = match load_entries(&file_path, DEFAULT_MAX_ENTRIES) {
+            Ok(entries) => (entries, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
         RecentRepos {
             entries,
             max_entries: DEFAULT_MAX_ENTRIES,
             file_path,
+            load_error,
         }
     }
 
     /// Loads from a specific path (for testing).
     #[allow(dead_code)]
     pub fn load_from(path: PathBuf) -> Self {
-        let entries = load_entries(&path, DEFAULT_MAX_ENTRIES);
+        let (entries, load_error) = match load_entries(&path, DEFAULT_MAX_ENTRIES) {
+            Ok(entries) => (entries, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
         RecentRepos {
             entries,
             max_entries: DEFAULT_MAX_ENTRIES,
             file_path: path,
+            load_error,
         }
     }
 
@@ -117,6 +126,15 @@ impl RecentRepos {
 
     /// Persists entries to the JSON file on disk, returning any I/O error.
     pub fn save(&self) -> std::io::Result<()> {
+        if let Some(error) = &self.load_error {
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot save recent repositories because existing history could not be loaded: {error}"
+                ),
+            ));
+        }
+
         let content = serde_json::to_string_pretty(&self.entries).map_err(|error| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
         })?;
@@ -131,13 +149,16 @@ impl RecentRepos {
     }
 }
 
-fn load_entries(path: &PathBuf, max_entries: usize) -> Vec<RecentEntry> {
-    let mut entries: Vec<RecentEntry> = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|content| serde_json::from_str(&content).ok())
-        .unwrap_or_default();
+fn load_entries(path: &PathBuf, max_entries: usize) -> std::io::Result<Vec<RecentEntry>> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut entries: Vec<RecentEntry> = serde_json::from_str(&content)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     entries.truncate(max_entries);
-    entries
+    Ok(entries)
 }
 
 fn get_config_path() -> PathBuf {
@@ -312,6 +333,30 @@ mod tests {
 
         let repos = RecentRepos::load_from(p.clone());
         assert!(repos.is_empty());
+
+        let _ = fs::remove_file(&p);
+    }
+
+    #[test]
+    fn test_add_does_not_overwrite_corrupt_history() {
+        let p = temp_path();
+        let corrupt_content = b"{ invalid recent repository data";
+        fs::write(&p, corrupt_content).unwrap();
+
+        let mut repos = RecentRepos::load_from(p.clone());
+        assert!(repos.is_empty());
+
+        let error = repos
+            .add("/path/to/repo")
+            .expect_err("saving after a failed load must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&p).unwrap(), corrupt_content);
+
+        let error = repos
+            .save()
+            .expect_err("direct saves must also preserve data that failed to load");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&p).unwrap(), corrupt_content);
 
         let _ = fs::remove_file(&p);
     }
