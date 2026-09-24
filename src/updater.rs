@@ -256,45 +256,111 @@ pub fn create_self_update_script(new_binary: &Path, current_binary: &Path) -> Re
         let script_path = temp_dir.join("update_git_manager.bat");
         let mut script = std::fs::File::create(&script_path)
             .map_err(|e| format!("Failed to create update script: {}", e))?;
-        write!(script, r#"@echo off
-ping 127.0.0.1 -n 3 > nul
-copy /Y {} {}
-del /F /Q {}
-start "" {}
-del "%~f0"
-"#,
-            windows_batch_quote_path(new_binary),
-            windows_batch_quote_path(current_binary),
-            windows_batch_quote_path(new_binary),
-            windows_batch_quote_path(current_binary),
-        ).map_err(|e| format!("Failed to write update script: {}", e))?;
+        script
+            .write_all(windows_self_update_script(new_binary, current_binary).as_bytes())
+            .map_err(|e| format!("Failed to write update script: {}", e))?;
         Ok(script_path)
     }
     #[cfg(not(target_os = "windows"))]
     {
+        use std::os::unix::fs::PermissionsExt;
+
         let script_path = temp_dir.join("update_git_manager.sh");
         let mut script = std::fs::File::create(&script_path)
             .map_err(|e| format!("Failed to create update script: {}", e))?;
-        write!(script, r#"#!/bin/sh
-sleep 2
-cp -f {} {}
-chmod +x {}
-rm -f {}
-{} &
-rm -- "$0"
-"#,
-            shell_quote_path(new_binary),
-            shell_quote_path(current_binary),
-            shell_quote_path(current_binary),
-            shell_quote_path(new_binary),
-            shell_quote_path(current_binary),
-        ).map_err(|e| format!("Failed to write update script: {}", e))?;
+        script
+            .write_all(unix_self_update_script(new_binary, current_binary)?.as_bytes())
+            .map_err(|e| format!("Failed to write update script: {}", e))?;
         // Mark script as executable on Unix
-        use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
             .map_err(|e| format!("Failed to make script executable: {}", e))?;
         Ok(script_path)
     }
+}
+
+#[cfg(any(windows, test))]
+fn windows_update_temp_path(current_binary: &Path) -> PathBuf {
+    let mut temp_path = current_binary.as_os_str().to_os_string();
+    temp_path.push(format!(".update-{}.tmp", std::process::id()));
+    PathBuf::from(temp_path)
+}
+
+#[cfg(any(windows, test))]
+fn windows_self_update_script(new_binary: &Path, current_binary: &Path) -> String {
+    let temp_path = windows_update_temp_path(current_binary);
+
+    format!(
+        r#"@echo off
+ping 127.0.0.1 -n 3 > nul
+copy /Y {} {}
+if errorlevel 1 goto update_failed
+move /Y {} {}
+if errorlevel 1 goto update_failed
+del /F /Q {}
+start "" {}
+del "%~f0"
+exit /b 0
+
+:update_failed
+del /F /Q {} >nul 2>&1
+echo Git Manager update failed: could not replace executable; downloaded update retained. 1>&2
+exit /b 1
+"#,
+        windows_batch_quote_path(new_binary),
+        windows_batch_quote_path(&temp_path),
+        windows_batch_quote_path(&temp_path),
+        windows_batch_quote_path(current_binary),
+        windows_batch_quote_path(new_binary),
+        windows_batch_quote_path(current_binary),
+        windows_batch_quote_path(&temp_path),
+    )
+}
+
+#[cfg(not(target_os = "windows"))]
+fn unix_executable_mode(path: &Path) -> Result<u32, String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::metadata(path)
+        .map(|metadata| metadata.permissions().mode() & 0o777)
+        .map_err(|e| format!("Failed to read current executable permissions: {}", e))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn unix_self_update_script(new_binary: &Path, current_binary: &Path) -> Result<String, String> {
+    let current_mode = unix_executable_mode(current_binary)?;
+    Ok(format!(
+        r#"#!/bin/sh
+sleep 2
+update_temp=$(mktemp {}.update.XXXXXX) || {{
+    printf '%s\n' 'Git Manager update failed: could not stage executable; downloaded update retained.' >&2
+    exit 1
+}}
+if ! cp -f {} "$update_temp"; then
+    printf '%s\n' 'Git Manager update failed: could not copy executable; downloaded update retained.' >&2
+    rm -f "$update_temp"
+    exit 1
+fi
+if ! chmod {:o} "$update_temp"; then
+    printf '%s\n' 'Git Manager update failed: could not set executable permissions; downloaded update retained.' >&2
+    rm -f "$update_temp"
+    exit 1
+fi
+if ! mv -f "$update_temp" {}; then
+    printf '%s\n' 'Git Manager update failed: could not replace executable; downloaded update retained.' >&2
+    rm -f "$update_temp"
+    exit 1
+fi
+rm -f {}
+{} &
+rm -- "$0"
+"#,
+        shell_quote_path(current_binary),
+        shell_quote_path(new_binary),
+        current_mode,
+        shell_quote_path(current_binary),
+        shell_quote_path(new_binary),
+        shell_quote_path(current_binary),
+    ))
 }
 
 fn shell_quote_path(path: &Path) -> String {
@@ -778,6 +844,263 @@ mod tests {
             windows_batch_quote_path(path),
             r#""C:\Users\A ^& B\100%% ready^!\update.exe""#
         );
+    }
+
+    #[test]
+    fn test_windows_update_script_stops_when_copy_fails() {
+        let script = windows_self_update_script(
+            Path::new(r"C:\Temp\update.exe"),
+            Path::new(r"C:\Program Files\Git Manager\git_manager.exe"),
+        );
+        let copy_failure_check = script.find("if errorlevel 1 goto update_failed").unwrap();
+        let move_pos = script.find("move /Y").unwrap();
+        let move_failure_check = script[move_pos..]
+            .find("if errorlevel 1 goto update_failed")
+            .map(|index| index + move_pos)
+            .unwrap();
+        let cleanup = script.find("del /F /Q").unwrap();
+        let relaunch = script.find("start \"\"").unwrap();
+        let failure_handler = script.find(":update_failed").unwrap();
+
+        assert!(copy_failure_check < move_pos);
+        assert!(move_pos < move_failure_check);
+        assert!(move_failure_check < cleanup);
+        assert!(move_failure_check < relaunch);
+        assert!(failure_handler > relaunch);
+        assert!(script.contains(
+            "could not replace executable; downloaded update retained."
+        ));
+        assert!(script.contains("exit /b 1"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_update_script_preserves_download_when_move_fails() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let new_binary = temp_dir.path().join("downloaded-update.exe");
+        std::fs::write(&new_binary, b"downloaded update").unwrap();
+
+        let current_binary = temp_dir.path().join("current-binary.bat");
+        let launch_marker = temp_dir.path().join("old-binary-launched");
+        let original_current = format!(
+            "@echo off\necho launched > \"{}\"\n",
+            launch_marker.display()
+        );
+        std::fs::write(&current_binary, &original_current).unwrap();
+        let mut current_permissions = std::fs::metadata(&current_binary).unwrap().permissions();
+        current_permissions.set_readonly(true);
+        std::fs::set_permissions(&current_binary, current_permissions).unwrap();
+
+        let script_path = temp_dir.path().join("update.bat");
+        std::fs::write(
+            &script_path,
+            windows_self_update_script(&new_binary, &current_binary),
+        )
+        .unwrap();
+        let output = std::process::Command::new("cmd")
+            .args(["/C"])
+            .arg(&script_path)
+            .output()
+            .unwrap();
+        let mut current_permissions = std::fs::metadata(&current_binary).unwrap().permissions();
+        current_permissions.set_readonly(false);
+        std::fs::set_permissions(&current_binary, current_permissions).unwrap();
+
+        assert!(
+            !output.status.success(),
+            "failed replacement must return failure"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr)
+            .contains("could not replace executable; downloaded update retained."));
+        assert_eq!(std::fs::read(&new_binary).unwrap(), b"downloaded update");
+        assert_eq!(
+            std::fs::read(&current_binary).unwrap(),
+            original_current.as_bytes()
+        );
+        for _ in 0..100 {
+            if launch_marker.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!launch_marker.exists(), "old executable must not be relaunched");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_update_script_preserves_files_after_partial_copy_failure() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let new_binary = temp_dir.path().join("downloaded-update.exe");
+        let current_binary = temp_dir.path().join("current-binary.bat");
+        let launch_marker = temp_dir.path().join("old-binary-launched");
+        let failing_copy = temp_dir.path().join("partial-copy.bat");
+        let copy_marker = temp_dir.path().join("partial-copy-ran");
+        let script_path = temp_dir.path().join("update.bat");
+        let staged_binary = windows_update_temp_path(&current_binary);
+        let original_current = format!(
+            "@echo off\necho launched > \"{}\"\n",
+            launch_marker.display()
+        );
+
+        std::fs::write(&new_binary, b"downloaded update").unwrap();
+        std::fs::write(&current_binary, &original_current).unwrap();
+        assert!(!staged_binary.exists());
+        std::fs::write(
+            &failing_copy,
+            format!(
+                "@echo off\r\n> \"%~2\" echo partial\r\nif errorlevel 1 exit /b 2\r\nif not exist \"%~2\" exit /b 2\r\nfor %%A in (\"%~2\") do if %%~zA LEQ 0 exit /b 2\r\n> {} echo partial-written\r\nexit /b 1\r\n",
+                windows_batch_quote_path(&copy_marker)
+            ),
+        )
+        .unwrap();
+
+        let generated_copy = format!(
+            "copy /Y {} {}",
+            windows_batch_quote_path(&new_binary),
+            windows_batch_quote_path(&staged_binary),
+        );
+        let simulated_copy = format!(
+            "call {} {} {}",
+            windows_batch_quote_path(&failing_copy),
+            windows_batch_quote_path(&new_binary),
+            windows_batch_quote_path(&staged_binary),
+        );
+        let script = windows_self_update_script(&new_binary, &current_binary);
+        assert!(script.contains(generated_copy.as_str()));
+        std::fs::write(
+            &script_path,
+            script.replace(generated_copy.as_str(), simulated_copy.as_str()),
+        )
+        .unwrap();
+
+        let output = std::process::Command::new("cmd")
+            .args(["/C"])
+            .arg(&script_path)
+            .output()
+            .unwrap();
+
+        assert!(
+            !output.status.success(),
+            "failed replacement must return failure"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr)
+            .contains("could not replace executable; downloaded update retained."));
+        assert_eq!(std::fs::read(&new_binary).unwrap(), b"downloaded update");
+        assert_eq!(std::fs::read_to_string(&copy_marker).unwrap().trim(), "partial-written");
+        assert_eq!(
+            std::fs::read(&current_binary).unwrap(),
+            original_current.as_bytes()
+        );
+        assert!(!staged_binary.exists(), "partial staging file must be removed");
+        for _ in 0..100 {
+            if launch_marker.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!launch_marker.exists(), "old executable must not be relaunched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_unix_update_script_preserves_download_and_stops_when_copy_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let bin_dir = temp_dir.path().join("bin");
+        std::fs::create_dir(&bin_dir).unwrap();
+
+        let new_binary = temp_dir.path().join("downloaded-update");
+        std::fs::write(&new_binary, b"downloaded update").unwrap();
+
+        let current_binary = temp_dir.path().join("current-binary");
+        let launch_marker = temp_dir.path().join("old-binary-launched");
+        let copy_marker = temp_dir.path().join("partial-copy-ran");
+        let original_current = format!(
+            "#!/bin/sh\nprintf launched > {}\n",
+            shell_quote_path(&launch_marker)
+        );
+        std::fs::write(&current_binary, &original_current).unwrap();
+        std::fs::set_permissions(&current_binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let failing_cp = bin_dir.join("cp");
+        std::fs::write(
+            &failing_cp,
+            format!(
+                "#!/bin/sh\nprintf partial > \"$3\"\ntest -s \"$3\" || exit 2\nprintf partial-written > {}\nexit 1\n",
+                shell_quote_path(&copy_marker)
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&failing_cp, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let script_path = temp_dir.path().join("update.sh");
+        let script = unix_self_update_script(&new_binary, &current_binary).unwrap();
+        assert!(script.contains("chmod 755 \"$update_temp\""));
+        std::fs::write(&script_path, script).unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+        let test_path = format!("{}:{}", bin_dir.display(), inherited_path.to_string_lossy());
+        let output = std::process::Command::new(&script_path)
+            .env("PATH", test_path)
+            .output()
+            .unwrap();
+
+        assert!(
+            !output.status.success(),
+            "failed replacement must return failure"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr)
+            .contains("could not copy executable; downloaded update retained."));
+        assert_eq!(std::fs::read(&new_binary).unwrap(), b"downloaded update");
+        assert_eq!(std::fs::read_to_string(&copy_marker).unwrap(), "partial-written");
+        assert_eq!(
+            std::fs::read(&current_binary).unwrap(),
+            original_current.as_bytes()
+        );
+        assert!(!std::fs::read_dir(temp_dir.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("current-binary.update.")
+        }));
+        assert!(!launch_marker.exists(), "old executable must not be relaunched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_unix_update_script_replaces_binary_and_preserves_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let new_binary = temp_dir.path().join("downloaded-update");
+        let current_binary = temp_dir.path().join("current-binary");
+        let launch_marker = temp_dir.path().join("updated-binary-launched");
+        let new_contents = format!(
+            "#!/bin/sh\nprintf updated > {}\n",
+            shell_quote_path(&launch_marker)
+        );
+        std::fs::write(&new_binary, &new_contents).unwrap();
+        std::fs::write(&current_binary, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&current_binary, std::fs::Permissions::from_mode(0o711)).unwrap();
+
+        let script_path = temp_dir.path().join("update.sh");
+        let script = unix_self_update_script(&new_binary, &current_binary).unwrap();
+        assert!(script.contains("chmod 711 \"$update_temp\""));
+        std::fs::write(&script_path, script).unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let output = std::process::Command::new(&script_path).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(std::fs::read(&current_binary).unwrap(), new_contents.as_bytes());
+        assert_eq!(
+            std::fs::metadata(&current_binary).unwrap().permissions().mode() & 0o777,
+            0o711
+        );
+        assert!(!new_binary.exists(), "downloaded file is removed after success");
+        assert!(launch_marker.exists(), "updated executable must be relaunched");
     }
 
     #[cfg(unix)]
