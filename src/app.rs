@@ -1318,6 +1318,31 @@ impl eframe::App for App {
                             });
                         });
                 }
+                UpdateState::Error(message) => {
+                    egui::Window::new("Update Download Failed")
+                        .collapsible(false)
+                        .resizable(false)
+                        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                        .show(ctx, |ui| {
+                            ui.vertical_centered(|ui| {
+                                ui.heading("Update Download Failed");
+                                ui.add_space(8.0);
+                                ui.colored_label(
+                                    App::adaptive_red(ctx.style().visuals.dark_mode),
+                                    message.as_str(),
+                                );
+                                ui.add_space(12.0);
+                                ui.horizontal(|ui| {
+                                    if crate::ui::ellipsis_button(ui, "Retry").clicked() {
+                                        self.trigger_update_check();
+                                    }
+                                    if crate::ui::ellipsis_button(ui, "Dismiss").clicked() {
+                                        self.dismiss_update_dialog();
+                                    }
+                                });
+                            });
+                        });
+                }
                 _ => {
                     // State changed while dialog was open (or no longer relevant)
                     self.show_update_dialog = false;
@@ -2225,6 +2250,86 @@ mod tests {
             !app.show_update_dialog,
             "The dialog should stay closed on the next frame after opening the browser"
         );
+    }
+
+    #[test]
+    fn test_auto_update_error_dialog_shows_message_and_dismiss_action() {
+        let mut app = App::new();
+        app.auto_check_done = true;
+        app.show_update_dialog = true;
+        let failure_message = "Failed to download update: connection refused";
+        *app.update_state.lock().unwrap() = UpdateState::Error(failure_message.to_string());
+
+        let ctx = egui::Context::default();
+        let screen_rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(800.0, 600.0),
+        );
+        let mut frame = eframe::Frame::_new_kittest();
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ctx| eframe::App::update(&mut app, ctx, &mut frame),
+        );
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ctx| eframe::App::update(&mut app, ctx, &mut frame),
+        );
+
+        let rendered_text = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(app.show_update_dialog, "Error state should keep the dialog open");
+        assert!(
+            rendered_text.contains(&failure_message),
+            "The dialog should display the download failure reason"
+        );
+        assert!(rendered_text.contains(&"Retry"), "The dialog should offer retry");
+        assert!(rendered_text.contains(&"Dismiss"), "The dialog should offer dismissal");
+
+        let dismiss_button_pos = output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.job.text == "Dismiss" => {
+                    Some(text.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .expect("Update error dialog should render a Dismiss button");
+        let pointer_input = |pressed| egui::RawInput {
+            screen_rect: Some(screen_rect),
+            events: vec![
+                egui::Event::PointerMoved(dismiss_button_pos),
+                egui::Event::PointerButton {
+                    pos: dismiss_button_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let _ = ctx.run(pointer_input(true), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+        let _ = ctx.run(pointer_input(false), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+
+        assert!(!app.show_update_dialog, "Dismiss should close the error dialog");
+        assert!(app.update_dialog_dismissed, "Dismiss should prevent automatic reopening");
     }
 
     // --- Download tracking tests ---
