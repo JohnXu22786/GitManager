@@ -25,7 +25,7 @@ jobs:
         id: extract-version
         shell: bash
         run: |
-          TAG="${{ github.ref_name }}"
+          TAG="$GITHUB_REF_NAME"
           VERSION="${TAG#v}"
           echo "app_version=$VERSION" >> $GITHUB_OUTPUT
 
@@ -108,15 +108,14 @@ jobs:
           echo "PKG_CONFIG_ALLOW_CROSS=1" >> $GITHUB_ENV
 
       - name: Set version in Cargo.toml
+        env:
+          VERSION: ${{ needs.prepare-version.outputs.app_version }}
         shell: bash
         run: |
-          VERSION="${{ needs.prepare-version.outputs.app_version }}"
           if [[ "${{ runner.os }}" == "Windows" ]]; then
-            powershell -Command "(Get-Content Cargo.toml) -replace '^version = \".*\"', 'version = \"$VERSION\"' | Set-Content Cargo.toml"
-          elif [[ "${{ runner.os }}" == "macOS" ]]; then
-            sed -i '' "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+            powershell -Command "(Get-Content Cargo.toml) -replace '^version = \".*\"', ('version = \"' + \$env:VERSION + '\"') | Set-Content Cargo.toml"
           else
-            sed -i "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+            perl -i -pe 's/^version = ".*"/version = "$ENV{VERSION}"/' Cargo.toml
           fi
 
       - name: Build release
@@ -125,8 +124,9 @@ jobs:
       - name: Package binary
         id: package
         shell: bash
+        env:
+          VERSION: ${{ needs.prepare-version.outputs.app_version }}
         run: |
-          VERSION="${{ needs.prepare-version.outputs.app_version }}"
           SUFFIX="${{ matrix.artifact_suffix }}"
 
           if [[ "${{ matrix.target }}" == *"windows"* ]]; then
