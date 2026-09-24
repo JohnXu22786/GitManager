@@ -337,6 +337,9 @@ impl App {
                 self.remote_name_user_edited = false;
                 self.push_branch.clear();
                 self.push_branch_user_edited = false;
+                self.diff_content.clear();
+                self.diff_path.clear();
+                self.show_diff = false;
                 self.status_message = format!("Opened repository at {}", path);
                 self.status_is_error = false;
                 self.refresh_all();
@@ -1482,6 +1485,39 @@ mod tests {
         assert_eq!(app.repo_path, new_repo.path().to_string_lossy());
         assert_eq!(app.commits.len(), 1);
         assert_eq!(app.commits[0].summary, "new repository commit");
+    }
+
+    #[test]
+    fn test_open_repo_clears_diff_from_previous_repository() {
+        let first_repo = tempfile::tempdir().expect("first repo dir");
+        let second_repo = tempfile::tempdir().expect("second repo dir");
+        git2::Repository::init(first_repo.path()).expect("init first repo");
+        git2::Repository::init(second_repo.path()).expect("init second repo");
+
+        let recent_file = tempfile::NamedTempFile::new().expect("recent repos file");
+        let mut app = App::new();
+        app.recent_repos = RecentRepos::load_from(recent_file.path().to_path_buf());
+        app.open_repo(first_repo.path().to_str().expect("first repo path"));
+
+        app.handle_op_result(
+            "Show diff".to_string(),
+            OpResult::DiffContent {
+                path: "repo-a.txt".to_string(),
+                lines: vec![DiffLine {
+                    origin: '+',
+                    content: "repo A content".to_string(),
+                }],
+            },
+        );
+        assert!(app.show_diff);
+        assert_eq!(app.diff_path, "repo-a.txt");
+        assert_eq!(app.diff_content.len(), 1);
+
+        app.open_repo(second_repo.path().to_str().expect("second repo path"));
+
+        assert!(app.diff_content.is_empty());
+        assert!(app.diff_path.is_empty());
+        assert!(!app.show_diff);
     }
 
     #[test]
