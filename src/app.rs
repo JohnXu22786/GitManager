@@ -25,6 +25,47 @@ fn update_asset_download_path(
     Ok(download_dir.join(file_name))
 }
 
+fn clone_credential(
+    url: &str,
+    username_from_url: Option<&str>,
+    allowed_types: git2::CredentialType,
+) -> Result<git2::Cred, git2::Error> {
+    let config = git2::Config::open_default().ok();
+    clone_credential_with_config(config.as_ref(), url, username_from_url, allowed_types)
+}
+
+fn clone_credential_with_config(
+    config: Option<&git2::Config>,
+    url: &str,
+    username_from_url: Option<&str>,
+    allowed_types: git2::CredentialType,
+) -> Result<git2::Cred, git2::Error> {
+    let username = username_from_url.unwrap_or("git");
+    if allowed_types.contains(git2::CredentialType::SSH_KEY) {
+        if let Ok(credential) = git2::Cred::ssh_key_from_agent(username) {
+            return Ok(credential);
+        }
+    }
+    if allowed_types.contains(git2::CredentialType::USER_PASS_PLAINTEXT) {
+        if let Some(config) = config {
+            if let Ok(credential) =
+                git2::Cred::credential_helper(config, url, username_from_url)
+            {
+                return Ok(credential);
+            }
+        }
+    }
+    if allowed_types.contains(git2::CredentialType::DEFAULT) {
+        return git2::Cred::default();
+    }
+    if allowed_types.contains(git2::CredentialType::USERNAME) {
+        return git2::Cred::username(username);
+    }
+    Err(git2::Error::from_str(
+        "No supported credentials are available for this remote",
+    ))
+}
+
 /// Tracks a Git operation running in a background thread.
 struct PendingOp {
     description: String,
@@ -108,6 +149,9 @@ pub struct App {
     pub last_refresh: std::time::Instant,
 
     pub show_about: bool,
+    show_clone_dialog: bool,
+    clone_url: String,
+    clone_destination: String,
     pub update_state: Arc<Mutex<UpdateState>>,
     pub show_update_dialog: bool,
     pub auto_check_done: bool,
@@ -177,6 +221,9 @@ impl App {
             last_refresh: std::time::Instant::now(),
 
             show_about: false,
+            show_clone_dialog: false,
+            clone_url: String::new(),
+            clone_destination: String::new(),
 
             update_state: Arc::new(Mutex::new(UpdateState::Idle)),
             show_update_dialog: false,
@@ -379,6 +426,227 @@ impl App {
         }
     }
 
+    fn show_welcome_screen(&mut self, ui: &mut egui::Ui) -> egui::Response {
+        let mut clone_response = None;
+        ui.vertical_centered(|ui| {
+            ui.add_space(100.0);
+            ui.heading("Git Manager");
+            ui.label("Open a Git repository to get started.");
+            ui.add_space(20.0);
+            if crate::ui::add_enabled_ellipsis(ui, !self.is_busy(), "📂 Open Repository").clicked() {
+                let path = crate::native_file_dialog();
+                if let Some(p) = path {
+                    self.open_repo(&p);
+                }
+            }
+            ui.add_space(10.0);
+            ui.label("Or drag & drop a folder");
+            let response = crate::ui::ellipsis_button(ui, "Clone Repository...");
+            if response.clicked() {
+                self.show_clone_dialog = true;
+            }
+            clone_response = Some(response);
+
+            if !self.recent_repos.is_empty() {
+                ui.add_space(30.0);
+                ui.separator();
+                ui.add_space(10.0);
+                ui.label(
+                    egui::RichText::new("📁 Recent Repositories")
+                        .heading(),
+                );
+                ui.add_space(5.0);
+
+                let mut to_delete: Option<usize> = None;
+                let entries = self.recent_repos.entries().to_vec();
+                egui::ScrollArea::vertical()
+                    .max_height(300.0)
+                    .show(ui, |ui| {
+                        for (i, entry) in entries.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.set_min_width(400.0);
+                                let repo_name = format!("📂 {}", entry.name);
+                                if ui
+                                    .selectable_label(false, egui::RichText::new(&repo_name).size(14.0))
+                                    .clicked()
+                                {
+                                    self.open_repo(&entry.path);
+                                }
+                                ui.label(
+                                    egui::RichText::new(&entry.path)
+                                        .size(10.0)
+                                        .color(egui::Color32::GRAY),
+                                );
+                                if crate::ui::ellipsis_button(ui, "🗑 Delete").clicked() {
+                                    to_delete = Some(i);
+                                }
+                            });
+                        }
+                    });
+                if let Some(idx) = to_delete {
+                    if let Err(error) = self.recent_repos.remove(idx) {
+                        self.status_message =
+                            format!("Failed to save recent history: {}", error);
+                        self.status_is_error = true;
+                    }
+                }
+            }
+        });
+        clone_response.expect("welcome screen clone button is always rendered")
+    }
+
+    fn start_clone(&mut self, ctx: &egui::Context, url: String, destination: String) {
+        let url = url.trim().to_string();
+        if url.is_empty() {
+            self.show_error("Repository URL required".into());
+            return;
+        }
+        let destination = std::path::PathBuf::from(destination.trim());
+        if destination.as_os_str().is_empty() {
+            self.show_error("Clone destination required".into());
+            return;
+        }
+        if self.is_busy() {
+            return;
+        }
+
+        self.status_message.clear();
+        self.status_is_error = false;
+        let (tx, rx) = mpsc::channel::<OpResult>();
+        let progress = Arc::new(Mutex::new(String::new()));
+        let operation_progress = progress.clone();
+        let operation_destination = destination.clone();
+
+        std::thread::spawn(move || {
+            let mut callbacks = git2::RemoteCallbacks::new();
+            callbacks.credentials(clone_credential);
+            callbacks.transfer_progress(move |stats| {
+                let message = format!(
+                    "Receiving objects: {}/{} ({} bytes)",
+                    stats.received_objects(),
+                    stats.total_objects(),
+                    stats.received_bytes()
+                );
+                *operation_progress.lock().unwrap() = message;
+                true
+            });
+            let mut fetch_options = git2::FetchOptions::new();
+            fetch_options.remote_callbacks(callbacks);
+            let mut builder = git2::build::RepoBuilder::new();
+            builder.fetch_options(fetch_options);
+
+            let result = match builder.clone(&url, &operation_destination) {
+                Ok(_) => OpResult::CloneSuccess(operation_destination),
+                Err(error) => OpResult::Error(format!("Failed to clone repository: {}", error)),
+            };
+            let _ = tx.send(result);
+        });
+
+        self.pending_ops.push(PendingOp {
+            description: "Cloning repository".to_string(),
+            receiver: rx,
+            repo_generation: self.repo_generation,
+            started_at: Instant::now(),
+            progress,
+            last_progress_update: Instant::now(),
+            last_seen_progress: String::new(),
+            timed_out: false,
+        });
+        self.last_operation_log =
+            "▶ Operation: Cloning repository\n  (waiting for progress...)\n".to_string();
+        ctx.request_repaint();
+    }
+
+    fn render_clone_dialog(&mut self, ctx: &egui::Context) -> Option<egui::Response> {
+        if !self.show_clone_dialog {
+            return None;
+        }
+
+        let busy = self.is_busy();
+        let mut open = true;
+        let mut start_clone = false;
+        let mut clone_button_response = None;
+        let mut window = egui::Window::new("Clone Repository")
+            .collapsible(false)
+            .resizable(false);
+        if !busy {
+            window = window.open(&mut open);
+        }
+        window.show(ctx, |ui| {
+                ui.label("Repository URL");
+                ui.add_enabled(
+                    !busy,
+                    egui::TextEdit::singleline(&mut self.clone_url).desired_width(360.0),
+                );
+                ui.add_space(8.0);
+                ui.label("Destination folder");
+                ui.horizontal(|ui| {
+                    ui.add_enabled(
+                        !busy,
+                        egui::TextEdit::singleline(&mut self.clone_destination)
+                            .desired_width(280.0),
+                    );
+                    if crate::ui::add_enabled_ellipsis(ui, !busy, "Browse...").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .set_title("Select clone destination")
+                            .pick_folder()
+                        {
+                            self.clone_destination = path.to_string_lossy().into_owned();
+                        }
+                    }
+                });
+
+                if busy {
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(self.current_operation());
+                    });
+                    if let Some(operation) = self.pending_ops.first() {
+                        let progress = operation.progress.lock().unwrap().clone();
+                        if !progress.is_empty() {
+                            ui.label(progress);
+                        }
+                    }
+                }
+
+                if self.status_is_error && !self.status_message.is_empty() {
+                    ui.add_space(4.0);
+                    ui.colored_label(
+                        App::adaptive_red(ctx.style().visuals.dark_mode),
+                        &self.status_message,
+                    );
+                }
+
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if crate::ui::add_enabled_ellipsis(ui, !busy, "Cancel").clicked() {
+                        self.show_clone_dialog = false;
+                    }
+                    let can_clone = !busy
+                        && !self.clone_url.trim().is_empty()
+                        && !self.clone_destination.trim().is_empty();
+                    let response = crate::ui::add_enabled_ellipsis(ui, can_clone, "Clone");
+                    if response.clicked() {
+                        start_clone = true;
+                    }
+                    clone_button_response = Some(response);
+                });
+            });
+
+        if !busy {
+            self.show_clone_dialog &= open;
+        }
+        if start_clone {
+            self.start_clone(
+                ctx,
+                self.clone_url.clone(),
+                self.clone_destination.clone(),
+            );
+        }
+        clone_button_response
+    }
+
     /// Checks if there are any pending background operations.
     pub fn is_busy(&self) -> bool {
         !self.pending_ops.is_empty()
@@ -518,11 +786,11 @@ impl App {
                 Ok(result) => {
                     let op = self.pending_ops.swap_remove(i);
                     if op.timed_out {
-                        // Keep the UI blocked until the timed-out worker has finished. A
-                        // successful late result may have mutated Git state, so refresh it
-                        // before allowing another operation to start.
+                        // Keep the UI blocked until the timed-out worker has finished.
                         if matches!(&result, OpResult::Success(_)) {
                             self.needs_refresh = true;
+                        } else if matches!(&result, OpResult::CloneSuccess(_)) {
+                            self.handle_op_result(op.description, result);
                         }
                         continue;
                     }
@@ -585,6 +853,20 @@ impl App {
                 // Set status_message to concise error message
                 self.status_message = err_msg;
                 self.status_is_error = true;
+            }
+            OpResult::CloneSuccess(path) => {
+                self.last_operation_log += &format!("  ✓ Cloned repository into {}\n", path.display());
+                let path = path.to_string_lossy().into_owned();
+                self.show_clone_dialog = false;
+                self.clone_url.clear();
+                self.clone_destination.clear();
+                self.open_repo(&path);
+                if self.repo_path == path {
+                    self.current_tab = Tab::Status;
+                    if !self.status_is_error {
+                        self.show_success(format!("Cloned repository into {}", path));
+                    }
+                }
             }
             OpResult::DiffContent { path, lines } => {
                 self.diff_path = path;
@@ -1040,69 +1322,7 @@ impl eframe::App for App {
         // --- Central Panel ---
         egui::CentralPanel::default().show(ctx, |ui| {
             if !self.git.is_open() {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(100.0);
-                    ui.heading("Git Manager");
-                    ui.label("Open a Git repository to get started.");
-                    ui.add_space(20.0);
-                    if crate::ui::add_enabled_ellipsis(ui, !self.is_busy(), "📂 Open Repository").clicked() {
-                        let path = crate::native_file_dialog();
-                        if let Some(p) = path {
-                            self.open_repo(&p);
-                        }
-                    }
-                    ui.add_space(10.0);
-                    ui.label("Or drag & drop a folder");
-                    if crate::ui::ellipsis_button(ui, "Clone Repository...").clicked() {
-                        self.current_tab = Tab::Remotes;
-                    }
-
-                    // Recent repositories section
-                    if !self.recent_repos.is_empty() {
-                        ui.add_space(30.0);
-                        ui.separator();
-                        ui.add_space(10.0);
-                        ui.label(
-                            egui::RichText::new("📁 Recent Repositories")
-                                .heading(),
-                        );
-                        ui.add_space(5.0);
-
-                        let mut to_delete: Option<usize> = None;
-                        let entries = self.recent_repos.entries().to_vec();
-                        egui::ScrollArea::vertical()
-                            .max_height(300.0)
-                            .show(ui, |ui| {
-                                for (i, entry) in entries.iter().enumerate() {
-                                    ui.horizontal(|ui| {
-                                        ui.set_min_width(400.0);
-                                        let repo_name = format!("📂 {}", entry.name);
-                                        if ui
-                                            .selectable_label(false, egui::RichText::new(&repo_name).size(14.0))
-                                            .clicked()
-                                        {
-                                            self.open_repo(&entry.path);
-                                        }
-                                        ui.label(
-                                            egui::RichText::new(&entry.path)
-                                                .size(10.0)
-                                                .color(egui::Color32::GRAY),
-                                        );
-                                        if crate::ui::ellipsis_button(ui, "🗑 Delete").clicked() {
-                                            to_delete = Some(i);
-                                        }
-                                    });
-                                }
-                            });
-                        if let Some(idx) = to_delete {
-                            if let Err(error) = self.recent_repos.remove(idx) {
-                                self.status_message =
-                                    format!("Failed to save recent history: {}", error);
-                                self.status_is_error = true;
-                            }
-                        }
-                    }
-                });
+                self.show_welcome_screen(ui);
                 return;
             }
 
@@ -1155,6 +1375,8 @@ impl eframe::App for App {
                     ui.allocate_space(ui.available_size());
                 });
         });
+
+        let _ = self.render_clone_dialog(ctx);
 
         // About window
         if self.show_about {
@@ -1726,6 +1948,362 @@ mod tests {
         assert!(!app.show_about);
         assert!(!app.git.is_open());
         assert_eq!(app.current_tab, Tab::Status);
+        assert!(!app.show_clone_dialog);
+    }
+
+    #[test]
+    fn welcome_clone_button_opens_clone_dialog_without_a_repository() {
+        let mut app = App::new();
+        let recent_dir = tempfile::tempdir().expect("recent directory");
+        app.recent_repos = RecentRepos::load_from(recent_dir.path().join("recent.json"));
+        let ctx = egui::Context::default();
+        let screen_rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(800.0, 600.0),
+        );
+        let mut clone_button_rect = egui::Rect::NOTHING;
+
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    clone_button_rect = app.show_welcome_screen(ui).rect;
+                });
+            },
+        );
+
+        let position = clone_button_rect.center();
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.show_welcome_screen(ui);
+                });
+            },
+        );
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.show_welcome_screen(ui);
+                });
+            },
+        );
+
+        assert!(!app.git.is_open());
+        assert!(app.show_clone_dialog);
+    }
+
+    fn run_clone_dialog_frame(
+        app: &mut App,
+        ctx: &egui::Context,
+        screen_rect: egui::Rect,
+        events: Vec<egui::Event>,
+    ) -> (egui::Rect, bool) {
+        let mut clone_button_rect = egui::Rect::NOTHING;
+        let mut clone_button_clicked = false;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |_ui| {});
+                let response = app.render_clone_dialog(ctx).expect("clone dialog is open");
+                clone_button_rect = response.rect;
+                clone_button_clicked = response.clicked();
+            },
+        );
+        (clone_button_rect, clone_button_clicked)
+    }
+
+    #[test]
+    fn clone_dialog_button_opens_repository_after_success() {
+        let source_dir = tempfile::tempdir().expect("source directory");
+        let source_repo = git2::Repository::init(source_dir.path()).expect("initialize source");
+        let signature = git2::Signature::now("test", "test@example.com").expect("signature");
+        let tree_oid = {
+            let mut index = source_repo.index().expect("source index");
+            index.write_tree().expect("write source tree")
+        };
+        let tree = source_repo.find_tree(tree_oid).expect("source tree");
+        source_repo
+            .commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+            .expect("create source commit");
+        drop(tree);
+        drop(source_repo);
+
+        let destination_parent = tempfile::tempdir().expect("destination parent");
+        let destination = destination_parent.path().join("cloned");
+        let recent_dir = tempfile::tempdir().expect("recent directory");
+        let mut app = App::new();
+        app.recent_repos = RecentRepos::load_from(recent_dir.path().join("recent.json"));
+        app.show_clone_dialog = true;
+        app.clone_url = source_dir.path().to_string_lossy().into_owned();
+        app.clone_destination = destination.to_string_lossy().into_owned();
+        let ctx = egui::Context::default();
+        let screen_rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(800.0, 600.0),
+        );
+        run_clone_dialog_frame(&mut app, &ctx, screen_rect, Vec::new());
+        let (clone_rect, _) = run_clone_dialog_frame(&mut app, &ctx, screen_rect, Vec::new());
+        let position = clone_rect.center();
+        let press = egui::Event::PointerButton {
+            pos: position,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        };
+        run_clone_dialog_frame(
+            &mut app,
+            &ctx,
+            screen_rect,
+            vec![egui::Event::PointerMoved(position), press],
+        );
+        let release = egui::Event::PointerButton {
+            pos: position,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        };
+        let (_, clone_clicked) = run_clone_dialog_frame(
+            &mut app,
+            &ctx,
+            screen_rect,
+            vec![egui::Event::PointerMoved(position), release],
+        );
+        assert!(clone_clicked, "clone dialog button should report a click");
+        assert!(app.is_busy(), "clone button should start the operation");
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while app.is_busy() && Instant::now() < deadline {
+            app.process_pending_ops(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(!app.is_busy(), "clone operation should complete");
+        assert!(app.git.is_open());
+        assert_eq!(app.git.path(), Some(destination.as_path()));
+        assert_eq!(app.current_tab, Tab::Status);
+        assert!(!app.show_clone_dialog);
+        assert!(!app.status_is_error);
+    }
+
+    #[test]
+    fn clone_success_preserves_recent_history_error() {
+        let clone_dir = tempfile::tempdir().expect("clone directory");
+        drop(git2::Repository::init(clone_dir.path()).expect("initialize cloned repository"));
+        let recent_dir = tempfile::tempdir().expect("recent directory");
+        let recent_path = recent_dir.path().join("invalid-history");
+        std::fs::create_dir(&recent_path).expect("make history path a directory");
+        let mut app = App::new();
+        app.recent_repos = RecentRepos::load_from(recent_path);
+
+        app.handle_op_result(
+            "Cloning repository".to_string(),
+            OpResult::CloneSuccess(clone_dir.path().to_path_buf()),
+        );
+
+        assert!(app.git.is_open());
+        assert!(app.status_is_error);
+        assert!(app.status_message.contains("failed to save recent history"));
+    }
+
+    #[test]
+    fn clone_credentials_support_username_only_transports() {
+        let credential = clone_credential_with_config(
+            None,
+            "ssh://git.example.com/repo.git",
+            Some("test-user"),
+            git2::CredentialType::USERNAME,
+        )
+        .expect("username credential");
+
+        assert!(credential.has_username());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clone_credentials_use_configured_git_helper() {
+        let temp_dir = tempfile::tempdir().expect("credential helper directory");
+        let credentials_path = temp_dir.path().join("credentials");
+        let config_path = temp_dir.path().join("config");
+        std::fs::write(
+            &credentials_path,
+            "https://test-user:test-password@git.example.com\n",
+        )
+        .expect("write test credentials");
+        std::fs::write(&config_path, "").expect("create credential config");
+        let mut config = git2::Config::open(&config_path).expect("credential config");
+        config
+            .set_str(
+                "credential.helper",
+                &format!("store --file={}", credentials_path.display()),
+            )
+            .expect("configure credential helper");
+
+        let credential = clone_credential_with_config(
+            Some(&config),
+            "https://git.example.com/repo.git",
+            None,
+            git2::CredentialType::USER_PASS_PLAINTEXT,
+        )
+        .expect("credential helper result");
+
+        assert!(credential.has_username());
+    }
+
+    #[test]
+    fn failed_clone_can_be_retried_from_the_dialog() {
+        let source_dir = tempfile::tempdir().expect("source directory");
+        let source_repo = git2::Repository::init(source_dir.path()).expect("initialize source");
+        let signature = git2::Signature::now("test", "test@example.com").expect("signature");
+        let tree_oid = {
+            let mut index = source_repo.index().expect("source index");
+            index.write_tree().expect("write source tree")
+        };
+        let tree = source_repo.find_tree(tree_oid).expect("source tree");
+        source_repo
+            .commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+            .expect("create source commit");
+        drop(tree);
+        drop(source_repo);
+
+        let temp_dir = tempfile::tempdir().expect("clone parent");
+        let recent_dir = tempfile::tempdir().expect("recent directory");
+        let mut app = App::new();
+        app.recent_repos = RecentRepos::load_from(recent_dir.path().join("recent.json"));
+        app.show_clone_dialog = true;
+        let ctx = egui::Context::default();
+        app.start_clone(
+            &ctx,
+            temp_dir.path().join("missing-source").to_string_lossy().into_owned(),
+            temp_dir.path().join("failed-clone").to_string_lossy().into_owned(),
+        );
+        let screen_rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(800.0, 600.0),
+        );
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ctx| {
+                let _ = app.render_clone_dialog(ctx);
+            },
+        );
+        assert!(app.show_clone_dialog, "dialog should stay open while cloning");
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while app.is_busy() && Instant::now() < deadline {
+            app.process_pending_ops(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!app.is_busy(), "failed clone should finish");
+        assert!(app.status_is_error);
+        assert!(app.show_clone_dialog);
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ctx| {
+                let _ = app.render_clone_dialog(ctx);
+            },
+        );
+        assert!(output.shapes.iter().any(|clipped| match &clipped.shape {
+            egui::Shape::Text(text) => text.galley.job.text == app.status_message,
+            _ => false,
+        }));
+
+        app.start_clone(
+            &ctx,
+            source_dir.path().to_string_lossy().into_owned(),
+            temp_dir.path().join("successful-clone").to_string_lossy().into_owned(),
+        );
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while app.is_busy() && Instant::now() < deadline {
+            app.process_pending_ops(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(!app.is_busy(), "retry should finish");
+        assert!(app.git.is_open());
+        assert!(!app.status_is_error);
+        assert!(!app.show_clone_dialog);
+    }
+
+    #[test]
+    fn late_clone_success_after_timeout_opens_repository() {
+        let clone_dir = tempfile::tempdir().expect("clone directory");
+        let clone_repo = git2::Repository::init(clone_dir.path()).expect("initialize cloned repository");
+        let signature = git2::Signature::now("test", "test@example.com").expect("signature");
+        let tree_oid = {
+            let mut index = clone_repo.index().expect("clone index");
+            index.write_tree().expect("write clone tree")
+        };
+        let tree = clone_repo.find_tree(tree_oid).expect("clone tree");
+        clone_repo
+            .commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+            .expect("create clone commit");
+        drop(tree);
+        drop(clone_repo);
+        let recent_dir = tempfile::tempdir().expect("recent repos directory");
+        let mut app = App::new();
+        app.recent_repos = RecentRepos::load_from(recent_dir.path().join("recent.json"));
+        app.show_clone_dialog = true;
+        app.show_error("Operation 'Cloning repository' timed out".into());
+        let (tx, rx) = mpsc::channel();
+        tx.send(OpResult::CloneSuccess(clone_dir.path().to_path_buf()))
+            .expect("send late clone result");
+        app.pending_ops.push(PendingOp {
+            description: "Cloning repository".to_string(),
+            receiver: rx,
+            repo_generation: app.repo_generation,
+            started_at: Instant::now(),
+            progress: Arc::new(Mutex::new(String::new())),
+            last_progress_update: Instant::now(),
+            last_seen_progress: String::new(),
+            timed_out: true,
+        });
+
+        app.process_pending_ops(&egui::Context::default());
+
+        assert!(app.git.is_open());
+        assert_eq!(app.repo_path, clone_dir.path().to_string_lossy());
+        assert_eq!(app.current_tab, Tab::Status);
+        assert!(!app.show_clone_dialog);
+        assert!(!app.status_is_error);
     }
 
     #[test]

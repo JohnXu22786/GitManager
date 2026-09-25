@@ -54,6 +54,8 @@ pub enum GitOperation {
 pub enum OpResult {
     /// Operation succeeded with a message.
     Success(String),
+    /// A repository was cloned successfully and can be opened by the app.
+    CloneSuccess(PathBuf),
     /// Operation failed with an error message.
     Error(String),
     /// Diff content for a file.
