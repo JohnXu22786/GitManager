@@ -1885,14 +1885,37 @@ mod tests {
 
     #[test]
     fn test_open_repo_clears_status_message() {
-        // We can't fully test open_repo without a real git repo,
-        // but we can verify it clears status_message
+        let repo_dir = tempfile::tempdir().expect("repo dir");
+        let repo = git2::Repository::init(repo_dir.path()).expect("init repo");
+        let signature = git2::Signature::now("test", "test@example.com").expect("signature");
+        let tree_oid = {
+            let mut index = repo.index().expect("index");
+            index.write_tree().expect("write tree")
+        };
+        let tree = repo.find_tree(tree_oid).expect("tree");
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "initial commit",
+            &tree,
+            &[],
+        )
+        .expect("commit");
+        drop(tree);
+        drop(repo);
+
+        let recent_repos_dir = tempfile::tempdir().expect("recent repos dir");
+        let repo_path = repo_dir.path().to_str().expect("repo path");
+
         let mut app = App::new();
+        app.recent_repos = RecentRepos::load_from(recent_repos_dir.path().join("recent.json"));
         app.status_message = "old message".into();
         app.status_is_error = true;
-        // Clearing before open:
-        app.status_message.clear();
-        app.status_is_error = false;
+
+        app.open_repo(repo_path);
+
+        assert_eq!(app.repo_path, repo_path);
         assert!(app.status_message.is_empty());
         assert!(!app.status_is_error);
     }
