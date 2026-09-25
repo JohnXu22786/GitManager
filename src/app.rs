@@ -2777,7 +2777,22 @@ mod tests {
         assert!(result.contains("h ago"));
     }
 
-    // --- Update dialog dismiss flag tests ---
+    // --- Update dialog behavior tests ---
+
+    fn run_app_frame(
+        app: &mut App,
+        ctx: &egui::Context,
+        frame: &mut eframe::Frame,
+        screen_rect: egui::Rect,
+    ) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ctx| eframe::App::update(app, ctx, frame),
+        )
+    }
 
     #[test]
     fn test_update_dialog_dismissed_initially_false() {
@@ -2794,43 +2809,86 @@ mod tests {
     }
 
     #[test]
-    fn test_dismiss_flag_prevents_dialog_reopen() {
+    fn test_update_available_opens_dialog_when_not_dismissed() {
         let mut app = App::new();
-        app.update_dialog_dismissed = true;
-        app.show_update_dialog = false;
+        app.auto_check_done = true;
+        *app.update_state.lock().unwrap() = UpdateState::UpdateAvailable {
+            latest_version: "0.2.0".to_string(),
+            download_url: String::new(),
+            assets: Vec::new(),
+        };
 
-        if !app.update_dialog_dismissed {
-            if !app.show_update_dialog {
-                app.show_update_dialog = true;
-            }
-        }
+        let ctx = egui::Context::default();
+        let screen_rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let mut frame = eframe::Frame::_new_kittest();
+        run_app_frame(&mut app, &ctx, &mut frame, screen_rect);
 
-        assert!(!app.show_update_dialog, "Dialog should not reopen when dismissed");
+        assert!(
+            app.show_update_dialog,
+            "An available update should open the dialog"
+        );
     }
 
     #[test]
-    fn test_dialog_opens_when_not_dismissed() {
+    fn test_remind_later_dismisses_dialog_and_prevents_reopening() {
         let mut app = App::new();
-        app.update_dialog_dismissed = false;
-        app.show_update_dialog = false;
+        app.auto_check_done = true;
+        *app.update_state.lock().unwrap() = UpdateState::UpdateAvailable {
+            latest_version: "0.2.0".to_string(),
+            download_url: String::new(),
+            assets: Vec::new(),
+        };
 
-        if !app.update_dialog_dismissed {
-            if !app.show_update_dialog {
-                app.show_update_dialog = true;
-            }
-        }
+        let ctx = egui::Context::default();
+        let screen_rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let mut frame = eframe::Frame::_new_kittest();
+        run_app_frame(&mut app, &ctx, &mut frame, screen_rect);
+        let output = run_app_frame(&mut app, &ctx, &mut frame, screen_rect);
+        let remind_later_pos = output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.job.text == "Remind Later" => {
+                    Some(text.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .expect("Update dialog should render a Remind Later button");
+        let pointer_input = |pressed| egui::RawInput {
+            screen_rect: Some(screen_rect),
+            events: vec![
+                egui::Event::PointerMoved(remind_later_pos),
+                egui::Event::PointerButton {
+                    pos: remind_later_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+            ..Default::default()
+        };
 
-        assert!(app.show_update_dialog, "Dialog should open when not dismissed");
-    }
+        let _ = ctx.run(pointer_input(true), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
+        let _ = ctx.run(pointer_input(false), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame);
+        });
 
-    #[test]
-    fn test_dismiss_flag_after_remind_later() {
-        let mut app = App::new();
-        app.show_update_dialog = false;
-        app.update_dialog_dismissed = true;
+        assert!(
+            !app.show_update_dialog,
+            "Remind Later should close the dialog"
+        );
+        assert!(
+            app.update_dialog_dismissed,
+            "Remind Later should mark the dialog dismissed"
+        );
 
-        assert!(app.update_dialog_dismissed, "Remind Later should set dismiss flag");
-        assert!(!app.show_update_dialog, "Remind Later should close dialog");
+        run_app_frame(&mut app, &ctx, &mut frame, screen_rect);
+        assert!(
+            !app.show_update_dialog,
+            "An available update should stay dismissed on the next frame"
+        );
     }
 
     #[test]
