@@ -486,11 +486,26 @@ pub fn download_file_with_progress(
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
 
-    // Read response body with progress tracking
     let mut reader = response.into_reader();
-    let mut buffer = Vec::new();
+    stream_response_to_path(&mut reader, dest_path, total_size, &progress)?;
+
+    if let Ok(mut prog) = progress.lock() {
+        *prog = 1.0;
+    }
+
+    Ok(())
+}
+
+const DOWNLOAD_CHUNK_SIZE: usize = 8192;
+
+fn stream_response_to_writer<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    total_size: u64,
+    progress: &Arc<Mutex<f32>>,
+) -> Result<(), String> {
     let mut downloaded: u64 = 0;
-    let mut chunk = [0u8; 8192];
+    let mut chunk = [0u8; DOWNLOAD_CHUNK_SIZE];
 
     loop {
         let bytes_read = reader
@@ -499,10 +514,11 @@ pub fn download_file_with_progress(
         if bytes_read == 0 {
             break;
         }
-        buffer.extend_from_slice(&chunk[..bytes_read]);
+        writer
+            .write_all(&chunk[..bytes_read])
+            .map_err(|e| format!("Download write error: {}", e))?;
         downloaded += bytes_read as u64;
 
-        // Update progress
         if total_size > 0 {
             let p = downloaded as f32 / total_size as f32;
             if let Ok(mut prog) = progress.lock() {
@@ -511,21 +527,97 @@ pub fn download_file_with_progress(
         }
     }
 
-    // Write downloaded data to file
-    std::fs::write(dest_path, &buffer)
-        .map_err(|e| format!("Failed to write download to file: {}", e))?;
-
-    // Mark as complete
-    if let Ok(mut prog) = progress.lock() {
-        *prog = 1.0;
-    }
-
     Ok(())
+}
+
+fn stream_response_to_path<R: Read>(
+    reader: &mut R,
+    dest_path: &Path,
+    total_size: u64,
+    progress: &Arc<Mutex<f32>>,
+) -> Result<(), String> {
+    let mut dest_file = std::fs::File::create(dest_path)
+        .map_err(|e| format!("Failed to write download to file: {}", e))?;
+    stream_response_to_writer(reader, &mut dest_file, total_size, progress)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct RepeatingReader {
+        remaining: usize,
+    }
+
+    impl Read for RepeatingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let bytes_read = buffer.len().min(self.remaining);
+            buffer[..bytes_read].fill(b'x');
+            self.remaining -= bytes_read;
+            Ok(bytes_read)
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingWriter {
+        bytes_written: usize,
+        largest_write: usize,
+    }
+
+    impl Write for CountingWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.bytes_written += buffer.len();
+            self.largest_write = self.largest_write.max(buffer.len());
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_stream_response_to_writer_uses_bounded_chunks() {
+        let body_size = 16 * 1024 * 1024;
+        let mut reader = RepeatingReader {
+            remaining: body_size,
+        };
+        let mut writer = CountingWriter::default();
+        let progress = Arc::new(Mutex::new(0.0));
+
+        stream_response_to_writer(&mut reader, &mut writer, body_size as u64, &progress).unwrap();
+
+        assert_eq!(writer.bytes_written, body_size);
+        assert!(writer.largest_write <= DOWNLOAD_CHUNK_SIZE);
+        assert_eq!(*progress.lock().unwrap(), 1.0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_stream_response_to_path_preserves_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dest_path = temp_dir.path().join("download.zip");
+        std::fs::write(&dest_path, b"old download").unwrap();
+        std::fs::set_permissions(&dest_path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let mut reader = std::io::Cursor::new(b"new download");
+        let progress = Arc::new(Mutex::new(0.0));
+
+        stream_response_to_path(
+            &mut reader,
+            &dest_path,
+            b"new download".len() as u64,
+            &progress,
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(&dest_path).unwrap(), b"new download");
+        assert_eq!(
+            std::fs::metadata(&dest_path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
 
     // --- parse_version tests ---
 
