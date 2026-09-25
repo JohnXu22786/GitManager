@@ -374,14 +374,16 @@ fn unix_executable_mode(path: &Path) -> Result<u32, String> {
 #[cfg(not(target_os = "windows"))]
 fn unix_self_update_script(new_binary: &Path, current_binary: &Path) -> Result<String, String> {
     let current_mode = unix_executable_mode(current_binary)?;
-    Ok(format!(
-        r#"#!/bin/sh
-sleep 2
-update_temp=$(mktemp {}.update.XXXXXX) || {{
+    let mut script = String::from("#!/bin/sh\n");
+    script.push_str(&shell_path_assignment("current_binary", current_binary));
+    script.push_str(&shell_path_assignment("new_binary", new_binary));
+    script.push_str(&format!(
+        r#"sleep 2
+update_temp=$(mktemp "${{current_binary}}.update.XXXXXX") || {{
     printf '%s\n' 'Git Manager update failed: could not stage executable; downloaded update retained.' >&2
     exit 1
 }}
-if ! cp -f {} "$update_temp"; then
+if ! cp -f "$new_binary" "$update_temp"; then
     printf '%s\n' 'Git Manager update failed: could not copy executable; downloaded update retained.' >&2
     rm -f "$update_temp"
     exit 1
@@ -391,26 +393,43 @@ if ! chmod {:o} "$update_temp"; then
     rm -f "$update_temp"
     exit 1
 fi
-if ! mv -f "$update_temp" {}; then
+if ! mv -f "$update_temp" "$current_binary"; then
     printf '%s\n' 'Git Manager update failed: could not replace executable; downloaded update retained.' >&2
     rm -f "$update_temp"
     exit 1
 fi
-rm -f {}
-{} &
+rm -f "$new_binary"
+"$current_binary" &
 rm -- "$0"
 "#,
-        shell_quote_path(current_binary),
-        shell_quote_path(new_binary),
         current_mode,
-        shell_quote_path(current_binary),
-        shell_quote_path(new_binary),
-        shell_quote_path(current_binary),
-    ))
+    ));
+    Ok(script)
 }
 
+#[cfg(not(target_os = "windows"))]
+fn shell_path_assignment(variable: &str, path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+
+    // Octal escapes keep arbitrary Unix path bytes out of the UTF-8 script.
+    let escaped_path = path
+        .as_os_str()
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("\\0{:03o}", byte))
+        .collect::<String>();
+    // The sentinel prevents command substitution from stripping path newlines.
+    format!("{variable}=$(printf '%bX' '{escaped_path}')\n{variable}=${{{variable}%X}}\n")
+}
+
+#[cfg(test)]
 fn shell_quote_path(path: &Path) -> String {
-    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+    format!(
+        "'{}'",
+        path.to_str()
+            .expect("test shell paths should be valid UTF-8")
+            .replace('\'', "'\\''")
+    )
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -1520,6 +1539,73 @@ mod tests {
         );
         assert!(!new_binary.exists(), "downloaded file is removed after success");
         assert!(launch_marker.exists(), "updated executable must be relaunched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_unix_update_script_preserves_non_utf8_paths() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let binary_dir = temp_dir
+            .path()
+            .join(OsString::from_vec(b"bin-\xff".to_vec()));
+        std::fs::create_dir(&binary_dir).unwrap();
+
+        let new_binary = binary_dir.join(OsString::from_vec(b"download-\xfe.bin".to_vec()));
+        let current_binary = binary_dir.join(OsString::from_vec(b"current-\xfd\n".to_vec()));
+        let launch_marker = temp_dir.path().join("updated-binary-launched");
+        let new_contents = format!(
+            "#!/bin/sh\nprintf updated > {}\n",
+            shell_quote_path(&launch_marker)
+        );
+        std::fs::write(&new_binary, &new_contents).unwrap();
+        std::fs::write(&current_binary, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&current_binary, std::fs::Permissions::from_mode(0o711)).unwrap();
+
+        let script_path = temp_dir.path().join("update-non-utf8.sh");
+        let script = unix_self_update_script(&new_binary, &current_binary).unwrap();
+        assert!(!script.contains('\u{fffd}'));
+        assert!(script.contains(r"\0377"));
+        assert!(script.contains(r"\0376"));
+        assert!(script.contains(r"\0375"));
+        std::fs::write(&script_path, script).unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let output = std::process::Command::new(&script_path).output().unwrap();
+        assert!(
+            output.status.success(),
+            "update script failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read(&current_binary).unwrap(),
+            new_contents.as_bytes()
+        );
+        assert_eq!(
+            std::fs::metadata(&current_binary)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o711
+        );
+        assert!(
+            !new_binary.exists(),
+            "downloaded file is removed after success"
+        );
+        for _ in 0..100 {
+            if launch_marker.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            launch_marker.exists(),
+            "updated executable must be relaunched"
+        );
     }
 
     #[cfg(unix)]
