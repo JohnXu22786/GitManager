@@ -1,6 +1,7 @@
 use chrono::DateTime;
 use git2::{BranchType, DiffOptions, Repository, Status, WorktreeAddOptions, WorktreePruneOptions};
 use std::cell::RefCell;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -10,6 +11,7 @@ pub type GitResult<T> = Result<T, String>;
 pub struct WorktreeFileIdentity {
     metadata: std::fs::Metadata,
     contents: Vec<u8>,
+    _lock_file: Option<Arc<std::fs::File>>,
 }
 
 /// Describes a Git operation to be executed in a background thread.
@@ -592,7 +594,11 @@ fn worktree_git_link_identity(worktree_path: &Path) -> Option<WorktreeFileIdenti
         return None;
     }
     let contents = worktree_git_link(worktree_path)?;
-    Some(WorktreeFileIdentity { metadata, contents })
+    Some(WorktreeFileIdentity {
+        metadata,
+        contents,
+        _lock_file: None,
+    })
 }
 
 fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
@@ -709,16 +715,89 @@ fn worktree_lock_identity(
     worktree: &git2::Worktree,
 ) -> GitResult<Option<WorktreeFileIdentity>> {
     let lock_path = worktree_lock_path(repo, worktree)?;
-    let metadata = match std::fs::symlink_metadata(&lock_path) {
+    let entry_metadata = match std::fs::symlink_metadata(&lock_path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("Check worktree lock: {}", error)),
     };
-    if !metadata.file_type().is_file() {
+    if !entry_metadata.file_type().is_file() {
         return Err("Check worktree lock: lock entry is not a regular file".into());
     }
-    let contents = std::fs::read(&lock_path).map_err(|error| format!("Check worktree lock: {}", error))?;
-    Ok(Some(WorktreeFileIdentity { metadata, contents }))
+    let mut file = std::fs::File::open(&lock_path)
+        .map_err(|error| format!("Check worktree lock: {}", error))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("Check worktree lock: {}", error))?;
+    if !metadata.file_type().is_file() || !same_file(&entry_metadata, &metadata) {
+        return Err("Check worktree lock: lock entry changed during inspection".into());
+    }
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents)
+        .map_err(|error| format!("Check worktree lock: {}", error))?;
+    let current_metadata = std::fs::symlink_metadata(&lock_path)
+        .map_err(|error| format!("Check worktree lock: {}", error))?;
+    if !same_file(&current_metadata, &metadata) {
+        return Err("Check worktree lock: lock entry changed during inspection".into());
+    }
+    Ok(Some(WorktreeFileIdentity {
+        metadata,
+        contents,
+        _lock_file: Some(Arc::new(file)),
+    }))
+}
+
+const WORKTREE_LOCK_REASON: &str = "GitManager is removing this worktree";
+
+fn acquire_worktree_lock_with<F>(
+    repo: &Repository,
+    worktree: &git2::Worktree,
+    after_write: F,
+) -> GitResult<WorktreeFileIdentity>
+where
+    F: FnOnce(&Path),
+{
+    let lock_path = worktree_lock_path(repo, worktree)?;
+    let mut lock_options = std::fs::OpenOptions::new();
+    lock_options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        lock_options.mode(0o644);
+    }
+    let mut lock_file = lock_options
+        .open(&lock_path)
+        .map_err(|error| format!("Lock worktree: {}", error))?;
+    let metadata = lock_file.metadata().map_err(|error| {
+        format!(
+            "Lock worktree: {}; lock entry retained because ownership could not be verified",
+            error
+        )
+    })?;
+    let contents = WORKTREE_LOCK_REASON.as_bytes().to_vec();
+    lock_file
+        .write_all(&contents)
+        .and_then(|()| lock_file.flush())
+        .map_err(|error| {
+            format!(
+                "Lock worktree: {}; incomplete lock entry retained",
+                error
+            )
+        })?;
+
+    let identity = WorktreeFileIdentity {
+        metadata,
+        contents,
+        _lock_file: Some(Arc::new(lock_file)),
+    };
+    after_write(&lock_path);
+    let still_owned = worktree_lock_identity_matches(repo, worktree, &identity);
+    if !still_owned {
+        return Err(
+            "Lock worktree: lock entry changed before ownership could be verified; lock retained"
+                .into(),
+        );
+    }
+    Ok(identity)
 }
 
 fn worktree_lock_status(repo: &Repository, worktree: &git2::Worktree) -> GitResult<git2::WorktreeLockStatus> {
@@ -737,19 +816,7 @@ fn worktree_lock_status(repo: &Repository, worktree: &git2::Worktree) -> GitResu
 }
 
 fn acquire_worktree_lock(repo: &Repository, worktree: &git2::Worktree) -> GitResult<WorktreeFileIdentity> {
-    worktree
-        .lock(Some("GitManager is removing this worktree"))
-        .map_err(|error| format!("Lock worktree: {}", error))?;
-    match worktree_lock_identity(repo, worktree) {
-        Ok(Some(identity)) => Ok(identity),
-        // Do not call unlock without an identity: another process may have
-        // removed and replaced the lock between acquisition and inspection.
-        Ok(None) => Err("Lock worktree: lock entry disappeared before ownership could be verified".into()),
-        Err(error) => Err(format!(
-            "{}; lock retained because ownership could not be verified",
-            error
-        )),
-    }
+    acquire_worktree_lock_with(repo, worktree, |_| {})
 }
 
 fn worktree_lock_identity_matches(
@@ -2347,6 +2414,44 @@ mod tests {
         url::Url::from_file_path(path)
             .expect("local remote path")
             .to_string()
+    }
+
+    #[test]
+    fn test_acquired_worktree_lock_rejects_replaced_lock_entry() {
+        let main_dir = tempfile::tempdir().expect("main temp dir");
+        let wt_root = tempfile::tempdir().expect("worktree temp dir");
+        let wt_path = wt_root.path().join("lock-race-wt");
+        let repo = create_repo_with_commit(main_dir.path());
+        let commit = repo.head().expect("HEAD").peel_to_commit().expect("commit");
+        let branch = repo.branch("lock-race-wt", &commit, false).expect("branch");
+        let reference = repo
+            .find_reference("refs/heads/lock-race-wt")
+            .expect("reference");
+        let mut opts = git2::WorktreeAddOptions::new();
+        opts.reference(Some(&reference));
+        repo.worktree("lock-race-wt", &wt_path, Some(&opts))
+            .expect("create worktree");
+        let worktree = repo.find_worktree("lock-race-wt").expect("find worktree");
+        let lock_path = worktree_lock_path(&repo, &worktree).expect("worktree lock path");
+        let replacement_reason = WORKTREE_LOCK_REASON;
+        let result = acquire_worktree_lock_with(&repo, &worktree, |lock_path| {
+            std::fs::remove_file(lock_path).expect("replace acquired lock");
+            std::fs::write(lock_path, replacement_reason).expect("write replacement lock");
+        });
+
+        assert!(
+            result.is_err(),
+            "a replaced lock must not be adopted as this operation's lock"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&lock_path).expect("read replacement lock"),
+            replacement_reason,
+            "rejection must leave the replacement lock untouched"
+        );
+
+        drop(reference);
+        drop(branch);
+        drop(commit);
     }
 
     fn commit_file(repo: &Repository, path: &str, contents: &str, message: &str) -> git2::Oid {
