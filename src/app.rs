@@ -1120,9 +1120,9 @@ impl eframe::App for App {
                                     }
                                 });
                             }
-                        if let Some(idx) = to_delete {
-                            self.remove_recent_repo(idx);
-                        }
+                            if let Some(idx) = to_delete {
+                                self.remove_recent_repo(idx);
+                            }
                         }
                     });
                 });
@@ -2047,10 +2047,7 @@ mod tests {
         assert!(app.status_message.contains("Failed to save recent history"));
 
         let ctx = egui::Context::default();
-        let screen_rect = egui::Rect::from_min_size(
-            egui::pos2(0.0, 0.0),
-            egui::vec2(600.0, 400.0),
-        );
+        let screen_rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(600.0, 400.0));
         let output = ctx.run(
             egui::RawInput {
                 screen_rect: Some(screen_rect),
@@ -2065,9 +2062,7 @@ mod tests {
 
         assert!(output.shapes.iter().any(|clipped| match &clipped.shape {
             egui::Shape::Text(text) if text.galley.job.text == app.status_message => {
-                clipped
-                    .clip_rect
-                    .contains_rect(text.visual_bounding_rect())
+                clipped.clip_rect.contains_rect(text.visual_bounding_rect())
             }
             _ => false,
         }));
