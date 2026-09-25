@@ -186,6 +186,10 @@ pub fn extract_binary_from_archive(archive_path: &Path) -> Result<PathBuf, Strin
 }
 
 fn extract_binary_from_zip(zip_path: &Path) -> Result<PathBuf, String> {
+    extract_binary_from_zip_in(zip_path, &std::env::temp_dir())
+}
+
+fn extract_binary_from_zip_in(zip_path: &Path, temp_dir: &Path) -> Result<PathBuf, String> {
     let file = std::fs::File::open(zip_path)
         .map_err(|e| format!("Failed to open zip: {}", e))?;
     let mut archive = zip::ZipArchive::new(file)
@@ -198,13 +202,13 @@ fn extract_binary_from_zip(zip_path: &Path) -> Result<PathBuf, String> {
         let entry_path = entry.name().to_string();
         // Match by file name (ignore directory nesting)
         if entry_path.ends_with(target_name) {
-            // Create a temp file for the extracted binary
-            let temp_dir = std::env::temp_dir();
-            let dest_path = temp_dir.join(target_name);
-            let mut dest_file = std::fs::File::create(&dest_path)
+            let mut dest_file = create_temp_file_in(temp_dir, "git_manager-", ".tmp")
                 .map_err(|e| format!("Failed to create temp file: {}", e))?;
-            std::io::copy(&mut entry, &mut dest_file)
+            std::io::copy(&mut entry, dest_file.as_file_mut())
                 .map_err(|e| format!("Failed to extract binary: {}", e))?;
+            let (_, dest_path) = dest_file
+                .keep()
+                .map_err(|e| format!("Failed to keep extracted binary: {}", e.error))?;
             return Ok(dest_path);
         }
     }
@@ -213,6 +217,10 @@ fn extract_binary_from_zip(zip_path: &Path) -> Result<PathBuf, String> {
 }
 
 fn extract_binary_from_tar_gz(tar_gz_path: &Path) -> Result<PathBuf, String> {
+    extract_binary_from_tar_gz_in(tar_gz_path, &std::env::temp_dir())
+}
+
+fn extract_binary_from_tar_gz_in(tar_gz_path: &Path, temp_dir: &Path) -> Result<PathBuf, String> {
     let file = std::fs::File::open(tar_gz_path)
         .map_err(|e| format!("Failed to open tar.gz: {}", e))?;
     let decoder = flate2::read::GzDecoder::new(file);
@@ -230,12 +238,13 @@ fn extract_binary_from_tar_gz(tar_gz_path: &Path) -> Result<PathBuf, String> {
             .to_string();
         // Match by file name (ignore directory nesting)
         if entry_path.ends_with(target_name) {
-            let temp_dir = std::env::temp_dir();
-            let dest_path = temp_dir.join(target_name);
-            let mut dest_file = std::fs::File::create(&dest_path)
+            let mut dest_file = create_temp_file_in(temp_dir, "git_manager-", ".tmp")
                 .map_err(|e| format!("Failed to create temp file: {}", e))?;
-            std::io::copy(&mut entry, &mut dest_file)
+            std::io::copy(&mut entry, dest_file.as_file_mut())
                 .map_err(|e| format!("Failed to extract binary: {}", e))?;
+            let (_, dest_path) = dest_file
+                .keep()
+                .map_err(|e| format!("Failed to keep extracted binary: {}", e.error))?;
             return Ok(dest_path);
         }
     }
@@ -251,31 +260,56 @@ fn extract_binary_from_tar_gz(tar_gz_path: &Path) -> Result<PathBuf, String> {
 /// - **Unix** (Linux/macOS): writes a shell script with the same logic.
 pub fn create_self_update_script(new_binary: &Path, current_binary: &Path) -> Result<PathBuf, String> {
     let temp_dir = std::env::temp_dir();
+    create_self_update_script_in(new_binary, current_binary, &temp_dir)
+}
+
+fn create_self_update_script_in(
+    new_binary: &Path,
+    current_binary: &Path,
+    temp_dir: &Path,
+) -> Result<PathBuf, String> {
     #[cfg(target_os = "windows")]
     {
-        let script_path = temp_dir.join("update_git_manager.bat");
-        let mut script = std::fs::File::create(&script_path)
+        let mut script = create_temp_file_in(temp_dir, "update_git_manager-", ".bat")
             .map_err(|e| format!("Failed to create update script: {}", e))?;
         script
             .write_all(windows_self_update_script(new_binary, current_binary).as_bytes())
             .map_err(|e| format!("Failed to write update script: {}", e))?;
+        let (_, script_path) = script
+            .keep()
+            .map_err(|e| format!("Failed to keep update script: {}", e.error))?;
         Ok(script_path)
     }
     #[cfg(not(target_os = "windows"))]
     {
         use std::os::unix::fs::PermissionsExt;
 
-        let script_path = temp_dir.join("update_git_manager.sh");
-        let mut script = std::fs::File::create(&script_path)
+        let script_contents = unix_self_update_script(new_binary, current_binary)?;
+        let mut script = create_temp_file_in(temp_dir, "update_git_manager-", ".sh")
             .map_err(|e| format!("Failed to create update script: {}", e))?;
         script
-            .write_all(unix_self_update_script(new_binary, current_binary)?.as_bytes())
+            .write_all(script_contents.as_bytes())
             .map_err(|e| format!("Failed to write update script: {}", e))?;
-        // Mark script as executable on Unix
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+        script
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o755))
             .map_err(|e| format!("Failed to make script executable: {}", e))?;
+        let (_, script_path) = script
+            .keep()
+            .map_err(|e| format!("Failed to keep update script: {}", e.error))?;
         Ok(script_path)
     }
+}
+
+fn create_temp_file_in(
+    temp_dir: &Path,
+    prefix: &str,
+    suffix: &str,
+) -> std::io::Result<tempfile::NamedTempFile> {
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .suffix(suffix)
+        .tempfile_in(temp_dir)
 }
 
 #[cfg(any(windows, test))]
@@ -871,6 +905,139 @@ mod tests {
             "could not replace executable; downloaded update retained."
         ));
         assert!(script.contains("exit /b 1"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_extract_zip_does_not_follow_predictable_temp_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let archive_path = temp_dir.path().join("update.zip");
+        let mut archive = zip::ZipWriter::new(std::fs::File::create(&archive_path).unwrap());
+        archive
+            .start_file(binary_name(), zip::write::SimpleFileOptions::default())
+            .unwrap();
+        archive.write_all(b"archive binary").unwrap();
+        archive.finish().unwrap();
+
+        let protected_path = temp_dir.path().join("protected-file");
+        let predictable_path = temp_dir.path().join(binary_name());
+        std::fs::write(&protected_path, b"leave this file alone").unwrap();
+        symlink(&protected_path, &predictable_path).unwrap();
+
+        let extracted_path = extract_binary_from_zip_in(&archive_path, temp_dir.path()).unwrap();
+
+        assert_ne!(extracted_path, predictable_path);
+        assert_eq!(
+            std::fs::read(&protected_path).unwrap(),
+            b"leave this file alone"
+        );
+        assert_eq!(std::fs::read(extracted_path).unwrap(), b"archive binary");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_extract_tar_gz_does_not_follow_predictable_temp_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let archive_path = temp_dir.path().join("update.tar.gz");
+        let archive_file = std::fs::File::create(&archive_path).unwrap();
+        let encoder = flate2::write::GzEncoder::new(archive_file, flate2::Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        let contents = b"archive binary";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, binary_name(), &contents[..])
+            .unwrap();
+        archive.into_inner().unwrap().finish().unwrap();
+
+        let protected_path = temp_dir.path().join("protected-file");
+        let predictable_path = temp_dir.path().join(binary_name());
+        std::fs::write(&protected_path, b"leave this file alone").unwrap();
+        symlink(&protected_path, &predictable_path).unwrap();
+
+        let extracted_path = extract_binary_from_tar_gz_in(&archive_path, temp_dir.path()).unwrap();
+
+        assert_ne!(extracted_path, predictable_path);
+        assert_eq!(
+            std::fs::read(&protected_path).unwrap(),
+            b"leave this file alone"
+        );
+        assert_eq!(std::fs::read(extracted_path).unwrap(), contents);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_create_update_script_does_not_follow_predictable_temp_symlink() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let new_binary = temp_dir.path().join("downloaded-update");
+        let current_binary = temp_dir.path().join("current-binary");
+        let protected_path = temp_dir.path().join("protected-file");
+        let predictable_path = temp_dir.path().join("update_git_manager.sh");
+        std::fs::write(&new_binary, b"updated binary").unwrap();
+        std::fs::write(&current_binary, b"current binary").unwrap();
+        std::fs::set_permissions(&current_binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(&protected_path, b"leave this file alone").unwrap();
+        std::fs::set_permissions(&protected_path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        symlink(&protected_path, &predictable_path).unwrap();
+
+        let script_path =
+            create_self_update_script_in(&new_binary, &current_binary, temp_dir.path()).unwrap();
+
+        assert_ne!(script_path, predictable_path);
+        assert_eq!(
+            std::fs::read(&protected_path).unwrap(),
+            b"leave this file alone"
+        );
+        assert_eq!(
+            std::fs::metadata(&protected_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+        assert_eq!(
+            std::fs::metadata(&script_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert!(std::fs::read_to_string(script_path)
+            .unwrap()
+            .contains("#!/bin/sh"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_create_update_script_does_not_overwrite_predictable_temp_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let new_binary = temp_dir.path().join("downloaded-update.exe");
+        let current_binary = temp_dir.path().join("current-binary.exe");
+        let predictable_path = temp_dir.path().join("update_git_manager.bat");
+        std::fs::write(&predictable_path, b"preserve this file").unwrap();
+
+        let script_path =
+            create_self_update_script_in(&new_binary, &current_binary, temp_dir.path()).unwrap();
+
+        assert_ne!(script_path, predictable_path);
+        assert!(script_path.extension().is_some_and(|extension| extension == "bat"));
+        assert_eq!(
+            std::fs::read(&predictable_path).unwrap(),
+            b"preserve this file"
+        );
+        assert!(std::fs::read_to_string(script_path)
+            .unwrap()
+            .contains("@echo off"));
     }
 
     #[cfg(windows)]
