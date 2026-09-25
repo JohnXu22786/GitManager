@@ -839,8 +839,11 @@ fn remove_worktree_directory(
         if let Err(rename_error) = std::fs::rename(path, &staging_path) {
             if force {
                 let path_metadata = std::fs::symlink_metadata(path)?;
-                let is_safe = || path_identity_matches(path, &path_metadata);
-                if let Err(force_error) = force_remove_dir_checked(path, is_safe) {
+                if let Err(force_error) = force_remove_worktree_directory_fallback(
+                    path,
+                    &path_metadata,
+                    &expected_git_link,
+                ) {
                     return Err(std::io::Error::new(
                         force_error.kind(),
                         format!(
@@ -1087,6 +1090,39 @@ where
     Err(last_err.unwrap_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to remove {:?}", path))
     }))
+}
+
+fn force_remove_worktree_directory_fallback(
+    path: &Path,
+    expected_path: &std::fs::Metadata,
+    expected_git_link: &WorktreeFileIdentity,
+) -> std::io::Result<()> {
+    force_remove_dir_checked(
+        path,
+        worktree_fallback_identity_guard(path, expected_path, expected_git_link),
+    )
+}
+
+fn worktree_fallback_identity_guard<'a>(
+    path: &'a Path,
+    expected_path: &'a std::fs::Metadata,
+    expected_git_link: &'a WorktreeFileIdentity,
+) -> impl Fn() -> bool + 'a {
+    let git_link_was_verified = std::cell::Cell::new(false);
+    move || {
+        if !path_identity_matches(path, expected_path) {
+            return false;
+        }
+
+        match path_entry_exists(&path.join(".git")) {
+            Ok(false) => git_link_was_verified.get(),
+            Ok(true) if staged_worktree_link_matches(path, expected_git_link) => {
+                git_link_was_verified.set(true);
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Check if a path exists and contains any files (not just the directory entry itself).
@@ -4230,6 +4266,44 @@ mod tests {
         assert!(
             path_identity_matches(&path, &path_metadata),
             "Directory identity must remain valid after recursive cleanup removes .git"
+        );
+    }
+
+    #[test]
+    fn test_force_fallback_rejects_replaced_git_link() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let path = root.path().join("worktree");
+        std::fs::create_dir(&path).expect("create worktree directory");
+        std::fs::write(path.join(".git"), b"gitdir: expected\n").expect("write git link");
+        std::fs::write(path.join("important.txt"), b"keep this file").expect("write worktree file");
+
+        let expected_path = std::fs::symlink_metadata(&path).expect("capture directory identity");
+        let expected_git_link =
+            worktree_git_link_identity(&path).expect("capture git link identity");
+        let is_safe = worktree_fallback_identity_guard(&path, &expected_path, &expected_git_link);
+        assert!(is_safe(), "Original directory and git link should match");
+
+        let replacement_git = path.join(".git-replacement");
+        std::fs::write(&replacement_git, b"gitdir: replacement\n")
+            .expect("write replacement git link");
+        std::fs::remove_file(path.join(".git")).expect("remove original git link");
+        std::fs::rename(&replacement_git, path.join(".git")).expect("install replacement git link");
+
+        let result = force_remove_dir_checked(&path, is_safe);
+
+        assert!(result.is_err(), "Fallback must reject a replaced .git link");
+        assert!(
+            path_identity_matches(&path, &expected_path),
+            "Outer directory identity should be unchanged"
+        );
+        assert_eq!(
+            std::fs::read(path.join("important.txt")).expect("read preserved worktree file"),
+            b"keep this file",
+            "Replacement worktree data must be preserved"
+        );
+        assert_eq!(
+            std::fs::read(path.join(".git")).expect("read replacement git link"),
+            b"gitdir: replacement\n"
         );
     }
 
