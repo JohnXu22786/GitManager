@@ -426,6 +426,12 @@ impl App {
         }
     }
 
+    fn remove_recent_repo(&mut self, index: usize) {
+        if let Err(error) = self.recent_repos.remove(index) {
+            self.show_error(format!("Failed to save recent history: {}", error));
+        }
+    }
+
     fn show_welcome_screen(&mut self, ui: &mut egui::Ui) -> egui::Response {
         let mut clone_response = None;
         ui.vertical_centered(|ui| {
@@ -446,6 +452,14 @@ impl App {
                 self.show_clone_dialog = true;
             }
             clone_response = Some(response);
+
+            if self.status_is_error && !self.status_message.is_empty() {
+                ui.add_space(4.0);
+                ui.colored_label(
+                    App::adaptive_red(ui.style().visuals.dark_mode),
+                    &self.status_message,
+                );
+            }
 
             if !self.recent_repos.is_empty() {
                 ui.add_space(30.0);
@@ -484,11 +498,7 @@ impl App {
                         }
                     });
                 if let Some(idx) = to_delete {
-                    if let Err(error) = self.recent_repos.remove(idx) {
-                        self.status_message =
-                            format!("Failed to save recent history: {}", error);
-                        self.status_is_error = true;
-                    }
+                    self.remove_recent_repo(idx);
                 }
             }
         });
@@ -1110,13 +1120,9 @@ impl eframe::App for App {
                                     }
                                 });
                             }
-                        if let Some(idx) = to_delete {
-                            if let Err(error) = self.recent_repos.remove(idx) {
-                                self.status_message =
-                                    format!("Failed to save recent history: {}", error);
-                                self.status_is_error = true;
+                            if let Some(idx) = to_delete {
+                                self.remove_recent_repo(idx);
                             }
-                        }
                         }
                     });
                 });
@@ -2019,6 +2025,47 @@ mod tests {
 
         assert!(!app.git.is_open());
         assert!(app.show_clone_dialog);
+    }
+
+    #[test]
+    fn welcome_screen_displays_recent_history_save_error() {
+        let recent_dir = tempfile::tempdir().expect("recent directory");
+        let history_path = recent_dir.path().join("recent.json");
+        let mut app = App::new();
+        app.recent_repos = RecentRepos::load_from(history_path.clone());
+        for index in 0..20 {
+            app.recent_repos
+                .add(&format!("repository-{index}"))
+                .expect("save initial history");
+        }
+
+        std::fs::remove_file(&history_path).expect("remove history file");
+        std::fs::create_dir(&history_path).expect("replace history file with directory");
+        app.remove_recent_repo(0);
+
+        assert!(app.status_is_error);
+        assert!(app.status_message.contains("Failed to save recent history"));
+
+        let ctx = egui::Context::default();
+        let screen_rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(600.0, 400.0));
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.show_welcome_screen(ui);
+                });
+            },
+        );
+
+        assert!(output.shapes.iter().any(|clipped| match &clipped.shape {
+            egui::Shape::Text(text) if text.galley.job.text == app.status_message => {
+                clipped.clip_rect.contains_rect(text.visual_bounding_rect())
+            }
+            _ => false,
+        }));
     }
 
     fn run_clone_dialog_frame(
