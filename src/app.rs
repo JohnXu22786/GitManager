@@ -9,6 +9,22 @@ use std::time::Instant;
 
 const ABOUT_BUTTON_LABEL: &str = "ℹ";
 
+fn update_asset_download_path(
+    download_dir: &Path,
+    file_name: &str,
+) -> Result<std::path::PathBuf, String> {
+    let mut components = Path::new(file_name).components();
+    if file_name.contains('/')
+        || file_name.contains('\\')
+        || !matches!(components.next(), Some(std::path::Component::Normal(_)))
+        || components.next().is_some()
+    {
+        return Err("Invalid update asset filename".to_string());
+    }
+
+    Ok(download_dir.join(file_name))
+}
+
 /// Tracks a Git operation running in a background thread.
 struct PendingOp {
     description: String,
@@ -213,6 +229,15 @@ impl App {
     /// Start downloading the update asset in a background thread.
     /// Updates `update_state` with progress as the download proceeds.
     pub fn trigger_download(&mut self, url: String, file_name: String) {
+        let dest_dir = updater::get_default_download_dir();
+        let dest_path = match update_asset_download_path(Path::new(&dest_dir), &file_name) {
+            Ok(path) => path,
+            Err(error) => {
+                *self.update_state.lock().unwrap() = UpdateState::Error(error);
+                return;
+            }
+        };
+
         let state = self.update_state.clone();
         let progress = Arc::new(Mutex::new(0.0f32));
         let prog = progress.clone();
@@ -224,10 +249,6 @@ impl App {
         self.download_progress = 0.0;
 
         std::thread::spawn(move || {
-            // Save to Downloads folder
-            let dest_dir = updater::get_default_download_dir();
-            let dest_path = std::path::Path::new(&dest_dir).join(&file_name);
-
             // Update progress in real-time from the background thread
             let prog_clone = prog.clone();
             let _prog_update_handle = std::thread::spawn(move || {
@@ -2338,6 +2359,31 @@ mod tests {
     fn test_download_progress_field_defaults() {
         let app = App::new();
         assert_eq!(app.download_progress, 0.0, "Download progress should start at 0");
+    }
+
+    #[test]
+    fn test_update_asset_download_path_rejects_paths_outside_download_dir() {
+        let download_dir = Path::new("/home/user/Downloads");
+        assert_eq!(
+            update_asset_download_path(download_dir, "git-manager.zip").unwrap(),
+            download_dir.join("git-manager.zip")
+        );
+
+        for file_name in [
+            "../outside.zip",
+            "/tmp/outside.zip",
+            "nested/asset.zip",
+            "..\\outside.zip",
+            "nested\\asset.zip",
+            "",
+            ".",
+            "..",
+        ] {
+            assert!(
+                update_asset_download_path(download_dir, file_name).is_err(),
+                "asset filename should be rejected: {file_name:?}"
+            );
+        }
     }
 
     #[test]
