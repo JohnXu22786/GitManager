@@ -19,9 +19,9 @@ rfd = "0.15"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 tar = "0.4"
 flate2 = "1"
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
 url = "2"
 
 [profile.release]
