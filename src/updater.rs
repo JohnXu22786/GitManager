@@ -189,6 +189,10 @@ fn extract_binary_from_zip(zip_path: &Path) -> Result<PathBuf, String> {
     extract_binary_from_zip_in(zip_path, &std::env::temp_dir())
 }
 
+fn zip_unix_mode_is_regular_file(mode: Option<u32>) -> bool {
+    mode.map_or(true, |mode| matches!(mode & 0o170000, 0 | 0o100000))
+}
+
 fn extract_binary_from_zip_in(zip_path: &Path, temp_dir: &Path) -> Result<PathBuf, String> {
     let file = std::fs::File::open(zip_path)
         .map_err(|e| format!("Failed to open zip: {}", e))?;
@@ -200,8 +204,14 @@ fn extract_binary_from_zip_in(zip_path: &Path, temp_dir: &Path) -> Result<PathBu
         let mut entry = archive.by_index(i)
             .map_err(|e| format!("Failed to read zip entry {}: {}", i, e))?;
         let entry_path = entry.name().to_string();
-        // Match by file name (ignore directory nesting)
-        if entry_path.ends_with(target_name) {
+        // Match the exact archive file name across both ZIP separators.
+        if entry.is_file()
+            && zip_unix_mode_is_regular_file(entry.unix_mode())
+            && entry_path
+                .rsplit(|separator| separator == '/' || separator == '\\')
+                .next()
+                == Some(target_name)
+        {
             let mut dest_file = create_temp_file_in(temp_dir, "git_manager-", ".tmp")
                 .map_err(|e| format!("Failed to create temp file: {}", e))?;
             std::io::copy(&mut entry, dest_file.as_file_mut())
@@ -236,8 +246,10 @@ fn extract_binary_from_tar_gz_in(tar_gz_path: &Path, temp_dir: &Path) -> Result<
             .map_err(|e| format!("Failed to get entry path: {}", e))?
             .to_string_lossy()
             .to_string();
-        // Match by file name (ignore directory nesting)
-        if entry_path.ends_with(target_name) {
+        // Match the exact archive file name while ignoring directory nesting.
+        if entry.header().entry_type().is_file()
+            && entry_path.rsplit('/').next() == Some(target_name)
+        {
             let mut dest_file = create_temp_file_in(temp_dir, "git_manager-", ".tmp")
                 .map_err(|e| format!("Failed to create temp file: {}", e))?;
             std::io::copy(&mut entry, dest_file.as_file_mut())
@@ -574,6 +586,29 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    fn set_zip_member_unix_mode(archive_path: &Path, member_name: &str, mode: u32) {
+        use std::io::{Seek, SeekFrom};
+
+        let file = std::fs::File::open(archive_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let central_header_start = (0..archive.len())
+            .find_map(|index| {
+                let entry = archive.by_index(index).ok()?;
+                (entry.name() == member_name).then(|| entry.central_header_start())
+            })
+            .expect("ZIP member should exist");
+        drop(archive);
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(archive_path)
+            .unwrap();
+        // The central-directory external-attributes field starts 38 bytes into its header.
+        file.seek(SeekFrom::Start(central_header_start + 38))
+            .unwrap();
+        file.write_all(&(mode << 16).to_le_bytes()).unwrap();
     }
 
     #[test]
@@ -1026,6 +1061,131 @@ mod tests {
             b"leave this file alone"
         );
         assert_eq!(std::fs::read(extracted_path).unwrap(), b"archive binary");
+    }
+
+    #[test]
+    fn test_extract_zip_selects_exact_binary_file_across_separators() {
+        for separator in ['/', '\\'] {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let archive_path = temp_dir.path().join("update.zip");
+            let mut archive = zip::ZipWriter::new(std::fs::File::create(&archive_path).unwrap());
+            archive
+                .add_directory(
+                    format!("release/{}/", binary_name()),
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .unwrap();
+            let special_member = format!("special/{}", binary_name());
+            archive
+                .start_file(&special_member, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            archive.write_all(b"special file").unwrap();
+            archive
+                .start_file(
+                    format!("bin/decoy_{}", binary_name()),
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .unwrap();
+            archive.write_all(b"decoy binary").unwrap();
+            archive
+                .add_symlink(
+                    format!("links/{}", binary_name()),
+                    "symlink target",
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .unwrap();
+            archive
+                .start_file(
+                    format!("release{separator}{}", binary_name()),
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .unwrap();
+            archive.write_all(b"exact binary").unwrap();
+            archive.finish().unwrap();
+            let fifo_mode = 0o010644;
+            set_zip_member_unix_mode(&archive_path, &special_member, fifo_mode);
+
+            let mut archive =
+                zip::ZipArchive::new(std::fs::File::open(&archive_path).unwrap()).unwrap();
+            let entry = archive.by_name(&special_member).unwrap();
+            assert!(entry.is_file());
+            assert_eq!(entry.unix_mode(), Some(fifo_mode));
+            assert!(!zip_unix_mode_is_regular_file(entry.unix_mode()));
+            drop(entry);
+            drop(archive);
+
+            let extracted_path =
+                extract_binary_from_zip_in(&archive_path, temp_dir.path()).unwrap();
+
+            assert_eq!(std::fs::read(extracted_path).unwrap(), b"exact binary");
+        }
+    }
+
+    #[test]
+    fn test_extract_tar_gz_selects_exact_binary_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let archive_path = temp_dir.path().join("update.tar.gz");
+        let archive_file = std::fs::File::create(&archive_path).unwrap();
+        let encoder = flate2::write::GzEncoder::new(archive_file, flate2::Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+
+        let mut directory_header = tar::Header::new_gnu();
+        directory_header.set_entry_type(tar::EntryType::Directory);
+        directory_header.set_size(0);
+        directory_header.set_mode(0o755);
+        directory_header.set_cksum();
+        archive
+            .append_data(
+                &mut directory_header,
+                format!("release/{}", binary_name()),
+                std::io::empty(),
+            )
+            .unwrap();
+
+        let decoy = b"decoy binary";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(decoy.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive
+            .append_data(
+                &mut header,
+                format!("bin/decoy_{}", binary_name()),
+                &decoy[..],
+            )
+            .unwrap();
+
+        let mut symlink_header = tar::Header::new_gnu();
+        symlink_header.set_entry_type(tar::EntryType::Symlink);
+        symlink_header.set_size(0);
+        symlink_header.set_mode(0o777);
+        symlink_header.set_link_name("target").unwrap();
+        symlink_header.set_cksum();
+        archive
+            .append_data(
+                &mut symlink_header,
+                format!("links/{}", binary_name()),
+                std::io::empty(),
+            )
+            .unwrap();
+
+        let exact = b"exact binary";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(exact.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive
+            .append_data(
+                &mut header,
+                format!("release/{}", binary_name()),
+                &exact[..],
+            )
+            .unwrap();
+        archive.into_inner().unwrap().finish().unwrap();
+
+        let extracted_path = extract_binary_from_tar_gz_in(&archive_path, temp_dir.path()).unwrap();
+
+        assert_eq!(std::fs::read(extracted_path).unwrap(), exact);
     }
 
     #[cfg(unix)]
