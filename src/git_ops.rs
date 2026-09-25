@@ -1395,28 +1395,42 @@ impl GitRepo {
             .map_err(|e| format!("Find '{}': {}", branch_name, e))?
             .peel_to_commit().map_err(|_| "Not a commit".to_string())?;
 
-        let base = repo.merge_base(head.id(), their.id())
-            .ok()
-            .and_then(|oid| repo.find_commit(oid).ok())
-            .and_then(|c| c.tree().ok());
-
-        let ours = head.tree().map_err(|e| format!("Tree: {}", e))?;
-        let theirs = their.tree().map_err(|e| format!("Tree: {}", e))?;
-
-        let mut idx = if let Some(ancestor) = base.as_ref() {
-            repo.merge_trees(ancestor, &ours, &theirs, None::<&git2::MergeOptions>)
-                .map_err(|e| format!("Merge: {}", e))?
-        } else {
-            repo.merge_trees(&ours, &ours, &theirs, None::<&git2::MergeOptions>)
-                .map_err(|e| format!("Merge: {}", e))?
-        };
-
-        if idx.has_conflicts() { return Err("Merge conflicts".into()); }
-
         let original_index = repo.index().map_err(|e| format!("Index: {}", e))?;
         if original_index.has_conflicts() {
             return Err("Index has conflicts".into());
         }
+
+        let already_integrated = head.id() == their.id()
+            || repo.graph_descendant_of(head.id(), their.id())
+                .map_err(|e| format!("Check ancestry: {}", e))?;
+        if already_integrated {
+            return Ok("Already up to date".into());
+        }
+
+        let fast_forward = repo.graph_descendant_of(their.id(), head.id())
+            .map_err(|e| format!("Check ancestry: {}", e))?;
+        let ours = head.tree().map_err(|e| format!("Tree: {}", e))?;
+        let t = if fast_forward {
+            their.tree().map_err(|e| format!("Tree: {}", e))?
+        } else {
+            let base = repo.merge_base(head.id(), their.id())
+                .ok()
+                .and_then(|oid| repo.find_commit(oid).ok())
+                .and_then(|c| c.tree().ok());
+            let theirs = their.tree().map_err(|e| format!("Tree: {}", e))?;
+            let mut idx = if let Some(ancestor) = base.as_ref() {
+                repo.merge_trees(ancestor, &ours, &theirs, None::<&git2::MergeOptions>)
+                    .map_err(|e| format!("Merge: {}", e))?
+            } else {
+                repo.merge_trees(&ours, &ours, &theirs, None::<&git2::MergeOptions>)
+                    .map_err(|e| format!("Merge: {}", e))?
+            };
+
+            if idx.has_conflicts() { return Err("Merge conflicts".into()); }
+
+            let toid = idx.write_tree_to(&*repo).map_err(|e| format!("Write tree: {}", e))?;
+            repo.find_tree(toid).map_err(|e| format!("Find tree: {}", e))?
+        };
         let index_path = original_index
             .path()
             .map(Path::to_path_buf)
@@ -1435,11 +1449,20 @@ impl GitRepo {
             .collect::<Vec<_>>();
         drop(original_index);
 
-        let sig = repo.signature().map_err(|e| format!("Sig: {}", e))?;
-        let toid = idx.write_tree_to(&*repo).map_err(|e| format!("Write tree: {}", e))?;
-        let t = repo.find_tree(toid).map_err(|e| format!("Find tree: {}", e))?;
-
         let msg = format!("Merge branch '{}'", branch_name);
+        let (commit_oid, ref_message, success_message) = if fast_forward {
+            (
+                their.id(),
+                format!("Fast-forward merge branch '{}'", branch_name),
+                format!("Fast-forwarded to branch '{}'", branch_name),
+            )
+        } else {
+            let sig = repo.signature().map_err(|e| format!("Sig: {}", e))?;
+            let commit_oid = repo
+                .commit(None, &sig, &sig, &msg, &t, &[&head, &their])
+                .map_err(|e| format!("Create merge commit: {}", e))?;
+            (commit_oid, msg.clone(), msg)
+        };
 
         let merge_diff = repo
             .diff_tree_to_tree(Some(&ours), Some(&t), None)
@@ -1463,12 +1486,6 @@ impl GitRepo {
             .filter(|path| !dirty_workdir_paths.iter().any(|dirty| paths_overlap(path, dirty)))
             .cloned()
             .collect::<Vec<_>>();
-
-        // Create the commit object without moving HEAD. This keeps all
-        // ref-update failures after checkout recoverable.
-        let commit_oid = repo
-            .commit(None, &sig, &sig, &msg, &t, &[&head, &their])
-            .map_err(|e| format!("Create merge commit: {}", e))?;
 
         // Checkout while HEAD still points to the pre-merge tree. Safe checkout
         // then updates clean merge paths without overwriting unrelated changes.
@@ -1534,7 +1551,7 @@ impl GitRepo {
                             && current_resolved.target() == Some(head.id()) =>
                     {
                         update_ref
-                            .set_target(commit_oid, &msg)
+                            .set_target(commit_oid, &ref_message)
                             .map(|_| ())
                             .map_err(|e| format!("Update HEAD: {}", e))
                     }
@@ -1559,7 +1576,7 @@ impl GitRepo {
             };
         }
 
-        Ok(msg)
+        Ok(success_message)
     }
 
     pub fn worktrees(&self) -> GitResult<Vec<WorktreeInfo>> {
@@ -2480,6 +2497,36 @@ mod tests {
         oid
     }
 
+    fn commit_file_on_branch(
+        repo: &Repository,
+        branch: &str,
+        parent: &git2::Commit<'_>,
+        path: &str,
+        contents: &str,
+        message: &str,
+    ) -> git2::Oid {
+        let blob_oid = repo.blob(contents.as_bytes()).expect("write branch blob");
+        let parent_tree = parent.tree().expect("branch parent tree");
+        let tree_oid = {
+            let mut builder = repo.treebuilder(Some(&parent_tree)).expect("create tree builder");
+            builder
+                .insert(path, blob_oid, 0o100644)
+                .expect("add branch file");
+            builder.write().expect("write branch tree")
+        };
+        let tree = repo.find_tree(tree_oid).expect("find branch tree");
+        let signature = repo.signature().expect("signature");
+        repo.commit(
+            Some(&format!("refs/heads/{}", branch)),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &[parent],
+        )
+        .expect("commit branch file")
+    }
+
     fn setup_rebase_repositories(
         initial_file: Option<(&str, &str)>,
         local_file: (&str, &str),
@@ -3142,6 +3189,107 @@ mod tests {
             "the removed commit's changes should remain staged"
         );
         assert_ne!(feature_id, parent_id, "the feature commit should have a distinct parent");
+    }
+
+    #[test]
+    fn test_merge_branch_already_integrated_is_noop() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(dir.path());
+        let initial = repo.head().expect("HEAD").peel_to_commit().expect("commit");
+        repo.branch("feature", &initial, false).expect("create feature branch");
+        let current_oid = commit_file(&repo, "main.txt", "main\n", "main change");
+        drop(initial);
+        drop(repo);
+
+        let git = open_git_repo(dir.path());
+        assert_eq!(git.merge_branch("feature").expect("merge integrated branch"), "Already up to date");
+
+        let merged_repo = Repository::open(dir.path()).expect("reopen repo");
+        let head = merged_repo.head().expect("HEAD").peel_to_commit().expect("HEAD commit");
+        assert_eq!(head.id(), current_oid, "an integrated branch must not move HEAD");
+        assert_eq!(head.parent_count(), 1, "an integrated branch must not create a merge commit");
+    }
+
+    #[test]
+    fn test_merge_branch_fast_forwards_without_merge_commit() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(dir.path());
+        let initial = repo.head().expect("HEAD").peel_to_commit().expect("commit");
+        let current_branch = repo.head().expect("HEAD").shorthand().expect("branch").to_string();
+        repo.branch("feature", &initial, false).expect("create feature branch");
+        let feature_oid = commit_file_on_branch(
+            &repo,
+            "feature",
+            &initial,
+            "feature.txt",
+            "feature\n",
+            "feature change",
+        );
+        repo.index()
+            .expect("repository index")
+            .write()
+            .expect("write repository index");
+        drop(initial);
+        drop(repo);
+
+        let git = open_git_repo(dir.path());
+        assert_eq!(
+            git.merge_branch("feature").expect("fast-forward feature branch"),
+            "Fast-forwarded to branch 'feature'"
+        );
+
+        let merged_repo = Repository::open(dir.path()).expect("reopen repo");
+        let head = merged_repo.head().expect("HEAD").peel_to_commit().expect("HEAD commit");
+        assert_eq!(head.id(), feature_oid, "fast-forward should advance to the feature tip");
+        assert_eq!(head.parent_count(), 1, "fast-forward must not create a merge commit");
+        assert_eq!(
+            merged_repo.head().expect("HEAD").shorthand(),
+            Some(current_branch.as_str()),
+            "fast-forward must leave HEAD attached to the current branch"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("feature.txt")).expect("read feature file"),
+            "feature\n"
+        );
+    }
+
+    #[test]
+    fn test_merge_branch_divergent_history_creates_two_parent_commit() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(dir.path());
+        let initial = repo.head().expect("HEAD").peel_to_commit().expect("commit");
+        repo.branch("feature", &initial, false).expect("create feature branch");
+        let main_oid = commit_file(&repo, "main.txt", "main\n", "main change");
+        let feature_oid = commit_file_on_branch(
+            &repo,
+            "feature",
+            &initial,
+            "feature.txt",
+            "feature\n",
+            "feature change",
+        );
+        drop(initial);
+        drop(repo);
+
+        let git = open_git_repo(dir.path());
+        assert_eq!(
+            git.merge_branch("feature").expect("merge divergent branch"),
+            "Merge branch 'feature'"
+        );
+
+        let merged_repo = Repository::open(dir.path()).expect("reopen repo");
+        let head = merged_repo.head().expect("HEAD").peel_to_commit().expect("HEAD commit");
+        assert_eq!(head.parent_count(), 2, "divergent histories should create a merge commit");
+        assert_eq!(head.parent_id(0).expect("first parent"), main_oid);
+        assert_eq!(head.parent_id(1).expect("second parent"), feature_oid);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("main.txt")).expect("read main file"),
+            "main\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("feature.txt")).expect("read feature file"),
+            "feature\n"
+        );
     }
 
     #[test]
