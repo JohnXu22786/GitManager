@@ -5,6 +5,7 @@ use eframe::egui;
 use std::path::Path;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 const ABOUT_BUTTON_LABEL: &str = "ℹ";
@@ -23,6 +24,38 @@ fn update_asset_download_path(
     }
 
     Ok(download_dir.join(file_name))
+}
+
+fn begin_update_request_if(
+    state: &Mutex<UpdateState>,
+    generation: &AtomicU64,
+    allowed: impl FnOnce(&UpdateState) -> bool,
+    next_state: UpdateState,
+) -> Option<u64> {
+    let mut current_state = state.lock().unwrap();
+    if !allowed(&current_state) {
+        return None;
+    }
+
+    let request_id = generation.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+    *current_state = next_state;
+    Some(request_id)
+}
+
+fn commit_update_state_if_current(
+    state: &Mutex<UpdateState>,
+    generation: &AtomicU64,
+    request_id: u64,
+    active: impl FnOnce(&UpdateState) -> bool,
+    next_state: UpdateState,
+) -> bool {
+    let mut current_state = state.lock().unwrap();
+    if generation.load(Ordering::Acquire) != request_id || !active(&current_state) {
+        return false;
+    }
+
+    *current_state = next_state;
+    true
 }
 
 fn clone_credential(
@@ -153,6 +186,7 @@ pub struct App {
     clone_url: String,
     clone_destination: String,
     pub update_state: Arc<Mutex<UpdateState>>,
+    update_request_id: Arc<AtomicU64>,
     pub show_update_dialog: bool,
     pub auto_check_done: bool,
     /// Set to true when the user dismisses the update dialog to prevent it from reopening.
@@ -226,6 +260,7 @@ impl App {
             clone_destination: String::new(),
 
             update_state: Arc::new(Mutex::new(UpdateState::Idle)),
+            update_request_id: Arc::new(AtomicU64::new(0)),
             show_update_dialog: false,
             auto_check_done: false,
             update_dialog_dismissed: false,
@@ -241,13 +276,29 @@ impl App {
     pub fn trigger_update_check(&mut self) {
         let current_version = env!("CARGO_PKG_VERSION").to_string();
         let state = self.update_state.clone();
-        *state.lock().unwrap() = UpdateState::Checking;
+        let generation = self.update_request_id.clone();
+        let Some(request_id) = begin_update_request_if(
+            &state,
+            &generation,
+            |current| {
+                !matches!(current, UpdateState::Downloading { .. } | UpdateState::Downloaded { .. })
+            },
+            UpdateState::Checking,
+        ) else {
+            return;
+        };
         self.update_dialog_dismissed = false;
         self.show_update_dialog = false;
 
         std::thread::spawn(move || {
             let result = updater::check_for_update(&current_version);
-            *state.lock().unwrap() = result;
+            commit_update_state_if_current(
+                &state,
+                &generation,
+                request_id,
+                |current| matches!(current, UpdateState::Checking),
+                result,
+            );
         });
     }
 
@@ -258,19 +309,29 @@ impl App {
 
     fn update_download_progress_if_active(
         state: &Mutex<UpdateState>,
+        generation: &AtomicU64,
+        request_id: u64,
         progress: f32,
         file_name: &str,
     ) -> bool {
-        let mut current_state = state.lock().unwrap();
-        if !matches!(*current_state, UpdateState::Downloading { .. }) {
-            return false;
-        }
-
-        *current_state = UpdateState::Downloading {
-            progress,
-            file_name: file_name.to_string(),
-        };
-        true
+        commit_update_state_if_current(
+            state,
+            generation,
+            request_id,
+            |current| {
+                matches!(
+                    current,
+                    UpdateState::Downloading {
+                        file_name: active_file,
+                        ..
+                    } if active_file.as_str() == file_name
+                )
+            },
+            UpdateState::Downloading {
+                progress,
+                file_name: file_name.to_string(),
+            },
+        )
     }
 
     /// Start downloading the update asset in a background thread.
@@ -280,31 +341,50 @@ impl App {
         let dest_path = match update_asset_download_path(Path::new(&dest_dir), &file_name) {
             Ok(path) => path,
             Err(error) => {
-                *self.update_state.lock().unwrap() = UpdateState::Error(error);
+                let state = self.update_state.clone();
+                let generation = self.update_request_id.clone();
+                begin_update_request_if(
+                    &state,
+                    &generation,
+                    |current| !matches!(current, UpdateState::Downloading { .. }),
+                    UpdateState::Error(error),
+                );
                 return;
             }
         };
 
         let state = self.update_state.clone();
+        let generation = self.update_request_id.clone();
         let progress = Arc::new(Mutex::new(0.0f32));
         let prog = progress.clone();
         let state_for_progress = state.clone();
-        *state.lock().unwrap() = UpdateState::Downloading {
-            progress: 0.0,
-            file_name: file_name.clone(),
+        let generation_for_progress = generation.clone();
+        let Some(request_id) = begin_update_request_if(
+            &state,
+            &generation,
+            |current| !matches!(current, UpdateState::Downloading { .. }),
+            UpdateState::Downloading {
+                progress: 0.0,
+                file_name: file_name.clone(),
+            },
+        ) else {
+            return;
         };
         self.download_progress = 0.0;
 
         std::thread::spawn(move || {
             // Update progress in real-time from the background thread
             let prog_clone = prog.clone();
+            let progress_file_name = file_name.clone();
             let _prog_update_handle = std::thread::spawn(move || {
                 loop {
                     let p = *prog_clone.lock().unwrap();
                     if !App::update_download_progress_if_active(
                         &state_for_progress,
+                        &generation_for_progress,
+                        request_id,
                         p,
-                        &file_name,
+                        &progress_file_name,
                     ) {
                         break;
                     }
@@ -314,17 +394,22 @@ impl App {
 
             let result = updater::download_file_with_progress(&url, &dest_path, prog);
 
-            match result {
+            let next_state = match result {
                 Ok(()) => {
                     let path_str = dest_path.to_string_lossy().to_string();
-                    *state.lock().unwrap() = UpdateState::Downloaded {
+                    UpdateState::Downloaded {
                         file_path: path_str,
-                    };
+                    }
                 }
-                Err(e) => {
-                    *state.lock().unwrap() = UpdateState::Error(e);
-                }
-            }
+                Err(error) => UpdateState::Error(error),
+            };
+            commit_update_state_if_current(
+                &state,
+                &generation,
+                request_id,
+                |current| matches!(current, UpdateState::Downloading { .. }),
+                next_state,
+            );
         });
     }
 
@@ -3097,9 +3182,12 @@ mod tests {
         let state = Arc::new(Mutex::new(UpdateState::Downloaded {
             file_path: "/tmp/update.zip".to_string(),
         }));
+        let generation = AtomicU64::new(1);
 
         assert!(!App::update_download_progress_if_active(
             &state,
+            &generation,
+            1,
             0.5,
             "update.zip",
         ));
@@ -3109,6 +3197,170 @@ mod tests {
                 file_path: "/tmp/update.zip".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn test_stale_update_check_result_cannot_overwrite_newer_request() {
+        let state = Mutex::new(UpdateState::Idle);
+        let generation = AtomicU64::new(0);
+        let older_request = begin_update_request_if(
+            &state,
+            &generation,
+            |_| true,
+            UpdateState::Checking,
+        )
+        .expect("start older check");
+        let newer_request = begin_update_request_if(
+            &state,
+            &generation,
+            |_| true,
+            UpdateState::Checking,
+        )
+        .expect("start newer check");
+        let newer_result = UpdateState::UpdateAvailable {
+            latest_version: "2.0.0".to_string(),
+            download_url: "https://example.com/update.zip".to_string(),
+            assets: Vec::new(),
+        };
+
+        assert!(!commit_update_state_if_current(
+            &state,
+            &generation,
+            older_request,
+            |current| matches!(current, UpdateState::Checking),
+            UpdateState::UpToDate,
+        ));
+        assert_eq!(*state.lock().unwrap(), UpdateState::Checking);
+        assert!(commit_update_state_if_current(
+            &state,
+            &generation,
+            newer_request,
+            |current| matches!(current, UpdateState::Checking),
+            newer_result.clone(),
+        ));
+        assert!(!commit_update_state_if_current(
+            &state,
+            &generation,
+            older_request,
+            |current| matches!(current, UpdateState::Checking),
+            UpdateState::UpToDate,
+        ));
+        assert_eq!(*state.lock().unwrap(), newer_result);
+    }
+
+    #[test]
+    fn test_new_download_invalidates_pending_check_result() {
+        let state = Mutex::new(UpdateState::Idle);
+        let generation = AtomicU64::new(0);
+        let check_request = begin_update_request_if(
+            &state,
+            &generation,
+            |_| true,
+            UpdateState::Checking,
+        )
+        .expect("start check");
+        let download_request = begin_update_request_if(
+            &state,
+            &generation,
+            |current| !matches!(current, UpdateState::Downloading { .. }),
+            UpdateState::Downloading {
+                progress: 0.0,
+                file_name: "new.zip".to_string(),
+            },
+        )
+        .expect("start download");
+
+        assert!(!commit_update_state_if_current(
+            &state,
+            &generation,
+            check_request,
+            |current| matches!(current, UpdateState::Checking),
+            UpdateState::UpToDate,
+        ));
+        assert_eq!(
+            *state.lock().unwrap(),
+            UpdateState::Downloading {
+                progress: 0.0,
+                file_name: "new.zip".to_string(),
+            }
+        );
+        assert!(download_request > check_request);
+    }
+
+    #[test]
+    fn test_stale_download_progress_and_result_cannot_overwrite_newer_download() {
+        let state = Mutex::new(UpdateState::Idle);
+        let generation = AtomicU64::new(0);
+        let older_request = begin_update_request_if(
+            &state,
+            &generation,
+            |current| !matches!(current, UpdateState::Downloading { .. }),
+            UpdateState::Downloading {
+                progress: 0.0,
+                file_name: "old.zip".to_string(),
+            },
+        )
+        .expect("start older download");
+
+        assert!(begin_update_request_if(
+            &state,
+            &generation,
+            |current| !matches!(current, UpdateState::Downloading { .. }),
+            UpdateState::Downloading {
+                progress: 0.0,
+                file_name: "duplicate.zip".to_string(),
+            },
+        )
+        .is_none());
+        assert!(App::update_download_progress_if_active(
+            &state,
+            &generation,
+            older_request,
+            0.25,
+            "old.zip",
+        ));
+        assert!(commit_update_state_if_current(
+            &state,
+            &generation,
+            older_request,
+            |current| matches!(current, UpdateState::Downloading { .. }),
+            UpdateState::Downloaded {
+                file_path: "/tmp/old.zip".to_string(),
+            },
+        ));
+
+        let newer_request = begin_update_request_if(
+            &state,
+            &generation,
+            |current| !matches!(current, UpdateState::Downloading { .. }),
+            UpdateState::Downloading {
+                progress: 0.0,
+                file_name: "new.zip".to_string(),
+            },
+        )
+        .expect("start newer download");
+        assert!(!App::update_download_progress_if_active(
+            &state,
+            &generation,
+            older_request,
+            0.9,
+            "old.zip",
+        ));
+        assert!(!commit_update_state_if_current(
+            &state,
+            &generation,
+            older_request,
+            |current| matches!(current, UpdateState::Downloading { .. }),
+            UpdateState::Error("stale download failure".to_string()),
+        ));
+        assert_eq!(
+            *state.lock().unwrap(),
+            UpdateState::Downloading {
+                progress: 0.0,
+                file_name: "new.zip".to_string(),
+            }
+        );
+        assert!(newer_request > older_request);
     }
 
 }
