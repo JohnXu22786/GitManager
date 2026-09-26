@@ -367,6 +367,20 @@ fn repository_path_bytes(path: &Path) -> Option<Vec<u8>> {
     }
 }
 
+fn index_path_overlaps_any(path: &[u8], changed_paths: &[Vec<u8>]) -> bool {
+    fn overlaps(a: &[u8], b: &[u8]) -> bool {
+        fn component_prefix(prefix: &[u8], path: &[u8]) -> bool {
+            path == prefix
+                || (path.starts_with(prefix) && path.get(prefix.len()) == Some(&b'/'))
+        }
+        component_prefix(a, b) || component_prefix(b, a)
+    }
+
+    changed_paths
+        .iter()
+        .any(|changed_path| overlaps(path, changed_path))
+}
+
 /// Compare two paths for equality, handling case-insensitivity and separator normalization on Windows.
 fn paths_match(a: &Path, b: &Path) -> bool {
     #[cfg(windows)]
@@ -412,13 +426,296 @@ fn paths_overlap(a: &Path, b: &Path) -> bool {
     a == b || a.starts_with(b) || b.starts_with(a)
 }
 
+fn worktree_is_case_insensitive(repo: &Repository) -> bool {
+    let Some(workdir) = repo.workdir() else {
+        return false;
+    };
+    match (
+        std::fs::canonicalize(workdir.join(".git")),
+        std::fs::canonicalize(workdir.join(".GIT")),
+    ) {
+        (Ok(git_dir), Ok(upper_git_dir)) => git_dir == upper_git_dir,
+        _ => false,
+    }
+}
+
+fn paths_overlap_case_insensitively(a: &Path, b: &Path) -> bool {
+    let a_components = a
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
+        .collect::<Vec<_>>();
+    let b_components = b
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
+        .collect::<Vec<_>>();
+    let shared_components = a_components.len().min(b_components.len());
+    shared_components > 0
+        && a_components[..shared_components]
+            .iter()
+            .zip(&b_components[..shared_components])
+            .all(|(a, b)| a == b)
+}
+
+fn paths_overlap_for_checkout(a: &Path, b: &Path, case_insensitive: bool) -> bool {
+    paths_overlap(a, b)
+        || (case_insensitive && paths_overlap_case_insensitively(a, b))
+}
+
+fn checkout_source_tree(repo: &Repository) -> GitResult<git2::Tree<'_>> {
+    match repo.head() {
+        Ok(head) => {
+            if head.target().is_some() {
+                return head
+                    .peel_to_tree()
+                    .map_err(|e| format!("Current tree: {}", e));
+            }
+            if !head.is_branch() || head.symbolic_target_bytes().is_none() {
+                return Err("Current HEAD has no commit".into());
+            }
+        }
+        Err(error) => {
+            if error.code() != git2::ErrorCode::UnbornBranch {
+                return Err(format!("HEAD: {}", error));
+            }
+        }
+    }
+
+    let mut index = repo.index().map_err(|e| format!("Index: {}", e))?;
+    let tree_id = index
+        .write_tree()
+        .map_err(|e| format!("Write pre-checkout tree: {}", e))?;
+    repo.find_tree(tree_id)
+        .map_err(|e| format!("Find pre-checkout tree: {}", e))
+}
+
+fn index_bytes_for_tree(
+    tree: &git2::Tree<'_>,
+    index_path: &Path,
+    original_index: Option<&[u8]>,
+    changed_paths: &[PathBuf],
+) -> GitResult<Vec<u8>> {
+    const INDEX_ENTRY_EXTENDED: u16 = 0x4000;
+    const INDEX_ENTRY_VALID: u16 = 0x8000;
+    const INDEX_ENTRY_SKIP_WORKTREE: u16 = 0x4000;
+
+    let parent = index_path
+        .parent()
+        .ok_or_else(|| "Index path has no parent".to_string())?;
+    let changed_path_bytes = changed_paths
+        .iter()
+        .filter_map(|path| repository_path_bytes(path))
+        .collect::<Vec<_>>();
+    if changed_path_bytes.is_empty() {
+        if let Some(original_index) = original_index {
+            return Ok(original_index.to_vec());
+        }
+    }
+    let include_all_target_entries = original_index.is_none();
+
+    let mut tree_index = git2::Index::new()
+        .map_err(|e| format!("Create target tree index: {}", e))?;
+    tree_index
+        .read_tree(tree)
+        .map_err(|e| format!("Read checkout tree into temporary index: {}", e))?;
+    let target_entries = tree_index.iter().collect::<Vec<_>>();
+
+    let temp_index_path = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|e| format!("Create temporary index file: {}", e))?
+        .into_temp_path();
+    std::fs::remove_file(&temp_index_path)
+        .map_err(|e| format!("Prepare temporary index file: {}", e))?;
+    if let Some(bytes) = original_index {
+        std::fs::write(&temp_index_path, bytes)
+            .map_err(|e| format!("Seed temporary checkout index: {}", e))?;
+    }
+    let mut index = git2::Index::open(&temp_index_path)
+        .map_err(|e| format!("Open temporary index: {}", e))?;
+    let original_entries = index
+        .iter()
+        .map(|entry| (entry.path.clone(), entry.flags, entry.flags_extended))
+        .collect::<Vec<_>>();
+    let existing_paths = index.iter().map(|entry| entry.path).collect::<Vec<_>>();
+    for entry_path in existing_paths {
+        if !index_path_overlaps_any(&entry_path, &changed_path_bytes) {
+            continue;
+        }
+        let path = path_from_git_bytes(&entry_path);
+        for stage in 0..=3 {
+            if index.get_path(&path, stage).is_some() {
+                index
+                    .remove(&path, stage)
+                    .map_err(|e| format!("Remove stale target index entry: {}", e))?;
+            }
+        }
+    }
+    for mut entry in target_entries {
+        if !include_all_target_entries
+            && !index_path_overlaps_any(&entry.path, &changed_path_bytes)
+        {
+            continue;
+        }
+        if let Some((_, flags, flags_extended)) = original_entries
+            .iter()
+            .find(|(path, _, _)| path == &entry.path)
+        {
+            let skip_worktree = flags_extended & INDEX_ENTRY_SKIP_WORKTREE;
+            entry.flags = flags & INDEX_ENTRY_VALID;
+            entry.flags_extended = skip_worktree;
+            if skip_worktree != 0 {
+                entry.flags |= INDEX_ENTRY_EXTENDED;
+            }
+        }
+        index
+            .add(&entry)
+            .map_err(|e| format!("Add target index entry: {}", e))?;
+    }
+    index
+        .write()
+        .map_err(|e| format!("Write temporary checkout index: {}", e))?;
+    let bytes = std::fs::read(&temp_index_path)
+        .map_err(|e| format!("Read temporary checkout index: {}", e))?;
+    drop(temp_index_path);
+    Ok(bytes)
+}
+
+fn checkout_head_state(repo: &Repository) -> GitResult<(Vec<u8>, bool, Option<git2::Oid>)> {
+    match repo.head_detached() {
+        Ok(true) => {
+            let head = repo.head().map_err(|e| format!("HEAD: {}", e))?;
+            Ok((head.name_bytes().to_vec(), false, head.target()))
+        }
+        Ok(false) => {
+            let mut contents = std::fs::read(repo.path().join("HEAD"))
+                .map_err(|e| format!("Read symbolic HEAD: {}", e))?;
+            while contents.last() == Some(&b'\n') {
+                contents.pop();
+            }
+            let name = contents
+                .strip_prefix(b"ref: ")
+                .ok_or_else(|| "Symbolic HEAD has invalid contents".to_string())?;
+            let target = match repo.head() {
+                Ok(head) => head.target(),
+                Err(error) if error.code() == git2::ErrorCode::UnbornBranch => None,
+                Err(error) => return Err(format!("HEAD: {}", error)),
+            };
+            Ok((name.to_vec(), true, target))
+        }
+        Err(error) => Err(format!("HEAD state: {}", error)),
+    }
+}
+
+fn restore_checkout_head(
+    repo: &Repository,
+    original_name: &[u8],
+    original_symbolic: bool,
+    original_target: Option<git2::Oid>,
+) -> GitResult<()> {
+    if original_symbolic || original_target.is_none() {
+        repo.set_head_bytes(original_name)
+            .map_err(|e| format!("Restore HEAD: {}", e))?;
+    } else {
+        repo.set_head_detached(original_target.expect("checked above"))
+            .map_err(|e| format!("Restore detached HEAD: {}", e))?;
+    }
+    Ok(())
+}
+
+enum IndexRestore<'a> {
+    Always(Option<&'a [u8]>),
+    Preserve,
+}
+
+fn read_index_snapshot(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+struct IndexLockFile {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+    identity: std::fs::Metadata,
+    owned: bool,
+}
+
+impl IndexLockFile {
+    fn create(index_path: &Path) -> GitResult<Self> {
+        let file_name = index_path
+            .file_name()
+            .ok_or_else(|| "Index path has no file name".to_string())?;
+        let mut lock_name = file_name.to_os_string();
+        lock_name.push(".lock");
+        let path = index_path.with_file_name(lock_name);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| format!("Acquire index lock: {}", error))?;
+        let identity = file
+            .metadata()
+            .map_err(|error| format!("Inspect index lock: {}", error))?;
+        Ok(Self {
+            path,
+            file: Some(file),
+            identity,
+            owned: true,
+        })
+    }
+
+    fn file_mut(&mut self) -> &mut std::fs::File {
+        self.file.as_mut().expect("index lock file is open")
+    }
+
+    fn verify_owned(&self) -> GitResult<()> {
+        let current = std::fs::symlink_metadata(&self.path)
+            .map_err(|error| format!("Verify index lock ownership: {}", error))?;
+        if !same_file(&current, &self.identity) {
+            return Err("Index lock was replaced; preserving current lock".into());
+        }
+        Ok(())
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) -> GitResult<()> {
+        self.verify_owned()?;
+        self.file_mut()
+            .write_all(bytes)
+            .map_err(|error| format!("Write rollback index: {}", error))?;
+        self.file_mut()
+            .sync_all()
+            .map_err(|error| format!("Flush rollback index: {}", error))?;
+        Ok(())
+    }
+
+    fn install(&mut self, index_path: &Path) -> GitResult<()> {
+        self.verify_owned()?;
+        std::fs::rename(&self.path, index_path)
+            .map_err(|error| format!("Replace index during rollback: {}", error))?;
+        self.owned = false;
+        Ok(())
+    }
+}
+
+impl Drop for IndexLockFile {
+    fn drop(&mut self) {
+        if !self.owned {
+            return;
+        }
+        if self.verify_owned().is_ok() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+        self.file.take();
+    }
+}
+
 fn rollback_merge_checkout(
     repo: &Repository,
     old_tree: &git2::Tree<'_>,
     merge_tree: &git2::Tree<'_>,
     index_path: &Path,
-    original_index: &[u8],
     clean_paths: &[PathBuf],
+    index_restore: IndexRestore<'_>,
 ) -> GitResult<()> {
     let mut errors = Vec::new();
 
@@ -431,9 +728,14 @@ fn rollback_merge_checkout(
     let paths_to_restore = match repo.diff_tree_to_workdir(Some(merge_tree), Some(&mut diff_options)) {
         Ok(diff) => {
             let dirty_after = collect_diff_paths(&diff);
+            let case_insensitive = worktree_is_case_insensitive(repo);
             clean_paths
                 .iter()
-                .filter(|path| !dirty_after.iter().any(|dirty| paths_overlap(path, dirty)))
+                .filter(|path| {
+                    !dirty_after
+                        .iter()
+                        .any(|dirty| paths_overlap_for_checkout(path, dirty, case_insensitive))
+                })
                 .cloned()
                 .collect()
         }
@@ -445,7 +747,11 @@ fn rollback_merge_checkout(
 
     if !paths_to_restore.is_empty() {
         let mut checkout = git2::build::CheckoutBuilder::new();
-        checkout.force().update_index(false).overwrite_ignored(false);
+        checkout
+            .force()
+            .update_index(false)
+            .overwrite_ignored(false)
+            .disable_pathspec_match(true);
         for path in &paths_to_restore {
             checkout.path(path);
         }
@@ -454,7 +760,17 @@ fn rollback_merge_checkout(
         }
     }
 
-    if let Err(e) = std::fs::write(index_path, original_index) {
+    let index_restore_result = match index_restore {
+        IndexRestore::Always(original) => match original {
+            Some(bytes) => std::fs::write(index_path, bytes),
+            None => match std::fs::remove_file(index_path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                result => result,
+            },
+        },
+        IndexRestore::Preserve => Ok(()),
+    };
+    if let Err(e) = index_restore_result {
         errors.push(format!("Restore index: {}", e));
     }
 
@@ -1340,12 +1656,136 @@ impl GitRepo {
         let resolved_ref = reference.as_ref()
             .and_then(|r| r.name())
             .map(str::to_owned);
-        repo.checkout_tree(&obj, None)
-            .map_err(|e| format!("Checkout: {}", e))?;
+
+        let (original_head_name, original_head_symbolic, original_head_target) =
+            checkout_head_state(&repo)?;
+        let old_tree = checkout_source_tree(&repo)?;
+        let new_tree = obj
+            .peel_to_tree()
+            .map_err(|e| format!("Checkout tree: {}", e))?;
+        let index_path = repo
+            .index()
+            .map_err(|e| format!("Index: {}", e))?
+            .path()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "Index path unavailable".to_string())?;
+        let original_index = read_index_snapshot(&index_path)
+            .map_err(|e| format!("Read index: {}", e))?;
+
+        let changed_diff = repo
+            .diff_tree_to_tree(Some(&old_tree), Some(&new_tree), None)
+            .map_err(|e| format!("Inspect checkout changes: {}", e))?;
+        let changed_paths = collect_diff_paths(&changed_diff);
+        drop(changed_diff);
+        if changed_paths.is_empty()
+            && repo
+                .index()
+                .map_err(|e| format!("Index: {}", e))?
+                .has_conflicts()
+        {
+            return Err("Checkout: index has unresolved conflicts".into());
+        }
+        let target_index = index_bytes_for_tree(
+            &new_tree,
+            &index_path,
+            original_index.as_deref(),
+            &changed_paths,
+        )?;
+
+        let mut workdir_diff_options = DiffOptions::new();
+        workdir_diff_options
+            .include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .include_ignored(true)
+            .recurse_ignored_dirs(true);
+        let workdir_diff = repo
+            .diff_tree_to_workdir(Some(&old_tree), Some(&mut workdir_diff_options))
+            .map_err(|e| format!("Inspect worktree changes: {}", e))?;
+        let dirty_workdir_paths = collect_diff_paths(&workdir_diff);
+        drop(workdir_diff);
+        let case_insensitive = worktree_is_case_insensitive(&repo);
+        let clean_paths = changed_paths
+            .iter()
+            .filter(|path| {
+                !dirty_workdir_paths
+                    .iter()
+                    .any(|dirty| paths_overlap_for_checkout(path, dirty, case_insensitive))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mut index_lock = IndexLockFile::create(&index_path)?;
+        let current_index = read_index_snapshot(&index_path)
+            .map_err(|e| format!("Recheck index before checkout: {}", e))?;
+        if current_index != original_index {
+            return Err("Index changed before checkout; preserving current index".into());
+        }
+        index_lock.write_bytes(&target_index)?;
+
+        if !changed_paths.is_empty() {
+            let mut checkout = git2::build::CheckoutBuilder::new();
+            checkout.update_index(false).disable_pathspec_match(true);
+            for path in &changed_paths {
+                checkout.path(path);
+            }
+            if let Err(e) = repo.checkout_tree(&obj, Some(&mut checkout)) {
+                let checkout_error = format!("Checkout: {}", e);
+                return match rollback_merge_checkout(
+                    &repo,
+                    &old_tree,
+                    &new_tree,
+                    &index_path,
+                    &clean_paths,
+                    IndexRestore::Preserve,
+                ) {
+                    Ok(()) => Err(checkout_error),
+                    Err(rollback_error) => Err(format!("{}; {}", checkout_error, rollback_error)),
+                };
+            }
+        }
         let rf = resolved_ref.unwrap_or_else(|| {
             if name.starts_with("refs/") { name.to_string() } else { format!("refs/heads/{}", name) }
         });
-        repo.set_head(&rf).map_err(|e| format!("Set HEAD: {}", e))?;
+        if let Err(e) = repo.set_head(&rf) {
+            let head_error = format!("Set HEAD: {}", e);
+            return match rollback_merge_checkout(
+                &repo,
+                &old_tree,
+                &new_tree,
+                &index_path,
+                &clean_paths,
+                IndexRestore::Preserve,
+            ) {
+                Ok(()) => Err(head_error),
+                Err(rollback_error) => Err(format!("{}; {}", head_error, rollback_error)),
+            };
+        }
+
+        if let Err(e) = index_lock.install(&index_path) {
+            let replace_error = format!("Install checkout index: {}", e);
+            let head_restore = restore_checkout_head(
+                &repo,
+                &original_head_name,
+                original_head_symbolic,
+                original_head_target,
+            );
+            let worktree_restore = rollback_merge_checkout(
+                &repo,
+                &old_tree,
+                &new_tree,
+                &index_path,
+                &clean_paths,
+                IndexRestore::Preserve,
+            );
+            let mut errors = vec![replace_error];
+            if let Err(error) = head_restore {
+                errors.push(error);
+            }
+            if let Err(error) = worktree_restore {
+                errors.push(error);
+            }
+            return Err(errors.join("; "));
+        }
         Ok(())
     }
 
@@ -1500,8 +1940,8 @@ impl GitRepo {
                 &ours,
                 &t,
                 &index_path,
-                &original_index_bytes,
                 &clean_paths,
+                IndexRestore::Always(Some(&original_index_bytes)),
             ) {
                 Ok(()) => Err(checkout_error),
                 Err(rollback_error) => Err(format!("{}; {}", checkout_error, rollback_error)),
@@ -1530,8 +1970,8 @@ impl GitRepo {
                 &ours,
                 &t,
                 &index_path,
-                &original_index_bytes,
                 &clean_paths,
+                IndexRestore::Always(Some(&original_index_bytes)),
             ) {
                 Ok(()) => Err(sync_error),
                 Err(rollback_error) => Err(format!("{}; {}", sync_error, rollback_error)),
@@ -1568,8 +2008,8 @@ impl GitRepo {
                 &ours,
                 &t,
                 &index_path,
-                &original_index_bytes,
                 &clean_paths,
+                IndexRestore::Always(Some(&original_index_bytes)),
             ) {
                 Ok(()) => Err(ref_error),
                 Err(rollback_error) => Err(format!("{}; {}", ref_error, rollback_error)),
@@ -2471,6 +2911,22 @@ mod tests {
         drop(commit);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_index_lock_drop_preserves_replaced_lock_entry() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let index_path = dir.path().join("index");
+        let lock_path = dir.path().join("index.lock");
+        let lock = IndexLockFile::create(&index_path).expect("create index lock");
+        std::fs::remove_file(&lock_path).expect("replace index lock");
+        std::fs::write(&lock_path, b"replacement lock").expect("write replacement lock");
+        drop(lock);
+        assert_eq!(
+            std::fs::read(&lock_path).expect("read replacement lock"),
+            b"replacement lock"
+        );
+    }
+
     fn commit_file(repo: &Repository, path: &str, contents: &str, message: &str) -> git2::Oid {
         std::fs::write(repo.workdir().expect("workdir").join(path), contents)
             .expect("write file");
@@ -2973,6 +3429,484 @@ mod tests {
         let head = checked_out.head().expect("HEAD");
         assert!(checked_out.head_detached().expect("HEAD state"));
         assert_eq!(head.target(), Some(remote_oid));
+    }
+
+    #[test]
+    fn test_checkout_branch_preserves_staged_and_sparse_index_state() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(dir.path());
+        commit_file(&repo, "tracked.txt", "tracked contents\n", "add tracked file");
+        let old_commit = repo.head().expect("old HEAD").peel_to_commit().expect("old commit");
+        repo.branch("feature", &old_commit, false).expect("create feature branch");
+        let feature_oid = commit_file_on_branch(
+            &repo,
+            "feature",
+            &old_commit,
+            "target.txt",
+            "target branch contents\n",
+            "add target file",
+        );
+        repo.reference(
+            "refs/remotes/origin/feature",
+            feature_oid,
+            true,
+            "create remote tracking ref",
+        )
+        .expect("create remote tracking ref");
+        std::fs::write(dir.path().join("staged.txt"), "staged contents\n")
+            .expect("write staged file");
+        let mut index = repo.index().expect("index");
+        index.add_path(Path::new("staged.txt")).expect("stage unrelated file");
+        let mut tracked_entry = index
+            .get_path(Path::new("tracked.txt"), 0)
+            .expect("tracked index entry");
+        tracked_entry.flags |= 0x4000;
+        tracked_entry.flags_extended |= 0x4000;
+        index.add(&tracked_entry).expect("mark skip-worktree");
+        index.set_version(4).expect("set index version");
+        index.write().expect("write index metadata");
+        drop(old_commit);
+        drop(repo);
+
+        let git = open_git_repo(dir.path());
+        git.checkout_branch("origin/feature")
+            .expect("checkout remote branch");
+
+        let checked_out = Repository::open(dir.path()).expect("reopen repository");
+        assert_eq!(checked_out.head().expect("HEAD").target(), Some(feature_oid));
+        let index = checked_out.index().expect("index");
+        assert_eq!(index.version(), 4);
+        assert!(index.get_path(Path::new("target.txt"), 0).is_some());
+        assert!(index.get_path(Path::new("staged.txt"), 0).is_some());
+        assert_ne!(
+            index.get_path(Path::new("tracked.txt"), 0)
+                .expect("tracked index entry")
+                .flags_extended & 0x4000,
+            0,
+            "skip-worktree state must survive checkout"
+        );
+    }
+
+    #[test]
+    fn test_checkout_branch_treats_glob_filename_as_literal() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(dir.path());
+        commit_file(&repo, "pattern[1].txt", "old literal contents\n", "add bracketed file");
+        commit_file(&repo, "pattern1.txt", "neighbor contents\n", "add glob neighbor");
+        let old_commit = repo.head().expect("old HEAD").peel_to_commit().expect("old commit");
+        repo.branch("feature", &old_commit, false).expect("create feature branch");
+        let feature_oid = commit_file_on_branch(
+            &repo,
+            "feature",
+            &old_commit,
+            "pattern[1].txt",
+            "new literal contents\n",
+            "update bracketed file",
+        );
+        drop(old_commit);
+        drop(repo);
+        std::fs::write(dir.path().join("pattern1.txt"), "local neighbor edit\n")
+            .expect("make glob neighbor dirty");
+
+        let git = open_git_repo(dir.path());
+        git.checkout_branch("feature")
+            .expect("checkout literal bracketed path");
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("pattern[1].txt"))
+                .expect("read checked out literal file"),
+            "new literal contents\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("pattern1.txt"))
+                .expect("read dirty neighbor"),
+            "local neighbor edit\n",
+            "literal path checkout must not match a glob neighbor"
+        );
+        let checked_out = Repository::open(dir.path()).expect("reopen repository");
+        assert_eq!(checked_out.head().expect("HEAD").target(), Some(feature_oid));
+    }
+
+    #[test]
+    fn test_checkout_rollback_treats_glob_filename_as_literal() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(dir.path());
+        commit_file(&repo, "pattern[1].txt", "old literal contents\n", "add bracketed file");
+        commit_file(&repo, "pattern1.txt", "neighbor contents\n", "add glob neighbor");
+        let old_commit = repo.head().expect("old HEAD").peel_to_commit().expect("old commit");
+        let old_head_oid = old_commit.id();
+        let old_head_name = repo
+            .head()
+            .expect("old HEAD")
+            .name()
+            .expect("old branch name")
+            .to_owned();
+        repo.branch("feature", &old_commit, false).expect("create feature branch");
+        commit_file_on_branch(
+            &repo,
+            "feature",
+            &old_commit,
+            "pattern[1].txt",
+            "new literal contents\n",
+            "update bracketed file",
+        );
+        drop(old_commit);
+        drop(repo);
+        std::fs::write(dir.path().join("pattern1.txt"), "local neighbor edit\n")
+            .expect("make glob neighbor dirty");
+        let head_lock_path = dir.path().join(".git").join("HEAD.lock");
+        std::fs::write(&head_lock_path, "block HEAD update").expect("create HEAD lock");
+
+        let git = open_git_repo(dir.path());
+        let result = git.checkout_branch("feature");
+        std::fs::remove_file(&head_lock_path).expect("remove HEAD lock");
+
+        let error = result.expect_err("locked HEAD must fail checkout");
+        assert!(error.contains("Set HEAD:"), "unexpected checkout error: {}", error);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("pattern[1].txt"))
+                .expect("read restored literal file"),
+            "old literal contents\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("pattern1.txt"))
+                .expect("read dirty neighbor"),
+            "local neighbor edit\n",
+            "rollback must not treat the literal path as a glob"
+        );
+        let checked_out = Repository::open(dir.path()).expect("reopen repository");
+        assert_eq!(checked_out.head().expect("HEAD").name(), Some(old_head_name.as_str()));
+        assert_eq!(checked_out.head().expect("HEAD").target(), Some(old_head_oid));
+    }
+
+    #[test]
+    fn test_checkout_branch_restores_worktree_when_head_update_fails() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(dir.path());
+        let old_commit_oid = commit_file(&repo, "tracked.txt", "old contents\n", "add tracked file");
+        let old_commit = repo.find_commit(old_commit_oid).expect("find old commit");
+        let old_head_name = repo
+            .head()
+            .expect("old HEAD")
+            .name()
+            .expect("old HEAD name")
+            .to_string();
+        let (head_state_name, head_is_symbolic, head_target) =
+            checkout_head_state(&repo).expect("snapshot attached HEAD");
+        assert!(head_is_symbolic);
+        assert!(head_state_name.starts_with(b"refs/heads/"));
+        assert_eq!(head_target, Some(old_commit_oid));
+        let signature = repo.signature().expect("signature");
+        repo.branch("feature", &old_commit, false).expect("create feature branch");
+
+        let old_tree = old_commit.tree().expect("old tree");
+        let feature_blob = repo.blob(b"feature contents\n").expect("write feature blob");
+        let feature_tree_oid = {
+            let mut builder = repo.treebuilder(Some(&old_tree)).expect("create feature tree");
+            builder
+                .insert("feature.txt", feature_blob, 0o100644)
+                .expect("update feature file");
+            builder.write().expect("write feature tree")
+        };
+        let feature_tree = repo.find_tree(feature_tree_oid).expect("find feature tree");
+        repo.commit(
+            Some("refs/heads/feature"),
+            &signature,
+            &signature,
+            "update feature file",
+            &feature_tree,
+            &[&old_commit],
+        )
+        .expect("commit feature file");
+
+        let index_path = repo.index().expect("index").path().expect("index path").to_path_buf();
+        let original_index = std::fs::read(&index_path).expect("read original index");
+        drop(feature_tree);
+        drop(old_tree);
+        drop(old_commit);
+        drop(repo);
+
+        let head_lock_path = dir.path().join(".git").join("HEAD.lock");
+        std::fs::write(&head_lock_path, "block HEAD update").expect("create HEAD lock");
+
+        let git = open_git_repo(dir.path());
+        let result = git.checkout_branch("feature");
+        std::fs::remove_file(&head_lock_path).expect("remove HEAD lock");
+
+        let error = result.expect_err("locked HEAD must fail checkout");
+        assert!(error.contains("Set HEAD:"), "unexpected checkout error: {}", error);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("tracked.txt")).expect("read restored file"),
+            "old contents\n",
+            "failed HEAD update must restore the original worktree"
+        );
+
+        let final_repo = Repository::open(dir.path()).expect("reopen repo");
+        let final_head = final_repo.head().expect("restored HEAD");
+        assert_eq!(final_head.name(), Some(old_head_name.as_str()));
+        assert_eq!(final_head.target(), Some(old_commit_oid));
+        assert_eq!(
+            std::fs::read(&index_path).expect("read restored index"),
+            original_index,
+            "failed HEAD update must restore the original index"
+        );
+    }
+
+    #[test]
+    fn test_checkout_branch_from_unborn_head() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = Repository::init(dir.path()).expect("initialize repository");
+        let signature = git2::Signature::now("Test User", "test@example.com").expect("signature");
+        let blob = repo.blob(b"feature contents\n").expect("write feature blob");
+        let tree_oid = {
+            let mut builder = repo.treebuilder(None).expect("create feature tree");
+            builder
+                .insert("tracked.txt", blob, 0o100644)
+                .expect("add feature file");
+            builder.write().expect("write feature tree")
+        };
+        let tree = repo.find_tree(tree_oid).expect("find feature tree");
+        let feature_oid = repo
+            .commit(
+                Some("refs/heads/feature"),
+                &signature,
+                &signature,
+                "create feature branch",
+                &tree,
+                &[],
+            )
+            .expect("create feature commit");
+        drop(tree);
+        drop(repo);
+
+        let git = open_git_repo(dir.path());
+        git.checkout_branch("feature").expect("checkout from unborn HEAD");
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("tracked.txt")).expect("read checked out file"),
+            "feature contents\n"
+        );
+        let checked_out = Repository::open(dir.path()).expect("reopen repository");
+        assert_eq!(checked_out.head().expect("HEAD").target(), Some(feature_oid));
+        assert_eq!(checked_out.head().expect("HEAD").name(), Some("refs/heads/feature"));
+        assert!(
+            checked_out
+                .index()
+                .expect("installed index")
+                .get_path(Path::new("tracked.txt"), 0)
+                .is_some(),
+            "installed index must contain the checked out tree"
+        );
+    }
+
+    #[test]
+    fn test_target_checkout_index_clears_conflict_stages_for_changed_path() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(dir.path());
+        commit_file(&repo, "tracked.txt", "target contents\n", "add tracked file");
+        let tree = repo.head().expect("HEAD").peel_to_tree().expect("target tree");
+        let mut index = repo.index().expect("index");
+        for stage in 1..=3 {
+            let mut entry = index
+                .get_path(Path::new("tracked.txt"), 0)
+                .expect("stage-zero source entry");
+            entry.flags = (entry.flags & !0x3000) | ((stage as u16) << 12);
+            index.add(&entry).expect("add conflict stage");
+        }
+        assert!(index.has_conflicts());
+        index.write().expect("write conflicted index");
+        let index_path = index.path().expect("index path").to_path_buf();
+        let original_index = std::fs::read(&index_path).expect("read conflicted index");
+
+        let target_index = index_bytes_for_tree(
+            &tree,
+            &index_path,
+            Some(&original_index),
+            &[PathBuf::from("tracked.txt")],
+        )
+        .expect("build target checkout index");
+        std::fs::write(&index_path, target_index).expect("install generated test index");
+
+        let checked_out = Repository::open(dir.path()).expect("reopen repository");
+        let checked_out_index = checked_out.index().expect("reopen target index");
+        assert!(!checked_out_index.has_conflicts());
+        assert!(checked_out_index.get_path(Path::new("tracked.txt"), 0).is_some());
+        for stage in 1..=3 {
+            assert!(checked_out_index.get_path(Path::new("tracked.txt"), stage).is_none());
+        }
+    }
+
+    #[test]
+    fn test_checkout_branch_rebuilds_full_index_when_missing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(dir.path());
+        commit_file(&repo, "unchanged.txt", "same contents\n", "add unchanged file");
+        commit_file(&repo, "also-unchanged.txt", "other contents\n", "add second unchanged file");
+        let old_commit_oid = repo.head().expect("old HEAD").target().expect("old target");
+        let old_commit = repo.find_commit(old_commit_oid).expect("old commit");
+        let signature = repo.signature().expect("signature");
+        repo.branch("feature", &old_commit, false).expect("create feature branch");
+        let added_blob = repo.blob(b"new target file\n").expect("write target blob");
+        let old_tree = old_commit.tree().expect("old tree");
+        let feature_tree_oid = {
+            let mut builder = repo.treebuilder(Some(&old_tree)).expect("create feature tree");
+            builder
+                .insert("added.txt", added_blob, 0o100644)
+                .expect("add target file");
+            builder.write().expect("write feature tree")
+        };
+        let feature_tree = repo.find_tree(feature_tree_oid).expect("find feature tree");
+        let feature_oid = repo
+            .commit(
+                Some("refs/heads/feature"),
+                &signature,
+                &signature,
+                "add target file",
+                &feature_tree,
+                &[&old_commit],
+            )
+            .expect("commit feature file");
+        let index_path = repo.index().expect("index").path().expect("index path").to_path_buf();
+        std::fs::remove_file(&index_path).expect("remove original index");
+        drop(feature_tree);
+        drop(old_tree);
+        drop(old_commit);
+        drop(repo);
+
+        let git = open_git_repo(dir.path());
+        git.checkout_branch("feature")
+            .expect("checkout without an on-disk index");
+
+        let checked_out = Repository::open(dir.path()).expect("reopen repository");
+        assert_eq!(checked_out.head().expect("HEAD").target(), Some(feature_oid));
+        let index = checked_out.index().expect("rebuilt index");
+        assert!(index.get_path(Path::new("unchanged.txt"), 0).is_some());
+        assert!(index.get_path(Path::new("also-unchanged.txt"), 0).is_some());
+        assert!(index.get_path(Path::new("added.txt"), 0).is_some());
+    }
+
+    #[test]
+    fn test_checkout_branch_rebuilds_index_for_identical_tree_when_missing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(dir.path());
+        commit_file(&repo, "tracked.txt", "tracked contents\n", "add tracked file");
+        let target_oid = repo.head().expect("HEAD").target().expect("target commit");
+        let target_commit = repo.find_commit(target_oid).expect("target commit");
+        repo.branch("feature", &target_commit, false).expect("create feature branch");
+        let index_path = repo.index().expect("index").path().expect("index path").to_path_buf();
+        std::fs::remove_file(&index_path).expect("remove original index");
+        drop(target_commit);
+        drop(repo);
+
+        let git = open_git_repo(dir.path());
+        git.checkout_branch("feature")
+            .expect("checkout identical tree without an on-disk index");
+
+        let checked_out = Repository::open(dir.path()).expect("reopen repository");
+        assert_eq!(checked_out.head().expect("HEAD").target(), Some(target_oid));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("tracked.txt")).expect("read tracked file"),
+            "tracked contents\n"
+        );
+        assert!(
+            checked_out
+                .index()
+                .expect("rebuilt index")
+                .get_path(Path::new("tracked.txt"), 0)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_checkout_same_tree_rejects_unresolved_index() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(dir.path());
+        commit_file(&repo, "tracked.txt", "tracked contents\n", "add tracked file");
+        let old_head = repo.head().expect("HEAD");
+        let old_head_oid = old_head.target().expect("old target");
+        let old_head_name = old_head.name().expect("old branch name").to_owned();
+        let old_commit = repo.find_commit(old_head_oid).expect("old commit");
+        repo.branch("feature", &old_commit, false).expect("create feature branch");
+        let mut index = repo.index().expect("index");
+        let mut conflict_entry = index
+            .get_path(Path::new("tracked.txt"), 0)
+            .expect("stage-zero entry");
+        index
+            .remove(Path::new("tracked.txt"), 0)
+            .expect("remove stage-zero entry");
+        for stage in 1..=3 {
+            conflict_entry.flags = (conflict_entry.flags & !0x3000) | ((stage as u16) << 12);
+            index.add(&conflict_entry).expect("add conflict stage");
+        }
+        assert!(index.has_conflicts());
+        index.write().expect("write conflicted index");
+        let index_path = index.path().expect("index path").to_path_buf();
+        let original_index = std::fs::read(&index_path).expect("read conflicted index");
+        drop(old_head);
+        drop(old_commit);
+        drop(repo);
+
+        let git = open_git_repo(dir.path());
+        let error = git
+            .checkout_branch("feature")
+            .expect_err("same-tree checkout must reject unresolved index");
+
+        assert!(error.contains("unresolved conflicts"), "unexpected error: {}", error);
+        let checked_out = Repository::open(dir.path()).expect("reopen repository");
+        assert_eq!(checked_out.head().expect("HEAD").name(), Some(old_head_name.as_str()));
+        assert_eq!(checked_out.head().expect("HEAD").target(), Some(old_head_oid));
+        assert!(checked_out.index().expect("index").has_conflicts());
+        assert_eq!(
+            std::fs::read(index_path).expect("read preserved index"),
+            original_index
+        );
+    }
+
+    #[test]
+    fn test_checkout_branch_restores_absent_index_when_head_update_fails() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(dir.path());
+        let old_head = repo.head().expect("old HEAD").target().expect("old target");
+        let old_commit = repo.find_commit(old_head).expect("old commit");
+        let old_tree = old_commit.tree().expect("old tree");
+        let signature = repo.signature().expect("signature");
+        let feature_blob = repo.blob(b"feature contents\n").expect("write feature blob");
+        let feature_tree_oid = {
+            let mut builder = repo.treebuilder(Some(&old_tree)).expect("create feature tree");
+            builder
+                .insert("tracked.txt", feature_blob, 0o100644)
+                .expect("update feature file");
+            builder.write().expect("write feature tree")
+        };
+        let feature_tree = repo.find_tree(feature_tree_oid).expect("find feature tree");
+        repo.commit(
+            Some("refs/heads/feature"),
+            &signature,
+            &signature,
+            "update feature file",
+            &feature_tree,
+            &[&old_commit],
+        )
+        .expect("commit feature file");
+        let index_path = repo.index().expect("index").path().expect("index path").to_path_buf();
+        assert!(!index_path.exists(), "empty initial repository should have no index");
+        drop(feature_tree);
+        drop(old_tree);
+        drop(old_commit);
+        drop(repo);
+
+        let head_lock_path = dir.path().join(".git").join("HEAD.lock");
+        std::fs::write(&head_lock_path, "block HEAD update").expect("create HEAD lock");
+        let git = open_git_repo(dir.path());
+        let result = git.checkout_branch("feature");
+        std::fs::remove_file(&head_lock_path).expect("remove HEAD lock");
+
+        let error = result.expect_err("locked HEAD must fail checkout");
+        assert!(error.contains("Set HEAD:"), "unexpected checkout error: {}", error);
+        assert!(!index_path.exists(), "failed checkout must preserve an absent index");
+        assert!(!dir.path().join("feature.txt").exists());
+        let final_repo = Repository::open(dir.path()).expect("reopen repository");
+        assert_eq!(final_repo.head().expect("HEAD").target(), Some(old_head));
     }
 
     #[test]
