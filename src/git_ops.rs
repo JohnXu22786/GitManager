@@ -1745,11 +1745,10 @@ impl GitRepo {
             .map_err(|e| format!("Inspect checkout changes: {}", e))?;
         let changed_paths = collect_diff_paths(&changed_diff);
         drop(changed_diff);
-        if changed_paths.is_empty()
-            && repo
-                .index()
-                .map_err(|e| format!("Index: {}", e))?
-                .has_conflicts()
+        if repo
+            .index()
+            .map_err(|e| format!("Index: {}", e))?
+            .has_conflicts()
         {
             return Err("Checkout: index has unresolved conflicts".into());
         }
@@ -3937,6 +3936,79 @@ mod tests {
         assert_eq!(
             std::fs::read(index_path).expect("read preserved index"),
             original_index
+        );
+    }
+
+    #[test]
+    fn test_checkout_branch_rejects_unresolved_index_when_target_changes_conflicted_path() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(dir.path());
+        commit_file(&repo, "tracked.txt", "base contents\n", "add tracked file");
+        let old_head = repo.head().expect("HEAD");
+        let old_head_oid = old_head.target().expect("old target");
+        let old_head_name = old_head.name().expect("old branch name").to_owned();
+        let old_commit = repo.find_commit(old_head_oid).expect("old commit");
+        repo.branch("feature", &old_commit, false).expect("create feature branch");
+
+        let signature = repo.signature().expect("signature");
+        let target_blob = repo.blob(b"feature contents\n").expect("write target blob");
+        let old_tree = old_commit.tree().expect("old tree");
+        let target_tree_oid = {
+            let mut builder = repo.treebuilder(Some(&old_tree)).expect("create target tree");
+            builder
+                .insert("tracked.txt", target_blob, 0o100644)
+                .expect("change conflicted path");
+            builder.write().expect("write target tree")
+        };
+        let target_tree = repo.find_tree(target_tree_oid).expect("find target tree");
+        repo.commit(
+            Some("refs/heads/feature"),
+            &signature,
+            &signature,
+            "change tracked file",
+            &target_tree,
+            &[&old_commit],
+        )
+        .expect("commit target branch");
+
+        let mut index = repo.index().expect("index");
+        let mut conflict_entry = index
+            .get_path(Path::new("tracked.txt"), 0)
+            .expect("stage-zero entry");
+        index
+            .remove(Path::new("tracked.txt"), 0)
+            .expect("remove stage-zero entry");
+        for stage in 1..=3 {
+            conflict_entry.flags = (conflict_entry.flags & !0x3000) | ((stage as u16) << 12);
+            index.add(&conflict_entry).expect("add conflict stage");
+        }
+        assert!(index.has_conflicts());
+        index.write().expect("write conflicted index");
+        let index_path = index.path().expect("index path").to_path_buf();
+        let original_index = std::fs::read(&index_path).expect("read conflicted index");
+        drop(old_head);
+        drop(old_tree);
+        drop(old_commit);
+        drop(target_tree);
+        drop(repo);
+
+        let git = open_git_repo(dir.path());
+        let error = git
+            .checkout_branch("feature")
+            .expect_err("checkout must reject unresolved index conflicts");
+
+        assert!(error.contains("unresolved conflicts"), "unexpected error: {}", error);
+        let checked_out = Repository::open(dir.path()).expect("reopen repository");
+        assert_eq!(checked_out.head().expect("HEAD").name(), Some(old_head_name.as_str()));
+        assert_eq!(checked_out.head().expect("HEAD").target(), Some(old_head_oid));
+        assert!(checked_out.index().expect("index").has_conflicts());
+        assert_eq!(
+            std::fs::read(index_path).expect("read preserved index"),
+            original_index
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("tracked.txt")).expect("read worktree file"),
+            "base contents\n"
         );
     }
 
