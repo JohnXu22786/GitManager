@@ -1,6 +1,6 @@
 [package]
 name = "git_manager"
-version = "0.1.0"
+version = "0.1.10"
 edition = "2021"
 description = "A dedicated Git branch & worktree manager GUI"
 homepage = "https://github.com/JohnXu22786/GitManager"
