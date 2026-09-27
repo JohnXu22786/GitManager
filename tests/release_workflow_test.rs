@@ -15,6 +15,32 @@ fn read_release_workflow() -> String {
     fs::read_to_string(&path).expect("Failed to read release.yml")
 }
 
+fn workflow_job_section(content: &str, name: &str) -> String {
+    let jobs = content
+        .split_once("jobs:\n")
+        .expect("workflow must define jobs")
+        .1;
+    let marker = format!("  {}:", name);
+    let mut in_job = false;
+    let mut section = String::new();
+
+    for line in jobs.lines() {
+        if line.starts_with("  ") && !line.starts_with("    ") {
+            if in_job {
+                break;
+            }
+            in_job = line == marker;
+        }
+        if in_job {
+            section.push_str(line);
+            section.push('\n');
+        }
+    }
+
+    assert!(!section.is_empty(), "Workflow must define job '{}'", name);
+    section
+}
+
 // ──────────────────────────────────────────────
 // Stroom Pattern: Structural checks
 // ──────────────────────────────────────────────
@@ -30,15 +56,13 @@ fn test_has_prepare_version_job() {
     );
 }
 
-/// The workflow MUST NOT have a separate upload-artifacts phase.
-/// Stroom pattern: each platform uploads directly — no aggregator job.
+/// The release upload job must be separate from dependency builds.
 #[test]
-fn test_no_separate_upload_job() {
+fn test_release_upload_has_a_separate_job() {
     let content = read_release_workflow();
     assert!(
-        !content.contains("upload-artifacts"),
-        "Workflow must NOT have a separate 'upload-artifacts' job \
-         (Stroom pattern: each platform uploads directly)"
+        workflow_job_section(&content, "release").contains("softprops/action-gh-release"),
+        "The release job must upload assets after the builds finish"
     );
 }
 
@@ -97,40 +121,53 @@ fn test_no_body_or_name_field_in_upload_step() {
     );
 }
 
-/// Each build job MUST directly call softprops/action-gh-release to upload
-/// its artifact (not a separate upload job).
-/// The action is defined once in the matrix job; the matrix expands it at
-/// runtime to run for each platform target.
+/// Build jobs must create artifacts but never call the release API.
 #[test]
-fn test_each_build_job_uploads_directly() {
+fn test_build_job_only_uploads_workflow_artifacts() {
     let content = read_release_workflow();
-    // The action appears once in the YAML (inside the build matrix job).
-    // The matrix expansion means it runs for all 5 platforms at runtime.
-    let gh_release_count = content
-        .matches("uses: softprops/action-gh-release")
-        .count();
+    let build = workflow_job_section(&content, "build");
     assert!(
-        gh_release_count >= 1,
-        "The build matrix job must use softprops/action-gh-release, \
-         but found {} occurrences",
-        gh_release_count
+        build.contains("actions/upload-artifact@v4"),
+        "Each platform build must publish its package as a workflow artifact"
+    );
+    assert!(
+        build.contains("name: release-${{ matrix.artifact_suffix }}"),
+        "Each platform artifact name must match the release download pattern"
+    );
+    assert!(
+        build.contains("path: ${{ steps.package.outputs.archive }}"),
+        "Each platform artifact must contain the package produced by its build"
+    );
+    assert!(
+        !build.contains("softprops/action-gh-release"),
+        "Build jobs must not upload to the release"
     );
 }
 
-/// The workflow MUST NOT use intermediate workflow artifact upload/download.
-/// Stroom pattern: each platform uploads directly to the release.
+/// The final upload job downloads build outputs after all platforms complete.
 #[test]
-fn test_no_intermediate_artifacts() {
+fn test_release_job_collects_build_artifacts() {
     let content = read_release_workflow();
+    let release = workflow_job_section(&content, "release");
     assert!(
-        !content.contains("actions/upload-artifact"),
-        "Workflow must NOT use 'actions/upload-artifact' \
-         (Stroom pattern: each platform uploads directly to release)"
+        release.contains("needs: [prepare-version, build]"),
+        "The release job must wait for every platform build"
     );
     assert!(
-        !content.contains("actions/download-artifact"),
-        "Workflow must NOT use 'actions/download-artifact' \
-         (Stroom pattern: each platform uploads directly to release)"
+        release.contains("actions/download-artifact@v4"),
+        "The release job must download the platform build artifacts"
+    );
+    assert!(
+        release.contains("pattern: release-*") && release.contains("merge-multiple: true"),
+        "The release job must flatten every platform artifact into the shared upload directory"
+    );
+    assert!(
+        release.contains("softprops/action-gh-release"),
+        "The release job must upload the downloaded artifacts"
+    );
+    assert!(
+        release.contains("files: release-assets/git-manager-*"),
+        "The release job must attach the downloaded GitManager packages"
     );
 }
 
@@ -194,8 +231,38 @@ fn test_triggers_on_release_published() {
 fn test_has_contents_write_permission() {
     let content = read_release_workflow();
     assert!(
-        content.contains("contents: write"),
-        "Workflow must have 'contents: write' permission"
+        content.contains("\npermissions:\n  contents: read\n"),
+        "Workflow defaults must be read-only"
+    );
+    assert!(
+        workflow_job_section(&content, "release").contains("contents: write"),
+        "Only the release upload job must have 'contents: write' permission"
+    );
+    assert!(
+        !workflow_job_section(&content, "build").contains("contents: write"),
+        "Build jobs must not have 'contents: write' permission"
+    );
+    assert!(
+        !workflow_job_section(&content, "prepare-version").contains("contents: write"),
+        "The version preparation job must not have 'contents: write' permission"
+    );
+    assert_eq!(
+        content.matches("contents: write").count(),
+        1,
+        "The release upload job must be the only write-enabled permission scope"
+    );
+}
+
+#[test]
+fn test_checkout_does_not_persist_credentials() {
+    let content = read_release_workflow();
+    assert!(
+        workflow_job_section(&content, "prepare-version").contains("persist-credentials: false"),
+        "Version preparation does not need persisted checkout credentials"
+    );
+    assert!(
+        workflow_job_section(&content, "build").contains("persist-credentials: false"),
+        "Dependency build scripts must not read checkout credentials"
     );
 }
 
