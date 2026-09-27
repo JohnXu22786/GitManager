@@ -5,7 +5,7 @@ on:
     types: [published]
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,10 +16,14 @@ jobs:
   # exposes it as a job output that all platform jobs can reference.
   prepare-version:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       app_version: ${{ steps.extract-version.outputs.app_version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Extract version from tag
         id: extract-version
@@ -29,10 +33,8 @@ jobs:
           VERSION="${TAG#v}"
           echo "app_version=$VERSION" >> $GITHUB_OUTPUT
 
-  # ── Phase 2: Build + Upload per platform ──
-  # Stroom pattern: each platform builds AND uploads its artifact directly
-  # to the GitHub Release. No intermediate workflow artifacts.
-  # No `body` or `name` is set, so the user's release notes are preserved.
+  # ── Phase 2: Build per platform ──
+  # Build jobs stay read-only; only the final upload job can modify releases.
   build:
     name: Build (${{ matrix.target }})
     needs: [prepare-version]
@@ -57,8 +59,12 @@ jobs:
             artifact_suffix: macos-aarch64
 
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Setup Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -141,11 +147,32 @@ jobs:
 
           echo "archive=$ARCHIVE" >> $GITHUB_OUTPUT
 
-      # Stroom pattern: each platform uploads directly to the GitHub Release.
-      # No `body` or `name` is set, so the release notes the user wrote
-      # when creating the release on GitHub's web UI are preserved intact.
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.artifact_suffix }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+
+  # Keep the write-scoped token out of all build and dependency execution.
+  release:
+    name: Upload release assets
+    needs: [prepare-version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      # Only tag_name and files are set, preserving the user's release notes.
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          files: ${{ steps.package.outputs.archive }}
+          files: release-assets/git-manager-*
+          fail_on_unmatched_files: true
