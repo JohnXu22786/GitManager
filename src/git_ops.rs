@@ -7,11 +7,17 @@ use std::sync::{Arc, Mutex};
 
 pub type GitResult<T> = Result<T, String>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileIdentity {
+    volume: u64,
+    index: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct WorktreeFileIdentity {
-    metadata: std::fs::Metadata,
+    identity: FileIdentity,
     contents: Vec<u8>,
-    directory_metadata: Option<std::fs::Metadata>,
+    directory_identity: Option<FileIdentity>,
     _directory_file: Option<Arc<std::fs::File>>,
     _git_link_file: Option<Arc<std::fs::File>>,
     _lock_file: Option<Arc<std::fs::File>>,
@@ -639,7 +645,7 @@ fn read_index_snapshot(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
 struct IndexLockFile {
     path: PathBuf,
     file: Option<std::fs::File>,
-    identity: std::fs::Metadata,
+    identity: FileIdentity,
     owned: bool,
 }
 
@@ -656,9 +662,8 @@ impl IndexLockFile {
             .create_new(true)
             .open(&path)
             .map_err(|error| format!("Acquire index lock: {}", error))?;
-        let identity = file
-            .metadata()
-            .map_err(|error| format!("Inspect index lock: {}", error))?;
+        let identity = file_identity_from_file(&file)
+            .ok_or_else(|| "Inspect index lock: file identity is unavailable".to_string())?;
         Ok(Self {
             path,
             file: Some(file),
@@ -672,9 +677,9 @@ impl IndexLockFile {
     }
 
     fn verify_owned(&self) -> GitResult<()> {
-        let current = std::fs::symlink_metadata(&self.path)
-            .map_err(|error| format!("Verify index lock ownership: {}", error))?;
-        if !same_file(&current, &self.identity) {
+        let current = file_identity_from_path(&self.path)
+            .ok_or_else(|| "Verify index lock ownership: file identity is unavailable".to_string())?;
+        if current != self.identity {
             return Err("Index lock was replaced; preserving current lock".into());
         }
         Ok(())
@@ -910,9 +915,10 @@ fn worktree_git_link_identity(worktree_path: &Path) -> Option<WorktreeFileIdenti
     if !directory_metadata.is_dir() {
         return None;
     }
+    let directory_identity = file_identity_from_path(worktree_path)?;
     let directory_file = open_worktree_directory(worktree_path).ok()?;
-    let opened_directory_metadata = directory_file.metadata().ok()?;
-    if !same_file(&directory_metadata, &opened_directory_metadata) {
+    let opened_directory_identity = file_identity_from_file(&directory_file)?;
+    if directory_identity != opened_directory_identity {
         return None;
     }
 
@@ -922,10 +928,11 @@ fn worktree_git_link_identity(worktree_path: &Path) -> Option<WorktreeFileIdenti
     if !file_type.is_file() && !file_type.is_symlink() {
         return None;
     }
+    let identity = file_identity_from_path(&git_entry)?;
     let contents = worktree_git_link(worktree_path)?;
     let mut git_link_file = std::fs::File::open(&git_entry).ok()?;
-    let opened_git_link_metadata = git_link_file.metadata().ok()?;
-    if file_type.is_file() && !same_file(&metadata, &opened_git_link_metadata) {
+    let opened_git_link_identity = file_identity_from_file(&git_link_file)?;
+    if file_type.is_file() && identity != opened_git_link_identity {
         return None;
     }
     let mut opened_contents = Vec::new();
@@ -933,18 +940,18 @@ fn worktree_git_link_identity(worktree_path: &Path) -> Option<WorktreeFileIdenti
     if opened_contents != contents {
         return None;
     }
-    let current_git_link_metadata = std::fs::symlink_metadata(&git_entry).ok()?;
-    if !same_file(&metadata, &current_git_link_metadata) {
+    let current_git_link_identity = file_identity_from_path(&git_entry)?;
+    if identity != current_git_link_identity {
         return None;
     }
-    let current_directory_metadata = std::fs::symlink_metadata(worktree_path).ok()?;
-    if !same_file(&directory_metadata, &current_directory_metadata) {
+    let current_directory_identity = file_identity_from_path(worktree_path)?;
+    if directory_identity != current_directory_identity {
         return None;
     }
     Some(WorktreeFileIdentity {
-        metadata,
+        identity,
         contents,
-        directory_metadata: Some(directory_metadata),
+        directory_identity: Some(directory_identity),
         _directory_file: Some(Arc::new(directory_file)),
         _git_link_file: Some(Arc::new(git_link_file)),
         _lock_file: None,
@@ -968,29 +975,72 @@ fn open_worktree_directory(path: &Path) -> std::io::Result<std::fs::File> {
     }
 }
 
-fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+fn file_identity_from_file(file: &std::fs::File) -> Option<FileIdentity> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        a.dev() == b.dev() && a.ino() == b.ino()
+        let metadata = file.metadata().ok()?;
+        Some(FileIdentity {
+            volume: metadata.dev(),
+            index: metadata.ino(),
+        })
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
-        matches!(
-            (
-                a.volume_serial_number(),
-                a.file_index(),
-                b.volume_serial_number(),
-                b.file_index()
-            ),
-            (Some(a_volume), Some(a_index), Some(b_volume), Some(b_index))
-                if a_volume == b_volume && a_index == b_index
-        )
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+
+        let mut information = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+        let succeeded = unsafe {
+            GetFileInformationByHandle(file.as_raw_handle() as _, information.as_mut_ptr())
+        };
+        if succeeded == 0 {
+            return None;
+        }
+        let information = unsafe { information.assume_init() };
+        Some(FileIdentity {
+            volume: u64::from(information.dwVolumeSerialNumber),
+            index: (u64::from(information.nFileIndexHigh) << 32)
+                | u64::from(information.nFileIndexLow),
+        })
     }
     #[cfg(not(any(unix, windows)))]
     {
-        false
+        let _ = file;
+        None
+    }
+}
+
+fn file_identity_from_path(path: &Path) -> Option<FileIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        Some(FileIdentity {
+            volume: metadata.dev(),
+            index: metadata.ino(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .ok()?;
+        file_identity_from_file(&file)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        None
     }
 }
 
@@ -1001,21 +1051,18 @@ fn staged_worktree_link_matches(
     let Some(actual) = worktree_git_link_identity(staged_path) else {
         return false;
     };
-    let directory_matches = match (
-        actual.directory_metadata.as_ref(),
-        expected.directory_metadata.as_ref(),
-    ) {
-        (Some(actual), Some(expected)) => same_file(actual, expected),
+    let directory_matches = match (actual.directory_identity, expected.directory_identity) {
+        (Some(actual), Some(expected)) => actual == expected,
         _ => false,
     };
     directory_matches
-        && same_file(&actual.metadata, &expected.metadata)
+        && actual.identity == expected.identity
         && actual.contents == expected.contents
 }
 
-fn path_identity_matches(path: &Path, expected: &std::fs::Metadata) -> bool {
-    std::fs::symlink_metadata(path)
-        .map(|actual| same_file(&actual, expected))
+fn path_identity_matches(path: &Path, expected: &FileIdentity) -> bool {
+    file_identity_from_path(path)
+        .map(|actual| actual == *expected)
         .unwrap_or(false)
 }
 
@@ -1099,26 +1146,30 @@ fn worktree_lock_identity(
     if !entry_metadata.file_type().is_file() {
         return Err("Check worktree lock: lock entry is not a regular file".into());
     }
+    let identity = file_identity_from_path(&lock_path)
+        .ok_or_else(|| "Check worktree lock: file identity is unavailable".to_string())?;
     let mut file = std::fs::File::open(&lock_path)
         .map_err(|error| format!("Check worktree lock: {}", error))?;
     let metadata = file
         .metadata()
         .map_err(|error| format!("Check worktree lock: {}", error))?;
-    if !metadata.file_type().is_file() || !same_file(&entry_metadata, &metadata) {
+    let opened_identity = file_identity_from_file(&file)
+        .ok_or_else(|| "Check worktree lock: file identity is unavailable".to_string())?;
+    if !metadata.file_type().is_file() || identity != opened_identity {
         return Err("Check worktree lock: lock entry changed during inspection".into());
     }
     let mut contents = Vec::new();
     file.read_to_end(&mut contents)
         .map_err(|error| format!("Check worktree lock: {}", error))?;
-    let current_metadata = std::fs::symlink_metadata(&lock_path)
-        .map_err(|error| format!("Check worktree lock: {}", error))?;
-    if !same_file(&current_metadata, &metadata) {
+    let current_identity = file_identity_from_path(&lock_path)
+        .ok_or_else(|| "Check worktree lock: file identity is unavailable".to_string())?;
+    if current_identity != identity {
         return Err("Check worktree lock: lock entry changed during inspection".into());
     }
     Ok(Some(WorktreeFileIdentity {
-        metadata,
+        identity,
         contents,
-        directory_metadata: None,
+        directory_identity: None,
         _directory_file: None,
         _git_link_file: None,
         _lock_file: Some(Arc::new(file)),
@@ -1146,11 +1197,8 @@ where
     let mut lock_file = lock_options
         .open(&lock_path)
         .map_err(|error| format!("Lock worktree: {}", error))?;
-    let metadata = lock_file.metadata().map_err(|error| {
-        format!(
-            "Lock worktree: {}; lock entry retained because ownership could not be verified",
-            error
-        )
+    let identity = file_identity_from_file(&lock_file).ok_or_else(|| {
+        "Lock worktree: file identity is unavailable; lock entry retained".to_string()
     })?;
     let contents = WORKTREE_LOCK_REASON.as_bytes().to_vec();
     lock_file
@@ -1164,9 +1212,9 @@ where
         })?;
 
     let identity = WorktreeFileIdentity {
-        metadata,
+        identity,
         contents,
-        directory_metadata: None,
+        directory_identity: None,
         _directory_file: None,
         _git_link_file: None,
         _lock_file: Some(Arc::new(lock_file)),
@@ -1209,7 +1257,7 @@ fn worktree_lock_identity_matches(
     let Ok(Some(actual)) = worktree_lock_identity(repo, worktree) else {
         return false;
     };
-    same_file(&actual.metadata, &expected.metadata) && actual.contents == expected.contents
+    actual.identity == expected.identity && actual.contents == expected.contents
 }
 
 fn unlock_worktree_if_owned(
@@ -1289,10 +1337,15 @@ fn remove_worktree_directory(
         let staging_path = worktree_staging_path(path)?;
         if let Err(rename_error) = std::fs::rename(path, &staging_path) {
             if force {
-                let path_metadata = std::fs::symlink_metadata(path)?;
+                let path_identity = file_identity_from_path(path).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Cannot verify worktree directory identity",
+                    )
+                })?;
                 if let Err(force_error) = force_remove_worktree_directory_fallback(
                     path,
-                    &path_metadata,
+                    &path_identity,
                     &expected_git_link,
                 ) {
                     return Err(std::io::Error::new(
@@ -1545,7 +1598,7 @@ where
 
 fn force_remove_worktree_directory_fallback(
     path: &Path,
-    expected_path: &std::fs::Metadata,
+    expected_path: &FileIdentity,
     expected_git_link: &WorktreeFileIdentity,
 ) -> std::io::Result<()> {
     force_remove_dir_checked(
@@ -1556,7 +1609,7 @@ fn force_remove_worktree_directory_fallback(
 
 fn worktree_fallback_identity_guard<'a>(
     path: &'a Path,
-    expected_path: &'a std::fs::Metadata,
+    expected_path: &'a FileIdentity,
     expected_git_link: &'a WorktreeFileIdentity,
 ) -> impl Fn() -> bool + 'a {
     let git_link_was_verified = std::cell::Cell::new(false);
@@ -5709,12 +5762,12 @@ mod tests {
         let path = root.path().join("worktree");
         std::fs::create_dir(&path).expect("create worktree directory");
         std::fs::write(path.join(".git"), "gitdir: placeholder\n").expect("write git link");
-        let path_metadata = std::fs::symlink_metadata(&path).expect("capture directory identity");
+        let path_identity = file_identity_from_path(&path).expect("capture directory identity");
 
         std::fs::remove_file(path.join(".git")).expect("remove git link during cleanup");
 
         assert!(
-            path_identity_matches(&path, &path_metadata),
+            path_identity_matches(&path, &path_identity),
             "Directory identity must remain valid after recursive cleanup removes .git"
         );
     }
@@ -5727,7 +5780,7 @@ mod tests {
         std::fs::write(path.join(".git"), b"gitdir: expected\n").expect("write git link");
         std::fs::write(path.join("important.txt"), b"keep this file").expect("write worktree file");
 
-        let expected_path = std::fs::symlink_metadata(&path).expect("capture directory identity");
+        let expected_path = file_identity_from_path(&path).expect("capture directory identity");
         let expected_git_link =
             worktree_git_link_identity(&path).expect("capture git link identity");
         let is_safe = worktree_fallback_identity_guard(&path, &expected_path, &expected_git_link);
