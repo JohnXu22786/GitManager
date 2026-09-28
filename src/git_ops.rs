@@ -2308,21 +2308,26 @@ impl GitRepo {
     pub fn create_worktree(&self, name: &str, path: &Path, branch: Option<&str>, new_branch: bool) -> GitResult<()> {
         let repo = self.repo()?;
 
-        let branch_ref = if let Some(b) = branch {
-            if new_branch {
-                let bc = repo.head().map_err(|e| format!("HEAD: {}", e))?
-                    .peel_to_commit().map_err(|_| "No commit".to_string())?;
-                repo.branch(name, &bc, false).map_err(|e| format!("Create branch: {}", e))?;
-                format!("refs/heads/{}", name)
-            } else if b.starts_with("refs/") { b.to_string() }
-            else { format!("refs/heads/{}", b) }
-        } else { return Err("Branch required".into()); };
+        let branch = branch.ok_or_else(|| "Branch required".to_string())?;
+        let branch_ref = if new_branch {
+            let bc = repo
+                .head()
+                .map_err(|e| format!("HEAD: {}", e))?
+                .peel_to_commit().map_err(|_| "No commit".to_string())?;
+            repo.branch(branch, &bc, false)
+                .map_err(|e| format!("Create branch: {}", e))?;
+            format!("refs/heads/{}", branch)
+        } else if branch.starts_with("refs/") {
+            branch.to_string()
+        } else {
+            format!("refs/heads/{}", branch)
+        };
 
-        let reference = repo.find_reference(&branch_ref).ok();
+        let reference = repo
+            .find_reference(&branch_ref)
+            .map_err(|e| format!("Find branch '{}': {}", branch, e))?;
         let mut opts = WorktreeAddOptions::new();
-        if let Some(ref r) = reference {
-            opts.reference(Some(r));
-        }
+        opts.reference(Some(&reference));
         let wt = match repo.worktree(name, path, Some(&opts)) {
             Ok(wt) => wt,
             Err(e) => {
@@ -5352,6 +5357,82 @@ mod tests {
         assert!(
             repo.find_branch("orphaned-branch", BranchType::Local).is_err(),
             "failed worktree creation must not leave its newly created branch"
+        );
+    }
+
+    #[test]
+    fn test_create_worktree_uses_explicit_branch_name_for_new_branch() {
+        let main_dir = tempfile::tempdir().expect("main temp dir");
+        let wt_root = tempfile::tempdir().expect("worktree temp dir");
+        let wt_path = wt_root.path().join("worktree-name");
+        drop(create_repo_with_commit(main_dir.path()));
+
+        let result = execute_operation(
+            main_dir.path(),
+            GitOperation::CreateWorktree {
+                name: "worktree-name".to_string(),
+                path: wt_path.clone(),
+                branch: Some("feature/explicit-name".to_string()),
+                new_branch: true,
+            },
+            Arc::new(Mutex::new(String::new())),
+        );
+        assert!(
+            matches!(&result, OpResult::Success(_)),
+            "worktree creation failed: {:?}",
+            result
+        );
+
+        let repo = Repository::open(main_dir.path()).expect("reopen main repo");
+        assert!(
+            repo.find_branch("feature/explicit-name", BranchType::Local)
+                .is_ok()
+        );
+        assert!(
+            repo.find_branch("worktree-name", BranchType::Local).is_err(),
+            "the worktree name must not be used as its branch name"
+        );
+        let worktree_repo = Repository::open(&wt_path).expect("open created worktree");
+        assert_eq!(
+            worktree_repo.head().expect("worktree HEAD").shorthand(),
+            Some("feature/explicit-name")
+        );
+    }
+
+    #[test]
+    fn test_create_worktree_rejects_missing_selected_branch_without_fallback() {
+        let main_dir = tempfile::tempdir().expect("main temp dir");
+        let wt_root = tempfile::tempdir().expect("worktree temp dir");
+        let wt_path = wt_root.path().join("fallback-worktree");
+        drop(create_repo_with_commit(main_dir.path()));
+
+        let result = execute_operation(
+            main_dir.path(),
+            GitOperation::CreateWorktree {
+                name: "fallback-worktree".to_string(),
+                path: wt_path.clone(),
+                branch: Some("missing/selected-branch".to_string()),
+                new_branch: false,
+            },
+            Arc::new(Mutex::new(String::new())),
+        );
+        match result {
+            OpResult::Error(message) => assert!(
+                message.contains("Find branch"),
+                "unexpected error: {}",
+                message
+            ),
+            other => panic!("expected missing branch error, got {:?}", other),
+        }
+
+        let repo = Repository::open(main_dir.path()).expect("reopen main repo");
+        assert!(
+            repo.find_branch("fallback-worktree", BranchType::Local).is_err(),
+            "a missing selected branch must not create a fallback branch named after the worktree"
+        );
+        assert!(
+            !wt_path.exists(),
+            "a worktree must not be created for a missing branch"
         );
     }
 
