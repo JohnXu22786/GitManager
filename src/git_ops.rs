@@ -182,6 +182,11 @@ impl GitOperation {
                 Self::simple(repo.create_branch(&name, base.as_deref()), format!("Created branch '{}'", name))
             }
             GitOperation::DeleteBranch { name, force } => {
+                if force {
+                    if let Err(error) = repo.ensure_branch_not_checked_out_in_linked_worktree(&name) {
+                        return OpResult::Error(error);
+                    }
+                }
                 // When force is true, we first try regular delete, and if that fails
                 // we delete the branch reference directly
                 match repo.delete_branch(&name, false) {
@@ -2002,6 +2007,49 @@ impl GitRepo {
         Ok(())
     }
 
+    fn ensure_branch_not_checked_out_in_linked_worktree(&self, name: &str) -> GitResult<()> {
+        let repo = self.repo()?;
+        let branch_ref = if name.starts_with("refs/heads/") {
+            name.to_string()
+        } else {
+            format!("refs/heads/{}", name)
+        };
+        let worktree_names = repo
+            .worktrees()
+            .map_err(|error| format!("List worktrees: {}", error))?;
+
+        for worktree_name in worktree_names.iter().flatten() {
+            let head_path = repo
+                .commondir()
+                .join("worktrees")
+                .join(worktree_name)
+                .join("HEAD");
+            let head = std::fs::read(&head_path).map_err(|error| {
+                format!("Inspect worktree '{}' HEAD: {}", worktree_name, error)
+            })?;
+            let Some(target) = head.strip_prefix(b"ref: ") else {
+                continue;
+            };
+            let target_end = target
+                .iter()
+                .rposition(|byte| !byte.is_ascii_whitespace())
+                .map(|index| index + 1)
+                .unwrap_or(0);
+            if &target[..target_end] == branch_ref.as_bytes() {
+                let worktree = repo
+                    .find_worktree(worktree_name)
+                    .map_err(|error| format!("Find worktree '{}': {}", worktree_name, error))?;
+                return Err(format!(
+                    "Cannot delete '{}': it is checked out in worktree '{}'",
+                    name,
+                    worktree.path().display()
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Force delete a branch by removing its reference directly.
     /// Used when regular delete fails (e.g., unmerged changes).
     pub fn delete_branch_ref(&self, name: &str) -> GitResult<()> {
@@ -3251,6 +3299,77 @@ mod tests {
         assert_eq!(amended.message().map(str::trim_end), Some("amended commit"));
         assert_eq!(amended.author().name(), Some("Hook Test User"));
         assert_eq!(amended.author().email(), Some("hook-test@example.com"));
+    }
+
+    #[test]
+    fn test_force_delete_refuses_branch_checked_out_in_linked_worktree() {
+        let main_dir = tempfile::tempdir().expect("main temp dir");
+        let worktree_root = tempfile::tempdir().expect("worktree temp dir");
+        let worktree_path = worktree_root.path().join("linked");
+        let branch_name = "checked-out-elsewhere";
+
+        let repo = create_repo_with_commit(main_dir.path());
+        let commit = repo.head().expect("HEAD").peel_to_commit().expect("commit");
+        repo.branch(branch_name, &commit, false).expect("create target branch");
+        let reference = repo
+            .find_reference(&format!("refs/heads/{}", branch_name))
+            .expect("target branch ref");
+        let mut options = WorktreeAddOptions::new();
+        options.reference(Some(&reference));
+        repo.worktree("linked", &worktree_path, Some(&options))
+            .expect("create linked worktree");
+        drop(reference);
+        drop(commit);
+        drop(repo);
+
+        let linked_repo = Repository::open(&worktree_path).expect("open linked worktree");
+        linked_repo
+            .set_head(&format!("refs/heads/{}", branch_name))
+            .expect("check out target branch in linked worktree");
+        drop(linked_repo);
+
+        let linked_head_oid = {
+            let linked_repo = Repository::open(&worktree_path).expect("open linked worktree");
+            let linked_head = linked_repo.head().expect("linked HEAD");
+            assert!(!linked_repo.head_detached().expect("linked HEAD state"));
+            assert_eq!(linked_head.shorthand(), Some(branch_name));
+            let commit = linked_head.peel_to_commit().expect("resolve linked HEAD");
+            let oid = commit.id();
+            drop(commit);
+            oid
+        };
+
+        let result = execute_operation(
+            main_dir.path(),
+            GitOperation::DeleteBranch {
+                name: branch_name.to_string(),
+                force: true,
+            },
+            Arc::new(Mutex::new(String::new())),
+        );
+        match result {
+            OpResult::Error(error) => assert!(
+                error.contains("checked out in worktree"),
+                "unexpected rejection: {}",
+                error
+            ),
+            other => panic!("force delete should be rejected, got {:?}", other),
+        }
+
+        let reopened_repo = Repository::open(main_dir.path()).expect("reopen main repo");
+        assert!(
+            reopened_repo
+                .find_branch(branch_name, BranchType::Local)
+                .is_ok(),
+            "the checked-out branch ref must remain"
+        );
+        let linked_repo = Repository::open(&worktree_path).expect("reopen linked worktree");
+        let linked_head = linked_repo.head().expect("linked HEAD must remain resolvable");
+        assert_eq!(
+            linked_head.peel_to_commit().expect("resolve linked HEAD after rejection").id(),
+            linked_head_oid,
+            "the linked worktree must still resolve to its original commit"
+        );
     }
 
     fn local_remote_url(path: &Path) -> String {
