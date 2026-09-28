@@ -3,6 +3,7 @@ use git2::{BranchType, DiffOptions, Repository, Status, WorktreeAddOptions, Work
 use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 pub type GitResult<T> = Result<T, String>;
@@ -2738,27 +2739,72 @@ impl GitRepo {
     pub fn commit(&self, message: &str, amend: bool) -> GitResult<String> {
         let repo = self.repo_mut()?;
         let sig = repo.signature().map_err(|e| format!("Sig: {}", e))?;
+        let git_dir = repo.path().canonicalize()
+            .map_err(|e| format!("Commit: resolve Git directory: {}", e))?;
+        let work_dir = repo.workdir().map(Path::canonicalize).transpose()
+            .map_err(|e| format!("Commit: resolve worktree: {}", e))?;
+        let command_dir = work_dir.as_deref().unwrap_or(&git_dir);
 
-        if amend {
-            let hc = repo.head().map_err(|e| format!("HEAD: {}", e))?
-                .peel_to_commit().map_err(|e| format!("Peel: {}", e))?;
-            let toid = repo.index().and_then(|mut i| i.write_tree())
-                .map_err(|e| format!("Write tree: {}", e))?;
-            let t = repo.find_tree(toid).map_err(|e| format!("Find tree: {}", e))?;
-            let parents: Vec<git2::Commit> = (0..hc.parent_count()).filter_map(|i| hc.parent(i).ok()).collect();
-            let pref: Vec<&git2::Commit> = parents.iter().collect();
-            return repo.commit(Some("HEAD"), &sig, &sig, message, &t, &pref)
-                .map(|o| o.to_string()).map_err(|e| format!("Amend: {}", e));
+        let mut command = Command::new("git");
+        command
+            .current_dir(command_dir)
+            .arg("--git-dir")
+            .arg(&git_dir);
+        if let Some(work_dir) = &work_dir {
+            command.arg("--work-tree").arg(work_dir);
         }
 
-        let toid = repo.index().map_err(|e| format!("Index: {}", e))
-            .and_then(|mut i| i.write_tree().map_err(|e| format!("Write tree: {}", e)))?;
-        let t = repo.find_tree(toid).map_err(|e| format!("Find tree: {}", e))?;
-        let pc = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
-        let parents: Vec<&git2::Commit> = pc.iter().collect();
+        command
+            .arg("commit")
+            .arg("--allow-empty")
+            .arg("--allow-empty-message")
+            .arg("--cleanup=verbatim")
+            // libgit2 did not sign commits; keep that behavior while invoking
+            // Git for its configured commit hooks.
+            .arg("--no-gpg-sign");
+        if amend {
+            // The libgit2 implementation used the current signature for both
+            // author and committer when amending.
+            command.arg("--amend").arg("--reset-author");
+        }
+        command.arg("--message").arg(message);
 
-        repo.commit(Some("HEAD"), &sig, &sig, message, &t, &parents)
-            .map(|o| o.to_string()).map_err(|e| format!("Commit: {}", e))
+        if let Some(name) = sig.name() {
+            command.env("GIT_AUTHOR_NAME", name).env("GIT_COMMITTER_NAME", name);
+        }
+        if let Some(email) = sig.email() {
+            command.env("GIT_AUTHOR_EMAIL", email).env("GIT_COMMITTER_EMAIL", email);
+        }
+
+        // Use the repository's own index even if the application was launched
+        // from an environment that overrides Git's index selection.
+        command.env_remove("GIT_INDEX_FILE");
+
+        let output = command.output()
+            .map_err(|e| format!("Commit: could not run Git; install Git or add it to PATH: {}", e))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let details = [stderr.trim(), stdout.trim()]
+                .into_iter()
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let status = output.status.code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "terminated by signal".to_string());
+            return Err(if details.is_empty() {
+                format!("Commit: Git exited with {}", status)
+            } else {
+                format!("Commit: Git exited with {}: {}", status, details)
+            });
+        }
+
+        let head = repo.head()
+            .map_err(|e| format!("Commit succeeded but HEAD could not be read: {}", e))?;
+        head.target()
+            .map(|oid| oid.to_string())
+            .ok_or_else(|| "Commit succeeded but HEAD has no target".to_string())
     }
 
     pub fn uncommit(&self) -> GitResult<String> {
@@ -3031,6 +3077,162 @@ mod tests {
         let mut git = GitRepo::new();
         git.open(repo_dir).expect("open repo");
         git
+    }
+
+    #[cfg(unix)]
+    fn create_hook_test_repo(dir: &Path) -> Repository {
+        let repo = Repository::init(dir).expect("initialize repository");
+        {
+            let mut config = repo.config().expect("repository config");
+            config.set_str("user.name", "Hook Test User").expect("set user name");
+            config.set_str("user.email", "hook-test@example.com").expect("set user email");
+        }
+        let signature = repo.signature().expect("signature");
+        let tree_oid = repo.index().expect("index").write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+        repo.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+            .expect("initial commit");
+        drop(tree);
+        let hooks_dir = dir.join("empty-hooks");
+        std::fs::create_dir_all(&hooks_dir).expect("create empty hooks directory");
+        repo.config()
+            .expect("repository config")
+            .set_str("core.hooksPath", hooks_dir.to_str().expect("hooks path"))
+            .expect("configure empty hooks path");
+        repo
+    }
+
+    #[cfg(unix)]
+    fn stage_hook_test_file(repo: &Repository, path: &str, contents: &str) {
+        std::fs::write(repo.workdir().expect("worktree").join(path), contents)
+            .expect("write staged file");
+        let mut index = repo.index().expect("index");
+        index.add_path(Path::new(path)).expect("stage file");
+        index.write().expect("write index");
+    }
+
+    #[cfg(unix)]
+    fn configure_rejecting_pre_commit_hook(repo: &Repository) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let work_dir = repo.workdir().expect("worktree");
+        let hooks_dir = work_dir.join("configured-hooks");
+        std::fs::create_dir_all(&hooks_dir).expect("create configured hooks directory");
+        let hook_path = hooks_dir.join("pre-commit");
+        std::fs::write(
+            &hook_path,
+            "#!/bin/sh\nprintf 'ran\\n' >> pre-commit-ran\necho 'blocked by test pre-commit hook' >&2\nexit 1\n",
+        )
+        .expect("write rejecting pre-commit hook");
+        let mut permissions = std::fs::metadata(&hook_path).expect("hook metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&hook_path, permissions).expect("make hook executable");
+
+        let mut config = repo.config().expect("repository config");
+        config
+            .set_str("core.hooksPath", hooks_dir.to_str().expect("hooks path"))
+            .expect("configure hooks path");
+    }
+
+    #[cfg(unix)]
+    fn assert_rejecting_hook_prevents_commit(amend: bool) {
+        let dir = tempfile::tempdir().expect("temporary repository directory");
+        let repo = create_hook_test_repo(dir.path());
+        let initial_head = repo.head().expect("initial HEAD").target().expect("initial commit");
+        stage_hook_test_file(&repo, "staged.txt", "staged change\n");
+        configure_rejecting_pre_commit_hook(&repo);
+        drop(repo);
+
+        let result = execute_operation(
+            dir.path(),
+            GitOperation::Commit { message: "attempted commit".to_string(), amend },
+            Arc::new(Mutex::new(String::new())),
+        );
+        let error = match result {
+            OpResult::Error(error) => error,
+            other => panic!("rejecting hook should fail the application commit, got {:?}", other),
+        };
+
+        assert!(error.contains("blocked by test pre-commit hook"), "unexpected error: {}", error);
+        assert!(dir.path().join("pre-commit-ran").exists(), "configured hook did not run");
+        let final_repo = Repository::open(dir.path()).expect("reopen repository");
+        assert_eq!(
+            final_repo.head().expect("final HEAD").target(),
+            Some(initial_head),
+            "failed commit must leave HEAD unchanged"
+        );
+        assert!(
+            final_repo
+                .index()
+                .expect("final index")
+                .get_path(Path::new("staged.txt"), 0)
+                .is_some(),
+            "failed commit must leave the staged index entry intact"
+        );
+        if amend {
+            assert_eq!(
+                final_repo.head().expect("final HEAD").peel_to_commit().expect("HEAD commit").message(),
+                Some("initial"),
+                "failed amend must preserve the original commit"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn application_commit_runs_configured_rejecting_pre_commit_hook() {
+        assert_rejecting_hook_prevents_commit(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn application_amend_runs_configured_rejecting_pre_commit_hook() {
+        assert_rejecting_hook_prevents_commit(true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn application_commit_and_amend_preserve_successful_commit_semantics() {
+        let dir = tempfile::tempdir().expect("temporary repository directory");
+        let repo = create_hook_test_repo(dir.path());
+        let initial_head = repo.head().expect("initial HEAD").target().expect("initial commit");
+        stage_hook_test_file(&repo, "staged.txt", "first staged content\n");
+        drop(repo);
+
+        let commit_result = execute_operation(
+            dir.path(),
+            GitOperation::Commit { message: "normal commit".to_string(), amend: false },
+            Arc::new(Mutex::new(String::new())),
+        );
+        assert!(matches!(&commit_result, OpResult::Success(_)), "normal commit failed: {:?}", commit_result);
+
+        let normal_head = {
+            let repo = Repository::open(dir.path()).expect("reopen repository");
+            let commit = repo.head().expect("normal HEAD").peel_to_commit().expect("normal commit");
+            assert_eq!(commit.parent_id(0).expect("normal commit parent"), initial_head);
+            assert_eq!(commit.message().map(str::trim_end), Some("normal commit"));
+            assert_eq!(commit.author().name(), Some("Hook Test User"));
+            assert_eq!(commit.author().email(), Some("hook-test@example.com"));
+            commit.id()
+        };
+
+        let repo = Repository::open(dir.path()).expect("reopen repository for amend");
+        stage_hook_test_file(&repo, "staged.txt", "amended staged content\n");
+        drop(repo);
+        let amend_result = execute_operation(
+            dir.path(),
+            GitOperation::Commit { message: "amended commit".to_string(), amend: true },
+            Arc::new(Mutex::new(String::new())),
+        );
+        assert!(matches!(&amend_result, OpResult::Success(_)), "amend failed: {:?}", amend_result);
+
+        let repo = Repository::open(dir.path()).expect("reopen amended repository");
+        let amended = repo.head().expect("amended HEAD").peel_to_commit().expect("amended commit");
+        assert_ne!(amended.id(), normal_head, "amend should replace the current commit");
+        assert_eq!(amended.parent_id(0).expect("amended commit parent"), initial_head);
+        assert_eq!(amended.message().map(str::trim_end), Some("amended commit"));
+        assert_eq!(amended.author().name(), Some("Hook Test User"));
+        assert_eq!(amended.author().email(), Some("hook-test@example.com"));
     }
 
     fn local_remote_url(path: &Path) -> String {
