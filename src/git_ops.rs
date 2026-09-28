@@ -1980,6 +1980,24 @@ impl GitRepo {
         let bt = if remote { BranchType::Remote } else { BranchType::Local };
         let mut b = repo.find_branch(name, bt)
             .map_err(|e| format!("Find '{}': {}", name, e))?;
+        if !remote {
+            let branch_tip = b.get().peel_to_commit()
+                .map_err(|e| format!("Resolve '{}': {}", name, e))?;
+            let merge_target = match b.upstream() {
+                Ok(upstream) => upstream.get().peel_to_commit()
+                    .map_err(|e| format!("Resolve upstream of '{}': {}", name, e))?,
+                Err(e) if e.code() == git2::ErrorCode::NotFound => repo.head()
+                    .and_then(|head| head.peel_to_commit())
+                    .map_err(|e| format!("Resolve HEAD: {}", e))?,
+                Err(e) => return Err(format!("Find upstream of '{}': {}", name, e)),
+            };
+            let is_merged = branch_tip.id() == merge_target.id()
+                || repo.graph_descendant_of(merge_target.id(), branch_tip.id())
+                    .map_err(|e| format!("Check whether '{}' is merged: {}", name, e))?;
+            if !is_merged {
+                return Err(format!("Branch '{}' is not fully merged", name));
+            }
+        }
         b.delete().map_err(|e| format!("Delete: {}", e))?;
         Ok(())
     }
@@ -3383,6 +3401,41 @@ mod tests {
             &[parent],
         )
         .expect("commit branch file")
+    }
+
+    #[test]
+    fn test_regular_delete_preserves_unmerged_branch() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(dir.path());
+        let base = repo.head().expect("HEAD").peel_to_commit().expect("base commit");
+        let branch = repo.branch("unmerged", &base, false).expect("create branch");
+        drop(branch);
+        let branch_tip = commit_file_on_branch(
+            &repo,
+            "unmerged",
+            &base,
+            "unmerged.txt",
+            "work that is not on HEAD\n",
+            "unmerged change",
+        );
+        drop(base);
+        drop(repo);
+
+        let result = execute_operation(
+            dir.path(),
+            GitOperation::DeleteBranch { name: "unmerged".into(), force: false },
+            Arc::new(Mutex::new(String::new())),
+        );
+
+        assert!(
+            matches!(result, OpResult::Error(_)),
+            "ordinary deletion should reject an unmerged branch, got {:?}",
+            result
+        );
+        let reopened = Repository::open(dir.path()).expect("reopen repo");
+        let branch = reopened.find_branch("unmerged", BranchType::Local)
+            .expect("unmerged branch must remain");
+        assert_eq!(branch.get().target(), Some(branch_tip));
     }
 
     fn setup_rebase_repositories(
