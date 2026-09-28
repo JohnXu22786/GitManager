@@ -95,6 +95,10 @@ fn platform_font_candidates(platform: FontPlatform) -> Vec<(PathBuf, &'static st
             vec![
                 (system_font_dir.join("seguiemj.ttf"), "SegoeUIEmoji"),
                 (system_font_dir.join("seguisym.ttf"), "SegoeUISymbol"),
+                (system_font_dir.join("msyh.ttc"), "CJKFallback"),
+                (system_font_dir.join("simhei.ttf"), "CJKFallback"),
+                (system_font_dir.join("simsun.ttc"), "CJKFallback"),
+                (system_font_dir.join("mingliu.ttc"), "CJKFallback"),
             ]
         }
 
@@ -112,6 +116,18 @@ fn platform_font_candidates(platform: FontPlatform) -> Vec<(PathBuf, &'static st
                 "ArialUnicode",
             ),
             (PathBuf::from("/Library/Fonts/Arial.ttf"), "Arial"),
+            (
+                PathBuf::from("/System/Library/Fonts/PingFang.ttc"),
+                "CJKFallback",
+            ),
+            (
+                PathBuf::from("/System/Library/Fonts/STHeiti Light.ttc"),
+                "CJKFallback",
+            ),
+            (
+                PathBuf::from("/System/Library/Fonts/Supplemental/Songti.ttc"),
+                "CJKFallback",
+            ),
         ],
 
         FontPlatform::Linux => vec![
@@ -138,6 +154,31 @@ fn platform_font_candidates(platform: FontPlatform) -> Vec<(PathBuf, &'static st
             (
                 PathBuf::from("/usr/share/fonts/google-noto-vf/NotoSansSymbols[wght].ttf"),
                 "NotoSansSymbols",
+            ),
+            // These share a name so only the first installed CJK font is loaded.
+            (
+                PathBuf::from("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+                "CJKFallback",
+            ),
+            (
+                PathBuf::from("/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf"),
+                "CJKFallback",
+            ),
+            (
+                PathBuf::from("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"),
+                "CJKFallback",
+            ),
+            (
+                PathBuf::from("/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc"),
+                "CJKFallback",
+            ),
+            (
+                PathBuf::from("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc"),
+                "CJKFallback",
+            ),
+            (
+                PathBuf::from("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"),
+                "CJKFallback",
             ),
             (
                 PathBuf::from("/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf"),
@@ -215,15 +256,15 @@ mod tests {
         for (platform, expected_names) in [
             (
                 FontPlatform::Windows,
-                ["SegoeUIEmoji", "SegoeUISymbol"].as_slice(),
+                ["SegoeUIEmoji", "SegoeUISymbol", "CJKFallback"].as_slice(),
             ),
             (
                 FontPlatform::MacOS,
-                ["ArialUnicode", "AppleSymbols"].as_slice(),
+                ["ArialUnicode", "AppleSymbols", "CJKFallback"].as_slice(),
             ),
             (
                 FontPlatform::Linux,
-                ["DejaVuSans", "NotoSansSymbols", "NotoEmoji"].as_slice(),
+                ["DejaVuSans", "NotoSansSymbols", "NotoEmoji", "CJKFallback"].as_slice(),
             ),
         ] {
             let names: Vec<&str> = platform_font_candidates(platform)
@@ -240,6 +281,36 @@ mod tests {
     }
 
     #[test]
+    fn platform_cjk_candidates_include_expected_font_files() {
+        for (platform, expected_files) in [
+            (FontPlatform::Windows, ["msyh.ttc", "simhei.ttf"].as_slice()),
+            (
+                FontPlatform::MacOS,
+                ["PingFang.ttc", "STHeiti Light.ttc", "Songti.ttc"].as_slice(),
+            ),
+            (
+                FontPlatform::Linux,
+                ["NotoSansCJK-Regular.ttc", "wqy-zenhei.ttc"].as_slice(),
+            ),
+        ] {
+            let cjk_files: Vec<String> = platform_font_candidates(platform)
+                .into_iter()
+                .filter(|(_, name)| *name == "CJKFallback")
+                .filter_map(|(path, _)| {
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                })
+                .collect();
+            for expected_file in expected_files {
+                assert!(
+                    cjk_files.iter().any(|file| file == expected_file),
+                    "{platform:?} should include {expected_file}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn linux_font_candidates_include_common_noto_installations() {
         let paths: Vec<PathBuf> = platform_font_candidates(FontPlatform::Linux)
             .into_iter()
@@ -249,6 +320,8 @@ mod tests {
         for expected in [
             "/usr/share/fonts/google-noto-emoji-fonts/NotoEmoji-Regular.ttf",
             "/usr/share/fonts/google-noto/NotoSansSymbols2-Regular.ttf",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
         ] {
             assert!(
                 paths.iter().any(|path| path == Path::new(expected)),
