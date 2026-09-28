@@ -76,6 +76,15 @@ fn clone_credential_with_config(
     credential_from_config(config, url, username_from_url, allowed_types)
 }
 
+struct PendingConfirmation {
+    title: String,
+    message: String,
+    confirm_label: String,
+    description: String,
+    operation: GitOperation,
+    repo_generation: u64,
+}
+
 /// Tracks a Git operation running in a background thread.
 struct PendingOp {
     description: String,
@@ -172,6 +181,8 @@ pub struct App {
     pub download_progress: f32,
     /// Pending Git operations running in background threads.
     pending_ops: Vec<PendingOp>,
+    /// A destructive Git operation awaiting explicit user confirmation.
+    pending_confirmation: Option<PendingConfirmation>,
     /// Whether to auto-refresh after a mutation operation completes.
     needs_refresh: bool,
     pub recent_repos: RecentRepos,
@@ -243,6 +254,7 @@ impl App {
             update_dialog_dismissed: false,
             download_progress: 0.0,
             pending_ops: Vec::new(),
+            pending_confirmation: None,
             needs_refresh: false,
             recent_repos: RecentRepos::load(),
             status_expanded: false,
@@ -719,22 +731,111 @@ impl App {
         clone_button_response
     }
 
-    /// Checks if there are any pending background operations.
+    /// Checks if an operation is running or awaits destructive-action confirmation.
     pub fn is_busy(&self) -> bool {
-        !self.pending_ops.is_empty()
+        !self.pending_ops.is_empty() || self.pending_confirmation.is_some()
     }
 
     /// Returns the description of the current/last operation.
     /// For the status bar: just the operation name (concise).
     pub fn current_operation(&self) -> String {
-        self.pending_ops.first()
+        self.pending_ops
+            .first()
             .map(|op| op.description.clone())
+            .or_else(|| {
+                self.pending_confirmation
+                    .as_ref()
+                    .map(|request| format!("Awaiting confirmation: {}", request.description))
+            })
             .unwrap_or_default()
+    }
+
+    pub fn request_confirmation(
+        &mut self,
+        ctx: &egui::Context,
+        title: impl Into<String>,
+        message: impl Into<String>,
+        confirm_label: impl Into<String>,
+        description: impl Into<String>,
+        operation: GitOperation,
+    ) {
+        if self.is_busy() {
+            return;
+        }
+        if self.git.path().is_none() {
+            self.show_error("No repository open".into());
+            return;
+        }
+
+        self.pending_confirmation = Some(PendingConfirmation {
+            title: title.into(),
+            message: message.into(),
+            confirm_label: confirm_label.into(),
+            description: description.into(),
+            operation,
+            repo_generation: self.repo_generation,
+        });
+        ctx.request_repaint();
+    }
+
+    fn confirm_pending_operation(&mut self, ctx: &egui::Context) {
+        let Some(request) = self.pending_confirmation.take() else {
+            return;
+        };
+        if request.repo_generation != self.repo_generation {
+            self.show_error("Repository changed; confirmation cancelled".into());
+            return;
+        }
+        self.start_operation(ctx, &request.description, request.operation);
+    }
+
+    fn cancel_pending_confirmation(&mut self) {
+        self.pending_confirmation = None;
+    }
+
+    fn render_confirmation_dialog(&mut self, ctx: &egui::Context) {
+        let Some(request) = self.pending_confirmation.as_ref() else {
+            return;
+        };
+        let title = request.title.clone();
+        let message = request.message.clone();
+        let confirm_label = request.confirm_label.clone();
+        let mut open = true;
+        let mut confirm = false;
+        let mut cancel = false;
+
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(message);
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                    if ui.button(&confirm_label).clicked() {
+                        confirm = true;
+                    }
+                });
+            });
+
+        if cancel || !open {
+            self.cancel_pending_confirmation();
+        } else if confirm {
+            self.confirm_pending_operation(ctx);
+        }
     }
 
     /// Spawn a Git operation in a background thread.
     /// Returns immediately. Results will be processed in `process_pending_ops()`.
     pub fn start_operation(&mut self, ctx: &egui::Context, description: &str, op: GitOperation) {
+        if self.pending_confirmation.is_some() {
+            return;
+        }
+
         // Get the repo path to pass to the thread
         let repo_path = match self.git.path() {
             Some(p) => p.to_path_buf(),
@@ -1445,6 +1546,7 @@ impl eframe::App for App {
         });
 
         let _ = self.render_clone_dialog(ctx);
+        self.render_confirmation_dialog(ctx);
 
         // About window
         if self.show_about {
@@ -1661,8 +1763,8 @@ impl eframe::App for App {
             }
         }
 
-        // Keep repainting while operations are in progress
-        if self.is_busy() {
+        // Keep repainting while background operations are in progress.
+        if !self.pending_ops.is_empty() {
             ctx.request_repaint();
         }
     }
@@ -1726,6 +1828,94 @@ mod tests {
             message: message.to_string(),
             summary: message.to_string(),
         }
+    }
+
+    fn init_repo_with_branch(path: &std::path::Path, branch_name: &str) {
+        let repo = git2::Repository::init(path).expect("initialize repository");
+        let signature = git2::Signature::now("test", "test@example.com").expect("signature");
+        let tree_oid = {
+            let mut index = repo.index().expect("index");
+            index.write_tree().expect("write tree")
+        };
+        let tree = repo.find_tree(tree_oid).expect("tree");
+        let commit_oid = repo
+            .commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+            .expect("initial commit");
+        let commit = repo.find_commit(commit_oid).expect("commit");
+        repo.branch(branch_name, &commit, false)
+            .expect("create test branch");
+    }
+
+    #[test]
+    fn cancelling_destructive_confirmation_keeps_target_and_does_not_dispatch() {
+        let repo_dir = tempfile::tempdir().expect("repository directory");
+        init_repo_with_branch(repo_dir.path(), "feature");
+        let mut app = App::new();
+        app.git.open(repo_dir.path()).expect("open repository");
+        let ctx = egui::Context::default();
+
+        app.request_confirmation(
+            &ctx,
+            "Confirm branch deletion",
+            "Delete local branch 'feature'?".to_string(),
+            "Delete branch",
+            "Delete branch 'feature'",
+            GitOperation::DeleteBranch {
+                name: "feature".to_string(),
+                force: false,
+            },
+        );
+        assert!(app.pending_ops.is_empty());
+        assert_eq!(
+            app.current_operation(),
+            "Awaiting confirmation: Delete branch 'feature'"
+        );
+        app.start_operation(&ctx, "Unconfirmed operation", GitOperation::StageAll);
+        assert!(app.pending_ops.is_empty());
+
+        app.cancel_pending_confirmation();
+
+        assert!(app.pending_confirmation.is_none());
+        assert!(app.pending_ops.is_empty());
+        let repo = git2::Repository::open(repo_dir.path()).expect("reopen repository");
+        assert!(repo
+            .find_branch("feature", git2::BranchType::Local)
+            .is_ok());
+    }
+
+    #[test]
+    fn confirming_destructive_operation_dispatches_it() {
+        let repo_dir = tempfile::tempdir().expect("repository directory");
+        init_repo_with_branch(repo_dir.path(), "feature");
+        let mut app = App::new();
+        app.git.open(repo_dir.path()).expect("open repository");
+        let ctx = egui::Context::default();
+
+        app.request_confirmation(
+            &ctx,
+            "Confirm branch deletion",
+            "Delete local branch 'feature'?".to_string(),
+            "Delete branch",
+            "Delete branch 'feature'",
+            GitOperation::DeleteBranch {
+                name: "feature".to_string(),
+                force: false,
+            },
+        );
+        assert!(app.pending_ops.is_empty());
+
+        app.confirm_pending_operation(&ctx);
+
+        assert!(app.pending_confirmation.is_none());
+        assert_eq!(app.pending_ops.len(), 1);
+        app.pending_ops[0]
+            .receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("confirmed operation should complete");
+        let repo = git2::Repository::open(repo_dir.path()).expect("reopen repository");
+        assert!(repo
+            .find_branch("feature", git2::BranchType::Local)
+            .is_err());
     }
 
     #[test]

@@ -60,7 +60,14 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 // Buttons on the right edge, message text truncates in between
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.add_enabled(!busy, egui::Button::new("Drop")).clicked() {
-                        app.start_operation(ctx, &format!("Drop stash@{{{}}}", index), GitOperation::StashDrop(index));
+                        app.request_confirmation(
+                            ctx,
+                            "Confirm stash drop",
+                            format!("Drop stash@{{{}}}? This permanently discards the stashed changes: {}", index, stash.message),
+                            "Drop stash",
+                            format!("Drop stash@{{{}}}", index),
+                            GitOperation::StashDrop(index),
+                        );
                     }
                     if ui.add_enabled(!busy, egui::Button::new("Apply")).clicked() {
                         app.start_operation(ctx, &format!("Apply stash@{{{}}}", index), GitOperation::StashApply(index));
