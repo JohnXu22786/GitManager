@@ -2266,10 +2266,22 @@ impl GitRepo {
     pub fn worktrees(&self) -> GitResult<Vec<WorktreeInfo>> {
         let repo = self.repo()?;
         let mp = main_worktree_path(&repo)?;
+        let (main_branch, main_sha) = Repository::open(&mp)
+            .ok()
+            .and_then(|main_repo| {
+                let head = main_repo.head().ok()?;
+                let branch = if head.is_branch() {
+                    head.shorthand().map(String::from)
+                } else {
+                    None
+                };
+                let sha = head.target().map(|oid| oid.to_string()).unwrap_or_default();
+                Some((branch, sha))
+            })
+            .unwrap_or_default();
         let mut list = Vec::new();
         list.push(WorktreeInfo {
-            path: mp, branch: Some(self.current_branch().unwrap_or_default()),
-            sha: repo.head().ok().and_then(|h| h.target().map(|o| o.to_string())).unwrap_or_default(),
+            path: mp, branch: main_branch, sha: main_sha,
             is_main: true,
             git_link_identity: None,
         });
@@ -5296,6 +5308,76 @@ mod tests {
             .expect("main worktree");
 
         assert_eq!(main.path, main_dir.path());
+    }
+
+    #[test]
+    fn test_refresh_from_linked_worktree_reports_each_worktrees_head() {
+        let main_dir = tempfile::tempdir().expect("main temp dir");
+        let wt_root = tempfile::tempdir().expect("worktree temp dir");
+        let wt_path = wt_root.path().join("linked-wt");
+
+        let main_repo = create_repo_with_commit(main_dir.path());
+        let main_head = main_repo.head().expect("main HEAD");
+        let main_branch = main_head.shorthand().expect("main branch").to_owned();
+        let main_sha = main_head.target().expect("main commit").to_string();
+        let base_commit = main_head.peel_to_commit().expect("main commit object");
+        let linked_branch = "linked-display";
+        main_repo.branch(linked_branch, &base_commit, false).expect("create linked branch");
+        let reference = main_repo
+            .find_reference(&format!("refs/heads/{}", linked_branch))
+            .expect("linked branch reference");
+        let mut options = WorktreeAddOptions::new();
+        options.reference(Some(&reference));
+        main_repo
+            .worktree("linked-wt", &wt_path, Some(&options))
+            .expect("create linked worktree");
+        drop(reference);
+        drop(base_commit);
+        drop(main_head);
+        drop(main_repo);
+
+        let linked_repo = Repository::open(&wt_path).expect("open linked worktree");
+        linked_repo
+            .set_head(&format!("refs/heads/{}", linked_branch))
+            .expect("check out linked branch");
+        let linked_head = linked_repo.head().expect("linked HEAD");
+        let linked_parent = linked_head.peel_to_commit().expect("linked parent commit");
+        let linked_tree = linked_parent.tree().expect("linked tree");
+        let signature = linked_repo.signature().expect("signature");
+        let linked_sha = linked_repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "linked worktree head",
+                &linked_tree,
+                &[&linked_parent],
+            )
+            .expect("advance linked branch")
+            .to_string();
+        drop(linked_tree);
+        drop(linked_parent);
+        drop(linked_head);
+        drop(linked_repo);
+
+        let result = execute_operation(
+            &wt_path,
+            GitOperation::RefreshAll,
+            Arc::new(Mutex::new(String::new())),
+        );
+        let OpResult::RefreshData { worktrees, errors, .. } = result else {
+            panic!("refresh should return repository data, got {:?}", result);
+        };
+        assert!(errors.is_empty(), "refresh reported errors: {:?}", errors);
+
+        let primary = worktrees.iter().find(|worktree| worktree.is_main).expect("primary row");
+        let linked = worktrees.iter().find(|worktree| !worktree.is_main).expect("linked row");
+        assert_eq!(primary.path, main_dir.path());
+        assert_eq!(primary.branch.as_deref(), Some(main_branch.as_str()));
+        assert_eq!(primary.sha, main_sha);
+        assert_eq!(linked.path, wt_path);
+        assert_eq!(linked.branch.as_deref(), Some(linked_branch));
+        assert_eq!(linked.sha, linked_sha);
     }
 
     #[test]
