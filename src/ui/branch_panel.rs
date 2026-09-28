@@ -222,11 +222,31 @@ fn show_branch_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, branch
                             ui.close_menu();
                         }
                         if ui.add_enabled(!busy, egui::Button::new("Delete")).clicked() {
-                            app.start_operation(ctx, &format!("Delete '{}'", name), GitOperation::DeleteBranch { name: name.clone(), force: false });
+                            app.request_confirmation(
+                                ctx,
+                                "Confirm branch deletion",
+                                format!("Delete local branch '{}'? This removes its branch reference. Git refuses deletion when it is not fully merged.", name),
+                                "Delete branch",
+                                format!("Delete branch '{}'", name),
+                                GitOperation::DeleteBranch {
+                                    name: name.clone(),
+                                    force: false,
+                                },
+                            );
                             ui.close_menu();
                         }
                         if ui.add_enabled(!busy, egui::Button::new("Force Del")).clicked() {
-                            app.start_operation(ctx, &format!("Force delete '{}'", name), GitOperation::DeleteBranch { name: name.clone(), force: true });
+                            app.request_confirmation(
+                                ctx,
+                                "Confirm force deletion",
+                                format!("Force-delete local branch '{}'? This removes its reference even with unmerged commits; commits not reachable elsewhere may become unavailable.", name),
+                                "Force delete",
+                                format!("Force delete branch '{}'", name),
+                                GitOperation::DeleteBranch {
+                                    name: name.clone(),
+                                    force: true,
+                                },
+                            );
                             ui.close_menu();
                         }
                     }
