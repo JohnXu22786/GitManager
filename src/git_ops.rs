@@ -7,6 +7,63 @@ use std::sync::{Arc, Mutex};
 
 pub type GitResult<T> = Result<T, String>;
 
+pub(crate) fn credential_from_config(
+    config: Option<&git2::Config>,
+    url: &str,
+    username_from_url: Option<&str>,
+    allowed_types: git2::CredentialType,
+) -> Result<git2::Cred, git2::Error> {
+    let username = username_from_url.unwrap_or("git");
+    if allowed_types.contains(git2::CredentialType::SSH_KEY) {
+        if let Ok(credential) = git2::Cred::ssh_key_from_agent(username) {
+            return Ok(credential);
+        }
+    }
+    if allowed_types.contains(git2::CredentialType::USER_PASS_PLAINTEXT) {
+        if let Some(config) = config {
+            if let Ok(credential) =
+                git2::Cred::credential_helper(config, url, username_from_url)
+            {
+                return Ok(credential);
+            }
+        }
+    }
+    if allowed_types.contains(git2::CredentialType::DEFAULT) {
+        return git2::Cred::default();
+    }
+    if allowed_types.contains(git2::CredentialType::USERNAME) {
+        return git2::Cred::username(username);
+    }
+    Err(git2::Error::from_str(
+        "No supported credentials are available for this remote",
+    ))
+}
+
+fn remote_credential_callback(
+    config: git2::Config,
+) -> impl FnMut(&str, Option<&str>, git2::CredentialType) -> Result<git2::Cred, git2::Error> + 'static
+{
+    move |url, username_from_url, allowed_types| {
+        credential_from_config(Some(&config), url, username_from_url, allowed_types)
+    }
+}
+
+fn remote_callbacks(
+    repo: &Repository,
+    progress: Arc<Mutex<String>>,
+) -> GitResult<git2::RemoteCallbacks<'static>> {
+    let config = repo.config().map_err(|e| format!("Config: {}", e))?;
+    let mut callbacks = git2::RemoteCallbacks::new();
+    callbacks.credentials(remote_credential_callback(config));
+    callbacks.sideband_progress(move |data| {
+        if let Ok(mut message) = progress.lock() {
+            *message = String::from_utf8_lossy(data).to_string();
+        }
+        true
+    });
+    Ok(callbacks)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FileIdentity {
     volume: u64,
@@ -2799,14 +2856,7 @@ impl GitRepo {
 
     pub fn push(&self, remote: &str, branch: &str, force: bool, progress: Arc<Mutex<String>>) -> GitResult<String> {
         let repo = self.repo_mut()?;
-        let prog = progress.clone();
-        let mut cb = git2::RemoteCallbacks::new();
-        cb.sideband_progress(move |data| {
-            if let Ok(mut p) = prog.lock() {
-                *p = String::from_utf8_lossy(data).to_string();
-            }
-            true
-        });
+        let mut cb = remote_callbacks(&repo, progress.clone())?;
         cb.push_update_reference(|refname, status| {
             if let Some(status) = status {
                 return Err(git2::Error::from_str(&format!(
@@ -2825,16 +2875,9 @@ impl GitRepo {
         Ok(format!("Pushed {}", branch))
     }
 
-        pub fn fetch(&self, remote: &str, progress: Arc<Mutex<String>>) -> GitResult<String> {
+    pub fn fetch(&self, remote: &str, progress: Arc<Mutex<String>>) -> GitResult<String> {
         let repo = self.repo_mut()?;
-        let prog = progress.clone();
-        let mut cb = git2::RemoteCallbacks::new();
-        cb.sideband_progress(move |data| {
-            if let Ok(mut p) = prog.lock() {
-                *p = String::from_utf8_lossy(data).to_string();
-            }
-            true
-        });
+        let cb = remote_callbacks(&repo, progress.clone())?;
         let mut fo = git2::FetchOptions::new();
         fo.remote_callbacks(cb);
         let spec = format!("+refs/heads/*:refs/remotes/{}/*", remote);
@@ -2846,14 +2889,7 @@ impl GitRepo {
 
     pub fn pull(&self, remote: &str, branch: &str, rebase: bool, progress: Arc<Mutex<String>>) -> GitResult<String> {
         let repo = self.repo_mut()?;
-        let prog = progress.clone();
-        let mut cb = git2::RemoteCallbacks::new();
-        cb.sideband_progress(move |data| {
-            if let Ok(mut p) = prog.lock() {
-                *p = String::from_utf8_lossy(data).to_string();
-            }
-            true
-        });
+        let cb = remote_callbacks(&repo, progress.clone())?;
         let mut fo = git2::FetchOptions::new();
         fo.remote_callbacks(cb);
         let rs = format!("+refs/heads/{}:refs/remotes/{}/{}", branch, remote, branch);
@@ -3001,6 +3037,40 @@ mod tests {
         url::Url::from_file_path(path)
             .expect("local remote path")
             .to_string()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_credential_callback_uses_repository_configured_helper() {
+        let temp_dir = tempfile::tempdir().expect("credential helper directory");
+        let credentials_path = temp_dir.path().join("credentials");
+        std::fs::write(
+            &credentials_path,
+            "https://test-user:test-password@git.example.com\n",
+        )
+        .expect("write test credentials");
+        let repo_dir = tempfile::tempdir().expect("repository directory");
+        let repo = Repository::init(repo_dir.path()).expect("initialize repository");
+        let mut config = repo.config().expect("repository config");
+        config
+            .set_str(
+                "credential.helper",
+                &format!("store --file={}", credentials_path.display()),
+            )
+            .expect("configure repository credential helper");
+
+        let mut callback = remote_credential_callback(config);
+        let credential = callback(
+            "https://git.example.com/repo.git",
+            None,
+            git2::CredentialType::USER_PASS_PLAINTEXT,
+        )
+        .expect("credential helper result");
+
+        assert!(
+            credential.has_username(),
+            "repository-configured helper should provide credentials"
+        );
     }
 
     #[test]

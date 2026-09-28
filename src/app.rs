@@ -73,30 +73,7 @@ fn clone_credential_with_config(
     username_from_url: Option<&str>,
     allowed_types: git2::CredentialType,
 ) -> Result<git2::Cred, git2::Error> {
-    let username = username_from_url.unwrap_or("git");
-    if allowed_types.contains(git2::CredentialType::SSH_KEY) {
-        if let Ok(credential) = git2::Cred::ssh_key_from_agent(username) {
-            return Ok(credential);
-        }
-    }
-    if allowed_types.contains(git2::CredentialType::USER_PASS_PLAINTEXT) {
-        if let Some(config) = config {
-            if let Ok(credential) =
-                git2::Cred::credential_helper(config, url, username_from_url)
-            {
-                return Ok(credential);
-            }
-        }
-    }
-    if allowed_types.contains(git2::CredentialType::DEFAULT) {
-        return git2::Cred::default();
-    }
-    if allowed_types.contains(git2::CredentialType::USERNAME) {
-        return git2::Cred::username(username);
-    }
-    Err(git2::Error::from_str(
-        "No supported credentials are available for this remote",
-    ))
+    credential_from_config(config, url, username_from_url, allowed_types)
 }
 
 /// Tracks a Git operation running in a background thread.
