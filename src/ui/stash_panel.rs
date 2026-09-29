@@ -1,4 +1,4 @@
-use crate::app::App;
+use crate::app::{App, FormSubmission};
 use crate::git_ops::GitOperation;
 use eframe::egui;
 
@@ -26,8 +26,15 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         } else {
             Some(app.stash_message.trim().to_string())
         };
-        app.start_operation(ctx, "Stashing all", GitOperation::StashAll(msg));
-        app.stash_message.clear();
+        let form_submission = FormSubmission::Stash {
+            message: app.stash_message.clone(),
+        };
+        app.start_operation_with_form_submission(
+            ctx,
+            "Stashing all",
+            GitOperation::StashAll(msg),
+            form_submission,
+        );
     }
 
     ui.separator();

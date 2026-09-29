@@ -1,4 +1,4 @@
-use crate::app::App;
+use crate::app::{App, FormSubmission};
 use crate::git_ops::GitOperation;
 use crate::git_ops::WorktreeInfo;
 use crate::ui::{column_cell, column_header, column_header_static};
@@ -141,7 +141,13 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 Some(app.new_worktree_branch.trim().to_string())
             };
 
-            app.start_operation(
+            let form_submission = FormSubmission::CreateWorktree {
+                name: app.new_worktree_name.clone(),
+                path: app.new_worktree_path.clone(),
+                branch: app.new_worktree_branch.clone(),
+                create_branch: app.new_worktree_create_branch,
+            };
+            app.start_operation_with_form_submission(
                 ctx,
                 &format!("Create worktree '{}'", name),
                 GitOperation::CreateWorktree {
@@ -150,11 +156,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                     branch,
                     new_branch: app.new_worktree_create_branch,
                 },
+                form_submission,
             );
-            app.new_worktree_name.clear();
-            app.new_worktree_path.clear();
-            app.new_worktree_branch.clear();
-            app.new_worktree_create_branch = false;
         }
     }
 }
