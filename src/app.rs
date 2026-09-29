@@ -99,6 +99,81 @@ struct PendingOp {
     last_seen_progress: String,
     /// Whether the watchdog timed out while the worker was still running.
     timed_out: bool,
+    form_submission: Option<FormSubmission>,
+}
+
+pub(crate) enum FormSubmission {
+    Commit { message: String, amend: bool },
+    CreateBranch { name: String, base: String },
+    MergeBranch { name: String },
+    RenameBranch { old: String, new: String },
+    CreateWorktree {
+        name: String,
+        path: String,
+        branch: String,
+        create_branch: bool,
+    },
+    Stash { message: String },
+}
+
+impl FormSubmission {
+    fn clear_if_unchanged(self, app: &mut App) {
+        match self {
+            Self::Commit { message, amend } => {
+                if app.commit_msg == message {
+                    app.commit_msg.clear();
+                }
+                if app.commit_amend == amend {
+                    app.commit_amend = false;
+                }
+            }
+            Self::CreateBranch { name, base } => {
+                if app.new_branch_name == name {
+                    app.new_branch_name.clear();
+                }
+                if app.new_branch_base == base {
+                    app.new_branch_base.clear();
+                }
+            }
+            Self::MergeBranch { name } => {
+                if app.merge_branch_name == name {
+                    app.merge_branch_name.clear();
+                }
+            }
+            Self::RenameBranch { old, new } => {
+                if app.rename_branch_old == old {
+                    app.rename_branch_old.clear();
+                }
+                if app.rename_branch_new == new {
+                    app.rename_branch_new.clear();
+                }
+            }
+            Self::CreateWorktree {
+                name,
+                path,
+                branch,
+                create_branch,
+            } => {
+                if app.new_worktree_name == name {
+                    app.new_worktree_name.clear();
+                }
+                if app.new_worktree_path == path {
+                    app.new_worktree_path.clear();
+                }
+                if app.new_worktree_branch == branch {
+                    app.new_worktree_branch.clear();
+                }
+                if app.new_worktree_create_branch == create_branch {
+                    app.new_worktree_create_branch = false;
+                }
+            }
+            Self::Stash { message } => {
+                if app.stash_message == message {
+                    app.stash_message.clear();
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -635,6 +710,8 @@ impl App {
             last_progress_update: Instant::now(),
             last_seen_progress: String::new(),
             timed_out: false,
+            form_submission: None,
+
         });
         self.last_operation_log =
             "▶ Operation: Cloning repository\n  (waiting for progress...)\n".to_string();
@@ -832,6 +909,26 @@ impl App {
     /// Spawn a Git operation in a background thread.
     /// Returns immediately. Results will be processed in `process_pending_ops()`.
     pub fn start_operation(&mut self, ctx: &egui::Context, description: &str, op: GitOperation) {
+        self.start_operation_inner(ctx, description, op, None);
+    }
+
+    pub(crate) fn start_operation_with_form_submission(
+        &mut self,
+        ctx: &egui::Context,
+        description: &str,
+        op: GitOperation,
+        form_submission: FormSubmission,
+    ) {
+        self.start_operation_inner(ctx, description, op, Some(form_submission));
+    }
+
+    fn start_operation_inner(
+        &mut self,
+        ctx: &egui::Context,
+        description: &str,
+        op: GitOperation,
+        form_submission: Option<FormSubmission>,
+    ) {
         if self.pending_confirmation.is_some() {
             return;
         }
@@ -865,6 +962,7 @@ impl App {
             last_progress_update: Instant::now(),
             last_seen_progress: String::new(),
             timed_out: false,
+            form_submission,
         });
 
         // Initialize the operation log with description
@@ -961,6 +1059,11 @@ impl App {
                     if op.timed_out {
                         // Keep the UI blocked until the timed-out worker has finished.
                         if matches!(&result, OpResult::Success(_)) {
+                            if op.repo_generation == self.repo_generation {
+                                if let Some(form_submission) = op.form_submission {
+                                    form_submission.clear_if_unchanged(self);
+                                }
+                            }
                             self.needs_refresh = true;
                         } else if matches!(&result, OpResult::CloneSuccess(_)) {
                             self.handle_op_result(op.description, result);
@@ -976,6 +1079,13 @@ impl App {
                     let final_progress = current_progress.clone();
                     if !final_progress.is_empty() {
                         self.last_operation_log += &format!("  {}\n", final_progress);
+                    }
+                    if op.repo_generation == self.repo_generation
+                        && matches!(&result, OpResult::Success(_))
+                    {
+                        if let Some(form_submission) = op.form_submission {
+                            form_submission.clear_if_unchanged(self);
+                        }
                     }
                     self.handle_op_result(op.description, result);
                 }
@@ -1830,6 +1940,126 @@ mod tests {
         }
     }
 
+    fn queue_form_result(app: &mut App, result: OpResult, form_submission: FormSubmission) {
+        let (sender, receiver) = mpsc::channel();
+        sender.send(result).expect("queue operation result");
+        app.pending_ops.push(PendingOp {
+            description: "Form operation".to_string(),
+            receiver,
+            repo_generation: app.repo_generation,
+            started_at: Instant::now(),
+            progress: Arc::new(Mutex::new(String::new())),
+            last_progress_update: Instant::now(),
+            last_seen_progress: String::new(),
+            timed_out: false,
+            form_submission: Some(form_submission),
+        });
+    }
+
+    #[test]
+    fn failed_form_operation_preserves_commit_input() {
+        let mut app = App::new();
+        app.commit_msg = "fix the parser".to_string();
+        app.commit_amend = true;
+        let form_submission = FormSubmission::Commit {
+            message: app.commit_msg.clone(),
+            amend: app.commit_amend,
+        };
+        queue_form_result(
+            &mut app,
+            OpResult::Error("hook rejected commit".to_string()),
+            form_submission,
+        );
+
+        app.process_pending_ops(&egui::Context::default());
+
+        assert_eq!(app.commit_msg, "fix the parser");
+        assert!(app.commit_amend);
+    }
+
+    #[test]
+    fn successful_form_operation_clears_only_unchanged_values() {
+        let mut app = App::new();
+        app.new_branch_name = "feature".to_string();
+        app.new_branch_base = "main".to_string();
+        let form_submission = FormSubmission::CreateBranch {
+            name: app.new_branch_name.clone(),
+            base: app.new_branch_base.clone(),
+        };
+        queue_form_result(
+            &mut app,
+            OpResult::Success("Created branch 'feature'".to_string()),
+            form_submission,
+        );
+        app.new_branch_name = "next feature".to_string();
+
+        app.process_pending_ops(&egui::Context::default());
+
+        assert_eq!(app.new_branch_name, "next feature");
+        assert!(app.new_branch_base.is_empty());
+    }
+
+    #[test]
+    fn successful_form_reset_covers_each_form() {
+        let mut app = App::new();
+        app.commit_msg = "commit".to_string();
+        app.commit_amend = true;
+        app.new_branch_name = "branch".to_string();
+        app.new_branch_base = "base".to_string();
+        app.merge_branch_name = "merge".to_string();
+        app.rename_branch_old = "old".to_string();
+        app.rename_branch_new = "new".to_string();
+        app.new_worktree_name = "worktree".to_string();
+        app.new_worktree_path = "/tmp/worktree".to_string();
+        app.new_worktree_branch = "branch".to_string();
+        app.new_worktree_create_branch = true;
+        app.stash_message = "stash".to_string();
+
+        FormSubmission::Commit {
+            message: "commit".to_string(),
+            amend: true,
+        }
+        .clear_if_unchanged(&mut app);
+        FormSubmission::CreateBranch {
+            name: "branch".to_string(),
+            base: "base".to_string(),
+        }
+        .clear_if_unchanged(&mut app);
+        FormSubmission::MergeBranch {
+            name: "merge".to_string(),
+        }
+        .clear_if_unchanged(&mut app);
+        FormSubmission::RenameBranch {
+            old: "old".to_string(),
+            new: "new".to_string(),
+        }
+        .clear_if_unchanged(&mut app);
+        FormSubmission::CreateWorktree {
+            name: "worktree".to_string(),
+            path: "/tmp/worktree".to_string(),
+            branch: "branch".to_string(),
+            create_branch: true,
+        }
+        .clear_if_unchanged(&mut app);
+        FormSubmission::Stash {
+            message: "stash".to_string(),
+        }
+        .clear_if_unchanged(&mut app);
+
+        assert!(app.commit_msg.is_empty());
+        assert!(!app.commit_amend);
+        assert!(app.new_branch_name.is_empty());
+        assert!(app.new_branch_base.is_empty());
+        assert!(app.merge_branch_name.is_empty());
+        assert!(app.rename_branch_old.is_empty());
+        assert!(app.rename_branch_new.is_empty());
+        assert!(app.new_worktree_name.is_empty());
+        assert!(app.new_worktree_path.is_empty());
+        assert!(app.new_worktree_branch.is_empty());
+        assert!(!app.new_worktree_create_branch);
+        assert!(app.stash_message.is_empty());
+    }
+
     fn init_repo_with_branch(path: &std::path::Path, branch_name: &str) {
         let repo = git2::Repository::init(path).expect("initialize repository");
         let signature = git2::Signature::now("test", "test@example.com").expect("signature");
@@ -2010,6 +2240,8 @@ mod tests {
             last_progress_update: Instant::now(),
             last_seen_progress: String::new(),
             timed_out: false,
+            form_submission: None,
+
         });
 
         app.process_pending_ops(&egui::Context::default());
@@ -2196,6 +2428,8 @@ mod tests {
             last_progress_update: Instant::now(),
             last_seen_progress: String::new(),
             timed_out: false,
+            form_submission: None,
+
         });
 
         app.open_repo(&second_path);
@@ -2617,6 +2851,8 @@ mod tests {
             last_progress_update: Instant::now(),
             last_seen_progress: String::new(),
             timed_out: true,
+            form_submission: None,
+
         });
 
         app.process_pending_ops(&egui::Context::default());
@@ -2955,6 +3191,8 @@ mod tests {
             last_progress_update: Instant::now(),
             last_seen_progress: String::new(),
             timed_out: false,
+            form_submission: None,
+
         });
 
         app.process_pending_ops(&ctx);
@@ -2993,6 +3231,8 @@ mod tests {
             last_progress_update: Instant::now(),
             last_seen_progress: String::new(),
             timed_out: false,
+            form_submission: None,
+
         });
 
         app.process_pending_ops(&ctx);
@@ -3018,6 +3258,8 @@ mod tests {
             last_progress_update: Instant::now(),
             last_seen_progress: String::new(),
             timed_out: false,
+            form_submission: None,
+
         };
         assert_eq!(*op.progress.lock().unwrap(), "initial progress");
     }

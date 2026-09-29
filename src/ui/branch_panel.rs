@@ -1,4 +1,4 @@
-use crate::app::App;
+use crate::app::{App, FormSubmission};
 use crate::git_ops::BranchInfo;
 use crate::git_ops::GitOperation;
 use crate::ui::{column_cell, column_header, column_header_static};
@@ -107,9 +107,16 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             } else {
                 Some(app.new_branch_base.trim().to_string())
             };
-            app.start_operation(ctx, &format!("Create branch '{}'", name), GitOperation::CreateBranch { name, base });
-            app.new_branch_name.clear();
-            app.new_branch_base.clear();
+            let form_submission = FormSubmission::CreateBranch {
+                name: app.new_branch_name.clone(),
+                base: app.new_branch_base.clone(),
+            };
+            app.start_operation_with_form_submission(
+                ctx,
+                &format!("Create branch '{}'", name),
+                GitOperation::CreateBranch { name, base },
+                form_submission,
+            );
         }
     }
 
@@ -124,8 +131,15 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         if name.is_empty() {
             app.show_error("Branch name required".into());
         } else {
-            app.start_operation(ctx, &format!("Merge '{}'", name), GitOperation::MergeBranch(name));
-            app.merge_branch_name.clear();
+            let form_submission = FormSubmission::MergeBranch {
+                name: app.merge_branch_name.clone(),
+            };
+            app.start_operation_with_form_submission(
+                ctx,
+                &format!("Merge '{}'", name),
+                GitOperation::MergeBranch(name),
+                form_submission,
+            );
         }
     }
 
@@ -145,9 +159,19 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         if old.is_empty() || new.is_empty() {
             app.show_error("Both names required".into());
         } else {
-            app.start_operation(ctx, &format!("Rename '{}'", old), GitOperation::RenameBranch { old, new: new.clone() });
-            app.rename_branch_old.clear();
-            app.rename_branch_new.clear();
+            let form_submission = FormSubmission::RenameBranch {
+                old: app.rename_branch_old.clone(),
+                new: app.rename_branch_new.clone(),
+            };
+            app.start_operation_with_form_submission(
+                ctx,
+                &format!("Rename '{}'", old),
+                GitOperation::RenameBranch {
+                    old,
+                    new: new.clone(),
+                },
+                form_submission,
+            );
         }
     }
 }

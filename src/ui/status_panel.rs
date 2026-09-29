@@ -1,4 +1,4 @@
-use crate::app::App;
+use crate::app::{App, FormSubmission};
 use crate::git_ops::GitOperation;
 use eframe::egui;
 
@@ -118,9 +118,16 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         } else {
             let msg = app.commit_msg.trim().to_string();
             let amend = app.commit_amend;
-            app.start_operation(ctx, "Committing", GitOperation::Commit { message: msg, amend });
-            app.commit_msg.clear();
-            app.commit_amend = false;
+            let form_submission = FormSubmission::Commit {
+                message: app.commit_msg.clone(),
+                amend: app.commit_amend,
+            };
+            app.start_operation_with_form_submission(
+                ctx,
+                "Committing",
+                GitOperation::Commit { message: msg, amend },
+                form_submission,
+            );
         }
     }
     if crate::ui::add_enabled_ellipsis(ui, !busy, "Uncommit").clicked() {
