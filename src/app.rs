@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 const ABOUT_BUTTON_LABEL: &str = "ℹ";
+const APP_VERSION: &str = crate::version_info::VERSION;
 
 fn update_asset_download_path(
     download_dir: &Path,
@@ -338,7 +339,7 @@ impl App {
     }
 
     pub fn trigger_update_check(&mut self) {
-        let current_version = env!("CARGO_PKG_VERSION").to_string();
+        let current_version = APP_VERSION.to_string();
         let state = self.update_state.clone();
         let generation = self.update_request_id.clone();
         let Some(request_id) = begin_update_request_if(
@@ -1455,7 +1456,7 @@ impl eframe::App for App {
                             self.show_about = !self.show_about;
                         }
                         // Version label (truncatable so it doesn't push buttons off-screen)
-                        let version_text = format!("v{}", crate::version_info::VERSION);
+                        let version_text = format!("v{}", APP_VERSION);
                         ui.add(
                             egui::Label::new(
                                 egui::RichText::new(&version_text)
@@ -1515,7 +1516,7 @@ impl eframe::App for App {
                         if ui.button(ABOUT_BUTTON_LABEL).clicked() {
                             self.show_about = !self.show_about;
                         }
-                        let version_text = format!("v{}", crate::version_info::VERSION);
+                        let version_text = format!("v{}", APP_VERSION);
                         ui.add(
                             egui::Label::new(
                                 egui::RichText::new(&version_text)
@@ -1673,7 +1674,7 @@ impl eframe::App for App {
                     ui.vertical_centered(|ui| {
                         ui.heading("Git Manager");
                         ui.add_space(4.0);
-                        ui.label(format!("Version: {}", crate::version_info::VERSION));
+                        ui.label(format!("Version: {}", APP_VERSION));
                         ui.label(format!("Commit: {}", crate::version_info::GIT_HASH));
                         ui.label(format!("Tag: {}", crate::version_info::GIT_DESCRIBE));
                         ui.label(format!("Build: {}", crate::version_info::BUILD_DATE));
@@ -1768,7 +1769,7 @@ impl eframe::App for App {
                                     ui.label(format!(
                                         "Version {} is now available (you have {}).",
                                         latest_version,
-                                        env!("CARGO_PKG_VERSION"),
+                                        APP_VERSION,
                                     ));
                                     ui.add_space(8.0);
                                     ui.label("An automatic download is available below.");
@@ -1888,6 +1889,11 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_version_matches_cargo_package_version() {
+        assert_eq!(APP_VERSION, env!("CARGO_PKG_VERSION"));
+    }
 
     // --- New tests for simplified status bar (Requirement 3 & 4) ---
 
