@@ -1440,7 +1440,8 @@ fn remove_worktree_directory(
 
         let staging_path = worktree_staging_path(path)?;
         if let Err(rename_error) = std::fs::rename(path, &staging_path) {
-            if force {
+            // Keep clean removal available when Windows rejects the staging rename.
+            if force || cfg!(windows) {
                 let path_identity = file_identity_from_path(path).ok_or_else(|| {
                     std::io::Error::new(
                         std::io::ErrorKind::Other,
@@ -1455,7 +1456,7 @@ fn remove_worktree_directory(
                     return Err(std::io::Error::new(
                         force_error.kind(),
                         format!(
-                            "{}; force cleanup fallback failed: {}",
+                            "{}; cleanup fallback failed: {}",
                             rename_error, force_error
                         ),
                     ));
@@ -1600,7 +1601,28 @@ where
             "directory identity changed before removal",
         ));
     }
-    std::fs::remove_dir_all(path)
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            #[cfg(windows)]
+            {
+                if !path_entry_exists(path)? {
+                    return Ok(());
+                }
+                if !is_safe() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "directory identity changed before removal",
+                    ));
+                }
+                let _ = force_remove_dir_windows(path);
+                if !path_entry_exists(path)? {
+                    return Ok(());
+                }
+            }
+            Err(error)
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -4350,6 +4372,10 @@ mod tests {
     fn test_checkout_branch_from_unborn_head() {
         let dir = tempfile::tempdir().expect("temp dir");
         let repo = Repository::init(dir.path()).expect("initialize repository");
+        repo.config()
+            .expect("repository config")
+            .set_bool("core.autocrlf", false)
+            .expect("disable line-ending conversion in test repository");
         let signature = git2::Signature::now("Test User", "test@example.com").expect("signature");
         let blob = repo.blob(b"feature contents\n").expect("write feature blob");
         let tree_oid = {
@@ -6404,7 +6430,7 @@ mod tests {
             .worktrees()
             .expect("list worktrees")
             .into_iter()
-            .find(|worktree| worktree.path == wt_path)
+            .find(|worktree| paths_match(&worktree.path, &wt_path))
             .and_then(|worktree| worktree.git_link_identity)
             .expect("capture git link identity");
         let git_link_contents = std::fs::read(wt_path.join(".git")).expect("read git link");
@@ -6460,7 +6486,7 @@ mod tests {
             .worktrees()
             .expect("list worktrees")
             .into_iter()
-            .find(|worktree| worktree.path == wt_path)
+            .find(|worktree| paths_match(&worktree.path, &wt_path))
             .and_then(|worktree| worktree.git_link_identity)
             .expect("capture git link identity");
         std::fs::hard_link(wt_path.join(".git"), &held_git_link)
@@ -7146,7 +7172,7 @@ mod tests {
         let root = tempfile::tempdir().expect("temp dir");
         let path = root
             .path()
-            .join("worktree&echo|preserved%literal!name^");
+            .join("worktree&echo-preserved%literal!name^");
         std::fs::create_dir_all(&path).expect("create directory");
         std::fs::write(path.join("file.txt"), "content").expect("write file");
 
