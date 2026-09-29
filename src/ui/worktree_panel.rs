@@ -100,11 +100,16 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.label("Name:");
         ui.text_edit_singleline(&mut app.new_worktree_name);
     });
-    ui.horizontal(|ui| {
-        ui.label("Path:");
-        ui.text_edit_singleline(&mut app.new_worktree_path);
-        ui.label("(leave empty for default)");
-    });
+    egui::CollapsingHeader::new("Advanced")
+        .id_salt("worktree_creation_advanced")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Path:");
+                ui.text_edit_singleline(&mut app.new_worktree_path);
+                ui.label("(leave empty for default)");
+            });
+        });
     ui.horizontal(|ui| {
         ui.label("Branch:");
         ui.text_edit_singleline(&mut app.new_worktree_branch);
