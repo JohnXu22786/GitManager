@@ -1356,7 +1356,7 @@ impl eframe::App for App {
 
         // --- Top Bar ---
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if crate::ui::add_enabled_ellipsis(ui, !self.is_busy(), "📂").clicked() {
                     let path = crate::native_file_dialog();
                     if let Some(p) = path {
@@ -1469,17 +1469,6 @@ impl eframe::App for App {
                     });
 
                     ui.separator();
-                    // Make repo path label truncatable when window is too narrow
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(&self.repo_path)
-                                .color(egui::Color32::from_rgb(100, 150, 255)),
-                        )
-                        .truncate(),
-                    )
-                    .on_hover_text(&self.repo_path);
-                    ui.separator();
-
                     let branch = self.git.current_branch().unwrap_or_default();
                     let branch_text = format!("🔀 {}", branch);
                     ui.add(
