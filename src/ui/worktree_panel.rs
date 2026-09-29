@@ -4,6 +4,8 @@ use crate::git_ops::WorktreeInfo;
 use crate::ui::{column_cell, column_header, column_header_static};
 use eframe::egui;
 
+const WORKTREE_ACTIONS_WIDTH: f32 = 90.0;
+
 pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     ui.horizontal(|ui| {
         ui.add(egui::Label::new(egui::RichText::new("Worktrees").heading()).truncate()).on_hover_text("Worktrees");
@@ -28,8 +30,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     ui.horizontal(|ui| {
         let cw = &mut app.column_widths;
         let avail = ui.available_width();
-        // Reserve 50px for "Actions" label
-        let reserved = 50.0;
+        let reserved = WORKTREE_ACTIONS_WIDTH;
         let max_cols = (avail - reserved).max(120.0);
 
         // Only Path column is draggable (divider between Path and Branch/SHA).
@@ -180,23 +181,26 @@ fn show_worktree_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, wt: 
     let path_display = wt.path.to_string_lossy().to_string();
 
     // Path column is draggable; Branch/SHA fills remaining space.
-    // For main worktree rows (no actions), reserved=0; for linked, reserve 39px for "…" button.
     let avail = ui.available_width();
-    let reserved = if !wt.is_main { 39.0 } else { 0.0 };
+    let reserved = WORKTREE_ACTIONS_WIDTH;
+    let is_current = app
+        .git
+        .path()
+        .is_some_and(|current_path| current_path == wt_path.as_path());
     let max_cols = (avail - reserved).max(120.0);
     let mut path_w = app.column_widths.get("worktree_path", 280.0);
     path_w = path_w.clamp(60.0, max_cols - 60.0);
     let bs_w = max_cols - path_w;
 
-    // Left-to-right flow: Path, Branch/SHA, "…" menu
+    // Left-to-right flow: Path, Branch/SHA, Actions.
     ui.horizontal(|ui| {
         column_cell(ui, path_w, &path_display, egui::Color32::GRAY);
 
         column_cell(ui, bs_w, &branch_sha_text, ui.style().visuals.text_color());
 
-        if !wt.is_main {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_space(4.0);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_space(4.0);
+            if !wt.is_main {
                 ui.menu_button("…", |ui| {
                     if ui.add_enabled(!busy, egui::Button::new("Remove")).clicked() {
                         app.request_confirmation(
@@ -231,14 +235,26 @@ fn show_worktree_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, wt: 
                         ui.close_menu();
                     }
                 });
-            });
-        }
+            }
+            if ui
+                .add_enabled(!busy && !is_current, egui::Button::new("Open"))
+                .clicked()
+            {
+                open_worktree(app, &wt_path);
+            }
+        });
     });
+}
+
+fn open_worktree(app: &mut App, path: &std::path::Path) {
+    app.open_repo_path(path);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::default_worktree_path;
+    use super::{default_worktree_path, open_worktree};
+    use crate::app::App;
+    use crate::recent::RecentRepos;
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -249,6 +265,29 @@ mod tests {
         let root = Path::new("/");
 
         assert_eq!(default_worktree_path(root, "feature"), None);
+    }
+
+    #[test]
+    fn open_action_switches_to_worktree_repository() {
+        let worktree_dir = tempfile::tempdir().expect("worktree directory");
+        drop(git2::Repository::init(worktree_dir.path()).expect("initialize worktree repository"));
+        let recent_dir = tempfile::tempdir().expect("recent repositories directory");
+        let mut app = App::new();
+        app.recent_repos = RecentRepos::load_from(recent_dir.path().join("recent.json"));
+
+        open_worktree(&mut app, worktree_dir.path());
+
+        assert_eq!(app.repo_path, worktree_dir.path().to_str().expect("UTF-8 path"));
+        assert_eq!(app.git.path(), Some(worktree_dir.path()));
+        let ctx = eframe::egui::Context::default();
+        for _ in 0..200 {
+            app.process_pending_ops(&ctx);
+            if !app.is_busy() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!app.is_busy(), "repository refresh should finish");
     }
 
     #[test]

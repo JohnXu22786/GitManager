@@ -538,32 +538,37 @@ impl App {
     }
 
     pub fn open_repo(&mut self, path: &str) {
+        self.open_repo_path(Path::new(path));
+    }
+
+    pub(crate) fn open_repo_path(&mut self, path: &Path) {
         // Pending operations publish results back into this App, so changing
         // repositories before they finish could apply stale data to the new one.
         if self.is_busy() {
             return;
         }
 
+        let path_display = path.to_string_lossy().into_owned();
         self.status_message.clear();
         self.status_is_error = false;
-        match self.git.open(Path::new(path)) {
+        match self.git.open(path) {
             Ok(()) => {
                 self.log_search_request_id = self.log_search_request_id.wrapping_add(1);
                 self.repo_generation = self.repo_generation.wrapping_add(1);
-                self.repo_path = path.to_string();
+                self.repo_path = path_display.clone();
                 self.remote_name_user_edited = false;
                 self.push_branch.clear();
                 self.push_branch_user_edited = false;
                 self.diff_content.clear();
                 self.diff_path.clear();
                 self.show_diff = false;
-                self.status_message = format!("Opened repository at {}", path);
+                self.status_message = format!("Opened repository at {}", path_display);
                 self.status_is_error = false;
                 self.refresh_all();
-                if let Err(error) = self.recent_repos.add(path) {
+                if let Err(error) = self.recent_repos.add(&path_display) {
                     self.status_message = format!(
                         "Opened repository at {} (failed to save recent history: {})",
-                        path, error
+                        path_display, error
                     );
                     self.status_is_error = true;
                 }
