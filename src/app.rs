@@ -405,7 +405,24 @@ impl App {
 
     /// Start downloading the update asset in a background thread.
     /// Updates `update_state` with progress as the download proceeds.
-    pub fn trigger_download(&mut self, url: String, file_name: String) {
+    pub fn trigger_download(&mut self, asset: updater::ReleaseAsset) {
+        if !asset.has_valid_sha256_digest() {
+            let state = self.update_state.clone();
+            let generation = self.update_request_id.clone();
+            begin_update_request_if(
+                &state,
+                &generation,
+                |current| !matches!(current, UpdateState::Downloading { .. }),
+                UpdateState::Error(
+                    "This release asset has no valid SHA-256 digest. Download it from the release page instead."
+                        .to_string(),
+                ),
+            );
+            return;
+        }
+        let expected_digest = asset.digest.expect("validated release digest");
+        let url = asset.browser_download_url;
+        let file_name = asset.name;
         let dest_dir = updater::get_default_download_dir();
         let dest_path = match update_asset_download_path(Path::new(&dest_dir), &file_name) {
             Ok(path) => path,
@@ -461,7 +478,12 @@ impl App {
                 }
             });
 
-            let result = updater::download_file_with_progress(&url, &dest_path, prog);
+            let result = updater::download_file_with_progress(
+                &url,
+                &dest_path,
+                &expected_digest,
+                prog,
+            );
 
             let next_state = match result {
                 Ok(()) => {
@@ -1678,12 +1700,18 @@ impl eframe::App for App {
                                 }
                                 UpdateState::UpdateAvailable { latest_version, download_url, ref assets } => {
                                     ui.colored_label(App::adaptive_yellow(dark), format!("Update available: {}!", latest_version));
-                                    // Try auto-download if matching asset is available
-                                    if let Some((asset_url, file_name)) = updater::find_asset_for_current_platform(assets) {
+                                    let asset = updater::find_asset_for_current_platform(assets);
+                                    let can_auto_download = asset
+                                        .as_ref()
+                                        .is_some_and(updater::ReleaseAsset::has_valid_sha256_digest);
+                                    if can_auto_download {
                                         if crate::ui::ellipsis_button(ui, "Download & Install").clicked() {
-                                            self.trigger_download(asset_url, file_name);
+                                            self.trigger_download(asset.expect("verified asset"));
                                         }
                                     } else {
+                                        if asset.is_some() {
+                                            ui.label("Automatic installation requires a valid SHA-256 release digest.");
+                                        }
                                         // Fallback: open browser
                                         if crate::ui::ellipsis_button(ui, "Download (Browser)").clicked() {
                                             let _ = open::that(&download_url);
@@ -1745,13 +1773,21 @@ impl eframe::App for App {
                                         APP_VERSION,
                                     ));
                                     ui.add_space(8.0);
-                                    ui.label("An automatic download is available below.");
+                                    let asset = updater::find_asset_for_current_platform(assets);
+                                    let can_auto_download = asset
+                                        .as_ref()
+                                        .is_some_and(updater::ReleaseAsset::has_valid_sha256_digest);
+                                    ui.label(if can_auto_download {
+                                        "The download will be verified before installation."
+                                    } else {
+                                        "Automatic installation is unavailable because no valid SHA-256 digest is published for this platform."
+                                    });
                                     ui.add_space(12.0);
                                     ui.horizontal(|ui| {
                                         // Try auto-download first
-                                        if let Some((asset_url, file_name)) = updater::find_asset_for_current_platform(assets) {
+                                        if can_auto_download {
                                             if crate::ui::ellipsis_button(ui, "Auto Download").clicked() {
-                                                self.trigger_download(asset_url, file_name);
+                                                self.trigger_download(asset.expect("verified asset"));
                                                 // Keep dialog open to show progress
                                             }
                                         }

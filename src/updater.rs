@@ -4,6 +4,7 @@
 /// Also provides automatic download of update assets.
 
 use serde::Deserialize;
+use ring::digest::{Context as Sha256Context, SHA256};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -15,6 +16,16 @@ pub struct ReleaseAsset {
     pub browser_download_url: String,
     #[serde(default)]
     pub content_type: String,
+    #[serde(default)]
+    pub digest: Option<String>,
+}
+
+impl ReleaseAsset {
+    pub fn has_valid_sha256_digest(&self) -> bool {
+        self.digest
+            .as_deref()
+            .is_some_and(|digest| parse_github_sha256_digest(digest).is_ok())
+    }
 }
 
 /// GitHub release response (only fields we need).
@@ -141,21 +152,15 @@ fn get_platform_suffix() -> &'static str {
 }
 
 /// Find the download asset that matches the current platform.
-/// Returns (download_url, file_name) if found.
-pub fn find_asset_for_current_platform(assets: &[ReleaseAsset]) -> Option<(String, String)> {
+/// Returns the matching release asset, including its verification digest.
+pub fn find_asset_for_current_platform(assets: &[ReleaseAsset]) -> Option<ReleaseAsset> {
     let suffix = get_platform_suffix();
-    find_asset_by_suffix(assets, suffix)
+    find_asset_by_suffix(assets, suffix).cloned()
 }
 
 /// Find a release asset whose name contains the given suffix.
-/// Returns (download_url, file_name) if found.
-fn find_asset_by_suffix(assets: &[ReleaseAsset], suffix: &str) -> Option<(String, String)> {
-    for asset in assets {
-        if asset.name.contains(suffix) {
-            return Some((asset.browser_download_url.clone(), asset.name.clone()));
-        }
-    }
-    None
+fn find_asset_by_suffix<'a>(assets: &'a [ReleaseAsset], suffix: &str) -> Option<&'a ReleaseAsset> {
+    assets.iter().find(|asset| asset.name.contains(suffix))
 }
 
 /// The name of the binary inside the archive (platform-dependent).
@@ -504,8 +509,10 @@ pub fn get_default_download_dir() -> String {
 pub fn download_file_with_progress(
     url: &str,
     dest_path: &Path,
+    expected_digest: &str,
     progress: Arc<Mutex<f32>>,
 ) -> Result<(), String> {
+    let expected_digest = parse_github_sha256_digest(expected_digest)?;
     let response = ureq::get(url)
         .set("User-Agent", "GitManager")
         .call()
@@ -518,25 +525,81 @@ pub fn download_file_with_progress(
         .unwrap_or(0);
 
     let mut reader = response.into_reader();
-    stream_response_to_path(&mut reader, dest_path, total_size, &progress)?;
-
-    if let Ok(mut prog) = progress.lock() {
-        *prog = 1.0;
-    }
-
-    Ok(())
+    download_reader_with_progress(
+        &mut reader,
+        dest_path,
+        total_size,
+        expected_digest,
+        &progress,
+    )
 }
 
 const DOWNLOAD_CHUNK_SIZE: usize = 8192;
+
+fn parse_github_sha256_digest(value: &str) -> Result<[u8; 32], String> {
+    let encoded = value
+        .strip_prefix("sha256:")
+        .ok_or_else(|| "Release asset does not provide a SHA-256 digest".to_string())?;
+    if encoded.len() != 64 || !encoded.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("Release asset has an invalid SHA-256 digest".to_string());
+    }
+
+    let mut decoded = [0u8; 32];
+    for (index, byte) in decoded.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&encoded[index * 2..index * 2 + 2], 16)
+            .map_err(|_| "Release asset has an invalid SHA-256 digest".to_string())?;
+    }
+    Ok(decoded)
+}
+
+fn download_reader_with_progress<R: Read>(
+    reader: &mut R,
+    dest_path: &Path,
+    total_size: u64,
+    expected_digest: [u8; 32],
+    progress: &Arc<Mutex<f32>>,
+) -> Result<(), String> {
+    let parent = dest_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temporary_file = tempfile::Builder::new()
+        .prefix(".git-manager-update-")
+        .tempfile_in(parent)
+        .map_err(|error| format!("Failed to create temporary update file: {}", error))?;
+
+    let actual_digest =
+        stream_response_to_writer(reader, temporary_file.as_file_mut(), total_size, progress)?;
+    if actual_digest != expected_digest {
+        return Err(
+            "Downloaded update SHA-256 does not match the release digest; the existing file was left unchanged."
+                .to_string(),
+        );
+    }
+
+    temporary_file
+        .as_file_mut()
+        .sync_all()
+        .map_err(|error| format!("Failed to sync verified update: {}", error))?;
+    temporary_file
+        .persist(dest_path)
+        .map_err(|error| format!("Failed to store verified update: {}", error.error))?;
+
+    if let Ok(mut progress) = progress.lock() {
+        *progress = 1.0;
+    }
+    Ok(())
+}
 
 fn stream_response_to_writer<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut W,
     total_size: u64,
     progress: &Arc<Mutex<f32>>,
-) -> Result<(), String> {
+) -> Result<[u8; 32], String> {
     let mut downloaded: u64 = 0;
     let mut chunk = [0u8; DOWNLOAD_CHUNK_SIZE];
+    let mut digest = Sha256Context::new(&SHA256);
 
     loop {
         let bytes_read = reader
@@ -545,6 +608,7 @@ fn stream_response_to_writer<R: Read, W: Write>(
         if bytes_read == 0 {
             break;
         }
+        digest.update(&chunk[..bytes_read]);
         writer
             .write_all(&chunk[..bytes_read])
             .map_err(|e| format!("Download write error: {}", e))?;
@@ -558,9 +622,13 @@ fn stream_response_to_writer<R: Read, W: Write>(
         }
     }
 
-    Ok(())
+    let digest = digest.finish();
+    let mut digest_bytes = [0u8; 32];
+    digest_bytes.copy_from_slice(digest.as_ref());
+    Ok(digest_bytes)
 }
 
+#[cfg(test)]
 fn stream_response_to_path<R: Read>(
     reader: &mut R,
     dest_path: &Path,
@@ -569,7 +637,7 @@ fn stream_response_to_path<R: Read>(
 ) -> Result<(), String> {
     let mut dest_file = std::fs::File::create(dest_path)
         .map_err(|e| format!("Failed to write download to file: {}", e))?;
-    stream_response_to_writer(reader, &mut dest_file, total_size, progress)
+    stream_response_to_writer(reader, &mut dest_file, total_size, progress).map(|_| ())
 }
 
 #[cfg(test)]
@@ -644,6 +712,80 @@ mod tests {
         assert_eq!(writer.bytes_written, body_size);
         assert!(writer.largest_write <= DOWNLOAD_CHUNK_SIZE);
         assert_eq!(*progress.lock().unwrap(), 1.0);
+    }
+
+    fn sha256_header(contents: &[u8]) -> String {
+        let digest = ring::digest::digest(&SHA256, contents);
+        let encoded = digest
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        format!("sha256:{encoded}")
+    }
+
+    #[test]
+    fn test_parse_github_sha256_digest() {
+        let parsed = parse_github_sha256_digest(
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        )
+        .unwrap();
+        let actual = ring::digest::digest(&SHA256, b"abc");
+        assert_eq!(parsed.as_slice(), actual.as_ref());
+    }
+
+    #[test]
+    fn test_parse_github_sha256_digest_rejects_malformed_values() {
+        assert!(parse_github_sha256_digest("sha512:00").is_err());
+        assert!(parse_github_sha256_digest("sha256:xyz").is_err());
+        assert!(parse_github_sha256_digest("sha256:").is_err());
+    }
+
+    #[test]
+    fn test_verified_download_replaces_destination_after_digest_match() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let destination = temp_dir.path().join("update.zip");
+        let contents = b"verified release asset";
+        std::fs::write(&destination, b"previous download").unwrap();
+        let mut reader = std::io::Cursor::new(contents);
+        let progress = Arc::new(Mutex::new(0.0));
+
+        download_reader_with_progress(
+            &mut reader,
+            &destination,
+            contents.len() as u64,
+            parse_github_sha256_digest(&sha256_header(contents)).unwrap(),
+            &progress,
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(&destination).unwrap(), contents);
+        assert_eq!(*progress.lock().unwrap(), 1.0);
+        assert_eq!(std::fs::read_dir(temp_dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn test_digest_mismatch_preserves_existing_download_and_removes_temporary_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let destination = temp_dir.path().join("update.zip");
+        let existing = b"previous verified download";
+        let contents = b"tampered release asset";
+        std::fs::write(&destination, existing).unwrap();
+        let mut reader = std::io::Cursor::new(contents);
+        let progress = Arc::new(Mutex::new(0.0));
+
+        let error = download_reader_with_progress(
+            &mut reader,
+            &destination,
+            contents.len() as u64,
+            parse_github_sha256_digest(&sha256_header(b"expected release asset")).unwrap(),
+            &progress,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("SHA-256"));
+        assert_eq!(std::fs::read(&destination).unwrap(), existing);
+        assert_eq!(std::fs::read_dir(temp_dir.path()).unwrap().count(), 1);
     }
 
     #[cfg(unix)]
@@ -833,6 +975,22 @@ mod tests {
         let asset: ReleaseAsset = serde_json::from_str(json).unwrap();
         assert_eq!(asset.name, "git-manager-0.2.0-linux-x86_64.tar.gz");
         assert_eq!(asset.content_type, "application/gzip");
+        assert_eq!(asset.digest, None);
+    }
+
+    #[test]
+    fn test_release_asset_deserializes_github_digest() {
+        let json = r#"{
+            "name": "git-manager-0.2.0-linux-x86_64.tar.gz",
+            "browser_download_url": "https://github.com/JohnXu22786/GitManager/releases/download/v0.2.0/git-manager-0.2.0-linux-x86_64.tar.gz",
+            "digest": "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        }"#;
+        let asset: ReleaseAsset = serde_json::from_str(json).unwrap();
+        assert!(asset.has_valid_sha256_digest());
+        assert_eq!(
+            asset.digest.as_deref(),
+            Some("sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
     }
 
     // --- find_asset_by_suffix tests ---
@@ -844,23 +1002,26 @@ mod tests {
                 name: "git-manager-0.2.0-linux-x86_64.tar.gz".to_string(),
                 browser_download_url: "https://example.com/linux.tar.gz".to_string(),
                 content_type: "application/gzip".to_string(),
+                digest: None,
             },
             ReleaseAsset {
                 name: "git-manager-0.2.0-windows-x86_64.zip".to_string(),
                 browser_download_url: "https://example.com/windows.zip".to_string(),
                 content_type: "application/zip".to_string(),
+                digest: None,
             },
             ReleaseAsset {
                 name: "git-manager-0.2.0-macos-x86_64.tar.gz".to_string(),
                 browser_download_url: "https://example.com/macos.tar.gz".to_string(),
                 content_type: "application/gzip".to_string(),
+                digest: None,
             },
         ];
         let result = find_asset_by_suffix(&assets, "windows-x86_64");
         assert!(result.is_some());
-        let (url, name) = result.unwrap();
-        assert_eq!(url, "https://example.com/windows.zip");
-        assert_eq!(name, "git-manager-0.2.0-windows-x86_64.zip");
+        let asset = result.unwrap();
+        assert_eq!(asset.browser_download_url, "https://example.com/windows.zip");
+        assert_eq!(asset.name, "git-manager-0.2.0-windows-x86_64.zip");
     }
 
     #[test]
@@ -870,18 +1031,20 @@ mod tests {
                 name: "git-manager-0.2.0-linux-x86_64.tar.gz".to_string(),
                 browser_download_url: "https://example.com/linux.tar.gz".to_string(),
                 content_type: "application/gzip".to_string(),
+                digest: None,
             },
             ReleaseAsset {
                 name: "git-manager-0.2.0-macos-x86_64.tar.gz".to_string(),
                 browser_download_url: "https://example.com/macos.tar.gz".to_string(),
                 content_type: "application/gzip".to_string(),
+                digest: None,
             },
         ];
         let result = find_asset_by_suffix(&assets, "macos-x86_64");
         assert!(result.is_some());
-        let (url, name) = result.unwrap();
-        assert_eq!(url, "https://example.com/macos.tar.gz");
-        assert_eq!(name, "git-manager-0.2.0-macos-x86_64.tar.gz");
+        let asset = result.unwrap();
+        assert_eq!(asset.browser_download_url, "https://example.com/macos.tar.gz");
+        assert_eq!(asset.name, "git-manager-0.2.0-macos-x86_64.tar.gz");
     }
 
     #[test]
@@ -891,6 +1054,7 @@ mod tests {
                 name: "git-manager-0.2.0-linux-x86_64.tar.gz".to_string(),
                 browser_download_url: "https://example.com/linux.tar.gz".to_string(),
                 content_type: "application/gzip".to_string(),
+                digest: None,
             },
         ];
         let result = find_asset_by_suffix(&assets, "windows-x86_64");
@@ -911,17 +1075,19 @@ mod tests {
                 name: "git-manager-0.2.0-linux-aarch64.tar.gz".to_string(),
                 browser_download_url: "https://example.com/linux-arm64.tar.gz".to_string(),
                 content_type: "application/gzip".to_string(),
+                digest: None,
             },
             ReleaseAsset {
                 name: "git-manager-0.2.0-linux-x86_64.tar.gz".to_string(),
                 browser_download_url: "https://example.com/linux-x64.tar.gz".to_string(),
                 content_type: "application/gzip".to_string(),
+                digest: None,
             },
         ];
         let result = find_asset_by_suffix(&assets, "linux-aarch64");
         assert!(result.is_some());
-        let (url, _) = result.unwrap();
-        assert_eq!(url, "https://example.com/linux-arm64.tar.gz");
+        let asset = result.unwrap();
+        assert_eq!(asset.browser_download_url, "https://example.com/linux-arm64.tar.gz");
     }
 
     // --- UpdateState Downloading / Downloaded tests ---
