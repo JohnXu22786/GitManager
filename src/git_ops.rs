@@ -271,12 +271,15 @@ impl GitOperation {
                 Err(e) => OpResult::Error(format!("Diff error: {}", e)),
             },
             GitOperation::LogSearch { filter, request_id } => {
-                let commits = repo.log(100).unwrap_or_default();
-                let filtered = filter_commits(commits, &filter);
+                let commits = if filter.is_empty() {
+                    repo.log(100).unwrap_or_default()
+                } else {
+                    repo.search_log(&filter).unwrap_or_default()
+                };
                 OpResult::SearchResults {
                     request_id,
                     filter,
-                    commits: filtered,
+                    commits,
                 }
             }
             GitOperation::RefreshAll => {
@@ -355,11 +358,15 @@ pub fn filter_commits(commits: Vec<CommitInfo>, filter: &str) -> Vec<CommitInfo>
     commits
         .into_iter()
         .filter(|commit| {
-            commit.message.to_lowercase().contains(&filter)
-                || commit.author.to_lowercase().contains(&filter)
-                || commit.short_sha.contains(&filter)
+            commit_matches_query(&commit.message, &commit.author, &commit.short_sha, &filter)
         })
         .collect()
+}
+
+fn commit_matches_query(message: &str, author: &str, short_sha: &str, filter: &str) -> bool {
+    message.to_lowercase().contains(filter)
+        || author.to_lowercase().contains(filter)
+        || short_sha.contains(filter)
 }
 
 #[derive(Clone, Debug)]
@@ -2970,22 +2977,43 @@ impl GitRepo {
     }
 
     pub fn log(&self, max_count: usize) -> GitResult<Vec<CommitInfo>> {
+        self.walk_log(Some(max_count), None)
+    }
+
+    pub fn search_log(&self, filter: &str) -> GitResult<Vec<CommitInfo>> {
+        self.walk_log(None, Some(filter))
+    }
+
+    fn walk_log(
+        &self,
+        max_count: Option<usize>,
+        filter: Option<&str>,
+    ) -> GitResult<Vec<CommitInfo>> {
         let repo = self.repo()?;
         let mut rw = repo.revwalk().map_err(|e| format!("Revwalk: {}", e))?;
         rw.push_head().map_err(|e| format!("Push HEAD: {}", e))?;
         rw.set_sorting(git2::Sort::TIME).ok();
 
+        let filter = filter.map(str::to_lowercase);
         let mut commits = Vec::new();
-        for oid in rw.take(max_count) {
+        for oid in rw.take(max_count.unwrap_or(usize::MAX)) {
             let oid = oid.map_err(|e| format!("Oid: {}", e))?;
             if let Ok(c) = repo.find_commit(oid) {
+                let short_sha = oid.to_string().get(..7).unwrap_or("").to_string();
+                let author = safe_str_lossy_infallible(c.author().name(), c.author().name_bytes());
+                let message = safe_str_lossy_infallible(c.message(), c.message_bytes());
+                if filter.as_ref().is_some_and(|filter| {
+                    !commit_matches_query(&message, &author, &short_sha, filter)
+                }) {
+                    continue;
+                }
                 commits.push(CommitInfo {
                     sha: oid.to_string(),
-                    short_sha: oid.to_string().get(..7).unwrap_or("").to_string(),
-                    author: safe_str_lossy_infallible(c.author().name(), c.author().name_bytes()),
+                    short_sha,
+                    author,
                     time: DateTime::from_timestamp(c.time().seconds(), 0)
                         .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string()).unwrap_or_default(),
-                    message: safe_str_lossy_infallible(c.message(), c.message_bytes()),
+                    message,
                     summary: safe_str_lossy(c.summary(), c.summary_bytes()),
                 });
             }
@@ -5693,6 +5721,88 @@ mod tests {
                 assert_eq!(request_id, 42);
                 assert_eq!(filter, "initial");
                 assert_eq!(commits.len(), 1);
+            }
+            other => panic!("expected search results, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_log_search_includes_matching_commits_beyond_default_limit() {
+        const COMMIT_COUNT: usize = 106;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+        let tree_oid = repo.index().expect("index").write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_oid).expect("tree");
+        let mut parent = None;
+        let mut older_sha = String::new();
+
+        for index in 0..COMMIT_COUNT {
+            let timestamp = 1_700_000_000 + index as i64;
+            let time = git2::Time::new(timestamp, 0);
+            let signature = git2::Signature::new("Test User", "test@example.com", &time)
+                .expect("signature");
+            let message = if index == 0 {
+                "older-search-target".to_string()
+            } else {
+                format!("newer commit {}", index)
+            };
+            let oid = match parent.as_ref() {
+                Some(previous) => repo
+                    .commit(Some("HEAD"), &signature, &signature, &message, &tree, &[previous])
+                    .expect("commit with parent"),
+                None => repo
+                    .commit(Some("HEAD"), &signature, &signature, &message, &tree, &[])
+                    .expect("initial commit"),
+            };
+            if index == 0 {
+                older_sha = oid.to_string();
+            }
+            parent = Some(repo.find_commit(oid).expect("find commit"));
+        }
+        drop(parent);
+        drop(tree);
+        drop(repo);
+
+        let git = open_git_repo(dir.path());
+        let default_log = git.log(100).expect("default log");
+        assert_eq!(default_log.len(), 100);
+        assert!(!default_log.iter().any(|commit| commit.sha == older_sha));
+        drop(git);
+
+        let result = execute_operation(
+            dir.path(),
+            GitOperation::LogSearch {
+                filter: "older-search-target".to_string(),
+                request_id: 43,
+            },
+            Arc::new(Mutex::new(String::new())),
+        );
+
+        match result {
+            OpResult::SearchResults { request_id, filter, commits } => {
+                assert_eq!(request_id, 43);
+                assert_eq!(filter, "older-search-target");
+                assert_eq!(commits.len(), 1);
+                assert_eq!(commits[0].sha, older_sha);
+            }
+            other => panic!("expected search results, got {:?}", other),
+        }
+
+        let empty_search = execute_operation(
+            dir.path(),
+            GitOperation::LogSearch {
+                filter: String::new(),
+                request_id: 44,
+            },
+            Arc::new(Mutex::new(String::new())),
+        );
+        match empty_search {
+            OpResult::SearchResults { request_id, filter, commits } => {
+                assert_eq!(request_id, 44);
+                assert!(filter.is_empty());
+                assert_eq!(commits.len(), 100, "clearing search restores the default log window");
+                assert!(!commits.iter().any(|commit| commit.sha == older_sha));
             }
             other => panic!("expected search results, got {:?}", other),
         }
