@@ -33,7 +33,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.add(egui::Label::new(egui::RichText::new("Remotes").heading()).truncate()).on_hover_text("Remotes");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if crate::ui::add_enabled_ellipsis(ui, !app.is_busy(), "🔄 Refresh").clicked() {
-                app.refresh_all();
+                app.refresh_all(ctx);
             }
         });
     });
@@ -182,6 +182,14 @@ mod tests {
     }
 
     fn show_panel(app: &mut App, ctx: &egui::Context) {
+        for _ in 0..200 {
+            app.process_pending_ops(ctx);
+            if !app.is_busy() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!app.is_busy(), "background refresh should finish");
         show_panel_with_events(app, ctx, Vec::new());
     }
 
@@ -427,7 +435,7 @@ mod tests {
 
         app.remote_name = String::from("ori");
         app.remote_name_user_edited = true;
-        app.refresh_all();
+        app.refresh_all(&ctx);
         show_panel(&mut app, &ctx);
 
         assert_eq!(app.remote_name, "ori");
