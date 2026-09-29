@@ -3,7 +3,7 @@ use crate::git_ops::GitOperation;
 use eframe::egui;
 
 fn should_show_stage_action(status: char) -> bool {
-    status != 'D' && status != '!'
+    status != '!'
 }
 
 pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -293,10 +293,10 @@ mod tests {
     }
 
     #[test]
-    fn test_untracked_entries_can_be_staged_individually() {
+    fn test_stage_action_is_available_for_deleted_entries() {
         assert!(should_show_stage_action('?'));
         assert!(should_show_stage_action('M'));
-        assert!(!should_show_stage_action('D'));
+        assert!(should_show_stage_action('D'));
         assert!(!should_show_stage_action('!'));
     }
 }
