@@ -3033,6 +3033,8 @@ impl GitRepo {
                     }
                     None => true,
                 };
+                #[cfg(windows)]
+                drop(_head_transaction.take()); // Windows cannot prune an open HEAD.lock.
                 let prune_result = if !lock_owned {
                     errors.push("Worktree lock changed during removal.".into());
                     None

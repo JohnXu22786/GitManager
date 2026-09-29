@@ -2471,7 +2471,9 @@ mod tests {
         let worktree = app
             .worktrees
             .iter()
-            .find(|worktree| worktree.path == path)
+            .find(|worktree| {
+                !worktree.is_main && worktree.path.file_name() == path.file_name()
+            })
             .cloned()
             .expect("listed worktree");
         app.preview_worktree_cleanup(ctx, &worktree, force_requested);
@@ -2490,26 +2492,38 @@ mod tests {
 
     #[test]
     fn cleanup_preview_rejects_worktree_identity_changed_after_listing() {
-        let (main_dir, _worktree_root, worktree_path) = setup_linked_worktree();
+        let (main_dir, _worktree_root, _worktree_path) = setup_linked_worktree();
+        let repo = git2::Repository::open(main_dir.path()).expect("open main repository");
+        let commit = repo
+            .head()
+            .expect("main HEAD")
+            .peel_to_commit()
+            .expect("main commit");
+        repo.branch("other", &commit, false)
+            .expect("create comparison branch");
+        drop(commit);
+        drop(repo);
+
+        let other_root = tempfile::tempdir().expect("comparison worktree root");
+        let other_path = other_root.path().join("other-wt");
+        create_linked_test_worktree(main_dir.path(), &other_path, "other");
+
         let mut app = App::new();
         app.git.open(main_dir.path()).expect("open main repository");
-        let worktree = app
-            .git
-            .worktrees()
-            .expect("list worktrees")
-            .into_iter()
-            .find(|worktree| !worktree.is_main)
-            .expect("linked worktree");
-        let expected_git_link = worktree
-            .git_link_identity
-            .clone()
-            .expect("capture worktree identity");
-        std::fs::write(worktree_path.join(".git"), "gitdir: /replacement/worktree\n")
-            .expect("replace git link");
+        let worktrees = app.git.worktrees().expect("list worktrees");
+        let target = worktrees
+            .iter()
+            .find(|worktree| !worktree.is_main && worktree.branch.as_deref() == Some("feature"))
+            .expect("target worktree");
+        let expected_git_link = worktrees
+            .iter()
+            .find(|worktree| worktree.branch.as_deref() == Some("other"))
+            .and_then(|worktree| worktree.git_link_identity.clone())
+            .expect("capture a different worktree identity");
 
-        app.worktrees = vec![worktree.clone()];
+        app.worktrees = vec![target.clone()];
         app.pending_worktree_cleanup = Some(PendingWorktreeCleanup {
-            path: worktree_path,
+            path: target.path.clone(),
             expected_git_link: Some(expected_git_link),
             directory_missing_at_request: false,
             force_requested: false,
