@@ -1363,6 +1363,7 @@ dependencies = [
  "git2",
  "open",
  "rfd",
+ "ring",
  "serde",
  "serde_json",
  "tar",

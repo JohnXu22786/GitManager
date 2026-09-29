@@ -23,6 +23,7 @@ rfd = "0.15"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 tar = "0.4"
 flate2 = "1"
+ring = "0.17"
 tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]
