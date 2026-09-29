@@ -326,7 +326,7 @@ fn test_progress_shared_state_visible_from_main_thread() {
     let progress = Arc::new(Mutex::new(String::new()));
 
     let p = progress.clone();
-    thread::spawn(move || {
+    let worker = thread::spawn(move || {
         // Simulate progress updates during a git operation
         *p.lock().unwrap() = "Receiving objects: 10%".to_string();
         thread::sleep(Duration::from_millis(10));
@@ -334,9 +334,7 @@ fn test_progress_shared_state_visible_from_main_thread() {
         thread::sleep(Duration::from_millis(10));
         *p.lock().unwrap() = "Receiving objects: 100% (1000/1000), done.".to_string();
     });
-
-    // Wait for thread to complete
-    thread::sleep(Duration::from_millis(50));
+    worker.join().expect("progress worker should finish");
 
     let result = progress.lock().unwrap().clone();
     assert!(result.contains("100%"), "Progress should show final state: {}", result);
@@ -348,28 +346,29 @@ fn test_progress_readable_during_operation() {
     let progress = Arc::new(Mutex::new(String::new()));
 
     let p = progress.clone();
-    thread::spawn(move || {
+    let (advance_tx, advance_rx) = std::sync::mpsc::channel();
+    let (updated_tx, updated_rx) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
         *p.lock().unwrap() = "Starting...".to_string();
-        thread::sleep(Duration::from_millis(20));
+        updated_tx.send(()).expect("signal initial progress");
+        advance_rx.recv().expect("allow progress to continue");
         *p.lock().unwrap() = "In progress...".to_string();
-        thread::sleep(Duration::from_millis(20));
+        updated_tx.send(()).expect("signal mid progress");
+        advance_rx.recv().expect("allow progress to finish");
         *p.lock().unwrap() = "Done".to_string();
+        updated_tx.send(()).expect("signal final progress");
     });
 
-    // Read progress while thread is running
-    thread::sleep(Duration::from_millis(5));
-    let early = progress.lock().unwrap().clone();
-    assert_eq!(early, "Starting...", "Should see early progress");
-
-    // Read mid-progress
-    thread::sleep(Duration::from_millis(20));
-    let mid = progress.lock().unwrap().clone();
-    assert_eq!(mid, "In progress...", "Should see mid progress");
-
-    // Read final
-    thread::sleep(Duration::from_millis(25));
-    let final_state = progress.lock().unwrap().clone();
-    assert_eq!(final_state, "Done", "Should see final progress");
+    for (index, expected) in ["Starting...", "In progress...", "Done"].iter().enumerate() {
+        updated_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("progress update should arrive");
+        assert_eq!(progress.lock().unwrap().as_str(), *expected);
+        if index < 2 {
+            advance_tx.send(()).expect("continue progress worker");
+        }
+    }
+    worker.join().expect("progress worker should finish");
 }
 
 /// Test that watchdog timeout fires when progress stops changing

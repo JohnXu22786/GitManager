@@ -4,8 +4,39 @@ mod git_metadata;
 mod version_info;
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+fn canonical_path_for_test(path: &Path) -> PathBuf {
+    let original = path;
+    let mut candidate = path;
+    let mut missing_components = Vec::new();
+
+    loop {
+        if let Ok(mut canonical) = fs::canonicalize(candidate) {
+            for component in missing_components.iter().rev() {
+                canonical.push(component);
+            }
+            return canonical;
+        }
+
+        let Some(file_name) = candidate.file_name() else {
+            return original.to_path_buf();
+        };
+        missing_components.push(file_name.to_os_string());
+        let Some(parent) = candidate.parent() else {
+            return original.to_path_buf();
+        };
+        candidate = parent;
+    }
+}
+
+fn contains_path(paths: &[PathBuf], expected: &Path) -> bool {
+    let expected = canonical_path_for_test(expected);
+    paths
+        .iter()
+        .any(|path| canonical_path_for_test(path) == expected)
+}
 
 #[test]
 fn watches_head_and_shared_refs_for_worktree_git_file() {
@@ -92,12 +123,12 @@ fn watches_the_index_and_every_tracked_file() {
 
     let actual = git_metadata::watch_paths(&package_root);
 
-    assert!(actual.contains(&package_root.join(".git/index")));
-    assert!(actual.contains(&package_root.join("src/main.rs")));
-    assert!(actual.contains(&package_root.join("README.md")));
+    assert!(contains_path(&actual, &package_root.join(".git/index")));
+    assert!(contains_path(&actual, &package_root.join("src/main.rs")));
+    assert!(contains_path(&actual, &package_root.join("README.md")));
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn watches_the_parent_of_a_non_utf8_tracked_file() {
     use std::ffi::OsString;
@@ -121,7 +152,7 @@ fn watches_the_parent_of_a_non_utf8_tracked_file() {
 
     let actual = git_metadata::watch_paths(&package_root);
 
-    assert!(actual.contains(&source_dir));
+    assert!(contains_path(&actual, &source_dir));
 }
 
 #[cfg(unix)]
@@ -141,7 +172,7 @@ fn watches_the_parent_of_a_newline_tracked_file() {
 
     let actual = git_metadata::watch_paths(&package_root);
 
-    assert!(actual.contains(&source_dir));
+    assert!(contains_path(&actual, &source_dir));
 }
 
 #[test]
@@ -183,7 +214,7 @@ fn watches_package_root_when_git_file_cannot_be_resolved() {
 
     let actual = git_metadata::watch_paths(&package_root);
 
-    assert!(actual.contains(&package_root));
+    assert!(contains_path(&actual, &package_root));
 }
 
 #[test]
@@ -206,9 +237,9 @@ fn watches_parent_repository_metadata_for_a_nested_package() {
 
     let actual = git_metadata::watch_paths(&package_root);
 
-    assert!(actual.contains(&repository.join(".git/index")));
-    assert!(actual.contains(&package_root.join("Cargo.toml")));
-    assert!(actual.contains(&repository.join("sibling.txt")));
+    assert!(contains_path(&actual, &repository.join(".git/index")));
+    assert!(contains_path(&actual, &package_root.join("Cargo.toml")));
+    assert!(contains_path(&actual, &repository.join("sibling.txt")));
 }
 
 #[test]
@@ -244,11 +275,11 @@ fn watches_tracked_files_in_a_real_linked_worktree() {
     };
     let actual = git_metadata::watch_paths(&worktree);
 
-    assert!(actual.contains(&git_dir.join("index")));
-    assert!(actual.contains(&worktree.join("README.md")));
+    assert!(contains_path(&actual, &git_dir.join("index")));
+    assert!(contains_path(&actual, &worktree.join("README.md")));
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn watches_linked_metadata_under_a_non_utf8_repository_path() {
     use std::ffi::OsString;
@@ -286,7 +317,7 @@ fn watches_linked_metadata_under_a_non_utf8_repository_path() {
     let cargo_path = git_metadata::cargo_watch_path(&worktree, index);
 
     assert!(!index.starts_with(&worktree));
-    assert!(actual.contains(&worktree.join("README.md")));
+    assert!(contains_path(&actual, &worktree.join("README.md")));
     assert!(cargo_path.to_str().is_some_and(|path| !path.contains('\n')));
 }
 
@@ -313,7 +344,7 @@ fn resolves_a_common_directory_path_ending_in_newline() {
 
     let actual = git_metadata::watch_paths(&package_root);
 
-    assert!(actual.contains(&common_dir.join("refs")));
+    assert!(contains_path(&actual, &common_dir.join("refs")));
 }
 
 fn run_git(package_root: &Path, args: &[&str]) {

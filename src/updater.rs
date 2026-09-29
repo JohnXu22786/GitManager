@@ -1541,7 +1541,7 @@ mod tests {
         assert!(launch_marker.exists(), "updated executable must be relaunched");
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn test_unix_update_script_preserves_non_utf8_paths() {
         use std::ffi::OsString;

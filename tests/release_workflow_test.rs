@@ -12,7 +12,9 @@ fn read_release_workflow() -> String {
         "release.yml must exist at {:?}",
         path
     );
-    fs::read_to_string(&path).expect("Failed to read release.yml")
+    fs::read_to_string(&path)
+        .expect("Failed to read release.yml")
+        .replace("\r\n", "\n")
 }
 
 fn workflow_job_section(content: &str, name: &str) -> String {

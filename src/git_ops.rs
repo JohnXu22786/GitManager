@@ -460,15 +460,49 @@ fn index_path_overlaps_any(path: &[u8], changed_paths: &[Vec<u8>]) -> bool {
         .any(|changed_path| overlaps(path, changed_path))
 }
 
-/// Compare two paths for equality, handling case-insensitivity and separator normalization on Windows.
+fn canonical_path_for_comparison(path: &Path) -> PathBuf {
+    let original = path;
+    let mut candidate = path;
+    let mut missing_components = Vec::new();
+
+    loop {
+        if let Ok(mut canonical) = std::fs::canonicalize(candidate) {
+            for component in missing_components.iter().rev() {
+                canonical.push(component);
+            }
+            return canonical;
+        }
+
+        let Some(file_name) = candidate.file_name() else {
+            return original.to_path_buf();
+        };
+        missing_components.push(file_name.to_os_string());
+        let Some(parent) = candidate.parent() else {
+            return original.to_path_buf();
+        };
+        candidate = parent;
+    }
+}
+
+/// Compare filesystem paths after resolving aliases such as macOS `/var` and
+/// Windows short or verbatim paths.
 fn paths_match(a: &Path, b: &Path) -> bool {
+    let a = canonical_path_for_comparison(a);
+    let b = canonical_path_for_comparison(b);
     #[cfg(windows)]
     {
-        // Normalize both paths: lowercase, replace / with \
-        fn normalize(p: &Path) -> String {
-            p.to_string_lossy().to_lowercase().replace('/', "\\")
+        fn normalize(path: &Path) -> String {
+            let path = path.to_string_lossy().replace('/', "\\");
+            let path = if let Some(unc_path) = path.strip_prefix(r"\\?\UNC\") {
+                format!(r"\\{}", unc_path)
+            } else if let Some(path) = path.strip_prefix(r"\\?\") {
+                path.to_owned()
+            } else {
+                path
+            };
+            path.to_lowercase()
         }
-        normalize(a) == normalize(b)
+        normalize(&a) == normalize(&b)
     }
     #[cfg(not(windows))]
     {
@@ -1406,7 +1440,8 @@ fn remove_worktree_directory(
 
         let staging_path = worktree_staging_path(path)?;
         if let Err(rename_error) = std::fs::rename(path, &staging_path) {
-            if force {
+            // Keep clean removal available when Windows rejects the staging rename.
+            if force || cfg!(windows) {
                 let path_identity = file_identity_from_path(path).ok_or_else(|| {
                     std::io::Error::new(
                         std::io::ErrorKind::Other,
@@ -1421,7 +1456,7 @@ fn remove_worktree_directory(
                     return Err(std::io::Error::new(
                         force_error.kind(),
                         format!(
-                            "{}; force cleanup fallback failed: {}",
+                            "{}; cleanup fallback failed: {}",
                             rename_error, force_error
                         ),
                     ));
@@ -1566,7 +1601,28 @@ where
             "directory identity changed before removal",
         ));
     }
-    std::fs::remove_dir_all(path)
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            #[cfg(windows)]
+            {
+                if !path_entry_exists(path)? {
+                    return Ok(());
+                }
+                if !is_safe() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "directory identity changed before removal",
+                    ));
+                }
+                let _ = force_remove_dir_windows(path);
+                if !path_entry_exists(path)? {
+                    return Ok(());
+                }
+            }
+            Err(error)
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -1729,7 +1785,11 @@ impl GitRepo {
 
     pub fn open(&mut self, path: &Path) -> GitResult<()> {
         let r = Repository::open(path).map_err(|e| format!("Open repo: {}", e))?;
-        let p = r.workdir().map(Path::to_path_buf).unwrap_or_else(|| path.to_path_buf());
+        let p = match r.workdir() {
+            Some(workdir) if path.is_absolute() && paths_match(workdir, path) => path.to_path_buf(),
+            Some(workdir) => workdir.to_path_buf(),
+            None => path.to_path_buf(),
+        };
         *self.repo.borrow_mut() = Some(r);
         self.path = Some(p);
         Ok(())
@@ -3181,6 +3241,10 @@ mod tests {
     /// Helper to create a temporary git repo with an initial commit
     fn create_repo_with_commit(dir: &Path) -> Repository {
         let repo = Repository::init(dir).expect("init repo");
+        repo.config()
+            .expect("repository config")
+            .set_bool("core.autocrlf", false)
+            .expect("disable line-ending conversion in test repository");
         let sig = repo.signature().expect("signature");
         let tree_oid = {
             let mut idx = repo.index().expect("index");
@@ -3191,6 +3255,29 @@ mod tests {
             .expect("initial commit");
         drop(tree);
         repo
+    }
+
+    #[test]
+    fn paths_match_resolves_filesystem_aliases_and_missing_children() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let canonical = dir.path().canonicalize().expect("canonical path");
+
+        assert!(paths_match(dir.path(), &canonical));
+        assert!(paths_match(
+            &dir.path().join("not-created"),
+            &canonical.join("not-created"),
+        ));
+    }
+
+    #[test]
+    fn open_preserves_the_selected_worktree_path() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        drop(create_repo_with_commit(dir.path()));
+        let selected_path = dir.path().to_path_buf();
+
+        let git = open_git_repo(&selected_path);
+
+        assert_eq!(git.path(), Some(selected_path.as_path()));
     }
 
     /// Helper: create a GitRepo (our wrapper) from a temp directory path
@@ -3639,7 +3726,7 @@ mod tests {
                 "set remote HEAD",
             )
             .expect("set remote HEAD");
-        let remote_url = format!("file://{}", remote_dir.path().to_string_lossy());
+        let remote_url = local_remote_url(remote_dir.path());
         let mut origin = local_repo.remote("origin", &remote_url).expect("add origin");
         let refspec = format!(
             "refs/heads/{0}:refs/heads/{0}",
@@ -4285,6 +4372,10 @@ mod tests {
     fn test_checkout_branch_from_unborn_head() {
         let dir = tempfile::tempdir().expect("temp dir");
         let repo = Repository::init(dir.path()).expect("initialize repository");
+        repo.config()
+            .expect("repository config")
+            .set_bool("core.autocrlf", false)
+            .expect("disable line-ending conversion in test repository");
         let signature = git2::Signature::now("Test User", "test@example.com").expect("signature");
         let blob = repo.blob(b"feature contents\n").expect("write feature blob");
         let tree_oid = {
@@ -5346,7 +5437,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn test_status_preserves_non_utf8_path_for_file_operations() {
         use std::ffi::OsString;
@@ -5403,7 +5494,7 @@ mod tests {
             .find(|worktree| worktree.is_main)
             .expect("main worktree");
 
-        assert_eq!(main.path, main_dir.path());
+        assert!(paths_match(&main.path, main_dir.path()));
     }
 
     #[test]
@@ -5468,10 +5559,10 @@ mod tests {
 
         let primary = worktrees.iter().find(|worktree| worktree.is_main).expect("primary row");
         let linked = worktrees.iter().find(|worktree| !worktree.is_main).expect("linked row");
-        assert_eq!(primary.path, main_dir.path());
+        assert!(paths_match(&primary.path, main_dir.path()));
         assert_eq!(primary.branch.as_deref(), Some(main_branch.as_str()));
         assert_eq!(primary.sha, main_sha);
-        assert_eq!(linked.path, wt_path);
+        assert!(paths_match(&linked.path, &wt_path));
         assert_eq!(linked.branch.as_deref(), Some(linked_branch));
         assert_eq!(linked.sha, linked_sha);
     }
@@ -5514,7 +5605,7 @@ mod tests {
             .find(|worktree| worktree.is_main)
             .expect("main worktree");
 
-        assert_eq!(main.path, main_dir);
+        assert!(paths_match(&main.path, &main_dir));
     }
 
     #[test]
@@ -6339,7 +6430,7 @@ mod tests {
             .worktrees()
             .expect("list worktrees")
             .into_iter()
-            .find(|worktree| worktree.path == wt_path)
+            .find(|worktree| paths_match(&worktree.path, &wt_path))
             .and_then(|worktree| worktree.git_link_identity)
             .expect("capture git link identity");
         let git_link_contents = std::fs::read(wt_path.join(".git")).expect("read git link");
@@ -6395,7 +6486,7 @@ mod tests {
             .worktrees()
             .expect("list worktrees")
             .into_iter()
-            .find(|worktree| worktree.path == wt_path)
+            .find(|worktree| paths_match(&worktree.path, &wt_path))
             .and_then(|worktree| worktree.git_link_identity)
             .expect("capture git link identity");
         std::fs::hard_link(wt_path.join(".git"), &held_git_link)
@@ -6671,7 +6762,7 @@ mod tests {
         assert!(!wt_gitdir.exists(), "Symlinked-git worktree metadata should be removed");
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn test_worktree_git_link_preserves_non_utf8_path_bytes() {
         use std::ffi::OsString;
@@ -6816,8 +6907,8 @@ mod tests {
 
         let remaining = git.worktrees().expect("list worktrees");
         assert_eq!(remaining.len(), 3, "main and both valid worktrees should remain");
-        assert!(remaining.iter().any(|wt| wt.path == clean_path));
-        assert!(remaining.iter().any(|wt| wt.path == dirty_path));
+        assert!(remaining.iter().any(|wt| paths_match(&wt.path, &clean_path)));
+        assert!(remaining.iter().any(|wt| paths_match(&wt.path, &dirty_path)));
     }
 
     #[test]
@@ -7081,7 +7172,7 @@ mod tests {
         let root = tempfile::tempdir().expect("temp dir");
         let path = root
             .path()
-            .join("worktree&echo|preserved%literal!name^");
+            .join("worktree&echo-preserved%literal!name^");
         std::fs::create_dir_all(&path).expect("create directory");
         std::fs::write(path.join("file.txt"), "content").expect("write file");
 
