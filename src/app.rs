@@ -257,9 +257,11 @@ pub struct App {
     pub download_progress: f32,
     /// Pending Git operations running in background threads.
     pending_ops: Vec<PendingOp>,
+    #[cfg(test)]
+    test_before_operation: Option<Arc<dyn Fn() + Send + Sync>>,
     /// A destructive Git operation awaiting explicit user confirmation.
     pending_confirmation: Option<PendingConfirmation>,
-    /// Whether to auto-refresh after a mutation operation completes.
+    /// Whether an asynchronous repository refresh is queued.
     needs_refresh: bool,
     pub recent_repos: RecentRepos,
     pub status_expanded: bool,
@@ -330,6 +332,8 @@ impl App {
             update_dialog_dismissed: false,
             download_progress: 0.0,
             pending_ops: Vec::new(),
+            #[cfg(test)]
+            test_before_operation: None,
             pending_confirmation: None,
             needs_refresh: false,
             recent_repos: RecentRepos::load(),
@@ -563,9 +567,13 @@ impl App {
                 self.diff_content.clear();
                 self.diff_path.clear();
                 self.show_diff = false;
-                self.status_message = format!("Opened repository at {}", path_display);
-                self.status_is_error = false;
-                self.refresh_all();
+                self.status_entries.clear();
+                self.branches.clear();
+                self.worktrees.clear();
+                self.commits.clear();
+                self.stashes.clear();
+                self.remote_list.clear();
+                self.needs_refresh = true;
                 if let Err(error) = self.recent_repos.add(&path_display) {
                     self.status_message = format!(
                         "Opened repository at {} (failed to save recent history: {})",
@@ -953,8 +961,14 @@ impl App {
         let repo_generation = self.repo_generation;
         let progress = Arc::new(Mutex::new(String::new()));
         let op_progress = progress.clone();
+        #[cfg(test)]
+        let test_before_operation = self.test_before_operation.clone();
 
         std::thread::spawn(move || {
+            #[cfg(test)]
+            if let Some(test_before_operation) = test_before_operation {
+                test_before_operation();
+            }
             let result = execute_operation(&repo_path, op, op_progress);
             let _ = tx.send(result);
         });
@@ -1117,8 +1131,11 @@ impl App {
             }
         }
 
-        // Trigger async refresh after mutation operations complete
-        if self.needs_refresh && self.pending_ops.is_empty() {
+        // Start a queued refresh once other operations and confirmations are clear.
+        if self.needs_refresh
+            && self.pending_ops.is_empty()
+            && self.pending_confirmation.is_none()
+        {
             self.needs_refresh = false;
             if self.git.is_open() {
                 self.start_operation(ctx, "Refreshing", GitOperation::RefreshAll);
@@ -1193,47 +1210,14 @@ impl App {
         }
     }
 
-    pub fn refresh_all(&mut self) {
-        if !self.git.is_open() {
+    pub fn refresh_all(&mut self, ctx: &egui::Context) {
+        if !self.git.is_open() || self.is_busy() || self.pending_confirmation.is_some() {
             return;
         }
         self.status_message.clear();
         self.status_is_error = false;
-
-        // Perform each operation with error reporting instead of silent swallowing
-        let mut errors: Vec<String> = Vec::new();
-
-        self.status_entries = self.git.get_status().unwrap_or_else(|e| {
-            errors.push(format!("Status: {}", e));
-            Vec::new()
-        });
-        self.branches = self.git.branches().unwrap_or_else(|e| {
-            errors.push(format!("Branches: {}", e));
-            Vec::new()
-        });
-        self.worktrees = self.git.worktrees().unwrap_or_else(|e| {
-            errors.push(format!("Worktrees: {}", e));
-            Vec::new()
-        });
-        let commits = self.git.log(100).unwrap_or_else(|e| {
-            errors.push(format!("Log: {}", e));
-            Vec::new()
-        });
-        self.commits = filter_commits(commits, &self.log_search);
-        self.stashes = self.git.stash_list().unwrap_or_else(|e| {
-            errors.push(format!("Stash: {}", e));
-            Vec::new()
-        });
-        self.remote_list = self.git.remotes().unwrap_or_else(|e| {
-            errors.push(format!("Remotes: {}", e));
-            Vec::new()
-        });
-
-        if !errors.is_empty() {
-            self.show_error(errors.join("; "));
-        }
-
-        self.last_refresh = std::time::Instant::now();
+        self.needs_refresh = false;
+        self.start_operation(ctx, "Refreshing", GitOperation::RefreshAll);
     }
 
     pub fn show_error(&mut self, msg: String) {
@@ -1879,6 +1863,17 @@ impl eframe::App for App {
 mod tests {
     use super::*;
 
+    fn wait_for_background_operations(app: &mut App, ctx: &egui::Context) {
+        for _ in 0..200 {
+            app.process_pending_ops(ctx);
+            if !app.is_busy() && !app.needs_refresh {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("background repository operations should finish");
+    }
+
     #[test]
     fn app_version_matches_cargo_package_version() {
         assert_eq!(APP_VERSION, env!("CARGO_PKG_VERSION"));
@@ -2244,7 +2239,9 @@ mod tests {
 
         });
 
-        app.process_pending_ops(&egui::Context::default());
+        let ctx = egui::Context::default();
+        app.process_pending_ops(&ctx);
+        wait_for_background_operations(&mut app, &ctx);
 
         assert_eq!(app.repo_path, new_repo.path().to_string_lossy());
         assert_eq!(app.commits.len(), 1);
@@ -2285,6 +2282,37 @@ mod tests {
     }
 
     #[test]
+    fn refresh_all_returns_while_git_worker_is_blocked() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        drop(git2::Repository::init(dir.path()).expect("init repo"));
+        let mut app = App::new();
+        app.git.open(dir.path()).expect("open repo");
+        let ctx = egui::Context::default();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        app.test_before_operation = Some(Arc::new(move || {
+            let _ = started_tx.send(());
+            let _ = release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(2));
+        }));
+
+        app.refresh_all(&ctx);
+
+        let worker_started = started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .is_ok();
+        let refresh_is_pending = app.is_busy();
+        let _ = release_tx.send(());
+        assert!(worker_started, "refresh Git work should start on a worker thread");
+        assert!(refresh_is_pending, "the UI should retain a pending refresh");
+        app.test_before_operation = None;
+        wait_for_background_operations(&mut app, &ctx);
+    }
+
+    #[test]
     fn test_refresh_all_preserves_active_log_filter() {
         let dir = tempfile::tempdir().expect("temp dir");
         let repo = git2::Repository::init(dir.path()).expect("init repo");
@@ -2308,7 +2336,9 @@ mod tests {
         let mut app = App::new();
         app.git.open(dir.path()).expect("open repo");
         app.log_search = "alice".to_string();
-        app.refresh_all();
+        let ctx = egui::Context::default();
+        app.refresh_all(&ctx);
+        wait_for_background_operations(&mut app, &ctx);
 
         assert_eq!(app.commits.len(), 1);
         assert_eq!(app.commits[0].author, "alice");

@@ -12,7 +12,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let busy = app.is_busy();
             if crate::ui::add_enabled_ellipsis(ui, !busy, "🔄 Refresh").clicked() {
-                app.refresh_all();
+                app.refresh_all(ctx);
             }
             if crate::ui::add_enabled_ellipsis(ui, !busy, "Prune").clicked() {
                 app.start_operation(ctx, "Pruning stale worktrees", GitOperation::PruneWorktrees);

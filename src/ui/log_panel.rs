@@ -7,7 +7,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             .on_hover_text("Commit Log");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if crate::ui::add_enabled_ellipsis(ui, !app.is_busy(), "🔄 Refresh").clicked() {
-                app.refresh_all();
+                app.refresh_all(ctx);
             }
     });
 
