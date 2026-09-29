@@ -2642,9 +2642,19 @@ impl GitRepo {
     }
 
     pub fn stage_file<P: AsRef<Path>>(&self, path: P) -> GitResult<()> {
+        let path = path.as_ref();
         let repo = self.repo()?;
+        let workdir = repo
+            .workdir()
+            .ok_or_else(|| "Stage: repository has no working directory".to_string())?;
         let mut idx = repo.index().map_err(|e| format!("Index: {}", e))?;
-        idx.add_path(path.as_ref()).map_err(|e| format!("Stage: {}", e))?;
+        match std::fs::symlink_metadata(workdir.join(path)) {
+            Ok(_) => idx.add_path(path).map_err(|e| format!("Stage: {}", e))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                idx.remove_path(path).map_err(|e| format!("Stage: {}", e))?;
+            }
+            Err(error) => return Err(format!("Stage: {}", error)),
+        }
         idx.write().map_err(|e| format!("Write: {}", e))?;
         Ok(())
     }
@@ -5247,6 +5257,64 @@ mod tests {
             std::fs::read_to_string(dir.path().join(path)).expect("read working tree file"),
             "working tree version\n",
             "unstaging must preserve the working tree change"
+        );
+    }
+
+    #[test]
+    fn test_stage_file_stages_deleted_tracked_path() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = create_repo_with_commit(dir.path());
+        let path = Path::new("deleted.txt");
+        let working_path = dir.path().join(path);
+        std::fs::write(&working_path, "tracked content\n").expect("write tracked file");
+        let tree_oid = {
+            let mut index = repo.index().expect("index");
+            index.add_path(path).expect("stage tracked file");
+            let tree_oid = index.write_tree().expect("write tree");
+            index.write().expect("write index");
+            tree_oid
+        };
+        let tree = repo.find_tree(tree_oid).expect("tree");
+        let parent = repo.head().expect("HEAD").peel_to_commit().expect("parent commit");
+        let signature = repo.signature().expect("signature");
+        repo.commit(Some("HEAD"), &signature, &signature, "add tracked file", &tree, &[&parent])
+            .expect("commit tracked file");
+        drop(tree);
+        drop(parent);
+        drop(repo);
+
+        let git = open_git_repo(dir.path());
+        std::fs::remove_file(&working_path).expect("delete tracked file");
+        let before = git.get_status().expect("status before staging");
+        assert!(
+            before
+                .iter()
+                .any(|entry| entry.path == path && entry.status == 'D' && !entry.staged),
+            "expected an unstaged deletion, got: {:?}",
+            before
+        );
+
+        git.stage_file(path).expect("stage deletion");
+
+        let after = git.get_status().expect("status after staging");
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].path, path);
+        assert_eq!(after[0].status, 'D');
+        assert!(after[0].staged, "the deletion must be in the index");
+        let reopened = Repository::open(dir.path()).expect("reopen repo");
+        assert!(
+            reopened.index().expect("index").get_path(path, 0).is_none(),
+            "staging a deletion must remove the path from the index"
+        );
+        assert!(
+            reopened
+                .head()
+                .expect("HEAD")
+                .peel_to_tree()
+                .expect("HEAD tree")
+                .get_path(path)
+                .is_ok(),
+            "the committed version must remain in HEAD"
         );
     }
 
