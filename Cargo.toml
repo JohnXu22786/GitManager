@@ -5,6 +5,10 @@ edition = "2021"
 description = "A dedicated Git branch & worktree manager GUI"
 homepage = "https://github.com/JohnXu22786/GitManager"
 repository = "https://github.com/JohnXu22786/GitManager"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+keywords = ["git", "branch", "worktree", "desktop", "gui"]
+categories = ["development-tools", "gui"]
 
 [dependencies]
 eframe = { version = "0.31", features = ["wgpu"] }
