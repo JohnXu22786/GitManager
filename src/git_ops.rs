@@ -81,6 +81,12 @@ pub struct WorktreeFileIdentity {
     _lock_file: Option<Arc<std::fs::File>>,
 }
 
+impl WorktreeFileIdentity {
+    pub fn matches_path(&self, path: &Path) -> bool {
+        staged_worktree_link_matches(path, self)
+    }
+}
+
 /// Describes a Git operation to be executed in a background thread.
 pub enum GitOperation {
     StageAll,
@@ -100,6 +106,7 @@ pub enum GitOperation {
         path: PathBuf,
         force: bool,
         expected_git_link: Option<WorktreeFileIdentity>,
+        expected_head: WorktreeHeadSnapshot,
         require_git_link_identity: bool,
     },
     PruneWorktrees,
@@ -116,6 +123,8 @@ pub enum GitOperation {
     LogSearch { filter: String, request_id: u64 },
     /// Refresh all cached data from the repository.
     RefreshAll,
+    /// Refresh with a full status scan for one worktree cleanup preview.
+    RefreshWorktreeCleanup(PathBuf),
 }
 
 /// Result of a Git operation executed in a background thread.
@@ -218,6 +227,7 @@ impl GitOperation {
                 path,
                 force,
                 expected_git_link,
+                expected_head,
                 require_git_link_identity,
             } => {
                 Self::simple(
@@ -226,6 +236,7 @@ impl GitOperation {
                         force,
                         expected_git_link,
                         require_git_link_identity,
+                        Some(expected_head),
                     ),
                     {
                     if force { format!("Force removed worktree at {:?}", path) }
@@ -282,16 +293,51 @@ impl GitOperation {
                     commits,
                 }
             }
-            GitOperation::RefreshAll => {
-                let mut errors: Vec<String> = Vec::new();
-                let status_entries = repo.get_status().unwrap_or_else(|e| { errors.push(format!("Status: {}", e)); Vec::new() });
-                let branches = repo.branches().unwrap_or_else(|e| { errors.push(format!("Branches: {}", e)); Vec::new() });
-                let worktrees = repo.worktrees().unwrap_or_else(|e| { errors.push(format!("Worktrees: {}", e)); Vec::new() });
-                let commits = repo.log(100).unwrap_or_else(|e| { errors.push(format!("Log: {}", e)); Vec::new() });
-                let stashes = repo.stash_list().unwrap_or_else(|e| { errors.push(format!("Stash: {}", e)); Vec::new() });
-                let remote_list = repo.remotes().unwrap_or_else(|e| { errors.push(format!("Remotes: {}", e)); Vec::new() });
-                OpResult::RefreshData { status_entries, branches, worktrees, commits, stashes, remote_list, errors }
+            GitOperation::RefreshAll => Self::refresh_data(repo, None),
+            GitOperation::RefreshWorktreeCleanup(path) => {
+                Self::refresh_data(repo, Some(&path))
             }
+        }
+    }
+
+    fn refresh_data(repo: &GitRepo, detailed_worktree_path: Option<&Path>) -> OpResult {
+        let mut errors = Vec::new();
+        let status_entries = repo.get_status().unwrap_or_else(|error| {
+            errors.push(format!("Status: {}", error));
+            Vec::new()
+        });
+        let branches = repo.branches().unwrap_or_else(|error| {
+            errors.push(format!("Branches: {}", error));
+            Vec::new()
+        });
+        let worktrees = match detailed_worktree_path {
+            Some(path) => repo.worktrees_for_cleanup(path),
+            None => repo.worktrees(),
+        }
+        .unwrap_or_else(|error| {
+            errors.push(format!("Worktrees: {}", error));
+            Vec::new()
+        });
+        let commits = repo.log(100).unwrap_or_else(|error| {
+            errors.push(format!("Log: {}", error));
+            Vec::new()
+        });
+        let stashes = repo.stash_list().unwrap_or_else(|error| {
+            errors.push(format!("Stash: {}", error));
+            Vec::new()
+        });
+        let remote_list = repo.remotes().unwrap_or_else(|error| {
+            errors.push(format!("Remotes: {}", error));
+            Vec::new()
+        });
+        OpResult::RefreshData {
+            status_entries,
+            branches,
+            worktrees,
+            commits,
+            stashes,
+            remote_list,
+            errors,
         }
     }
 
@@ -321,13 +367,57 @@ pub struct BranchInfo {
     pub last_commit_time: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorktreeHeadSnapshot {
+    pub attached_ref: Option<Vec<u8>>,
+    pub target: Option<git2::Oid>,
+}
+
 #[derive(Clone, Debug)]
 pub struct WorktreeInfo {
     pub path: PathBuf,
     pub branch: Option<String>,
     pub sha: String,
+    pub head_snapshot: Option<WorktreeHeadSnapshot>,
     pub is_main: bool,
     pub git_link_identity: Option<WorktreeFileIdentity>,
+    pub status: WorktreeStatusSummary,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WorktreeStatusSummary {
+    pub staged_changes: usize,
+    pub unstaged_changes: usize,
+    pub untracked_paths: usize,
+    pub ignored_paths: usize,
+    pub conflicted_paths: usize,
+    pub change_path_count: usize,
+    pub change_paths: Vec<WorktreeChange>,
+    pub omitted_path_count: usize,
+    pub upstream: Option<String>,
+    pub ahead: Option<usize>,
+    pub behind: Option<usize>,
+    pub merged_into_main: Option<bool>,
+    pub locked: bool,
+    pub lock_reason: Option<String>,
+    pub directory_missing: bool,
+    pub inspection_error: Option<String>,
+}
+
+impl WorktreeStatusSummary {
+    pub fn has_removal_blockers(&self) -> bool {
+        self.change_path_count > 0 || self.locked
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct WorktreeChange {
+    pub path: PathBuf,
+    pub staged: bool,
+    pub unstaged: bool,
+    pub untracked: bool,
+    pub ignored: bool,
+    pub conflicted: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1214,6 +1304,160 @@ fn worktree_staging_path(path: &Path) -> std::io::Result<PathBuf> {
         std::io::ErrorKind::AlreadyExists,
         "could not find an unused worktree staging path",
     ))
+}
+
+const WORKTREE_CHANGE_SAMPLE_LIMIT: usize = 12;
+
+fn summarize_worktree_status(
+    repository: &Repository,
+    main_head: Option<git2::Oid>,
+    scan_all_paths: bool,
+) -> WorktreeStatusSummary {
+    let mut summary = WorktreeStatusSummary::default();
+    // Keep normal refreshes shallow; cleanup previews can enumerate one selected worktree.
+    let mut options = git2::StatusOptions::new();
+    options
+        .include_untracked(true)
+        .recurse_untracked_dirs(scan_all_paths)
+        .include_ignored(true)
+        .recurse_ignored_dirs(scan_all_paths)
+        .show(git2::StatusShow::IndexAndWorkdir);
+
+    let statuses = match repository.statuses(Some(&mut options)) {
+        Ok(statuses) => statuses,
+        Err(error) => {
+            summary.inspection_error = Some(format!("Read worktree status: {}", error));
+            return summary;
+        }
+    };
+
+    for entry in statuses.iter() {
+        let flags = entry.status();
+        let ignored = flags.contains(Status::IGNORED);
+        let conflicted = flags.contains(Status::CONFLICTED);
+        let staged = flags.intersects(
+            Status::INDEX_NEW
+                | Status::INDEX_MODIFIED
+                | Status::INDEX_DELETED
+                | Status::INDEX_RENAMED
+                | Status::INDEX_TYPECHANGE,
+        );
+        let untracked = !ignored && flags.contains(Status::WT_NEW);
+        let unstaged = flags.intersects(
+            Status::WT_MODIFIED | Status::WT_DELETED | Status::WT_RENAMED | Status::WT_TYPECHANGE,
+        );
+
+        if staged {
+            summary.staged_changes += 1;
+        }
+        if unstaged {
+            summary.unstaged_changes += 1;
+        }
+        if untracked {
+            summary.untracked_paths += 1;
+        }
+        if ignored {
+            summary.ignored_paths += 1;
+        }
+        if conflicted {
+            summary.conflicted_paths += 1;
+        }
+
+        if staged || unstaged || untracked || ignored || conflicted {
+            summary.change_path_count += 1;
+            if summary.change_paths.len() < WORKTREE_CHANGE_SAMPLE_LIMIT {
+                summary.change_paths.push(WorktreeChange {
+                    path: path_from_git_bytes(entry.path_bytes()),
+                    staged,
+                    unstaged,
+                    untracked,
+                    ignored,
+                    conflicted,
+                });
+            }
+        }
+    }
+    summary.omitted_path_count = summary
+        .change_path_count
+        .saturating_sub(summary.change_paths.len());
+
+    if let Ok(head) = repository.head() {
+        if let (Some(main_head), Some(worktree_head)) = (main_head, head.target()) {
+            summary.merged_into_main = if main_head == worktree_head {
+                Some(true)
+            } else {
+                repository.graph_descendant_of(main_head, worktree_head).ok()
+            };
+        }
+
+        if head.is_branch() {
+            if let Some(branch_name) = head.shorthand() {
+                if let Ok(branch) = repository.find_branch(branch_name, BranchType::Local) {
+                    if let Ok(upstream) = branch.upstream() {
+                        summary.upstream = upstream.name().ok().flatten().map(str::to_owned);
+                        if let (Some(local), Some(remote)) =
+                            (branch.get().target(), upstream.get().target())
+                        {
+                            if let Ok((ahead, behind)) =
+                                repository.graph_ahead_behind(local, remote)
+                            {
+                                summary.ahead = Some(ahead);
+                                summary.behind = Some(behind);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    summary
+}
+
+fn worktree_head_snapshot(repository: &Repository) -> GitResult<WorktreeHeadSnapshot> {
+    let detached = repository
+        .head_detached()
+        .map_err(|error| format!("Read worktree HEAD attachment: {}", error))?;
+    let head = repository
+        .head()
+        .map_err(|error| format!("Read worktree HEAD: {}", error))?;
+    let attached_ref = if detached {
+        None
+    } else {
+        Some(head.name_bytes().to_vec())
+    };
+    Ok(WorktreeHeadSnapshot {
+        attached_ref,
+        target: head.target(),
+    })
+}
+
+fn branch_name_from_head_snapshot(snapshot: &WorktreeHeadSnapshot) -> Option<String> {
+    snapshot
+        .attached_ref
+        .as_deref()?
+        .strip_prefix(b"refs/heads/")
+        .map(|name| String::from_utf8_lossy(name).into_owned())
+}
+
+fn worktree_metadata_repository(
+    repository: &Repository,
+    worktree: &git2::Worktree,
+) -> GitResult<Repository> {
+    let name = worktree
+        .name()
+        .ok_or_else(|| "Worktree name is unavailable".to_string())?;
+    let git_dir = repository.commondir().join("worktrees").join(name);
+    Repository::open(&git_dir)
+        .map_err(|error| format!("Open worktree metadata '{}': {}", name, error))
+}
+
+fn worktree_head_snapshot_from_metadata(
+    repository: &Repository,
+    worktree: &git2::Worktree,
+) -> GitResult<WorktreeHeadSnapshot> {
+    let worktree_repo = worktree_metadata_repository(repository, worktree)?;
+    worktree_head_snapshot(&worktree_repo)
 }
 
 fn worktree_is_clean(path: &Path) -> GitResult<bool> {
@@ -2331,26 +2575,70 @@ impl GitRepo {
     }
 
     pub fn worktrees(&self) -> GitResult<Vec<WorktreeInfo>> {
+        self.worktrees_with_cleanup_scan(None)
+    }
+
+    fn worktrees_for_cleanup(&self, path: &Path) -> GitResult<Vec<WorktreeInfo>> {
+        self.worktrees_with_cleanup_scan(Some(path))
+    }
+
+    fn worktrees_with_cleanup_scan(
+        &self,
+        detailed_path: Option<&Path>,
+    ) -> GitResult<Vec<WorktreeInfo>> {
         let repo = self.repo()?;
         let mp = main_worktree_path(&repo)?;
-        let (main_branch, main_sha) = Repository::open(&mp)
-            .ok()
-            .and_then(|main_repo| {
-                let head = main_repo.head().ok()?;
-                let branch = if head.is_branch() {
-                    head.shorthand().map(String::from)
-                } else {
-                    None
-                };
-                let sha = head.target().map(|oid| oid.to_string()).unwrap_or_default();
-                Some((branch, sha))
+        let main_repo = Repository::open(&mp).ok();
+        let (main_branch, main_sha, main_head, main_head_snapshot, head_error) =
+            match main_repo.as_ref() {
+                Some(main_repo) => match worktree_head_snapshot(main_repo) {
+                    Ok(snapshot) => {
+                        let main_head = snapshot.target;
+                        let branch = branch_name_from_head_snapshot(&snapshot);
+                        let sha = main_head.map(|oid| oid.to_string()).unwrap_or_default();
+                        (branch, sha, main_head, Some(snapshot), None)
+                    }
+                    Err(error) => (None, String::new(), None, None, Some(error)),
+                },
+                None => (
+                    None,
+                    String::new(),
+                    None,
+                    None,
+                    Some("Open main worktree to read HEAD".into()),
+                ),
+            };
+        let mut main_status = main_repo
+            .as_ref()
+            .map(|main_repo| {
+                summarize_worktree_status(
+                    main_repo,
+                    main_head,
+                    detailed_path.is_some_and(|path| paths_match(path, &mp)),
+                )
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| WorktreeStatusSummary {
+                inspection_error: Some("Open main worktree to read status".into()),
+                ..WorktreeStatusSummary::default()
+            });
+        if let Some(error) = head_error {
+            main_status.inspection_error = Some(match main_status.inspection_error.take() {
+                Some(existing) => format!("{}; {}", existing, error),
+                None => error,
+            });
+        }
+        if main_head.is_some() {
+            main_status.merged_into_main = Some(true);
+        }
         let mut list = Vec::new();
         list.push(WorktreeInfo {
-            path: mp, branch: main_branch, sha: main_sha,
+            path: mp,
+            branch: main_branch,
+            sha: main_sha,
+            head_snapshot: main_head_snapshot,
             is_main: true,
             git_link_identity: None,
+            status: main_status,
         });
 
         let names = repo.worktrees().map_err(|e| format!("Worktrees: {}", e))?;
@@ -2358,27 +2646,96 @@ impl GitRepo {
             if let Ok(wt) = repo.find_worktree(name) {
                 let wp = wt.path().to_path_buf();
                 let git_link_identity = worktree_git_link_identity(&wp);
-                if let Ok(r) = Repository::open(&wp) {
-                    let branch = r.head().ok().and_then(|h| {
-                        if h.is_branch() { h.shorthand().map(String::from) } else { None }
-                    });
-                    let sha = r.head().ok().and_then(|h| h.target().map(|o| o.to_string())).unwrap_or_default();
-                    list.push(WorktreeInfo {
-                        path: wp,
-                        branch,
-                        sha,
-                        is_main: false,
-                        git_link_identity,
-                    });
+                let (branch, sha, head_snapshot, mut status) = if path_exists(&wp)? {
+                    match Repository::open(&wp) {
+                        Ok(worktree_repo) => {
+                            let mut status = summarize_worktree_status(
+                                &worktree_repo,
+                                main_head,
+                                detailed_path.is_some_and(|path| paths_match(path, &wp)),
+                            );
+                            match worktree_head_snapshot(&worktree_repo) {
+                                Ok(snapshot) => {
+                                    let branch = branch_name_from_head_snapshot(&snapshot);
+                                    let sha = snapshot
+                                        .target
+                                        .map(|oid| oid.to_string())
+                                        .unwrap_or_default();
+                                    (branch, sha, Some(snapshot), status)
+                                }
+                                Err(error) => {
+                                    status.inspection_error = Some(match status.inspection_error.take() {
+                                        Some(existing) => format!("{}; {}", existing, error),
+                                        None => error,
+                                    });
+                                    (None, String::new(), None, status)
+                                }
+                            }
+                        }
+                        Err(error) => (
+                            None,
+                            String::new(),
+                            None,
+                            WorktreeStatusSummary {
+                                inspection_error: Some(format!("Open worktree: {}", error)),
+                                ..WorktreeStatusSummary::default()
+                            },
+                        ),
+                    }
                 } else {
-                    list.push(WorktreeInfo {
-                        path: wp,
-                        branch: None,
-                        sha: String::new(),
-                        is_main: false,
-                        git_link_identity,
-                    });
+                    let mut status = WorktreeStatusSummary {
+                        directory_missing: true,
+                        ..WorktreeStatusSummary::default()
+                    };
+                    match worktree_head_snapshot_from_metadata(&repo, &wt) {
+                        Ok(snapshot) => {
+                            if let (Some(main_head), Some(worktree_head)) =
+                                (main_head, snapshot.target)
+                            {
+                                status.merged_into_main = if main_head == worktree_head {
+                                    Some(true)
+                                } else {
+                                    repo.graph_descendant_of(main_head, worktree_head).ok()
+                                };
+                            }
+                            let branch = branch_name_from_head_snapshot(&snapshot);
+                            let sha = snapshot
+                                .target
+                                .map(|oid| oid.to_string())
+                                .unwrap_or_default();
+                            (branch, sha, Some(snapshot), status)
+                        }
+                        Err(error) => {
+                            status.inspection_error = Some(error);
+                            (None, String::new(), None, status)
+                        }
+                    }
+                };
+
+                match worktree_lock_status(&repo, &wt) {
+                    Ok(git2::WorktreeLockStatus::Unlocked) => {}
+                    Ok(git2::WorktreeLockStatus::Locked(reason)) => {
+                        status.locked = true;
+                        status.lock_reason = reason;
+                    }
+                    Err(error) => {
+                        let lock_error = format!("Inspect worktree lock: {}", error);
+                        status.inspection_error = Some(match status.inspection_error.take() {
+                            Some(existing) => format!("{}; {}", existing, lock_error),
+                            None => lock_error,
+                        });
+                    }
                 }
+
+                list.push(WorktreeInfo {
+                    path: wp,
+                    branch,
+                    sha,
+                    head_snapshot,
+                    is_main: false,
+                    git_link_identity,
+                    status,
+                });
             }
         }
         Ok(list)
@@ -2452,7 +2809,18 @@ impl GitRepo {
     }
 
     pub fn remove_worktree(&self, path: &Path, force: bool) -> GitResult<()> {
-        self.remove_worktree_with_identity(path, force, None, false)
+        let repo = self.repo()?;
+        let names = repo.worktrees().map_err(|error| format!("Worktrees: {}", error))?;
+        let worktree = names.iter().flatten().find_map(|name| {
+            repo.find_worktree(name)
+                .ok()
+                .filter(|worktree| paths_match(worktree.path(), path))
+        });
+        let expected_head = worktree
+            .as_ref()
+            .map(|worktree| worktree_head_snapshot_from_metadata(&repo, worktree))
+            .transpose()?;
+        self.remove_worktree_with_identity(path, force, None, false, expected_head)
     }
 
     fn remove_worktree_with_identity(
@@ -2461,6 +2829,7 @@ impl GitRepo {
         force: bool,
         expected_git_link: Option<WorktreeFileIdentity>,
         require_git_link_identity: bool,
+        expected_head: Option<WorktreeHeadSnapshot>,
     ) -> GitResult<()> {
         let expected_git_link = match expected_git_link {
             Some(identity) => Some(identity),
@@ -2514,6 +2883,45 @@ impl GitRepo {
             }
         } else if path_exists(path)? {
             return Err("Cannot remove path that is not a registered worktree.".into());
+        }
+
+        if require_git_link_identity && expected_head.is_none() {
+            return Err("Cannot remove worktree because its HEAD snapshot is unavailable.".into());
+        }
+        let head_repository = match expected_head.as_ref() {
+            Some(_) => {
+                let worktree = found_wt
+                    .as_ref()
+                    .ok_or_else(|| "Cannot verify HEAD for an unregistered worktree.".to_string())?;
+                Some(worktree_metadata_repository(&repo, worktree)?)
+            }
+            None => None,
+        };
+        let mut _head_transaction = None;
+        if let (Some(expected_head), Some(head_repository)) =
+            (expected_head.as_ref(), head_repository.as_ref())
+        {
+            let mut transaction = head_repository
+                .transaction()
+                .map_err(|error| format!("Lock worktree HEAD for removal: {}", error))?;
+            transaction
+                .lock_ref("HEAD")
+                .map_err(|error| format!("Lock worktree HEAD for removal: {}", error))?;
+            if let Some(attached_ref) = expected_head.attached_ref.as_deref() {
+                let attached_ref = std::str::from_utf8(attached_ref)
+                    .map_err(|_| "Cannot safely lock the worktree branch reference".to_string())?;
+                transaction.lock_ref(attached_ref).map_err(|error| {
+                    format!("Lock worktree branch for removal: {}", error)
+                })?;
+            }
+            let actual_head = worktree_head_snapshot(head_repository)?;
+            if &actual_head != expected_head {
+                return Err(
+                    "Worktree HEAD changed since the cleanup preview; review the new commit and retry."
+                        .into(),
+                );
+            }
+            _head_transaction = Some(transaction);
         }
 
         // Regular removal must not discard uncommitted work. Check the
@@ -2599,8 +3007,38 @@ impl GitRepo {
                     .as_ref()
                     .map(|identity| worktree_lock_identity_matches(&repo, wt, identity))
                     .unwrap_or(true);
+                let head_matches = match expected_head.as_ref() {
+                    Some(expected_head) => {
+                        let actual_head = head_repository
+                            .as_ref()
+                            .map(worktree_head_snapshot)
+                            .unwrap_or_else(|| worktree_head_snapshot_from_metadata(&repo, wt));
+                        match actual_head {
+                            Ok(actual_head) if &actual_head == expected_head => true,
+                            Ok(_) => {
+                                errors.push(
+                                    "Worktree HEAD changed during cleanup; Git metadata was kept."
+                                        .into(),
+                                );
+                                false
+                            }
+                            Err(error) => {
+                                errors.push(format!(
+                                    "Cannot verify worktree HEAD before pruning: {}",
+                                    error
+                                ));
+                                false
+                            }
+                        }
+                    }
+                    None => true,
+                };
+                #[cfg(windows)]
+                drop(_head_transaction.take()); // Windows cannot prune an open HEAD.lock.
                 let prune_result = if !lock_owned {
                     errors.push("Worktree lock changed during removal.".into());
+                    None
+                } else if !head_matches {
                     None
                 } else if lock_identity.is_some() {
                     let mut opts = WorktreePruneOptions::new();
@@ -5568,6 +6006,236 @@ mod tests {
     }
 
     #[test]
+    fn worktree_status_reports_changes_tracking_and_merge_state() {
+        let main_dir = tempfile::tempdir().expect("main temp dir");
+        let wt_root = tempfile::tempdir().expect("worktree temp dir");
+        let wt_path = wt_root.path().join("linked-wt");
+        let repo = create_repo_with_commit(main_dir.path());
+
+        std::fs::write(main_dir.path().join("tracked.txt"), "base\n").expect("write tracked file");
+        std::fs::write(main_dir.path().join(".gitignore"), "ignored.txt\n").expect("write ignore file");
+        let base_oid = {
+            let mut index = repo.index().expect("index");
+            index.add_path(Path::new("tracked.txt")).expect("stage tracked file");
+            index.add_path(Path::new(".gitignore")).expect("stage ignore file");
+            let tree_oid = index.write_tree().expect("write base tree");
+            let tree = repo.find_tree(tree_oid).expect("base tree");
+            let parent = repo.head().expect("main HEAD").peel_to_commit().expect("main commit");
+            let signature = repo.signature().expect("signature");
+            repo.commit(Some("HEAD"), &signature, &signature, "add status files", &tree, &[&parent])
+                .expect("commit base files")
+        };
+
+        let base_commit = repo.find_commit(base_oid).expect("base commit");
+        let mut branch = repo.branch("feature", &base_commit, false).expect("create branch");
+        repo.remote("origin", "https://example.com/repo.git")
+            .expect("create origin remote");
+        repo.reference(
+            "refs/remotes/origin/feature",
+            base_oid,
+            true,
+            "test upstream",
+        )
+        .expect("create upstream ref");
+        branch.set_upstream(Some("origin/feature")).expect("set branch upstream");
+        let reference = repo
+            .find_reference("refs/heads/feature")
+            .expect("feature reference");
+        let mut options = WorktreeAddOptions::new();
+        options.reference(Some(&reference));
+        repo.worktree("linked-wt", &wt_path, Some(&options))
+            .expect("create linked worktree");
+        drop(reference);
+        drop(branch);
+        drop(base_commit);
+        drop(repo);
+
+        let linked_repo = Repository::open(&wt_path).expect("open linked worktree");
+        linked_repo.set_head("refs/heads/feature").expect("checkout feature");
+        std::fs::write(wt_path.join("ahead.txt"), "committed ahead\n").expect("write ahead file");
+        let mut index = linked_repo.index().expect("linked index");
+        index.add_path(Path::new("ahead.txt")).expect("stage ahead file");
+        let tree_oid = index.write_tree().expect("write ahead tree");
+        let tree = linked_repo.find_tree(tree_oid).expect("ahead tree");
+        let parent = linked_repo.head().expect("linked HEAD").peel_to_commit().expect("linked commit");
+        let signature = linked_repo.signature().expect("signature");
+        linked_repo
+            .commit(Some("HEAD"), &signature, &signature, "advance feature", &tree, &[&parent])
+            .expect("commit ahead file");
+        drop(index);
+        drop(tree);
+        drop(parent);
+        drop(signature);
+
+        std::fs::write(wt_path.join("tracked.txt"), "modified\n").expect("modify tracked file");
+        std::fs::write(wt_path.join("staged.txt"), "staged\n").expect("write staged file");
+        let mut index = linked_repo.index().expect("linked index");
+        index.add_path(Path::new("staged.txt")).expect("stage file");
+        index.write().expect("write index");
+        std::fs::write(wt_path.join("untracked.txt"), "untracked\n").expect("write untracked file");
+        std::fs::write(wt_path.join("ignored.txt"), "ignored\n").expect("write ignored file");
+        drop(linked_repo);
+
+        let git = open_git_repo(main_dir.path());
+        let worktrees = git.worktrees().expect("list worktrees with status");
+        let main = worktrees.iter().find(|worktree| worktree.is_main).expect("main worktree");
+        let linked = worktrees.iter().find(|worktree| !worktree.is_main).expect("linked worktree");
+
+        assert_eq!(main.status.merged_into_main, Some(true));
+        assert_eq!(linked.status.staged_changes, 1);
+        assert_eq!(linked.status.unstaged_changes, 1);
+        assert_eq!(linked.status.untracked_paths, 1);
+        assert_eq!(linked.status.ignored_paths, 1);
+        assert_eq!(linked.status.change_path_count, 4);
+        assert_eq!(linked.status.upstream.as_deref(), Some("origin/feature"));
+        assert_eq!(linked.status.ahead, Some(1));
+        assert_eq!(linked.status.behind, Some(0));
+        assert_eq!(linked.status.merged_into_main, Some(false));
+        assert!(linked.status.inspection_error.is_none());
+        assert_eq!(linked.status.omitted_path_count, 0);
+        for name in ["tracked.txt", "staged.txt", "untracked.txt", "ignored.txt"] {
+            assert!(linked
+                .status
+                .change_paths
+                .iter()
+                .any(|change| change.path == Path::new(name)));
+        }
+    }
+
+    #[test]
+    fn missing_worktree_retains_its_head_snapshot_for_cleanup() {
+        let main_dir = tempfile::tempdir().expect("main repository directory");
+        let worktree_root = tempfile::tempdir().expect("worktree directory");
+        let worktree_path = worktree_root.path().join("missing-head-wt");
+        let repo = create_repo_with_commit(main_dir.path());
+        let commit = repo.head().expect("HEAD").peel_to_commit().expect("commit");
+        let branch = repo
+            .branch("missing-head", &commit, false)
+            .expect("create branch");
+        let reference = repo
+            .find_reference("refs/heads/missing-head")
+            .expect("branch reference");
+        let mut options = git2::WorktreeAddOptions::new();
+        options.reference(Some(&reference));
+        repo.worktree("missing-head-wt", &worktree_path, Some(&options))
+            .expect("create linked worktree");
+        let linked_repo = Repository::open(&worktree_path).expect("open linked worktree");
+        linked_repo
+            .set_head_detached(commit.id())
+            .expect("detach linked worktree HEAD");
+        drop(linked_repo);
+        drop(reference);
+        drop(branch);
+        drop(commit);
+        drop(repo);
+
+        let git = open_git_repo(main_dir.path());
+        let (expected_head, expected_branch, expected_sha) = {
+            let worktrees = git.worktrees().expect("list worktrees");
+            let worktree = worktrees
+                .iter()
+                .find(|worktree| !worktree.is_main)
+                .expect("linked worktree");
+            (
+                worktree.head_snapshot.clone(),
+                worktree.branch.clone(),
+                worktree.sha.clone(),
+            )
+        };
+        std::fs::remove_dir_all(&worktree_path).expect("remove worktree directory");
+
+        let worktrees = git.worktrees().expect("list missing worktree metadata");
+        let missing = worktrees
+            .iter()
+            .find(|worktree| !worktree.is_main)
+            .expect("missing worktree row");
+        assert!(missing.status.directory_missing);
+        assert!(missing.status.inspection_error.is_none());
+        let main = worktrees
+            .iter()
+            .find(|worktree| worktree.is_main)
+            .expect("main worktree row");
+        assert_eq!(missing.sha, main.sha);
+        assert_eq!(missing.status.merged_into_main, Some(true));
+        assert!(missing
+            .head_snapshot
+            .as_ref()
+            .expect("missing worktree HEAD snapshot")
+            .attached_ref
+            .is_none());
+        assert_eq!(missing.head_snapshot, expected_head);
+        assert_eq!(missing.branch, expected_branch);
+        assert_eq!(missing.sha, expected_sha);
+    }
+
+    #[test]
+    fn detailed_cleanup_scan_recurses_only_for_selected_worktree() {
+        let dir = tempfile::tempdir().expect("repository directory");
+        let repo = create_repo_with_commit(dir.path());
+        std::fs::write(dir.path().join(".gitignore"), "ignored-tree/\n")
+            .expect("write ignore rule");
+        let mut index = repo.index().expect("index");
+        index.add_path(Path::new(".gitignore")).expect("stage ignore rule");
+        index.write().expect("write index");
+        let tree_oid = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_oid).expect("tree");
+        let parent = repo.head().expect("HEAD").peel_to_commit().expect("commit");
+        let signature = repo.signature().expect("signature");
+        repo.commit(Some("HEAD"), &signature, &signature, "add ignore rule", &tree, &[&parent])
+            .expect("commit ignore rule");
+        drop(tree);
+        drop(parent);
+        drop(signature);
+        drop(index);
+        drop(repo);
+
+        for index in 0..4 {
+            let loose_dir = dir.path().join("untracked-tree");
+            std::fs::create_dir_all(&loose_dir).expect("create untracked directory");
+            std::fs::write(loose_dir.join(format!("{}.txt", index)), "untracked\n")
+                .expect("write untracked file");
+            let ignored_dir = dir.path().join("ignored-tree");
+            std::fs::create_dir_all(&ignored_dir).expect("create ignored directory");
+            std::fs::write(ignored_dir.join(format!("{}.txt", index)), "ignored\n")
+                .expect("write ignored file");
+        }
+
+        let git = open_git_repo(dir.path());
+        let shallow = git.worktrees().expect("normal refresh status");
+        let detailed = git
+            .worktrees_for_cleanup(dir.path())
+            .expect("cleanup preview status");
+        let shallow = &shallow.iter().find(|worktree| worktree.is_main).unwrap().status;
+        let detailed = &detailed.iter().find(|worktree| worktree.is_main).unwrap().status;
+
+        assert_eq!(shallow.untracked_paths, 1, "shallow paths: {:?}", shallow.change_paths);
+        assert_eq!(shallow.ignored_paths, 1, "shallow paths: {:?}", shallow.change_paths);
+        assert_eq!(detailed.untracked_paths, 4);
+        assert_eq!(detailed.ignored_paths, 4);
+    }
+
+    #[test]
+    fn worktree_status_samples_are_bounded() {
+        let dir = tempfile::tempdir().expect("repository directory");
+        drop(create_repo_with_commit(dir.path()));
+        for index in 0..20 {
+            std::fs::write(dir.path().join(format!("untracked-{}.txt", index)), "data\n")
+                .expect("write untracked file");
+        }
+
+        let worktrees = open_git_repo(dir.path())
+            .worktrees()
+            .expect("list worktrees with status");
+        let main = worktrees
+            .iter()
+            .find(|worktree| worktree.is_main)
+            .expect("main worktree");
+        assert_eq!(main.status.change_path_count, 20);
+        assert_eq!(main.status.change_paths.len(), WORKTREE_CHANGE_SAMPLE_LIMIT);
+        assert_eq!(main.status.omitted_path_count, 8);
+    }
+
+    #[test]
     fn test_worktrees_from_linked_worktree_with_separate_git_dir_identifies_main_path() {
         let root = tempfile::tempdir().expect("temp dir");
         let main_dir = root.path().join("main");
@@ -6440,7 +7108,7 @@ mod tests {
         std::fs::write(wt_path.join(".git"), git_link_contents).expect("copy git link");
         std::fs::write(wt_path.join("important.txt"), "keep copied-link replacement")
             .expect("write replacement file");
-        let result = git.remove_worktree_with_identity(&wt_path, true, Some(expected_identity), true);
+        let result = git.remove_worktree_with_identity(&wt_path, true, Some(expected_identity), true, None);
 
         assert!(result.is_err(), "Removal must reject a copied .git link after selection");
         assert!(wt_path.exists(), "The copied-link replacement must be preserved");
@@ -6448,7 +7116,7 @@ mod tests {
         assert!(wt_gitdir.exists(), "Registered worktree metadata must be preserved");
 
         let unavailable_snapshot_result =
-            git.remove_worktree_with_identity(&wt_path, true, None, true);
+            git.remove_worktree_with_identity(&wt_path, true, None, true, None);
         assert!(
             unavailable_snapshot_result.is_err(),
             "Removal must reject an existing path when the listed identity was unavailable"
@@ -6503,6 +7171,7 @@ mod tests {
             true,
             Some(expected_identity),
             true,
+            None,
         );
 
         assert!(
