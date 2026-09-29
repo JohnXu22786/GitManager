@@ -11,6 +11,138 @@ use std::time::Instant;
 const ABOUT_BUTTON_LABEL: &str = "ℹ";
 const APP_VERSION: &str = crate::version_info::VERSION;
 
+fn cleanup_change_label(change: &WorktreeChange) -> String {
+    let mut labels = Vec::new();
+    if change.conflicted {
+        labels.push("conflict");
+    }
+    if change.staged {
+        labels.push("staged");
+    }
+    if change.unstaged {
+        labels.push("modified");
+    }
+    if change.untracked {
+        labels.push("untracked");
+    }
+    if change.ignored {
+        labels.push("ignored");
+    }
+    labels.join(", ")
+}
+
+fn escaped_preview_path(path: &Path) -> String {
+    format!("{:?}", path.to_string_lossy())
+}
+
+fn worktree_cleanup_preview_message(
+    worktree: &WorktreeInfo,
+    force: bool,
+    branch_used_elsewhere: bool,
+) -> String {
+    let status = &worktree.status;
+    let mut lines = vec![format!("Path: {}", escaped_preview_path(&worktree.path))];
+
+    if status.directory_missing {
+        lines.push("The worktree directory is already missing.".into());
+    } else if status.change_path_count == 0 {
+        lines.push("Working tree is clean; no staged, modified, untracked, or ignored paths were found.".into());
+    } else {
+        lines.push(format!(
+            "Git reports {} affected path(s): {} staged, {} modified, {} untracked, {} ignored, {} conflicted.",
+            status.change_path_count,
+            status.staged_changes,
+            status.unstaged_changes,
+            status.untracked_paths,
+            status.ignored_paths,
+            status.conflicted_paths,
+        ));
+        if !status.change_paths.is_empty() {
+            lines.push("Affected paths at preview time:".into());
+            for change in &status.change_paths {
+                lines.push(format!(
+                    "  {}  {}",
+                    cleanup_change_label(change),
+                    escaped_preview_path(&change.path),
+                ));
+            }
+            if status.omitted_path_count > 0 {
+                lines.push(format!("  ... and {} more path(s)", status.omitted_path_count));
+            }
+        }
+    }
+
+    if let Some(branch) = worktree.branch.as_deref() {
+        lines.push(format!("Branch: {}", branch));
+        lines.push("The branch and its committed history remain after worktree removal.".into());
+        if branch_used_elsewhere {
+            lines.push("The branch is also checked out in another listed worktree.".into());
+        }
+    } else {
+        lines.push(match status.merged_into_main {
+            Some(true) => "Detached HEAD: this commit is already reachable from the main worktree.",
+            Some(false) => "Detached HEAD: no branch ref protects commits unique to this worktree.",
+            None => "Detached HEAD: merge status is unknown and no branch ref protects this commit.",
+        }.into());
+    }
+    if !worktree.sha.is_empty() {
+        lines.push(format!("HEAD commit: {}", &worktree.sha[..worktree.sha.len().min(12)]));
+    }
+    match status.merged_into_main {
+        Some(true) => lines.push("Commits are merged into the main worktree HEAD.".into()),
+        Some(false) => lines.push("Commits are not merged into the main worktree HEAD.".into()),
+        None => lines.push("Merge status relative to the main worktree is unavailable.".into()),
+    }
+    if worktree.branch.is_none() {
+        match status.merged_into_main {
+            Some(true) => {}
+            Some(false) => lines.push(if status.directory_missing {
+                "No branch ref protects this HEAD; its commits may become unreachable when stale metadata is removed.".into()
+            } else {
+                "Create a branch before cleanup; otherwise unique commits may become unreachable.".into()
+            }),
+            None => lines.push(if status.directory_missing {
+                "Merge status could not be verified; detached commits may become unreachable when stale metadata is removed.".into()
+            } else {
+                "Merge status could not be verified; protect detached commits with a branch before cleanup.".into()
+            }),
+        }
+    }
+    if status.directory_missing {
+        lines.push("Remote tracking status is unavailable because the worktree directory is missing.".into());
+    } else {
+        match status.upstream.as_deref() {
+            Some(upstream) => match (status.ahead, status.behind) {
+                (Some(ahead), Some(behind)) => lines.push(format!(
+                    "Tracking {}: {} ahead (not pushed), {} behind.",
+                    upstream, ahead, behind
+                )),
+                _ => lines.push(format!("Tracking {}: ahead/behind status unavailable.", upstream)),
+            },
+            None => lines.push("No upstream is configured; remote commit status is unknown.".into()),
+        }
+    }
+    if status.locked {
+        lines.push(match status.lock_reason.as_deref() {
+            Some(reason) if !reason.is_empty() => format!("Worktree is locked: {}", reason),
+            _ => "Worktree is locked.".into(),
+        });
+    }
+
+    if status.directory_missing {
+        lines.push(if force {
+            "Force Remove bypasses the worktree lock and removes its stale Git metadata.".into()
+        } else {
+            "Only stale Git worktree metadata is removed; any local branch ref is kept.".into()
+        });
+    } else if force {
+        lines.push("Force Remove bypasses any worktree lock and deletes the worktree directory, including ignored and uncommitted files. Changes made after this preview are removed too.".into());
+    } else {
+        lines.push("Only this worktree directory and its Git metadata are removed; the branch ref is kept.".into());
+    }
+    lines.join("\n")
+}
+
 fn update_asset_download_path(
     download_dir: &Path,
     file_name: &str,
@@ -85,6 +217,19 @@ struct PendingConfirmation {
     operation: GitOperation,
     repo_generation: u64,
 }
+
+
+const WORKTREE_CLEANUP_PREVIEW_OPERATION: &str = "Preparing worktree cleanup preview";
+
+struct PendingWorktreeCleanup {
+    path: std::path::PathBuf,
+    expected_git_link: Option<WorktreeFileIdentity>,
+    directory_missing_at_request: bool,
+    force_requested: bool,
+    repo_generation: u64,
+    ready: bool,
+}
+
 
 /// Tracks a Git operation running in a background thread.
 struct PendingOp {
@@ -261,6 +406,8 @@ pub struct App {
     test_before_operation: Option<Arc<dyn Fn() + Send + Sync>>,
     /// A destructive Git operation awaiting explicit user confirmation.
     pending_confirmation: Option<PendingConfirmation>,
+    /// A cleanup request waiting for a fresh worktree snapshot.
+    pending_worktree_cleanup: Option<PendingWorktreeCleanup>,
     /// Whether an asynchronous repository refresh is queued.
     needs_refresh: bool,
     pub recent_repos: RecentRepos,
@@ -335,6 +482,7 @@ impl App {
             #[cfg(test)]
             test_before_operation: None,
             pending_confirmation: None,
+            pending_worktree_cleanup: None,
             needs_refresh: false,
             recent_repos: RecentRepos::load(),
             status_expanded: false,
@@ -582,6 +730,7 @@ impl App {
             Ok(()) => {
                 self.log_search_request_id = self.log_search_request_id.wrapping_add(1);
                 self.repo_generation = self.repo_generation.wrapping_add(1);
+                self.pending_worktree_cleanup = None;
                 self.repo_path = path_display.clone();
                 self.remote_name_user_edited = false;
                 self.push_branch.clear();
@@ -846,7 +995,9 @@ impl App {
 
     /// Checks if an operation is running or awaits destructive-action confirmation.
     pub fn is_busy(&self) -> bool {
-        !self.pending_ops.is_empty() || self.pending_confirmation.is_some()
+        !self.pending_ops.is_empty()
+            || self.pending_confirmation.is_some()
+            || self.pending_worktree_cleanup.is_some()
     }
 
     /// Returns the description of the current/last operation.
@@ -891,6 +1042,41 @@ impl App {
         ctx.request_repaint();
     }
 
+    pub(crate) fn preview_worktree_cleanup(
+        &mut self,
+        ctx: &egui::Context,
+        worktree: &WorktreeInfo,
+        force_requested: bool,
+    ) {
+        if self.is_busy() {
+            return;
+        }
+        if !self.git.is_open() {
+            self.show_error("No repository open".into());
+            return;
+        }
+
+        self.pending_worktree_cleanup = Some(PendingWorktreeCleanup {
+            path: worktree.path.clone(),
+            expected_git_link: worktree.git_link_identity.clone(),
+            directory_missing_at_request: worktree.status.directory_missing,
+            force_requested,
+            repo_generation: self.repo_generation,
+            ready: false,
+        });
+        self.status_message.clear();
+        self.status_is_error = false;
+        self.needs_refresh = false;
+        self.start_operation(
+            ctx,
+            WORKTREE_CLEANUP_PREVIEW_OPERATION,
+            GitOperation::RefreshWorktreeCleanup(worktree.path.clone()),
+        );
+        if self.pending_ops.is_empty() {
+            self.pending_worktree_cleanup = None;
+        }
+    }
+
     fn confirm_pending_operation(&mut self, ctx: &egui::Context) {
         let Some(request) = self.pending_confirmation.take() else {
             return;
@@ -904,6 +1090,82 @@ impl App {
 
     fn cancel_pending_confirmation(&mut self) {
         self.pending_confirmation = None;
+    }
+
+    fn finish_worktree_cleanup_preview(&mut self, ctx: &egui::Context) {
+        let Some(request) = self.pending_worktree_cleanup.take() else {
+            return;
+        };
+        if request.repo_generation != self.repo_generation {
+            return;
+        }
+
+        let Some(worktree) = self
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.path == request.path)
+            .cloned()
+        else {
+            self.show_error("Worktree disappeared before cleanup could be previewed".into());
+            return;
+        };
+        if let Some(error) = worktree.status.inspection_error.as_deref() {
+            self.show_error(format!("Cannot safely preview worktree cleanup: {}", error));
+            return;
+        }
+        if request.directory_missing_at_request {
+            if !worktree.status.directory_missing || request.expected_git_link.is_some() {
+                self.show_error(
+                    "Worktree directory changed since it was listed; refresh and retry".into(),
+                );
+                return;
+            }
+        } else {
+            let Some(expected_git_link) = request.expected_git_link.as_ref() else {
+                self.show_error(
+                    "Cannot safely preview cleanup because the listed worktree identity is unavailable".into(),
+                );
+                return;
+            };
+            if worktree.git_link_identity.is_none()
+                || !expected_git_link.matches_path(&request.path)
+            {
+                self.show_error(
+                    "Worktree identity changed since it was listed; refresh and retry".into(),
+                );
+                return;
+            }
+        }
+
+        let Some(expected_head) = worktree.head_snapshot.clone() else {
+            self.show_error("Cannot safely preview cleanup because worktree HEAD is unavailable".into());
+            return;
+        };
+        let branch_used_elsewhere = worktree.branch.as_ref().is_some_and(|branch| {
+            self.worktrees.iter().any(|other| {
+                other.path != worktree.path && other.branch.as_ref() == Some(branch)
+            })
+        });
+        let force = request.force_requested || worktree.status.has_removal_blockers();
+        let label = if force {
+            "Force Remove worktree"
+        } else {
+            "Remove worktree"
+        };
+        self.request_confirmation(
+            ctx,
+            "Review worktree cleanup",
+            worktree_cleanup_preview_message(&worktree, force, branch_used_elsewhere),
+            label,
+            format!("{} {:?}", label, worktree.path),
+            GitOperation::RemoveWorktree {
+                path: worktree.path,
+                force,
+                expected_git_link: request.expected_git_link,
+                expected_head,
+                require_git_link_identity: true,
+            },
+        );
     }
 
     fn render_confirmation_dialog(&mut self, ctx: &egui::Context) {
@@ -923,7 +1185,10 @@ impl App {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .open(&mut open)
             .show(ctx, |ui| {
-                ui.label(message);
+                ui.set_max_width(540.0);
+                egui::ScrollArea::vertical()
+                    .max_height(260.0)
+                    .show(ui, |ui| ui.label(message));
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     if ui.button("Cancel").clicked() {
@@ -965,7 +1230,10 @@ impl App {
         op: GitOperation,
         form_submission: Option<FormSubmission>,
     ) {
-        if self.pending_confirmation.is_some() {
+        if self.pending_confirmation.is_some()
+            || (self.pending_worktree_cleanup.is_some()
+                && description != WORKTREE_CLEANUP_PREVIEW_OPERATION)
+        {
             return;
         }
 
@@ -1065,6 +1333,9 @@ impl App {
                 if current_progress.is_empty() {
                     // No progress ever received: give 60 seconds total
                     if started_at.elapsed().as_secs() > 60 {
+                        if description == WORKTREE_CLEANUP_PREVIEW_OPERATION {
+                            self.pending_worktree_cleanup = None;
+                        }
                         let msg = format!(
                             "Operation '{}' timed out (no progress in 60s)",
                             description
@@ -1080,6 +1351,9 @@ impl App {
                     // Progress was received but stopped: 30 second stall threshold
                     let stall_secs = last_progress_update.elapsed().as_secs();
                     if stall_secs > 30 {
+                        if description == WORKTREE_CLEANUP_PREVIEW_OPERATION {
+                            self.pending_worktree_cleanup = None;
+                        }
                         let msg = format!(
                             "Operation '{}' timed out (stalled {}s)\nLast: {}",
                             description, stall_secs, current_progress
@@ -1115,6 +1389,13 @@ impl App {
                     if op.repo_generation != self.repo_generation
                         && matches!(&result, OpResult::RefreshData { .. })
                     {
+                        if self
+                            .pending_worktree_cleanup
+                            .as_ref()
+                            .is_some_and(|request| request.repo_generation == op.repo_generation)
+                        {
+                            self.pending_worktree_cleanup = None;
+                        }
                         continue;
                     }
                     // Append final progress to log before handling result
@@ -1135,6 +1416,9 @@ impl App {
                     i += 1; // Still pending
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    if self.pending_ops[i].description == WORKTREE_CLEANUP_PREVIEW_OPERATION {
+                        self.pending_worktree_cleanup = None;
+                    }
                     if self.pending_ops[i].timed_out {
                         self.pending_ops.swap_remove(i);
                         continue;
@@ -1151,6 +1435,14 @@ impl App {
                     self.pending_ops.swap_remove(i);
                 }
             }
+        }
+
+        let cleanup_preview_ready = self
+            .pending_worktree_cleanup
+            .as_ref()
+            .is_some_and(|request| request.ready);
+        if cleanup_preview_ready && self.pending_ops.is_empty() {
+            self.finish_worktree_cleanup_preview(ctx);
         }
 
         // Start a queued refresh once other operations and confirmations are clear.
@@ -1176,6 +1468,9 @@ impl App {
                 self.needs_refresh = true;
             }
             OpResult::Error(e) => {
+                if description == WORKTREE_CLEANUP_PREVIEW_OPERATION {
+                    self.pending_worktree_cleanup = None;
+                }
                 let err_msg = format!("{}: {}", description, e);
                 self.last_operation_log += &format!("  ✗ {}\n", err_msg);
                 // Set status_message to concise error message
@@ -1218,6 +1513,11 @@ impl App {
                 self.status_entries = status_entries;
                 self.branches = branches;
                 self.worktrees = worktrees;
+                if description == WORKTREE_CLEANUP_PREVIEW_OPERATION {
+                    if let Some(request) = &mut self.pending_worktree_cleanup {
+                        request.ready = true;
+                    }
+                }
                 self.commits = filter_commits(commits, &self.log_search);
                 self.stashes = stashes;
                 self.remote_list = remote_list;
@@ -2105,6 +2405,404 @@ mod tests {
         let commit = repo.find_commit(commit_oid).expect("commit");
         repo.branch(branch_name, &commit, false)
             .expect("create test branch");
+    }
+
+    fn create_linked_test_worktree(
+        main_path: &std::path::Path,
+        worktree_path: &std::path::Path,
+        branch_name: &str,
+    ) {
+        let repo = git2::Repository::open(main_path).expect("open main repository");
+        let branch = repo
+            .find_branch(branch_name, git2::BranchType::Local)
+            .expect("find test branch");
+        let reference = repo
+            .find_reference(&format!("refs/heads/{}", branch_name))
+            .expect("find branch reference");
+        let name = worktree_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("worktree name");
+        let mut options = git2::WorktreeAddOptions::new();
+        options.reference(Some(&reference));
+        repo.worktree(name, worktree_path, Some(&options))
+            .expect("create linked worktree");
+        drop(reference);
+        drop(branch);
+        drop(repo);
+
+        git2::Repository::open(worktree_path)
+            .expect("open linked worktree")
+            .set_head(&format!("refs/heads/{}", branch_name))
+            .expect("checkout linked branch");
+    }
+
+    fn setup_linked_worktree() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        std::path::PathBuf,
+    ) {
+        let main_dir = tempfile::tempdir().expect("main repository directory");
+        init_repo_with_branch(main_dir.path(), "feature");
+        let worktree_root = tempfile::tempdir().expect("worktree root");
+        let worktree_path = worktree_root.path().join("linked-wt");
+        create_linked_test_worktree(main_dir.path(), &worktree_path, "feature");
+        (main_dir, worktree_root, worktree_path)
+    }
+
+    fn setup_dirty_linked_worktree() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        std::path::PathBuf,
+    ) {
+        let (main_dir, worktree_root, worktree_path) = setup_linked_worktree();
+        std::fs::write(worktree_path.join("dirty.txt"), "uncommitted data\n")
+            .expect("write untracked file");
+        (main_dir, worktree_root, worktree_path)
+    }
+
+    fn start_cleanup_preview(
+        app: &mut App,
+        ctx: &egui::Context,
+        path: &std::path::Path,
+        force_requested: bool,
+    ) {
+        app.worktrees = app.git.worktrees().expect("list worktrees");
+        let worktree = app
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.path == path)
+            .cloned()
+            .expect("listed worktree");
+        app.preview_worktree_cleanup(ctx, &worktree, force_requested);
+    }
+
+    fn wait_for_cleanup_preview(app: &mut App, ctx: &egui::Context) {
+        for _ in 0..200 {
+            app.process_pending_ops(ctx);
+            if app.pending_ops.is_empty() && app.pending_worktree_cleanup.is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("worktree cleanup preview should finish");
+    }
+
+    #[test]
+    fn cleanup_preview_rejects_worktree_identity_changed_after_listing() {
+        let (main_dir, _worktree_root, worktree_path) = setup_linked_worktree();
+        let mut app = App::new();
+        app.git.open(main_dir.path()).expect("open main repository");
+        let worktree = app
+            .git
+            .worktrees()
+            .expect("list worktrees")
+            .into_iter()
+            .find(|worktree| !worktree.is_main)
+            .expect("linked worktree");
+        let expected_git_link = worktree
+            .git_link_identity
+            .clone()
+            .expect("capture worktree identity");
+        std::fs::write(worktree_path.join(".git"), "gitdir: /replacement/worktree\n")
+            .expect("replace git link");
+
+        app.worktrees = vec![worktree.clone()];
+        app.pending_worktree_cleanup = Some(PendingWorktreeCleanup {
+            path: worktree_path,
+            expected_git_link: Some(expected_git_link),
+            directory_missing_at_request: false,
+            force_requested: false,
+            repo_generation: app.repo_generation,
+            ready: true,
+        });
+        app.finish_worktree_cleanup_preview(&egui::Context::default());
+
+        assert!(app.pending_confirmation.is_none());
+        assert!(app.status_is_error);
+        assert!(app.status_message.contains("identity changed"));
+    }
+
+    #[test]
+    fn cleanup_confirmation_rejects_a_new_detached_head_commit() {
+        let (main_dir, _worktree_root, worktree_path) = setup_linked_worktree();
+        let worktree_repo = git2::Repository::open(&worktree_path).expect("open linked worktree");
+        let original_head = worktree_repo
+            .head()
+            .expect("worktree HEAD")
+            .target()
+            .expect("worktree commit");
+        worktree_repo
+            .set_head_detached(original_head)
+            .expect("detach worktree HEAD");
+        drop(worktree_repo);
+
+        let mut app = App::new();
+        app.git.open(main_dir.path()).expect("open main repository");
+        let ctx = egui::Context::default();
+        start_cleanup_preview(&mut app, &ctx, &worktree_path, false);
+        wait_for_cleanup_preview(&mut app, &ctx);
+        assert!(app.pending_confirmation.is_some());
+
+        let worktree_repo = git2::Repository::open(&worktree_path).expect("reopen linked worktree");
+        let parent = worktree_repo
+            .head()
+            .expect("detached HEAD")
+            .peel_to_commit()
+            .expect("parent commit");
+        let tree = parent.tree().expect("parent tree");
+        let signature = worktree_repo.signature().expect("signature");
+        let new_head = worktree_repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "external detached commit",
+                &tree,
+                &[&parent],
+            )
+            .expect("advance detached HEAD");
+        drop(tree);
+        drop(parent);
+        drop(signature);
+        drop(worktree_repo);
+
+        app.confirm_pending_operation(&ctx);
+        wait_for_background_operations(&mut app, &ctx);
+
+        assert!(worktree_path.exists());
+        assert!(app.status_is_error);
+        assert!(app.status_message.contains("HEAD changed"));
+        let refreshed = app.git.worktrees().expect("list worktrees after rejection");
+        let worktree = refreshed
+            .iter()
+            .find(|worktree| !worktree.is_main)
+            .expect("linked worktree remains registered");
+        assert_eq!(worktree.sha, new_head.to_string());
+        assert!(worktree.branch.is_none());
+    }
+
+    #[test]
+    fn cleanup_confirmation_rejects_attached_branch_advance() {
+        let (main_dir, _worktree_root, worktree_path) = setup_linked_worktree();
+        let mut app = App::new();
+        app.git.open(main_dir.path()).expect("open main repository");
+        let ctx = egui::Context::default();
+        start_cleanup_preview(&mut app, &ctx, &worktree_path, false);
+        wait_for_cleanup_preview(&mut app, &ctx);
+
+        let worktree_repo = git2::Repository::open(&worktree_path).expect("open linked worktree");
+        let parent = worktree_repo
+            .head()
+            .expect("attached HEAD")
+            .peel_to_commit()
+            .expect("parent commit");
+        let tree = parent.tree().expect("parent tree");
+        let signature = worktree_repo.signature().expect("signature");
+        let new_head = worktree_repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "external attached commit",
+                &tree,
+                &[&parent],
+            )
+            .expect("advance attached branch");
+        drop(tree);
+        drop(parent);
+        drop(signature);
+        drop(worktree_repo);
+
+        app.confirm_pending_operation(&ctx);
+        wait_for_background_operations(&mut app, &ctx);
+
+        assert!(worktree_path.exists());
+        assert!(app.status_is_error);
+        assert!(app.status_message.contains("HEAD changed"));
+        let refreshed = app.git.worktrees().expect("list worktrees after rejection");
+        let worktree = refreshed
+            .iter()
+            .find(|worktree| !worktree.is_main)
+            .expect("linked worktree remains registered");
+        assert_eq!(worktree.sha, new_head.to_string());
+        assert_eq!(worktree.branch.as_deref(), Some("feature"));
+    }
+
+    #[test]
+    fn cleanup_preview_fails_closed_when_worktree_status_is_unknown() {
+        let mut app = App::new();
+        let path = std::path::PathBuf::from("/tmp/uninspectable-worktree");
+        app.worktrees = vec![WorktreeInfo {
+            path: path.clone(),
+            branch: Some("feature".into()),
+            sha: "1234567890".into(),
+            head_snapshot: None,
+            is_main: false,
+            git_link_identity: None,
+            status: WorktreeStatusSummary {
+                inspection_error: Some("permission denied".into()),
+                ..WorktreeStatusSummary::default()
+            },
+        }];
+        app.pending_worktree_cleanup = Some(PendingWorktreeCleanup {
+            path,
+            expected_git_link: None,
+            directory_missing_at_request: false,
+            force_requested: false,
+            repo_generation: app.repo_generation,
+            ready: true,
+        });
+
+        app.finish_worktree_cleanup_preview(&egui::Context::default());
+
+        assert!(app.pending_confirmation.is_none());
+        assert!(app.status_is_error);
+        assert!(app.status_message.contains("permission denied"));
+    }
+
+    #[test]
+    fn cleanup_preview_can_prune_missing_directory_without_losing_branch() {
+        let (main_dir, _worktree_root, worktree_path) = setup_linked_worktree();
+        let mut app = App::new();
+        app.git.open(main_dir.path()).expect("open main repository");
+        std::fs::remove_dir_all(&worktree_path).expect("remove linked worktree directory");
+        let ctx = egui::Context::default();
+
+        start_cleanup_preview(&mut app, &ctx, &worktree_path, false);
+        wait_for_cleanup_preview(&mut app, &ctx);
+        let confirmation = app
+            .pending_confirmation
+            .as_ref()
+            .expect("missing-directory cleanup preview");
+        assert!(confirmation.message.contains("directory is already missing"));
+        assert!(confirmation.message.contains("Branch: feature"));
+        assert!(confirmation.message.contains("HEAD commit:"));
+        assert!(confirmation.message.contains("branch ref is kept"));
+
+        app.confirm_pending_operation(&ctx);
+        wait_for_background_operations(&mut app, &ctx);
+
+        let repo = git2::Repository::open(main_dir.path()).expect("reopen main repository");
+        assert!(repo.find_branch("feature", git2::BranchType::Local).is_ok());
+        assert!(repo.worktrees().expect("list worktrees").is_empty());
+    }
+
+    #[test]
+    fn missing_detached_preview_does_not_warn_for_a_merged_commit() {
+        let (main_dir, _worktree_root, worktree_path) = setup_linked_worktree();
+        let worktree_repo = git2::Repository::open(&worktree_path).expect("open linked worktree");
+        let head = worktree_repo
+            .head()
+            .expect("worktree HEAD")
+            .target()
+            .expect("worktree commit");
+        worktree_repo
+            .set_head_detached(head)
+            .expect("detach worktree HEAD");
+        drop(worktree_repo);
+
+        let mut app = App::new();
+        app.git.open(main_dir.path()).expect("open main repository");
+        std::fs::remove_dir_all(&worktree_path).expect("remove linked worktree directory");
+        let ctx = egui::Context::default();
+        start_cleanup_preview(&mut app, &ctx, &worktree_path, false);
+        wait_for_cleanup_preview(&mut app, &ctx);
+
+        let confirmation = app
+            .pending_confirmation
+            .as_ref()
+            .expect("missing detached cleanup preview");
+        assert!(confirmation
+            .message
+            .contains("this commit is already reachable from the main worktree"));
+        assert!(confirmation
+            .message
+            .contains("Commits are merged into the main worktree HEAD"));
+        assert!(!confirmation.message.contains("may become unreachable"));
+        app.cancel_pending_confirmation();
+    }
+
+    #[test]
+    fn cleanup_preview_lists_dirty_path_and_cancel_preserves_worktree() {
+        let (main_dir, _worktree_root, worktree_path) = setup_dirty_linked_worktree();
+        std::fs::create_dir_all(worktree_path.join("nested"))
+            .expect("create nested untracked directory");
+        std::fs::write(worktree_path.join("nested/deep.txt"), "nested untracked data\n")
+            .expect("write nested untracked file");
+        let mut app = App::new();
+        app.git.open(main_dir.path()).expect("open main repository");
+        let ctx = egui::Context::default();
+
+        start_cleanup_preview(&mut app, &ctx, &worktree_path, false);
+        wait_for_cleanup_preview(&mut app, &ctx);
+
+        let confirmation = app
+            .pending_confirmation
+            .as_ref()
+            .expect("cleanup preview confirmation");
+        assert_eq!(confirmation.confirm_label, "Force Remove worktree");
+        assert!(confirmation.message.contains("dirty.txt"));
+        assert!(confirmation.message.contains("deep.txt"));
+        assert!(confirmation.message.contains("untracked"));
+        assert!(confirmation.message.contains("committed history remain"));
+        assert!(confirmation.message.contains("Changes made after this preview"));
+
+        app.cancel_pending_confirmation();
+        assert!(!app.is_busy());
+        assert!(worktree_path.exists());
+        assert!(worktree_path.join("dirty.txt").exists());
+    }
+
+    #[test]
+    fn normal_cleanup_preview_exposes_force_for_locked_worktree() {
+        let (main_dir, _worktree_root, worktree_path) = setup_linked_worktree();
+        let main_repo = git2::Repository::open(main_dir.path()).expect("open main repository");
+        let lock_path = main_repo.path().join("worktrees").join("linked-wt").join("locked");
+        std::fs::write(lock_path, "kept by test").expect("lock linked worktree");
+        drop(main_repo);
+
+        let mut app = App::new();
+        app.git.open(main_dir.path()).expect("open main repository");
+        let ctx = egui::Context::default();
+
+        start_cleanup_preview(&mut app, &ctx, &worktree_path, false);
+        wait_for_cleanup_preview(&mut app, &ctx);
+
+        let confirmation = app
+            .pending_confirmation
+            .as_ref()
+            .expect("locked cleanup preview confirmation");
+        assert_eq!(confirmation.confirm_label, "Force Remove worktree");
+        assert!(confirmation.message.contains("Worktree is locked: kept by test"));
+        assert!(worktree_path.exists());
+        app.cancel_pending_confirmation();
+        assert!(worktree_path.exists());
+    }
+
+    #[test]
+    fn confirming_cleanup_preview_removes_worktree_but_keeps_branch() {
+        let (main_dir, _worktree_root, worktree_path) = setup_dirty_linked_worktree();
+        let mut app = App::new();
+        app.git.open(main_dir.path()).expect("open main repository");
+        let ctx = egui::Context::default();
+
+        start_cleanup_preview(&mut app, &ctx, &worktree_path, false);
+        wait_for_cleanup_preview(&mut app, &ctx);
+        app.confirm_pending_operation(&ctx);
+        wait_for_background_operations(&mut app, &ctx);
+
+        assert!(!worktree_path.exists());
+        let repo = git2::Repository::open(main_dir.path()).expect("reopen main repository");
+        assert!(repo
+            .find_branch("feature", git2::BranchType::Local)
+            .is_ok());
+        assert!(!repo
+            .worktrees()
+            .expect("list remaining worktrees")
+            .iter()
+            .flatten()
+            .any(|name| name == "linked-wt"));
     }
 
     #[test]
