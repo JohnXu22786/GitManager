@@ -6,7 +6,7 @@ Use this protocol with 5–10 developers who routinely work across multiple bran
 
 ## Preflight
 
-- Use a release candidate built from the exact commit being evaluated. The public v0.1.10 archives predate 24 commits on `main` as of 2026-09-30, so do not use those archives to evaluate the current worktree workflow.
+- Use a release candidate built from the exact commit being evaluated. The public v0.1.10 archives predate the `main` snapshot as of 2026-09-30; do not use them to evaluate the newer worktree workflow.
 - Recruit participants who already use Git worktrees or regularly switch between parallel branches. Do not contact anyone until the repository owner authorizes the outreach and provides an audience.
 - Ask participants to use a disposable repository or a copy with no valuable uncommitted work. Do not ask them to force-remove a worktree from an active project.
 - Record consent, app version, OS/version, and task outcomes. Do not collect repository contents, credentials, or private remote URLs.
