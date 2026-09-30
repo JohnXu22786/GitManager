@@ -422,7 +422,7 @@ impl App {
     pub fn new() -> Self {
         Self {
             git: GitRepo::new(),
-            current_tab: Tab::Status,
+            current_tab: Tab::Worktrees,
             repo_path: String::new(),
             status_message: String::new(),
             status_is_error: false,
@@ -1485,7 +1485,7 @@ impl App {
                 self.clone_destination.clear();
                 self.open_repo(&path);
                 if self.repo_path == path {
-                    self.current_tab = Tab::Status;
+                    self.current_tab = Tab::Worktrees;
                     if !self.status_is_error {
                         self.show_success(format!("Cloned repository into {}", path));
                     }
@@ -3240,7 +3240,7 @@ mod tests {
         let app = App::new();
         assert!(!app.show_about);
         assert!(!app.git.is_open());
-        assert_eq!(app.current_tab, Tab::Status);
+        assert_eq!(app.current_tab, Tab::Worktrees);
         assert!(!app.show_clone_dialog);
     }
 
@@ -3447,7 +3447,7 @@ mod tests {
         assert!(!app.is_busy(), "clone operation should complete");
         assert!(app.git.is_open());
         assert_eq!(app.git.path(), Some(destination.as_path()));
-        assert_eq!(app.current_tab, Tab::Status);
+        assert_eq!(app.current_tab, Tab::Worktrees);
         assert!(!app.show_clone_dialog);
         assert!(!app.status_is_error);
     }
@@ -3637,7 +3637,7 @@ mod tests {
 
         assert!(app.git.is_open());
         assert_eq!(app.repo_path, clone_dir.path().to_string_lossy());
-        assert_eq!(app.current_tab, Tab::Status);
+        assert_eq!(app.current_tab, Tab::Worktrees);
         assert!(!app.show_clone_dialog);
         assert!(!app.status_is_error);
     }

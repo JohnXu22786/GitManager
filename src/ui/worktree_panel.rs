@@ -1,8 +1,11 @@
 use crate::app::{App, FormSubmission};
 use crate::git_ops::GitOperation;
 use crate::git_ops::WorktreeInfo;
+use crate::recent::RecentEntry;
 use crate::ui::{column_cell, column_header, column_header_static};
+use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
 use eframe::egui;
+use std::path::Path;
 
 const WORKTREE_ACTIONS_WIDTH: f32 = 90.0;
 const WORKTREE_STATUS_MIN_WIDTH: f32 = 88.0;
@@ -15,6 +18,94 @@ fn worktree_status_column_width(available_width: f32) -> f32 {
     } else {
         width.min(WORKTREE_STATUS_WIDTH)
     }
+}
+
+fn same_recent_path(entry_path: &str, worktree_path: &Path) -> bool {
+    let entry_path = Path::new(entry_path);
+    if entry_path == worktree_path {
+        return true;
+    }
+
+    let entry_path = std::fs::canonicalize(entry_path).unwrap_or_else(|_| entry_path.to_path_buf());
+    let worktree_path =
+        std::fs::canonicalize(worktree_path).unwrap_or_else(|_| worktree_path.to_path_buf());
+    #[cfg(windows)]
+    {
+        let entry_path = entry_path.to_string_lossy();
+        let worktree_path = worktree_path.to_string_lossy();
+        entry_path
+            .as_ref()
+            .eq_ignore_ascii_case(worktree_path.as_ref())
+    }
+    #[cfg(not(windows))]
+    {
+        entry_path == worktree_path
+    }
+}
+
+fn recent_open_activity(
+    entries: &[RecentEntry],
+    path: &Path,
+    now: DateTime<Local>,
+) -> (String, String) {
+    let Some(entry) = entries
+        .iter()
+        .find(|entry| same_recent_path(&entry.path, path))
+    else {
+        return (
+            "No app history record".into(),
+            "No matching Git Manager open is in recent history; use from terminals or editors is not tracked."
+                .into(),
+        );
+    };
+    let Ok(local_time) = NaiveDateTime::parse_from_str(&entry.last_opened, "%Y-%m-%d %H:%M:%S")
+    else {
+        return (
+            "Open time unknown".into(),
+            format!(
+                "Git Manager history contains an invalid open time: {}",
+                entry.last_opened
+            ),
+        );
+    };
+    let Some(opened_at) = Local.from_local_datetime(&local_time).earliest() else {
+        return (
+            "Open time unknown".into(),
+            format!(
+                "Git Manager history contains an ambiguous open time: {}",
+                entry.last_opened
+            ),
+        );
+    };
+
+    let seconds = now.signed_duration_since(opened_at).num_seconds();
+    let label = if seconds < 0 {
+        "Opened here just now".to_string()
+    } else if seconds < 60 {
+        "Opened here <1m ago".to_string()
+    } else if seconds < 3_600 {
+        format!("Opened here {}m ago", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("Opened here {}h ago", seconds / 3_600)
+    } else if seconds < 2_592_000 {
+        format!("Opened here {}d ago", seconds / 86_400)
+    } else if seconds < 31_536_000 {
+        format!("Opened here {}mo ago", seconds / 2_592_000)
+    } else {
+        format!("Opened here {}y ago", seconds / 31_536_000)
+    };
+    let detail = if seconds < 0 {
+        format!(
+            "Last opened in Git Manager at {}; the saved time is ahead of the system clock. Use outside Git Manager is not tracked.",
+            entry.last_opened
+        )
+    } else {
+        format!(
+            "Last opened in Git Manager at {}. Use from terminals, editors, or other apps is not tracked.",
+            entry.last_opened
+        )
+    };
+    (label, detail)
 }
 
 fn worktree_status_label(worktree: &WorktreeInfo, dark: bool) -> (String, egui::Color32) {
@@ -126,7 +217,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
 
         column_header(ui, "Path", &mut path_w, 60.0, max_cols - 60.0, "wt_path_hdr");
         cw.set("worktree_path", path_w);
-        column_header_static(ui, "Branch/SHA", bs_w);
+        column_header_static(ui, "Branch / opened", bs_w);
         if status_w > 0.0 {
             column_header_static(ui, "Status", status_w);
         }
@@ -283,16 +374,17 @@ fn show_worktree_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, wt: 
     path_w = path_w.clamp(60.0, max_cols - 60.0);
     let bs_w = max_cols - path_w;
     let (status_text, status_color) = worktree_status_label(wt, ui.style().visuals.dark_mode);
-    let branch_sha_text = if status_w > 0.0 {
-        format!("{}{} [{}]", icon, branch_display, sha_short)
-    } else {
-        format!(
-            "{}{} [{}] · {}",
-            icon, branch_display, sha_short, status_text
-        )
-    };
+    let (recent_label, recent_detail) =
+        recent_open_activity(app.recent_repos.entries(), &wt.path, Local::now());
+    let mut branch_sha_text = format!(
+        "{}{} [{}] · {} ({})",
+        icon, branch_display, sha_short, recent_label, recent_detail
+    );
+    if status_w == 0.0 {
+        branch_sha_text.push_str(&format!(" · {}", status_text));
+    }
 
-    // Left-to-right flow: Path, Branch/SHA, Status, Actions.
+    // Left-to-right flow: Path, Branch/open history, Status, Actions.
     ui.horizontal(|ui| {
         column_cell(ui, path_w, &path_display, egui::Color32::GRAY);
 
@@ -338,11 +430,13 @@ fn open_worktree(app: &mut App, path: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_worktree_path, open_worktree, worktree_status_column_width, worktree_status_label,
+        default_worktree_path, open_worktree, recent_open_activity, worktree_status_column_width,
+        worktree_status_label,
     };
     use crate::app::App;
     use crate::git_ops::{WorktreeInfo, WorktreeStatusSummary};
-    use crate::recent::RecentRepos;
+    use crate::recent::{RecentEntry, RecentRepos};
+    use chrono::{Local, TimeZone};
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -350,6 +444,39 @@ mod tests {
         assert_eq!(worktree_status_column_width(380.0), 0.0);
         assert_eq!(worktree_status_column_width(398.0), 88.0);
         assert_eq!(worktree_status_column_width(800.0), 170.0);
+    }
+
+    #[test]
+    fn recent_open_activity_shows_last_git_manager_open() {
+        let path = Path::new("/repo/feature");
+        let entries = [RecentEntry {
+            path: path.to_string_lossy().into_owned(),
+            name: "feature".into(),
+            last_opened: "2025-01-31 12:00:00".into(),
+        }];
+        let now = Local
+            .with_ymd_and_hms(2025, 2, 1, 12, 0, 0)
+            .single()
+            .expect("local time");
+
+        let (label, detail) = recent_open_activity(&entries, path, now);
+
+        assert_eq!(label, "Opened here 1d ago");
+        assert!(detail.contains("Last opened in Git Manager"));
+        assert!(detail.contains("not tracked"));
+    }
+
+    #[test]
+    fn recent_open_activity_does_not_claim_missing_history_means_unused() {
+        let now = Local
+            .with_ymd_and_hms(2025, 2, 1, 12, 0, 0)
+            .single()
+            .expect("local time");
+
+        let (label, detail) = recent_open_activity(&[], Path::new("/repo/feature"), now);
+
+        assert_eq!(label, "No app history record");
+        assert!(detail.contains("not tracked"));
     }
 
     #[test]
