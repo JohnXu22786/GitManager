@@ -2,15 +2,28 @@
 
 [![CI](https://github.com/JohnXu22786/GitManager/actions/workflows/ci.yml/badge.svg)](https://github.com/JohnXu22786/GitManager/actions/workflows/ci.yml)
 
-Git Manager is a desktop application for managing Git branches and worktrees, with repository status, history, stash, and remote actions in one interface.
+Git Manager is a lightweight desktop Git client for developers working across multiple branches and worktrees. Its worktree-first view helps you see workspace state, reopen a workspace inside the app, and review cleanup before removing it.
 
 ![Git Manager welcome screen](docs/images/git-manager-welcome.png)
+
+## Quick start
+
+1. Open or clone a repository.
+2. Use the Worktrees view to create a worktree from an existing or new branch.
+3. Open the worktree inside Git Manager, review its local and upstream state, and inspect the cleanup preview before removal.
+
+The `Opened here` label uses Git Manager's recent-open history only. It does not track activity in terminals, editors, or other applications; no history entry does not mean a worktree is unused.
+
+## Scope
+
+Git Manager focuses on local branch and worktree operations. It does not create pull requests or launch coding agents.
 
 ## Features
 
 - Review repository status, inspect diffs, stage or unstage files, and commit changes.
+- Create, open, prune, and safely remove Git worktrees.
+- Compare worktree change counts, upstream/merge state, lock state, and recent opens inside Git Manager.
 - Create, switch, rename, merge, and safely delete branches.
-- Create, open, prune, and remove Git worktrees.
 - Browse and search commit history, and manage stashes.
 - Configure remotes and run fetch, pull, and push operations.
 - Clone repositories and reopen recently used repositories.
@@ -75,7 +88,7 @@ cargo build --release
 cargo test --all-targets
 ```
 
-The CI workflow currently runs the test suite on Ubuntu. Release builds are produced for the platforms listed above.
+The CI workflow runs the test suite on Ubuntu, macOS, and Windows. Release builds are produced for the platforms listed above.
 
 ## License
 
