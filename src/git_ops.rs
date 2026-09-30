@@ -7169,7 +7169,7 @@ mod tests {
         let result = git.remove_worktree_with_identity(
             &wt_path,
             true,
-            Some(expected_identity),
+            Some(expected_identity.clone()),
             true,
             None,
         );
@@ -7184,6 +7184,24 @@ mod tests {
             "Replacement files must be preserved"
         );
         assert!(wt_gitdir.exists(), "Registered worktree metadata must be preserved");
+
+        let replacement_identity =
+            file_identity_from_path(&wt_path).expect("capture replacement directory identity");
+        let fallback = force_remove_worktree_directory_fallback(
+            &wt_path,
+            &replacement_identity,
+            &expected_identity,
+        );
+        assert!(
+            fallback.is_err(),
+            "Fallback removal must reject a replacement linked to the original .git file"
+        );
+        assert!(wt_path.exists(), "The fallback must preserve the replacement directory");
+        assert!(
+            wt_path.join("important.txt").exists(),
+            "The fallback must preserve replacement files"
+        );
+        assert!(wt_gitdir.exists(), "The fallback must preserve registered metadata");
     }
 
     #[test]
