@@ -19,7 +19,14 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 app.start_operation(ctx, "Unstaging all", GitOperation::UnstageAll);
             }
             if crate::ui::add_enabled_ellipsis(ui, !busy, "Discard All").clicked() {
-                app.start_operation(ctx, "Discarding all", GitOperation::RestoreAll);
+                app.request_confirmation(
+                    ctx,
+                    "Confirm discard all changes",
+                    "Restore tracked working-tree files from HEAD? This discards unstaged changes. Staged changes remain in the index, and untracked files that conflict with tracked paths may be overwritten.",
+                    "Discard all",
+                    "Discard all unstaged changes",
+                    GitOperation::RestoreAll,
+                );
             }
         });
     });
@@ -75,7 +82,17 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                             }
                             if entry.status != '?' && entry.status != '!' {
                                 if ui.add_enabled(!busy, egui::Button::new("Discard")).clicked() {
-                                    app.start_operation(ctx, &format!("Restore {}", path_display), GitOperation::RestoreFile(path.clone()));
+                                    app.request_confirmation(
+                                        ctx,
+                                        "Confirm discard file changes",
+                                        format!(
+                                            "Restore {:?} from the index? This discards its unstaged working-tree changes; staged changes remain.",
+                                            path
+                                        ),
+                                        "Discard file changes",
+                                        format!("Discard unstaged changes to {:?}", path),
+                                        GitOperation::RestoreFile(path.clone()),
+                                    );
                                 }
                             }
                             if ui.add_enabled(!busy, egui::Button::new("Diff")).clicked() {
@@ -174,6 +191,59 @@ mod tests {
     use super::*;
     use crate::app::App;
     use crate::git_ops::StatusEntry;
+
+    fn status_panel_frame(
+        app: &mut App,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(800.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(app, ui, ctx);
+                });
+            },
+        )
+    }
+
+    fn click_status_button(app: &mut App, label: &str) {
+        let ctx = egui::Context::default();
+        let output = status_panel_frame(app, &ctx, Vec::new());
+        let position = output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.job.text == label => {
+                    Some(clipped.shape.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("button label '{}' should be rendered", label));
+
+        for pressed in [true, false] {
+            status_panel_frame(
+                app,
+                &ctx,
+                vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ],
+            );
+        }
+    }
 
     /// Helper: run the status panel `show` function in a test context.
     fn run_status_panel(app: &mut App) {
@@ -298,5 +368,50 @@ mod tests {
         assert!(should_show_stage_action('M'));
         assert!(should_show_stage_action('D'));
         assert!(!should_show_stage_action('!'));
+    }
+
+    #[test]
+    fn discard_all_requires_confirmation_before_dispatch() {
+        let repo_dir = tempfile::tempdir().expect("repository directory");
+        drop(git2::Repository::init(repo_dir.path()).expect("initialize repository"));
+        let mut app = App::new();
+        app.git.open(repo_dir.path()).expect("open repository");
+
+        click_status_button(&mut app, "Discard All");
+
+        assert_eq!(
+            app.current_operation(),
+            "Awaiting confirmation: Discard all unstaged changes"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn discard_file_requires_confirmation_and_escapes_filename_before_dispatch() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let repo_dir = tempfile::tempdir().expect("repository directory");
+        drop(git2::Repository::init(repo_dir.path()).expect("initialize repository"));
+        let mut app = App::new();
+        app.git.open(repo_dir.path()).expect("open repository");
+        let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(
+            b"tracked\n\xfffile.txt".to_vec(),
+        ));
+        app.status_entries.push(StatusEntry {
+            path: path.clone(),
+            status: 'M',
+            staged: false,
+        });
+
+        click_status_button(&mut app, "Discard");
+
+        assert_eq!(
+            app.current_operation(),
+            format!("Awaiting confirmation: Discard unstaged changes to {:?}", path)
+        );
+        assert!(
+            !app.current_operation().contains('\u{fffd}'),
+            "the confirmation target must preserve invalid filename bytes"
+        );
     }
 }
