@@ -58,7 +58,7 @@ Download a release archive from [GitHub Releases](https://github.com/JohnXu22786
 
 Use the release version in the asset name; the release workflow removes a leading `v` from the tag. Archives contain the application binary, not a platform installer. macOS releases are command-line executables rather than `.app` bundles.
 
-The public `v0.1.12` archives predate the latest `main` snapshot, which includes the changes from PRs #126 and #127. Current `main` is preparing version `0.1.13`; use a build from the exact commit selected for a pilot rather than the older public archives.
+The public `v0.1.12` archives predate the changes in PRs #126–#128, which merged on 2026-10-02. Current `main` is preparing version `0.1.13`; use a build from the exact commit selected for a pilot rather than the older public archives.
 
 ### Linux
 
