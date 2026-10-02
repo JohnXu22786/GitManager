@@ -4,7 +4,9 @@
 
 Git Manager is a lightweight desktop Git client for developers working across multiple branches and worktrees. Its worktree-first view helps you see workspace state, reopen a workspace inside the app, and review cleanup before removing it.
 
-![Git Manager welcome screen](docs/images/git-manager-welcome.png)
+![Git Manager Worktrees view with a sample repository and several active worktrees](docs/images/git-manager-worktrees.png)
+
+*Illustrative workspace data shows concurrent branch and worktree activity.*
 
 ## Quick start
 
