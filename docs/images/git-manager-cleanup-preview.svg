@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="840" viewBox="0 0 1280 840">
+  <defs>
+    <style>
+      text { font-family: "Open Sans", "DejaVu Sans", sans-serif; fill: #dedede; }
+      .muted { fill: #969696; }
+      .brand { fill: #78a6ff; }
+      .green { fill: #8ccc9b; }
+      .rule { stroke: #363636; stroke-width: 1; }
+    </style>
+  </defs>
+  <rect width="1280" height="840" fill="#1e1e1e"/>
+  <rect width="1280" height="47" fill="#272727"/>
+  <line x1="0" y1="46.5" x2="1280" y2="46.5" class="rule"/>
+  <text x="108" y="29" font-size="15" font-weight="600" class="brand">GitManager</text>
+  <text x="203" y="29" font-size="13" class="muted">/dev/GitManager</text>
+  <text x="424" y="29" font-size="13">main</text>
+  <text x="1160" y="28" text-anchor="end" font-size="12" class="muted">v0.1.13</text>
+  <rect x="0" y="47" width="1280" height="47" fill="#212121"/>
+  <g font-size="13">
+    <text x="54" y="75">Status</text><text x="159" y="75">Branches</text>
+    <rect x="244" y="52" width="124" height="37" rx="5" fill="#3d4a63"/><text x="286" y="75" fill="#f0f3f9">Worktrees</text>
+    <text x="411" y="75">Log</text><text x="502" y="75">Stash</text><text x="590" y="75">Remotes</text>
+  </g>
+  <line x1="0" y1="93.5" x2="1280" y2="93.5" class="rule"/>
+  <text x="22" y="132" font-size="21" font-weight="600">Worktrees</text>
+  <text x="26" y="176" font-size="13" font-weight="600">Path</text>
+  <text x="306" y="176" font-size="13" font-weight="600">Branch / opened</text>
+  <text x="1004" y="176" font-size="13" font-weight="600">Status</text>
+  <line x1="20" y1="188" x2="1260" y2="188" class="rule"/>
+  <text x="24" y="211" font-size="13" font-weight="600">Main Worktree</text>
+  <text x="26" y="239" font-size="13" class="muted">/dev/GitManager</text>
+  <text x="306" y="239" font-size="13">★ main [bc83d92] · Opened here &lt;1m ago</text>
+  <text x="1004" y="239" font-size="12.5" class="green">Clean · Up to date</text>
+  <line x1="20" y1="263" x2="1260" y2="263" class="rule"/>
+  <text x="24" y="286" font-size="13" font-weight="600">Linked Worktrees</text>
+  <text x="26" y="321" font-size="13" class="muted">/dev/worktrees/docs-site</text>
+  <text x="306" y="321" font-size="13">○ docs/site [834fe21] · Opened here 8m ago</text>
+  <text x="1004" y="321" font-size="12.5" class="green">Clean · Up to date · Merged to main</text>
+  <line x1="20" y1="338" x2="1260" y2="338" class="rule"/>
+
+  <rect x="0" y="0" width="1280" height="840" fill="#000" opacity="0.55"/>
+  <rect x="318" y="153" width="644" height="514" rx="8" fill="#292929" stroke="#555" stroke-width="1.2"/>
+  <rect x="319" y="154" width="642" height="48" rx="7" fill="#303030"/>
+  <text x="342" y="185" font-size="18" font-weight="600">Review worktree cleanup</text>
+  <line x1="319" y1="202" x2="961" y2="202" stroke="#464646"/>
+  <text x="346" y="238" font-size="14">Path: "/dev/worktrees/docs-site"</text>
+  <text x="346" y="272" font-size="14">Working tree is clean; no staged, modified, untracked, or ignored paths were found.</text>
+  <text x="346" y="306" font-size="14">Branch: docs/site</text>
+  <text x="346" y="337" font-size="14">The branch and its committed history remain after worktree removal.</text>
+  <text x="346" y="371" font-size="14">Commits are merged into the main worktree HEAD.</text>
+  <text x="346" y="405" font-size="14">Tracking origin/docs-site: 0 ahead (not pushed), 0 behind.</text>
+  <rect x="344" y="434" width="592" height="1" fill="#454545"/>
+  <text x="346" y="469" font-size="14">Only this worktree directory and its Git metadata are removed;</text>
+  <text x="346" y="492" font-size="14">the branch ref is kept.</text>
+  <rect x="705" y="603" width="92" height="34" rx="4" fill="#383838" stroke="#4a4a4a"/>
+  <text x="751" y="625" text-anchor="middle" font-size="13">Cancel</text>
+  <rect x="807" y="603" width="129" height="34" rx="4" fill="#3d4a63" stroke="#63779b"/>
+  <text x="871.5" y="625" text-anchor="middle" font-size="13">Remove worktree</text>
+  <text x="342" y="705" font-size="13" class="muted">Illustrative sample data · Review the paths and impact, then cancel if unsure</text>
+  <rect x="0" y="808" width="1280" height="32" fill="#292929"/><line x1="0" y1="808.5" x2="1280" y2="808.5" class="rule"/>
+  <circle cx="22" cy="824" r="4" fill="#8ccc9b"/><text x="34" y="829" font-size="13" class="green">Ready</text>
+  <text x="1200" y="829" text-anchor="end" font-size="12" class="muted">just now</text>
+</svg>

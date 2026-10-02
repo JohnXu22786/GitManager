@@ -33,6 +33,17 @@ Git Manager focuses on local branch and worktree operations. It does not create 
 - Clone repositories and reopen recently used repositories.
 - Check for and install releases from within the application.
 
+### Worktree workflow visuals
+
+The following illustrative screens show the create and cleanup-review flows. The
+short GIF is a storyboard; all repository names and status details are sample data.
+
+![Creating a worktree from a new branch with Advanced options open](docs/images/git-manager-create-worktree.png)
+
+![Reviewing a clean, merged worktree before removal](docs/images/git-manager-cleanup-preview.png)
+
+![Illustrated worktree creation and cleanup-review walkthrough](docs/images/git-manager-worktree-demo.gif)
+
 ## Download and install
 
 Download a release archive from [GitHub Releases](https://github.com/JohnXu22786/GitManager/releases). The workflow publishes these targets:
@@ -46,6 +57,8 @@ Download a release archive from [GitHub Releases](https://github.com/JohnXu22786
 | macOS Apple silicon | `git-manager-<version>-macos-aarch64.tar.gz` |
 
 Use the release version in the asset name; the release workflow removes a leading `v` from the tag. Archives contain the application binary, not a platform installer. macOS releases are command-line executables rather than `.app` bundles.
+
+The public `v0.1.12` archives predate the latest `main` snapshot, which includes the changes from PRs #126 and #127. Current `main` is preparing version `0.1.13`; use a build from the exact commit selected for a pilot rather than the older public archives.
 
 ### Linux
 
@@ -80,7 +93,7 @@ chmod +x git_manager
 
 Use the `macos-x86_64` archive for Intel Macs.
 
-Git Manager can check the latest GitHub release and offer an update for supported platforms. Updates are downloaded from the project's GitHub Releases page.
+Git Manager can check the latest GitHub release and offer an update for supported platforms. Automatic installation verifies the downloaded archive against the SHA-256 digest supplied by GitHub Releases. If a valid digest is unavailable, automatic installation is disabled and the release page remains available for manual download.
 
 ## Build from source
 

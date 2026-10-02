@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="840" viewBox="0 0 1280 840">
+  <defs>
+    <style>
+      text { font-family: "Open Sans", "DejaVu Sans", sans-serif; fill: #dedede; }
+      .muted { fill: #969696; }
+      .brand { fill: #78a6ff; }
+      .green { fill: #8ccc9b; }
+      .amber { fill: #f0ca64; }
+      .small { font-size: 13px; }
+      .button-text { font-size: 13px; }
+      .rule { stroke: #363636; stroke-width: 1; }
+    </style>
+  </defs>
+  <rect width="1280" height="840" fill="#1e1e1e"/>
+  <rect width="1280" height="47" fill="#272727"/>
+  <line x1="0" y1="46.5" x2="1280" y2="46.5" class="rule"/>
+  <rect x="14" y="8" width="32" height="31" rx="4" fill="#3a3a3a"/>
+  <path d="M21 17h8l3 3h7v12H21z M21 17v-3h8l3 3" fill="none" stroke="#d0d0d0" stroke-width="1.6" stroke-linejoin="round"/>
+  <rect x="51" y="8" width="32" height="31" rx="4" fill="#3a3a3a"/>
+  <circle cx="67" cy="23.5" r="8" fill="none" stroke="#c7c7c7" stroke-width="1.5"/>
+  <path d="M67 18v6l4 2" fill="none" stroke="#c7c7c7" stroke-width="1.5" stroke-linecap="round"/>
+  <line x1="94" y1="11" x2="94" y2="36" stroke="#454545"/>
+  <text x="108" y="29" font-size="15" font-weight="600" class="brand">GitManager</text>
+  <text x="203" y="29" font-size="13" class="muted">/dev/GitManager</text>
+  <line x1="388" y1="11" x2="388" y2="36" stroke="#454545"/>
+  <path d="M406 16v15m0-9c0-4 8-3 8-7m-8 7c0 4 8 3 8 7" fill="none" stroke="#8eafff" stroke-width="1.5"/>
+  <circle cx="406" cy="16" r="2.4" fill="#8eafff"/><circle cx="406" cy="31" r="2.4" fill="#8eafff"/><circle cx="414" cy="15" r="2.4" fill="#8eafff"/><circle cx="414" cy="32" r="2.4" fill="#8eafff"/>
+  <text x="424" y="29" font-size="13">main</text>
+  <rect x="476" y="12" width="88" height="23" rx="11.5" fill="#544a2f"/>
+  <text x="490" y="28" font-size="12" class="amber">1 change</text>
+  <line x1="580" y1="11" x2="580" y2="36" stroke="#454545"/>
+  <circle cx="599" cy="23.5" r="8" fill="none" stroke="#bdbdbd" stroke-width="1.4"/>
+  <ellipse cx="599" cy="23.5" rx="3.5" ry="8" fill="none" stroke="#bdbdbd" stroke-width="1"/>
+  <path d="M591 23.5h16M593 19h12M593 28h12" fill="none" stroke="#bdbdbd" stroke-width="1"/>
+  <text x="613" y="29" font-size="13">origin</text>
+  <text x="1160" y="28" text-anchor="end" font-size="12" class="muted">v0.1.13</text>
+  <rect x="1190" y="8" width="32" height="31" rx="4" fill="#3a3a3a"/>
+  <circle cx="1206" cy="23.5" r="8" fill="none" stroke="#c7c7c7" stroke-width="1.4"/>
+  <text x="1206" y="28" text-anchor="middle" font-size="13" font-weight="600">i</text>
+
+  <rect x="0" y="47" width="1280" height="47" fill="#212121"/>
+  <g font-size="13">
+    <rect x="16" y="54" width="103" height="33" rx="5" fill="transparent"/><text x="54" y="75">Status</text>
+    <rect x="126" y="54" width="112" height="33" rx="5" fill="transparent"/><text x="159" y="75">Branches</text>
+    <rect x="244" y="52" width="124" height="37" rx="5" fill="#3d4a63"/><text x="286" y="75" fill="#f0f3f9">Worktrees</text>
+    <rect x="374" y="54" width="84" height="33" rx="5" fill="transparent"/><text x="411" y="75">Log</text>
+    <rect x="464" y="54" width="82" height="33" rx="5" fill="transparent"/><text x="502" y="75">Stash</text>
+    <rect x="552" y="54" width="100" height="33" rx="5" fill="transparent"/><text x="590" y="75">Remotes</text>
+  </g>
+  <line x1="0" y1="93.5" x2="1280" y2="93.5" class="rule"/>
+  <text x="22" y="132" font-size="21" font-weight="600">Worktrees</text>
+  <rect x="1110" y="108" width="69" height="31" rx="4" fill="#383838" stroke="#4a4a4a"/><text x="1144.5" y="128" text-anchor="middle" class="button-text">Prune</text>
+  <rect x="1187" y="108" width="77" height="31" rx="4" fill="#383838" stroke="#4a4a4a"/><text x="1231" y="128" text-anchor="middle" class="button-text">Refresh</text>
+  <line x1="20" y1="151" x2="1260" y2="151" class="rule"/>
+
+  <text x="26" y="176" font-size="13" font-weight="600">Path</text>
+  <text x="306" y="176" font-size="13" font-weight="600">Branch / opened</text>
+  <text x="1004" y="176" font-size="13" font-weight="600">Status</text>
+  <text x="1181" y="176" font-size="13" font-weight="600">Actions</text>
+  <line x1="20" y1="188" x2="1260" y2="188" class="rule"/>
+  <text x="24" y="211" font-size="13" font-weight="600">Main Worktree</text>
+  <text x="26" y="239" font-size="13" class="muted">/dev/GitManager</text>
+  <text x="306" y="239" font-size="13">★ main [bc83d92] · Opened here &lt;1m ago</text>
+  <text x="1004" y="239" font-size="12.5" class="amber">1 affected · No upstream</text>
+  <rect x="1192" y="218" width="56" height="27" rx="4" fill="#2d2d2d" stroke="#3c3c3c"/><text x="1220" y="236" text-anchor="middle" font-size="12" class="muted">Open</text>
+  <line x1="20" y1="263" x2="1260" y2="263" class="rule"/>
+  <text x="24" y="286" font-size="13" font-weight="600">Linked Worktrees</text>
+  <text x="26" y="321" font-size="13" class="muted">/dev/worktrees/docs-site</text>
+  <text x="306" y="321" font-size="13">○ docs/site [834fe21] · Opened here 8m ago</text>
+  <text x="1004" y="321" font-size="12.5" class="green">Clean · Merged</text>
+  <rect x="1192" y="300" width="48" height="27" rx="4" fill="#383838" stroke="#4a4a4a"/><text x="1216" y="318" text-anchor="middle" font-size="12">Open</text>
+  <line x1="20" y1="338" x2="1260" y2="338" stroke="#2d2d2d"/>
+
+  <line x1="20" y1="370" x2="1260" y2="370" class="rule"/>
+  <text x="22" y="402" font-size="18" font-weight="600">Add Worktree</text>
+  <text x="24" y="438" font-size="13">Branch:</text>
+  <rect x="84" y="415" width="310" height="31" rx="4" fill="#282828" stroke="#78a6ff" stroke-width="1.5"/>
+  <text x="96" y="435" font-size="13">feature/parallel-change</text>
+  <rect x="412" y="423" width="14" height="14" rx="2" fill="#78a6ff" stroke="#78a6ff"/>
+  <path d="M415 430l3 3 6-7" fill="none" stroke="#17202e" stroke-width="1.5"/>
+  <text x="434" y="436" font-size="13">Create new branch</text>
+  <path d="M420 470l6 6 6-6" fill="none" stroke="#aaa" stroke-width="1.5" transform="rotate(180 426 473)"/>
+  <text x="438" y="480" font-size="13">Advanced</text>
+  <text x="24" y="525" font-size="13">Worktree name:</text>
+  <rect x="142" y="502" width="370" height="31" rx="4" fill="#282828" stroke="#494949"/>
+  <text x="154" y="522" font-size="13">feature-parallel-change</text>
+  <text x="524" y="522" font-size="12" class="muted">(defaults from branch)</text>
+  <text x="24" y="569" font-size="13">Path:</text>
+  <rect x="84" y="546" width="428" height="31" rx="4" fill="#282828" stroke="#494949"/>
+  <text x="96" y="566" font-size="13" class="muted">(leave empty for default)</text>
+  <rect x="24" y="602" width="132" height="31" rx="4" fill="#383838" stroke="#4a4a4a"/>
+  <text x="90" y="623" text-anchor="middle" font-size="13">Add Worktree</text>
+  <text x="24" y="685" font-size="13" class="muted">Illustrative sample data · No repository changes are performed in this image</text>
+  <rect x="0" y="808" width="1280" height="32" fill="#292929"/><line x1="0" y1="808.5" x2="1280" y2="808.5" class="rule"/>
+  <circle cx="22" cy="824" r="4" fill="#8ccc9b"/><text x="34" y="829" font-size="13" class="green">Ready</text>
+  <text x="1200" y="829" text-anchor="end" font-size="12" class="muted">just now</text>
+</svg>
