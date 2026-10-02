@@ -12,7 +12,9 @@ Git Manager is a lightweight desktop Git client for developers working across mu
 
 1. Open or clone a repository.
 2. Use the Worktrees view to create a worktree from an existing or new branch.
-3. Open the worktree inside Git Manager, review its local and upstream state, and inspect the cleanup preview before removal.
+   Its name and sibling path default from the branch name; Advanced lets you override them.
+3. Open the worktree inside Git Manager or in the file manager, review its local
+   and upstream state, and inspect the cleanup preview before removal.
 
 The `Opened here` label uses Git Manager's recent-open history only. It does not track activity in terminals, editors, or other applications; no history entry does not mean a worktree is unused.
 

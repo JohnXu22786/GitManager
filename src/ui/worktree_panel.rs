@@ -7,9 +7,10 @@ use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
 use eframe::egui;
 use std::path::Path;
 
-const WORKTREE_ACTIONS_WIDTH: f32 = 90.0;
+const WORKTREE_ACTIONS_WIDTH: f32 = 150.0;
 const WORKTREE_STATUS_MIN_WIDTH: f32 = 88.0;
 const WORKTREE_STATUS_WIDTH: f32 = 170.0;
+const MAX_WORKTREE_NAME_BYTES: usize = 240;
 
 fn worktree_status_column_width(available_width: f32) -> f32 {
     let width = available_width - WORKTREE_ACTIONS_WIDTH - 220.0;
@@ -276,31 +277,39 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     ui.heading("Add Worktree");
 
     ui.horizontal(|ui| {
-        ui.label("Name:");
-        ui.text_edit_singleline(&mut app.new_worktree_name);
+        ui.label("Branch:");
+        ui.text_edit_singleline(&mut app.new_worktree_branch);
+        ui.checkbox(&mut app.new_worktree_create_branch, "Create new branch");
     });
     egui::CollapsingHeader::new("Advanced")
         .id_salt("worktree_creation_advanced")
         .default_open(false)
         .show(ui, |ui| {
             ui.horizontal(|ui| {
+                ui.label("Worktree name:");
+                ui.text_edit_singleline(&mut app.new_worktree_name);
+                ui.label("(defaults from branch)");
+            });
+            ui.horizontal(|ui| {
                 ui.label("Path:");
                 ui.text_edit_singleline(&mut app.new_worktree_path);
                 ui.label("(leave empty for default)");
             });
         });
-    ui.horizontal(|ui| {
-        ui.label("Branch:");
-        ui.text_edit_singleline(&mut app.new_worktree_branch);
-        ui.checkbox(&mut app.new_worktree_create_branch, "Create new branch");
-    });
 
     let busy = app.is_busy();
     if crate::ui::add_enabled_ellipsis(ui, !busy, "Add Worktree").clicked() {
-        let name = app.new_worktree_name.trim().to_string();
-        if name.is_empty() {
-            app.show_error("Worktree name required".into());
+        let branch = app.new_worktree_branch.trim().to_string();
+        if branch.is_empty() {
+            app.show_error("Branch required".into());
         } else {
+            let name = match worktree_name_for_creation(&branch, &app.new_worktree_name) {
+                Ok(name) => name,
+                Err(error) => {
+                    app.show_error(error.into());
+                    return;
+                }
+            };
             let path = if app.new_worktree_path.trim().is_empty() {
                 let Some(repo_path) = app.git.path() else {
                     app.show_error(
@@ -320,12 +329,6 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 std::path::PathBuf::from(app.new_worktree_path.trim())
             };
 
-            let branch = if app.new_worktree_branch.trim().is_empty() {
-                None
-            } else {
-                Some(app.new_worktree_branch.trim().to_string())
-            };
-
             let form_submission = FormSubmission::CreateWorktree {
                 name: app.new_worktree_name.clone(),
                 path: app.new_worktree_path.clone(),
@@ -338,7 +341,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 GitOperation::CreateWorktree {
                     name,
                     path,
-                    branch,
+                    branch: Some(branch),
                     new_branch: app.new_worktree_create_branch,
                 },
                 form_submission,
@@ -347,11 +350,104 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     }
 }
 
+fn default_worktree_name(value: &str) -> String {
+    const SHA256_SUFFIX_LENGTH: usize = 1 + 64;
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut name = String::new();
+    for byte in value.bytes() {
+        push_encoded_branch_byte(&mut name, byte);
+    }
+    if name.len() > MAX_WORKTREE_NAME_BYTES {
+        let prefix_limit = MAX_WORKTREE_NAME_BYTES - SHA256_SUFFIX_LENGTH;
+        let mut prefix = String::new();
+        for byte in value.bytes() {
+            let previous_len = prefix.len();
+            push_encoded_branch_byte(&mut prefix, byte);
+            if prefix.len() > prefix_limit {
+                prefix.truncate(previous_len);
+                break;
+            }
+        }
+
+        let digest = ring::digest::digest(&ring::digest::SHA256, value.as_bytes());
+        name = prefix;
+        name.push('~');
+        for byte in digest.as_ref() {
+            name.push(HEX[(byte >> 4) as usize] as char);
+            name.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    if name.is_empty() {
+        return "worktree".into();
+    }
+    if is_windows_reserved_device_name(&name) {
+        let escaped_first = format!("~{:02X}", value.as_bytes()[0]);
+        name.replace_range(0..1, &escaped_first);
+    }
+    name
+}
+
+fn push_encoded_branch_byte(name: &mut String, byte: u8) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    if byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_') {
+        name.push(char::from(byte));
+    } else {
+        name.push('~');
+        name.push(HEX[(byte >> 4) as usize] as char);
+        name.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+}
+
+fn is_windows_reserved_device_name(name: &str) -> bool {
+    let device_name = name
+        .split('.')
+        .next()
+        .unwrap_or(name)
+        .trim_end_matches(|character| matches!(character, ' ' | '.'))
+        .to_ascii_uppercase();
+    matches!(
+        device_name.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || ["COM", "LPT"].iter().any(|prefix| {
+        device_name.strip_prefix(prefix).is_some_and(|number| {
+            matches!(
+                number,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
+    })
+}
+
 fn default_worktree_path(
     repo_path: &std::path::Path,
     name: &str,
 ) -> Option<std::path::PathBuf> {
     repo_path.parent().map(|parent| parent.join(name))
+}
+
+fn worktree_name_for_creation(branch: &str, name_input: &str) -> Result<String, &'static str> {
+    if name_input.trim().is_empty() {
+        return Ok(default_worktree_name(branch));
+    }
+
+    let has_invalid_character = name_input.chars().any(|character| {
+        character.is_control()
+            || matches!(
+                character,
+                '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+            )
+    });
+    if name_input.len() > MAX_WORKTREE_NAME_BYTES
+        || matches!(name_input, "." | "..")
+        || name_input.ends_with(' ')
+        || name_input.ends_with('.')
+        || has_invalid_character
+        || is_windows_reserved_device_name(name_input)
+    {
+        return Err("Worktree name must be a single valid directory name up to 240 bytes");
+    }
+
+    Ok(name_input.into())
 }
 
 fn show_worktree_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, wt: &WorktreeInfo) {
@@ -413,12 +509,22 @@ fn show_worktree_row(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, wt: 
                     }
                 });
             }
-            if ui
-                .add_enabled(!busy && !is_current, egui::Button::new("Open"))
-                .clicked()
-            {
+            let folder_button = ui.add_enabled(!busy, egui::Button::new("Folder"));
+            if folder_button.clicked() {
+                if let Err(error) = open::that(&wt_path) {
+                    app.show_error(format!(
+                        "Could not open worktree in file manager: {}",
+                        error
+                    ));
+                }
+            }
+            folder_button.on_hover_text("Open this worktree in the file manager");
+
+            let open_button = ui.add_enabled(!busy && !is_current, egui::Button::new("Open"));
+            if open_button.clicked() {
                 open_worktree(app, &wt_path);
             }
+            open_button.on_hover_text("Open this worktree in Git Manager");
         });
     });
 }
@@ -430,8 +536,8 @@ fn open_worktree(app: &mut App, path: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_worktree_path, open_worktree, recent_open_activity, worktree_status_column_width,
-        worktree_status_label,
+        default_worktree_name, default_worktree_path, open_worktree, recent_open_activity,
+        worktree_name_for_creation, worktree_status_column_width, worktree_status_label,
     };
     use crate::app::App;
     use crate::git_ops::{WorktreeInfo, WorktreeStatusSummary};
@@ -441,8 +547,8 @@ mod tests {
 
     #[test]
     fn status_column_hides_when_the_window_is_too_narrow() {
-        assert_eq!(worktree_status_column_width(380.0), 0.0);
-        assert_eq!(worktree_status_column_width(398.0), 88.0);
+        assert_eq!(worktree_status_column_width(440.0), 0.0);
+        assert_eq!(worktree_status_column_width(458.0), 88.0);
         assert_eq!(worktree_status_column_width(800.0), 170.0);
     }
 
@@ -558,6 +664,82 @@ mod tests {
         assert_eq!(
             default_worktree_path(&repo_path, "feature"),
             Some(PathBuf::from("parent").join("feature"))
+        );
+    }
+
+    #[test]
+    fn explicit_worktree_names_are_preserved_or_rejected() {
+        assert_eq!(
+            worktree_name_for_creation("feature/new", "Release-v1.0"),
+            Ok("Release-v1.0".into())
+        );
+        assert_eq!(
+            worktree_name_for_creation("feature/new", " Release"),
+            Ok(" Release".into())
+        );
+        assert!(worktree_name_for_creation("feature/new", "Release/v1.0").is_err());
+        assert!(worktree_name_for_creation("feature/new", "../../outside").is_err());
+        assert!(worktree_name_for_creation("feature/new", "CON.txt").is_err());
+        assert_eq!(
+            worktree_name_for_creation("feature/new", ""),
+            Ok("feature~2Fnew".into())
+        );
+    }
+
+    #[test]
+    fn windows_superscript_device_names_are_rejected() {
+        for name in ["COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³"] {
+            assert!(
+                worktree_name_for_creation("feature/new", name).is_err(),
+                "reserved name was accepted: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn branch_default_uses_one_distinct_portable_name_for_worktree_and_directory() {
+        let repo_path = PathBuf::from("parent").join("repository");
+        let worktree_name = default_worktree_name("feature/add-login");
+
+        assert_eq!(worktree_name, "feature~2Fadd-login");
+        assert_eq!(
+            default_worktree_name(r"feature\add-login"),
+            "feature~5Cadd-login"
+        );
+        assert_eq!(
+            default_worktree_name("feature/<user>"),
+            "feature~2F~3Cuser~3E"
+        );
+        let slash_branch_name = default_worktree_name("feature/login");
+        let hyphen_branch_name = default_worktree_name("feature-login");
+        assert_ne!(slash_branch_name, hyphen_branch_name);
+        assert_ne!(
+            default_worktree_path(&repo_path, &slash_branch_name),
+            default_worktree_path(&repo_path, &hyphen_branch_name)
+        );
+        assert_ne!(
+            default_worktree_name("Feature/login"),
+            default_worktree_name("feature/login")
+        );
+        assert_eq!(
+            default_worktree_name("CON.txt"),
+            "~43~4F~4E~2Etxt"
+        );
+        assert_eq!(default_worktree_name("con"), "~63on");
+        assert_eq!(default_worktree_name("lpt9.log"), "lpt9~2Elog");
+        assert_eq!(default_worktree_name("feature."), "feature~2E");
+        assert_eq!(default_worktree_name(".."), "~2E~2E");
+        assert_eq!(default_worktree_name(""), "worktree");
+        let long_branch_a = format!("{}A", "A".repeat(85));
+        let long_branch_b = format!("{}B", "A".repeat(85));
+        let long_name_a = default_worktree_name(&long_branch_a);
+        let long_name_b = default_worktree_name(&long_branch_b);
+        assert!(long_name_a.len() <= 240);
+        assert!(long_name_b.len() <= 240);
+        assert_ne!(long_name_a, long_name_b);
+        assert_eq!(
+            default_worktree_path(&repo_path, &worktree_name),
+            Some(PathBuf::from("parent").join("feature~2Fadd-login"))
         );
     }
 }
