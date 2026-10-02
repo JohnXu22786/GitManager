@@ -6,7 +6,8 @@ Use this protocol with 5–10 developers who routinely work across multiple bran
 
 ## Preflight
 
-- Use a release candidate built from the exact commit being evaluated. The public v0.1.10 archives predate the `main` snapshot as of 2026-09-30; do not use them to evaluate the newer worktree workflow.
+- Use a release candidate built from the exact commit being evaluated. As of 2026-10-02, the public v0.1.12 assets are from tag `97ff413` and predate the latest `main` snapshot at `68ba382`, which includes PRs #126 and #127. Current `main` is preparing version 0.1.13; do not use the v0.1.12 archives to evaluate the latest worktree workflow.
+- Record the candidate's exact Git commit and displayed application version with the session results. Do not assume that the latest public release contains every change on `main`.
 - Recruit participants who already use Git worktrees or regularly switch between parallel branches. Do not contact anyone until the repository owner authorizes the outreach and provides an audience.
 - Ask participants to use a disposable repository or a copy with no valuable uncommitted work. Do not ask them to force-remove a worktree from an active project.
 - Record consent, app version, OS/version, and task outcomes. Do not collect repository contents, credentials, or private remote URLs.
@@ -58,9 +59,11 @@ Treat these as proposed gates, not results:
 
 ## Short Demo Outline
 
+The README links a short [illustrative storyboard GIF](images/git-manager-worktree-demo.gif). It uses sample data and is not a live screen recording.
+
 1. Open a sample repository and show the Worktrees-first view.
 2. Create and open a parallel worktree.
 3. Point out local/upstream state and the limited, app-local last-opened signal.
 4. Open a cleanup preview, read the impact summary, and cancel.
 
-This is a recording outline only; no demo video or worktree-focused screenshot has been produced in this task.
+For a live demonstration, record these steps from the selected release candidate on the platform being evaluated. The repository visuals are illustrative, not physical-device validation.
