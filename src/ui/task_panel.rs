@@ -1,7 +1,8 @@
-use crate::app::{App, Tab};
+use crate::app::{App, Tab, TaskVerificationCommandDraft};
 use crate::git_ops::TaskDiffReviewState;
 use crate::harness::{ClaudeHarness, CodexHarness, ResumeCapability, TaskHarness};
 use crate::tasks::TaskRecord;
+use crate::task_verification::{VerificationCommand, VerificationState};
 use eframe::egui;
 use std::path::Path;
 
@@ -142,8 +143,18 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     let mut start_claude: Option<TaskRecord> = None;
     let mut resume_claude: Option<TaskRecord> = None;
     let mut review_task: Option<TaskRecord> = None;
+    let mut configure_verification: Option<TaskRecord> = None;
+    let mut run_verification: Option<TaskRecord> = None;
+    let mut cancel_verification: Option<String> = None;
     for task in &entries {
         let available = worktree_directory_present(&task.worktree_path);
+        let current_fingerprint = if task.verification_result.is_some() {
+            app.current_task_fingerprint(ctx, task)
+        } else {
+            None
+        };
+        let verification_running = app.task_verification_is_running(&task.id);
+        let any_verification_running = app.task_verification_any_running();
         ui.group(|ui| {
             ui.horizontal(|ui| {
                 ui.add(
@@ -151,7 +162,13 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                         .truncate(),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if crate::ui::ellipsis_button(ui, "Unlink").clicked() {
+                    if crate::ui::add_enabled_ellipsis(
+                        ui,
+                        !verification_running,
+                        "Unlink",
+                    )
+                    .clicked()
+                    {
                         unlink_task = Some(task.id.clone());
                     }
                     if ui
@@ -258,6 +275,18 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                     "Harness: Claude Code · session ID not tracked"
                 });
             }
+            render_task_verification(
+                app,
+                ui,
+                task,
+                available,
+                verification_running,
+                any_verification_running,
+                current_fingerprint.as_ref(),
+                &mut configure_verification,
+                &mut run_verification,
+                &mut cancel_verification,
+            );
             ui.horizontal_wrapped(|ui| {
                 if let Some(branch) = &task.branch {
                     ui.label(format!("Branch: {branch}"));
@@ -281,9 +310,22 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         });
     }
 
+    if let Some(task) = configure_verification {
+        app.task_verification_editor = Some(TaskVerificationCommandDraft::for_task(&task));
+    }
+    render_verification_command_editor(app, ui, &entries);
+
+    if let Some(task) = run_verification {
+        app.start_task_verification(ctx, &task);
+    }
+    if let Some(task_id) = cancel_verification {
+        app.cancel_task_verification(&task_id);
+    }
+
     if let Some(id) = unlink_task {
         match app.task_registry.unlink(&id) {
             Ok(()) => {
+                app.forget_task_fingerprint_probe(&id);
                 if app
                     .task_diff_review
                     .as_ref()
@@ -405,6 +447,266 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     }
 
     render_task_diff_review(app, ui);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_task_verification(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    task: &TaskRecord,
+    available: bool,
+    verification_running: bool,
+    any_verification_running: bool,
+    current_fingerprint: Option<&Result<String, String>>,
+    configure_verification: &mut Option<TaskRecord>,
+    run_verification: &mut Option<TaskRecord>,
+    cancel_verification: &mut Option<String>,
+) {
+    let cancellation_requested = app.task_verification_cancel_requested(&task.id);
+    ui.separator();
+    ui.label(egui::RichText::new("Task verification").strong());
+    if let Some(command) = &task.verification_command {
+        ui.monospace(format!("{} {:?}", command.executable, command.args));
+    } else {
+        ui.label("No verification command configured.");
+    }
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("Configure command").clicked() {
+            *configure_verification = Some(task.clone());
+        }
+        if verification_running {
+            let progress_label = if cancellation_requested { "Cancelling…" } else { "Running" };
+            ui.label(egui::RichText::new(progress_label).color(App::adaptive_yellow(ui.style().visuals.dark_mode)));
+            if !cancellation_requested && ui.button("Cancel verification").clicked() {
+                *cancel_verification = Some(task.id.clone());
+            }
+        } else if ui
+            .add_enabled(
+                available
+                    && task.verification_command.is_some()
+                    && !any_verification_running
+                    && !app.is_busy(),
+                egui::Button::new("Run verification"),
+            )
+            .clicked()
+        {
+            *run_verification = Some(task.clone());
+        }
+    });
+
+    if let Some(result) = &task.verification_result {
+        let dark = ui.style().visuals.dark_mode;
+        let source_is_current = match (&result.source_fingerprint, current_fingerprint) {
+            (Some(saved), Some(Ok(current))) => Some(saved == current),
+            _ => None,
+        };
+        let command_matches = task.verification_command.as_ref() == Some(&result.command);
+        let state_prefix = if source_is_current == Some(false) {
+            "Stale · "
+        } else if source_is_current.is_none() && result.source_fingerprint.is_some() {
+            if current_fingerprint.is_none() {
+                "Checking freshness · "
+            } else {
+                "Freshness unknown · "
+            }
+        } else if !command_matches {
+            "Previous command · "
+        } else if result.source_fingerprint.is_none() {
+            "Freshness unknown · "
+        } else {
+            ""
+        };
+        let state_label = format!("{state_prefix}{}", result.state.label());
+        let state_color = if source_is_current != Some(true) || !command_matches {
+            App::adaptive_yellow(dark)
+        } else {
+            match result.state {
+                VerificationState::Passed => App::adaptive_green(dark),
+                VerificationState::Failed | VerificationState::Error => App::adaptive_red(dark),
+                VerificationState::Running
+                | VerificationState::TimedOut
+                | VerificationState::Cancelled => App::adaptive_yellow(dark),
+            }
+        };
+        ui.colored_label(state_color, format!("Last result: {state_label}"));
+        if result.state == VerificationState::Running && !verification_running {
+            ui.colored_label(
+                App::adaptive_yellow(dark),
+                "Run was recorded as running; live process state is unavailable.",
+            );
+        }
+        ui.horizontal_wrapped(|ui| {
+            if let Some(exit_code) = result.exit_code {
+                ui.label(format!("Exit code: {exit_code}"));
+            }
+            ui.label(format!("Started: {}", result.started_at));
+            if let Some(finished_at) = &result.finished_at {
+                ui.label(format!("Finished: {finished_at}"));
+            }
+        });
+        if !command_matches {
+            ui.colored_label(App::adaptive_yellow(dark), "The saved result used a different command configuration.");
+        }
+        match source_is_current {
+            Some(true) => {
+                ui.colored_label(App::adaptive_green(dark), "Source state matches this result.");
+            }
+            Some(false) => {
+                ui.colored_label(App::adaptive_yellow(dark), "Stale: task source changed after this run.");
+            }
+            None if result.source_fingerprint.is_some() && current_fingerprint.is_some() => {
+                let error = current_fingerprint.and_then(|fingerprint| fingerprint.as_ref().err());
+                ui.colored_label(
+                    App::adaptive_yellow(dark),
+                    format!("Freshness unavailable: {}", error.cloned().unwrap_or_else(|| "could not compare source fingerprints".into())),
+                );
+            }
+            None if result.source_fingerprint.is_some() => {
+                ui.label("Checking whether the task source has changed…");
+            }
+            _ => {
+                ui.colored_label(App::adaptive_yellow(dark), "Source freshness could not be established.");
+            }
+        }
+        egui::CollapsingHeader::new("Verification output")
+            .id_salt(("task_verification_output", &task.id))
+            .show(ui, |ui| {
+                ui.label(format!("Executable: {}", result.command.executable));
+                ui.label(format!("Arguments: {:?}", result.command.args));
+                ui.label(format!(
+                    "Timeout: {} minute(s)",
+                    result.command.timeout_seconds.saturating_add(59) / 60
+                ));
+                if let Some(fingerprint) = &result.source_fingerprint {
+                    ui.monospace(format!("Source fingerprint: {fingerprint}"));
+                }
+                if result.output_truncated {
+                    ui.colored_label(
+                        App::adaptive_yellow(ui.style().visuals.dark_mode),
+                        "Output is incomplete or truncated; up to 16 KiB per stream is retained.",
+                    );
+                }
+                egui::ScrollArea::vertical()
+                    .max_height(180.0)
+                    .show(ui, |ui| {
+                        if !result.stdout.is_empty() {
+                            ui.label("stdout");
+                            ui.monospace(&result.stdout);
+                        }
+                        if !result.stderr.is_empty() {
+                            ui.label("stderr");
+                            ui.monospace(&result.stderr);
+                        }
+                        if result.stdout.is_empty() && result.stderr.is_empty() {
+                            ui.label("No output captured.");
+                        }
+                    });
+            });
+    }
+}
+
+fn render_verification_command_editor(app: &mut App, ui: &mut egui::Ui, entries: &[TaskRecord]) {
+    let Some(editor_task_id) = app
+        .task_verification_editor
+        .as_ref()
+        .map(|editor| editor.task_id.clone())
+    else {
+        return;
+    };
+    if !entries.iter().any(|task| task.id == editor_task_id) {
+        app.task_verification_editor = None;
+        return;
+    }
+    if app.task_verification_is_running(&editor_task_id) {
+        ui.label("Command settings cannot be changed while this task is running verification.");
+        return;
+    }
+    let Some(editor) = app.task_verification_editor.as_mut() else {
+        return;
+    };
+
+    let mut save = false;
+    let mut remove = false;
+    let mut cancel = false;
+    ui.add_space(8.0);
+    ui.group(|ui| {
+        ui.label(egui::RichText::new(format!("Verification command · {}", editor.title)).strong());
+        ui.label("The executable and arguments are launched directly without shell parsing.");
+        ui.label("Executable");
+        ui.text_edit_singleline(&mut editor.executable);
+        ui.label("Arguments (JSON array of strings; use \"\" for an empty argument)");
+        let arguments_width = ui.available_width();
+        ui.add(
+            egui::TextEdit::multiline(&mut editor.arguments)
+                .desired_rows(3)
+                .desired_width(arguments_width),
+        );
+        ui.horizontal(|ui| {
+            ui.label("Timeout (minutes)");
+            ui.add(egui::TextEdit::singleline(&mut editor.timeout_minutes).desired_width(80.0));
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Save command").clicked() {
+                save = true;
+            }
+            if ui.button("Remove command").clicked() {
+                remove = true;
+            }
+            if ui.button("Cancel").clicked() {
+                cancel = true;
+            }
+        });
+    });
+
+    let task_id = editor.task_id.clone();
+    let executable = editor.executable.clone();
+    let arguments = editor.arguments.clone();
+    let timeout_text = editor.timeout_minutes.clone();
+    if save {
+        let command = match timeout_text.trim().parse::<u64>() {
+            Ok(minutes) if (1..=24 * 60).contains(&minutes) => {
+                serde_json::from_str::<Vec<String>>(&arguments)
+                    .map(|args| VerificationCommand {
+                        executable: executable.trim().to_string(),
+                        args,
+                        timeout_seconds: minutes * 60,
+                    })
+                    .map_err(|error| {
+                        format!("Arguments must be a JSON array of strings: {error}")
+                    })
+            }
+            _ => Err("Set the timeout to a whole number from 1 to 1440 minutes".into()),
+        };
+        match command {
+            Ok(command) => match command.validate() {
+                Ok(()) => match app
+                    .task_registry
+                    .save_verification_command(&task_id, Some(command))
+                {
+                    Ok(()) => {
+                        app.task_verification_editor = None;
+                        app.show_success("Task verification command saved".into());
+                    }
+                    Err(error) => app.show_error(format!("Could not save command: {error}")),
+                },
+                Err(error) => app.show_error(error),
+            },
+            Err(error) => app.show_error(error),
+        }
+    } else if remove {
+        match app
+            .task_registry
+            .save_verification_command(&task_id, None)
+        {
+            Ok(()) => {
+                app.task_verification_editor = None;
+                app.show_success("Task verification command removed".into());
+            }
+            Err(error) => app.show_error(format!("Could not remove command: {error}")),
+        }
+    } else if cancel {
+        app.task_verification_editor = None;
+    }
 }
 
 fn render_task_diff_review(app: &mut App, ui: &mut egui::Ui) {

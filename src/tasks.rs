@@ -1,5 +1,7 @@
 use chrono::{SecondsFormat, Utc};
+use crate::task_verification::{VerificationCommand, VerificationResult, VerificationState};
 use git2::Repository;
+use ring::digest::{digest, SHA256};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
@@ -31,6 +33,10 @@ pub struct TaskRecord {
     pub session_ref: Option<String>,
     #[serde(default)]
     pub validation_ref: Option<String>,
+    #[serde(default)]
+    pub verification_command: Option<VerificationCommand>,
+    #[serde(default)]
+    pub verification_result: Option<VerificationResult>,
 }
 
 impl TaskRecord {
@@ -74,6 +80,8 @@ impl TaskRecord {
             provider_ref: None,
             session_ref: None,
             validation_ref: None,
+            verification_command: None,
+            verification_result: None,
         })
     }
 }
@@ -129,6 +137,7 @@ impl TaskRegistry {
     }
 
     pub fn unlink(&mut self, id: &str) -> io::Result<()> {
+        let _run_lock = self.acquire_verification_run_lock(id)?;
         self.update_registry(|entries| {
             let old_len = entries.len();
             entries.retain(|entry| entry.id != id);
@@ -186,6 +195,138 @@ impl TaskRegistry {
         })
     }
 
+    pub fn save_verification_command(
+        &mut self,
+        id: &str,
+        command: Option<VerificationCommand>,
+    ) -> io::Result<()> {
+        self.update_registry(|entries| {
+            let entry = entries
+                .iter_mut()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task no longer exists"))?;
+            if entry.verification_command == command {
+                return Ok(false);
+            }
+            entry.verification_command = command;
+            entry.updated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+            Ok(true)
+        })
+    }
+
+    pub fn start_verification(
+        &mut self,
+        id: &str,
+        command: &VerificationCommand,
+        result: VerificationResult,
+    ) -> io::Result<TaskVerificationRunLock> {
+        let run_lock = self.acquire_verification_run_lock(id)?;
+        self.update_registry(|entries| {
+            let entry = entries
+                .iter_mut()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task no longer exists"))?;
+            if entry.verification_command.as_ref() != Some(command) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "task verification command changed before the run could start",
+                ));
+            }
+            if result.state != VerificationState::Running {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "a task verification must start in the running state",
+                ));
+            }
+            entry.verification_result = Some(result);
+            entry.updated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+            Ok(true)
+        })?;
+        Ok(run_lock)
+    }
+
+    fn acquire_verification_run_lock(&self, id: &str) -> io::Result<TaskVerificationRunLock> {
+        let parent = self
+            .file_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        fs::create_dir_all(parent)?;
+        let key = digest(&SHA256, id.as_bytes());
+        let suffix = key
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let lock_path = self
+            .file_path
+            .with_extension(format!("verification-{suffix}.lock"));
+        TaskVerificationRunLock::try_acquire(&lock_path)
+    }
+
+    pub fn record_verification_fingerprint(
+        &mut self,
+        id: &str,
+        run_id: &str,
+        fingerprint: &str,
+    ) -> io::Result<()> {
+        self.update_registry(|entries| {
+            let entry = entries
+                .iter_mut()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task no longer exists"))?;
+            let result = entry.verification_result.as_mut().filter(|result| {
+                result.run_id == run_id && result.state == VerificationState::Running
+            }).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::WouldBlock, "task verification run is no longer current")
+            })?;
+            if result.source_fingerprint.as_deref() == Some(fingerprint) {
+                return Ok(false);
+            }
+            result.source_fingerprint = Some(fingerprint.to_string());
+            Ok(true)
+        })
+    }
+
+    pub fn record_verification_result(
+        &mut self,
+        id: &str,
+        run_id: &str,
+        result: VerificationResult,
+    ) -> io::Result<()> {
+        self.update_registry(|entries| {
+            let entry = entries
+                .iter_mut()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task no longer exists"))?;
+            let current = entry.verification_result.as_ref().filter(|current| {
+                current.run_id == run_id && current.state == VerificationState::Running
+            }).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::WouldBlock, "task verification run is no longer current")
+            })?;
+            let mut result = result;
+            if result.source_fingerprint.is_none() {
+                result.source_fingerprint = current.source_fingerprint.clone();
+            }
+            entry.verification_result = Some(result);
+            entry.updated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+            Ok(true)
+        })
+    }
+
+    pub fn reload(&mut self) {
+        match load_registry(&self.file_path) {
+            Ok(entries) => {
+                self.entries = entries;
+                self.load_error = None;
+            }
+            Err(error) => {
+                self.entries.clear();
+                self.load_error = Some(error.to_string());
+            }
+        }
+    }
+
     fn update_registry(
         &mut self,
         change: impl FnOnce(&mut Vec<TaskRecord>) -> io::Result<bool>,
@@ -221,6 +362,41 @@ struct RegistryFileLock {
     _file: fs::File,
     #[cfg(windows)]
     _overlapped: windows_sys::Win32::System::IO::OVERLAPPED,
+}
+
+pub struct TaskVerificationRunLock {
+    _file: fs::File,
+    #[cfg(windows)]
+    _overlapped: windows_sys::Win32::System::IO::OVERLAPPED,
+}
+
+impl TaskVerificationRunLock {
+    fn try_acquire(path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path)?;
+        #[cfg(windows)]
+        let mut overlapped = unsafe { std::mem::zeroed() };
+
+        #[cfg(windows)]
+        let locked = try_lock_file(&file, &mut overlapped)?;
+        #[cfg(not(windows))]
+        let locked = try_lock_file(&file)?;
+        if !locked {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "task verification is already running in another Git Manager instance",
+            ));
+        }
+
+        Ok(Self {
+            _file: file,
+            #[cfg(windows)]
+            _overlapped: overlapped,
+        })
+    }
 }
 
 impl RegistryFileLock {
@@ -327,7 +503,7 @@ fn next_id() -> String {
     format!("task-{nanos:x}-{:x}-{sequence:x}", std::process::id())
 }
 
-fn repository_root(repository: &Repository, worktree: &Path) -> Result<PathBuf, String> {
+pub(crate) fn repository_root(repository: &Repository, worktree: &Path) -> Result<PathBuf, String> {
     let git_dir = repository.path();
     let common_dir_file = git_dir.join("commondir");
     let common_dir = match std::fs::read_to_string(common_dir_file) {

@@ -1,13 +1,17 @@
 use crate::git_ops::*;
 use crate::recent::{path_name, RecentRepos};
-use crate::tasks::{TaskRecord, TaskRegistry};
+use crate::tasks::{TaskRecord, TaskRegistry, TaskVerificationRunLock};
+use crate::task_verification::{
+    self, VerificationCommand, VerificationResult, VerificationState,
+};
 use crate::updater::{self, UpdateState};
 use eframe::egui;
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 const ABOUT_BUTTON_LABEL: &str = "ℹ";
 const APP_VERSION: &str = crate::version_info::VERSION;
@@ -231,6 +235,45 @@ struct PendingWorktreeCleanup {
     ready: bool,
 }
 
+pub struct TaskVerificationCommandDraft {
+    pub task_id: String,
+    pub title: String,
+    pub executable: String,
+    pub arguments: String,
+    pub timeout_minutes: String,
+}
+
+impl TaskVerificationCommandDraft {
+    pub(crate) fn for_task(task: &TaskRecord) -> Self {
+        let command = task.verification_command.as_ref();
+        Self {
+            task_id: task.id.clone(),
+            title: task.title.clone(),
+            executable: command.map(|command| command.executable.clone()).unwrap_or_default(),
+            arguments: command
+                .and_then(|command| serde_json::to_string_pretty(&command.args).ok())
+                .unwrap_or_else(|| "[]".into()),
+            timeout_minutes: command
+                .map(|command| (command.timeout_seconds.saturating_add(59) / 60).to_string())
+                .unwrap_or_else(|| "30".into()),
+        }
+    }
+}
+
+struct PendingTaskVerification {
+    task_id: String,
+    cancel_requested: Arc<AtomicBool>,
+    receiver: mpsc::Receiver<Result<(), String>>,
+    worker: std::thread::JoinHandle<()>,
+    _run_lock: TaskVerificationRunLock,
+}
+
+struct TaskFingerprintProbe {
+    result: Option<Result<String, String>>,
+    checked_at: Option<Instant>,
+    receiver: Option<mpsc::Receiver<Result<String, String>>>,
+}
+
 
 /// Tracks a Git operation running in a background thread.
 struct PendingOp {
@@ -419,6 +462,9 @@ pub struct App {
     pub task_title: String,
     pub task_worktree_path: String,
     pub task_diff_review: Option<TaskDiffReviewView>,
+    pub task_verification_editor: Option<TaskVerificationCommandDraft>,
+    task_verification_run: Option<PendingTaskVerification>,
+    task_fingerprint_probes: HashMap<String, TaskFingerprintProbe>,
     task_diff_request_id: u64,
     pub status_expanded: bool,
     /// Excel-style resizable column widths for tables.
@@ -499,6 +545,9 @@ impl App {
             task_title: String::new(),
             task_worktree_path: String::new(),
             task_diff_review: None,
+            task_verification_editor: None,
+            task_verification_run: None,
+            task_fingerprint_probes: HashMap::new(),
             task_diff_request_id: 0,
             status_expanded: false,
             column_widths: crate::ui::init_column_widths(),
@@ -670,6 +719,10 @@ impl App {
     /// Extract the binary from the downloaded archive, create a self-update
     /// script, launch it, and exit the current process to complete the update.
     pub fn install_and_restart(&mut self) {
+        if self.task_verification_any_running() {
+            self.show_error("Finish or cancel task verification before installing an update".into());
+            return;
+        }
         let current_state = self.update_state.lock().unwrap().clone();
         let archive_path = match &current_state {
             UpdateState::Downloaded { file_path } => file_path.clone(),
@@ -1014,6 +1067,7 @@ impl App {
         !self.pending_ops.is_empty()
             || self.pending_confirmation.is_some()
             || self.pending_worktree_cleanup.is_some()
+            || self.task_verification_run.is_some()
     }
 
     /// Returns the description of the current/last operation.
@@ -1022,6 +1076,11 @@ impl App {
         self.pending_ops
             .first()
             .map(|op| op.description.clone())
+            .or_else(|| {
+                self.task_verification_run
+                    .as_ref()
+                    .map(|_| "Running task verification".into())
+            })
             .or_else(|| {
                 self.pending_confirmation
                     .as_ref()
@@ -1261,6 +1320,214 @@ impl App {
             None,
             Some(std::path::PathBuf::from(&task.worktree_path)),
         );
+    }
+
+    pub fn start_task_verification(&mut self, ctx: &egui::Context, task: &TaskRecord) {
+        if self.is_busy() {
+            return;
+        }
+        let Some(command) = task.verification_command.clone() else {
+            self.show_error("Configure a verification command before running it".into());
+            return;
+        };
+        if let Err(error) = command.validate() {
+            self.show_error(error);
+            return;
+        }
+
+        let run_id = task_verification::next_run_id();
+        let running = VerificationResult::running(run_id.clone(), command.clone());
+        let run_lock = match self
+            .task_registry
+            .start_verification(&task.id, &command, running)
+        {
+            Ok(run_lock) => run_lock,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                self.show_error(
+                    "Task verification is already running in another Git Manager instance".into(),
+                );
+                return;
+            }
+            Err(error) => {
+                self.show_error(format!("Could not start task verification: {error}"));
+                return;
+            }
+        };
+
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel_requested.clone();
+        let task_id = task.id.clone();
+        let worker_task_id = task_id.clone();
+        let worktree_path = PathBuf::from(&task.worktree_path);
+        let worker_path = worktree_path.clone();
+        let repository_path = PathBuf::from(&task.repository_path);
+        let worker_repository_path = repository_path.clone();
+        let worker_run_id = run_id.clone();
+        let worker_command = command.clone();
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = task_verification::run_and_record(
+                &worker_task_id,
+                worker_path,
+                worker_repository_path,
+                worker_run_id,
+                worker_command,
+                worker_cancel,
+            );
+            let _ = sender.send(result);
+        });
+
+        self.task_fingerprint_probes.remove(&task_id);
+        self.task_verification_run = Some(PendingTaskVerification {
+            task_id,
+            cancel_requested,
+            receiver,
+            worker,
+            _run_lock: run_lock,
+        });
+        ctx.request_repaint();
+    }
+
+    pub fn cancel_task_verification(&mut self, task_id: &str) {
+        if let Some(run) = self
+            .task_verification_run
+            .as_ref()
+            .filter(|run| run.task_id.as_str() == task_id)
+        {
+            run.cancel_requested.store(true, Ordering::Relaxed);
+        }
+    }
+
+    pub fn task_verification_is_running(&self, task_id: &str) -> bool {
+        self.task_verification_run
+            .as_ref()
+            .is_some_and(|run| run.task_id == task_id)
+    }
+
+    pub fn task_verification_any_running(&self) -> bool {
+        self.task_verification_run.is_some()
+    }
+
+    pub fn forget_task_fingerprint_probe(&mut self, task_id: &str) {
+        self.task_fingerprint_probes.remove(task_id);
+    }
+
+    pub fn task_verification_cancel_requested(&self, task_id: &str) -> bool {
+        self.task_verification_run.as_ref().is_some_and(|run| {
+            run.task_id.as_str() == task_id && run.cancel_requested.load(Ordering::Relaxed)
+        })
+    }
+
+    /// Returns the current task fingerprint when a recent asynchronous check is ready.
+    /// `None` means a check is in progress or the task has no saved source snapshot.
+    pub fn current_task_fingerprint(
+        &mut self,
+        ctx: &egui::Context,
+        task: &TaskRecord,
+    ) -> Option<Result<String, String>> {
+        let saved_fingerprint = task
+            .verification_result
+            .as_ref()
+            .and_then(|result| result.source_fingerprint.as_ref());
+        if saved_fingerprint.is_none() {
+            return None;
+        }
+
+        let active_probes = self
+            .task_fingerprint_probes
+            .values()
+            .filter(|probe| probe.receiver.is_some())
+            .count();
+        let probe = self
+            .task_fingerprint_probes
+            .entry(task.id.clone())
+            .or_insert_with(|| TaskFingerprintProbe {
+                result: None,
+                checked_at: None,
+                receiver: None,
+            });
+
+        if let Some(receiver) = &probe.receiver {
+            match receiver.try_recv() {
+                Ok(result) => {
+                    probe.result = Some(result);
+                    probe.checked_at = Some(Instant::now());
+                    probe.receiver = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    probe.result = Some(Err("Fingerprint check stopped before it completed".into()));
+                    probe.checked_at = Some(Instant::now());
+                    probe.receiver = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+
+        let needs_check = probe.receiver.is_none()
+            && probe
+                .checked_at
+                .map_or(true, |checked_at| checked_at.elapsed() >= Duration::from_secs(5));
+        if needs_check {
+            if active_probes >= 2 {
+                ctx.request_repaint_after(Duration::from_millis(250));
+                return None;
+            }
+            let path = PathBuf::from(&task.worktree_path);
+            let repository_path = PathBuf::from(&task.repository_path);
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(task_verification::source_fingerprint(
+                    &path,
+                    &repository_path,
+                ));
+            });
+            probe.receiver = Some(receiver);
+            probe.result = None;
+        }
+
+        if probe.receiver.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(250));
+            None
+        } else {
+            if let Some(checked_at) = probe.checked_at {
+                ctx.request_repaint_after(Duration::from_secs(5).saturating_sub(checked_at.elapsed()));
+            }
+            probe.result.clone()
+        }
+    }
+
+    fn process_task_verification(&mut self, ctx: &egui::Context) {
+        let completion = self
+            .task_verification_run
+            .as_ref()
+            .map(|run| run.receiver.try_recv());
+        match completion {
+            Some(Ok(result)) => {
+                let run = self.task_verification_run.take();
+                if let Some(run) = run {
+                    let _ = run.worker.join();
+                    self.task_registry.reload();
+                    self.task_fingerprint_probes.remove(&run.task_id);
+                    match result {
+                        Ok(()) => self.show_success("Task verification finished; its saved result is bound to the captured source state.".into()),
+                        Err(error) => self.show_error(error),
+                    }
+                }
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                let run = self.task_verification_run.take();
+                if let Some(run) = run {
+                    let _ = run.worker.join();
+                    self.task_registry.reload();
+                    self.task_fingerprint_probes.remove(&run.task_id);
+                }
+                self.show_error("Task verification worker stopped before it could save a result".into());
+            }
+            Some(Err(mpsc::TryRecvError::Empty)) => {
+                ctx.request_repaint_after(Duration::from_millis(250));
+            }
+            None => {}
+        }
     }
 
     fn start_operation_inner_at(
@@ -1760,6 +2027,7 @@ impl eframe::App for App {
             }
         }
         self.process_pending_ops(ctx);
+        self.process_task_verification(ctx);
 
         let dark = ctx.style().visuals.dark_mode;
         if dark {
@@ -2278,13 +2546,22 @@ impl eframe::App for App {
                                     ).on_hover_text(file_path.clone());
                                 ui.add_space(12.0);
                                 ui.horizontal(|ui| {
-                                    if crate::ui::ellipsis_button(ui, "Install & Restart").clicked() {
+                                    if crate::ui::add_enabled_ellipsis(
+                                        ui,
+                                        !self.task_verification_any_running(),
+                                        "Install & Restart",
+                                    )
+                                    .clicked()
+                                    {
                                         self.install_and_restart();
                                     }
                                     if crate::ui::ellipsis_button(ui, "Dismiss").clicked() {
                                         *self.update_state.lock().unwrap() = UpdateState::Idle;
                                     }
                                 });
+                                if self.task_verification_any_running() {
+                                    ui.label("Finish or cancel task verification before installing an update.");
+                                }
                             });
                         });
                 }
@@ -2323,6 +2600,15 @@ impl eframe::App for App {
         // Keep repainting while background operations are in progress.
         if !self.pending_ops.is_empty() {
             ctx.request_repaint();
+        }
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        if let Some(run) = self.task_verification_run.take() {
+            run.cancel_requested.store(true, Ordering::Relaxed);
+            let _ = run.worker.join();
         }
     }
 }
