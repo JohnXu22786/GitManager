@@ -3445,6 +3445,9 @@ impl GitRepo {
             Err(TaskDiffReviewState::Loading) => TaskReviewQueueState::Error(
                 "The task diff check did not finish".into(),
             ),
+            Err(TaskDiffReviewState::Ready(_)) => TaskReviewQueueState::Error(
+                "The task diff check returned an inconsistent state".into(),
+            ),
         }
     }
 
