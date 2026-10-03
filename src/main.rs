@@ -5,6 +5,7 @@ mod harness;
 mod git_ops;
 mod recent;
 mod tasks;
+mod task_verification;
 mod ui;
 mod updater;
 
