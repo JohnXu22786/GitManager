@@ -87,6 +87,17 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     ui.add_space(10.0);
     ui.heading(format!("Not ready to review ({})", not_ready.len()));
     for (task, state) in not_ready {
+        let verification_fingerprint = match state.as_ref() {
+            Some(TaskReviewQueueState::NoReviewableChanges { source_fingerprint }) => {
+                Some(source_fingerprint.clone())
+            }
+            Some(TaskReviewQueueState::Reviewable { source_fingerprint, .. }) => {
+                Some(source_fingerprint.clone())
+            }
+            _ => app
+                .current_task_fingerprint(ctx, task)
+                .and_then(Result::ok),
+        };
         ui.group(|ui| {
             ui.label(egui::RichText::new(&task.title).strong());
             match state {
@@ -111,7 +122,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                         "Verification: {}",
                         verification_status(
                             task,
-                            None,
+                            verification_fingerprint.as_deref(),
                             app.task_verification_is_running(&task.id),
                         )
                     ));
@@ -126,7 +137,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                         "Verification: {}",
                         verification_status(
                             task,
-                            None,
+                            verification_fingerprint.as_deref(),
                             app.task_verification_is_running(&task.id),
                         )
                     ));
@@ -139,7 +150,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                         "Verification: {}",
                         verification_status(
                             task,
-                            None,
+                            verification_fingerprint.as_deref(),
                             app.task_verification_is_running(&task.id),
                         )
                     ));
