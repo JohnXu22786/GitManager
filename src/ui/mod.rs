@@ -5,6 +5,7 @@ pub mod log_panel;
 pub mod stash_panel;
 pub mod remote_panel;
 pub mod task_panel;
+pub mod task_review_queue;
 
 use eframe::egui;
 use std::collections::HashMap;

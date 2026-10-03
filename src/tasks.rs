@@ -37,6 +37,10 @@ pub struct TaskRecord {
     pub verification_command: Option<VerificationCommand>,
     #[serde(default)]
     pub verification_result: Option<VerificationResult>,
+    #[serde(default)]
+    pub reviewed_source_fingerprint: Option<String>,
+    #[serde(default)]
+    pub reviewed_at: Option<String>,
 }
 
 impl TaskRecord {
@@ -82,6 +86,8 @@ impl TaskRecord {
             validation_ref: None,
             verification_command: None,
             verification_result: None,
+            reviewed_source_fingerprint: None,
+            reviewed_at: None,
         })
     }
 }
@@ -209,6 +215,41 @@ impl TaskRegistry {
                 return Ok(false);
             }
             entry.verification_command = command;
+            entry.updated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+            Ok(true)
+        })
+    }
+
+    pub fn mark_reviewed(&mut self, id: &str, source_fingerprint: &str) -> io::Result<()> {
+        self.update_registry(|entries| {
+            let entry = entries
+                .iter_mut()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task no longer exists"))?;
+            let reviewed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+            if entry.reviewed_source_fingerprint.as_deref() == Some(source_fingerprint)
+                && entry.reviewed_at.is_some()
+            {
+                return Ok(false);
+            }
+            entry.reviewed_source_fingerprint = Some(source_fingerprint.to_string());
+            entry.reviewed_at = Some(reviewed_at);
+            entry.updated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+            Ok(true)
+        })
+    }
+
+    pub fn mark_review_pending(&mut self, id: &str) -> io::Result<()> {
+        self.update_registry(|entries| {
+            let entry = entries
+                .iter_mut()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task no longer exists"))?;
+            if entry.reviewed_source_fingerprint.is_none() && entry.reviewed_at.is_none() {
+                return Ok(false);
+            }
+            entry.reviewed_source_fingerprint = None;
+            entry.reviewed_at = None;
             entry.updated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
             Ok(true)
         })
