@@ -153,15 +153,15 @@ impl TaskHarness for ClaudeHarness {
 
         let support = claude_cli_support_for(&claude);
         let message = if !support.inspected {
-            "Claude Code CLI is available; session support could not be checked, so exact tracking and resume may be unavailable".into()
+            "Claude Code CLI is available; session support could not be checked, so exact tracking and resume may be unavailable. Session creation and run state are not confirmed or tracked.".into()
         } else if support.session_id && support.resume {
-            "Claude Code CLI is available; task session IDs can be saved and resumed".into()
+            "Claude Code CLI can assign a task session ID for best-effort resume. Session creation and run state are not confirmed or tracked.".into()
         } else if support.session_id && support.continue_session {
-            "Claude Code CLI can save task session IDs, but resume opens only the most recent conversation in this worktree".into()
+            "Claude Code CLI can assign a task session ID, but continuation opens only the most recent conversation in this worktree. Session creation and run state are not confirmed or tracked.".into()
         } else if support.session_id {
-            "Claude Code CLI can save task session IDs, but this version does not support session resume".into()
+            "Claude Code CLI can assign a task session ID, but this version does not support session resume. Session creation and run state are not confirmed or tracked.".into()
         } else if support.continue_session {
-            "Claude Code CLI is available; resume opens the most recent conversation in this worktree".into()
+            "Claude Code CLI is available; resume opens the most recent conversation in this worktree. Session IDs and run state are not tracked.".into()
         } else {
             "Claude Code CLI is available; session tracking and resume are unavailable".into()
         };
@@ -189,6 +189,7 @@ impl TaskHarness for ClaudeHarness {
         if let Some(session_ref) = &session_ref {
             args.extend([OsString::from("--session-id"), OsString::from(session_ref)]);
         }
+        args.push(OsString::from("--"));
         args.push(OsString::from(task.title.as_str()));
         launch_harness(&claude, worktree, &args, "Claude Code")?;
         Ok(session_ref)
@@ -457,8 +458,9 @@ fn launch_harness(program: &Path, cwd: &Path, args: &[OsString], provider: &str)
     }
     script.push_str("\nresult=$?\nrm -- \"$0\"\nexit \"$result\"\n");
 
+    let launcher_prefix = format!("gitmanager-{}-", provider.to_ascii_lowercase().replace(' ', "-"));
     let mut launcher = tempfile::Builder::new()
-        .prefix(format!("gitmanager-{}-", provider.to_ascii_lowercase().replace(' ', "-")))
+        .prefix(&launcher_prefix)
         .suffix(".command")
         .tempfile()
         .map_err(|error| format!("Could not create {provider} terminal launcher: {error}"))?;

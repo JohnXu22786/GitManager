@@ -245,7 +245,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, _ctx: &egui::Context) {
             }
             if task.provider_ref.as_deref() == Some(claude.provider_ref()) {
                 ui.label(if task.session_ref.is_some() {
-                    "Harness: Claude Code · session ID recorded"
+                    "Harness: Claude Code · assigned ID saved for best-effort resume"
                 } else {
                     "Harness: Claude Code · session ID not tracked"
                 });
@@ -288,67 +288,65 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, _ctx: &egui::Context) {
     }
 
     if let Some(task) = start_codex {
-        match app
-            .task_registry
-            .prepare_provider_start(&task.id, codex.provider_ref())
-        {
+        match app.task_registry.check_provider_start(&task) {
             Ok(()) => match codex.start(&task) {
-                Ok(None) => app.show_success(
-                    "Codex launch requested with this task's goal. Session ID and run state are not tracked."
-                        .into(),
-                ),
-                Ok(Some(session_ref)) => match app.task_registry.record_provider_session(
+                Ok(session_ref) => match app.task_registry.record_provider_start(
                     &task.id,
+                    task.provider_ref.as_deref(),
+                    task.session_ref.as_deref(),
                     codex.provider_ref(),
-                    &session_ref,
+                    session_ref.as_deref(),
                 ) {
-                    Ok(()) => app.show_success(
+                    Ok(()) if session_ref.is_some() => app.show_success(
                         "Codex launch requested with this task's goal and its session reference was saved."
                             .into(),
                     ),
+                    Ok(()) => app.show_success(
+                        "Codex launch requested with this task's goal. Session ID and run state are not tracked."
+                            .into(),
+                    ),
                     Err(error) => app.show_error(format!(
-                        "Codex was launched, but its session reference could not be saved: {error}"
+                        "Codex was launched, but its provider/session reference could not be saved: {error}"
                     )),
                 },
                 Err(error) => app.show_error(error),
             },
             Err(error) => app.show_error(format!(
-                "Could not save the Codex provider reference; the launch was not started: {error}"
+                "Could not confirm the Codex task before launch; the launch was not started: {error}"
             )),
         }
     }
 
     if let Some(task) = start_claude {
-        match app
-            .task_registry
-            .prepare_provider_start(&task.id, claude.provider_ref())
-        {
+        match app.task_registry.check_provider_start(&task) {
             Ok(()) => match claude.start(&task) {
-                Ok(Some(session_ref)) => match app.task_registry.record_provider_session(
+                Ok(session_ref) => match app.task_registry.record_provider_start(
                     &task.id,
+                    task.provider_ref.as_deref(),
+                    task.session_ref.as_deref(),
                     claude.provider_ref(),
-                    &session_ref,
+                    session_ref.as_deref(),
                 ) {
+                    Ok(()) if session_ref.is_some() => app.show_success(
+                        "Claude Code launch requested with this task's goal. Its assigned session ID was saved for best-effort resume; session creation and run state are not confirmed or tracked."
+                            .into(),
+                    ),
+                    Ok(()) if claude_capabilities.continue_latest => app.show_success(
+                        "Claude Code launch requested with this task's goal. No session ID was saved, so continuation opens only the latest conversation in this worktree; session creation and run state are not tracked."
+                            .into(),
+                    ),
                     Ok(()) => app.show_success(
-                        "Claude Code launch requested with this task's goal. Its assigned session ID was saved; run state is not tracked."
+                        "Claude Code launch requested with this task's goal, but no session ID was saved; this task session cannot be resumed from GitManager, and session creation/run state are not tracked."
                             .into(),
                     ),
                     Err(error) => app.show_error(format!(
-                        "Claude Code was launched, but its session ID could not be saved: {error}"
+                        "Claude Code was launched, but its provider/session reference could not be saved: {error}"
                     )),
                 },
-                Ok(None) if claude_capabilities.continue_latest => app.show_success(
-                    "Claude Code launch requested with this task's goal. No session ID was saved, so continuation opens only the latest conversation in this worktree."
-                        .into(),
-                ),
-                Ok(None) => app.show_success(
-                    "Claude Code launch requested with this task's goal, but no session ID was saved; this task session cannot be resumed from GitManager."
-                        .into(),
-                ),
                 Err(error) => app.show_error(error),
             },
             Err(error) => app.show_error(format!(
-                "Could not save the Claude Code provider reference; the launch was not started: {error}"
+                "Could not confirm the Claude Code task before launch; the launch was not started: {error}"
             )),
         }
     }
@@ -374,10 +372,11 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, _ctx: &egui::Context) {
             && claude_capabilities.resume == ResumeCapability::SessionReference;
         match claude.resume(&task) {
             Ok(()) if has_saved_session => app.show_success(
-                "Claude Code resume requested for the saved session ID.".into(),
+                "Claude Code resume requested for the assigned session ID; session creation and run state are not confirmed or tracked."
+                    .into(),
             ),
             Ok(()) => app.show_success(
-                "Claude Code continuation requested for the most recent conversation in this worktree; it may differ from this task's session."
+                "Claude Code continuation requested for the most recent conversation in this worktree; it may differ from this task's assigned session, and session creation/run state are not tracked."
                     .into(),
             ),
             Err(error) => app.show_error(error),
