@@ -136,19 +136,51 @@ impl TaskRegistry {
         })
     }
 
-    pub fn prepare_provider_start(&mut self, id: &str, provider_ref: &str) -> io::Result<()> {
+    pub fn check_provider_start(&mut self, task: &TaskRecord) -> io::Result<()> {
+        self.update_registry(|entries| {
+            let entry = entries.iter().find(|entry| entry.id == task.id).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "task no longer exists")
+            })?;
+            if entry.provider_ref.as_deref() != task.provider_ref.as_deref()
+                || entry.session_ref.as_deref() != task.session_ref.as_deref()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "task provider changed before the launch could start",
+                ));
+            }
+            Ok(false)
+        })
+    }
+
+    pub fn record_provider_start(
+        &mut self,
+        id: &str,
+        expected_provider_ref: Option<&str>,
+        expected_session_ref: Option<&str>,
+        provider_ref: &str,
+        session_ref: Option<&str>,
+    ) -> io::Result<()> {
         self.update_registry(|entries| {
             let entry = entries
                 .iter_mut()
                 .find(|entry| entry.id == id)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task no longer exists"))?;
-            let changed = entry.provider_ref.as_deref() != Some(provider_ref)
-                || entry.session_ref.is_some();
-            if !changed {
+            if entry.provider_ref.as_deref() != expected_provider_ref
+                || entry.session_ref.as_deref() != expected_session_ref
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "task provider changed before the launch could be recorded",
+                ));
+            }
+            if entry.provider_ref.as_deref() == Some(provider_ref)
+                && entry.session_ref.as_deref() == session_ref
+            {
                 return Ok(false);
             }
             entry.provider_ref = Some(provider_ref.to_string());
-            entry.session_ref = None;
+            entry.session_ref = session_ref.map(|session_ref| session_ref.to_string());
             entry.updated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
             Ok(true)
         })
