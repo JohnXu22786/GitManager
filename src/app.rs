@@ -1,5 +1,6 @@
 use crate::git_ops::*;
 use crate::recent::{path_name, RecentRepos};
+use crate::tasks::TaskRegistry;
 use crate::updater::{self, UpdateState};
 use eframe::egui;
 use std::path::Path;
@@ -324,6 +325,7 @@ impl FormSubmission {
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Tab {
+    Tasks,
     Status,
     Branches,
     Worktrees,
@@ -411,6 +413,10 @@ pub struct App {
     /// Whether an asynchronous repository refresh is queued.
     needs_refresh: bool,
     pub recent_repos: RecentRepos,
+    pub task_registry: TaskRegistry,
+    pub task_form_open: bool,
+    pub task_title: String,
+    pub task_worktree_path: String,
     pub status_expanded: bool,
     /// Excel-style resizable column widths for tables.
     pub column_widths: crate::ui::ColumnWidthStore,
@@ -485,6 +491,10 @@ impl App {
             pending_worktree_cleanup: None,
             needs_refresh: false,
             recent_repos: RecentRepos::load(),
+            task_registry: TaskRegistry::load(),
+            task_form_open: false,
+            task_title: String::new(),
+            task_worktree_path: String::new(),
             status_expanded: false,
             column_widths: crate::ui::init_column_widths(),
         }
@@ -1663,6 +1673,9 @@ impl eframe::App for App {
         // --- Top Bar ---
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
+                if crate::ui::ellipsis_button(ui, "☷ Tasks").clicked() {
+                    self.current_tab = Tab::Tasks;
+                }
                 if crate::ui::add_enabled_ellipsis(ui, !self.is_busy(), "📂").clicked() {
                     let path = crate::native_file_dialog();
                     if let Some(p) = path {
@@ -1902,7 +1915,14 @@ impl eframe::App for App {
         // --- Central Panel ---
         egui::CentralPanel::default().show(ctx, |ui| {
             if !self.git.is_open() {
-                self.show_welcome_screen(ui);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        crate::ui::task_panel::show(self, ui, ctx);
+                        ui.add_space(12.0);
+                        ui.separator();
+                        self.show_welcome_screen(ui);
+                    });
                 return;
             }
 
@@ -1912,6 +1932,7 @@ impl eframe::App for App {
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         let tabs = [
+                            (Tab::Tasks, "☷ Tasks"),
                             (Tab::Status, "📊 Status"),
                             (Tab::Branches, "🔀 Branches"),
                             (Tab::Worktrees, "📂 Worktrees"),
@@ -1945,6 +1966,7 @@ impl eframe::App for App {
                 .show(ui, |ui| {
                     // Render the active tab panel
                     match self.current_tab {
+                        Tab::Tasks => crate::ui::task_panel::show(self, ui, ctx),
                         Tab::Status => crate::ui::status_panel::show(self, ui, ctx),
                         Tab::Branches => crate::ui::branch_panel::show(self, ui, ctx),
                         Tab::Worktrees => crate::ui::worktree_panel::show(self, ui, ctx),
