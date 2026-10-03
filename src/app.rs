@@ -274,6 +274,12 @@ struct TaskFingerprintProbe {
     receiver: Option<mpsc::Receiver<Result<String, String>>>,
 }
 
+struct TaskReviewQueueProbe {
+    result: Option<TaskReviewQueueState>,
+    checked_at: Option<Instant>,
+    receiver: Option<mpsc::Receiver<TaskReviewQueueState>>,
+}
+
 
 /// Tracks a Git operation running in a background thread.
 struct PendingOp {
@@ -370,6 +376,7 @@ impl FormSubmission {
 #[derive(Debug, PartialEq, Clone)]
 pub enum Tab {
     Tasks,
+    ReviewQueue,
     Status,
     Branches,
     Worktrees,
@@ -465,6 +472,7 @@ pub struct App {
     pub task_verification_editor: Option<TaskVerificationCommandDraft>,
     task_verification_run: Option<PendingTaskVerification>,
     task_fingerprint_probes: HashMap<String, TaskFingerprintProbe>,
+    task_review_queue_probes: HashMap<String, TaskReviewQueueProbe>,
     task_diff_request_id: u64,
     pub status_expanded: bool,
     /// Excel-style resizable column widths for tables.
@@ -548,6 +556,7 @@ impl App {
             task_verification_editor: None,
             task_verification_run: None,
             task_fingerprint_probes: HashMap::new(),
+            task_review_queue_probes: HashMap::new(),
             task_diff_request_id: 0,
             status_expanded: false,
             column_widths: crate::ui::init_column_widths(),
@@ -1316,6 +1325,7 @@ impl App {
                 task_id: task.id.clone(),
                 request_id,
                 base_commit: task.base_commit.clone(),
+                repository_path: PathBuf::from(&task.repository_path),
             },
             None,
             Some(std::path::PathBuf::from(&task.worktree_path)),
@@ -1378,6 +1388,7 @@ impl App {
         });
 
         self.task_fingerprint_probes.remove(&task_id);
+        self.task_review_queue_probes.remove(&task_id);
         self.task_verification_run = Some(PendingTaskVerification {
             task_id,
             cancel_requested,
@@ -1410,6 +1421,7 @@ impl App {
 
     pub fn forget_task_fingerprint_probe(&mut self, task_id: &str) {
         self.task_fingerprint_probes.remove(task_id);
+        self.task_review_queue_probes.remove(task_id);
     }
 
     pub fn task_verification_cancel_requested(&self, task_id: &str) -> bool {
@@ -1496,6 +1508,83 @@ impl App {
         }
     }
 
+    pub fn current_task_review_queue_state(
+        &mut self,
+        ctx: &egui::Context,
+        task: &TaskRecord,
+    ) -> Option<TaskReviewQueueState> {
+        let active_probes = self
+            .task_review_queue_probes
+            .values()
+            .filter(|probe| probe.receiver.is_some())
+            .count();
+        let probe = self
+            .task_review_queue_probes
+            .entry(task.id.clone())
+            .or_insert_with(|| TaskReviewQueueProbe {
+                result: None,
+                checked_at: None,
+                receiver: None,
+            });
+
+        if let Some(receiver) = &probe.receiver {
+            match receiver.try_recv() {
+                Ok(result) => {
+                    probe.result = Some(result);
+                    probe.checked_at = Some(Instant::now());
+                    probe.receiver = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    probe.result = Some(TaskReviewQueueState::Error(
+                        "Task review status check stopped before it completed".into(),
+                    ));
+                    probe.checked_at = Some(Instant::now());
+                    probe.receiver = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+
+        let needs_check = probe.receiver.is_none()
+            && probe
+                .checked_at
+                .map_or(true, |checked_at| checked_at.elapsed() >= Duration::from_secs(5));
+        if needs_check {
+            if active_probes >= 2 {
+                ctx.request_repaint_after(Duration::from_millis(250));
+                return None;
+            }
+            let worktree_path = PathBuf::from(&task.worktree_path);
+            let repository_path = PathBuf::from(&task.repository_path);
+            let base_commit = task.base_commit.clone();
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || {
+                let mut repo = GitRepo::new();
+                let state = match repo.open(&worktree_path) {
+                    Ok(()) => repo.task_review_queue_state(base_commit.as_deref(), &repository_path),
+                    Err(error) => TaskReviewQueueState::Error(format!(
+                        "Could not open the task worktree: {error}"
+                    )),
+                };
+                let _ = sender.send(state);
+            });
+            probe.receiver = Some(receiver);
+            probe.result = None;
+        }
+
+        if probe.receiver.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(250));
+            None
+        } else {
+            if let Some(checked_at) = probe.checked_at {
+                ctx.request_repaint_after(
+                    Duration::from_secs(5).saturating_sub(checked_at.elapsed()),
+                );
+            }
+            probe.result.clone()
+        }
+    }
+
     fn process_task_verification(&mut self, ctx: &egui::Context) {
         let completion = self
             .task_verification_run
@@ -1508,6 +1597,7 @@ impl App {
                     let _ = run.worker.join();
                     self.task_registry.reload();
                     self.task_fingerprint_probes.remove(&run.task_id);
+                    self.task_review_queue_probes.remove(&run.task_id);
                     match result {
                         Ok(()) => self.show_success("Task verification finished; its saved result is bound to the captured source state.".into()),
                         Err(error) => self.show_error(error),
@@ -1520,6 +1610,7 @@ impl App {
                     let _ = run.worker.join();
                     self.task_registry.reload();
                     self.task_fingerprint_probes.remove(&run.task_id);
+                    self.task_review_queue_probes.remove(&run.task_id);
                 }
                 self.show_error("Task verification worker stopped before it could save a result".into());
             }
@@ -2296,7 +2387,19 @@ impl eframe::App for App {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        crate::ui::task_panel::show(self, ui, ctx);
+                        ui.horizontal(|ui| {
+                            if ui.button("Tasks").clicked() {
+                                self.current_tab = Tab::Tasks;
+                            }
+                            if ui.button("Review queue").clicked() {
+                                self.current_tab = Tab::ReviewQueue;
+                            }
+                        });
+                        if self.current_tab == Tab::ReviewQueue {
+                            crate::ui::task_review_queue::show(self, ui, ctx);
+                        } else {
+                            crate::ui::task_panel::show(self, ui, ctx);
+                        }
                         ui.add_space(12.0);
                         ui.separator();
                         self.show_welcome_screen(ui);
@@ -2311,6 +2414,7 @@ impl eframe::App for App {
                     ui.horizontal(|ui| {
                         let tabs = [
                             (Tab::Tasks, "☷ Tasks"),
+                            (Tab::ReviewQueue, "☷ Review queue"),
                             (Tab::Status, "📊 Status"),
                             (Tab::Branches, "🔀 Branches"),
                             (Tab::Worktrees, "📂 Worktrees"),
@@ -2345,6 +2449,7 @@ impl eframe::App for App {
                     // Render the active tab panel
                     match self.current_tab {
                         Tab::Tasks => crate::ui::task_panel::show(self, ui, ctx),
+                        Tab::ReviewQueue => crate::ui::task_review_queue::show(self, ui, ctx),
                         Tab::Status => crate::ui::status_panel::show(self, ui, ctx),
                         Tab::Branches => crate::ui::branch_panel::show(self, ui, ctx),
                         Tab::Worktrees => crate::ui::worktree_panel::show(self, ui, ctx),

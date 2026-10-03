@@ -1,3 +1,4 @@
+use crate::task_verification;
 use chrono::DateTime;
 use git2::{BranchType, DiffOptions, Repository, Status, WorktreeAddOptions, WorktreePruneOptions};
 use std::cell::RefCell;
@@ -124,6 +125,7 @@ pub enum GitOperation {
         task_id: String,
         request_id: u64,
         base_commit: Option<String>,
+        repository_path: PathBuf,
     },
     /// Search commits in the log, identified by the request that started it.
     LogSearch { filter: String, request_id: u64 },
@@ -310,10 +312,11 @@ impl GitOperation {
                 task_id,
                 request_id,
                 base_commit,
+                repository_path,
             } => OpResult::TaskDiffReview {
                 task_id,
                 request_id,
-                state: repo.task_diff_review(base_commit.as_deref()),
+                state: repo.task_diff_review(base_commit.as_deref(), &repository_path),
             },
             GitOperation::LogSearch { filter, request_id } => {
                 let commits = if filter.is_empty() {
@@ -522,8 +525,22 @@ pub struct TaskDiffFile {
 pub struct TaskDiffReview {
     pub base_commit: String,
     pub head_commit: String,
+    pub source_fingerprint: String,
     pub files: Vec<TaskDiffFile>,
     pub patch: String,
+}
+
+#[derive(Clone, Debug)]
+pub enum TaskReviewQueueState {
+    Reviewable {
+        source_fingerprint: String,
+        changed_file_count: usize,
+    },
+    NoReviewableChanges {
+        source_fingerprint: String,
+    },
+    Unavailable(String),
+    Error(String),
 }
 
 #[derive(Clone, Debug)]
@@ -3397,7 +3414,84 @@ impl GitRepo {
         Ok(lines)
     }
 
-    pub fn task_diff_review(&self, saved_base: Option<&str>) -> TaskDiffReviewState {
+    pub fn task_diff_review(
+        &self,
+        saved_base: Option<&str>,
+        expected_repository_path: &Path,
+    ) -> TaskDiffReviewState {
+        match self.task_diff_at_snapshot(saved_base, expected_repository_path, true, true) {
+            Ok(review) => TaskDiffReviewState::Ready(review),
+            Err(state) => state,
+        }
+    }
+
+    pub fn task_review_queue_state(
+        &self,
+        saved_base: Option<&str>,
+        expected_repository_path: &Path,
+    ) -> TaskReviewQueueState {
+        match self.task_diff_at_snapshot(saved_base, expected_repository_path, false, true) {
+            Ok(review) if review.files.is_empty() => TaskReviewQueueState::NoReviewableChanges {
+                source_fingerprint: review.source_fingerprint,
+            },
+            Ok(review) => TaskReviewQueueState::Reviewable {
+                source_fingerprint: review.source_fingerprint,
+                changed_file_count: review.files.len(),
+            },
+            Err(TaskDiffReviewState::Unavailable(reason)) => {
+                TaskReviewQueueState::Unavailable(reason)
+            }
+            Err(TaskDiffReviewState::Error(reason)) => TaskReviewQueueState::Error(reason),
+            Err(TaskDiffReviewState::Loading) => TaskReviewQueueState::Error(
+                "The task diff check did not finish".into(),
+            ),
+            Err(TaskDiffReviewState::Ready(_)) => TaskReviewQueueState::Error(
+                "The task diff check returned an inconsistent state".into(),
+            ),
+        }
+    }
+
+    fn task_diff_at_snapshot(
+        &self,
+        saved_base: Option<&str>,
+        expected_repository_path: &Path,
+        include_patch: bool,
+        validate_patch: bool,
+    ) -> Result<TaskDiffReview, TaskDiffReviewState> {
+        if saved_base.is_none() {
+            return match self.task_diff(saved_base, include_patch, validate_patch) {
+                TaskDiffReviewState::Unavailable(reason) => {
+                    Err(TaskDiffReviewState::Unavailable(reason))
+                }
+                state => Err(state),
+            };
+        }
+        let worktree_path = self.path.as_deref().ok_or_else(|| {
+            TaskDiffReviewState::Error("No task worktree is open".into())
+        })?;
+        let before = task_verification::source_fingerprint(worktree_path, expected_repository_path)
+            .map_err(TaskDiffReviewState::Unavailable)?;
+        let mut review = match self.task_diff(saved_base, include_patch, validate_patch) {
+            TaskDiffReviewState::Ready(review) => review,
+            state => return Err(state),
+        };
+        let after = task_verification::source_fingerprint(worktree_path, expected_repository_path)
+            .map_err(TaskDiffReviewState::Unavailable)?;
+        if before != after {
+            return Err(TaskDiffReviewState::Unavailable(
+                "The task source changed while its diff was being read. Open the diff again to review the current snapshot.".into(),
+            ));
+        }
+        review.source_fingerprint = before;
+        Ok(review)
+    }
+
+    fn task_diff(
+        &self,
+        saved_base: Option<&str>,
+        include_patch: bool,
+        validate_patch: bool,
+    ) -> TaskDiffReviewState {
         let Some(saved_base) = saved_base else {
             return TaskDiffReviewState::Unavailable(
                 "This task has no saved base commit, so a complete diff cannot be established."
@@ -3511,36 +3605,41 @@ impl GitRepo {
         files.sort_by(|left, right| left.path.cmp(&right.path));
 
         let mut patch = String::new();
-        let mut non_utf8_patch = false;
-        let printed = diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
-            let content = match std::str::from_utf8(line.content()) {
-                Ok(content) => content,
-                Err(_) => {
-                    non_utf8_patch = true;
-                    return false;
+        if include_patch || validate_patch {
+            let mut non_utf8_patch = false;
+            let printed = diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
+                let content = match std::str::from_utf8(line.content()) {
+                    Ok(content) => content,
+                    Err(_) => {
+                        non_utf8_patch = true;
+                        return false;
+                    }
+                };
+                if include_patch && matches!(line.origin(), ' ' | '+' | '-') {
+                    patch.push(line.origin());
                 }
-            };
-            if matches!(line.origin(), ' ' | '+' | '-') {
-                patch.push(line.origin());
+                if include_patch {
+                    patch.push_str(content);
+                }
+                true
+            });
+            if non_utf8_patch {
+                return TaskDiffReviewState::Unavailable(
+                    "The patch contains non-UTF-8 bytes that this text view cannot render completely."
+                        .into(),
+                );
             }
-            patch.push_str(content);
-            true
-        });
-        if non_utf8_patch {
-            return TaskDiffReviewState::Unavailable(
-                "The patch contains non-UTF-8 bytes that this text view cannot render completely."
-                    .into(),
-            );
-        }
-        if let Err(error) = printed {
-            return TaskDiffReviewState::Error(format!(
-                "Could not render the complete task patch: {error}"
-            ));
+            if let Err(error) = printed {
+                return TaskDiffReviewState::Error(format!(
+                    "Could not render the complete task patch: {error}"
+                ));
+            }
         }
 
         TaskDiffReviewState::Ready(TaskDiffReview {
             base_commit: base_oid.to_string(),
             head_commit: head.id().to_string(),
+            source_fingerprint: String::new(),
             files,
             patch,
         })

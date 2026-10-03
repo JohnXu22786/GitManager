@@ -709,13 +709,15 @@ fn render_verification_command_editor(app: &mut App, ui: &mut egui::Ui, entries:
     }
 }
 
-fn render_task_diff_review(app: &mut App, ui: &mut egui::Ui) {
+pub fn render_task_diff_review(app: &mut App, ui: &mut egui::Ui) {
     let Some(view) = app.task_diff_review.as_ref() else {
         return;
     };
 
     ui.separator();
     let mut close_review = false;
+    let mut mark_reviewed: Option<(String, String)> = None;
+    let mut mark_pending: Option<String> = None;
     ui.horizontal(|ui| {
         ui.heading(format!("Review changes: {}", view.title));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -758,6 +760,31 @@ fn render_task_diff_review(app: &mut App, ui: &mut egui::Ui) {
             if review.files.is_empty() {
                 ui.label("No changes since the saved base commit.");
             } else {
+                let task = app
+                    .task_registry
+                    .entries()
+                    .iter()
+                    .find(|task| task.id == view.task_id);
+                if let Some(task) = task {
+                    if task.reviewed_source_fingerprint.as_deref()
+                        == Some(review.source_fingerprint.as_str())
+                    {
+                        ui.label(format!(
+                            "Reviewed for this source snapshot on {}. This does not record approval, merge, or verification.",
+                            task.reviewed_at.as_deref().unwrap_or("an unknown date")
+                        ));
+                        if ui.button("Set review to pending").clicked() {
+                            mark_pending = Some(task.id.clone());
+                        }
+                    } else if ui.button("Mark this snapshot as reviewed").clicked() {
+                        mark_reviewed = Some((
+                            task.id.clone(),
+                            review.source_fingerprint.clone(),
+                        ));
+                    }
+                } else {
+                    ui.label("This task record is no longer linked; its review disposition cannot be changed.");
+                }
                 egui::ScrollArea::both()
                     .id_salt(("task_diff_files", &view.task_id))
                     .max_height(150.0)
@@ -787,6 +814,24 @@ fn render_task_diff_review(app: &mut App, ui: &mut egui::Ui) {
 
     if close_review {
         app.task_diff_review = None;
+    }
+    if let Some((task_id, source_fingerprint)) = mark_reviewed {
+        match app
+            .task_registry
+            .mark_reviewed(&task_id, &source_fingerprint)
+        {
+            Ok(()) => app.show_success(
+                "Recorded as reviewed for the displayed task snapshot. Verification remains separate."
+                    .into(),
+            ),
+            Err(error) => app.show_error(format!("Could not record task review: {error}")),
+        }
+    }
+    if let Some(task_id) = mark_pending {
+        match app.task_registry.mark_review_pending(&task_id) {
+            Ok(()) => app.show_success("Task review set to pending".into()),
+            Err(error) => app.show_error(format!("Could not set task review to pending: {error}")),
+        }
     }
 }
 
