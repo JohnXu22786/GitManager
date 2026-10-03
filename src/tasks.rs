@@ -136,6 +136,24 @@ impl TaskRegistry {
         })
     }
 
+    pub fn prepare_provider_start(&mut self, id: &str, provider_ref: &str) -> io::Result<()> {
+        self.update_registry(|entries| {
+            let entry = entries
+                .iter_mut()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task no longer exists"))?;
+            let changed = entry.provider_ref.as_deref() != Some(provider_ref)
+                || entry.session_ref.is_some();
+            if !changed {
+                return Ok(false);
+            }
+            entry.provider_ref = Some(provider_ref.to_string());
+            entry.session_ref = None;
+            entry.updated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+            Ok(true)
+        })
+    }
+
     fn update_registry(
         &mut self,
         change: impl FnOnce(&mut Vec<TaskRecord>) -> io::Result<bool>,
