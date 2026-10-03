@@ -1,10 +1,11 @@
 use crate::app::{App, Tab};
+use crate::git_ops::TaskDiffReviewState;
 use crate::harness::{ClaudeHarness, CodexHarness, ResumeCapability, TaskHarness};
 use crate::tasks::TaskRecord;
 use eframe::egui;
 use std::path::Path;
 
-pub fn show(app: &mut App, ui: &mut egui::Ui, _ctx: &egui::Context) {
+pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     ui.horizontal(|ui| {
         ui.heading("Tasks");
         if crate::ui::ellipsis_button(ui, "＋ Link existing workspace").clicked() {
@@ -140,6 +141,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, _ctx: &egui::Context) {
     let mut resume_codex: Option<TaskRecord> = None;
     let mut start_claude: Option<TaskRecord> = None;
     let mut resume_claude: Option<TaskRecord> = None;
+    let mut review_task: Option<TaskRecord> = None;
     for task in &entries {
         let available = worktree_directory_present(&task.worktree_path);
         ui.group(|ui| {
@@ -164,6 +166,12 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, _ctx: &egui::Context) {
                 });
             });
             ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(!app.is_busy(), egui::Button::new("Review changes"))
+                    .clicked()
+                {
+                    review_task = Some(task.clone());
+                }
                 if ui
                     .add_enabled(
                         available
@@ -275,7 +283,16 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, _ctx: &egui::Context) {
 
     if let Some(id) = unlink_task {
         match app.task_registry.unlink(&id) {
-            Ok(()) => app.show_success("Task record unlinked; workspace and branch were left unchanged".into()),
+            Ok(()) => {
+                if app
+                    .task_diff_review
+                    .as_ref()
+                    .is_some_and(|view| view.task_id == id)
+                {
+                    app.task_diff_review = None;
+                }
+                app.show_success("Task record unlinked; workspace and branch were left unchanged".into());
+            }
             Err(error) => app.show_error(format!("Could not unlink task: {error}")),
         }
     }
@@ -285,6 +302,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, _ctx: &egui::Context) {
         if app.git.is_open() && app.repo_path == path {
             app.current_tab = Tab::Worktrees;
         }
+    }
+
+    if let Some(task) = review_task {
+        app.start_task_diff_review(ctx, &task);
     }
 
     if let Some(task) = start_codex {
@@ -381,6 +402,89 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, _ctx: &egui::Context) {
             ),
             Err(error) => app.show_error(error),
         }
+    }
+
+    render_task_diff_review(app, ui);
+}
+
+fn render_task_diff_review(app: &mut App, ui: &mut egui::Ui) {
+    let Some(view) = app.task_diff_review.as_ref() else {
+        return;
+    };
+
+    ui.separator();
+    let mut close_review = false;
+    ui.horizontal(|ui| {
+        ui.heading(format!("Review changes: {}", view.title));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("Close").clicked() {
+                close_review = true;
+            }
+        });
+    });
+
+    match &view.state {
+        TaskDiffReviewState::Loading => {
+            ui.label("Reading the task worktree diff…");
+        }
+        TaskDiffReviewState::Unavailable(reason) => {
+            ui.colored_label(
+                App::adaptive_yellow(ui.style().visuals.dark_mode),
+                format!("Complete review diff unavailable: {reason}"),
+            );
+        }
+        TaskDiffReviewState::Error(reason) => {
+            ui.colored_label(
+                App::adaptive_red(ui.style().visuals.dark_mode),
+                format!("Could not read the complete task diff: {reason}"),
+            );
+        }
+        TaskDiffReviewState::Ready(review) => {
+            ui.label(
+                "Diff from the saved base through current HEAD, staged and unstaged edits, and untracked files.",
+            );
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Base:");
+                ui.monospace(&review.base_commit);
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Current HEAD:");
+                ui.monospace(&review.head_commit);
+            });
+
+            ui.label(format!("Changed files ({})", review.files.len()));
+            if review.files.is_empty() {
+                ui.label("No changes since the saved base commit.");
+            } else {
+                egui::ScrollArea::both()
+                    .id_salt(("task_diff_files", &view.task_id))
+                    .max_height(150.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for file in &review.files {
+                            ui.monospace(format!("{}  {}", file.status, file.path));
+                        }
+                    });
+            }
+
+            if !review.patch.is_empty() {
+                ui.label("Complete patch");
+                egui::ScrollArea::both()
+                    .id_salt(("task_diff_patch", &view.task_id))
+                    .max_height(420.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(&review.patch).monospace())
+                                .extend(),
+                        );
+                    });
+            }
+        }
+    }
+
+    if close_review {
+        app.task_diff_review = None;
     }
 }
 

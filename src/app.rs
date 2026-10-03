@@ -1,6 +1,6 @@
 use crate::git_ops::*;
 use crate::recent::{path_name, RecentRepos};
-use crate::tasks::TaskRegistry;
+use crate::tasks::{TaskRecord, TaskRegistry};
 use crate::updater::{self, UpdateState};
 use eframe::egui;
 use std::path::Path;
@@ -246,6 +246,7 @@ struct PendingOp {
     last_seen_progress: String,
     /// Whether the watchdog timed out while the worker was still running.
     timed_out: bool,
+    task_diff_identity: Option<(String, u64)>,
     form_submission: Option<FormSubmission>,
 }
 
@@ -417,6 +418,8 @@ pub struct App {
     pub task_form_open: bool,
     pub task_title: String,
     pub task_worktree_path: String,
+    pub task_diff_review: Option<TaskDiffReviewView>,
+    task_diff_request_id: u64,
     pub status_expanded: bool,
     /// Excel-style resizable column widths for tables.
     pub column_widths: crate::ui::ColumnWidthStore,
@@ -495,6 +498,8 @@ impl App {
             task_form_open: false,
             task_title: String::new(),
             task_worktree_path: String::new(),
+            task_diff_review: None,
+            task_diff_request_id: 0,
             status_expanded: false,
             column_widths: crate::ui::init_column_widths(),
         }
@@ -905,6 +910,7 @@ impl App {
             last_progress_update: Instant::now(),
             last_seen_progress: String::new(),
             timed_out: false,
+            task_diff_identity: None,
             form_submission: None,
 
         });
@@ -1220,7 +1226,7 @@ impl App {
     /// Spawn a Git operation in a background thread.
     /// Returns immediately. Results will be processed in `process_pending_ops()`.
     pub fn start_operation(&mut self, ctx: &egui::Context, description: &str, op: GitOperation) {
-        self.start_operation_inner(ctx, description, op, None);
+        self.start_operation_inner_at(ctx, description, op, None, None);
     }
 
     pub(crate) fn start_operation_with_form_submission(
@@ -1230,15 +1236,40 @@ impl App {
         op: GitOperation,
         form_submission: FormSubmission,
     ) {
-        self.start_operation_inner(ctx, description, op, Some(form_submission));
+        self.start_operation_inner_at(ctx, description, op, Some(form_submission), None);
     }
 
-    fn start_operation_inner(
+    pub fn start_task_diff_review(&mut self, ctx: &egui::Context, task: &TaskRecord) {
+        if self.is_busy() {
+            return;
+        }
+        self.task_diff_request_id = self.task_diff_request_id.wrapping_add(1);
+        let request_id = self.task_diff_request_id;
+        self.task_diff_review = Some(TaskDiffReviewView {
+            task_id: task.id.clone(),
+            title: task.title.clone(),
+            state: TaskDiffReviewState::Loading,
+        });
+        self.start_operation_inner_at(
+            ctx,
+            "Reading task diff",
+            GitOperation::TaskDiffReview {
+                task_id: task.id.clone(),
+                request_id,
+                base_commit: task.base_commit.clone(),
+            },
+            None,
+            Some(std::path::PathBuf::from(&task.worktree_path)),
+        );
+    }
+
+    fn start_operation_inner_at(
         &mut self,
         ctx: &egui::Context,
         description: &str,
         op: GitOperation,
         form_submission: Option<FormSubmission>,
+        repo_path_override: Option<std::path::PathBuf>,
     ) {
         if self.pending_confirmation.is_some()
             || (self.pending_worktree_cleanup.is_some()
@@ -1248,17 +1279,28 @@ impl App {
         }
 
         // Get the repo path to pass to the thread
-        let repo_path = match self.git.path() {
-            Some(p) => p.to_path_buf(),
-            None => {
-                self.show_error("No repository open".into());
-                return;
-            }
+        let repo_path = match repo_path_override {
+            Some(path) => path,
+            None => match self.git.path() {
+                Some(path) => path.to_path_buf(),
+                None => {
+                    self.show_error("No repository open".into());
+                    return;
+                }
+            },
         };
 
         let (tx, rx) = mpsc::channel::<OpResult>();
         let desc = description.to_string();
         let repo_generation = self.repo_generation;
+        let task_diff_identity = match &op {
+            GitOperation::TaskDiffReview {
+                task_id,
+                request_id,
+                ..
+            } => Some((task_id.clone(), *request_id)),
+            _ => None,
+        };
         let progress = Arc::new(Mutex::new(String::new()));
         let op_progress = progress.clone();
         #[cfg(test)]
@@ -1282,6 +1324,7 @@ impl App {
             last_progress_update: Instant::now(),
             last_seen_progress: String::new(),
             timed_out: false,
+            task_diff_identity,
             form_submission,
         });
 
@@ -1313,7 +1356,15 @@ impl App {
         let mut i = 0;
         while i < self.pending_ops.len() {
             // --- Watchdog timeout: check if the operation is still making progress ---
-            let (description, started_at, current_progress, last_seen_progress, last_progress_update, timed_out) = {
+            let (
+                description,
+                started_at,
+                current_progress,
+                last_seen_progress,
+                last_progress_update,
+                timed_out,
+                task_diff_identity,
+            ) = {
                 let op = &self.pending_ops[i];
                 let description = op.description.clone();
                 let started_at = op.started_at;
@@ -1321,7 +1372,16 @@ impl App {
                 let last_seen_progress = op.last_seen_progress.clone();
                 let last_progress_update = op.last_progress_update;
                 let timed_out = op.timed_out;
-                (description, started_at, current_progress, last_seen_progress, last_progress_update, timed_out)
+                let task_diff_identity = op.task_diff_identity.clone();
+                (
+                    description,
+                    started_at,
+                    current_progress,
+                    last_seen_progress,
+                    last_progress_update,
+                    timed_out,
+                    task_diff_identity,
+                )
             };
 
             // If progress text changed, reset the watchdog timer and accumulate to log
@@ -1353,6 +1413,10 @@ impl App {
                         self.status_message = msg.clone();
                         self.status_is_error = true;
                         self.last_operation_log += &format!("  ✗ {}\n", msg);
+                        self.fail_task_diff_review(
+                            task_diff_identity.clone(),
+                            "The task diff worker timed out before returning a complete patch.".into(),
+                        );
                         self.pending_ops[i].timed_out = true;
                         i += 1;
                         continue;
@@ -1371,6 +1435,10 @@ impl App {
                         self.status_message = msg.clone();
                         self.status_is_error = true;
                         self.last_operation_log += &format!("  ✗ {}\n", msg);
+                        self.fail_task_diff_review(
+                            task_diff_identity.clone(),
+                            "The task diff worker stalled before returning a complete patch.".into(),
+                        );
                         self.pending_ops[i].timed_out = true;
                         i += 1;
                         continue;
@@ -1393,6 +1461,13 @@ impl App {
                             self.needs_refresh = true;
                         } else if matches!(&result, OpResult::CloneSuccess(_)) {
                             self.handle_op_result(op.description, result);
+                        } else if let OpResult::TaskDiffReview {
+                            task_id,
+                            request_id,
+                            state,
+                        } = result
+                        {
+                            self.update_task_diff_review(task_id, request_id, state);
                         }
                         continue;
                     }
@@ -1430,6 +1505,10 @@ impl App {
                         self.pending_worktree_cleanup = None;
                     }
                     if self.pending_ops[i].timed_out {
+                        self.fail_task_diff_review(
+                            task_diff_identity.clone(),
+                            "The task diff worker exited before returning a complete patch.".into(),
+                        );
                         self.pending_ops.swap_remove(i);
                         continue;
                     }
@@ -1442,6 +1521,7 @@ impl App {
                     self.status_message = fail_msg.clone();
                     self.status_is_error = true;
                     self.last_operation_log += &format!("  ✗ {}\n", fail_msg);
+                    self.fail_task_diff_review(task_diff_identity, fail_msg);
                     self.pending_ops.swap_remove(i);
                 }
             }
@@ -1506,6 +1586,11 @@ impl App {
                 self.diff_content = lines;
                 self.show_diff = true;
             }
+            OpResult::TaskDiffReview {
+                task_id,
+                request_id,
+                state,
+            } => self.update_task_diff_review(task_id, request_id, state),
             OpResult::SearchResults { request_id, filter, commits } => {
                 if request_id == self.log_search_request_id && filter == self.log_search {
                     self.commits = commits;
@@ -1539,6 +1624,31 @@ impl App {
                     self.status_is_error = true;
                 }
             }
+        }
+    }
+
+    fn update_task_diff_review(
+        &mut self,
+        task_id: String,
+        request_id: u64,
+        state: TaskDiffReviewState,
+    ) {
+        if request_id == self.task_diff_request_id {
+            if let Some(view) = self.task_diff_review.as_mut() {
+                if view.task_id == task_id {
+                    view.state = state;
+                }
+            }
+        }
+    }
+
+    fn fail_task_diff_review(&mut self, identity: Option<(String, u64)>, message: String) {
+        if let Some((task_id, request_id)) = identity {
+            self.update_task_diff_review(
+                task_id,
+                request_id,
+                TaskDiffReviewState::Error(message),
+            );
         }
     }
 
@@ -2305,6 +2415,7 @@ mod tests {
             last_progress_update: Instant::now(),
             last_seen_progress: String::new(),
             timed_out: false,
+            task_diff_identity: None,
             form_submission: Some(form_submission),
         });
     }
@@ -3005,6 +3116,7 @@ mod tests {
             last_progress_update: Instant::now(),
             last_seen_progress: String::new(),
             timed_out: false,
+            task_diff_identity: None,
             form_submission: None,
 
         });
@@ -3228,6 +3340,7 @@ mod tests {
             last_progress_update: Instant::now(),
             last_seen_progress: String::new(),
             timed_out: false,
+            task_diff_identity: None,
             form_submission: None,
 
         });
@@ -3651,6 +3764,7 @@ mod tests {
             last_progress_update: Instant::now(),
             last_seen_progress: String::new(),
             timed_out: true,
+            task_diff_identity: None,
             form_submission: None,
 
         });
@@ -3991,6 +4105,7 @@ mod tests {
             last_progress_update: Instant::now(),
             last_seen_progress: String::new(),
             timed_out: false,
+            task_diff_identity: None,
             form_submission: None,
 
         });
@@ -4031,6 +4146,7 @@ mod tests {
             last_progress_update: Instant::now(),
             last_seen_progress: String::new(),
             timed_out: false,
+            task_diff_identity: None,
             form_submission: None,
 
         });
@@ -4058,6 +4174,7 @@ mod tests {
             last_progress_update: Instant::now(),
             last_seen_progress: String::new(),
             timed_out: false,
+            task_diff_identity: None,
             form_submission: None,
 
         };

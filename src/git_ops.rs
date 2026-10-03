@@ -119,6 +119,12 @@ pub enum GitOperation {
     Pull { remote: String, branch: String, rebase: bool },
     Fetch(String),
     GetDiff { path: PathBuf, staged: bool },
+    /// Read a task's complete diff from its saved base through the current worktree.
+    TaskDiffReview {
+        task_id: String,
+        request_id: u64,
+        base_commit: Option<String>,
+    },
     /// Search commits in the log, identified by the request that started it.
     LogSearch { filter: String, request_id: u64 },
     /// Refresh all cached data from the repository.
@@ -140,6 +146,12 @@ pub enum OpResult {
     DiffContent {
         path: String,
         lines: Vec<DiffLine>,
+    },
+    /// Complete diff review data for one task worktree.
+    TaskDiffReview {
+        task_id: String,
+        request_id: u64,
+        state: TaskDiffReviewState,
     },
     /// Search results for commit log, tagged with the query and request that produced them.
     SearchResults {
@@ -166,7 +178,20 @@ pub fn execute_operation(path: &Path, op: GitOperation, progress: Arc<Mutex<Stri
     let mut repo = GitRepo::new();
     match repo.open(path) {
         Ok(()) => op.dispatch_with_progress(&repo, progress),
-        Err(e) => OpResult::Error(format!("Failed to open repo: {}", e)),
+        Err(e) => match op {
+            GitOperation::TaskDiffReview {
+                task_id,
+                request_id,
+                ..
+            } => OpResult::TaskDiffReview {
+                task_id,
+                request_id,
+                state: TaskDiffReviewState::Error(format!(
+                    "Could not open the task worktree: {e}"
+                )),
+            },
+            _ => OpResult::Error(format!("Failed to open repo: {}", e)),
+        },
     }
 }
 
@@ -280,6 +305,15 @@ impl GitOperation {
             GitOperation::GetDiff { path, staged } => match repo.get_diff(&path, staged) {
                 Ok(lines) => OpResult::DiffContent { path: path.to_string_lossy().into_owned(), lines },
                 Err(e) => OpResult::Error(format!("Diff error: {}", e)),
+            },
+            GitOperation::TaskDiffReview {
+                task_id,
+                request_id,
+                base_commit,
+            } => OpResult::TaskDiffReview {
+                task_id,
+                request_id,
+                state: repo.task_diff_review(base_commit.as_deref()),
             },
             GitOperation::LogSearch { filter, request_id } => {
                 let commits = if filter.is_empty() {
@@ -476,6 +510,35 @@ pub struct RemoteInfo {
 pub struct DiffLine {
     pub origin: char,
     pub content: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct TaskDiffFile {
+    pub path: String,
+    pub status: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct TaskDiffReview {
+    pub base_commit: String,
+    pub head_commit: String,
+    pub files: Vec<TaskDiffFile>,
+    pub patch: String,
+}
+
+#[derive(Clone, Debug)]
+pub enum TaskDiffReviewState {
+    Loading,
+    Ready(TaskDiffReview),
+    Unavailable(String),
+    Error(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct TaskDiffReviewView {
+    pub task_id: String,
+    pub title: String,
+    pub state: TaskDiffReviewState,
 }
 
 /// Extract a branch name with lossy UTF-8 handling.
@@ -3332,6 +3395,155 @@ impl GitRepo {
         ).map_err(|e| format!("Diff foreach: {}", e))?;
 
         Ok(lines)
+    }
+
+    pub fn task_diff_review(&self, saved_base: Option<&str>) -> TaskDiffReviewState {
+        let Some(saved_base) = saved_base else {
+            return TaskDiffReviewState::Unavailable(
+                "This task has no saved base commit, so a complete diff cannot be established."
+                    .into(),
+            );
+        };
+
+        let repo = match self.repo() {
+            Ok(repo) => repo,
+            Err(error) => return TaskDiffReviewState::Error(error),
+        };
+        if repo.workdir().is_none() {
+            return TaskDiffReviewState::Unavailable(
+                "The task repository has no working directory.".into(),
+            );
+        }
+
+        let base_oid = match git2::Oid::from_str(saved_base) {
+            Ok(oid) => oid,
+            Err(error) => {
+                return TaskDiffReviewState::Unavailable(format!(
+                    "The saved base commit is invalid: {error}"
+                ));
+            }
+        };
+        let base = match repo.find_commit(base_oid) {
+            Ok(commit) => commit,
+            Err(error) => {
+                return TaskDiffReviewState::Unavailable(format!(
+                    "The saved base commit is unavailable in this repository: {error}"
+                ));
+            }
+        };
+        let head = match repo.head().and_then(|reference| reference.peel_to_commit()) {
+            Ok(commit) => commit,
+            Err(error) => {
+                return TaskDiffReviewState::Unavailable(format!(
+                    "The current worktree HEAD is unavailable: {error}"
+                ));
+            }
+        };
+        if base_oid != head.id() {
+            match repo.graph_descendant_of(head.id(), base_oid) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return TaskDiffReviewState::Unavailable(
+                        "The saved base is not an ancestor of the current HEAD, so the review base cannot be trusted.".into(),
+                    );
+                }
+                Err(error) => {
+                    return TaskDiffReviewState::Unavailable(format!(
+                        "Could not verify that the saved base is an ancestor of the current HEAD: {error}"
+                    ));
+                }
+            }
+        }
+
+        let base_tree = match base.tree() {
+            Ok(tree) => tree,
+            Err(error) => {
+                return TaskDiffReviewState::Unavailable(format!(
+                    "Could not read the saved base tree: {error}"
+                ));
+            }
+        };
+        let mut options = DiffOptions::new();
+        options
+            .include_typechange(true)
+            .include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .show_untracked_content(true)
+            .include_unreadable(true)
+            .show_binary(true);
+        let diff = match repo.diff_tree_to_workdir_with_index(Some(&base_tree), Some(&mut options)) {
+            Ok(diff) => diff,
+            Err(error) => {
+                return TaskDiffReviewState::Error(format!(
+                    "Could not read the complete task diff: {error}"
+                ));
+            }
+        };
+
+        let mut files = Vec::new();
+        for delta in diff.deltas() {
+            let status = delta.status();
+            let Some(path) = delta
+                .new_file()
+                .path()
+                .or_else(|| delta.old_file().path())
+            else {
+                return TaskDiffReviewState::Error(
+                    "Git returned a changed file without a readable path.".into(),
+                );
+            };
+            let Some(path) = path.to_str() else {
+                return TaskDiffReviewState::Unavailable(
+                    "A changed file path contains non-UTF-8 bytes that this text view cannot display exactly.".into(),
+                );
+            };
+            let path = path.to_owned();
+            if matches!(status, git2::Delta::Unreadable | git2::Delta::Conflicted) {
+                return TaskDiffReviewState::Error(format!(
+                    "Git could not read a complete patch for {path} ({status:?})."
+                ));
+            }
+            files.push(TaskDiffFile {
+                path,
+                status: format!("{status:?}"),
+            });
+        }
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+
+        let mut patch = String::new();
+        let mut non_utf8_patch = false;
+        let printed = diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
+            let content = match std::str::from_utf8(line.content()) {
+                Ok(content) => content,
+                Err(_) => {
+                    non_utf8_patch = true;
+                    return false;
+                }
+            };
+            if matches!(line.origin(), ' ' | '+' | '-') {
+                patch.push(line.origin());
+            }
+            patch.push_str(content);
+            true
+        });
+        if non_utf8_patch {
+            return TaskDiffReviewState::Unavailable(
+                "The patch contains non-UTF-8 bytes that this text view cannot render completely."
+                    .into(),
+            );
+        }
+        if let Err(error) = printed {
+            return TaskDiffReviewState::Error(format!(
+                "Could not render the complete task patch: {error}"
+            ));
+        }
+
+        TaskDiffReviewState::Ready(TaskDiffReview {
+            base_commit: base_oid.to_string(),
+            head_commit: head.id().to_string(),
+            files,
+            patch,
+        })
     }
 
     pub fn commit(&self, message: &str, amend: bool) -> GitResult<String> {
