@@ -3,6 +3,7 @@
 mod app;
 mod git_ops;
 mod recent;
+mod tasks;
 mod ui;
 mod updater;
 
