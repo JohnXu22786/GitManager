@@ -194,11 +194,11 @@ fn verification_status(
     if task.verification_command.as_ref() != Some(&result.command) {
         return "Stale · command changed".into();
     }
-    let Some(current_fingerprint) = current_fingerprint else {
-        return "Freshness unavailable".into();
-    };
     let Some(saved_fingerprint) = result.source_fingerprint.as_deref() else {
         return "Stale · result has no source fingerprint".into();
+    };
+    let Some(current_fingerprint) = current_fingerprint else {
+        return "Freshness unavailable".into();
     };
     if saved_fingerprint != current_fingerprint {
         return "Stale".into();
