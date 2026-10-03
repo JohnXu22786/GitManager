@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod app;
+mod harness;
 mod git_ops;
 mod recent;
 mod tasks;

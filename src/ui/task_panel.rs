@@ -1,4 +1,5 @@
 use crate::app::{App, Tab};
+use crate::harness::{CodexHarness, ResumeCapability, TaskHarness};
 use crate::tasks::TaskRecord;
 use eframe::egui;
 use std::path::Path;
@@ -13,6 +14,23 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, _ctx: &egui::Context) {
         }
     });
     ui.label("Local task records linked to existing Git workspaces.");
+
+    let codex = CodexHarness;
+    let codex_capabilities = codex.capabilities();
+    let codex_availability = codex.availability();
+    let availability_color = if codex_availability.available {
+        App::adaptive_green(ui.style().visuals.dark_mode)
+    } else {
+        App::adaptive_yellow(ui.style().visuals.dark_mode)
+    };
+    ui.colored_label(availability_color, &codex_availability.message);
+    if !codex_capabilities.tracks_sessions
+        && codex_capabilities.resume == ResumeCapability::UserSelectsSession
+    {
+        ui.label(
+            "New Codex session IDs are not captured; tasks without a saved ID use Codex's worktree-filtered picker.",
+        );
+    }
 
     if let Some(error) = app.task_registry.load_error() {
         ui.colored_label(
@@ -101,6 +119,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, _ctx: &egui::Context) {
 
     let mut open_workspace: Option<String> = None;
     let mut unlink_task: Option<String> = None;
+    let mut start_codex: Option<TaskRecord> = None;
+    let mut resume_codex: Option<TaskRecord> = None;
     for task in &entries {
         let available = worktree_directory_present(&task.worktree_path);
         ui.group(|ui| {
@@ -124,8 +144,48 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, _ctx: &egui::Context) {
                     }
                 });
             });
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(
+                        available
+                            && codex_availability.available
+                            && codex_capabilities.can_start
+                            && !app.is_busy(),
+                        egui::Button::new("Start in Codex"),
+                    )
+                    .clicked()
+                {
+                    start_codex = Some(task.clone());
+                }
+                let has_codex_session = task.provider_ref.as_deref() == Some(codex.provider_ref())
+                    && task.session_ref.is_some();
+                let resume_label = if has_codex_session {
+                    "Resume Codex session"
+                } else {
+                    "Choose Codex session"
+                };
+                if ui
+                    .add_enabled(
+                        available
+                            && codex_availability.available
+                            && !app.is_busy()
+                            && codex_capabilities.resume != ResumeCapability::Unsupported,
+                        egui::Button::new(resume_label),
+                    )
+                    .clicked()
+                {
+                    resume_codex = Some(task.clone());
+                }
+            });
             ui.label(format!("Repository: {}", task.repository_path));
             ui.label(format!("Worktree: {}", task.worktree_path));
+            if task.provider_ref.as_deref() == Some(codex.provider_ref()) {
+                ui.label(if task.session_ref.is_some() {
+                    "Harness: Codex · session reference recorded"
+                } else {
+                    "Harness: Codex · session ID not tracked"
+                });
+            }
             ui.horizontal_wrapped(|ui| {
                 if let Some(branch) = &task.branch {
                     ui.label(format!("Branch: {branch}"));
@@ -160,6 +220,39 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, _ctx: &egui::Context) {
         app.open_repo(&path);
         if app.git.is_open() && app.repo_path == path {
             app.current_tab = Tab::Worktrees;
+        }
+    }
+
+    if let Some(task) = start_codex {
+        match app
+            .task_registry
+            .prepare_provider_start(&task.id, codex.provider_ref())
+        {
+            Ok(()) => match codex.start(&task) {
+                Ok(()) => app.show_success(
+                    "Codex launch requested with this task's goal. Session ID and run state are not tracked."
+                        .into(),
+                ),
+                Err(error) => app.show_error(error),
+            },
+            Err(error) => app.show_error(format!(
+                "Could not save the Codex provider reference; the launch was not started: {error}"
+            )),
+        }
+    }
+
+    if let Some(task) = resume_codex {
+        match codex.resume(&task) {
+            Ok(()) if task.provider_ref.as_deref() == Some(codex.provider_ref())
+                && task.session_ref.is_some() =>
+            {
+                app.show_success("Codex resume requested for the saved session reference.".into())
+            }
+            Ok(()) => app.show_success(
+                "Codex worktree-filtered session picker launch requested. Choose this task's session."
+                    .into(),
+            ),
+            Err(error) => app.show_error(error),
         }
     }
 }
