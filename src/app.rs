@@ -610,6 +610,7 @@ pub struct App {
     pub task_title: String,
     pub task_worktree_path: String,
     pub task_diff_review: Option<TaskDiffReviewView>,
+    pub task_merge_preview: crate::task_merge_preview::TaskMergePreviewController,
     pub task_verification_editor: Option<TaskVerificationCommandDraft>,
     task_verification_run: Option<PendingTaskVerification>,
     task_fingerprint_probes: HashMap<String, TaskFingerprintProbe>,
@@ -697,6 +698,7 @@ impl App {
             task_title: String::new(),
             task_worktree_path: String::new(),
             task_diff_review: None,
+            task_merge_preview: crate::task_merge_preview::TaskMergePreviewController::default(),
             task_verification_editor: None,
             task_verification_run: None,
             task_fingerprint_probes: HashMap::new(),
@@ -2237,6 +2239,10 @@ impl App {
             }
             probe.result.clone()
         }
+    }
+
+    pub fn invalidate_task_review_queue_state(&mut self, task_id: &str) {
+        self.task_review_queue_probes.remove(task_id);
     }
 
     fn process_task_verification(&mut self, ctx: &egui::Context) {

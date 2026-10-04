@@ -5,7 +5,7 @@ use crate::task_delivery::{
     PullRequestSnapshot, PullRequestStatusView, TaskSourceFreshness,
 };
 use crate::task_verification::VerificationState;
-use crate::tasks::{resolve_dependency, DependencyReference, TaskRecord};
+use crate::tasks::{dependency_order, resolve_dependency, DependencyReference, TaskRecord};
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
 
@@ -52,6 +52,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         })
         .collect::<HashMap<_, _>>();
     render_dependency_order(ui, &entries, &pull_request_statuses);
+    render_merge_preview(app, ui, ctx, &entries, &task_states);
 
     let mut open_task: Option<TaskRecord> = None;
     let mut delivery_action: Option<(
@@ -294,80 +295,329 @@ fn render_dependency_order(
     }
 }
 
-fn dependency_order(tasks: &[TaskRecord]) -> (Vec<String>, HashMap<String, String>) {
-    let mut unavailable = HashMap::new();
-    for task in tasks {
-        for dependency in &task.dependencies {
-            let issue = match resolve_dependency(task, dependency, tasks) {
-                DependencyReference::Resolved(_) => None,
-                DependencyReference::Missing => Some(format!(
-                    "dependency task {} is missing or unlinked",
-                    dependency.task_id
-                )),
-                DependencyReference::RepositoryChanged => Some(format!(
-                    "dependency task {} no longer matches its saved repository or worktree",
-                    dependency.task_id
-                )),
-            };
-            if let Some(issue) = issue {
-                unavailable.entry(task.id.clone()).or_insert(issue);
-                break;
-            }
+fn render_merge_preview(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    entries: &[TaskRecord],
+    task_states: &[(TaskRecord, Option<TaskReviewQueueState>)],
+) {
+    use crate::task_merge_preview::TaskMergePreviewState;
+
+    app.task_merge_preview.poll();
+    let running = app.task_merge_preview.is_running();
+    ui.add_space(10.0);
+    ui.separator();
+    ui.heading("Non-destructive merge preview");
+    ui.weak(
+        "Select task sources, a repository, and a local base branch. The preview follows saved task dependencies and uses only changes captured from clean task worktrees.",
+    );
+
+    let mut repository_paths = entries
+        .iter()
+        .map(|task| task.repository_path.clone())
+        .collect::<Vec<_>>();
+    repository_paths.sort();
+    repository_paths.dedup();
+    if repository_paths.is_empty() {
+        ui.label("No linked task repositories are available to preview.");
+        return;
+    }
+    if !running && !repository_paths
+        .iter()
+        .any(|path| path == &app.task_merge_preview.repository_path)
+    {
+        app.task_merge_preview
+            .set_repository(repository_paths[0].clone());
+    }
+
+    let mut selected_repository = app.task_merge_preview.repository_path.clone();
+    ui.add_enabled_ui(!running, |ui| {
+        egui::ComboBox::from_id_salt("task_merge_preview_repository")
+            .selected_text(&selected_repository)
+            .show_ui(ui, |ui| {
+                for path in &repository_paths {
+                    ui.selectable_value(&mut selected_repository, path.clone(), path);
+                }
+            });
+    });
+    if selected_repository != app.task_merge_preview.repository_path {
+        app.task_merge_preview.set_repository(selected_repository);
+    }
+
+    if let Some(error) = app.task_merge_preview.base_ref_error.as_deref() {
+        ui.colored_label(
+            App::adaptive_yellow(ui.style().visuals.dark_mode),
+            format!("Base branches unavailable: {error}"),
+        );
+    } else {
+        let mut selected_base = app.task_merge_preview.base_ref.clone();
+        ui.add_enabled_ui(!running, |ui| {
+            egui::ComboBox::from_id_salt("task_merge_preview_base")
+                .selected_text(if selected_base.is_empty() {
+                    "Choose a local base branch"
+                } else {
+                    selected_base.as_str()
+                })
+                .show_ui(ui, |ui| {
+                    for branch in &app.task_merge_preview.base_refs {
+                        ui.selectable_value(&mut selected_base, branch.clone(), branch);
+                    }
+                });
+        });
+        if selected_base != app.task_merge_preview.base_ref {
+            app.task_merge_preview.base_ref = selected_base;
+            app.task_merge_preview.invalidate();
         }
     }
 
-    loop {
-        let blocked_by_unavailable = tasks.iter().find_map(|task| {
-            if unavailable.contains_key(&task.id) {
-                return None;
+    let repository_tasks = entries
+        .iter()
+        .filter(|task| task.repository_path == app.task_merge_preview.repository_path)
+        .cloned()
+        .collect::<Vec<_>>();
+    let (ordered_ids, order_unavailable) = dependency_order(&repository_tasks);
+    let mut selection_changed = false;
+    ui.label("Choose tasks to integrate in dependency order:");
+    ui.add_enabled_ui(!running, |ui| {
+        for task in &repository_tasks {
+            if let Some(reason) = order_unavailable.get(&task.id) {
+                ui.colored_label(
+                    App::adaptive_yellow(ui.style().visuals.dark_mode),
+                    format!("{} · order unavailable: {reason}", task.title),
+                );
+                continue;
             }
-            task.dependencies.iter().find_map(|dependency| {
-                let DependencyReference::Resolved(target) =
-                    resolve_dependency(task, dependency, tasks)
-                else {
-                    return None;
-                };
-                unavailable.get(&target.id).map(|_| {
-                    (
-                        task.id.clone(),
-                        format!("depends on {} whose order is unavailable", target.title),
-                    )
-                })
-            })
+            let mut selected = app
+                .task_merge_preview
+                .selected_task_ids
+                .contains(&task.id);
+            if ui.checkbox(&mut selected, &task.title).changed() {
+                if selected {
+                    app.task_merge_preview
+                        .selected_task_ids
+                        .insert(task.id.clone());
+                } else {
+                    app.task_merge_preview
+                        .selected_task_ids
+                        .remove(&task.id);
+                }
+                selection_changed = true;
+            }
+        }
+        ui.horizontal(|ui| {
+            if ui.button("Select all available").clicked() {
+                for task_id in &ordered_ids {
+                    app.task_merge_preview
+                        .selected_task_ids
+                        .insert(task_id.clone());
+                }
+                selection_changed = true;
+            }
+            if ui.button("Clear selection").clicked()
+                && !app.task_merge_preview.selected_task_ids.is_empty()
+            {
+                app.task_merge_preview.selected_task_ids.clear();
+                selection_changed = true;
+            }
         });
-        let Some((task_id, reason)) = blocked_by_unavailable else {
-            break;
-        };
-        unavailable.insert(task_id, reason);
+    });
+    if selection_changed {
+        app.task_merge_preview.invalidate();
     }
 
-    let mut ordered = Vec::new();
-    let mut completed = HashSet::new();
-    loop {
-        let next = tasks.iter().find(|task| {
-            !unavailable.contains_key(&task.id)
-                && !completed.contains(&task.id)
-                && task.dependencies.iter().all(|dependency| {
-                    matches!(resolve_dependency(task, dependency, tasks),
-                        DependencyReference::Resolved(target) if completed.contains(&target.id))
+    let selected_ids = app.task_merge_preview.selected_task_ids.clone();
+    let blocked_selected = selected_ids
+        .iter()
+        .filter_map(|id| order_unavailable.get(id).map(|reason| (id, reason)))
+        .collect::<Vec<_>>();
+    let omitted_prerequisites = repository_tasks
+        .iter()
+        .filter(|task| selected_ids.contains(&task.id))
+        .flat_map(|task| {
+            task.dependencies
+                .iter()
+                .filter(|dependency| !selected_ids.contains(&dependency.task_id))
+                .map(|dependency| {
+                    let prerequisite = repository_tasks
+                        .iter()
+                        .find(|candidate| candidate.id == dependency.task_id)
+                        .map(|candidate| candidate.title.as_str())
+                        .unwrap_or(dependency.task_id.as_str());
+                    (task.title.clone(), prerequisite.to_owned())
                 })
-        });
-        let Some(task) = next else {
-            break;
-        };
-        completed.insert(task.id.clone());
-        ordered.push(task.id.clone());
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let ordered_tasks = ordered_ids
+        .iter()
+        .filter(|id| selected_ids.contains(*id))
+        .filter_map(|id| repository_tasks.iter().find(|task| task.id == *id).cloned())
+        .collect::<Vec<_>>();
+    let result_needs_identity_check = matches!(
+        app.task_merge_preview.state(),
+        TaskMergePreviewState::ConflictFree { .. } | TaskMergePreviewState::Conflicted { .. }
+    );
+    if result_needs_identity_check
+        && !app.task_merge_preview.selection_matches(
+            &app.task_merge_preview.repository_path,
+            &app.task_merge_preview.base_ref,
+            &ordered_tasks,
+        )
+    {
+        app.task_merge_preview.show_unavailable(
+            "The selected task set or dependency order changed after this preview. Run it again.",
+        );
+    }
+    let stale_source_reason = match app.task_merge_preview.state() {
+        TaskMergePreviewState::ConflictFree {
+            source_fingerprints,
+            ..
+        }
+        | TaskMergePreviewState::Conflicted {
+            source_fingerprints,
+            ..
+        } => source_fingerprints.iter().find_map(|(task_id, expected)| {
+            let (task, current_state) = task_states.iter().find(|(task, _)| &task.id == task_id)?;
+            match current_state {
+                Some(TaskReviewQueueState::Reviewable { source_fingerprint, .. })
+                | Some(TaskReviewQueueState::NoReviewableChanges { source_fingerprint })
+                    if source_fingerprint != expected => Some(format!(
+                        "{} changed after the preview snapshot. Run the preview again.",
+                        task.title
+                    )),
+                Some(TaskReviewQueueState::Unavailable(reason))
+                | Some(TaskReviewQueueState::Error(reason)) => Some(format!(
+                    "{} is no longer available for preview: {reason}",
+                    task.title
+                )),
+                _ => None,
+            }
+        }),
+        _ => None,
+    };
+    if let Some(reason) = stale_source_reason {
+        app.task_merge_preview.show_unavailable(reason);
+    }
+    if let Some(reason) = app.task_merge_preview.check_base_freshness() {
+        app.task_merge_preview.show_unavailable(reason);
+    }
+    if matches!(
+        app.task_merge_preview.state(),
+        TaskMergePreviewState::ConflictFree { .. } | TaskMergePreviewState::Conflicted { .. }
+    ) {
+        ctx.request_repaint_after(std::time::Duration::from_secs(5));
+    }
+    let can_preview = !running
+        && !ordered_tasks.is_empty()
+        && blocked_selected.is_empty()
+        && omitted_prerequisites.is_empty()
+        && app.task_merge_preview.base_ref_error.is_none()
+        && app
+            .task_merge_preview
+            .base_refs
+            .contains(&app.task_merge_preview.base_ref);
+    if ui
+        .add_enabled(can_preview, egui::Button::new("Preview selected tasks"))
+        .clicked()
+    {
+        for task in &ordered_tasks {
+            app.invalidate_task_review_queue_state(&task.id);
+        }
+        app.task_merge_preview.start(ctx, ordered_tasks);
+    }
+    if !blocked_selected.is_empty() {
+        ui.colored_label(
+            App::adaptive_yellow(ui.style().visuals.dark_mode),
+            "One or more selected tasks have an unavailable dependency order.",
+        );
+    }
+    for (task_title, prerequisite) in &omitted_prerequisites {
+        ui.colored_label(
+            App::adaptive_yellow(ui.style().visuals.dark_mode),
+            format!("{task_title} depends on {prerequisite}; select that prerequisite too."),
+        );
     }
 
-    for task in tasks {
-        if !unavailable.contains_key(&task.id) && !completed.contains(&task.id) {
-            unavailable.insert(
-                task.id.clone(),
-                "a dependency cycle prevents a valid order".into(),
+    match app.task_merge_preview.state() {
+        TaskMergePreviewState::Idle => {}
+        TaskMergePreviewState::Running => {
+            ui.label("Checking captured task sources in a temporary integration area…");
+        }
+        TaskMergePreviewState::ConflictFree {
+            changed_files,
+            task_titles,
+            ..
+        } => {
+            ui.colored_label(
+                App::adaptive_green(ui.style().visuals.dark_mode),
+                format!("No file conflicts found across {} task(s).", task_titles.len()),
             );
+            render_preview_changed_files(ui, changed_files);
+            ui.weak("A clean preview does not prove that tests pass or that the changes are safe to merge.");
+        }
+        TaskMergePreviewState::Conflicted {
+            changed_files,
+            task_titles,
+            task_title,
+            task_position,
+            conflicts,
+            ..
+        } => {
+            ui.colored_label(
+                App::adaptive_red(ui.style().visuals.dark_mode),
+                format!(
+                    "Conflicts while integrating {task_title} at task {task_position} of {}.",
+                    task_titles.len()
+                ),
+            );
+            render_preview_changed_files(ui, changed_files);
+            ui.label("Conflicted paths and available merge stages:");
+            egui::ScrollArea::vertical()
+                .max_height(110.0)
+                .show(ui, |ui| {
+                    for conflict in conflicts {
+                        ui.monospace(format!(
+                            "{} · {}",
+                            conflict.path,
+                            conflict.stages.join(" + ")
+                        ));
+                    }
+                });
+        }
+        TaskMergePreviewState::Unavailable {
+            reason,
+            changed_files,
+            task_titles,
+        } => {
+            ui.colored_label(
+                App::adaptive_yellow(ui.style().visuals.dark_mode),
+                format!("Preview unavailable: {reason}"),
+            );
+            if !task_titles.is_empty() {
+                ui.label(format!("Selected task sources: {}", task_titles.join(", ")));
+            }
+            if !changed_files.is_empty() {
+                render_preview_changed_files(ui, changed_files);
+            }
         }
     }
-    (ordered, unavailable)
+    ui.weak("The preview does not merge, commit, push, or run configured verification commands.");
+}
+
+fn render_preview_changed_files(ui: &mut egui::Ui, changed_files: &[String]) {
+    ui.label(format!("Combined changed files ({}):", changed_files.len()));
+    if changed_files.is_empty() {
+        ui.label("No changed files in the selected task sources.");
+        return;
+    }
+    egui::ScrollArea::vertical()
+        .max_height(110.0)
+        .show(ui, |ui| {
+            for path in changed_files {
+                ui.monospace(path);
+            }
+        });
 }
 
 fn task_readiness(

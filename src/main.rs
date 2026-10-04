@@ -7,6 +7,7 @@ mod recent;
 mod tasks;
 mod task_delivery;
 mod task_verification;
+mod task_merge_preview;
 mod ui;
 mod updater;
 
