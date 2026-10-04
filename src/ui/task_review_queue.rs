@@ -60,7 +60,14 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         .iter()
         .cloned()
         .map(|task| {
-            let state = app.current_task_review_queue_state(ctx, &task);
+            let state = task.worktree_cleanup_completed_at.as_ref().map_or_else(
+                || app.current_task_review_queue_state(ctx, &task),
+                |cleaned_at| {
+                    Some(TaskReviewQueueState::Unavailable(format!(
+                        "Task worktree was cleaned at {cleaned_at}; the saved task and PR evidence remain available"
+                    )))
+                },
+            );
             (task, state)
         })
         .collect::<Vec<_>>();
@@ -83,6 +90,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         Option<String>,
         Option<String>,
     )> = None;
+    let mut cleanup_task: Option<(TaskRecord, PullRequestSnapshot)> = None;
 
     let reviewable = task_states
         .iter()
@@ -132,6 +140,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 &pull_request_statuses[&task.id],
                 Some(source_fingerprint.as_str()),
                 &mut delivery_action,
+                &mut cleanup_task,
             );
         });
     }
@@ -150,6 +159,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             Some(TaskReviewQueueState::Reviewable { source_fingerprint, .. }) => {
                 Some(source_fingerprint.clone())
             }
+            _ if task.worktree_cleanup_completed_at.is_some() => None,
             _ => app
                 .current_task_fingerprint(ctx, task)
                 .and_then(Result::ok),
@@ -227,6 +237,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 &pull_request_statuses[&task.id],
                 delivery_fingerprint,
                 &mut delivery_action,
+                &mut cleanup_task,
             );
         });
     }
@@ -236,6 +247,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     }
     if let Some((task, action, identifier, source_fingerprint)) = delivery_action {
         app.start_task_pull_request_action(ctx, &task, action, identifier, source_fingerprint);
+    }
+    if let Some((task, completion)) = cleanup_task {
+        app.preview_task_worktree_cleanup(ctx, &task, &completion);
     }
     crate::ui::task_panel::render_task_diff_review(app, ui);
 }
@@ -402,11 +416,47 @@ fn render_merge_preview(
         .filter(|task| task.repository_path == app.task_merge_preview.repository_path)
         .cloned()
         .collect::<Vec<_>>();
-    let (ordered_ids, order_unavailable) = dependency_order(&repository_tasks);
-    let mut selection_changed = false;
+    let preview_order_tasks = repository_tasks
+        .iter()
+        .map(|task| {
+            let mut task = task.clone();
+            if task_has_cleaned_merged_source(&task) {
+                task.dependencies.clear();
+            }
+            task
+        })
+        .collect::<Vec<_>>();
+    let (ordered_ids, order_unavailable) = dependency_order(&preview_order_tasks);
+    let cleaned_task_ids = repository_tasks
+        .iter()
+        .filter(|task| task.worktree_cleanup_completed_at.is_some())
+        .map(|task| task.id.clone())
+        .collect::<HashSet<_>>();
+    let previewable_ids = ordered_ids
+        .iter()
+        .filter(|task_id| !cleaned_task_ids.contains(*task_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut selection_changed = app
+        .task_merge_preview
+        .selected_task_ids
+        .iter()
+        .any(|task_id| cleaned_task_ids.contains(task_id));
+    if selection_changed {
+        app.task_merge_preview
+            .selected_task_ids
+            .retain(|task_id| !cleaned_task_ids.contains(task_id));
+    }
     ui.label("Choose tasks to integrate in dependency order:");
     ui.add_enabled_ui(controls_enabled, |ui| {
         for task in &repository_tasks {
+            if task.worktree_cleanup_completed_at.is_some() {
+                ui.weak(format!(
+                    "{} · task worktree cleaned; source unavailable for preview",
+                    task.title
+                ));
+                continue;
+            }
             if let Some(reason) = order_unavailable.get(&task.id) {
                 ui.colored_label(
                     App::adaptive_yellow(ui.style().visuals.dark_mode),
@@ -433,7 +483,7 @@ fn render_merge_preview(
         }
         ui.horizontal(|ui| {
             if ui.button("Select all available").clicked() {
-                for task_id in &ordered_ids {
+                for task_id in &previewable_ids {
                     app.task_merge_preview
                         .selected_task_ids
                         .insert(task_id.clone());
@@ -472,7 +522,13 @@ fn render_merge_preview(
         .flat_map(|task| {
             task.dependencies
                 .iter()
-                .filter(|dependency| !selected_ids.contains(&dependency.task_id))
+                .filter(|dependency| {
+                    !selected_ids.contains(&dependency.task_id)
+                        && !repository_tasks
+                            .iter()
+                            .find(|candidate| candidate.id == dependency.task_id)
+                            .is_some_and(task_has_cleaned_merged_source)
+                })
                 .map(|dependency| {
                     let prerequisite = repository_tasks
                         .iter()
@@ -486,6 +542,7 @@ fn render_merge_preview(
         .collect::<Vec<_>>();
     let ordered_tasks = ordered_ids
         .iter()
+        .filter(|id| !cleaned_task_ids.contains(*id))
         .filter(|id| selected_ids.contains(*id))
         .filter_map(|id| repository_tasks.iter().find(|task| task.id == *id).cloned())
         .collect::<Vec<_>>();
@@ -946,6 +1003,14 @@ fn render_preview_changed_files(ui: &mut egui::Ui, changed_files: &[String]) {
         });
 }
 
+fn task_has_cleaned_merged_source(task: &TaskRecord) -> bool {
+    task.worktree_cleanup_completed_at.is_some()
+        && task.latest_pull_request_snapshot.as_ref().is_some_and(|snapshot| {
+            task.pull_request_url.as_deref() == Some(snapshot.url.as_str())
+                && snapshot.is_merged()
+        })
+}
+
 fn task_readiness(
     task: &TaskRecord,
     entries: &[TaskRecord],
@@ -955,6 +1020,13 @@ fn task_readiness(
 ) -> DependencyReadiness {
     if let Some(readiness) = memo.get(&task.id) {
         return readiness.clone();
+    }
+    if task.worktree_cleanup_completed_at.is_some()
+        && task_pull_request_is_currently_merged(task, pull_request_statuses)
+    {
+        let readiness = DependencyReadiness::Delivered;
+        memo.insert(task.id.clone(), readiness.clone());
+        return readiness;
     }
     if !visiting.insert(task.id.clone()) {
         return DependencyReadiness::Blocked("dependency cycle".into());
@@ -1005,7 +1077,7 @@ fn task_readiness(
         }
     }
 
-    let result = if task_pull_request_is_currently_merged(&task.id, pull_request_statuses) {
+    let result = if task_pull_request_is_currently_merged(task, pull_request_statuses) {
         DependencyReadiness::Delivered
     } else {
         DependencyReadiness::Ready
@@ -1016,11 +1088,35 @@ fn task_readiness(
 }
 
 fn task_pull_request_is_currently_merged(
-    task_id: &str,
+    task: &TaskRecord,
     pull_request_statuses: &HashMap<String, PullRequestStatusView>,
 ) -> bool {
+    if task.worktree_cleanup_completed_at.is_some() {
+        let saved_merge = task.latest_pull_request_snapshot.as_ref().is_some_and(|snapshot| {
+            task.pull_request_url.as_deref() == Some(snapshot.url.as_str())
+                && snapshot.is_merged()
+        });
+        let current_merge = pull_request_statuses
+            .get(&task.id)
+            .is_some_and(|status| match &status.remote {
+                PullRequestRemoteView::Ready { snapshot } => {
+                    task.pull_request_url.as_deref() == Some(snapshot.url.as_str())
+                        && snapshot.is_merged()
+                }
+                PullRequestRemoteView::Refreshing { previous, .. }
+                | PullRequestRemoteView::Unavailable { previous, .. } => previous
+                    .as_ref()
+                    .is_some_and(|snapshot| {
+                        task.pull_request_url.as_deref() == Some(snapshot.url.as_str())
+                            && snapshot.is_merged()
+                    }),
+                PullRequestRemoteView::Checking { .. } | PullRequestRemoteView::Unlinked => false,
+            });
+        return saved_merge || current_merge;
+    }
+
     pull_request_statuses
-        .get(task_id)
+        .get(&task.id)
         .is_some_and(|status| match &status.remote {
             PullRequestRemoteView::Ready { snapshot } => {
                 snapshot.is_merged()
@@ -1130,8 +1226,21 @@ fn render_task_delivery(
         Option<String>,
         Option<String>,
     )>,
+    cleanup_task: &mut Option<(TaskRecord, PullRequestSnapshot)>,
 ) {
     let action_running = app.task_pull_request_action_running(&task.id);
+    let delivery_controls_enabled = !action_running && !app.is_busy();
+    let saved_task = app
+        .task_registry
+        .entries()
+        .iter()
+        .find(|entry| entry.id == task.id)
+        .cloned()
+        .unwrap_or_else(|| task.clone());
+    let saved_snapshot = saved_task
+        .latest_pull_request_snapshot
+        .as_ref()
+        .filter(|snapshot| saved_task.pull_request_url.as_deref() == Some(snapshot.url.as_str()));
     ui.separator();
     ui.label(egui::RichText::new("PR and remote CI").strong());
     match &status.remote {
@@ -1142,6 +1251,16 @@ fn render_task_delivery(
         PullRequestRemoteView::Checking { action } => {
             ui.label(format!("Checking · {action}…"));
             ui.label("Source: GitHub via `gh`.");
+            if let Some(snapshot) = saved_snapshot {
+                ui.label("Most recent saved remote evidence; current status is being checked:");
+                render_pull_request_snapshot(
+                    ui,
+                    &task.id,
+                    snapshot,
+                    Some(&snapshot.fetched_at),
+                    true,
+                );
+            }
         }
         PullRequestRemoteView::Refreshing {
             previous,
@@ -1160,6 +1279,15 @@ fn render_task_delivery(
                 ui.label(format!("Last response: {previous_at}"));
             } else {
                 ui.label("Source: GitHub via `gh` · waiting for a remote response.");
+                if let Some(snapshot) = saved_snapshot {
+                    render_pull_request_snapshot(
+                        ui,
+                        &task.id,
+                        snapshot,
+                        Some(&snapshot.fetched_at),
+                        true,
+                    );
+                }
             }
         }
         PullRequestRemoteView::Unavailable {
@@ -1179,6 +1307,15 @@ fn render_task_delivery(
                     &task.id,
                     previous,
                     previous_at.as_deref(),
+                    true,
+                );
+            } else if let Some(snapshot) = saved_snapshot {
+                ui.label("Most recent saved remote evidence; current status could not be confirmed:");
+                render_pull_request_snapshot(
+                    ui,
+                    &task.id,
+                    snapshot,
+                    Some(&snapshot.fetched_at),
                     true,
                 );
             }
@@ -1203,14 +1340,61 @@ fn render_task_delivery(
         ui.colored_label(color, &message.text);
     }
 
-    let linked_url = app
-        .task_registry
-        .entries()
-        .iter()
-        .find(|entry| entry.id == task.id)
-        .map_or(task.pull_request_url.as_deref(), |entry| {
-            entry.pull_request_url.as_deref()
+    let linked_url = saved_task.pull_request_url.as_deref();
+    let stored_task = &saved_task;
+    let task_cleanup_completed = stored_task.worktree_cleanup_completed_at.is_some();
+    let saved_merged_snapshot = || {
+        saved_task
+            .latest_pull_request_snapshot
+            .as_ref()
+            .filter(|snapshot| snapshot.is_merged())
+            .cloned()
+    };
+    let completion_snapshot = match &status.remote {
+        PullRequestRemoteView::Ready { snapshot } => {
+            snapshot.is_merged().then(|| snapshot.clone())
+        }
+        PullRequestRemoteView::Refreshing { previous, .. }
+        | PullRequestRemoteView::Unavailable { previous, .. } => previous
+            .as_ref()
+            .filter(|snapshot| snapshot.is_merged())
+            .cloned()
+            .or_else(saved_merged_snapshot),
+        PullRequestRemoteView::Checking { .. } | PullRequestRemoteView::Unlinked => {
+            saved_merged_snapshot()
+        }
+    }
+    .filter(|snapshot| Some(snapshot.url.as_str()) == linked_url);
+    let task_completion_confirmed = task_cleanup_completed || completion_snapshot.is_some();
+
+    if let Some(cleaned_at) = stored_task.worktree_cleanup_completed_at.as_deref() {
+        ui.colored_label(
+            App::adaptive_green(ui.style().visuals.dark_mode),
+            format!(
+                "Task cleanup completed at {cleaned_at}; recorded worktree path retained for recovery: {}",
+                stored_task.worktree_path
+            ),
+        );
+    } else if let Some(completion) = completion_snapshot {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!(
+                "Task completion confirmed by merged PR #{}.",
+                completion.number
+            ));
+            if ui
+                .add_enabled(
+                    !app.is_busy() && !action_running,
+                    egui::Button::new("Preview task worktree cleanup"),
+                )
+                .on_hover_text(
+                    "Review the existing worktree cleanup preflight. Cancel retains the worktree; its branch is preserved after cleanup.",
+                )
+                .clicked()
+            {
+                *cleanup_task = Some((stored_task.clone(), completion));
+            }
         });
+    }
     let pr_is_linked = linked_url.is_some();
     ui.horizontal_wrapped(|ui| {
         if let Some(url) = linked_url
@@ -1218,7 +1402,7 @@ fn render_task_delivery(
         {
             ui.hyperlink_to("Open PR", url);
         }
-        if pr_is_linked && !action_running
+        if pr_is_linked && delivery_controls_enabled
             && ui.button("Refresh PR status").clicked()
         {
             *next_action = Some((
@@ -1232,12 +1416,15 @@ fn render_task_delivery(
 
     ui.horizontal(|ui| {
         let input = app.task_pull_request_input(&task.id);
-        ui.add(
+        ui.add_enabled(
+            !task_completion_confirmed,
             egui::TextEdit::singleline(input)
                 .hint_text("PR number or HTTPS URL")
                 .desired_width(230.0),
         );
-        let can_associate = !input.trim().is_empty() && !action_running;
+        let can_associate = !input.trim().is_empty()
+            && delivery_controls_enabled
+            && !task_completion_confirmed;
         if ui
             .add_enabled(
                 can_associate,
@@ -1258,7 +1445,8 @@ fn render_task_delivery(
         }
         if !pr_is_linked {
             let can_create = task.branch.as_deref().is_some_and(|branch| !branch.is_empty())
-                && !action_running;
+                && delivery_controls_enabled
+                && !task_completion_confirmed;
             if ui
                 .add_enabled(can_create, egui::Button::new("Create PR"))
                 .clicked()
@@ -1270,9 +1458,14 @@ fn render_task_delivery(
                     current_source_fingerprint.map(str::to_owned),
                 ));
             }
-            if task.branch.as_deref().map_or(true, |branch| branch.is_empty()) {
+            if !task_completion_confirmed
+                && task.branch.as_deref().map_or(true, |branch| branch.is_empty())
+            {
                 ui.label("Create PR requires a task linked to a branch; you can still associate an existing PR.");
             }
+        }
+        if task_completion_confirmed {
+            ui.weak("The PR association is retained after task completion and cannot be changed.");
         }
     });
 }

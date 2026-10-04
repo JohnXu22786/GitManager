@@ -148,8 +148,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     let mut cancel_verification: Option<String> = None;
     let mut dependency_action: Option<TaskDependencyAction> = None;
     for task in &entries {
-        let available = worktree_directory_present(&task.worktree_path);
-        let current_fingerprint = if task.verification_result.is_some() {
+        let directory_present = worktree_directory_present(&task.worktree_path);
+        let available = directory_present && task.worktree_cleanup_completed_at.is_none();
+        let current_fingerprint = if available && task.verification_result.is_some() {
             app.current_task_fingerprint(ctx, task)
         } else {
             None
@@ -165,7 +166,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if crate::ui::add_enabled_ellipsis(
                         ui,
-                        !verification_running,
+                        !verification_running && !app.is_busy(),
                         "Unlink",
                     )
                     .clicked()
@@ -185,7 +186,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             });
             ui.horizontal_wrapped(|ui| {
                 if ui
-                    .add_enabled(!app.is_busy(), egui::Button::new("Review changes"))
+                    .add_enabled(
+                        available && !app.is_busy(),
+                        egui::Button::new("Review changes"),
+                    )
                     .clicked()
                 {
                     review_task = Some(task.clone());
@@ -261,7 +265,14 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 }
             });
             ui.label(format!("Repository: {}", task.repository_path));
-            ui.label(format!("Worktree: {}", task.worktree_path));
+            if let Some(cleaned_at) = task.worktree_cleanup_completed_at.as_deref() {
+                ui.label(format!(
+                    "Worktree cleaned at {cleaned_at}; recorded path retained: {}",
+                    task.worktree_path
+                ));
+            } else {
+                ui.label(format!("Worktree: {}", task.worktree_path));
+            }
             render_task_dependencies(ui, task, &entries, &mut dependency_action);
             if task.provider_ref.as_deref() == Some(codex.provider_ref()) {
                 ui.label(if task.session_ref.is_some() {
@@ -297,12 +308,14 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                     ui.label(format!("Base commit: {}", &commit[..commit.len().min(12)]));
                 }
                 ui.label(format!("Created: {}", task.created_at));
-                let state = if available {
+                let state = if task.worktree_cleanup_completed_at.is_some() {
+                    "Cleaned"
+                } else if directory_present {
                     "Directory present"
                 } else {
-                    "Unavailable"
+                    "Missing; cleanup not recorded"
                 };
-                let color = if available {
+                let color = if available || task.worktree_cleanup_completed_at.is_some() {
                     App::adaptive_green(ui.style().visuals.dark_mode)
                 } else {
                     App::adaptive_yellow(ui.style().visuals.dark_mode)
