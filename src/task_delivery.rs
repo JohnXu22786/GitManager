@@ -7,7 +7,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 const PULL_REQUEST_FIELDS: &str =
-    "number,url,title,state,isDraft,headRefOid,headRefName,baseRefName,statusCheckRollup";
+    "number,url,title,state,isDraft,mergedAt,headRefOid,headRefName,baseRefName,statusCheckRollup";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PullRequestAction {
@@ -66,6 +66,7 @@ pub struct PullRequestSnapshot {
     pub title: String,
     pub state: String,
     pub is_draft: bool,
+    pub merged_at: Option<String>,
     pub head_sha: String,
     pub head_branch: String,
     pub base_branch: String,
@@ -74,6 +75,12 @@ pub struct PullRequestSnapshot {
     pub freshness: TaskSourceFreshness,
     pub source_fingerprint_at_fetch: Option<String>,
     pub fetched_at: String,
+}
+
+impl PullRequestSnapshot {
+    pub fn is_merged(&self) -> bool {
+        self.merged_at.is_some() || self.state.eq_ignore_ascii_case("MERGED")
+    }
 }
 
 #[derive(Debug)]
@@ -142,6 +149,7 @@ struct PullRequestData {
     title: String,
     state: String,
     is_draft: bool,
+    merged_at: Option<String>,
     head_ref_oid: String,
     head_ref_name: String,
     base_ref_name: String,
@@ -477,6 +485,7 @@ fn parse_pull_request(task: &TaskRecord, value: Value) -> Result<PullRequestSnap
         title: data.title,
         state: data.state,
         is_draft: data.is_draft,
+        merged_at: data.merged_at,
         head_sha: data.head_ref_oid,
         head_branch: data.head_ref_name,
         base_branch: data.base_ref_name,

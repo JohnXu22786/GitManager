@@ -1,7 +1,7 @@
 use crate::app::{App, Tab, TaskVerificationCommandDraft};
 use crate::git_ops::TaskDiffReviewState;
 use crate::harness::{ClaudeHarness, CodexHarness, ResumeCapability, TaskHarness};
-use crate::tasks::TaskRecord;
+use crate::tasks::{resolve_dependency, DependencyReference, TaskRecord};
 use crate::task_verification::{VerificationCommand, VerificationState};
 use eframe::egui;
 use std::path::Path;
@@ -146,6 +146,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     let mut configure_verification: Option<TaskRecord> = None;
     let mut run_verification: Option<TaskRecord> = None;
     let mut cancel_verification: Option<String> = None;
+    let mut dependency_action: Option<TaskDependencyAction> = None;
     for task in &entries {
         let available = worktree_directory_present(&task.worktree_path);
         let current_fingerprint = if task.verification_result.is_some() {
@@ -261,6 +262,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             });
             ui.label(format!("Repository: {}", task.repository_path));
             ui.label(format!("Worktree: {}", task.worktree_path));
+            render_task_dependencies(ui, task, &entries, &mut dependency_action);
             if task.provider_ref.as_deref() == Some(codex.provider_ref()) {
                 ui.label(if task.session_ref.is_some() {
                     "Harness: Codex · session reference recorded"
@@ -314,6 +316,21 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         app.task_verification_editor = Some(TaskVerificationCommandDraft::for_task(&task));
     }
     render_verification_command_editor(app, ui, &entries);
+
+    if let Some(action) = dependency_action {
+        let result = match action {
+            TaskDependencyAction::Add(task_id, dependency_id) => {
+                app.task_registry.add_dependency(&task_id, &dependency_id)
+            }
+            TaskDependencyAction::Remove(task_id, dependency_id) => {
+                app.task_registry.remove_dependency(&task_id, &dependency_id)
+            }
+        };
+        match result {
+            Ok(()) => app.show_success("Task dependency updated".into()),
+            Err(error) => app.show_error(format!("Could not update task dependency: {error}")),
+        }
+    }
 
     if let Some(task) = run_verification {
         app.start_task_verification(ctx, &task);
@@ -604,6 +621,82 @@ fn render_task_verification(
                     });
             });
     }
+}
+
+enum TaskDependencyAction {
+    Add(String, String),
+    Remove(String, String),
+}
+
+fn render_task_dependencies(
+    ui: &mut egui::Ui,
+    task: &TaskRecord,
+    entries: &[TaskRecord],
+    action: &mut Option<TaskDependencyAction>,
+) {
+    egui::CollapsingHeader::new(format!("Dependencies ({})", task.dependencies.len()))
+        .id_salt(("task_dependencies", &task.id))
+        .show(ui, |ui| {
+            for dependency in &task.dependencies {
+                ui.horizontal_wrapped(|ui| {
+                    let label = match resolve_dependency(task, dependency, entries) {
+                        DependencyReference::Resolved(target) => {
+                            format!("Depends on {}", target.title)
+                        }
+                        DependencyReference::Missing => format!(
+                            "Unresolved · task {} is missing or unlinked",
+                            dependency.task_id
+                        ),
+                        DependencyReference::RepositoryChanged => format!(
+                            "Unresolved · task {} no longer matches its saved repository or worktree",
+                            dependency.task_id
+                        ),
+                    };
+                    ui.label(label);
+                    if ui.small_button("Remove").clicked() {
+                        *action = Some(TaskDependencyAction::Remove(
+                            task.id.clone(),
+                            dependency.task_id.clone(),
+                        ));
+                    }
+                });
+            }
+
+            let candidates = entries
+                .iter()
+                .filter(|candidate| {
+                    candidate.id != task.id
+                        && candidate.repository_path == task.repository_path
+                        && !task
+                            .dependencies
+                            .iter()
+                            .any(|dependency| dependency.task_id == candidate.id)
+                })
+                .collect::<Vec<_>>();
+            if candidates.is_empty() {
+                ui.weak("No other tasks in this repository are available to add.");
+                return;
+            }
+
+            let mut selected = None;
+            egui::ComboBox::from_id_salt(("add_task_dependency", &task.id))
+                .selected_text("Select a prerequisite to add")
+                .show_ui(ui, |ui| {
+                    for candidate in candidates {
+                        ui.selectable_value(
+                            &mut selected,
+                            Some(candidate.id.clone()),
+                            &candidate.title,
+                        );
+                    }
+                });
+            if let Some(dependency_id) = selected {
+                *action = Some(TaskDependencyAction::Add(
+                    task.id.clone(),
+                    dependency_id,
+                ));
+            }
+        });
 }
 
 fn render_verification_command_editor(app: &mut App, ui: &mut egui::Ui, entries: &[TaskRecord]) {
