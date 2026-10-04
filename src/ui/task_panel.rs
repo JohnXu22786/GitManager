@@ -326,6 +326,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         match app.task_registry.unlink(&id) {
             Ok(()) => {
                 app.forget_task_fingerprint_probe(&id);
+                app.forget_task_pull_request_probe(&id);
                 if app
                     .task_diff_review
                     .as_ref()

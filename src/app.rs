@@ -1,6 +1,9 @@
 use crate::git_ops::*;
 use crate::recent::{path_name, RecentRepos};
 use crate::tasks::{TaskRecord, TaskRegistry, TaskVerificationRunLock};
+use crate::task_delivery::{
+    self, PullRequestAction, PullRequestActionMessage, PullRequestSnapshot, PullRequestStatusView,
+};
 use crate::task_verification::{
     self, VerificationCommand, VerificationResult, VerificationState,
 };
@@ -15,6 +18,8 @@ use std::time::{Duration, Instant};
 
 const ABOUT_BUTTON_LABEL: &str = "ℹ";
 const APP_VERSION: &str = crate::version_info::VERSION;
+const TASK_PR_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const MAX_TASK_PR_REFRESHES: usize = 2;
 
 fn cleanup_change_label(change: &WorktreeChange) -> String {
     let mut labels = Vec::new();
@@ -280,6 +285,28 @@ struct TaskReviewQueueProbe {
     receiver: Option<mpsc::Receiver<TaskReviewQueueState>>,
 }
 
+struct TaskPullRequestProbe {
+    snapshot: Option<PullRequestSnapshot>,
+    error: Option<String>,
+    checked_at: Option<Instant>,
+    receiver: Option<mpsc::Receiver<Result<PullRequestSnapshot, task_delivery::PullRequestActionError>>>,
+    action: Option<PullRequestAction>,
+    action_message: Option<PullRequestActionMessage>,
+}
+
+impl Default for TaskPullRequestProbe {
+    fn default() -> Self {
+        Self {
+            snapshot: None,
+            error: None,
+            checked_at: None,
+            receiver: None,
+            action: None,
+            action_message: None,
+        }
+    }
+}
+
 
 /// Tracks a Git operation running in a background thread.
 struct PendingOp {
@@ -473,6 +500,8 @@ pub struct App {
     task_verification_run: Option<PendingTaskVerification>,
     task_fingerprint_probes: HashMap<String, TaskFingerprintProbe>,
     task_review_queue_probes: HashMap<String, TaskReviewQueueProbe>,
+    task_pull_request_probes: HashMap<String, TaskPullRequestProbe>,
+    task_pull_request_inputs: HashMap<String, String>,
     task_diff_request_id: u64,
     pub status_expanded: bool,
     /// Excel-style resizable column widths for tables.
@@ -557,6 +586,8 @@ impl App {
             task_verification_run: None,
             task_fingerprint_probes: HashMap::new(),
             task_review_queue_probes: HashMap::new(),
+            task_pull_request_probes: HashMap::new(),
+            task_pull_request_inputs: HashMap::new(),
             task_diff_request_id: 0,
             status_expanded: false,
             column_widths: crate::ui::init_column_widths(),
@@ -1424,6 +1455,318 @@ impl App {
         self.task_review_queue_probes.remove(task_id);
     }
 
+    pub fn forget_task_pull_request_probe(&mut self, task_id: &str) {
+        self.task_pull_request_probes.remove(task_id);
+        self.task_pull_request_inputs.remove(task_id);
+    }
+
+    pub fn task_pull_request_input(&mut self, task_id: &str) -> &mut String {
+        self.task_pull_request_inputs
+            .entry(task_id.to_string())
+            .or_default()
+    }
+
+    pub fn task_pull_request_action_running(&self, task_id: &str) -> bool {
+        self.task_pull_request_probes
+            .get(task_id)
+            .is_some_and(|probe| probe.receiver.is_some())
+    }
+
+    pub fn start_task_pull_request_action(
+        &mut self,
+        ctx: &egui::Context,
+        task: &TaskRecord,
+        action: PullRequestAction,
+        identifier: Option<String>,
+        source_fingerprint: Option<String>,
+    ) {
+        if action == PullRequestAction::Create
+            && self
+                .task_registry
+                .entries()
+                .iter()
+                .find(|entry| entry.id == task.id)
+                .map_or(true, |entry| entry.pull_request_url.is_some())
+        {
+            return;
+        }
+        if self
+            .task_pull_request_probes
+            .get(&task.id)
+            .is_some_and(|probe| probe.receiver.is_some())
+        {
+            return;
+        }
+
+        let worker_task = task.clone();
+        let worker_identifier = identifier;
+        let worker_source_fingerprint = source_fingerprint;
+        let worker_ctx = ctx.clone();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = task_delivery::perform_action(
+                &worker_task,
+                action,
+                worker_identifier.as_deref(),
+            )
+            .map(|mut snapshot| {
+                snapshot.source_fingerprint_at_fetch = worker_source_fingerprint;
+                snapshot
+            });
+            let _ = sender.send(result);
+            worker_ctx.request_repaint();
+        });
+
+        let probe = self
+            .task_pull_request_probes
+            .entry(task.id.clone())
+            .or_default();
+        probe.receiver = Some(receiver);
+        probe.action = Some(action);
+        probe.action_message = None;
+        if action == PullRequestAction::Refresh {
+            probe.error = None;
+        }
+        ctx.request_repaint();
+    }
+
+    fn process_task_pull_request_actions(&mut self) {
+        let task_ids = self
+            .task_pull_request_probes
+            .iter()
+            .filter_map(|(task_id, probe)| probe.receiver.as_ref().map(|_| task_id.clone()))
+            .collect::<Vec<_>>();
+        for task_id in task_ids {
+            self.process_task_pull_request_action(&task_id);
+        }
+    }
+
+    fn process_task_pull_request_action(&mut self, task_id: &str) {
+        let completion = self
+            .task_pull_request_probes
+            .get(task_id)
+            .and_then(|probe| {
+                let receiver = probe.receiver.as_ref()?;
+                let action = probe.action.unwrap_or(PullRequestAction::Refresh);
+                match receiver.try_recv() {
+                    Ok(result) => Some((action, result)),
+                    Err(mpsc::TryRecvError::Disconnected) => Some((
+                        action,
+                        Err(task_delivery::PullRequestActionError {
+                            message: "The GitHub status worker stopped before returning a result"
+                                .into(),
+                            created_url: None,
+                        }),
+                    )),
+                    Err(mpsc::TryRecvError::Empty) => None,
+                }
+            });
+        let Some((action, result)) = completion else {
+            return;
+        };
+
+        let result = if action != PullRequestAction::Refresh {
+            match result {
+                Ok(snapshot) => match self
+                    .task_registry
+                    .record_pull_request(task_id, &snapshot.url)
+                {
+                    Ok(()) => {
+                        let action_text = match action {
+                            PullRequestAction::Associate => "Associated",
+                            PullRequestAction::Create => "Created",
+                            PullRequestAction::Refresh => unreachable!(),
+                        };
+                        if action == PullRequestAction::Associate {
+                            self.task_pull_request_inputs.remove(task_id);
+                        }
+                        let message = PullRequestActionMessage {
+                            succeeded: true,
+                            text: format!(
+                                "{action_text} PR #{} · {}",
+                                snapshot.number, snapshot.url
+                            ),
+                        };
+                        if let Some(probe) = self.task_pull_request_probes.get_mut(task_id) {
+                            probe.action_message = Some(message);
+                        }
+                        Ok(snapshot)
+                    }
+                    Err(error) => Err(format!(
+                        "PR #{} is available at {}, but its link could not be saved: {error}",
+                        snapshot.number, snapshot.url
+                    )),
+                },
+                Err(error) => {
+                    let mut message = error.message;
+                    if action == PullRequestAction::Create {
+                        if let Some(url) = error.created_url {
+                            match self.task_registry.record_pull_request(task_id, &url) {
+                                Ok(()) => {
+                                    message = format!("{message}. The created PR is linked at {url}.");
+                                }
+                                Err(save_error) => {
+                                    message = format!(
+                                        "{message}. The created PR is at {url}, but its link could not be saved: {save_error}. Use Associate PR with this URL."
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(message)
+                }
+            }
+        } else {
+            result.map_err(|error| error.message)
+        };
+
+        if let Some(probe) = self.task_pull_request_probes.get_mut(task_id) {
+            probe.receiver = None;
+            probe.action = None;
+            match result {
+                Ok(snapshot) => {
+                    probe.snapshot = Some(snapshot.clone());
+                    probe.error = None;
+                    probe.checked_at = Some(Instant::now());
+                    if action != PullRequestAction::Refresh {
+                        probe.action_message.get_or_insert_with(|| PullRequestActionMessage {
+                            succeeded: true,
+                            text: format!("Refreshed PR #{}", snapshot.number),
+                        });
+                    }
+                }
+                Err(error) if action == PullRequestAction::Refresh => {
+                    probe.error = Some(error);
+                    probe.checked_at = Some(Instant::now());
+                }
+                Err(error) => {
+                    probe.action_message = Some(PullRequestActionMessage {
+                        succeeded: false,
+                        text: error,
+                    });
+                }
+            }
+        }
+    }
+
+    pub fn current_task_pull_request_status(
+        &mut self,
+        ctx: &egui::Context,
+        task: &TaskRecord,
+        current_source_fingerprint: Option<&str>,
+    ) -> PullRequestStatusView {
+        self.process_task_pull_request_action(&task.id);
+
+        let current_task = self
+            .task_registry
+            .entries()
+            .iter()
+            .find(|entry| entry.id == task.id)
+            .cloned()
+            .unwrap_or_else(|| task.clone());
+        let linked = current_task.pull_request_url.is_some();
+        let active_refreshes = self
+            .task_pull_request_probes
+            .values()
+            .filter(|probe| {
+                probe.action == Some(PullRequestAction::Refresh) && probe.receiver.is_some()
+            })
+            .count();
+        let should_refresh = linked
+            && active_refreshes < MAX_TASK_PR_REFRESHES
+            && self.task_pull_request_probes.get(&task.id).map_or(true, |probe| {
+                probe.receiver.is_none()
+                    && (probe.checked_at.map_or(true, |checked_at| {
+                        checked_at.elapsed() >= TASK_PR_REFRESH_INTERVAL
+                    }) || (current_source_fingerprint.is_some()
+                        && probe.snapshot.as_ref().is_some_and(|snapshot| {
+                            snapshot.source_fingerprint_at_fetch.is_none()
+                        })))
+            });
+        if should_refresh {
+            self.start_task_pull_request_action(
+                ctx,
+                &current_task,
+                PullRequestAction::Refresh,
+                None,
+                current_source_fingerprint.map(str::to_owned),
+            );
+        }
+
+        let Some(probe) = self.task_pull_request_probes.get(&task.id) else {
+            return PullRequestStatusView {
+                remote: if linked {
+                    task_delivery::PullRequestRemoteView::Checking {
+                        action: "Waiting for a GitHub status slot",
+                    }
+                } else {
+                    task_delivery::PullRequestRemoteView::Unlinked
+                },
+                action_message: None,
+            };
+        };
+        let remote = if let Some(action) = probe.action.filter(|_| probe.receiver.is_some()) {
+            if action == PullRequestAction::Refresh {
+                if probe.snapshot.is_some() || probe.error.is_some() {
+                    task_delivery::PullRequestRemoteView::Refreshing {
+                        previous: probe.snapshot.clone(),
+                        previous_at: probe
+                            .snapshot
+                            .as_ref()
+                            .map(|snapshot| snapshot.fetched_at.clone()),
+                    }
+                } else {
+                    task_delivery::PullRequestRemoteView::Checking {
+                        action: action.label(),
+                    }
+                }
+            } else {
+                task_delivery::PullRequestRemoteView::Checking {
+                    action: action.label(),
+                }
+            }
+        } else if !linked {
+            task_delivery::PullRequestRemoteView::Unlinked
+        } else if probe.checked_at.map_or(true, |checked_at| {
+            checked_at.elapsed() >= TASK_PR_REFRESH_INTERVAL
+        }) {
+            task_delivery::PullRequestRemoteView::Refreshing {
+                previous: probe.snapshot.clone(),
+                previous_at: probe
+                    .snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.fetched_at.clone()),
+            }
+        } else if let Some(error) = &probe.error {
+            task_delivery::PullRequestRemoteView::Unavailable {
+                message: error.clone(),
+                previous: probe.snapshot.clone(),
+                previous_at: probe
+                    .snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.fetched_at.clone()),
+            }
+        } else if let Some(snapshot) = &probe.snapshot {
+            task_delivery::PullRequestRemoteView::Ready {
+                snapshot: task_delivery::refresh_snapshot_freshness(
+                    snapshot,
+                    current_source_fingerprint,
+                ),
+            }
+        } else {
+            task_delivery::PullRequestRemoteView::Checking {
+                action: PullRequestAction::Refresh.label(),
+            }
+        };
+        if probe.receiver.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
+        PullRequestStatusView {
+            remote,
+            action_message: probe.action_message.clone(),
+        }
+    }
+
     pub fn task_verification_cancel_requested(&self, task_id: &str) -> bool {
         self.task_verification_run.as_ref().is_some_and(|run| {
             run.task_id.as_str() == task_id && run.cancel_requested.load(Ordering::Relaxed)
@@ -2119,6 +2462,7 @@ impl eframe::App for App {
         }
         self.process_pending_ops(ctx);
         self.process_task_verification(ctx);
+        self.process_task_pull_request_actions();
 
         let dark = ctx.style().visuals.dark_mode;
         if dark {
