@@ -3,7 +3,7 @@ use crate::task_verification::{VerificationCommand, VerificationResult, Verifica
 use git2::Repository;
 use ring::digest::{digest, SHA256};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -75,6 +75,84 @@ pub fn resolve_dependency<'a>(
         return DependencyReference::RepositoryChanged;
     }
     DependencyReference::Resolved(task)
+}
+
+/// Return tasks in their recorded dependency order and explain any tasks whose
+/// place in that order cannot be established.
+pub fn dependency_order(tasks: &[TaskRecord]) -> (Vec<String>, HashMap<String, String>) {
+    let mut unavailable = HashMap::new();
+    for task in tasks {
+        for dependency in &task.dependencies {
+            let issue = match resolve_dependency(task, dependency, tasks) {
+                DependencyReference::Resolved(_) => None,
+                DependencyReference::Missing => Some(format!(
+                    "dependency task {} is missing or unlinked",
+                    dependency.task_id
+                )),
+                DependencyReference::RepositoryChanged => Some(format!(
+                    "dependency task {} no longer matches its saved repository or worktree",
+                    dependency.task_id
+                )),
+            };
+            if let Some(issue) = issue {
+                unavailable.entry(task.id.clone()).or_insert(issue);
+                break;
+            }
+        }
+    }
+
+    loop {
+        let blocked_by_unavailable = tasks.iter().find_map(|task| {
+            if unavailable.contains_key(&task.id) {
+                return None;
+            }
+            task.dependencies.iter().find_map(|dependency| {
+                let DependencyReference::Resolved(target) =
+                    resolve_dependency(task, dependency, tasks)
+                else {
+                    return None;
+                };
+                unavailable.get(&target.id).map(|_| {
+                    (
+                        task.id.clone(),
+                        format!("depends on {} whose order is unavailable", target.title),
+                    )
+                })
+            })
+        });
+        let Some((task_id, reason)) = blocked_by_unavailable else {
+            break;
+        };
+        unavailable.insert(task_id, reason);
+    }
+
+    let mut ordered = Vec::new();
+    let mut completed = HashSet::new();
+    loop {
+        let next = tasks.iter().find(|task| {
+            !unavailable.contains_key(&task.id)
+                && !completed.contains(&task.id)
+                && task.dependencies.iter().all(|dependency| {
+                    matches!(resolve_dependency(task, dependency, tasks),
+                        DependencyReference::Resolved(target) if completed.contains(&target.id))
+                })
+        });
+        let Some(task) = next else {
+            break;
+        };
+        completed.insert(task.id.clone());
+        ordered.push(task.id.clone());
+    }
+
+    for task in tasks {
+        if !unavailable.contains_key(&task.id) && !completed.contains(&task.id) {
+            unavailable.insert(
+                task.id.clone(),
+                "a dependency cycle prevents a valid order".into(),
+            );
+        }
+    }
+    (ordered, unavailable)
 }
 
 impl TaskRecord {
