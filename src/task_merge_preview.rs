@@ -927,7 +927,7 @@ fn materialize_preview_tree(
     checkout.force().remove_untracked(true);
     if let Some(cancel_requested) = cancel_requested {
         checkout
-            .notify_on(git2::build::CheckoutNotificationType::all())
+            .notify_on(git2::CheckoutNotificationType::all())
             .notify(|_, _, _, _, _| !cancel_requested.load(Ordering::Relaxed));
     }
     if let Err(error) = repository.checkout_tree(tree.as_object(), Some(&mut checkout)) {
