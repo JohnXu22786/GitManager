@@ -43,6 +43,38 @@ pub struct TaskRecord {
     pub reviewed_at: Option<String>,
     #[serde(default)]
     pub pull_request_url: Option<String>,
+    #[serde(default)]
+    pub dependencies: Vec<TaskDependency>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct TaskDependency {
+    pub task_id: String,
+    pub repository_path: String,
+    pub worktree_path: String,
+}
+
+pub enum DependencyReference<'a> {
+    Resolved(&'a TaskRecord),
+    Missing,
+    RepositoryChanged,
+}
+
+pub fn resolve_dependency<'a>(
+    owner: &TaskRecord,
+    dependency: &TaskDependency,
+    entries: &'a [TaskRecord],
+) -> DependencyReference<'a> {
+    let Some(task) = entries.iter().find(|task| task.id == dependency.task_id) else {
+        return DependencyReference::Missing;
+    };
+    if owner.repository_path != dependency.repository_path
+        || task.repository_path != dependency.repository_path
+        || task.worktree_path != dependency.worktree_path
+    {
+        return DependencyReference::RepositoryChanged;
+    }
+    DependencyReference::Resolved(task)
 }
 
 impl TaskRecord {
@@ -91,6 +123,7 @@ impl TaskRecord {
             reviewed_source_fingerprint: None,
             reviewed_at: None,
             pull_request_url: None,
+            dependencies: Vec::new(),
         })
     }
 }
@@ -151,6 +184,76 @@ impl TaskRegistry {
             let old_len = entries.len();
             entries.retain(|entry| entry.id != id);
             Ok(entries.len() != old_len)
+        })
+    }
+
+    pub fn add_dependency(&mut self, task_id: &str, dependency_id: &str) -> io::Result<()> {
+        self.update_registry(|entries| {
+            let task = entries
+                .iter()
+                .find(|entry| entry.id == task_id)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task no longer exists"))?;
+            let dependency = entries
+                .iter()
+                .find(|entry| entry.id == dependency_id)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "dependency task no longer exists"))?;
+            let dependency_task_id = dependency.id.clone();
+            let dependency_repository_path = dependency.repository_path.clone();
+            let dependency_worktree_path = dependency.worktree_path.clone();
+            if task_id == dependency_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "a task cannot depend on itself",
+                ));
+            }
+            if task.repository_path != dependency.repository_path {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "dependency tasks must belong to the same repository",
+                ));
+            }
+            if task.dependencies.iter().any(|item| item.task_id == dependency_id) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "this dependency is already linked",
+                ));
+            }
+            if has_dependency_path(entries, dependency_id, task_id, &mut HashSet::new()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "this dependency would create a cycle",
+                ));
+            }
+
+            let task = entries
+                .iter_mut()
+                .find(|entry| entry.id == task_id)
+                .expect("task was checked above");
+            task.dependencies.push(TaskDependency {
+                task_id: dependency_task_id,
+                repository_path: dependency_repository_path,
+                worktree_path: dependency_worktree_path,
+            });
+            task.updated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+            Ok(true)
+        })
+    }
+
+    pub fn remove_dependency(&mut self, task_id: &str, dependency_id: &str) -> io::Result<()> {
+        self.update_registry(|entries| {
+            let task = entries
+                .iter_mut()
+                .find(|entry| entry.id == task_id)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task no longer exists"))?;
+            let old_len = task.dependencies.len();
+            task.dependencies
+                .retain(|dependency| dependency.task_id != dependency_id);
+            if task.dependencies.len() != old_len {
+                task.updated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                Ok(true)
+            } else {
+                Ok(false)
+            }
         })
     }
 
@@ -415,6 +518,31 @@ impl TaskRegistry {
         self.entries = entries;
         Ok(())
     }
+}
+
+fn has_dependency_path(
+    entries: &[TaskRecord],
+    from_id: &str,
+    target_id: &str,
+    visited: &mut HashSet<String>,
+) -> bool {
+    if from_id == target_id {
+        return true;
+    }
+    if !visited.insert(from_id.to_string()) {
+        return false;
+    }
+    let Some(task) = entries.iter().find(|entry| entry.id == from_id) else {
+        return false;
+    };
+    task.dependencies.iter().any(|dependency| {
+        match resolve_dependency(task, dependency, entries) {
+            DependencyReference::Resolved(next) => {
+                has_dependency_path(entries, &next.id, target_id, visited)
+            }
+            DependencyReference::Missing | DependencyReference::RepositoryChanged => false,
+        }
+    })
 }
 
 struct RegistryFileLock {

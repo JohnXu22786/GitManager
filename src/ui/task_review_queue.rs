@@ -2,11 +2,12 @@ use crate::app::App;
 use crate::git_ops::TaskReviewQueueState;
 use crate::task_delivery::{
     CheckState, PullRequestAction, PullRequestCheck, PullRequestRemoteView,
-    PullRequestSnapshot, TaskSourceFreshness,
+    PullRequestSnapshot, PullRequestStatusView, TaskSourceFreshness,
 };
 use crate::task_verification::VerificationState;
-use crate::tasks::TaskRecord;
+use crate::tasks::{resolve_dependency, DependencyReference, TaskRecord};
 use eframe::egui;
+use std::collections::{HashMap, HashSet};
 
 pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     ui.heading("Task review queue");
@@ -34,12 +35,24 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
     }
 
     let task_states = entries
-        .into_iter()
+        .iter()
+        .cloned()
         .map(|task| {
             let state = app.current_task_review_queue_state(ctx, &task);
             (task, state)
         })
         .collect::<Vec<_>>();
+    let pull_request_statuses = task_states
+        .iter()
+        .map(|(task, _)| {
+            (
+                task.id.clone(),
+                app.current_task_pull_request_status(ctx, task),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    render_dependency_order(ui, &entries, &pull_request_statuses);
+
     let mut open_task: Option<TaskRecord> = None;
     let mut delivery_action: Option<(
         TaskRecord,
@@ -92,8 +105,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             render_task_delivery(
                 app,
                 ui,
-                ctx,
                 task,
+                &pull_request_statuses[&task.id],
                 Some(source_fingerprint.as_str()),
                 &mut delivery_action,
             );
@@ -187,8 +200,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             render_task_delivery(
                 app,
                 ui,
-                ctx,
                 task,
+                &pull_request_statuses[&task.id],
                 delivery_fingerprint,
                 &mut delivery_action,
             );
@@ -202,6 +215,243 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         app.start_task_pull_request_action(ctx, &task, action, identifier, source_fingerprint);
     }
     crate::ui::task_panel::render_task_diff_review(app, ui);
+}
+
+#[derive(Clone)]
+enum DependencyReadiness {
+    Ready,
+    Delivered,
+    Blocked(String),
+}
+
+fn render_dependency_order(
+    ui: &mut egui::Ui,
+    entries: &[TaskRecord],
+    pull_request_statuses: &HashMap<String, PullRequestStatusView>,
+) {
+    ui.add_space(10.0);
+    ui.separator();
+    ui.heading("Dependency order");
+    ui.weak(
+        "Order comes only from explicit task dependencies. Shared file paths do not imply a dependency. A prerequisite is complete when its current task source has a merged PR.",
+    );
+
+    let mut repositories = Vec::new();
+    for task in entries {
+        if !repositories.contains(&task.repository_path) {
+            repositories.push(task.repository_path.clone());
+        }
+    }
+
+    for repository_path in repositories {
+        let tasks = entries
+            .iter()
+            .filter(|task| task.repository_path == repository_path)
+            .cloned()
+            .collect::<Vec<_>>();
+        let (ordered_ids, unavailable) = dependency_order(&tasks);
+        ui.group(|ui| {
+            ui.label(format!("Repository: {repository_path}"));
+            let mut readiness = HashMap::new();
+            for (position, task_id) in ordered_ids.iter().enumerate() {
+                let Some(task) = tasks.iter().find(|task| task.id == *task_id) else {
+                    continue;
+                };
+                let state = task_readiness(
+                    task,
+                    &tasks,
+                    pull_request_statuses,
+                    &mut HashSet::new(),
+                    &mut readiness,
+                );
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!("{}. {}", position + 1, task.title));
+                    match state {
+                        DependencyReadiness::Delivered => ui.colored_label(
+                            App::adaptive_green(ui.style().visuals.dark_mode),
+                            "Delivered",
+                        ),
+                        DependencyReadiness::Ready => ui.colored_label(
+                            App::adaptive_green(ui.style().visuals.dark_mode),
+                            "Ready",
+                        ),
+                        DependencyReadiness::Blocked(reason) => ui.colored_label(
+                            App::adaptive_yellow(ui.style().visuals.dark_mode),
+                            format!("Blocked · {reason}"),
+                        ),
+                    };
+                });
+            }
+            for task in &tasks {
+                if let Some(reason) = unavailable.get(&task.id) {
+                    ui.colored_label(
+                        App::adaptive_yellow(ui.style().visuals.dark_mode),
+                        format!("{} · order unavailable: {reason}", task.title),
+                    );
+                }
+            }
+        });
+    }
+}
+
+fn dependency_order(tasks: &[TaskRecord]) -> (Vec<String>, HashMap<String, String>) {
+    let mut unavailable = HashMap::new();
+    for task in tasks {
+        for dependency in &task.dependencies {
+            let issue = match resolve_dependency(task, dependency, tasks) {
+                DependencyReference::Resolved(_) => None,
+                DependencyReference::Missing => Some(format!(
+                    "dependency task {} is missing or unlinked",
+                    dependency.task_id
+                )),
+                DependencyReference::RepositoryChanged => Some(format!(
+                    "dependency task {} no longer matches its saved repository or worktree",
+                    dependency.task_id
+                )),
+            };
+            if let Some(issue) = issue {
+                unavailable.entry(task.id.clone()).or_insert(issue);
+                break;
+            }
+        }
+    }
+
+    loop {
+        let blocked_by_unavailable = tasks.iter().find_map(|task| {
+            if unavailable.contains_key(&task.id) {
+                return None;
+            }
+            task.dependencies.iter().find_map(|dependency| {
+                let DependencyReference::Resolved(target) =
+                    resolve_dependency(task, dependency, tasks)
+                else {
+                    return None;
+                };
+                unavailable.get(&target.id).map(|_| {
+                    (
+                        task.id.clone(),
+                        format!("depends on {} whose order is unavailable", target.title),
+                    )
+                })
+            })
+        });
+        let Some((task_id, reason)) = blocked_by_unavailable else {
+            break;
+        };
+        unavailable.insert(task_id, reason);
+    }
+
+    let mut ordered = Vec::new();
+    let mut completed = HashSet::new();
+    loop {
+        let next = tasks.iter().find(|task| {
+            !unavailable.contains_key(&task.id)
+                && !completed.contains(&task.id)
+                && task.dependencies.iter().all(|dependency| {
+                    matches!(resolve_dependency(task, dependency, tasks),
+                        DependencyReference::Resolved(target) if completed.contains(&target.id))
+                })
+        });
+        let Some(task) = next else {
+            break;
+        };
+        completed.insert(task.id.clone());
+        ordered.push(task.id.clone());
+    }
+
+    for task in tasks {
+        if !unavailable.contains_key(&task.id) && !completed.contains(&task.id) {
+            unavailable.insert(
+                task.id.clone(),
+                "a dependency cycle prevents a valid order".into(),
+            );
+        }
+    }
+    (ordered, unavailable)
+}
+
+fn task_readiness(
+    task: &TaskRecord,
+    entries: &[TaskRecord],
+    pull_request_statuses: &HashMap<String, PullRequestStatusView>,
+    visiting: &mut HashSet<String>,
+    memo: &mut HashMap<String, DependencyReadiness>,
+) -> DependencyReadiness {
+    if let Some(readiness) = memo.get(&task.id) {
+        return readiness.clone();
+    }
+    if !visiting.insert(task.id.clone()) {
+        return DependencyReadiness::Blocked("dependency cycle".into());
+    }
+
+    for dependency in &task.dependencies {
+        let target = match resolve_dependency(task, dependency, entries) {
+            DependencyReference::Resolved(target) => target,
+            DependencyReference::Missing => {
+                let result = DependencyReadiness::Blocked(format!(
+                    "dependency task {} is missing or unlinked",
+                    dependency.task_id
+                ));
+                visiting.remove(&task.id);
+                memo.insert(task.id.clone(), result.clone());
+                return result;
+            }
+            DependencyReference::RepositoryChanged => {
+                let result = DependencyReadiness::Blocked(format!(
+                    "dependency task {} no longer matches its saved repository or worktree",
+                    dependency.task_id
+                ));
+                visiting.remove(&task.id);
+                memo.insert(task.id.clone(), result.clone());
+                return result;
+            }
+        };
+        match task_readiness(target, entries, pull_request_statuses, visiting, memo) {
+            DependencyReadiness::Delivered => {}
+            DependencyReadiness::Ready => {
+                let result = DependencyReadiness::Blocked(format!(
+                    "waiting for {} to be merged first",
+                    target.title
+                ));
+                visiting.remove(&task.id);
+                memo.insert(task.id.clone(), result.clone());
+                return result;
+            }
+            DependencyReadiness::Blocked(reason) => {
+                let result = DependencyReadiness::Blocked(format!(
+                    "{} is blocked: {reason}",
+                    target.title
+                ));
+                visiting.remove(&task.id);
+                memo.insert(task.id.clone(), result.clone());
+                return result;
+            }
+        }
+    }
+
+    let result = if task_pull_request_is_currently_merged(&task.id, pull_request_statuses) {
+        DependencyReadiness::Delivered
+    } else {
+        DependencyReadiness::Ready
+    };
+    visiting.remove(&task.id);
+    memo.insert(task.id.clone(), result.clone());
+    result
+}
+
+fn task_pull_request_is_currently_merged(
+    task_id: &str,
+    pull_request_statuses: &HashMap<String, PullRequestStatusView>,
+) -> bool {
+    pull_request_statuses
+        .get(task_id)
+        .is_some_and(|status| match &status.remote {
+            PullRequestRemoteView::Ready { snapshot } => {
+                snapshot.is_merged()
+                    && matches!(&snapshot.freshness, TaskSourceFreshness::Current { .. })
+            }
+            _ => false,
+        })
 }
 
 fn render_shared_file_overlap(
@@ -295,8 +545,8 @@ fn task_changed_paths(state: &TaskReviewQueueState) -> Option<&[String]> {
 fn render_task_delivery(
     app: &mut App,
     ui: &mut egui::Ui,
-    ctx: &egui::Context,
     task: &TaskRecord,
+    status: &PullRequestStatusView,
     current_source_fingerprint: Option<&str>,
     next_action: &mut Option<(
         TaskRecord,
@@ -305,7 +555,6 @@ fn render_task_delivery(
         Option<String>,
     )>,
 ) {
-    let status = app.current_task_pull_request_status(ctx, task);
     let action_running = app.task_pull_request_action_running(&task.id);
     ui.separator();
     ui.label(egui::RichText::new("PR and remote CI").strong());
@@ -369,13 +618,13 @@ fn render_task_delivery(
         }
     }
 
-    if let Some(message) = status.action_message {
+    if let Some(message) = &status.action_message {
         let color = if message.succeeded {
             App::adaptive_green(ui.style().visuals.dark_mode)
         } else {
             App::adaptive_red(ui.style().visuals.dark_mode)
         };
-        ui.colored_label(color, message.text);
+        ui.colored_label(color, &message.text);
     }
 
     let linked_url = app
@@ -459,12 +708,15 @@ fn render_pull_request_snapshot(
     fetched_at: Option<&str>,
     previous: bool,
 ) {
-    let lifecycle = match snapshot.state.to_ascii_uppercase().as_str() {
-        "MERGED" => "Merged",
-        "CLOSED" => "Closed",
-        "OPEN" if snapshot.is_draft => "Draft",
-        "OPEN" => "Open",
-        _ => "Unavailable",
+    let lifecycle = if snapshot.is_merged() {
+        "Merged"
+    } else {
+        match snapshot.state.to_ascii_uppercase().as_str() {
+            "CLOSED" => "Closed",
+            "OPEN" if snapshot.is_draft => "Draft",
+            "OPEN" => "Open",
+            _ => "Unavailable",
+        }
     };
     ui.label(format!(
         "PR #{} · {} · {} → {} · {}",
