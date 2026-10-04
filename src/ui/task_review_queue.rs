@@ -427,6 +427,15 @@ fn render_merge_preview(
     }
 
     let selected_ids = app.task_merge_preview.selected_task_ids.clone();
+    let missing_selected = selected_ids
+        .iter()
+        .filter(|id| {
+            !repository_tasks
+                .iter()
+                .any(|task| task.id.as_str() == id.as_str())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     let blocked_selected = selected_ids
         .iter()
         .filter_map(|id| order_unavailable.get(id).map(|reason| (id, reason)))
@@ -510,6 +519,7 @@ fn render_merge_preview(
     }
     let can_preview = !running
         && !ordered_tasks.is_empty()
+        && missing_selected.is_empty()
         && blocked_selected.is_empty()
         && omitted_prerequisites.is_empty()
         && app.task_merge_preview.base_ref_error.is_none()
@@ -530,6 +540,12 @@ fn render_merge_preview(
         ui.colored_label(
             App::adaptive_yellow(ui.style().visuals.dark_mode),
             "One or more selected tasks have an unavailable dependency order.",
+        );
+    }
+    if !missing_selected.is_empty() {
+        ui.colored_label(
+            App::adaptive_yellow(ui.style().visuals.dark_mode),
+            "One or more selected tasks are no longer available in this repository. Clear the selection and choose current tasks.",
         );
     }
     for (task_title, prerequisite) in &omitted_prerequisites {

@@ -378,6 +378,9 @@ fn run_preview(
             )
         }
     };
+    if let Err(reason) = ensure_external_merge_drivers_supported(&source_repository) {
+        return unavailable(reason, Vec::new());
+    }
     let base_commit = match source_repository
         .find_branch(base_ref, BranchType::Local)
         .and_then(|branch| branch.get().peel_to_commit())
@@ -437,6 +440,12 @@ fn run_preview(
                 )
             }
         };
+        if let Err(reason) = ensure_external_merge_drivers_supported(&task_repository) {
+            return unavailable(
+                format!("{} cannot be previewed: {reason}", task.title),
+                Vec::new(),
+            );
+        }
         let Some(workdir) = task_repository.workdir() else {
             return unavailable(
                 format!("{} no longer points to a Git worktree.", task.title),
@@ -645,7 +654,7 @@ fn run_preview(
     };
 
     let mut integrated_tree_oid = base_tree.id();
-        for (position, snapshot) in captured.iter().enumerate() {
+    for (position, snapshot) in captured.iter().enumerate() {
         let ancestor = match preview_repository.find_tree(snapshot.base_tree_oid) {
             Ok(tree) => tree,
             Err(error) => {
@@ -677,7 +686,7 @@ fn run_preview(
             }
         };
         let mut merge_options = MergeOptions::new();
-        let merged = match preview_repository.merge_trees(
+        let mut merged = match preview_repository.merge_trees(
             &ancestor,
             &ours,
             &theirs,
@@ -787,13 +796,33 @@ fn ensure_source_is_clean(repository: &Repository) -> Result<(), String> {
     Ok(())
 }
 
+fn ensure_external_merge_drivers_supported(repository: &Repository) -> Result<(), String> {
+    let config = repository
+        .config()
+        .map_err(|error| format!("Could not read Git merge-driver configuration: {error}"))?;
+    let entries = config
+        .entries(None)
+        .map_err(|error| format!("Could not inspect Git merge-driver configuration: {error}"))?;
+    for entry in entries {
+        let entry = entry
+            .map_err(|error| format!("Could not inspect Git merge-driver configuration: {error}"))?;
+        let Some(name) = entry.name() else {
+            continue;
+        };
+        let normalized_name = name.to_ascii_lowercase();
+        if normalized_name.starts_with("merge.") && normalized_name.ends_with(".driver") {
+            return Err(format!(
+                "The selected repository configures an external merge driver ({name}), which an isolated preview cannot run."
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn merge_conflicts(index: &Index) -> Result<Vec<MergeConflict>, String> {
     let conflicts = index
         .conflicts()
         .map_err(|error| format!("Could not read merge conflict details: {error}"))?;
-    let Some(conflicts) = conflicts else {
-        return Ok(Vec::new());
-    };
     let mut paths: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for conflict in conflicts {
         let conflict = conflict.map_err(|error| format!("Could not read a merge conflict: {error}"))?;
