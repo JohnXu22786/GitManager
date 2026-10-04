@@ -1,5 +1,6 @@
 use chrono::{SecondsFormat, Utc};
 use crate::task_verification::{VerificationCommand, VerificationResult, VerificationState};
+use crate::task_delivery::PullRequestSnapshot;
 use git2::Repository;
 use ring::digest::{digest, SHA256};
 use serde::{Deserialize, Serialize};
@@ -43,6 +44,10 @@ pub struct TaskRecord {
     pub reviewed_at: Option<String>,
     #[serde(default)]
     pub pull_request_url: Option<String>,
+    #[serde(default)]
+    pub latest_pull_request_snapshot: Option<PullRequestSnapshot>,
+    #[serde(default)]
+    pub worktree_cleanup_completed_at: Option<String>,
     #[serde(default)]
     pub dependencies: Vec<TaskDependency>,
 }
@@ -201,6 +206,8 @@ impl TaskRecord {
             reviewed_source_fingerprint: None,
             reviewed_at: None,
             pull_request_url: None,
+            latest_pull_request_snapshot: None,
+            worktree_cleanup_completed_at: None,
             dependencies: Vec::new(),
         })
     }
@@ -448,8 +455,83 @@ impl TaskRegistry {
             if entry.pull_request_url.as_deref() == Some(url) {
                 return Ok(false);
             }
+            let task_is_complete = entry.worktree_cleanup_completed_at.is_some()
+                || entry.latest_pull_request_snapshot.as_ref().is_some_and(|snapshot| {
+                    entry.pull_request_url.as_deref() == Some(snapshot.url.as_str())
+                        && snapshot.is_merged()
+                });
+            if task_is_complete {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "cannot change a completed task's pull request association",
+                ));
+            }
             entry.pull_request_url = Some(url.to_string());
             entry.updated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+            Ok(true)
+        })
+    }
+
+    pub fn record_pull_request_snapshot(
+        &mut self,
+        id: &str,
+        snapshot: &PullRequestSnapshot,
+    ) -> io::Result<()> {
+        self.update_registry(|entries| {
+            let entry = entries
+                .iter_mut()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task no longer exists"))?;
+            if entry.pull_request_url.as_deref() != Some(snapshot.url.as_str()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "task pull request association changed before its status could be saved",
+                ));
+            }
+            if entry.latest_pull_request_snapshot.as_ref() == Some(snapshot) {
+                return Ok(false);
+            }
+            entry.latest_pull_request_snapshot = Some(snapshot.clone());
+            entry.updated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+            Ok(true)
+        })
+    }
+
+    pub fn mark_worktree_cleanup_completed(
+        &mut self,
+        id: &str,
+        expected_repository_path: &str,
+        expected_worktree_path: &str,
+        expected_branch: Option<&str>,
+        completed_pr_url: &str,
+        completed_pr_number: u64,
+    ) -> io::Result<()> {
+        self.update_registry(|entries| {
+            let entry = entries
+                .iter_mut()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task no longer exists"))?;
+            if entry.repository_path != expected_repository_path
+                || entry.worktree_path != expected_worktree_path
+                || entry.branch.as_deref() != expected_branch
+                || entry.pull_request_url.as_deref() != Some(completed_pr_url)
+                || !entry.latest_pull_request_snapshot.as_ref().is_some_and(|snapshot| {
+                    snapshot.url == completed_pr_url
+                        && snapshot.number == completed_pr_number
+                        && snapshot.is_merged()
+                })
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "task identity or merged pull request changed before cleanup could be recorded",
+                ));
+            }
+            if entry.worktree_cleanup_completed_at.is_some() {
+                return Ok(false);
+            }
+            let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+            entry.worktree_cleanup_completed_at = Some(now.clone());
+            entry.updated_at = now;
             Ok(true)
         })
     }

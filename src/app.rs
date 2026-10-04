@@ -156,6 +156,54 @@ fn worktree_cleanup_preview_message(
     lines.join("\n")
 }
 
+fn task_cleanup_preview_heading(task: &TaskCleanupContext) -> String {
+    let branch = task.branch.as_deref().unwrap_or("(detached HEAD)");
+    let merged_at = task
+        .merged_at
+        .as_deref()
+        .map(|time| format!(" · merged at {time}"))
+        .unwrap_or_default();
+    format!(
+        "Task: {} ({})\nWorktree: {}\nBranch: {}\nCompleted by merged PR #{}{} · {}\nThe task record, verification result, PR snapshot, and branch will be retained. Cancel keeps the worktree.",
+        task.task_title,
+        task.task_id,
+        task.worktree_path,
+        branch,
+        task.pull_request_number,
+        merged_at,
+        task.pull_request_url,
+    )
+}
+
+fn cleanup_paths_match(saved_path: &str, listed_path: &Path) -> bool {
+    let saved_path = Path::new(saved_path);
+    if saved_path == listed_path {
+        return true;
+    }
+    match (
+        std::fs::canonicalize(saved_path),
+        std::fs::canonicalize(listed_path),
+    ) {
+        (Ok(saved_path), Ok(listed_path)) => saved_path == listed_path,
+        _ => false,
+    }
+}
+
+fn task_cleanup_context_matches(task: &TaskRecord, cleanup: &TaskCleanupContext) -> bool {
+    task.id == cleanup.task_id
+        && task.title == cleanup.task_title
+        && task.repository_path == cleanup.repository_path
+        && task.worktree_path == cleanup.worktree_path
+        && task.branch == cleanup.branch
+        && task.pull_request_url.as_deref() == Some(cleanup.pull_request_url.as_str())
+        && task.worktree_cleanup_completed_at.is_none()
+        && task.latest_pull_request_snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.url == cleanup.pull_request_url
+                && snapshot.number == cleanup.pull_request_number
+                && snapshot.is_merged()
+        })
+}
+
 fn update_asset_download_path(
     download_dir: &Path,
     file_name: &str,
@@ -229,10 +277,29 @@ struct PendingConfirmation {
     description: String,
     operation: GitOperation,
     repo_generation: u64,
+    task_cleanup: Option<TaskCleanupContext>,
 }
 
 
 const WORKTREE_CLEANUP_PREVIEW_OPERATION: &str = "Preparing worktree cleanup preview";
+
+#[derive(Clone)]
+struct TaskCleanupContext {
+    task_id: String,
+    task_title: String,
+    repository_path: String,
+    worktree_path: String,
+    branch: Option<String>,
+    pull_request_url: String,
+    pull_request_number: u64,
+    merged_at: Option<String>,
+}
+
+struct PendingTaskCleanupLaunch {
+    task: TaskCleanupContext,
+    repo_generation: u64,
+    ready_after_refresh: bool,
+}
 
 struct PendingWorktreeCleanup {
     path: std::path::PathBuf,
@@ -241,6 +308,7 @@ struct PendingWorktreeCleanup {
     force_requested: bool,
     repo_generation: u64,
     ready: bool,
+    task_cleanup: Option<TaskCleanupContext>,
 }
 
 pub struct TaskVerificationCommandDraft {
@@ -602,6 +670,10 @@ pub struct App {
     pending_confirmation: Option<PendingConfirmation>,
     /// A cleanup request waiting for a fresh worktree snapshot.
     pending_worktree_cleanup: Option<PendingWorktreeCleanup>,
+    /// A task cleanup request waiting for its repository to finish refreshing.
+    pending_task_cleanup_launch: Option<PendingTaskCleanupLaunch>,
+    /// Task context for the currently confirmed cleanup operation.
+    task_cleanup_operation: Option<TaskCleanupContext>,
     /// Whether an asynchronous repository refresh is queued.
     needs_refresh: bool,
     pub recent_repos: RecentRepos,
@@ -693,6 +765,8 @@ impl App {
             test_before_operation: None,
             pending_confirmation: None,
             pending_worktree_cleanup: None,
+            pending_task_cleanup_launch: None,
+            task_cleanup_operation: None,
             needs_refresh: false,
             recent_repos: RecentRepos::load(),
             task_registry: TaskRegistry::load(),
@@ -961,6 +1035,7 @@ impl App {
                 self.log_search_request_id = self.log_search_request_id.wrapping_add(1);
                 self.repo_generation = self.repo_generation.wrapping_add(1);
                 self.pending_worktree_cleanup = None;
+                self.pending_task_cleanup_launch = None;
                 self.repo_path = path_display.clone();
                 self.remote_name_user_edited = false;
                 self.push_branch.clear();
@@ -1229,6 +1304,7 @@ impl App {
         !self.pending_ops.is_empty()
             || self.pending_confirmation.is_some()
             || self.pending_worktree_cleanup.is_some()
+            || self.pending_task_cleanup_launch.is_some()
             || self.task_verification_run.is_some()
             || self.task_integrated_verification.is_running()
     }
@@ -1281,6 +1357,7 @@ impl App {
             description: description.into(),
             operation,
             repo_generation: self.repo_generation,
+            task_cleanup: None,
         });
         ctx.request_repaint();
     }
@@ -1290,6 +1367,16 @@ impl App {
         ctx: &egui::Context,
         worktree: &WorktreeInfo,
         force_requested: bool,
+    ) {
+        self.preview_worktree_cleanup_for_task(ctx, worktree, force_requested, None);
+    }
+
+    fn preview_worktree_cleanup_for_task(
+        &mut self,
+        ctx: &egui::Context,
+        worktree: &WorktreeInfo,
+        force_requested: bool,
+        task_cleanup: Option<TaskCleanupContext>,
     ) {
         if self.is_busy() {
             return;
@@ -1306,6 +1393,7 @@ impl App {
             force_requested,
             repo_generation: self.repo_generation,
             ready: false,
+            task_cleanup,
         });
         self.status_message.clear();
         self.status_is_error = false;
@@ -1320,6 +1408,181 @@ impl App {
         }
     }
 
+    pub fn preview_task_worktree_cleanup(
+        &mut self,
+        ctx: &egui::Context,
+        task: &TaskRecord,
+        completion: &PullRequestSnapshot,
+    ) {
+        if self.is_busy() || self.task_pull_request_action_running(&task.id) {
+            return;
+        }
+        let Some(current_task) = self
+            .task_registry
+            .entries()
+            .iter()
+            .find(|entry| entry.id == task.id)
+            .cloned()
+        else {
+            self.show_error("This task record is no longer available; cleanup was not started".into());
+            return;
+        };
+        if !completion.is_merged()
+            || current_task.pull_request_url.as_deref() != Some(completion.url.as_str())
+        {
+            self.show_error("Task cleanup requires a merged pull request linked to this task".into());
+            return;
+        }
+        if current_task.worktree_cleanup_completed_at.is_some() {
+            self.show_error("This task's worktree has already been cleaned up".into());
+            return;
+        }
+        if let Err(error) = self
+            .task_registry
+            .record_pull_request_snapshot(&current_task.id, completion)
+        {
+            self.show_error(format!(
+                "Could not save the merged pull request evidence; cleanup was not started: {error}"
+            ));
+            return;
+        }
+        let cleanup = TaskCleanupContext {
+            task_id: current_task.id.clone(),
+            task_title: current_task.title.clone(),
+            repository_path: current_task.repository_path.clone(),
+            worktree_path: current_task.worktree_path.clone(),
+            branch: current_task.branch.clone(),
+            pull_request_url: completion.url.clone(),
+            pull_request_number: completion.number,
+            merged_at: completion.merged_at.clone(),
+        };
+        match self.task_repository_is_open(&cleanup.repository_path) {
+            Ok(true) => self.start_task_cleanup_preview_for_current(ctx, cleanup),
+            Ok(false) => {
+                self.open_repo_path(Path::new(&cleanup.repository_path));
+                match self.task_repository_is_open(&cleanup.repository_path) {
+                    Ok(true) => {
+                        self.pending_task_cleanup_launch = Some(PendingTaskCleanupLaunch {
+                            task: cleanup,
+                            repo_generation: self.repo_generation,
+                            ready_after_refresh: false,
+                        });
+                    }
+                    Ok(false) => {
+                        if !self.status_is_error {
+                            self.show_error(
+                                "Could not open the task repository; cleanup was not started".into(),
+                            );
+                        }
+                    }
+                    Err(error) => self.show_error(format!(
+                        "Could not verify the opened task repository; cleanup was not started: {error}"
+                    )),
+                }
+            }
+            Err(error) => self.show_error(format!(
+                "Could not verify the task repository; cleanup was not started: {error}"
+            )),
+        }
+    }
+
+    fn task_repository_is_open(&self, expected_repository_path: &str) -> Result<bool, String> {
+        let Some(current_path) = self.git.path() else {
+            return Ok(false);
+        };
+        let current = git2::Repository::open(current_path)
+            .map_err(|error| format!("Could not verify the open repository: {error}"))?;
+        let current_worktree = current.workdir().unwrap_or(current_path);
+        let current_root = crate::tasks::repository_root(&current, current_worktree)?;
+        let expected_root = std::fs::canonicalize(expected_repository_path)
+            .map_err(|error| format!("Could not resolve the task repository: {error}"))?;
+        Ok(current_root == expected_root)
+    }
+
+    fn start_task_cleanup_preview_for_current(
+        &mut self,
+        ctx: &egui::Context,
+        task: TaskCleanupContext,
+    ) {
+        let valid_task = self
+            .task_registry
+            .entries()
+            .iter()
+            .any(|entry| task_cleanup_context_matches(entry, &task));
+        if !valid_task {
+            self.show_error(
+                "Task identity or merged pull request changed before cleanup preview; refresh the task and retry".into(),
+            );
+            return;
+        }
+        match self.task_repository_is_open(&task.repository_path) {
+            Ok(true) => {}
+            Ok(false) => {
+                self.show_error("The task repository changed before cleanup preview; retry from the task review queue".into());
+                return;
+            }
+            Err(error) => {
+                self.show_error(format!("Could not verify the task repository: {error}"));
+                return;
+            }
+        }
+        let Some(worktree) = self
+            .worktrees
+            .iter()
+            .find(|worktree| cleanup_paths_match(&task.worktree_path, &worktree.path))
+            .cloned()
+        else {
+            self.preview_task_cleanup_without_listed_worktree(ctx, task);
+            return;
+        };
+        if worktree.is_main {
+            self.show_error(format!(
+                "Task {} points to the main worktree, which cannot be removed",
+                task.task_id
+            ));
+            return;
+        }
+        if worktree.branch != task.branch {
+            self.show_error(format!(
+                "Task {} branch no longer matches this worktree; refresh the task link before cleanup",
+                task.task_id
+            ));
+            return;
+        }
+        self.preview_worktree_cleanup_for_task(ctx, &worktree, false, Some(task));
+    }
+
+    fn preview_task_cleanup_without_listed_worktree(
+        &mut self,
+        ctx: &egui::Context,
+        task: TaskCleanupContext,
+    ) {
+        if self.is_busy() {
+            return;
+        }
+        let path = PathBuf::from(&task.worktree_path);
+        self.pending_worktree_cleanup = Some(PendingWorktreeCleanup {
+            path: path.clone(),
+            expected_git_link: None,
+            directory_missing_at_request: true,
+            force_requested: false,
+            repo_generation: self.repo_generation,
+            ready: false,
+            task_cleanup: Some(task),
+        });
+        self.status_message.clear();
+        self.status_is_error = false;
+        self.needs_refresh = false;
+        self.start_operation(
+            ctx,
+            WORKTREE_CLEANUP_PREVIEW_OPERATION,
+            GitOperation::RefreshWorktreeCleanup(path),
+        );
+        if self.pending_ops.is_empty() {
+            self.pending_worktree_cleanup = None;
+        }
+    }
+
     fn confirm_pending_operation(&mut self, ctx: &egui::Context) {
         let Some(request) = self.pending_confirmation.take() else {
             return;
@@ -1328,7 +1591,27 @@ impl App {
             self.show_error("Repository changed; confirmation cancelled".into());
             return;
         }
+        if let Some(task) = request.task_cleanup.as_ref() {
+            let valid_task = self
+                .task_registry
+                .entries()
+                .iter()
+                .any(|entry| task_cleanup_context_matches(entry, task));
+            let repository_matches = self
+                .task_repository_is_open(&task.repository_path)
+                .unwrap_or(false);
+            if !valid_task || !repository_matches {
+                self.show_error(
+                    "Task identity, merged pull request, or repository changed after the cleanup preview; no cleanup was performed".into(),
+                );
+                return;
+            }
+        }
+        self.task_cleanup_operation = request.task_cleanup.clone();
         self.start_operation(ctx, &request.description, request.operation);
+        if self.pending_ops.is_empty() {
+            self.task_cleanup_operation = None;
+        }
     }
 
     fn cancel_pending_confirmation(&mut self) {
@@ -1339,6 +1622,7 @@ impl App {
         let Some(request) = self.pending_worktree_cleanup.take() else {
             return;
         };
+        let task_cleanup = request.task_cleanup.clone();
         if request.repo_generation != self.repo_generation {
             return;
         }
@@ -1349,9 +1633,80 @@ impl App {
             .find(|worktree| worktree.path == request.path)
             .cloned()
         else {
+            if let Some(task) = task_cleanup.as_ref() {
+                if self.status_is_error {
+                    self.show_error(
+                        "Git reported errors while refreshing worktrees, so task cleanup could not be confirmed or recorded; retry the preview".into(),
+                    );
+                    return;
+                }
+                if !self
+                    .task_registry
+                    .entries()
+                    .iter()
+                    .any(|entry| task_cleanup_context_matches(entry, task))
+                {
+                    self.show_error(
+                        "Task identity or merged pull request changed during cleanup recovery; no cleanup state was recorded".into(),
+                    );
+                    return;
+                }
+                match self.task_repository_is_open(&task.repository_path) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        self.show_error(
+                            "The task repository changed during cleanup recovery; no cleanup state was recorded".into(),
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        self.show_error(format!(
+                            "Could not verify the task repository during cleanup recovery: {error}"
+                        ));
+                        return;
+                    }
+                }
+                match std::fs::symlink_metadata(&task.worktree_path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        let completed_message = format!(
+                            "Task {} worktree {} was already absent from Git and the filesystem",
+                            task.task_id, task.worktree_path
+                        );
+                        self.record_task_cleanup_completion(task, &completed_message);
+                    }
+                    Err(error) => self.show_error(format!(
+                        "Could not verify whether task {} worktree {} is absent; no cleanup state was recorded: {error}",
+                        task.task_id, task.worktree_path
+                    )),
+                    Ok(_) => self.show_error(format!(
+                        "Git no longer lists task {} worktree {}, but its filesystem path still exists; no cleanup state was recorded",
+                        task.task_id, task.worktree_path
+                    )),
+                }
+                return;
+            }
             self.show_error("Worktree disappeared before cleanup could be previewed".into());
             return;
         };
+        if let Some(task) = task_cleanup.as_ref() {
+            if !self
+                .task_registry
+                .entries()
+                .iter()
+                .any(|entry| task_cleanup_context_matches(entry, task))
+            {
+                self.show_error(
+                    "Task identity or merged pull request changed during cleanup preview; no cleanup was started".into(),
+                );
+                return;
+            }
+            if worktree.is_main || worktree.branch != task.branch {
+                self.show_error(
+                    "The task worktree or branch changed during cleanup preview; refresh and retry".into(),
+                );
+                return;
+            }
+        }
         if let Some(error) = worktree.status.inspection_error.as_deref() {
             self.show_error(format!("Cannot safely preview worktree cleanup: {}", error));
             return;
@@ -1395,10 +1750,19 @@ impl App {
         } else {
             "Remove worktree"
         };
+        let preview_message = worktree_cleanup_preview_message(&worktree, force, branch_used_elsewhere);
+        let message = task_cleanup
+            .as_ref()
+            .map(|task| format!("{}\n\n{}", task_cleanup_preview_heading(task), preview_message))
+            .unwrap_or(preview_message);
         self.request_confirmation(
             ctx,
-            "Review worktree cleanup",
-            worktree_cleanup_preview_message(&worktree, force, branch_used_elsewhere),
+            if task_cleanup.is_some() {
+                "Review completed task cleanup"
+            } else {
+                "Review worktree cleanup"
+            },
+            message,
             label,
             format!("{} {:?}", label, worktree.path),
             GitOperation::RemoveWorktree {
@@ -1409,6 +1773,9 @@ impl App {
                 require_git_link_identity: true,
             },
         );
+        if let Some(request) = self.pending_confirmation.as_mut() {
+            request.task_cleanup = task_cleanup;
+        }
     }
 
     fn render_confirmation_dialog(&mut self, ctx: &egui::Context) {
@@ -1675,6 +2042,13 @@ impl App {
         identifier: Option<String>,
         source_fingerprint: Option<String>,
     ) {
+        if self.pending_confirmation.is_some()
+            || self.pending_worktree_cleanup.is_some()
+            || self.pending_task_cleanup_launch.is_some()
+            || self.task_cleanup_operation.is_some()
+        {
+            return;
+        }
         if action == PullRequestAction::Create
             && self
                 .task_registry
@@ -1682,6 +2056,22 @@ impl App {
                 .iter()
                 .find(|entry| entry.id == task.id)
                 .map_or(true, |entry| entry.pull_request_url.is_some())
+        {
+            return;
+        }
+        if action == PullRequestAction::Associate
+            && self
+                .task_registry
+                .entries()
+                .iter()
+                .find(|entry| entry.id == task.id)
+                .is_some_and(|entry| {
+                    entry.worktree_cleanup_completed_at.is_some()
+                        || entry.latest_pull_request_snapshot.as_ref().is_some_and(|snapshot| {
+                            entry.pull_request_url.as_deref() == Some(snapshot.url.as_str())
+                                && snapshot.is_merged()
+                        })
+                })
         {
             return;
         }
@@ -1815,6 +2205,23 @@ impl App {
             result.map_err(|error| error.message)
         };
 
+        if let Ok(snapshot) = &result {
+            if let Err(error) = self
+                .task_registry
+                .record_pull_request_snapshot(task_id, snapshot)
+            {
+                if let Some(probe) = self.task_pull_request_probes.get_mut(task_id) {
+                    probe.action_message = Some(PullRequestActionMessage {
+                        succeeded: false,
+                        text: format!(
+                            "GitHub returned PR #{} status, but the saved task evidence could not be updated: {error}",
+                            snapshot.number
+                        ),
+                    });
+                }
+            }
+        }
+
         if let Some(probe) = self.task_pull_request_probes.get_mut(task_id) {
             probe.receiver = None;
             probe.action = None;
@@ -1858,8 +2265,24 @@ impl App {
             .find(|entry| entry.id == task.id)
             .cloned()
             .unwrap_or_else(|| task.clone());
+        let saved_snapshot = current_task
+            .latest_pull_request_snapshot
+            .as_ref()
+            .filter(|snapshot| {
+                current_task.pull_request_url.as_deref() == Some(snapshot.url.as_str())
+            })
+            .cloned();
+        let probe = self
+            .task_pull_request_probes
+            .entry(task.id.clone())
+            .or_default();
+        if probe.snapshot.is_none() {
+            probe.snapshot = saved_snapshot;
+        }
         let linked = current_task.pull_request_url.is_some();
-        let current_source_fingerprint = if linked {
+        let current_source_fingerprint = if linked
+            && current_task.worktree_cleanup_completed_at.is_none()
+        {
             self.current_task_pr_source_fingerprint(ctx, &current_task)
         } else {
             None
@@ -2581,6 +3004,21 @@ impl App {
                 Ok(result) => {
                     let op = self.pending_ops.swap_remove(i);
                     if op.timed_out {
+                        let task_cleanup_refresh_timed_out = op.description == "Refreshing"
+                            && self
+                                .pending_task_cleanup_launch
+                                .as_ref()
+                                .is_some_and(|request| {
+                                    request.repo_generation == op.repo_generation
+                                });
+                        if task_cleanup_refresh_timed_out {
+                            self.pending_task_cleanup_launch = None;
+                            let msg =
+                                "Repository refresh timed out before task cleanup could be prepared; task cleanup was not started";
+                            self.status_message = msg.into();
+                            self.status_is_error = true;
+                            self.last_operation_log += &format!("  ✗ {}\n", msg);
+                        }
                         // Keep the UI blocked until the timed-out worker has finished.
                         if matches!(&result, OpResult::Success(_)) {
                             if op.repo_generation == self.repo_generation {
@@ -2590,15 +3028,20 @@ impl App {
                             }
                             self.needs_refresh = true;
                         } else if matches!(&result, OpResult::CloneSuccess(_)) {
-                            self.handle_op_result(op.description, result);
+                            self.handle_op_result(op.description, result.clone());
                         } else if let OpResult::TaskDiffReview {
                             task_id,
                             request_id,
                             state,
-                        } = result
+                        } = &result
                         {
-                            self.update_task_diff_review(task_id, request_id, state);
+                            self.update_task_diff_review(
+                                task_id.clone(),
+                                *request_id,
+                                state.clone(),
+                            );
                         }
+                        self.finish_task_cleanup_from_result(&result);
                         continue;
                     }
                     if op.repo_generation != self.repo_generation
@@ -2618,6 +3061,7 @@ impl App {
                     if !final_progress.is_empty() {
                         self.last_operation_log += &format!("  {}\n", final_progress);
                     }
+                    let task_cleanup_result = result.clone();
                     if op.repo_generation == self.repo_generation
                         && matches!(&result, OpResult::Success(_))
                     {
@@ -2626,15 +3070,37 @@ impl App {
                         }
                     }
                     self.handle_op_result(op.description, result);
+                    self.finish_task_cleanup_from_result(&task_cleanup_result);
                 }
                 Err(mpsc::TryRecvError::Empty) => {
                     i += 1; // Still pending
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    let task_cleanup_refresh_failed = self.pending_ops[i].description
+                        == "Refreshing"
+                        && self
+                            .pending_task_cleanup_launch
+                            .as_ref()
+                            .is_some_and(|request| {
+                                request.repo_generation == self.pending_ops[i].repo_generation
+                            });
+                    if task_cleanup_refresh_failed {
+                        self.pending_task_cleanup_launch = None;
+                    }
                     if self.pending_ops[i].description == WORKTREE_CLEANUP_PREVIEW_OPERATION {
                         self.pending_worktree_cleanup = None;
                     }
                     if self.pending_ops[i].timed_out {
+                        if task_cleanup_refresh_failed {
+                            let msg =
+                                "Repository refresh stopped before task cleanup could be prepared; task cleanup was not started";
+                            self.status_message = msg.into();
+                            self.status_is_error = true;
+                            self.last_operation_log += &format!("  ✗ {}\n", msg);
+                        }
+                        self.finish_task_cleanup_with_error(
+                            "the cleanup worker stopped before reporting whether removal completed",
+                        );
                         self.fail_task_diff_review(
                             task_diff_identity.clone(),
                             "The task diff worker exited before returning a complete patch.".into(),
@@ -2643,14 +3109,18 @@ impl App {
                         continue;
                     }
                     let last_prog = op.progress.lock().unwrap().clone();
-                    let fail_msg = if last_prog.is_empty() {
+                    let mut fail_msg = if last_prog.is_empty() {
                         format!("Operation '{}' failed unexpectedly", op.description)
                     } else {
                         format!("Operation '{}' failed unexpectedly\nLast progress: {}", op.description, last_prog)
                     };
+                    if task_cleanup_refresh_failed {
+                        fail_msg.push_str("; task cleanup was not started");
+                    }
                     self.status_message = fail_msg.clone();
                     self.status_is_error = true;
                     self.last_operation_log += &format!("  ✗ {}\n", fail_msg);
+                    self.finish_task_cleanup_with_error(&fail_msg);
                     self.fail_task_diff_review(task_diff_identity, fail_msg);
                     self.pending_ops.swap_remove(i);
                 }
@@ -2663,6 +3133,18 @@ impl App {
             .is_some_and(|request| request.ready);
         if cleanup_preview_ready && self.pending_ops.is_empty() {
             self.finish_worktree_cleanup_preview(ctx);
+        }
+
+        let task_cleanup_ready = self
+            .pending_task_cleanup_launch
+            .as_ref()
+            .is_some_and(|request| {
+                request.repo_generation == self.repo_generation && request.ready_after_refresh
+            });
+        if task_cleanup_ready && self.pending_ops.is_empty() && self.pending_confirmation.is_none() {
+            if let Some(request) = self.pending_task_cleanup_launch.take() {
+                self.start_task_cleanup_preview_for_current(ctx, request.task);
+            }
         }
 
         // Start a queued refresh once other operations and confirmations are clear.
@@ -2691,7 +3173,19 @@ impl App {
                 if description == WORKTREE_CLEANUP_PREVIEW_OPERATION {
                     self.pending_worktree_cleanup = None;
                 }
-                let err_msg = format!("{}: {}", description, e);
+                let task_cleanup_refresh_failed = description == "Refreshing"
+                    && self
+                        .pending_task_cleanup_launch
+                        .as_ref()
+                        .is_some_and(|request| request.repo_generation == self.repo_generation);
+                if task_cleanup_refresh_failed {
+                    self.pending_task_cleanup_launch = None;
+                }
+                let err_msg = if task_cleanup_refresh_failed {
+                    format!("{}: {}; task cleanup was not started", description, e)
+                } else {
+                    format!("{}: {}", description, e)
+                };
                 self.last_operation_log += &format!("  ✗ {}\n", err_msg);
                 // Set status_message to concise error message
                 self.status_message = err_msg;
@@ -2742,6 +3236,12 @@ impl App {
                     if let Some(request) = &mut self.pending_worktree_cleanup {
                         request.ready = true;
                     }
+                } else if description == "Refreshing" {
+                    if let Some(request) = &mut self.pending_task_cleanup_launch {
+                        if request.repo_generation == self.repo_generation {
+                            request.ready_after_refresh = true;
+                        }
+                    }
                 }
                 self.commits = filter_commits(commits, &self.log_search);
                 self.stashes = stashes;
@@ -2780,6 +3280,86 @@ impl App {
                 TaskDiffReviewState::Error(message),
             );
         }
+    }
+
+    fn finish_task_cleanup_from_result(&mut self, result: &OpResult) {
+        let Some(task) = self.task_cleanup_operation.take() else {
+            return;
+        };
+        match result {
+            OpResult::Success(_) => self.record_task_cleanup_completion(
+                &task,
+                &format!("Git cleanup succeeded for task {} at {}", task.task_id, task.worktree_path),
+            ),
+            OpResult::Error(error) => self.report_task_cleanup_failure(&task, error),
+            _ => self.task_cleanup_operation = Some(task),
+        }
+    }
+
+    fn record_task_cleanup_completion(&mut self, task: &TaskCleanupContext, message: &str) {
+        match self.task_registry.mark_worktree_cleanup_completed(
+            &task.task_id,
+            &task.repository_path,
+            &task.worktree_path,
+            task.branch.as_deref(),
+            &task.pull_request_url,
+            task.pull_request_number,
+        ) {
+            Ok(()) => {
+                self.forget_task_fingerprint_probe(&task.task_id);
+                self.forget_task_pull_request_probe(&task.task_id);
+                self.show_success(format!(
+                    "{message}; the task record, PR evidence, and branch were retained"
+                ));
+            }
+            Err(error) => self.show_error(format!(
+                "{message}, but its cleaned state could not be saved. The task record still retains the historical worktree path and branch. Retry the cleanup preview after the registry becomes writable: {error}"
+            )),
+        }
+    }
+
+    fn finish_task_cleanup_with_error(&mut self, error: &str) {
+        if let Some(task) = self.task_cleanup_operation.take() {
+            self.report_task_cleanup_failure(&task, error);
+        }
+    }
+
+    fn report_task_cleanup_failure(&mut self, task: &TaskCleanupContext, error: &str) {
+        let directory_state = if Path::new(&task.worktree_path).exists() {
+            format!("Worktree directory remains at {}.", task.worktree_path)
+        } else {
+            format!("Worktree directory is absent at {}.", task.worktree_path)
+        };
+        let metadata_state = match git2::Repository::open(&task.repository_path) {
+            Ok(repository) => match repository.worktrees() {
+                Ok(worktrees) => {
+                    let registered = worktrees.iter().flatten().any(|name| {
+                        repository
+                            .find_worktree(name)
+                            .ok()
+                            .is_some_and(|worktree| {
+                                cleanup_paths_match(&task.worktree_path, worktree.path())
+                            })
+                    });
+                    if registered {
+                        "Git still lists this worktree's metadata.".to_string()
+                    } else {
+                        "Git no longer lists this worktree's metadata.".to_string()
+                    }
+                }
+                Err(error) => format!("Git metadata state could not be read: {error}."),
+            },
+            Err(error) => format!("Git metadata state could not be read: {error}."),
+        };
+        let branch_state = task
+            .branch
+            .as_deref()
+            .map(|branch| format!("Branch {branch} remains preserved."))
+            .unwrap_or_else(|| "The task had no branch ref to remove.".into());
+        self.show_error(format!(
+            "Task {} cleanup did not complete. {directory_state} {metadata_state} {branch_state} Git reported: {error}. The task record remains linked so you can inspect the result and retry the cleanup preview.",
+            task.task_id
+        ));
     }
 
     pub fn refresh_all(&mut self, ctx: &egui::Context) {
@@ -3828,6 +4408,7 @@ mod tests {
             force_requested: false,
             repo_generation: app.repo_generation,
             ready: true,
+            task_cleanup: None,
         });
         app.finish_worktree_cleanup_preview(&egui::Context::default());
 
@@ -3965,6 +4546,7 @@ mod tests {
             force_requested: false,
             repo_generation: app.repo_generation,
             ready: true,
+            task_cleanup: None,
         });
 
         app.finish_worktree_cleanup_preview(&egui::Context::default());

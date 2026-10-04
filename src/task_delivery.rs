@@ -1,7 +1,7 @@
 use crate::tasks::TaskRecord;
 use chrono::{SecondsFormat, Utc};
 use git2::{Repository, StatusOptions};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
 use std::process::{Command, Output};
@@ -26,7 +26,8 @@ impl PullRequestAction {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CheckState {
     NoChecks,
     Pending,
@@ -45,21 +46,22 @@ impl CheckState {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequestCheck {
     pub name: String,
     pub state: CheckState,
     pub details_url: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
 pub enum TaskSourceFreshness {
     Current { local_head_sha: String },
     Stale { local_head_sha: Option<String>, reason: String },
     Unavailable { reason: String },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequestSnapshot {
     pub number: u64,
     pub url: String,
