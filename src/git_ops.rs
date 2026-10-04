@@ -535,6 +535,7 @@ pub enum TaskReviewQueueState {
     Reviewable {
         source_fingerprint: String,
         changed_file_count: usize,
+        changed_paths: Vec<String>,
     },
     NoReviewableChanges {
         source_fingerprint: String,
@@ -3437,6 +3438,7 @@ impl GitRepo {
             Ok(review) => TaskReviewQueueState::Reviewable {
                 source_fingerprint: review.source_fingerprint,
                 changed_file_count: review.files.len(),
+                changed_paths: review.files.into_iter().map(|file| file.path).collect(),
             },
             Err(TaskDiffReviewState::Unavailable(reason)) => {
                 TaskReviewQueueState::Unavailable(reason)
