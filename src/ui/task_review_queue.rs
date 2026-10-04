@@ -61,6 +61,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         let Some(TaskReviewQueueState::Reviewable {
             source_fingerprint,
             changed_file_count,
+            ..
         }) = state.as_ref()
         else {
             continue;
@@ -77,6 +78,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 }
             });
             ui.label(format!("Worktree: {}", task.worktree_path));
+            render_shared_file_overlap(ui, task, state.as_ref(), &task_states);
             ui.label(review_disposition(task, source_fingerprint));
             ui.label(format!(
                 "Verification: {}",
@@ -125,6 +127,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         };
         ui.group(|ui| {
             ui.label(egui::RichText::new(&task.title).strong());
+            render_shared_file_overlap(ui, task, state.as_ref(), &task_states);
             match state {
                 Some(TaskReviewQueueState::NoReviewableChanges { source_fingerprint }) => {
                     ui.label("No reviewable changes since this task's saved base.");
@@ -199,6 +202,94 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         app.start_task_pull_request_action(ctx, &task, action, identifier, source_fingerprint);
     }
     crate::ui::task_panel::render_task_diff_review(app, ui);
+}
+
+fn render_shared_file_overlap(
+    ui: &mut egui::Ui,
+    task: &TaskRecord,
+    state: Option<&TaskReviewQueueState>,
+    task_states: &[(TaskRecord, Option<TaskReviewQueueState>)],
+) {
+    let same_repository = task_states
+        .iter()
+        .filter(|(other, _)| {
+            other.id != task.id && other.repository_path == task.repository_path
+        })
+        .collect::<Vec<_>>();
+    if same_repository.is_empty() {
+        return;
+    }
+
+    ui.label(egui::RichText::new("Shared-file overlap").strong());
+    ui.weak("Matching paths indicate shared files, not a merge conflict.");
+
+    let Some(state) = state else {
+        ui.label("Checking overlap · this task's diff state is still pending.");
+        return;
+    };
+    let Some(paths) = task_changed_paths(state) else {
+        ui.colored_label(
+            App::adaptive_yellow(ui.style().visuals.dark_mode),
+            "Overlap unavailable · this task's complete current diff or source state is unavailable.",
+        );
+        return;
+    };
+
+    let mut found_overlap = false;
+    let mut unavailable_tasks = Vec::new();
+    let mut checking_tasks = Vec::new();
+    for (other, other_state) in same_repository {
+        let Some(other_state) = other_state.as_ref() else {
+            checking_tasks.push(other.title.as_str());
+            continue;
+        };
+        let Some(other_paths) = task_changed_paths(other_state) else {
+            unavailable_tasks.push(other.title.as_str());
+            continue;
+        };
+        let overlapping_paths = paths
+            .iter()
+            .filter(|path| other_paths.contains(path))
+            .collect::<Vec<_>>();
+        if !overlapping_paths.is_empty() {
+            found_overlap = true;
+            ui.label(format!("Shared with {}:", other.title));
+            ui.monospace(
+                overlapping_paths
+                    .iter()
+                    .map(|path| path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+        }
+    }
+
+    if !found_overlap && unavailable_tasks.is_empty() && checking_tasks.is_empty() {
+        ui.label("No shared changed files in the current task diffs.");
+    }
+    if !unavailable_tasks.is_empty() {
+        ui.colored_label(
+            App::adaptive_yellow(ui.style().visuals.dark_mode),
+            format!(
+                "Overlap unavailable with {} · complete diff or source state is unavailable.",
+                unavailable_tasks.join(", "),
+            ),
+        );
+    }
+    if !checking_tasks.is_empty() {
+        ui.label(format!(
+            "Checking overlap with {} · diff states are still pending.",
+            checking_tasks.join(", "),
+        ));
+    }
+}
+
+fn task_changed_paths(state: &TaskReviewQueueState) -> Option<&[String]> {
+    match state {
+        TaskReviewQueueState::Reviewable { changed_paths, .. } => Some(changed_paths),
+        TaskReviewQueueState::NoReviewableChanges { .. } => Some(&[]),
+        TaskReviewQueueState::Unavailable(_) | TaskReviewQueueState::Error(_) => None,
+    }
 }
 
 fn render_task_delivery(
