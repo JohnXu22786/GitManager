@@ -30,6 +30,28 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         } else {
             "No task records are linked yet."
         });
+        if app.task_integrated_verification.result().is_some()
+            || app.task_integrated_verification.is_running()
+        {
+            app.task_integrated_verification.refresh_current_state(
+                &app.task_merge_preview.repository_path,
+                &app.task_merge_preview.base_ref,
+                None,
+                None,
+                Some(false),
+                &[],
+                &HashMap::new(),
+            );
+            render_integrated_verification(
+                app,
+                ui,
+                ctx,
+                &[],
+                Some(false),
+                &None,
+                &None,
+            );
+        }
         crate::ui::task_panel::render_task_diff_review(app, ui);
         return;
     }
@@ -306,6 +328,8 @@ fn render_merge_preview(
 
     app.task_merge_preview.poll();
     let running = app.task_merge_preview.is_running();
+    let integrated_running = app.task_integrated_verification.is_running();
+    let controls_enabled = !running && !integrated_running;
     ui.add_space(10.0);
     ui.separator();
     ui.heading("Non-destructive merge preview");
@@ -332,7 +356,7 @@ fn render_merge_preview(
     }
 
     let mut selected_repository = app.task_merge_preview.repository_path.clone();
-    ui.add_enabled_ui(!running, |ui| {
+    ui.add_enabled_ui(controls_enabled, |ui| {
         egui::ComboBox::from_id_salt("task_merge_preview_repository")
             .selected_text(&selected_repository)
             .show_ui(ui, |ui| {
@@ -354,7 +378,7 @@ fn render_merge_preview(
         );
     } else {
         let mut selected_base = app.task_merge_preview.base_ref.clone();
-        ui.add_enabled_ui(!running, |ui| {
+        ui.add_enabled_ui(controls_enabled, |ui| {
             egui::ComboBox::from_id_salt("task_merge_preview_base")
                 .selected_text(if selected_base.is_empty() {
                     "Choose a local base branch"
@@ -381,7 +405,7 @@ fn render_merge_preview(
     let (ordered_ids, order_unavailable) = dependency_order(&repository_tasks);
     let mut selection_changed = false;
     ui.label("Choose tasks to integrate in dependency order:");
-    ui.add_enabled_ui(!running, |ui| {
+    ui.add_enabled_ui(controls_enabled, |ui| {
         for task in &repository_tasks {
             if let Some(reason) = order_unavailable.get(&task.id) {
                 ui.colored_label(
@@ -510,16 +534,98 @@ fn render_merge_preview(
     if let Some(reason) = stale_source_reason {
         app.task_merge_preview.show_unavailable(reason);
     }
-    if let Some(reason) = app.task_merge_preview.check_base_freshness() {
+    let base_freshness_reason = app.task_merge_preview.check_base_freshness();
+    let base_state_current = base_freshness_reason.is_none();
+    if let Some(reason) = base_freshness_reason {
         app.task_merge_preview.show_unavailable(reason);
     }
+    let current_source_fingerprints = task_states
+        .iter()
+        .filter_map(|(task, state)| match state {
+            Some(TaskReviewQueueState::Reviewable { source_fingerprint, .. })
+            | Some(TaskReviewQueueState::NoReviewableChanges { source_fingerprint }) => {
+                Some((task.id.clone(), source_fingerprint.clone()))
+            }
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
+    let (current_base_oid, current_tree_oid, source_state_current) = match app.task_merge_preview.state() {
+        TaskMergePreviewState::ConflictFree {
+            base_oid,
+            preview_tree_oid,
+            source_fingerprints,
+            ..
+        } => {
+            let mut all_current = true;
+            let mut unknown = false;
+            for task in &ordered_tasks {
+                match (
+                    current_source_fingerprints.get(&task.id),
+                    source_fingerprints.get(&task.id),
+                ) {
+                    (Some(current), Some(expected)) if current == expected => {}
+                    (Some(_), Some(_)) => all_current = false,
+                    _ => {
+                        let is_unavailable = task_states
+                            .iter()
+                            .find(|(candidate, _)| candidate.id == task.id)
+                            .is_some_and(|(_, state)| {
+                                matches!(
+                                    state,
+                                    Some(TaskReviewQueueState::Unavailable(_)
+                                        | TaskReviewQueueState::Error(_))
+                                )
+                            });
+                        if is_unavailable {
+                            all_current = false;
+                        } else {
+                            unknown = true;
+                        }
+                    }
+                }
+            }
+            let source_state_current = if !all_current {
+                Some(false)
+            } else if unknown {
+                None
+            } else {
+                Some(true)
+            };
+            (
+                Some(base_oid.clone()),
+                Some(preview_tree_oid.clone()),
+                source_state_current,
+            )
+        }
+        TaskMergePreviewState::Running => (None, None, None),
+        _ => (None, None, Some(false)),
+    };
+    let selection_is_current = app.task_merge_preview.selection_matches(
+        &app.task_merge_preview.repository_path,
+        &app.task_merge_preview.base_ref,
+        &ordered_tasks,
+    );
+    let preview_is_current = if !selection_is_current || !base_state_current {
+        Some(false)
+    } else {
+        source_state_current
+    };
+    app.task_integrated_verification.refresh_current_state(
+        &app.task_merge_preview.repository_path,
+        &app.task_merge_preview.base_ref,
+        current_base_oid.as_deref(),
+        current_tree_oid.as_deref(),
+        preview_is_current,
+        &ordered_tasks,
+        &current_source_fingerprints,
+    );
     if matches!(
         app.task_merge_preview.state(),
         TaskMergePreviewState::ConflictFree { .. } | TaskMergePreviewState::Conflicted { .. }
     ) {
         ctx.request_repaint_after(std::time::Duration::from_secs(5));
     }
-    let can_preview = !running
+    let can_preview = controls_enabled
         && !ordered_tasks.is_empty()
         && missing_selected.is_empty()
         && blocked_selected.is_empty()
@@ -620,7 +726,209 @@ fn render_merge_preview(
             }
         }
     }
-    ui.weak("The preview does not merge, commit, push, or run configured verification commands.");
+    render_integrated_verification(
+        app,
+        ui,
+        ctx,
+        &ordered_tasks,
+        preview_is_current,
+        &current_base_oid,
+        &current_tree_oid,
+    );
+    ui.weak("The preview does not merge, commit, or push task changes.");
+}
+
+fn render_integrated_verification(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    tasks: &[TaskRecord],
+    preview_is_current: Option<bool>,
+    base_oid: &Option<String>,
+    tree_oid: &Option<String>,
+) {
+    use crate::task_integrated_verification::{
+        resolve_command_coverage, IntegratedVerificationStatus,
+    };
+
+    ui.add_space(8.0);
+    ui.separator();
+    ui.label(egui::RichText::new("Integrated verification").strong());
+    let coverage = resolve_command_coverage(tasks);
+    match &coverage {
+        Ok(coverage) if coverage.commands.is_empty() => {
+            ui.colored_label(
+                App::adaptive_yellow(ui.style().visuals.dark_mode),
+                "Unavailable · none of the selected tasks has a verification command configured.",
+            );
+        }
+        Ok(coverage) => {
+            ui.label("Configured commands that apply to this ordered task selection:");
+            for (index, entry) in coverage.commands.iter().enumerate() {
+                let covered = entry
+                    .task_ids
+                    .iter()
+                    .filter_map(|id| tasks.iter().find(|task| &task.id == id))
+                    .map(|task| format!("{} ({})", task.title, task.id))
+                    .collect::<Vec<_>>();
+                ui.monospace(format!(
+                    "#{} · {} {:?} · timeout {}s",
+                    index + 1,
+                    entry.command.executable,
+                    entry.command.args,
+                    entry.command.timeout_seconds
+                ));
+                ui.label(format!("Configured for: {}", covered.join(", ")));
+            }
+            if !coverage.unconfigured_task_ids.is_empty() {
+                let missing = coverage
+                    .unconfigured_task_ids
+                    .iter()
+                    .filter_map(|id| tasks.iter().find(|task| &task.id == id))
+                    .map(|task| format!("{} ({})", task.title, task.id))
+                    .collect::<Vec<_>>();
+                ui.colored_label(
+                    App::adaptive_yellow(ui.style().visuals.dark_mode),
+                    format!("No command configured for: {}", missing.join(", ")),
+                );
+            }
+            if coverage.commands.len() > 1 {
+                ui.weak("Selected tasks have different verification configurations. Each listed command runs once, in dependency order, for the tasks shown.");
+            }
+            if !coverage.unconfigured_task_ids.is_empty() {
+                ui.weak("A passing aggregate will remain partial because these selected tasks have no configured command.");
+            }
+        }
+        Err(error) => {
+            ui.colored_label(
+                App::adaptive_yellow(ui.style().visuals.dark_mode),
+                format!("Integrated verification unavailable: {error}"),
+            );
+        }
+    }
+
+    let integrated_running = app.task_integrated_verification.is_running();
+    if integrated_running {
+        ui.horizontal(|ui| {
+            ui.colored_label(
+                App::adaptive_yellow(ui.style().visuals.dark_mode),
+                "Running in the isolated combined preview tree…",
+            );
+            if ui.button("Cancel integrated verification").clicked() {
+                app.cancel_task_integrated_verification();
+            }
+        });
+    } else {
+        let has_commands = coverage
+            .as_ref()
+            .is_ok_and(|coverage| !coverage.commands.is_empty());
+        let can_run = preview_is_current == Some(true) && has_commands && !app.is_busy();
+        if ui
+            .add_enabled(can_run, egui::Button::new("Run integrated verification"))
+            .clicked()
+        {
+            app.start_task_integrated_verification(ctx, tasks);
+        }
+        if preview_is_current != Some(true) {
+            ui.label(if preview_is_current.is_none() {
+                "Checking the current combined preview inputs…"
+            } else {
+                "Run verification only after a current, conflict-free preview is available."
+            });
+        }
+    }
+
+    if let Some(result) = app.task_integrated_verification.result() {
+        let dark = ui.style().visuals.dark_mode;
+        let color = match result.status {
+            IntegratedVerificationStatus::Passed => App::adaptive_green(dark),
+            IntegratedVerificationStatus::Failed
+            | IntegratedVerificationStatus::Error => App::adaptive_red(dark),
+            IntegratedVerificationStatus::Running
+            | IntegratedVerificationStatus::Partial
+            | IntegratedVerificationStatus::Cancelled
+            | IntegratedVerificationStatus::TimedOut
+            | IntegratedVerificationStatus::Stale
+            | IntegratedVerificationStatus::Unavailable => App::adaptive_yellow(dark),
+        };
+        ui.colored_label(color, format!("Integrated result: {}", result.status.label()));
+        if let Some(reason) = &result.stale_reason {
+            ui.label(reason);
+        }
+        ui.label(format!(
+            "Tasks in dependency order: {}",
+            result.ordered_task_ids.join(" → ")
+        ));
+        ui.label(format!("Base commit: {}", result.base_oid));
+        ui.label(format!("Combined preview tree: {}", result.preview_tree_oid));
+        ui.label(format!("Started: {}", result.started_at));
+        if let Some(finished_at) = &result.finished_at {
+            ui.label(format!("Finished: {finished_at}"));
+        }
+        egui::CollapsingHeader::new("Bound input fingerprints")
+            .id_salt(("integrated_verification_inputs", &result.run_id))
+            .show(ui, |ui| {
+                ui.label(format!("Repository: {}", result.repository_path));
+                ui.label(format!("Base branch: {}", result.base_ref));
+                for task in &result.tasks {
+                    ui.monospace(format!(
+                        "{} · {}",
+                        task.task_id, task.source_fingerprint
+                    ));
+                }
+            });
+        for (index, outcome) in result.commands.iter().enumerate() {
+            let covered = outcome
+                .task_ids
+                .iter()
+                .filter_map(|id| result.tasks.iter().find(|task| &task.task_id == id))
+                .map(|task| format!("{} ({})", task.title, task.task_id))
+                .collect::<Vec<_>>();
+            egui::CollapsingHeader::new(format!(
+                "#{} · {} {:?} · {}",
+                index + 1,
+                outcome.command.executable,
+                outcome.command.args,
+                covered.join(", ")
+            ))
+            .id_salt(("integrated_verification", &result.run_id, &outcome.command.executable, &outcome.task_ids))
+            .show(ui, |ui| {
+                match &outcome.result {
+                    Some(command_result) => {
+                        ui.label(format!("Outcome: {}", command_result.state.label()));
+                        if let Some(exit_code) = command_result.exit_code {
+                            ui.label(format!("Exit code: {exit_code}"));
+                        }
+                        if command_result.output_truncated {
+                            ui.label("Captured output was truncated.");
+                        }
+                        if !command_result.stdout.is_empty() {
+                            ui.label("stdout");
+                            ui.monospace(&command_result.stdout);
+                        }
+                        if !command_result.stderr.is_empty() {
+                            ui.label("stderr");
+                            ui.monospace(&command_result.stderr);
+                        }
+                        if command_result.stdout.is_empty() && command_result.stderr.is_empty() {
+                            ui.label("No output captured.");
+                        }
+                    }
+                    None => {
+                        ui.label(outcome.not_run_reason.as_deref().unwrap_or("Not run"));
+                    }
+                };
+            });
+        }
+        if !result.unconfigured_task_ids.is_empty() {
+            ui.label(format!(
+                "Unconfigured task IDs: {}",
+                result.unconfigured_task_ids.join(", ")
+            ));
+        }
+    } else if base_oid.is_some() && tree_oid.is_some() {
+        ui.label("No integrated result has been saved for this preview.");
+    }
 }
 
 fn render_preview_changed_files(ui: &mut egui::Ui, changed_files: &[String]) {

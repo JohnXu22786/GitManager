@@ -130,6 +130,18 @@ pub fn source_fingerprint(
     source_fingerprint_inner(worktree_path, expected_repository_path, None)
 }
 
+pub fn source_fingerprint_with_cancel(
+    worktree_path: &Path,
+    expected_repository_path: &Path,
+    cancel_requested: &AtomicBool,
+) -> Result<String, String> {
+    source_fingerprint_inner(
+        worktree_path,
+        expected_repository_path,
+        Some(cancel_requested),
+    )
+}
+
 fn source_fingerprint_inner(
     worktree_path: &Path,
     expected_repository_path: &Path,
@@ -506,6 +518,19 @@ fn record_result(task_id: &str, run_id: &str, result: VerificationResult) -> Res
     registry
         .record_verification_result(task_id, run_id, result)
         .map_err(|error| format!("Could not save the task verification result: {error}"))
+}
+
+/// Run a configured verification command in a caller-selected isolated directory.
+/// This shares task verification's process-tree control, timeout, cancellation,
+/// and bounded output capture without saving the result to an individual task.
+pub fn execute_in_directory(
+    working_directory: &Path,
+    run_id: String,
+    command: VerificationCommand,
+    cancel_requested: Arc<AtomicBool>,
+) -> VerificationResult {
+    let result = VerificationResult::running(run_id, command);
+    execute_command(working_directory, result, cancel_requested)
 }
 
 fn execute_command(

@@ -8,6 +8,7 @@ mod tasks;
 mod task_delivery;
 mod task_verification;
 mod task_merge_preview;
+mod task_integrated_verification;
 mod ui;
 mod updater;
 
