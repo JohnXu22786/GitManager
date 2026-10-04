@@ -53,6 +53,7 @@ pub struct TaskMergePreviewController {
     completed_identity: Option<PreviewIdentity>,
     completed_base_oid: Option<String>,
     base_checked_at: Option<Instant>,
+    base_refs_checked_at: Option<Instant>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,6 +99,7 @@ impl Default for TaskMergePreviewController {
             completed_identity: None,
             completed_base_oid: None,
             base_checked_at: None,
+            base_refs_checked_at: None,
         }
     }
 }
@@ -113,6 +115,7 @@ impl TaskMergePreviewController {
         self.completed_identity = None;
         self.completed_base_oid = None;
         self.base_checked_at = None;
+        self.base_refs_checked_at = None;
         self.base_ref_error = None;
         match local_base_refs(Path::new(&self.repository_path)) {
             Ok(refs) => {
@@ -124,6 +127,38 @@ impl TaskMergePreviewController {
                 self.base_refs.clear();
                 self.base_ref_error = Some(error);
             }
+        }
+        self.base_refs_checked_at = Some(Instant::now());
+    }
+
+    pub fn refresh_base_refs_if_due(&mut self) {
+        if self.repository_path.is_empty()
+            || self.receiver.is_some()
+            || self
+                .base_refs_checked_at
+                .is_some_and(|checked_at| checked_at.elapsed() < Duration::from_secs(5))
+        {
+            return;
+        }
+        self.base_refs_checked_at = Some(Instant::now());
+        match local_base_refs(Path::new(&self.repository_path)) {
+            Ok(refs) => {
+                self.base_ref_error = None;
+                if self.base_ref.is_empty() {
+                    self.base_ref = default_base_ref(&refs).unwrap_or_default();
+                } else if !refs.contains(&self.base_ref) {
+                    let removed_base_ref = self.base_ref.clone();
+                    self.base_ref = default_base_ref(&refs).unwrap_or_default();
+                    self.base_refs = refs;
+                    self.invalidate();
+                    self.show_unavailable(format!(
+                        "Selected base branch {removed_base_ref} is no longer available. Choose a current base branch and run the preview again."
+                    ));
+                    return;
+                }
+                self.base_refs = refs;
+            }
+            Err(error) => self.base_ref_error = Some(error),
         }
     }
 
@@ -800,10 +835,10 @@ fn ensure_external_merge_drivers_supported(repository: &Repository) -> Result<()
     let config = repository
         .config()
         .map_err(|error| format!("Could not read Git merge-driver configuration: {error}"))?;
-    let entries = config
+    let mut entries = config
         .entries(None)
         .map_err(|error| format!("Could not inspect Git merge-driver configuration: {error}"))?;
-    for entry in entries {
+    while let Some(entry) = entries.next() {
         let entry = entry
             .map_err(|error| format!("Could not inspect Git merge-driver configuration: {error}"))?;
         let Some(name) = entry.name() else {

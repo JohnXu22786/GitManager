@@ -344,6 +344,8 @@ fn render_merge_preview(
     if selected_repository != app.task_merge_preview.repository_path {
         app.task_merge_preview.set_repository(selected_repository);
     }
+    app.task_merge_preview.refresh_base_refs_if_due();
+    ctx.request_repaint_after(std::time::Duration::from_secs(5));
 
     if let Some(error) = app.task_merge_preview.base_ref_error.as_deref() {
         ui.colored_label(
