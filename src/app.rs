@@ -5,7 +5,7 @@ use crate::task_delivery::{
     self, PullRequestAction, PullRequestActionMessage, PullRequestSnapshot, PullRequestStatusView,
 };
 use crate::task_verification::{
-    self, VerificationCommand, VerificationResult, VerificationState,
+    self, VerificationResult,
 };
 use crate::updater::{self, UpdateState};
 use eframe::egui;

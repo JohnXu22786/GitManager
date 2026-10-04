@@ -5,6 +5,7 @@ use git2::{BranchType, Index, MergeOptions, Repository, Status, StatusOptions};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::thread;
@@ -69,6 +70,7 @@ pub struct PreviewWorkspace {
     _temporary_directory: TempDir,
     pub path: std::path::PathBuf,
     pub object_repository_path: std::path::PathBuf,
+    pub base_oid: String,
     pub tree_oid: String,
 }
 
@@ -76,7 +78,10 @@ impl PreviewWorkspace {
     /// Create an independent checkout of the exact combined preview tree for one command.
     /// Each configured command starts from a clean materialization even if an earlier command
     /// changed files in its own working directory.
-    pub fn materialize_for_command(&self) -> Result<Self, String> {
+    pub fn materialize_for_command(
+        &self,
+        cancel_requested: &AtomicBool,
+    ) -> Result<Self, String> {
         let temporary_directory = tempfile::Builder::new()
             .prefix("git-manager-integrated-command-")
             .tempdir_in(self._temporary_directory.path())
@@ -85,7 +90,15 @@ impl PreviewWorkspace {
             })?;
         let tree_oid = git2::Oid::from_str(&self.tree_oid)
             .map_err(|error| format!("The combined preview tree ID is invalid: {error}"))?;
-        materialize_preview_tree(temporary_directory, &self.object_repository_path, tree_oid)
+        let base_oid = git2::Oid::from_str(&self.base_oid)
+            .map_err(|error| format!("The combined preview base ID is invalid: {error}"))?;
+        materialize_preview_tree(
+            temporary_directory,
+            &self.object_repository_path,
+            base_oid,
+            tree_oid,
+            Some(cancel_requested),
+        )
     }
 }
 
@@ -834,7 +847,13 @@ fn run_preview(
     }
     let preview_tree_oid = integrated_tree_oid.to_string();
     let workspace =
-        match materialize_preview_tree(temp_root, &preview_git_dir, integrated_tree_oid) {
+        match materialize_preview_tree(
+            temp_root,
+            &preview_git_dir,
+            base_oid,
+            integrated_tree_oid,
+            None,
+        ) {
             Ok(workspace) => workspace,
             Err(reason) => {
                 return TaskMergePreviewState::Unavailable {
@@ -860,8 +879,13 @@ fn run_preview(
 fn materialize_preview_tree(
     temporary_directory: TempDir,
     object_repository_path: &Path,
+    base_oid: git2::Oid,
     tree_oid: git2::Oid,
+    cancel_requested: Option<&AtomicBool>,
 ) -> Result<PreviewWorkspace, String> {
+    if cancel_requested.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+        return Err("Combined preview materialization was cancelled.".into());
+    }
     let path = temporary_directory.path().join("combined");
     fs::create_dir(&path)
         .map_err(|error| format!("Could not create the isolated combined preview tree: {error}"))?;
@@ -901,15 +925,45 @@ fn materialize_preview_tree(
         .map_err(|error| format!("Could not read the combined preview tree: {error}"))?;
     let mut checkout = git2::build::CheckoutBuilder::new();
     checkout.force().remove_untracked(true);
+    if let Some(cancel_requested) = cancel_requested {
+        checkout
+            .notify_on(git2::build::CheckoutNotificationType::all())
+            .notify(|_, _, _, _, _| !cancel_requested.load(Ordering::Relaxed));
+    }
+    if let Err(error) = repository.checkout_tree(tree.as_object(), Some(&mut checkout)) {
+        if cancel_requested.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+            return Err("Combined preview materialization was cancelled.".into());
+        }
+        return Err(format!("Could not materialize the combined preview tree: {error}"));
+    }
+    if cancel_requested.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+        return Err("Combined preview materialization was cancelled.".into());
+    }
+    let base_commit = repository
+        .find_commit(base_oid)
+        .map_err(|error| format!("Could not load the combined preview base commit: {error}"))?;
+    let signature = git2::Signature::now("GitManager Preview", "preview@invalid")
+        .map_err(|error| format!("Could not create isolated preview Git metadata: {error}"))?;
+    let preview_commit = repository
+        .commit(
+            None,
+            &signature,
+            &signature,
+            "Combined task preview",
+            &tree,
+            &[&base_commit],
+        )
+        .map_err(|error| format!("Could not create isolated preview Git metadata: {error}"))?;
     repository
-        .checkout_tree(tree.as_object(), Some(&mut checkout))
-        .map_err(|error| format!("Could not materialize the combined preview tree: {error}"))?;
+        .set_head_detached(preview_commit)
+        .map_err(|error| format!("Could not set the combined preview HEAD: {error}"))?;
     let path = fs::canonicalize(&path)
         .map_err(|error| format!("Could not resolve the combined preview tree: {error}"))?;
     Ok(PreviewWorkspace {
         _temporary_directory: temporary_directory,
         path,
         object_repository_path,
+        base_oid: base_oid.to_string(),
         tree_oid: tree_oid.to_string(),
     })
 }

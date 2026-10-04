@@ -642,7 +642,7 @@ fn render_merge_preview(
         for task in &ordered_tasks {
             app.invalidate_task_review_queue_state(&task.id);
         }
-        app.task_merge_preview.start(ctx, ordered_tasks);
+        app.task_merge_preview.start(ctx, ordered_tasks.clone());
     }
     if !blocked_selected.is_empty() {
         ui.colored_label(

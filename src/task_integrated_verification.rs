@@ -131,6 +131,7 @@ pub struct TaskIntegratedVerificationController {
     result: Option<IntegratedVerificationResult>,
     inputs: Option<VerificationInputs>,
     run: Option<PendingIntegratedVerification>,
+    status_before_freshness_unavailable: Option<(IntegratedVerificationStatus, Option<String>)>,
 }
 
 impl TaskIntegratedVerificationController {
@@ -200,6 +201,7 @@ impl TaskIntegratedVerificationController {
         };
         let run_id = task_verification::next_run_id();
         let mut result = result_for_run(&inputs, &coverage, run_id);
+        self.status_before_freshness_unavailable = None;
         self.inputs = Some(inputs.clone());
         if coverage.commands.is_empty() {
             result.status = IntegratedVerificationStatus::Unavailable;
@@ -299,9 +301,7 @@ impl TaskIntegratedVerificationController {
         let (Some(result), Some(inputs)) = (self.result.as_mut(), self.inputs.as_ref()) else {
             return;
         };
-        if result.status == IntegratedVerificationStatus::Running
-            || result.status == IntegratedVerificationStatus::Unavailable
-        {
+        if result.status == IntegratedVerificationStatus::Running {
             return;
         }
         let stale_reason = if preview_is_current == Some(false) {
@@ -344,6 +344,8 @@ impl TaskIntegratedVerificationController {
                         break;
                     }
                     None => {
+                        self.status_before_freshness_unavailable
+                            .get_or_insert((result.status, result.stale_reason.clone()));
                         result.status = IntegratedVerificationStatus::Unavailable;
                         result.stale_reason = Some(format!(
                             "{} source freshness is unavailable.",
@@ -357,8 +359,14 @@ impl TaskIntegratedVerificationController {
             reason
         };
         if let Some(reason) = stale_reason {
+            self.status_before_freshness_unavailable = None;
             result.status = IntegratedVerificationStatus::Stale;
             result.stale_reason = Some(reason);
+        } else if let Some((status, stale_reason)) =
+            self.status_before_freshness_unavailable.take()
+        {
+            result.status = status;
+            result.stale_reason = stale_reason;
         }
     }
 }
@@ -447,12 +455,7 @@ fn run_verification(
         return result;
     }
     if let Err(failure) = check_inputs(inputs, Some(cancel_requested.as_ref())) {
-        if cancel_requested.load(Ordering::Relaxed) {
-            result.status = IntegratedVerificationStatus::Cancelled;
-            result.stale_reason = Some("Cancelled before configured commands started.".into());
-        } else {
-            apply_input_failure(&mut result, failure);
-        }
+        apply_input_failure(&mut result, failure);
         finish(&mut result);
         return result;
     }
@@ -463,7 +466,7 @@ fn run_verification(
             break;
         }
         if let Err(failure) = check_inputs(inputs, Some(cancel_requested.as_ref())) {
-            if cancel_requested.load(Ordering::Relaxed) {
+            if failure.status == IntegratedVerificationStatus::Cancelled {
                 cancelled_before_all_commands_finished = true;
                 mark_not_run(&mut result, index, "Cancellation was requested.");
             } else {
@@ -477,9 +480,14 @@ fn run_verification(
             break;
         }
         let planned = &coverage.commands[index];
-        let command_workspace = match workspace.materialize_for_command() {
+        let command_workspace = match workspace.materialize_for_command(cancel_requested.as_ref()) {
             Ok(command_workspace) => command_workspace,
             Err(error) => {
+                if cancel_requested.load(Ordering::Relaxed) {
+                    cancelled_before_all_commands_finished = true;
+                    mark_not_run(&mut result, index, "Cancellation was requested.");
+                    break;
+                }
                 command_preview_unavailable = Some(format!(
                     "Could not prepare an isolated combined preview for {}: {error}",
                     planned.command.executable
@@ -522,19 +530,43 @@ fn run_verification(
             _ => {}
         }
     }
-    let completion_check = match check_inputs(inputs, Some(cancel_requested.as_ref())) {
-        Err(_) if cancel_requested.load(Ordering::Relaxed) => check_inputs(inputs, None),
-        check => check,
-    };
-    if let Err(failure) = completion_check {
-        apply_input_failure(&mut result, failure);
-    } else if cancelled_before_all_commands_finished || cancel_requested.load(Ordering::Relaxed) {
-        result.status = IntegratedVerificationStatus::Cancelled;
-    } else if let Some(reason) = command_preview_unavailable {
-        result.status = IntegratedVerificationStatus::Unavailable;
-        result.stale_reason = Some(reason);
-    } else {
-        result.status = aggregate_status(&result, coverage);
+    let input_failure_already_detected = matches!(
+        result.status,
+        IntegratedVerificationStatus::Stale | IntegratedVerificationStatus::Unavailable
+    );
+    let command_error = result.commands.iter().any(|outcome| {
+        outcome
+            .result
+            .as_ref()
+            .is_some_and(|command| command.state == VerificationState::Error)
+    });
+    let final_input_check = check_inputs(inputs, Some(cancel_requested.as_ref()));
+    let cancellation_requested =
+        cancelled_before_all_commands_finished || cancel_requested.load(Ordering::Relaxed);
+    match final_input_check {
+        Err(failure) if failure.status == IntegratedVerificationStatus::Cancelled => {
+            if !input_failure_already_detected {
+                if command_error {
+                    result.status = IntegratedVerificationStatus::Error;
+                } else {
+                    apply_input_failure(&mut result, failure);
+                }
+            }
+        }
+        Err(failure) => apply_input_failure(&mut result, failure),
+        Ok(()) if input_failure_already_detected => {}
+        Ok(()) if cancellation_requested => {
+            if command_error {
+                result.status = IntegratedVerificationStatus::Error;
+            } else {
+                result.status = IntegratedVerificationStatus::Cancelled;
+            }
+        }
+        Ok(()) if command_preview_unavailable.is_some() => {
+            result.status = IntegratedVerificationStatus::Unavailable;
+            result.stale_reason = command_preview_unavailable;
+        }
+        Ok(()) => result.status = aggregate_status(&result, coverage),
     }
     finish(&mut result);
     result
@@ -712,13 +744,20 @@ fn check_inputs(
                 Path::new(&input.repository_path),
             ),
         };
-        let current_fingerprint = fingerprint
-        .map_err(|error| {
-            InputCheckFailure::unavailable(format!(
-                "Could not recheck {} source: {error}",
-                input.title
-            ))
-        })?;
+        let current_fingerprint = match fingerprint {
+            Ok(fingerprint) => fingerprint,
+            Err(error) if error == "Task verification was cancelled before the command started" => {
+                return Err(InputCheckFailure::cancelled(
+                    "Cancellation was requested while rechecking task sources.",
+                ));
+            }
+            Err(error) => {
+                return Err(InputCheckFailure::unavailable(format!(
+                    "Could not recheck {} source: {error}",
+                    input.title
+                )));
+            }
+        };
         if current_fingerprint != input.source_fingerprint {
             return Err(InputCheckFailure::changed(format!(
                 "{} source changed during verification.",
@@ -745,6 +784,13 @@ impl InputCheckFailure {
     fn unavailable(reason: impl Into<String>) -> Self {
         Self {
             status: IntegratedVerificationStatus::Unavailable,
+            reason: reason.into(),
+        }
+    }
+
+    fn cancelled(reason: impl Into<String>) -> Self {
+        Self {
+            status: IntegratedVerificationStatus::Cancelled,
             reason: reason.into(),
         }
     }
