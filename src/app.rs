@@ -5,7 +5,7 @@ use crate::task_delivery::{
     self, PullRequestAction, PullRequestActionMessage, PullRequestSnapshot, PullRequestStatusView,
 };
 use crate::task_verification::{
-    self, VerificationCommand, VerificationResult, VerificationState,
+    self, VerificationResult,
 };
 use crate::updater::{self, UpdateState};
 use eframe::egui;
@@ -611,6 +611,8 @@ pub struct App {
     pub task_worktree_path: String,
     pub task_diff_review: Option<TaskDiffReviewView>,
     pub task_merge_preview: crate::task_merge_preview::TaskMergePreviewController,
+    pub task_integrated_verification:
+        crate::task_integrated_verification::TaskIntegratedVerificationController,
     pub task_verification_editor: Option<TaskVerificationCommandDraft>,
     task_verification_run: Option<PendingTaskVerification>,
     task_fingerprint_probes: HashMap<String, TaskFingerprintProbe>,
@@ -699,6 +701,8 @@ impl App {
             task_worktree_path: String::new(),
             task_diff_review: None,
             task_merge_preview: crate::task_merge_preview::TaskMergePreviewController::default(),
+            task_integrated_verification:
+                crate::task_integrated_verification::TaskIntegratedVerificationController::default(),
             task_verification_editor: None,
             task_verification_run: None,
             task_fingerprint_probes: HashMap::new(),
@@ -1226,6 +1230,7 @@ impl App {
             || self.pending_confirmation.is_some()
             || self.pending_worktree_cleanup.is_some()
             || self.task_verification_run.is_some()
+            || self.task_integrated_verification.is_running()
     }
 
     /// Returns the description of the current/last operation.
@@ -1238,6 +1243,11 @@ impl App {
                 self.task_verification_run
                     .as_ref()
                     .map(|_| "Running task verification".into())
+            })
+            .or_else(|| {
+                self.task_integrated_verification
+                    .is_running()
+                    .then(|| "Running integrated verification".into())
             })
             .or_else(|| {
                 self.pending_confirmation
@@ -1567,6 +1577,70 @@ impl App {
 
     pub fn task_verification_any_running(&self) -> bool {
         self.task_verification_run.is_some()
+    }
+
+    pub fn start_task_integrated_verification(
+        &mut self,
+        ctx: &egui::Context,
+        tasks: &[TaskRecord],
+    ) {
+        if self.is_busy() {
+            return;
+        }
+        let (base_oid, preview_tree_oid, source_fingerprints) =
+            match self.task_merge_preview.state() {
+                crate::task_merge_preview::TaskMergePreviewState::ConflictFree {
+                    base_oid,
+                    preview_tree_oid,
+                    source_fingerprints,
+                    ..
+                } => (
+                    base_oid.clone(),
+                    preview_tree_oid.clone(),
+                    source_fingerprints.clone(),
+                ),
+                _ => {
+                    self.show_error(
+                        "Run a current, conflict-free combined preview before integrated verification"
+                            .into(),
+                    );
+                    return;
+                }
+            };
+        let repository_path = self.task_merge_preview.repository_path.clone();
+        let base_ref = self.task_merge_preview.base_ref.clone();
+        if !self
+            .task_merge_preview
+            .selection_matches(&repository_path, &base_ref, tasks)
+        {
+            self.show_error(
+                "The selected task set or dependency order changed; run the preview again".into(),
+            );
+            return;
+        }
+        let Some(workspace) = self.task_merge_preview.workspace() else {
+            self.show_error("The combined preview tree is unavailable; run it again".into());
+            return;
+        };
+        if workspace.tree_oid != preview_tree_oid {
+            self.show_error("The combined preview tree changed; run the preview again".into());
+            return;
+        }
+        if let Err(error) = self.task_integrated_verification.start(
+            ctx,
+            repository_path,
+            base_ref,
+            base_oid,
+            tasks,
+            &source_fingerprints,
+            workspace,
+        ) {
+            self.show_error(error);
+        }
+    }
+
+    pub fn cancel_task_integrated_verification(&self) {
+        self.task_integrated_verification.cancel();
     }
 
     pub fn forget_task_fingerprint_probe(&mut self, task_id: &str) {
@@ -2281,6 +2355,44 @@ impl App {
         }
     }
 
+    fn process_task_integrated_verification(&mut self, ctx: &egui::Context) {
+        let was_running = self.task_integrated_verification.is_running();
+        self.task_integrated_verification.poll();
+        if self.task_integrated_verification.is_running() {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        } else if was_running {
+            if let Some(status) = self
+                .task_integrated_verification
+                .result()
+                .map(|result| result.status)
+            {
+                match status {
+                    crate::task_integrated_verification::IntegratedVerificationStatus::Passed => {
+                        self.show_success(
+                            "Integrated verification passed on the combined preview tree".into(),
+                        );
+                    }
+                    crate::task_integrated_verification::IntegratedVerificationStatus::Partial => {
+                        self.show_success(
+                            "Integrated verification finished with partial command coverage".into(),
+                        );
+                    }
+                    crate::task_integrated_verification::IntegratedVerificationStatus::Cancelled => {
+                        self.show_success("Integrated verification was cancelled".into());
+                    }
+                    crate::task_integrated_verification::IntegratedVerificationStatus::Failed
+                    | crate::task_integrated_verification::IntegratedVerificationStatus::TimedOut
+                    | crate::task_integrated_verification::IntegratedVerificationStatus::Error
+                    | crate::task_integrated_verification::IntegratedVerificationStatus::Stale
+                    | crate::task_integrated_verification::IntegratedVerificationStatus::Unavailable => {
+                        self.show_error(format!("Integrated verification {}", status.label()));
+                    }
+                    crate::task_integrated_verification::IntegratedVerificationStatus::Running => {}
+                }
+            }
+        }
+    }
+
     fn start_operation_inner_at(
         &mut self,
         ctx: &egui::Context,
@@ -2779,6 +2891,7 @@ impl eframe::App for App {
         }
         self.process_pending_ops(ctx);
         self.process_task_verification(ctx);
+        self.process_task_integrated_verification(ctx);
         self.process_task_pull_request_actions();
 
         let dark = ctx.style().visuals.dark_mode;
@@ -3376,6 +3489,7 @@ impl Drop for App {
             run.cancel_requested.store(true, Ordering::Relaxed);
             let _ = run.worker.join();
         }
+        self.task_integrated_verification.shutdown();
     }
 }
 

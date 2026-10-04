@@ -5,9 +5,12 @@ use git2::{BranchType, Index, MergeOptions, Repository, Status, StatusOptions};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+use tempfile::TempDir;
 
 #[derive(Clone, Debug, Default)]
 pub enum TaskMergePreviewState {
@@ -19,6 +22,7 @@ pub enum TaskMergePreviewState {
         task_titles: Vec<String>,
         source_fingerprints: HashMap<String, String>,
         base_oid: String,
+        preview_tree_oid: String,
     },
     Conflicted {
         changed_files: Vec<String>,
@@ -49,11 +53,53 @@ pub struct TaskMergePreviewController {
     pub base_ref_error: Option<String>,
     pub selected_task_ids: HashSet<String>,
     state: TaskMergePreviewState,
-    receiver: Option<Receiver<TaskMergePreviewState>>,
+    receiver: Option<Receiver<PreviewWorkerCompletion>>,
+    workspace: Option<Arc<PreviewWorkspace>>,
     completed_identity: Option<PreviewIdentity>,
     completed_base_oid: Option<String>,
     base_checked_at: Option<Instant>,
     base_refs_checked_at: Option<Instant>,
+}
+
+struct PreviewWorkerCompletion {
+    state: TaskMergePreviewState,
+    workspace: Option<PreviewWorkspace>,
+}
+
+pub struct PreviewWorkspace {
+    _temporary_directory: TempDir,
+    pub path: std::path::PathBuf,
+    pub object_repository_path: std::path::PathBuf,
+    pub base_oid: String,
+    pub tree_oid: String,
+}
+
+impl PreviewWorkspace {
+    /// Create an independent checkout of the exact combined preview tree for one command.
+    /// Each configured command starts from a clean materialization even if an earlier command
+    /// changed files in its own working directory.
+    pub fn materialize_for_command(
+        &self,
+        cancel_requested: &AtomicBool,
+    ) -> Result<Self, String> {
+        let temporary_directory = tempfile::Builder::new()
+            .prefix("git-manager-integrated-command-")
+            .tempdir_in(self._temporary_directory.path())
+            .map_err(|error| {
+                format!("Could not create an isolated command preview directory: {error}")
+            })?;
+        let tree_oid = git2::Oid::from_str(&self.tree_oid)
+            .map_err(|error| format!("The combined preview tree ID is invalid: {error}"))?;
+        let base_oid = git2::Oid::from_str(&self.base_oid)
+            .map_err(|error| format!("The combined preview base ID is invalid: {error}"))?;
+        materialize_preview_tree(
+            temporary_directory,
+            &self.object_repository_path,
+            base_oid,
+            tree_oid,
+            Some(cancel_requested),
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,6 +142,7 @@ impl Default for TaskMergePreviewController {
             selected_task_ids: HashSet::new(),
             state: TaskMergePreviewState::Idle,
             receiver: None,
+            workspace: None,
             completed_identity: None,
             completed_base_oid: None,
             base_checked_at: None,
@@ -112,6 +159,7 @@ impl TaskMergePreviewController {
         self.repository_path = repository_path;
         self.selected_task_ids.clear();
         self.state = TaskMergePreviewState::Idle;
+        self.workspace = None;
         self.completed_identity = None;
         self.completed_base_oid = None;
         self.base_checked_at = None;
@@ -165,6 +213,7 @@ impl TaskMergePreviewController {
     pub fn invalidate(&mut self) {
         if self.receiver.is_none() {
             self.state = TaskMergePreviewState::Idle;
+            self.workspace = None;
             self.completed_identity = None;
             self.completed_base_oid = None;
             self.base_checked_at = None;
@@ -173,6 +222,10 @@ impl TaskMergePreviewController {
 
     pub fn state(&self) -> &TaskMergePreviewState {
         &self.state
+    }
+
+    pub fn workspace(&self) -> Option<Arc<PreviewWorkspace>> {
+        self.workspace.clone()
     }
 
     pub fn is_running(&self) -> bool {
@@ -186,6 +239,7 @@ impl TaskMergePreviewController {
                 changed_files: Vec::new(),
                 task_titles: Vec::new(),
             };
+            self.workspace = None;
             self.completed_identity = None;
             self.completed_base_oid = None;
             self.base_checked_at = None;
@@ -247,13 +301,15 @@ impl TaskMergePreviewController {
         let repaint = ctx.clone();
         let (sender, receiver) = mpsc::channel();
         self.state = TaskMergePreviewState::Running;
+        self.workspace = None;
         self.completed_base_oid = None;
         self.base_checked_at = None;
         match thread::Builder::new()
             .name("task-merge-preview".into())
             .spawn(move || {
-                let result = run_preview(&repository_path, &base_ref, &tasks);
-                let _ = sender.send(result);
+                let mut workspace = None;
+                let state = run_preview(&repository_path, &base_ref, &tasks, &mut workspace);
+                let _ = sender.send(PreviewWorkerCompletion { state, workspace });
                 repaint.request_repaint();
             })
         {
@@ -274,17 +330,18 @@ impl TaskMergePreviewController {
             return;
         };
         match received {
-            Ok(result) => {
-                self.completed_base_oid = match &result {
+            Ok(completion) => {
+                self.completed_base_oid = match &completion.state {
                     TaskMergePreviewState::ConflictFree { base_oid, .. }
                     | TaskMergePreviewState::Conflicted { base_oid, .. } => Some(base_oid.clone()),
                     _ => None,
                 };
+                self.workspace = completion.workspace.map(Arc::new);
                 self.base_checked_at = self
                     .completed_base_oid
                     .as_ref()
                     .map(|_| Instant::now());
-                self.state = result;
+                self.state = completion.state;
                 self.receiver = None;
             }
             Err(TryRecvError::Disconnected) => {
@@ -294,6 +351,7 @@ impl TaskMergePreviewController {
                     changed_files: Vec::new(),
                     task_titles: Vec::new(),
                 };
+                self.workspace = None;
                 self.completed_identity = None;
                 self.completed_base_oid = None;
                 self.base_checked_at = None;
@@ -352,6 +410,7 @@ fn run_preview(
     repository_path: &str,
     base_ref: &str,
     tasks: &[TaskRecord],
+    workspace_out: &mut Option<PreviewWorkspace>,
 ) -> TaskMergePreviewState {
     let task_titles = tasks.iter().map(|task| task.title.clone()).collect::<Vec<_>>();
     let unavailable = |reason: String, changed_files: Vec<String>| {
@@ -786,6 +845,25 @@ fn run_preview(
             task_titles: titles,
         };
     }
+    let preview_tree_oid = integrated_tree_oid.to_string();
+    let workspace =
+        match materialize_preview_tree(
+            temp_root,
+            &preview_git_dir,
+            base_oid,
+            integrated_tree_oid,
+            None,
+        ) {
+            Ok(workspace) => workspace,
+            Err(reason) => {
+                return TaskMergePreviewState::Unavailable {
+                    reason,
+                    changed_files,
+                    task_titles: titles,
+                }
+            }
+        };
+    *workspace_out = Some(workspace);
     TaskMergePreviewState::ConflictFree {
         changed_files,
         task_titles: titles,
@@ -794,7 +872,100 @@ fn run_preview(
             .map(|snapshot| (snapshot.task.id.clone(), snapshot.source_fingerprint.clone()))
             .collect(),
         base_oid: base_oid.to_string(),
+        preview_tree_oid,
     }
+}
+
+fn materialize_preview_tree(
+    temporary_directory: TempDir,
+    object_repository_path: &Path,
+    base_oid: git2::Oid,
+    tree_oid: git2::Oid,
+    cancel_requested: Option<&AtomicBool>,
+) -> Result<PreviewWorkspace, String> {
+    if cancel_requested.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+        return Err("Combined preview materialization was cancelled.".into());
+    }
+    let path = temporary_directory.path().join("combined");
+    fs::create_dir(&path)
+        .map_err(|error| format!("Could not create the isolated combined preview tree: {error}"))?;
+    let repository = Repository::init(&path)
+        .map_err(|error| format!("Could not initialize the isolated combined preview tree: {error}"))?;
+    let repository_git_directory = repository.path().to_path_buf();
+    let object_repository_path = fs::canonicalize(object_repository_path)
+        .map_err(|error| format!("Could not resolve the temporary preview object store: {error}"))?;
+    let object_directory = fs::canonicalize(object_repository_path.join("objects"))
+        .map_err(|error| format!("Could not resolve the temporary preview objects: {error}"))?;
+    let object_directory = object_directory.to_str().ok_or_else(|| {
+        "The temporary preview object path cannot be represented safely.".to_string()
+    })?;
+    if object_directory.contains('\n') || object_directory.contains('\r') {
+        return Err(
+            "The temporary preview object path contains a line break and cannot be represented safely."
+                .into(),
+        );
+    }
+    drop(repository);
+    let alternates_path = repository_git_directory
+        .join("objects")
+        .join("info")
+        .join("alternates");
+    let alternates_directory = alternates_path
+        .parent()
+        .ok_or_else(|| "The isolated preview object link has no parent directory.".to_string())?;
+    fs::create_dir_all(alternates_directory).map_err(|error| {
+        format!("Could not prepare the isolated preview object link: {error}")
+    })?;
+    fs::write(&alternates_path, format!("{object_directory}\n"))
+        .map_err(|error| format!("Could not link the combined tree to its temporary objects: {error}"))?;
+    let repository = Repository::open(&path)
+        .map_err(|error| format!("Could not open the isolated combined preview tree: {error}"))?;
+    let tree = repository
+        .find_tree(tree_oid)
+        .map_err(|error| format!("Could not read the combined preview tree: {error}"))?;
+    let mut checkout = git2::build::CheckoutBuilder::new();
+    checkout.force().remove_untracked(true);
+    if let Some(cancel_requested) = cancel_requested {
+        checkout
+            .notify_on(git2::CheckoutNotificationType::all())
+            .notify(|_, _, _, _, _| !cancel_requested.load(Ordering::Relaxed));
+    }
+    if let Err(error) = repository.checkout_tree(tree.as_object(), Some(&mut checkout)) {
+        if cancel_requested.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+            return Err("Combined preview materialization was cancelled.".into());
+        }
+        return Err(format!("Could not materialize the combined preview tree: {error}"));
+    }
+    if cancel_requested.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+        return Err("Combined preview materialization was cancelled.".into());
+    }
+    let base_commit = repository
+        .find_commit(base_oid)
+        .map_err(|error| format!("Could not load the combined preview base commit: {error}"))?;
+    let signature = git2::Signature::now("GitManager Preview", "preview@invalid")
+        .map_err(|error| format!("Could not create isolated preview Git metadata: {error}"))?;
+    let preview_commit = repository
+        .commit(
+            None,
+            &signature,
+            &signature,
+            "Combined task preview",
+            &tree,
+            &[&base_commit],
+        )
+        .map_err(|error| format!("Could not create isolated preview Git metadata: {error}"))?;
+    repository
+        .set_head_detached(preview_commit)
+        .map_err(|error| format!("Could not set the combined preview HEAD: {error}"))?;
+    let path = fs::canonicalize(&path)
+        .map_err(|error| format!("Could not resolve the combined preview tree: {error}"))?;
+    Ok(PreviewWorkspace {
+        _temporary_directory: temporary_directory,
+        path,
+        object_repository_path,
+        base_oid: base_oid.to_string(),
+        tree_oid: tree_oid.to_string(),
+    })
 }
 
 fn ensure_source_is_clean(repository: &Repository) -> Result<(), String> {
