@@ -20,7 +20,7 @@ The `Opened here` label uses Git Manager's recent-open history only. It does not
 
 ## Scope
 
-Git Manager focuses on local branch and worktree operations. It does not create pull requests or launch coding agents.
+Git Manager focuses on local branch and worktree operations. Its task review queue can create or associate GitHub pull requests and display remote checks through the user's existing GitHub CLI sign-in. PR creation does not push branches or store GitHub credentials, and Git Manager does not launch coding agents.
 
 ## Features
 
@@ -32,6 +32,7 @@ Git Manager focuses on local branch and worktree operations. It does not create 
 - Configure remotes and run fetch, pull, and push operations.
 - Clone repositories and reopen recently used repositories.
 - Check for and install releases from within the application.
+- Create or associate a task pull request and inspect its lifecycle, remote checks, and result freshness in the review queue.
 
 ### Worktree workflow visuals
 

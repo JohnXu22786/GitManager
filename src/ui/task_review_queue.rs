@@ -1,5 +1,9 @@
 use crate::app::App;
 use crate::git_ops::TaskReviewQueueState;
+use crate::task_delivery::{
+    CheckState, PullRequestAction, PullRequestCheck, PullRequestRemoteView,
+    PullRequestSnapshot, TaskSourceFreshness,
+};
 use crate::task_verification::VerificationState;
 use crate::tasks::TaskRecord;
 use eframe::egui;
@@ -37,6 +41,12 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         })
         .collect::<Vec<_>>();
     let mut open_task: Option<TaskRecord> = None;
+    let mut delivery_action: Option<(
+        TaskRecord,
+        PullRequestAction,
+        Option<String>,
+        Option<String>,
+    )> = None;
 
     let reviewable = task_states
         .iter()
@@ -77,6 +87,14 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                 )
             ));
             render_verification_details(ui, task);
+            render_task_delivery(
+                app,
+                ui,
+                ctx,
+                task,
+                Some(source_fingerprint.as_str()),
+                &mut delivery_action,
+            );
         });
     }
 
@@ -97,6 +115,13 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
             _ => app
                 .current_task_fingerprint(ctx, task)
                 .and_then(Result::ok),
+        };
+        let delivery_fingerprint = match state.as_ref() {
+            Some(TaskReviewQueueState::NoReviewableChanges { source_fingerprint })
+            | Some(TaskReviewQueueState::Reviewable { source_fingerprint, .. }) => {
+                Some(source_fingerprint.as_str())
+            }
+            _ => verification_fingerprint.as_deref(),
         };
         ui.group(|ui| {
             ui.label(egui::RichText::new(&task.title).strong());
@@ -156,13 +181,284 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                     ));
                 }
             }
+            render_task_delivery(
+                app,
+                ui,
+                ctx,
+                task,
+                delivery_fingerprint,
+                &mut delivery_action,
+            );
         });
     }
 
     if let Some(task) = open_task {
         app.start_task_diff_review(ctx, &task);
     }
+    if let Some((task, action, identifier, source_fingerprint)) = delivery_action {
+        app.start_task_pull_request_action(ctx, &task, action, identifier, source_fingerprint);
+    }
     crate::ui::task_panel::render_task_diff_review(app, ui);
+}
+
+fn render_task_delivery(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    task: &TaskRecord,
+    current_source_fingerprint: Option<&str>,
+    next_action: &mut Option<(
+        TaskRecord,
+        PullRequestAction,
+        Option<String>,
+        Option<String>,
+    )>,
+) {
+    let status = app.current_task_pull_request_status(ctx, task);
+    let action_running = app.task_pull_request_action_running(&task.id);
+    ui.separator();
+    ui.label(egui::RichText::new("PR and remote CI").strong());
+    match &status.remote {
+        PullRequestRemoteView::Unlinked => {
+            ui.label("Unlinked · create a PR or associate an existing one.");
+            ui.label("GitHub CLI (`gh`) uses its existing sign-in; Git Manager stores no credentials.");
+        }
+        PullRequestRemoteView::Checking { action } => {
+            ui.label(format!("Checking · {action}…"));
+            ui.label("Source: GitHub via `gh`.");
+        }
+        PullRequestRemoteView::Refreshing {
+            previous,
+            previous_at,
+        } => {
+            ui.label("Refreshing remote status · previous results are not current.");
+            if let Some(previous) = previous {
+                render_pull_request_snapshot(
+                    ui,
+                    &task.id,
+                    previous,
+                    previous_at.as_deref(),
+                    true,
+                );
+            } else if let Some(previous_at) = previous_at {
+                ui.label(format!("Last response: {previous_at}"));
+            } else {
+                ui.label("Source: GitHub via `gh` · waiting for a remote response.");
+            }
+        }
+        PullRequestRemoteView::Unavailable {
+            message,
+            previous,
+            previous_at,
+        } => {
+            ui.colored_label(
+                App::adaptive_yellow(ui.style().visuals.dark_mode),
+                format!("Unavailable · {message}"),
+            );
+            ui.label("Source: GitHub via `gh` · current remote status could not be confirmed.");
+            if let Some(previous) = previous {
+                ui.label("Last known result; its current status could not be confirmed:");
+                render_pull_request_snapshot(
+                    ui,
+                    &task.id,
+                    previous,
+                    previous_at.as_deref(),
+                    true,
+                );
+            }
+        }
+        PullRequestRemoteView::Ready { snapshot } => {
+            render_pull_request_snapshot(
+                ui,
+                &task.id,
+                snapshot,
+                Some(&snapshot.fetched_at),
+                false,
+            );
+        }
+    }
+
+    if let Some(message) = status.action_message {
+        let color = if message.succeeded {
+            App::adaptive_green(ui.style().visuals.dark_mode)
+        } else {
+            App::adaptive_red(ui.style().visuals.dark_mode)
+        };
+        ui.colored_label(color, message.text);
+    }
+
+    let linked_url = app
+        .task_registry
+        .entries()
+        .iter()
+        .find(|entry| entry.id == task.id)
+        .map_or(task.pull_request_url.as_deref(), |entry| {
+            entry.pull_request_url.as_deref()
+        });
+    let pr_is_linked = linked_url.is_some();
+    ui.horizontal_wrapped(|ui| {
+        if let Some(url) = linked_url
+            .filter(|url| url.starts_with("https://") && !url.chars().any(char::is_whitespace))
+        {
+            ui.hyperlink_to("Open PR", url);
+        }
+        if pr_is_linked && !action_running
+            && ui.button("Refresh PR status").clicked()
+        {
+            *next_action = Some((
+                task.clone(),
+                PullRequestAction::Refresh,
+                None,
+                current_source_fingerprint.map(str::to_owned),
+            ));
+        }
+    });
+
+    ui.horizontal(|ui| {
+        let input = app.task_pull_request_input(&task.id);
+        ui.add(
+            egui::TextEdit::singleline(input)
+                .hint_text("PR number or HTTPS URL")
+                .desired_width(230.0),
+        );
+        let can_associate = !input.trim().is_empty() && !action_running;
+        if ui
+            .add_enabled(
+                can_associate,
+                egui::Button::new(if pr_is_linked {
+                    "Change PR association"
+                } else {
+                    "Associate PR"
+                }),
+            )
+            .clicked()
+        {
+            *next_action = Some((
+                task.clone(),
+                PullRequestAction::Associate,
+                Some(input.trim().to_string()),
+                current_source_fingerprint.map(str::to_owned),
+            ));
+        }
+        if !pr_is_linked {
+            let can_create = task.branch.as_deref().is_some_and(|branch| !branch.is_empty())
+                && !action_running;
+            if ui
+                .add_enabled(can_create, egui::Button::new("Create PR"))
+                .clicked()
+            {
+                *next_action = Some((
+                    task.clone(),
+                    PullRequestAction::Create,
+                    None,
+                    current_source_fingerprint.map(str::to_owned),
+                ));
+            }
+            if task.branch.as_deref().map_or(true, |branch| branch.is_empty()) {
+                ui.label("Create PR requires a task linked to a branch; you can still associate an existing PR.");
+            }
+        }
+    });
+}
+
+fn render_pull_request_snapshot(
+    ui: &mut egui::Ui,
+    task_id: &str,
+    snapshot: &PullRequestSnapshot,
+    fetched_at: Option<&str>,
+    previous: bool,
+) {
+    let lifecycle = match snapshot.state.to_ascii_uppercase().as_str() {
+        "MERGED" => "Merged",
+        "CLOSED" => "Closed",
+        "OPEN" if snapshot.is_draft => "Draft",
+        "OPEN" => "Open",
+        _ => "Unavailable",
+    };
+    ui.label(format!(
+        "PR #{} · {} · {} → {} · {}",
+        snapshot.number, lifecycle, snapshot.head_branch, snapshot.base_branch, snapshot.title
+    ));
+    let sha = short_sha(&snapshot.head_sha);
+    let stale_prefix = if previous { "Last known · " } else { "" };
+    match &snapshot.freshness {
+        TaskSourceFreshness::Current { local_head_sha } => {
+            if previous {
+                ui.label(format!(
+                    "{stale_prefix}remote checks {} on PR head {}; this result is not current.",
+                    snapshot.check_state.label(),
+                    short_sha(local_head_sha)
+                ));
+            } else {
+                match snapshot.check_state {
+                    CheckState::NoChecks => {
+                        ui.label(format!("No checks reported by GitHub for PR head {sha}."));
+                    }
+                    _ => {
+                        ui.label(format!(
+                            "Remote checks: {} on PR head {sha}.",
+                            snapshot.check_state.label()
+                        ));
+                    }
+                };
+                ui.label(format!(
+                    "Freshness: task HEAD {} matches the PR head and the worktree is clean.",
+                    short_sha(local_head_sha)
+                ));
+            }
+        }
+        TaskSourceFreshness::Stale {
+            local_head_sha,
+            reason,
+        } => {
+            let local = local_head_sha
+                .as_deref()
+                .map(short_sha)
+                .unwrap_or_else(|| "unavailable".into());
+            ui.colored_label(
+                App::adaptive_yellow(ui.style().visuals.dark_mode),
+                format!(
+                    "Stale · GitHub checks {} on PR head {sha}; local task HEAD {local}: {reason}.",
+                    snapshot.check_state.label()
+                ),
+            );
+        }
+        TaskSourceFreshness::Unavailable { reason } => {
+            ui.colored_label(
+                App::adaptive_yellow(ui.style().visuals.dark_mode),
+                format!(
+                    "Freshness unavailable · GitHub checks {} on PR head {sha}; {reason}.",
+                    snapshot.check_state.label()
+                ),
+            );
+        }
+    }
+    if let Some(fetched_at) = fetched_at {
+        ui.label(format!("Source: GitHub via `gh` · fetched {fetched_at}"));
+    }
+    render_check_details(ui, task_id, &snapshot.checks);
+}
+
+fn render_check_details(ui: &mut egui::Ui, task_id: &str, checks: &[PullRequestCheck]) {
+    if checks.is_empty() {
+        return;
+    }
+    egui::CollapsingHeader::new(format!("GitHub checks ({})", checks.len()))
+        .id_salt((task_id, "task_pull_request_checks", checks.len()))
+        .show(ui, |ui| {
+            for check in checks {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!("{} · {}", check.name, check.state.label()));
+                    if let Some(url) = &check.details_url {
+                        ui.hyperlink_to("Details", url);
+                    }
+                });
+            }
+        });
+}
+
+fn short_sha(sha: &str) -> String {
+    sha.chars().take(7).collect()
 }
 
 fn review_disposition(task: &TaskRecord, current_fingerprint: &str) -> String {

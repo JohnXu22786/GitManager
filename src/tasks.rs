@@ -41,6 +41,8 @@ pub struct TaskRecord {
     pub reviewed_source_fingerprint: Option<String>,
     #[serde(default)]
     pub reviewed_at: Option<String>,
+    #[serde(default)]
+    pub pull_request_url: Option<String>,
 }
 
 impl TaskRecord {
@@ -88,6 +90,7 @@ impl TaskRecord {
             verification_result: None,
             reviewed_source_fingerprint: None,
             reviewed_at: None,
+            pull_request_url: None,
         })
     }
 }
@@ -250,6 +253,21 @@ impl TaskRegistry {
             }
             entry.reviewed_source_fingerprint = None;
             entry.reviewed_at = None;
+            entry.updated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+            Ok(true)
+        })
+    }
+
+    pub fn record_pull_request(&mut self, id: &str, url: &str) -> io::Result<()> {
+        self.update_registry(|entries| {
+            let entry = entries
+                .iter_mut()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task no longer exists"))?;
+            if entry.pull_request_url.as_deref() == Some(url) {
+                return Ok(false);
+            }
+            entry.pull_request_url = Some(url.to_string());
             entry.updated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
             Ok(true)
         })
