@@ -9,6 +9,7 @@ use crate::task_verification::{
 };
 use crate::updater::{self, UpdateState};
 use eframe::egui;
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -19,7 +20,9 @@ use std::time::{Duration, Instant};
 const ABOUT_BUTTON_LABEL: &str = "ℹ";
 const APP_VERSION: &str = crate::version_info::VERSION;
 const TASK_PR_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const TASK_FINGERPRINT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_TASK_PR_REFRESHES: usize = 2;
+const MAX_TASK_SOURCE_FINGERPRINT_PROBES: usize = 2;
 
 fn cleanup_change_label(change: &WorktreeChange) -> String {
     let mut labels = Vec::new();
@@ -279,6 +282,117 @@ struct TaskFingerprintProbe {
     receiver: Option<mpsc::Receiver<Result<String, String>>>,
 }
 
+struct TaskPrSourceWatcher {
+    _watcher: RecommendedWatcher,
+    invalidated: Arc<AtomicBool>,
+    error: Arc<Mutex<Option<String>>>,
+}
+
+struct TaskPrSourceFingerprintProbe {
+    worktree_path: String,
+    repository_path: String,
+    result: Option<String>,
+    receiver: Option<mpsc::Receiver<Result<String, String>>>,
+    watcher: Option<TaskPrSourceWatcher>,
+    watcher_receiver: Option<mpsc::Receiver<Result<TaskPrSourceWatcher, String>>>,
+    watch_error: Option<String>,
+}
+
+impl TaskPrSourceFingerprintProbe {
+    fn for_task(task: &TaskRecord) -> Self {
+        Self {
+            worktree_path: task.worktree_path.clone(),
+            repository_path: task.repository_path.clone(),
+            result: None,
+            receiver: None,
+            watcher: None,
+            watcher_receiver: None,
+            watch_error: None,
+        }
+    }
+}
+
+fn task_pr_source_watcher(
+    worktree_path: &Path,
+    expected_repository_path: &Path,
+    ctx: &egui::Context,
+) -> Result<TaskPrSourceWatcher, String> {
+    let repository = git2::Repository::open(worktree_path)
+        .map_err(|error| {
+            format!("Could not open the task worktree to watch for source changes: {error}")
+        })?;
+    let worktree_path = std::fs::canonicalize(worktree_path)
+        .map_err(|error| {
+            format!("Could not resolve the task worktree to watch for source changes: {error}")
+        })?;
+    let repository_root = crate::tasks::repository_root(&repository, &worktree_path)?;
+    let expected_repository_path = std::fs::canonicalize(expected_repository_path)
+        .map_err(|error| {
+            format!("Could not resolve the task's saved repository path: {error}")
+        })?;
+    if repository_root != expected_repository_path {
+        return Err("The task worktree is no longer linked to its saved repository".into());
+    }
+    let worktree_git_dir = repository.path().to_path_buf();
+    let common_git_dir = repository.commondir().to_path_buf();
+    let invalidated = Arc::new(AtomicBool::new(true));
+    let error = Arc::new(Mutex::new(None));
+    let callback_invalidated = Arc::clone(&invalidated);
+    let callback_error = Arc::clone(&error);
+    let callback_context = ctx.clone();
+    let mut watcher = RecommendedWatcher::new(
+        move |event: notify::Result<notify::Event>| match event {
+            Ok(_) => {
+                if !callback_invalidated.swap(true, Ordering::AcqRel) {
+                    callback_context.request_repaint();
+                }
+            }
+            Err(error) => {
+                *callback_error
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error.to_string());
+                callback_context.request_repaint();
+            }
+        },
+        notify::Config::default(),
+    )
+    .map_err(|error| {
+        format!("Could not watch the task worktree for source changes: {error}")
+    })?;
+    watcher
+        .watch(&worktree_path, RecursiveMode::Recursive)
+        .map_err(|error| {
+            format!("Could not watch the task worktree for source changes: {error}")
+        })?;
+    if !worktree_git_dir.starts_with(&worktree_path) {
+        watcher
+            .watch(&worktree_git_dir, RecursiveMode::NonRecursive)
+            .map_err(|error| {
+                format!("Could not watch the task Git metadata for source changes: {error}")
+            })?;
+    }
+    let refs_dir = common_git_dir.join("refs");
+    if !refs_dir.starts_with(&worktree_path) && refs_dir.is_dir() {
+        watcher
+            .watch(&refs_dir, RecursiveMode::Recursive)
+            .map_err(|error| {
+                format!("Could not watch the repository references for source changes: {error}")
+            })?;
+    }
+    if common_git_dir != worktree_git_dir && !common_git_dir.starts_with(&worktree_path) {
+        watcher
+            .watch(&common_git_dir, RecursiveMode::NonRecursive)
+            .map_err(|error| {
+                format!("Could not watch the repository Git metadata for source changes: {error}")
+            })?;
+    }
+    Ok(TaskPrSourceWatcher {
+        _watcher: watcher,
+        invalidated,
+        error,
+    })
+}
+
 struct TaskReviewQueueProbe {
     result: Option<TaskReviewQueueState>,
     checked_at: Option<Instant>,
@@ -499,6 +613,7 @@ pub struct App {
     pub task_verification_editor: Option<TaskVerificationCommandDraft>,
     task_verification_run: Option<PendingTaskVerification>,
     task_fingerprint_probes: HashMap<String, TaskFingerprintProbe>,
+    task_pr_source_fingerprint_probes: HashMap<String, TaskPrSourceFingerprintProbe>,
     task_review_queue_probes: HashMap<String, TaskReviewQueueProbe>,
     task_pull_request_probes: HashMap<String, TaskPullRequestProbe>,
     task_pull_request_inputs: HashMap<String, String>,
@@ -585,6 +700,7 @@ impl App {
             task_verification_editor: None,
             task_verification_run: None,
             task_fingerprint_probes: HashMap::new(),
+            task_pr_source_fingerprint_probes: HashMap::new(),
             task_review_queue_probes: HashMap::new(),
             task_pull_request_probes: HashMap::new(),
             task_pull_request_inputs: HashMap::new(),
@@ -1419,6 +1535,7 @@ impl App {
         });
 
         self.task_fingerprint_probes.remove(&task_id);
+        self.task_pr_source_fingerprint_probes.remove(&task_id);
         self.task_review_queue_probes.remove(&task_id);
         self.task_verification_run = Some(PendingTaskVerification {
             task_id,
@@ -1452,11 +1569,13 @@ impl App {
 
     pub fn forget_task_fingerprint_probe(&mut self, task_id: &str) {
         self.task_fingerprint_probes.remove(task_id);
+        self.task_pr_source_fingerprint_probes.remove(task_id);
         self.task_review_queue_probes.remove(task_id);
     }
 
     pub fn forget_task_pull_request_probe(&mut self, task_id: &str) {
         self.task_pull_request_probes.remove(task_id);
+        self.task_pr_source_fingerprint_probes.remove(task_id);
         self.task_pull_request_inputs.remove(task_id);
     }
 
@@ -1653,7 +1772,6 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         task: &TaskRecord,
-        current_source_fingerprint: Option<&str>,
     ) -> PullRequestStatusView {
         self.process_task_pull_request_action(&task.id);
 
@@ -1665,6 +1783,11 @@ impl App {
             .cloned()
             .unwrap_or_else(|| task.clone());
         let linked = current_task.pull_request_url.is_some();
+        let current_source_fingerprint = if linked {
+            self.current_task_pr_source_fingerprint(ctx, &current_task)
+        } else {
+            None
+        };
         let active_refreshes = self
             .task_pull_request_probes
             .values()
@@ -1689,7 +1812,7 @@ impl App {
                 &current_task,
                 PullRequestAction::Refresh,
                 None,
-                current_source_fingerprint.map(str::to_owned),
+                current_source_fingerprint.clone(),
             );
         }
 
@@ -1750,7 +1873,7 @@ impl App {
             task_delivery::PullRequestRemoteView::Ready {
                 snapshot: task_delivery::refresh_snapshot_freshness(
                     snapshot,
-                    current_source_fingerprint,
+                    current_source_fingerprint.as_deref(),
                 ),
             }
         } else {
@@ -1788,6 +1911,194 @@ impl App {
             return None;
         }
 
+        self.request_task_source_fingerprint(ctx, task, TASK_FINGERPRINT_REFRESH_INTERVAL)
+    }
+
+    fn current_task_pr_source_fingerprint(
+        &mut self,
+        ctx: &egui::Context,
+        task: &TaskRecord,
+    ) -> Option<String> {
+        let probe_matches_task = self
+            .task_pr_source_fingerprint_probes
+            .get(&task.id)
+            .is_some_and(|probe| {
+                probe.worktree_path == task.worktree_path
+                    && probe.repository_path == task.repository_path
+            });
+        if !probe_matches_task {
+            self.task_pr_source_fingerprint_probes.insert(
+                task.id.clone(),
+                TaskPrSourceFingerprintProbe::for_task(task),
+            );
+        }
+
+        let watcher_setup = self
+            .task_pr_source_fingerprint_probes
+            .get_mut(&task.id)
+            .and_then(|probe| probe.watcher_receiver.as_ref())
+            .map(|receiver| receiver.try_recv());
+        if let Some(result) = watcher_setup {
+            match result {
+                Ok(Ok(watcher)) => {
+                    if let Some(probe) = self.task_pr_source_fingerprint_probes.get_mut(&task.id) {
+                        probe.watcher = Some(watcher);
+                        probe.watcher_receiver = None;
+                    }
+                }
+                Ok(Err(error)) => {
+                    if let Some(probe) = self.task_pr_source_fingerprint_probes.get_mut(&task.id) {
+                        probe.watcher_receiver = None;
+                        probe.watch_error = Some(error);
+                    }
+                    return None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if let Some(probe) = self.task_pr_source_fingerprint_probes.get_mut(&task.id) {
+                        probe.watcher_receiver = None;
+                        probe.watch_error = Some(
+                            "Task source watcher stopped before it was initialized".into(),
+                        );
+                    }
+                    return None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(Duration::from_millis(250));
+                    return None;
+                }
+            }
+        }
+
+        let watch_error = self
+            .task_pr_source_fingerprint_probes
+            .get(&task.id)
+            .and_then(|probe| probe.watch_error.as_ref())
+            .is_some();
+        if watch_error {
+            return None;
+        }
+
+        let watcher_ready = self
+            .task_pr_source_fingerprint_probes
+            .get(&task.id)
+            .is_some_and(|probe| probe.watcher.is_some());
+        if !watcher_ready {
+            let active_probes = self
+                .task_pr_source_fingerprint_probes
+                .values()
+                .filter(|probe| probe.receiver.is_some() || probe.watcher_receiver.is_some())
+                .count()
+                + self
+                    .task_fingerprint_probes
+                    .values()
+                    .filter(|probe| probe.receiver.is_some())
+                    .count();
+            if active_probes >= MAX_TASK_SOURCE_FINGERPRINT_PROBES {
+                ctx.request_repaint_after(Duration::from_millis(250));
+                return None;
+            }
+            let worktree_path = PathBuf::from(&task.worktree_path);
+            let repository_path = PathBuf::from(&task.repository_path);
+            let worker_context = ctx.clone();
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(task_pr_source_watcher(
+                    &worktree_path,
+                    &repository_path,
+                    &worker_context,
+                ));
+            });
+            if let Some(probe) = self.task_pr_source_fingerprint_probes.get_mut(&task.id) {
+                probe.watcher_receiver = Some(receiver);
+            }
+            ctx.request_repaint_after(Duration::from_millis(250));
+            return None;
+        }
+
+        let active_probes = self
+            .task_pr_source_fingerprint_probes
+            .values()
+            .filter(|probe| probe.receiver.is_some() || probe.watcher_receiver.is_some())
+            .count()
+            + self
+                .task_fingerprint_probes
+                .values()
+                .filter(|probe| probe.receiver.is_some())
+                .count();
+        let Some(probe) = self.task_pr_source_fingerprint_probes.get_mut(&task.id) else {
+            return None;
+        };
+        let Some(watcher) = probe.watcher.as_ref() else {
+            return None;
+        };
+        if watcher
+            .error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+        {
+            probe.result = None;
+            probe.receiver = None;
+            return None;
+        }
+
+        if watcher.invalidated.load(Ordering::Acquire) {
+            probe.result = None;
+        }
+        if let Some(receiver) = &probe.receiver {
+            match receiver.try_recv() {
+                Ok(Ok(result)) => {
+                    let source_changed_during_check =
+                        watcher.invalidated.load(Ordering::Acquire);
+                    probe.receiver = None;
+                    probe.result = (!source_changed_during_check).then_some(result);
+                }
+                Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => {
+                    probe.receiver = None;
+                    probe.result = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+
+        let needs_check = probe.receiver.is_none()
+            && watcher.invalidated.load(Ordering::Acquire)
+            && probe.result.is_none();
+        if needs_check {
+            if active_probes >= MAX_TASK_SOURCE_FINGERPRINT_PROBES {
+                ctx.request_repaint_after(Duration::from_millis(250));
+                return None;
+            }
+            watcher.invalidated.store(false, Ordering::Release);
+            let path = PathBuf::from(&task.worktree_path);
+            let repository_path = PathBuf::from(&task.repository_path);
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(task_verification::source_fingerprint(
+                    &path,
+                    &repository_path,
+                ));
+            });
+            probe.receiver = Some(receiver);
+            probe.result = None;
+        }
+
+        if probe.receiver.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(250));
+            None
+        } else if watcher.invalidated.load(Ordering::Acquire) {
+            None
+        } else {
+            probe.result.clone()
+        }
+    }
+
+    fn request_task_source_fingerprint(
+        &mut self,
+        ctx: &egui::Context,
+        task: &TaskRecord,
+        refresh_interval: Duration,
+    ) -> Option<Result<String, String>> {
         let active_probes = self
             .task_fingerprint_probes
             .values()
@@ -1821,7 +2132,7 @@ impl App {
         let needs_check = probe.receiver.is_none()
             && probe
                 .checked_at
-                .map_or(true, |checked_at| checked_at.elapsed() >= Duration::from_secs(5));
+                .map_or(true, |checked_at| checked_at.elapsed() >= refresh_interval);
         if needs_check {
             if active_probes >= 2 {
                 ctx.request_repaint_after(Duration::from_millis(250));
@@ -1845,7 +2156,7 @@ impl App {
             None
         } else {
             if let Some(checked_at) = probe.checked_at {
-                ctx.request_repaint_after(Duration::from_secs(5).saturating_sub(checked_at.elapsed()));
+                ctx.request_repaint_after(refresh_interval.saturating_sub(checked_at.elapsed()));
             }
             probe.result.clone()
         }

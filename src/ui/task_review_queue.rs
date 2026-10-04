@@ -2,7 +2,7 @@ use crate::app::App;
 use crate::git_ops::TaskReviewQueueState;
 use crate::task_delivery::{
     CheckState, PullRequestAction, PullRequestCheck, PullRequestRemoteView,
-    PullRequestSnapshot, PullRequestStatusView, TaskSourceFreshness,
+    PullRequestSnapshot, TaskSourceFreshness,
 };
 use crate::task_verification::VerificationState;
 use crate::tasks::TaskRecord;
@@ -214,7 +214,7 @@ fn render_task_delivery(
         Option<String>,
     )>,
 ) {
-    let status = app.current_task_pull_request_status(ctx, task, current_source_fingerprint);
+    let status = app.current_task_pull_request_status(ctx, task);
     let action_running = app.task_pull_request_action_running(&task.id);
     ui.separator();
     ui.label(egui::RichText::new("PR and remote CI").strong());
