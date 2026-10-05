@@ -8,7 +8,22 @@ Git Manager is a lightweight desktop Git client for developers working across mu
 
 *Illustrative workspace data shows concurrent branch and worktree activity.*
 
-## Quick start
+## My tools (no repository required)
+
+Open **我的工具** to create a local order-progress tool without Git, an account,
+a Harness, or an API key. Start with an isolated fictional example or create an
+empty real project at an explicit local location. Save records, compare supported
+timer/date/reminder rules on copies, confirm a scope, and withdraw a rule while
+preserving later business data. Optional proposal exchange uses reviewed local
+files and real local replay; imported success claims are never trusted.
+
+See the [tool studio guide](docs/tool-studio-guide.md) for the complete workflow,
+saving and recovery boundaries, optional-field versions, and proposal limitations.
+This is a finite local tool studio, not a promise to interpret arbitrary requests
+or generate any application. The existing Git workflow remains available through
+Tasks and the repository button. No new release is implied by this source change.
+
+## Quick start (Git worktrees)
 
 1. Open or clone a repository.
 2. Use the Worktrees view to create a worktree from an existing or new branch.
