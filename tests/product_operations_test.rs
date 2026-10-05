@@ -277,20 +277,37 @@ use std::path::Path;
 fn concurrent_pointer_replacement_keeps_open_readers_valid() {
     use std::sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Barrier,
+        mpsc, Arc,
     };
+    use std::time::{Duration, Instant};
     let dir = tempfile::tempdir().unwrap();
     let path = fs::canonicalize(dir.path()).unwrap();
     let files = product_files::Directory::open(&path).unwrap();
     files.publish("CURRENT", b"first", false).unwrap();
-    let done = Arc::new(AtomicBool::new(false));
-    let barrier = Arc::new(Barrier::new(2));
-    let worker_done = done.clone();
-    let worker_barrier = barrier.clone();
+    let fault = std::env::var("GITMANAGER_POINTER_WRITER_FAULT").ok();
+    let timeout = if fault.as_deref() == Some("timeout") {
+        Duration::from_millis(20)
+    } else {
+        Duration::from_secs(30)
+    };
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let worker_cancelled = cancelled.clone();
+    let (start, ready) = mpsc::sync_channel(1);
     let writer = std::thread::spawn(move || {
+        ready.recv().unwrap();
+        match fault.as_deref() {
+            Some("panic") => panic!("injected pointer writer failure"),
+            Some("timeout") => std::thread::sleep(Duration::from_secs(1)),
+            _ => {}
+        }
+        if worker_cancelled.load(Ordering::Acquire) {
+            return;
+        }
         let writer = product_files::Directory::open(&path).unwrap();
-        worker_barrier.wait();
         for i in 0..1000 {
+            if worker_cancelled.load(Ordering::Acquire) {
+                return;
+            }
             writer
                 .publish(
                     "CURRENT",
@@ -299,20 +316,33 @@ fn concurrent_pointer_replacement_keeps_open_readers_valid() {
                 )
                 .unwrap();
         }
-        worker_done.store(true, Ordering::Release);
     });
-    barrier.wait();
-    let mut failures = Vec::new();
-    while !done.load(Ordering::Acquire) {
+    let deadline = Instant::now() + timeout;
+    start.send(()).unwrap();
+    let mut failure_count = 0usize;
+    let mut first_failure = None;
+    // is_finished covers both successful completion and an unwinding writer.
+    // Keep diagnostics bounded even if every read fails.
+    while !writer.is_finished() && Instant::now() < deadline {
         match files.read("CURRENT", 16) {
             Ok(bytes) => assert!(bytes == b"first" || bytes == b"other"),
-            Err(error) => failures.push(error.to_string()),
+            Err(error) => {
+                failure_count += 1;
+                first_failure.get_or_insert(error);
+            }
         }
     }
-    writer.join().unwrap();
-    assert!(
-        failures.is_empty(),
-        "an atomically replaced pointer must remain readable: {failures:?}"
+    if !writer.is_finished() {
+        cancelled.store(true, Ordering::Release);
+        // Joining an unfinished I/O operation could itself hang the test.
+        panic!("pointer writer exceeded its deadline of {timeout:?}");
+    }
+    if let Err(panic) = writer.join() {
+        std::panic::resume_unwind(panic);
+    }
+    assert_eq!(
+        failure_count, 0,
+        "an atomically replaced pointer must remain readable; first failure: {first_failure:?}"
     );
 }
 
@@ -465,5 +495,55 @@ fn same_program_choices_preserve_session_but_real_switches_reset_it() {
         assert_eq!(switched.data.records, saved.data.records);
         assert_eq!(switched.data.events, saved.data.events);
         assert_eq!(switched.decisions, graph);
+    }
+}
+
+#[test]
+fn pointer_writer_failure_and_timeout_are_bounded() {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    for (fault, expected) in [
+        ("panic", "injected pointer writer failure"),
+        ("timeout", "pointer writer exceeded its deadline"),
+    ] {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "concurrent_pointer_replacement_keeps_open_readers_valid",
+                "--nocapture",
+            ])
+            .env("GITMANAGER_POINTER_WRITER_FAULT", fault)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log.reopen().unwrap()))
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("pointer regression child hung after {fault}");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(
+            !status.success(),
+            "the injected {fault} must remain a failing test"
+        );
+        let mut diagnostic = String::new();
+        log.reopen()
+            .unwrap()
+            .take(32 * 1024)
+            .read_to_string(&mut diagnostic)
+            .unwrap();
+        assert!(
+            diagnostic.contains(expected),
+            "missing actual {fault} diagnosis: {diagnostic}"
+        );
     }
 }
