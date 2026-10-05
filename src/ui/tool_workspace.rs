@@ -6,6 +6,8 @@ use crate::tool_workspace_protocol::*;
 use chrono::NaiveDate;
 use egui::{Button, Color32, Response, ScrollArea, TextEdit, Ui};
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Default)]
 pub struct WorkspaceOutput {
@@ -166,7 +168,9 @@ impl Default for ProjectDraft {
     fn default() -> Self {
         Self {
             name: "我的订单工具".into(),
-            location: String::new(),
+            location: default_tool_data_directory()
+                .map(|root| new_project_location(&root))
+                .unwrap_or_default(),
             spec: studio_order_template(),
             generation: None,
             optional_name: String::new(),
@@ -190,6 +194,7 @@ struct ChangeDraft {
     due_date: String,
     stage: String,
     supersedes: Vec<String>,
+    selected_outcome: Option<usize>,
 }
 impl ChangeDraft {
     fn new(view: &WorkspaceView<'_>, policy: &BehaviorPolicy) -> Self {
@@ -207,11 +212,12 @@ impl ChangeDraft {
             due_date: String::new(),
             stage: String::new(),
             supersedes: vec![],
+            selected_outcome: None,
         }
     }
     fn input(&self, spec: &ToolSpec) -> Result<RuleInput, String> {
-        if self.original_request.trim().is_empty() || self.reason.trim().is_empty() {
-            return Err("请填写想修改的做法和理由，再演练或保存决定".into());
+        if self.original_request.trim().is_empty() {
+            return Err("写下想修改的做法，即可在副本上比较结果".into());
         }
         let mut record_changes = BTreeMap::new();
         if self.due_override {
@@ -238,10 +244,22 @@ impl ChangeDraft {
         Ok(RuleInput {
             rule_keys,
             original_request: self.original_request.clone(),
-            rationale: self.reason.clone(),
+            rationale: if self.selected_outcome.is_some() {
+                self.reason.clone()
+            } else {
+                String::new()
+            },
             unresolved_questions: lines(&self.unresolved),
-            supersedes: self.supersedes.clone(),
-            scope: self.scope,
+            supersedes: if self.selected_outcome.is_some() {
+                self.supersedes.clone()
+            } else {
+                vec![]
+            },
+            scope: if self.selected_outcome.is_some() {
+                self.scope
+            } else {
+                ScopeKind::SingleRecord
+            },
             candidates: [a, b],
             as_of_date: parse_date(&self.date)?,
             record_changes,
@@ -268,6 +286,9 @@ pub struct ToolWorkspace {
     seen_status: Option<OperationStatus>,
     last_operation: String,
     preview_request: Option<RequestContext>,
+    comparison_only: bool,
+    #[cfg(test)]
+    folder_choice: Option<Option<PathBuf>>,
     input_epoch: u64,
     notice: Option<String>,
     error: Option<String>,
@@ -276,6 +297,28 @@ pub struct ToolWorkspace {
 }
 
 impl ToolWorkspace {
+    #[cfg(test)]
+    pub fn set_folder_choice_for_test(&mut self, choice: Option<PathBuf>) {
+        self.folder_choice = Some(choice);
+    }
+    fn pick_folder(&mut self, initial: &str) -> Option<PathBuf> {
+        let open_dialog = || {
+            let mut dialog = rfd::FileDialog::new().set_title("选择工具文件夹");
+            if let Some(parent) = Path::new(initial).ancestors().find(|path| path.is_dir()) {
+                dialog = dialog.set_directory(parent);
+            }
+            // The modal call completes before this draft can change or switch project.
+            dialog.pick_folder()
+        };
+        #[cfg(test)]
+        let choice = self.folder_choice.take().unwrap_or_else(open_dialog);
+        #[cfg(not(test))]
+        let choice = open_dialog();
+        if choice.is_none() {
+            self.notice = Some("未选择文件夹：已取消或系统选择器不可用。原位置与输入已保留，创建工具仍可使用建议位置。".into());
+        }
+        choice
+    }
     pub fn show(&mut self, ui: &mut Ui, view: &WorkspaceView<'_>) -> WorkspaceOutput {
         let mut out = WorkspaceOutput::default();
         let frame_id =
@@ -359,6 +402,17 @@ impl ToolWorkspace {
     fn synchronize(&mut self, view: &WorkspaceView<'_>) {
         let project = view.project.map(|m| m.project_id.clone());
         if self.session != view.session_id || self.project != project {
+            let created = self.pending.as_ref().is_some_and(|pending| {
+                matches!(pending.action, WorkspaceAction::CreateProject { .. })
+                    && view.project.is_some()
+                    && view.operation.is_some_and(|status| {
+                        status.context == pending.context
+                            && status.outcome == OperationOutcome::PreviewReady
+                    })
+            });
+            if created {
+                self.project_draft = ProjectDraft::default();
+            }
             self.session = view.session_id.into();
             self.project = project;
             self.selected = view
@@ -408,7 +462,9 @@ impl ToolWorkspace {
             OperationOutcome::PreviewReady => {
                 if matches!(
                     pending.action,
-                    WorkspaceAction::Rehearse { .. } | WorkspaceAction::PreviewWithdrawal { .. }
+                    WorkspaceAction::Compare { .. }
+                        | WorkspaceAction::Rehearse { .. }
+                        | WorkspaceAction::PreviewWithdrawal { .. }
                 ) {
                     self.pending = None;
                     self.failed = false;
@@ -422,7 +478,8 @@ impl ToolWorkspace {
                 if !advanced
                     || matches!(
                         pending.action,
-                        WorkspaceAction::Rehearse { .. }
+                        WorkspaceAction::Compare { .. }
+                            | WorkspaceAction::Rehearse { .. }
                             | WorkspaceAction::PreviewWithdrawal { .. }
                     )
                 {
@@ -495,9 +552,12 @@ impl ToolWorkspace {
         };
         if matches!(
             request.action,
-            WorkspaceAction::Rehearse { .. } | WorkspaceAction::PreviewWithdrawal { .. }
+            WorkspaceAction::Compare { .. }
+                | WorkspaceAction::Rehearse { .. }
+                | WorkspaceAction::PreviewWithdrawal { .. }
         ) {
             self.preview_request = Some(request.context.clone());
+            self.comparison_only = matches!(request.action, WorkspaceAction::Compare { .. });
         }
         self.last_operation = view.next_operation_id.into();
         self.pending = Some(request.clone());
@@ -519,7 +579,9 @@ impl ToolWorkspace {
         if self.pending.as_ref().is_some_and(|request| {
             matches!(
                 request.action,
-                WorkspaceAction::Rehearse { .. } | WorkspaceAction::PreviewWithdrawal { .. }
+                WorkspaceAction::Compare { .. }
+                    | WorkspaceAction::Rehearse { .. }
+                    | WorkspaceAction::PreviewWithdrawal { .. }
             )
         }) {
             self.pending = None;
@@ -566,7 +628,8 @@ impl ToolWorkspace {
                     .is_none_or(|m| m.access == ProjectAccess::Writable)
                     || matches!(
                         pending.action,
-                        WorkspaceAction::Rehearse { .. }
+                        WorkspaceAction::Compare { .. }
+                            | WorkspaceAction::Rehearse { .. }
                             | WorkspaceAction::PreviewWithdrawal { .. }
                     );
                 if out.button(ui, "operation.retry", "重试同一次操作", same && writable) {
@@ -583,7 +646,8 @@ impl ToolWorkspace {
                     ui,
                     if matches!(
                         pending.action,
-                        WorkspaceAction::Rehearse { .. }
+                        WorkspaceAction::Compare { .. }
+                            | WorkspaceAction::Rehearse { .. }
                             | WorkspaceAction::PreviewWithdrawal { .. }
                     ) {
                         "演练中…"
@@ -626,8 +690,22 @@ impl ToolWorkspace {
         out.label(ui, "填写已有工具的本地目录");
         out.control(
             "project.location",
-            ui.add(TextEdit::singleline(&mut self.open_location).desired_width(f32::INFINITY)),
+            ui.add(
+                TextEdit::singleline(&mut self.open_location)
+                    .id(egui::Id::new(("tool-open-location", &self.session)))
+                    .desired_width(f32::INFINITY),
+            ),
         );
+        if out.button(
+            ui,
+            "project.choose_folder",
+            "选择已有工具文件夹…",
+            self.pending.is_none(),
+        ) {
+            if let Some(path) = self.pick_folder(&self.open_location.clone()) {
+                self.open_location = path.display().to_string();
+            }
+        }
         if out.button(
             ui,
             "project.open",
@@ -677,16 +755,22 @@ impl ToolWorkspace {
             edited |= out
                 .control(
                     "project.name",
-                    ui.add(TextEdit::singleline(&mut draft.name).desired_width(f32::INFINITY)),
+                    ui.add(TextEdit::singleline(&mut draft.name).id(egui::Id::new(("tool-name", &self.session, configure, &self.project))).desired_width(f32::INFINITY)),
                 )
                 .changed();
             if !configure {
-                out.label(ui, "本地保存位置（正式工具不包含虚构记录）");
+                out.label(ui, "本地保存位置已建议，可直接创建；也可以选择其他文件夹。正式工具不包含虚构记录");
+                if out.button(ui, "project.choose_folder", "选择保存文件夹…", allowed) {
+                    if let Some(parent) = self.pick_folder(&draft.location) {
+                        draft.location = new_project_location(&parent);
+                        edited = true;
+                    }
+                }
                 edited |= out
                     .control(
                         "project.location",
                         ui.add(
-                            TextEdit::singleline(&mut draft.location).desired_width(f32::INFINITY),
+                            TextEdit::singleline(&mut draft.location).id(egui::Id::new(("tool-location", &self.session))).desired_width(f32::INFINITY),
                         ),
                     )
                     .changed();
@@ -1296,6 +1380,7 @@ impl ToolWorkspace {
                     "change.request",
                     ui.add(
                         TextEdit::multiline(&mut draft.original_request)
+                            .id(egui::Id::new(("tool-change-request", &self.session, &self.selected)))
                             .desired_rows(2)
                             .desired_width(f32::INFINITY),
                     ),
@@ -1362,7 +1447,7 @@ impl ToolWorkspace {
             changed |= out
                 .control(
                     "change.date",
-                    ui.add(TextEdit::singleline(&mut draft.date).desired_width(f32::INFINITY)),
+                    ui.add(TextEdit::singleline(&mut draft.date).id(egui::Id::new(("tool-change-date", &self.session, &self.selected))).desired_width(f32::INFINITY)),
                 )
                 .changed();
             changed |= out
@@ -1394,6 +1479,8 @@ impl ToolWorkspace {
                 }
                 out.label(ui, "只有允许的状态转移才可演练，不会改写实际记录的过去事件");
             });
+            if let Some(index) = draft.selected_outcome {
+                out.label(ui, format!("已选择方案 {}，尚未生效。现在确认它适用于哪些记录", if index == 0 { "A" } else { "B" }));
             out.label(ui, "适用范围");
             for (scope, key, label) in [
                 (ScopeKind::SingleRecord, "scope.single", "只改这一笔"),
@@ -1417,12 +1504,14 @@ impl ToolWorkspace {
                     .control(key, ui.radio_value(&mut draft.scope, scope, label))
                     .changed();
             }
-            out.label(ui, "理由（必填，可以写“暂时还不能判断”）");
+            out.label(ui, "理由（可选）");
+            out.label(ui, "留空时只记录系统说明：未提供理由，用户选择了这个结果；不会把系统说明当作你的原话。");
             changed |= out
                 .control(
                     "change.reason",
                     ui.add(
                         TextEdit::multiline(&mut draft.reason)
+                            .id(egui::Id::new(("tool-change-reason", &self.session, &self.selected)))
                             .desired_rows(2)
                             .desired_width(f32::INFINITY),
                     ),
@@ -1474,6 +1563,8 @@ impl ToolWorkspace {
                 }
             });
             out.control("change.supersedes.expand", supersedes.header_response);
+            }
+
         });
         if changed {
             self.input_epoch += 1;
@@ -1486,13 +1577,23 @@ impl ToolWorkspace {
         if out.button(
             ui,
             "change.rehearse",
-            "在副本上演练两种结果",
+            if draft.selected_outcome.is_some() {
+                "重新演练所选范围，核对后采用"
+            } else {
+                "在副本上演练两种结果"
+            },
             self.pending.is_none() && input.is_ok() && !stale,
         ) {
             self.emit(
                 view,
-                WorkspaceAction::Rehearse {
-                    input: input.as_ref().unwrap().clone(),
+                if draft.selected_outcome.is_some() {
+                    WorkspaceAction::Rehearse {
+                        input: input.as_ref().unwrap().clone(),
+                    }
+                } else {
+                    WorkspaceAction::Compare {
+                        input: input.as_ref().unwrap().clone(),
+                    }
                 },
                 out,
             );
@@ -1513,7 +1614,7 @@ impl ToolWorkspace {
             out.label(
                 ui,
                 format!(
-                    "冻结范围：{} 笔现有记录；{}以后新建记录的默认规则",
+                    "本次演练范围：{} 笔现有记录；{}以后新建记录的默认规则",
                     preview.scope.frozen_record_ids.len(),
                     if preview.scope.applies_to_future_records {
                         "会改变"
@@ -1522,11 +1623,11 @@ impl ToolWorkspace {
                     }
                 ),
             );
-            out.label(
-                ui,
-                "原始录入、状态变化、完成时间与承诺事实不会被规则预览改写",
-            );
-            for candidate in &preview.candidates {
+            if self.comparison_only {
+                out.label(ui, "这只是眼前记录的副本比较，不是适用于其他记录的证明，也没有采用任何规则。选择结果后再确认范围。");
+            }
+            out.label(ui, "未覆盖的记录、日期和条件仍未知。原始录入、状态变化、完成时间与承诺事实不会被规则预览改写");
+            for (index, candidate) in preview.candidates.iter().enumerate() {
                 ui.separator();
                 out.label(ui, &candidate.label);
                 out.label(ui, "实际现有记录的影响");
@@ -1559,7 +1660,23 @@ impl ToolWorkspace {
                             && e.errors.is_empty()
                             && e.runtime_semantics_version == RUNTIME_SEMANTICS_VERSION
                     });
+                if self.comparison_only && draft.selected_outcome.is_none() {
+                    if out.button(
+                        ui,
+                        &format!("candidate.choose.{}", candidate.candidate_id),
+                        "选择这个结果，再确认适用范围",
+                        self.pending.is_none() && current && local,
+                    ) {
+                        draft.selected_outcome = Some(index);
+                        self.input_epoch += 1;
+                        self.preview_request = None;
+                        self.notice = Some("结果已选中，尚未采用。请确认范围并重新演练".into());
+                    }
+                    continue;
+                }
                 let enabled = self.writable(view)
+                    && !self.comparison_only
+                    && draft.selected_outcome == Some(index)
                     && current
                     && local
                     && candidate.ready_to_adopt
@@ -1591,6 +1708,18 @@ impl ToolWorkspace {
                 "还没有演练结果。运行后会显示真实计算值，不会预填通过状态",
             );
         }
+        if draft.selected_outcome.is_some()
+            && out.button(
+                ui,
+                "change.compare_again",
+                "返回比较，重新选择结果",
+                self.pending.is_none(),
+            )
+        {
+            draft.selected_outcome = None;
+            self.input_epoch += 1;
+            self.preview_request = None;
+        }
         ui.separator();
         out.label(
             ui,
@@ -1609,7 +1738,12 @@ impl ToolWorkspace {
                 ui,
                 key,
                 label,
-                self.writable(view) && input.is_ok() && !stale,
+                self.writable(view)
+                    && input.is_ok()
+                    && !stale
+                    && view.rehearsal.is_some_and(|preview| {
+                        preview.fresh && self.current_context(view, &preview.context)
+                    }),
             ) {
                 self.emit(
                     view,
@@ -1912,4 +2046,17 @@ fn rule_name(rule: RuleKey) -> &'static str {
         RuleKey::DeliveryTarget => "交付目标",
         RuleKey::Reminder => "提醒",
     }
+}
+
+fn new_project_location(parent: &Path) -> String {
+    static NEXT_LOCATION: AtomicU64 = AtomicU64::new(0);
+    parent
+        .join(format!(
+            "tool-{:x}-{:x}-{:x}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+            NEXT_LOCATION.fetch_add(1, Ordering::Relaxed)
+        ))
+        .display()
+        .to_string()
 }

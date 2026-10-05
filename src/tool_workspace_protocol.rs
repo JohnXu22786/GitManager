@@ -66,6 +66,11 @@ pub enum WorkspaceAction {
         spec: ToolSpec,
     },
     Record(ToolCommand),
+    /// First, copied-record comparison only. It cannot authorize adoption.
+    Compare {
+        input: RuleInput,
+    },
+    /// Fresh scope-bound proof after the user has selected an outcome.
     Rehearse {
         input: RuleInput,
     },
@@ -175,4 +180,22 @@ pub struct WithdrawalView {
     pub preserved_event_count: usize,
     pub retained_bindings: Vec<RetainedBindingView>,
     pub conflicts: Vec<ConflictView>,
+}
+
+/// Suggested private storage root, never a temporary fallback. This does not
+/// create directories or authorize writes; the controller validates every path.
+pub fn default_tool_data_directory() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    #[cfg(target_os = "windows")]
+    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    #[cfg(target_os = "macos")]
+    let base = std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join("Library/Application Support"));
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let base = match std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
+        Some(path) => Some(PathBuf::from(path)),
+        None => std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")),
+    };
+    base.filter(|path| path.is_absolute())
+        .map(|base| base.join("GitManager/tools"))
 }
