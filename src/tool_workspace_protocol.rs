@@ -23,6 +23,8 @@ pub struct WorkspaceView<'a> {
     /// Effective scoped policy for each displayed record, resolved by the controller.
     /// Original saved requests, projected using the decision layer accessor.
     pub decision_requests: &'a BTreeMap<String, String>,
+    /// The immutable spec revision each existing record was created with.
+    pub record_specs: &'a BTreeMap<String, ToolSpec>,
     pub record_policies: &'a BTreeMap<String, BehaviorPolicy>,
     pub record_history: &'a [RecordEvent],
     pub operation: Option<&'a OperationStatus>,
@@ -85,6 +87,8 @@ pub enum WorkspaceAction {
 /// scope, and executes both candidates; these fields never directly edit records.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuleInput {
+    /// Explicit dimensions chosen by the user; never inferred from one record or other targets.
+    pub rule_keys: Vec<RuleKey>,
     pub original_request: String,
     pub rationale: String,
     pub unresolved_questions: Vec<String>,

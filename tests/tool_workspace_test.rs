@@ -342,7 +342,12 @@ fn editing_optional_boolean_preserves_true_until_user_changes_it() {
     model.records[0]
         .values
         .insert("urgent".into(), FieldValue::Boolean(true));
-    let view = fixture::project_view(&model);
+    let specs = std::collections::BTreeMap::from([
+        ("order-1".into(), model.active_spec.clone()),
+        ("order-2".into(), model.active_spec.clone()),
+    ]);
+    let mut view = fixture::project_view(&model);
+    view.record_specs = &specs;
     let mut h = EguiHarness::new(Vec2::new(800.0, 1500.0));
     let mut state = ToolWorkspace::default();
     click(&mut h, &mut state, &view, "record.select.order-1");
@@ -1005,4 +1010,159 @@ fn back_cancels_only_the_local_rehearsal_and_ignores_its_late_reply() {
         .text
         .iter()
         .any(|s| s.contains("旧演练的结果")));
+}
+
+#[test]
+fn record_text_keeps_focus_across_dirty_label_and_character_frames() {
+    let model = fixture::model();
+    let view = fixture::project_view(&model);
+    let mut h = EguiHarness::new(Vec2::new(800.0, 1500.0));
+    let mut state = ToolWorkspace::default();
+    click(&mut h, &mut state, &view, "record.new");
+    click(&mut h, &mut state, &view, "field.order_number");
+    for character in "native-order".chars() {
+        h.text(&character.to_string());
+        frame(&mut h, &mut state, &view);
+    }
+    type_in(
+        &mut h,
+        &mut state,
+        &view,
+        "field.work_description",
+        "real typing",
+    );
+    let request = click(&mut h, &mut state, &view, "record.save")
+        .request
+        .unwrap();
+    let WorkspaceAction::Record(ToolCommand::CreateRecord { values, .. }) = request.action else {
+        panic!("expected record creation")
+    };
+    assert_eq!(
+        values["order_number"],
+        FieldValue::Text("native-order".into())
+    );
+}
+
+#[test]
+fn optional_enum_creation_validates_choices_and_keeps_per_character_focus() {
+    let mut h = EguiHarness::new(Vec2::new(900.0, 2000.0));
+    let mut state = ToolWorkspace::default();
+    let view = fixture::entry_view();
+    click(&mut h, &mut state, &view, "entry.create");
+    click(&mut h, &mut state, &view, "spec.expand");
+    // Let the real collapsing-header animation expose its lower controls before
+    // clicking. A returned layout rectangle can still be outside its clip rect.
+    for _ in 0..15 {
+        frame(&mut h, &mut state, &view);
+    }
+    type_in(&mut h, &mut state, &view, "spec.optional.name", "包装");
+    click(&mut h, &mut state, &view, "spec.optional.kind.4");
+    for invalid in ["", "small\nsmall", "small\n\nlarge"] {
+        type_in(&mut h, &mut state, &view, "spec.optional.choices", invalid);
+        assert!(frame(&mut h, &mut state, &view).controls["spec.optional.add"].enabled);
+        click(&mut h, &mut state, &view, "spec.optional.add");
+        let invalid_result = frame(&mut h, &mut state, &view);
+        assert!(!invalid_result.controls.contains_key("spec.field.custom-1"));
+        assert!(invalid_result
+            .text
+            .iter()
+            .any(|text| text.contains("字段未添加")));
+    }
+    type_in(&mut h, &mut state, &view, "spec.optional.choices", "");
+    for character in "small\nlarge".chars() {
+        if character == '\n' {
+            h.key(Key::Enter, true, Modifiers::NONE);
+            frame(&mut h, &mut state, &view);
+            h.key(Key::Enter, false, Modifiers::NONE);
+        } else {
+            h.text(&character.to_string());
+        }
+        frame(&mut h, &mut state, &view);
+    }
+    click(&mut h, &mut state, &view, "spec.optional.add");
+    type_in(
+        &mut h,
+        &mut state,
+        &view,
+        "project.location",
+        "/home/test/orders",
+    );
+    let req = click(&mut h, &mut state, &view, "project.submit")
+        .request
+        .unwrap();
+    let WorkspaceAction::CreateProject { spec, .. } = req.action else {
+        panic!("create expected")
+    };
+    assert_eq!(
+        spec.field("custom-1")
+            .unwrap_or_else(|| panic!("spec {spec:?}"))
+            .kind,
+        FieldKind::Enum {
+            options: vec!["small".into(), "large".into()]
+        }
+    );
+}
+
+#[test]
+fn explicit_rule_dimensions_survive_scope_switch_and_invalidate_old_preview() {
+    let model = fixture::model();
+    let mut view = fixture::project_view(&model);
+    let mut h = EguiHarness::new(Vec2::new(900.0, 1800.0));
+    let mut state = ToolWorkspace::default();
+    click(&mut h, &mut state, &view, "record.select.order-1");
+    click(&mut h, &mut state, &view, "record.change");
+    type_in(
+        &mut h,
+        &mut state,
+        &view,
+        "change.request",
+        "把此计时用于以后记录",
+    );
+    type_in(
+        &mut h,
+        &mut state,
+        &view,
+        "change.reason",
+        "明确选择范围与做法",
+    );
+    click(&mut h, &mut state, &view, "change.timer.apply");
+    click(&mut h, &mut state, &view, "change.reminder.apply");
+    click(&mut h, &mut state, &view, "scope.future");
+    let request = click(&mut h, &mut state, &view, "change.rehearse")
+        .request
+        .unwrap();
+    let WorkspaceAction::Rehearse { input } = request.action else {
+        panic!("rehearsal expected")
+    };
+    assert_eq!(
+        input.rule_keys,
+        vec![RuleKey::DeliveryTarget, RuleKey::Timer, RuleKey::Reminder]
+    );
+    assert_eq!(input.scope, ScopeKind::FutureRecords);
+    let mut preview = fixture::rehearsal(request.context.clone());
+    preview.scope.kind = ScopeKind::FutureRecords;
+    preview.scope.frozen_record_ids.clear();
+    preview.scope.applies_to_future_records = true;
+    let status = OperationStatus {
+        delivery_id: 1,
+        context: request.context,
+        outcome: OperationOutcome::PreviewReady,
+    };
+    view.operation = Some(&status);
+    view.rehearsal = Some(&preview);
+    view.next_operation_id = "operation-2";
+    assert!(frame(&mut h, &mut state, &view).controls["candidate.adopt.a"].enabled);
+    click(&mut h, &mut state, &view, "change.reminder.apply");
+    assert!(!frame(&mut h, &mut state, &view).controls["candidate.adopt.a"].enabled);
+    let next = click(&mut h, &mut state, &view, "change.rehearse")
+        .request
+        .unwrap();
+    let WorkspaceAction::Rehearse { input } = next.action else {
+        panic!("rehearsal expected")
+    };
+    assert_eq!(
+        input.rule_keys,
+        vec![RuleKey::DeliveryTarget, RuleKey::Timer]
+    );
+    assert_eq!(input.scope, ScopeKind::FutureRecords);
 }

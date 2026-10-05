@@ -83,13 +83,12 @@ struct RecordDraft {
     dirty: bool,
 }
 impl RecordDraft {
-    fn new(model: &ToolViewModel, record: Option<&ToolRecordView>) -> Self {
+    fn new(model: &ToolViewModel, spec: &ToolSpec, record: Option<&ToolRecordView>) -> Self {
         let original = record.map(|r| r.values.clone()).unwrap_or_default();
         Self {
             generation: model.generation,
             revision: record.map(|r| r.record_revision),
-            values: model
-                .active_spec
+            values: spec
                 .fields
                 .iter()
                 .map(|f| {
@@ -111,7 +110,7 @@ impl RecordDraft {
             original,
             stage: record
                 .map(|r| r.current_stage_id.clone())
-                .unwrap_or_else(|| model.active_spec.default_stage_id.clone()),
+                .unwrap_or_else(|| spec.default_stage_id.clone()),
             dirty: false,
         }
     }
@@ -161,6 +160,7 @@ struct ProjectDraft {
     generation: Option<u64>,
     optional_name: String,
     optional_kind: usize,
+    optional_choices: String,
 }
 impl Default for ProjectDraft {
     fn default() -> Self {
@@ -171,6 +171,7 @@ impl Default for ProjectDraft {
             generation: None,
             optional_name: String::new(),
             optional_kind: 0,
+            optional_choices: String::new(),
         }
     }
 }
@@ -181,6 +182,8 @@ struct ChangeDraft {
     reason: String,
     unresolved: String,
     policy: BehaviorPolicy,
+    apply_timer: bool,
+    apply_reminder: bool,
     scope: ScopeKind,
     date: String,
     due_override: bool,
@@ -196,6 +199,8 @@ impl ChangeDraft {
             reason: String::new(),
             unresolved: String::new(),
             policy: policy.clone(),
+            apply_timer: false,
+            apply_reminder: false,
             scope: ScopeKind::SingleRecord,
             date: view.as_of_date.to_string(),
             due_override: false,
@@ -223,7 +228,15 @@ impl ChangeDraft {
         let mut b = self.policy.clone();
         b.due_date = DateDuePolicy::ExtendByPausedDays;
         a.validate().map_err(|_| "提醒天数超出支持范围")?;
+        let mut rule_keys = vec![RuleKey::DeliveryTarget];
+        if self.apply_timer {
+            rule_keys.push(RuleKey::Timer);
+        }
+        if self.apply_reminder {
+            rule_keys.push(RuleKey::Reminder);
+        }
         Ok(RuleInput {
+            rule_keys,
             original_request: self.original_request.clone(),
             rationale: self.reason.clone(),
             unresolved_questions: lines(&self.unresolved),
@@ -721,18 +734,20 @@ impl ToolWorkspace {
                         "spec.optional.name",
                         ui.add(
                             TextEdit::singleline(&mut draft.optional_name)
+                                .id(egui::Id::new(("tool-optional-name", &self.session, configure, &self.project)))
                                 .desired_width(f32::INFINITY),
                         ),
                     )
                     .changed();
                 ui.horizontal_wrapped(|ui| {
-                    for (i, label) in ["文字", "日期", "整数", "是或否"].iter().enumerate()
-                    {
-                        edited |= ui
-                            .selectable_value(&mut draft.optional_kind, i, *label)
-                            .changed();
+                    for (i, label) in ["文字", "日期", "整数", "是或否", "枚举（选项）"].iter().enumerate() {
+                        edited |= out.control(&format!("spec.optional.kind.{i}"),ui.selectable_value(&mut draft.optional_kind,i,*label)).changed();
                     }
                 });
+                if draft.optional_kind==4 {
+                    out.label(ui,"枚举选项：每行一个，不得为空或重复，最多 128 项；保存后的选项不自动改写旧记录");
+                    edited |= out.control("spec.optional.choices",ui.add(TextEdit::multiline(&mut draft.optional_choices).id(egui::Id::new(("tool-enum-choices",&self.session,configure,&self.project))).desired_rows(3).desired_width(f32::INFINITY))).changed();
+                }
                 if out.button(
                     ui,
                     "spec.optional.add",
@@ -746,21 +761,26 @@ impl ToolWorkspace {
                         n += 1;
                     }
                     let id = format!("custom-{n}");
-                    draft.spec.fields.push(FieldDefinition {
+                    let mut candidate=draft.spec.clone();
+                    candidate.fields.push(FieldDefinition {
                         id: id.clone(),
                         display_name: draft.optional_name.trim().into(),
                         kind: match draft.optional_kind {
                             1 => FieldKind::Date,
                             2 => FieldKind::Integer,
                             3 => FieldKind::Boolean,
+                            4 => FieldKind::Enum { options:draft.optional_choices.lines().map(|line|line.trim().to_owned()).collect() },
                             _ => FieldKind::Text,
                         },
                         role: FieldRole::Custom,
                         required: false,
                         extensions: BTreeMap::new(),
                     });
-                    draft.spec.detail_field_ids.push(id);
-                    draft.optional_name.clear();
+                    candidate.detail_field_ids.push(id);
+                    match candidate.validate() {
+                        Ok(())=> { draft.spec=candidate; draft.optional_name.clear(); draft.optional_choices.clear(); self.error=None; }
+                        Err(error)=> { self.error=Some(format!("字段未添加：请检查选项，每行一项且不得为空或重复（最多 128 项）。{}",error.path)); }
+                    }
                 }
             });
             edited |= out.control("spec.expand", fields.header_response).changed();
@@ -798,6 +818,9 @@ impl ToolWorkspace {
                 ..ProjectDraft::default()
             };
         }
+        if !draft.optional_name.trim().is_empty() {
+            out.label(ui, "待添加字段尚未进入设置，请先添加或清空它，再保存工具");
+        }
         if out.button(
             ui,
             "project.submit",
@@ -806,7 +829,7 @@ impl ToolWorkspace {
             } else {
                 "创建正式工具"
             },
-            allowed && !stale,
+            allowed && !stale && draft.optional_name.trim().is_empty(),
         ) {
             if draft.name.trim().is_empty() || (!configure && draft.location.trim().is_empty()) {
                 self.error = Some("请填写工具名称和本地保存位置".into());
@@ -1055,11 +1078,23 @@ impl ToolWorkspace {
         } else {
             "新增记录"
         });
+        let spec = if let Some(id) = &self.selected {
+            let Some(spec) = view.record_specs.get(id) else {
+                out.label(ui, "记录的原始字段版本缺失，不能安全编辑。请重新打开工具");
+                return;
+            };
+            spec
+        } else {
+            &model.active_spec
+        };
+        if spec.revision != model.active_spec.revision {
+            out.label(ui, "这笔记录保留创建时的字段版本；后来新增的可选字段不适用于此记录，新记录使用当前版本。原有字段仍可编辑。");
+        }
         let key = self.key();
         let mut draft = self
             .drafts
             .remove(&key)
-            .unwrap_or_else(|| RecordDraft::new(model, self.record(model)));
+            .unwrap_or_else(|| RecordDraft::new(model, spec, self.record(model)));
         let stale = draft.generation != model.generation
             || draft.revision != self.record(model).map(|r| r.record_revision);
         if stale {
@@ -1076,14 +1111,14 @@ impl ToolWorkspace {
                 self.pending.is_none(),
             )
         {
-            draft = RecordDraft::new(model, self.record(model));
+            draft = RecordDraft::new(model, spec, self.record(model));
         }
         if draft.dirty {
             self.notice = None;
             out.label(ui, "未保存");
         }
         ui.add_enabled_ui(self.writable(view) && !stale, |ui| {
-            for field in &model.active_spec.fields {
+            for field in &spec.fields {
                 let Some(input) = draft.values.get_mut(&field.id) else {
                     continue;
                 };
@@ -1119,8 +1154,15 @@ impl ToolWorkspace {
                         FieldKind::Enum { options } => {
                             let before = input.text.clone();
                             ui.horizontal_wrapped(|ui| {
-                                for option in options {
-                                    ui.selectable_value(&mut input.text, option.clone(), option);
+                                for (index, option) in options.iter().enumerate() {
+                                    out.control(
+                                        &format!("enum.{}.{index}", field.id),
+                                        ui.selectable_value(
+                                            &mut input.text,
+                                            option.clone(),
+                                            option,
+                                        ),
+                                    );
                                 }
                             });
                             before != input.text
@@ -1138,7 +1180,15 @@ impl ToolWorkspace {
                             };
                             out.control(
                                 &format!("field.{}", field.id),
-                                ui.add(edit.desired_width(f32::INFINITY)),
+                                ui.add(
+                                    edit.id(egui::Id::new((
+                                        "tool-record-field",
+                                        &self.session,
+                                        &key,
+                                        &field.id,
+                                    )))
+                                    .desired_width(f32::INFINITY),
+                                ),
                             )
                             .changed()
                         }
@@ -1148,12 +1198,11 @@ impl ToolWorkspace {
             }
         });
         if out.button(ui, "record.save", "保存记录", self.writable(view) && !stale) {
-            match draft.values(&model.active_spec) {
+            match draft.values(spec) {
                 Err(error) => self.error = Some(error),
                 Ok(values) => {
                     let command = if let Some(record) = self.record(model) {
-                        let changes: BTreeMap<_, _> = model
-                            .active_spec
+                        let changes: BTreeMap<_, _> = spec
                             .fields
                             .iter()
                             .filter_map(|f| {
@@ -1252,26 +1301,20 @@ impl ToolWorkspace {
                     ),
                 )
                 .changed();
+            out.label(ui,"本次始终比较交付目标。勾选的计时和提醒也应用到所选范围；未勾选的保持各笔记录及未来默认各自的规则。");
+            changed |= out.control("change.timer.apply",ui.checkbox(&mut draft.apply_timer,"也修改所选范围的制作计时")).changed();
             ui.horizontal_wrapped(|ui| {
-                changed |= ui
-                    .radio_value(
-                        &mut draft.policy.timer,
-                        TimerPolicy::PauseStagesMarkedPaused,
-                        "等待时暂停制作计时",
-                    )
-                    .changed();
-                changed |= ui
-                    .radio_value(
-                        &mut draft.policy.timer,
-                        TimerPolicy::CountPausedStages,
-                        "等待也计入制作时间",
-                    )
-                    .changed();
+                for (policy,key,label) in [(TimerPolicy::PauseStagesMarkedPaused,"change.timer.pause","等待时暂停制作计时"),(TimerPolicy::CountPausedStages,"change.timer.count","等待也计入制作时间")] {
+                    let response=out.control(key,ui.radio_value(&mut draft.policy.timer,policy,label));
+                    if response.clicked() { changed |= !draft.apply_timer;draft.apply_timer=true; }
+                    changed |= response.changed();
+                }
             });
             out.label(
                 ui,
                 "将实际比较：A 保留原承诺日期；B 显示目标按等待天数顺延。两者都会保留原始承诺。",
             );
+            changed |= out.control("change.reminder.apply",ui.checkbox(&mut draft.apply_reminder,"也修改所选范围的跟进提醒")).changed();
             let mut reminder_kind = match draft.policy.reminder {
                 ReminderPolicy::Never => 0,
                 ReminderPolicy::WaitingBeforeDue { .. } => 1,
@@ -1279,9 +1322,10 @@ impl ToolWorkspace {
             };
             let old_kind = reminder_kind;
             ui.horizontal_wrapped(|ui| {
-                ui.radio_value(&mut reminder_kind, 0, "不提醒");
-                ui.radio_value(&mut reminder_kind, 1, "临近承诺日提醒");
-                ui.radio_value(&mut reminder_kind, 2, "等待达到天数时提醒");
+                for (kind,label) in [(0,"不提醒"),(1,"临近承诺日提醒"),(2,"等待达到天数时提醒")] {
+                    let response=out.control(&format!("change.reminder.{kind}"),ui.radio_value(&mut reminder_kind,kind,label));
+                    if response.clicked() { changed |= !draft.apply_reminder;draft.apply_reminder=true; }
+                }
             });
             if reminder_kind != old_kind {
                 changed = true;
@@ -1293,22 +1337,24 @@ impl ToolWorkspace {
             }
             match &mut draft.policy.reminder {
                 ReminderPolicy::WaitingBeforeDue { days_before_due } => {
-                    changed |= ui
+                    let threshold_changed = ui
                         .add(
                             egui::DragValue::new(days_before_due)
                                 .range(0..=3650)
                                 .suffix(" 天前"),
                         )
                         .changed();
+                    if threshold_changed { draft.apply_reminder=true; changed=true; }
                 }
                 ReminderPolicy::WaitingAfterDays { days_waiting } => {
-                    changed |= ui
+                    let threshold_changed = ui
                         .add(
                             egui::DragValue::new(days_waiting)
                                 .range(1..=3650)
                                 .suffix(" 天后"),
                         )
                         .changed();
+                    if threshold_changed { draft.apply_reminder=true; changed=true; }
                 }
                 _ => {}
             }

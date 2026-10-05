@@ -11,6 +11,14 @@ mod task_merge_preview;
 mod task_integrated_verification;
 mod ui;
 mod updater;
+mod tool_project;
+mod tool_runtime;
+mod tool_store;
+mod tool_decisions;
+mod tool_proposal_input;
+mod tool_proposals;
+mod tool_workspace_protocol;
+mod tool_studio;
 
 use eframe::egui;
 use std::path::{Path, PathBuf};

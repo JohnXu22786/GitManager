@@ -71,6 +71,7 @@ pub fn entry_view<'a>() -> WorkspaceView<'a> {
         is_example: false,
         decision_requests: decision_requests(),
         record_policies: policies(),
+        record_specs: specs(),
         record_history: &[],
         operation: None,
         rehearsal: None,
@@ -166,4 +167,14 @@ fn policies() -> &'static BTreeMap<String, BehaviorPolicy> {
 fn decision_requests() -> &'static BTreeMap<String, String> {
     static REQUESTS: std::sync::OnceLock<BTreeMap<String, String>> = std::sync::OnceLock::new();
     REQUESTS.get_or_init(BTreeMap::new)
+}
+
+fn specs() -> &'static BTreeMap<String, ToolSpec> {
+    static SPECS: std::sync::OnceLock<BTreeMap<String, ToolSpec>> = std::sync::OnceLock::new();
+    SPECS.get_or_init(|| {
+        BTreeMap::from([
+            ("order-1".into(), studio_order_template()),
+            ("order-2".into(), studio_order_template()),
+        ])
+    })
 }

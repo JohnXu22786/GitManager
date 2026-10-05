@@ -1,3 +1,4 @@
+pub mod tool_workspace;
 pub mod status_panel;
 pub mod branch_panel;
 pub mod worktree_panel;

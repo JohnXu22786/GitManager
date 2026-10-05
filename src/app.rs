@@ -595,6 +595,8 @@ pub enum Tab {
 }
 
 pub struct App {
+    pub tool_studio: crate::tool_studio::ToolStudio,
+    pub tools_mode: bool,
     pub git: GitRepo,
     pub current_tab: Tab,
     pub repo_path: String,
@@ -703,6 +705,8 @@ impl App {
 
     pub fn new() -> Self {
         Self {
+            tool_studio: crate::tool_studio::ToolStudio::new(),
+            tools_mode: true,
             git: GitRepo::new(),
             current_tab: Tab::Worktrees,
             repo_path: String::new(),
@@ -1017,6 +1021,7 @@ impl App {
     }
 
     pub fn open_repo(&mut self, path: &str) {
+        self.tools_mode = false;
         self.open_repo_path(Path::new(path));
     }
 
@@ -3496,7 +3501,9 @@ impl eframe::App for App {
         // --- Top Bar ---
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
+                if ui.button("我的工具").clicked() { self.tools_mode = true; }
                 if crate::ui::ellipsis_button(ui, "☷ Tasks").clicked() {
+                    self.tools_mode = false;
                     self.current_tab = Tab::Tasks;
                 }
                 if crate::ui::add_enabled_ellipsis(ui, !self.is_busy(), "📂").clicked() {
@@ -3737,6 +3744,19 @@ impl eframe::App for App {
 
         // --- Central Panel ---
         egui::CentralPanel::default().show(ctx, |ui| {
+            if self.tools_mode {
+                let tasks = self.task_registry.entries().iter().map(|t| (t.id.clone(), t.title.clone())).collect::<Vec<_>>();
+                self.tool_studio.show(ui, &tasks, &|id| {
+                    let registry = TaskRegistry::load();
+                    let task = registry.entries().iter().find(|t| t.id == id)?;
+                    let fingerprint = crate::task_verification::source_fingerprint(
+                        std::path::Path::new(&task.worktree_path),
+                        std::path::Path::new(&task.repository_path),
+                    ).ok()?;
+                    Some(crate::tool_proposals::TaskIdentity { task_id: task.id.clone(), candidate_fingerprint: fingerprint })
+                });
+                return;
+            }
             if !self.git.is_open() {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
