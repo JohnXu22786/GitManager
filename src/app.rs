@@ -4074,6 +4074,10 @@ impl Drop for App {
 }
 
 #[cfg(test)]
+#[path = "../tests/support/egui_harness.rs"]
+mod egui_harness;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -5127,74 +5131,105 @@ mod tests {
         assert!(!app.show_clone_dialog);
     }
 
+    fn welcome_frame(harness: &mut egui_harness::EguiHarness, app: &mut App) -> egui::Response {
+        harness.frame(|ctx| {
+            egui::CentralPanel::default()
+                .show(ctx, |ui| app.show_welcome_screen(ui))
+                .inner
+        })
+    }
+
     #[test]
     fn welcome_clone_button_opens_clone_dialog_without_a_repository() {
         let mut app = App::new();
         let recent_dir = tempfile::tempdir().expect("recent directory");
         app.recent_repos = RecentRepos::load_from(recent_dir.path().join("recent.json"));
-        let ctx = egui::Context::default();
-        let screen_rect = egui::Rect::from_min_size(
-            egui::pos2(0.0, 0.0),
-            egui::vec2(800.0, 600.0),
-        );
-        let mut clone_button_rect = egui::Rect::NOTHING;
+        let mut harness = egui_harness::EguiHarness::new(egui::vec2(800.0, 600.0));
+        let position = welcome_frame(&mut harness, &mut app).rect.center();
 
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(screen_rect),
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    clone_button_rect = app.show_welcome_screen(ui).rect;
-                });
-            },
-        );
-
-        let position = clone_button_rect.center();
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(screen_rect),
-                events: vec![
-                    egui::Event::PointerMoved(position),
-                    egui::Event::PointerButton {
-                        pos: position,
-                        button: egui::PointerButton::Primary,
-                        pressed: true,
-                        modifiers: egui::Modifiers::default(),
-                    },
-                ],
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    app.show_welcome_screen(ui);
-                });
-            },
-        );
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(screen_rect),
-                events: vec![
-                    egui::Event::PointerMoved(position),
-                    egui::Event::PointerButton {
-                        pos: position,
-                        button: egui::PointerButton::Primary,
-                        pressed: false,
-                        modifiers: egui::Modifiers::default(),
-                    },
-                ],
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    app.show_welcome_screen(ui);
-                });
-            },
-        );
+        harness.press_at(position);
+        welcome_frame(&mut harness, &mut app);
+        harness.release_at(position);
+        assert!(welcome_frame(&mut harness, &mut app).clicked());
 
         assert!(!app.git.is_open());
         assert!(app.show_clone_dialog);
+    }
+
+    #[test]
+    fn welcome_clone_press_and_hold_does_not_open_dialog() {
+        let mut app = App::new();
+        let recent_dir = tempfile::tempdir().expect("recent directory");
+        app.recent_repos = RecentRepos::load_from(recent_dir.path().join("recent.json"));
+        let mut harness = egui_harness::EguiHarness::new(egui::vec2(800.0, 600.0));
+        let position = welcome_frame(&mut harness, &mut app).rect.center();
+
+        harness.press_at(position);
+        for _ in 0..3 {
+            let response = welcome_frame(&mut harness, &mut app);
+            assert!(response.is_pointer_button_down_on());
+            assert!(!response.clicked());
+            assert!(!app.show_clone_dialog);
+            assert!(!app.git.is_open());
+        }
+        harness.release_at(position);
+        assert!(welcome_frame(&mut harness, &mut app).clicked());
+        assert!(app.show_clone_dialog);
+        assert!(!app.git.is_open());
+    }
+
+    #[test]
+    fn welcome_clone_move_out_and_release_does_not_open_dialog() {
+        let mut app = App::new();
+        let recent_dir = tempfile::tempdir().expect("recent directory");
+        app.recent_repos = RecentRepos::load_from(recent_dir.path().join("recent.json"));
+        let mut harness = egui_harness::EguiHarness::new(egui::vec2(800.0, 600.0));
+        let position = welcome_frame(&mut harness, &mut app).rect.center();
+        let outside = egui::pos2(1.0, 1.0);
+
+        harness.press_at(position);
+        welcome_frame(&mut harness, &mut app);
+        harness.move_to(outside);
+        assert!(!welcome_frame(&mut harness, &mut app).clicked());
+        harness.release_at(outside);
+        assert!(!welcome_frame(&mut harness, &mut app).clicked());
+        assert!(!app.show_clone_dialog);
+        assert!(!app.git.is_open());
+
+        harness.press_at(position);
+        welcome_frame(&mut harness, &mut app);
+        harness.release_at(position);
+        assert!(welcome_frame(&mut harness, &mut app).clicked());
+        assert!(app.show_clone_dialog);
+        assert!(!app.git.is_open());
+    }
+
+    #[test]
+    fn welcome_clone_repeated_clicks_after_resize_use_current_geometry() {
+        let mut app = App::new();
+        let recent_dir = tempfile::tempdir().expect("recent directory");
+        app.recent_repos = RecentRepos::load_from(recent_dir.path().join("recent.json"));
+        let mut harness = egui_harness::EguiHarness::new(egui::vec2(800.0, 600.0));
+        let original = welcome_frame(&mut harness, &mut app).rect;
+        harness.resize(egui::vec2(320.0, 480.0));
+        let resized = welcome_frame(&mut harness, &mut app).rect;
+        assert_ne!(resized.center(), original.center());
+        assert!(
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(320.0, 480.0))
+                .contains_rect(resized)
+        );
+        assert!(!app.show_clone_dialog);
+
+        // Only the welcome action is rendered here, not the clone dialog itself.
+        for _ in 0..2 {
+            harness.press_at(resized.center());
+            assert!(!welcome_frame(&mut harness, &mut app).clicked());
+            harness.release_at(resized.center());
+            assert!(welcome_frame(&mut harness, &mut app).clicked());
+            assert!(app.show_clone_dialog);
+            assert!(!app.git.is_open());
+            assert!(!welcome_frame(&mut harness, &mut app).clicked());
+        }
     }
 
     #[test]
