@@ -547,3 +547,60 @@ fn pointer_writer_failure_and_timeout_are_bounded() {
         );
     }
 }
+
+#[cfg(windows)]
+#[test]
+fn windows_pointer_replacement_preserves_an_open_reader() {
+    use std::io::Read;
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = fs::canonicalize(dir.path()).unwrap();
+    let files = product_files::Directory::open(&path).unwrap();
+    files
+        .publish("CURRENT", b"old committed pointer", false)
+        .unwrap();
+    let mut old_reader = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path.join("CURRENT"))
+        .unwrap();
+    files
+        .publish("CURRENT", b"new committed pointer", true)
+        .unwrap();
+    let mut old_bytes = Vec::new();
+    old_reader.read_to_end(&mut old_bytes).unwrap();
+    assert_eq!(old_bytes, b"old committed pointer");
+    assert_eq!(files.read("CURRENT", 64).unwrap(), b"new committed pointer");
+    assert!(files.publish("CURRENT", b"collision", false).is_err());
+    assert_eq!(files.read("CURRENT", 64).unwrap(), b"new committed pointer");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_replacement_does_not_override_readonly_or_hardlinks() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = fs::canonicalize(dir.path()).unwrap();
+    let files = product_files::Directory::open(&path).unwrap();
+    files.publish("CURRENT", b"preserved", false).unwrap();
+    let target = path.join("CURRENT");
+    let original = fs::metadata(&target).unwrap().permissions();
+    let mut readonly = original.clone();
+    readonly.set_readonly(true);
+    fs::set_permissions(&target, readonly).unwrap();
+    let rejected = files.publish("CURRENT", b"must not replace", true);
+    let bytes = fs::read(&target).unwrap();
+    fs::set_permissions(&target, original).unwrap();
+    assert!(rejected.is_err(), "readonly refusal must remain visible");
+    assert_eq!(bytes, b"preserved");
+    let alias = path.join("external-alias");
+    fs::hard_link(&target, &alias).unwrap();
+    assert!(files
+        .publish("CURRENT", b"must not redirect", true)
+        .is_err());
+    assert_eq!(fs::read(&target).unwrap(), b"preserved");
+    assert_eq!(fs::read(&alias).unwrap(), b"preserved");
+}

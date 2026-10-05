@@ -187,7 +187,16 @@ impl Directory {
         valid_name(OsStr::new(name))?;
         // Existing objects/pointers must never be symlinks or special files.
         match self.open_file(OsStr::new(name), false, false) {
-            Ok(_) => {}
+            Ok(_existing) =>
+            {
+                #[cfg(windows)]
+                if replace && _existing.metadata()?.permissions().readonly() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "the existing project file is read-only",
+                    ));
+                }
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
@@ -442,6 +451,14 @@ mod windows {
         let mut temporary = tempfile::NamedTempFile::new_in(path)?;
         temporary.write_all(bytes)?;
         temporary.as_file().sync_all()?;
+        if replace {
+            // Rust's Windows rename uses FileRenameInfoEx when necessary so
+            // existing readers retain their old handle while new opens see
+            // the new file. MoveFileExW alone can reject an open destination.
+            // Keep the no-clobber path below separate for immutable objects.
+            fs::rename(temporary.path(), path.join(name))?;
+            return temporary.as_file().sync_all();
+        }
         let source: Vec<u16> = temporary
             .path()
             .as_os_str()
@@ -454,19 +471,7 @@ mod windows {
             .encode_wide()
             .chain(Some(0))
             .collect();
-        if unsafe {
-            MoveFileExW(
-                source.as_ptr(),
-                target.as_ptr(),
-                MOVEFILE_WRITE_THROUGH
-                    | if replace {
-                        MOVEFILE_REPLACE_EXISTING
-                    } else {
-                        0
-                    },
-            )
-        } == 0
-        {
+        if unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(())
