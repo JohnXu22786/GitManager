@@ -1177,10 +1177,33 @@ fn directory_path_from_handle(directory: &File, fallback: &Path) -> io::Result<P
     }
     #[cfg(target_os = "macos")]
     {
+        use std::ffi::CStr;
         use std::os::fd::AsRawFd;
+        use std::os::raw::{c_char, c_int};
+        use std::os::unix::ffi::OsStrExt;
+
+        const F_GETPATH: c_int = 50;
+        extern "C" {
+            fn fcntl(descriptor: c_int, command: c_int, ...) -> c_int;
+        }
 
         let _ = fallback;
-        return Ok(PathBuf::from(format!("/dev/fd/{}", directory.as_raw_fd())));
+        let mut bytes = [0 as c_char; 1024];
+        let result = unsafe { fcntl(directory.as_raw_fd(), F_GETPATH, bytes.as_mut_ptr()) };
+        if result == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let path = PathBuf::from(OsStr::from_bytes(
+            unsafe { CStr::from_ptr(bytes.as_ptr()) }.to_bytes(),
+        ));
+        let reopened = open_store_directory(&path)?;
+        if !same_directory_identity(directory, &reopened)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory handle path no longer identifies the pinned directory",
+            ));
+        }
+        return Ok(path);
     }
     #[cfg(windows)]
     {
@@ -1288,27 +1311,38 @@ fn open_store_directory(path: &Path) -> io::Result<File> {
 }
 
 fn same_directory_identity(left: &File, right: &File) -> io::Result<bool> {
-    let left = left.metadata()?;
-    let right = right.metadata()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
 
+        let left = left.metadata()?;
+        let right = right.metadata()?;
         Ok(left.dev() == right.dev() && left.ino() == right.ino())
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
 
-        let left_identity = left.volume_serial_number().zip(left.file_index());
-        let right_identity = right.volume_serial_number().zip(right.file_index());
-        match (left_identity, right_identity) {
-            (Some(left), Some(right)) => Ok(left == right),
-            _ => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "the platform did not provide stable project directory identity",
-            )),
+        fn identity(file: &File) -> io::Result<(u32, u64)> {
+            let mut information = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+            let succeeded = unsafe {
+                GetFileInformationByHandle(file.as_raw_handle() as _, information.as_mut_ptr())
+            };
+            if succeeded == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let information = unsafe { information.assume_init() };
+            Ok((
+                information.dwVolumeSerialNumber,
+                (u64::from(information.nFileIndexHigh) << 32)
+                    | u64::from(information.nFileIndexLow),
+            ))
         }
+
+        Ok(identity(left)? == identity(right)?)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -2364,6 +2398,20 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_directory_handle_path_can_stage_a_project_directory() {
+        let temporary_root = tempfile::tempdir().unwrap();
+        let directory = open_store_directory(temporary_root.path()).unwrap();
+        let staging_parent = directory_path_from_handle(&directory, temporary_root.path()).unwrap();
+
+        let staging = tempfile::Builder::new()
+            .prefix(".tool-project-create-regression-")
+            .tempdir_in(staging_parent)
+            .unwrap();
+        assert!(staging.path().is_dir());
+    }
+
     #[cfg(unix)]
     #[test]
     fn unix_parent_directory_walk_rejects_intermediate_symlinks() {
@@ -2378,5 +2426,23 @@ mod tests {
 
         let candidate = redirected_parent.join("store-parent");
         assert!(open_store_directory_chain(&candidate).is_err());
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_directory_identity_tests {
+    use super::*;
+
+    #[test]
+    fn directory_identity_uses_stable_handle_metadata() {
+        let temporary_root = tempfile::tempdir().unwrap();
+        let same_directory = open_store_directory(temporary_root.path()).unwrap();
+        let same_directory_again = open_store_directory(temporary_root.path()).unwrap();
+        let other_path = temporary_root.path().join("other");
+        fs::create_dir(&other_path).unwrap();
+        let other_directory = open_store_directory(&other_path).unwrap();
+
+        assert!(same_directory_identity(&same_directory, &same_directory_again).unwrap());
+        assert!(!same_directory_identity(&same_directory, &other_directory).unwrap());
     }
 }

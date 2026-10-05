@@ -183,6 +183,8 @@ pub struct FieldDefinition {
     pub kind: FieldKind,
     pub role: FieldRole,
     pub required: bool,
+    #[serde(flatten)]
+    pub extensions: ExtensionFields,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,6 +202,8 @@ pub struct StageDefinition {
     pub clock: StageClock,
     pub terminal: bool,
     pub allowed_next_stage_ids: Vec<String>,
+    #[serde(flatten)]
+    pub extensions: ExtensionFields,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -256,6 +260,11 @@ impl ToolSpec {
         let mut role_counts: HashMap<String, usize> = HashMap::new();
         let mut title_is_required = false;
         for (index, field) in self.fields.iter().enumerate() {
+            validate_extension_keys(
+                &field.extensions,
+                &["id", "display_name", "kind", "role", "required"],
+                &format!("fields[{index}].extensions"),
+            )?;
             if !valid_id(&field.id) || !field_ids.insert(field.id.as_str()) {
                 return Err(validation(
                     ValidationCode::DuplicateOrInvalidId,
@@ -330,6 +339,17 @@ impl ToolSpec {
 
         let mut stage_ids = HashSet::new();
         for (index, stage) in self.stages.iter().enumerate() {
+            validate_extension_keys(
+                &stage.extensions,
+                &[
+                    "id",
+                    "display_name",
+                    "clock",
+                    "terminal",
+                    "allowed_next_stage_ids",
+                ],
+                &format!("stages[{index}].extensions"),
+            )?;
             if !valid_id(&stage.id) || !stage_ids.insert(stage.id.as_str()) {
                 return Err(validation(
                     ValidationCode::DuplicateOrInvalidId,
@@ -2876,6 +2896,7 @@ pub fn studio_order_template() -> ToolSpec {
                 kind: FieldKind::Text,
                 role: FieldRole::Title,
                 required: true,
+                extensions: BTreeMap::new(),
             },
             FieldDefinition {
                 id: "work_description".to_owned(),
@@ -2883,6 +2904,7 @@ pub fn studio_order_template() -> ToolSpec {
                 kind: FieldKind::Text,
                 role: FieldRole::WorkDescription,
                 required: true,
+                extensions: BTreeMap::new(),
             },
             FieldDefinition {
                 id: "started_on".to_owned(),
@@ -2890,6 +2912,7 @@ pub fn studio_order_template() -> ToolSpec {
                 kind: FieldKind::Date,
                 role: FieldRole::WorkStartedOn,
                 required: false,
+                extensions: BTreeMap::new(),
             },
             FieldDefinition {
                 id: "promised_on".to_owned(),
@@ -2897,6 +2920,7 @@ pub fn studio_order_template() -> ToolSpec {
                 kind: FieldKind::Date,
                 role: FieldRole::PromisedDate,
                 required: false,
+                extensions: BTreeMap::new(),
             },
             FieldDefinition {
                 id: "notes".to_owned(),
@@ -2904,6 +2928,7 @@ pub fn studio_order_template() -> ToolSpec {
                 kind: FieldKind::Text,
                 role: FieldRole::Notes,
                 required: false,
+                extensions: BTreeMap::new(),
             },
         ],
         stages: vec![
@@ -2913,6 +2938,7 @@ pub fn studio_order_template() -> ToolSpec {
                 clock: StageClock::Stopped,
                 terminal: false,
                 allowed_next_stage_ids: vec!["in_progress".to_owned(), "cancelled".to_owned()],
+                extensions: BTreeMap::new(),
             },
             StageDefinition {
                 id: "in_progress".to_owned(),
@@ -2924,6 +2950,7 @@ pub fn studio_order_template() -> ToolSpec {
                     "completed".to_owned(),
                     "cancelled".to_owned(),
                 ],
+                extensions: BTreeMap::new(),
             },
             StageDefinition {
                 id: "waiting_materials".to_owned(),
@@ -2931,6 +2958,7 @@ pub fn studio_order_template() -> ToolSpec {
                 clock: StageClock::Paused,
                 terminal: false,
                 allowed_next_stage_ids: vec!["in_progress".to_owned(), "cancelled".to_owned()],
+                extensions: BTreeMap::new(),
             },
             StageDefinition {
                 id: "completed".to_owned(),
@@ -2938,6 +2966,7 @@ pub fn studio_order_template() -> ToolSpec {
                 clock: StageClock::Stopped,
                 terminal: true,
                 allowed_next_stage_ids: Vec::new(),
+                extensions: BTreeMap::new(),
             },
             StageDefinition {
                 id: "cancelled".to_owned(),
@@ -2945,6 +2974,7 @@ pub fn studio_order_template() -> ToolSpec {
                 clock: StageClock::Stopped,
                 terminal: true,
                 allowed_next_stage_ids: Vec::new(),
+                extensions: BTreeMap::new(),
             },
         ],
         default_stage_id: "queued".to_owned(),

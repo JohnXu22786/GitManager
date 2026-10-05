@@ -100,6 +100,7 @@ fn invalid_typed_fields_and_dangling_stage_references_are_rejected() {
         kind: FieldKind::Integer,
         role: FieldRole::Custom,
         required: false,
+        extensions: BTreeMap::new(),
     });
     compatible_revision.spec_revisions.push(next_spec.clone());
     compatible_revision.active_spec = (&next_spec).into();
@@ -1376,6 +1377,27 @@ fn rule_binding_history_must_point_to_an_earlier_same_dimension_binding() {
 }
 
 #[test]
+fn nested_tool_spec_extensions_survive_a_roundtrip() {
+    let field_extension = serde_json::json!({"unit": "millimeter"});
+    let stage_extension = serde_json::json!({"queue": "materials"});
+    let mut encoded = serde_json::to_value(studio_order_template()).unwrap();
+    encoded["fields"][0]["future_field_metadata"] = field_extension.clone();
+    encoded["stages"][0]["future_stage_metadata"] = stage_extension.clone();
+
+    let decoded: tool_project::ToolSpec = serde_json::from_value(encoded).unwrap();
+    let roundtrip = serde_json::to_value(decoded).unwrap();
+
+    assert_eq!(
+        roundtrip["fields"][0]["future_field_metadata"],
+        field_extension
+    );
+    assert_eq!(
+        roundtrip["stages"][0]["future_stage_metadata"],
+        stage_extension
+    );
+}
+
+#[test]
 fn flattened_extensions_cannot_shadow_serialized_fields() {
     let snapshot = fixture::studio_order_project("extension-collision-project");
     let mut shadowed_spec = studio_order_template();
@@ -1383,6 +1405,18 @@ fn flattened_extensions_cannot_shadow_serialized_fields() {
         .extensions
         .insert("spec_id".to_owned(), serde_json::json!("shadow"));
     assert!(shadowed_spec.validate().is_err());
+
+    let mut shadowed_field = studio_order_template();
+    shadowed_field.fields[0]
+        .extensions
+        .insert("id".to_owned(), serde_json::json!("shadow"));
+    assert!(shadowed_field.validate().is_err());
+
+    let mut shadowed_stage = studio_order_template();
+    shadowed_stage.stages[0]
+        .extensions
+        .insert("clock".to_owned(), serde_json::json!("shadow"));
+    assert!(shadowed_stage.validate().is_err());
 
     let mut with_record = snapshot.clone();
     with_record.records[0]

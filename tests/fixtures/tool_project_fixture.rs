@@ -44,6 +44,7 @@ pub fn maintenance_task_spec() -> ToolSpec {
                 kind: FieldKind::Text,
                 role: FieldRole::Title,
                 required: true,
+                extensions: BTreeMap::new(),
             },
             FieldDefinition {
                 id: "opened_on".to_owned(),
@@ -51,6 +52,7 @@ pub fn maintenance_task_spec() -> ToolSpec {
                 kind: FieldKind::Date,
                 role: FieldRole::WorkStartedOn,
                 required: false,
+                extensions: BTreeMap::new(),
             },
             FieldDefinition {
                 id: "target_date".to_owned(),
@@ -58,6 +60,7 @@ pub fn maintenance_task_spec() -> ToolSpec {
                 kind: FieldKind::Date,
                 role: FieldRole::PromisedDate,
                 required: false,
+                extensions: BTreeMap::new(),
             },
             FieldDefinition {
                 id: "repair_notes".to_owned(),
@@ -65,6 +68,7 @@ pub fn maintenance_task_spec() -> ToolSpec {
                 kind: FieldKind::Text,
                 role: FieldRole::Notes,
                 required: false,
+                extensions: BTreeMap::new(),
             },
             FieldDefinition {
                 id: "repair_kind".to_owned(),
@@ -74,6 +78,7 @@ pub fn maintenance_task_spec() -> ToolSpec {
                 },
                 role: FieldRole::Custom,
                 required: false,
+                extensions: BTreeMap::new(),
             },
         ],
         stages: vec![
@@ -83,6 +88,7 @@ pub fn maintenance_task_spec() -> ToolSpec {
                 clock: StageClock::Stopped,
                 terminal: false,
                 allowed_next_stage_ids: vec!["repairing".to_owned(), "cancelled".to_owned()],
+                extensions: BTreeMap::new(),
             },
             StageDefinition {
                 id: "repairing".to_owned(),
@@ -94,6 +100,7 @@ pub fn maintenance_task_spec() -> ToolSpec {
                     "done".to_owned(),
                     "cancelled".to_owned(),
                 ],
+                extensions: BTreeMap::new(),
             },
             StageDefinition {
                 id: "waiting_parts".to_owned(),
@@ -101,6 +108,7 @@ pub fn maintenance_task_spec() -> ToolSpec {
                 clock: StageClock::Paused,
                 terminal: false,
                 allowed_next_stage_ids: vec!["repairing".to_owned(), "cancelled".to_owned()],
+                extensions: BTreeMap::new(),
             },
             StageDefinition {
                 id: "done".to_owned(),
@@ -108,6 +116,7 @@ pub fn maintenance_task_spec() -> ToolSpec {
                 clock: StageClock::Stopped,
                 terminal: true,
                 allowed_next_stage_ids: vec![],
+                extensions: BTreeMap::new(),
             },
             StageDefinition {
                 id: "cancelled".to_owned(),
@@ -115,6 +124,7 @@ pub fn maintenance_task_spec() -> ToolSpec {
                 clock: StageClock::Stopped,
                 terminal: true,
                 allowed_next_stage_ids: vec![],
+                extensions: BTreeMap::new(),
             },
         ],
         default_stage_id: "open".to_owned(),
