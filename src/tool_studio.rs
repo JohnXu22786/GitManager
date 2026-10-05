@@ -75,6 +75,7 @@ struct Rehearsal {
     input: RuleInput,
     now: DateTime<FixedOffset>,
     clock_date: NaiveDate,
+    comparison_only: bool,
     candidates: Vec<(ChangeRequest, ChangePreview)>,
 }
 struct Withdrawal {
@@ -409,7 +410,6 @@ impl ToolStudio {
                 location,
                 spec,
             } => {
-                let location = self.safe_location(location)?;
                 let initial = ProjectSnapshot::new(
                     identity("project"),
                     name.clone(),
@@ -421,6 +421,9 @@ impl ToolStudio {
                     initial_policy(),
                 )
                 .map_err(message)?;
+                let checked_location = self.safe_location(location)?;
+                self.ensure_default_parent(location, &checked_location)?;
+                let location = checked_location;
                 self.pending_create = Some(PendingCreate {
                     request: request.clone(),
                     initial,
@@ -497,8 +500,17 @@ impl ToolStudio {
                 });
                 Ok(self.retry_local())
             }
+            WorkspaceAction::Compare { input } => {
+                if input.scope != ScopeKind::SingleRecord || !input.supersedes.is_empty() {
+                    return Err(
+                        "首次比较只演练这一笔记录，不替代任何决定；选定结果后再确认范围".into(),
+                    );
+                }
+                self.rehearse(request, input, true)?;
+                Ok(OperationOutcome::PreviewReady)
+            }
             WorkspaceAction::Rehearse { input } => {
-                self.rehearse(request, input)?;
+                self.rehearse(request, input, false)?;
                 Ok(OperationOutcome::PreviewReady)
             }
             WorkspaceAction::SaveDecision {
@@ -510,7 +522,8 @@ impl ToolStudio {
                 let source = self.writable()?;
                 let prepared = if *choice == DecisionChoice::Adopt {
                     let rehearsal = self.rehearsal.as_ref().ok_or("请先演练")?;
-                    if preview_id.as_ref() != Some(&rehearsal.view.preview_id)
+                    if rehearsal.comparison_only
+                        || preview_id.as_ref() != Some(&rehearsal.view.preview_id)
                         || &rehearsal.input != input
                         || !same_input_context(&rehearsal.view.context, &request.context)
                         || self.date() != rehearsal.clock_date
@@ -537,6 +550,21 @@ impl ToolStudio {
                 } else {
                     let mut input = input.clone();
                     input.supersedes.clear();
+                    if input.rationale.trim().is_empty() {
+                        input.rationale = match choice {
+                            DecisionChoice::Both => {
+                                "System audit: no reason supplied; user selected both needed"
+                            }
+                            DecisionChoice::Neither => {
+                                "System audit: no reason supplied; user selected neither fits"
+                            }
+                            DecisionChoice::Defer => {
+                                "System audit: no reason supplied; user deferred this decision"
+                            }
+                            DecisionChoice::Adopt => unreachable!(),
+                        }
+                        .into();
+                    }
                     let native = self.change_request(request, &input, 0, self.now, false)?;
                     decisions::prepare_unresolved(source, &native, *choice, self.now)
                         .map_err(message)?
@@ -637,10 +665,24 @@ impl ToolStudio {
         {
             return Err("请填写不含目录跳转的绝对路径".into());
         }
-        let parent = path
-            .parent()
-            .filter(|p| p.is_dir())
-            .ok_or("请选择已经存在的父目录")?;
+        let requested_parent = path.parent().ok_or("请选择新的项目目录名称")?;
+        let allow_missing = default_tool_data_directory().as_deref() == Some(requested_parent);
+        let mut parent = requested_parent;
+        loop {
+            match std::fs::symlink_metadata(parent) {
+                Ok(metadata) if metadata.is_dir() || metadata.file_type().is_symlink() => break,
+                Ok(_) => return Err("保存位置的父路径不是文件夹".into()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound && allow_missing => {
+                    parent = parent
+                        .parent()
+                        .ok_or("找不到可用的本地数据目录，请选择其他文件夹")?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err("请选择已经存在的父目录".into())
+                }
+                Err(error) => return Err(format!("无法检查保存位置，请改选文件夹：{error}")),
+            }
+        }
         for ancestor in parent.ancestors() {
             let metadata = std::fs::symlink_metadata(ancestor).map_err(message)?;
             if metadata.file_type().is_symlink() {
@@ -686,12 +728,33 @@ impl ToolStudio {
             Err(error) if error.code() == git2::ErrorCode::NotFound => {}
             Err(error) => return Err(format!("无法确认 Git 仓库边界，请改选位置：{error}")),
         }
-        let destination = canonical_parent.join(path.file_name().ok_or("请选择新的项目目录名称")?);
+        path.file_name().ok_or("请选择新的项目目录名称")?;
+        let destination = canonical_parent.join(path.strip_prefix(parent).map_err(message)?);
         let temporary = std::fs::canonicalize(std::env::temp_dir()).map_err(message)?;
         if !self.fixed_clock && destination.starts_with(temporary) {
             return Err("正式工具不能放在系统临时目录，请选择稳定的本地位置".into());
         }
         Ok(destination)
+    }
+    fn ensure_default_parent(&self, original: &str, location: &Path) -> Result<(), String> {
+        let parent = location.parent().ok_or("保存位置没有父目录")?;
+        if parent.is_dir() {
+            return Ok(());
+        }
+        // Only the suggested application data hierarchy may be created for the
+        // user. Arbitrary missing parents still need an explicit folder choice.
+        let root = default_tool_data_directory().ok_or("没有可用的默认位置，请选择文件夹")?;
+        if Path::new(original).parent() != Some(root.as_path()) {
+            return Err("请选择已经存在的父目录".into());
+        }
+        create_private_data_directory(
+            parent,
+            #[cfg(test)]
+            |_| {},
+        )
+        .map_err(|error| format!("无法创建本地保存文件夹，请改选位置：{error}"))?;
+        self.safe_location(original)?;
+        Ok(())
     }
     fn retry_create(&mut self) -> OperationOutcome {
         let pending = self.pending_create.as_ref().expect("retained create");
@@ -798,6 +861,7 @@ impl ToolStudio {
     pub fn recover_creation(&mut self) -> Result<(), String> {
         let pending = self.pending_create.as_ref().ok_or("没有待确认的创建操作")?;
         let location = pending.location.clone();
+        let context = pending.request.context.clone();
         let original = (
             pending.initial.project_id.clone(),
             pending.request.context.request_id.clone(),
@@ -809,6 +873,7 @@ impl ToolStudio {
                 && snapshot.operation_receipts.contains_key(&original.1)
             {
                 self.install(store.clone(), snapshot.clone(), location);
+                self.publish(&context, OperationOutcome::PreviewReady);
                 self.creation_notice = Some(
                     "发现同一次创建的已保存项目，已从磁盘打开；请核对内容。没有重复创建。".into(),
                 );
@@ -1065,13 +1130,22 @@ impl ToolStudio {
             candidate_policy: candidate,
             scope,
             original_request: input.original_request.clone(),
-            rationale: input.rationale.clone(),
+            rationale: if input.rationale.trim().is_empty() {
+                "System audit: no reason supplied; user selected this outcome".into()
+            } else {
+                input.rationale.clone()
+            },
             unresolved_questions: input.unresolved_questions.clone(),
             supersedes: input.supersedes.clone(),
             cases,
         })
     }
-    fn rehearse(&mut self, request: &WorkspaceRequest, input: &RuleInput) -> Result<(), String> {
+    fn rehearse(
+        &mut self,
+        request: &WorkspaceRequest,
+        input: &RuleInput,
+        comparison_only: bool,
+    ) -> Result<(), String> {
         let mut candidates = Vec::new();
         let mut displays = Vec::new();
         // Future what-if dates use an explicitly advanced copied clock; real
@@ -1090,7 +1164,10 @@ impl ToolStudio {
                 .ok_or("无效日期")?,
         );
         for index in 0..2 {
-            let native_request = self.change_request(request, input, index, now, true)?;
+            let mut native_request = self.change_request(request, input, index, now, true)?;
+            if comparison_only {
+                native_request.rationale = "System-authored preview: copied record comparison; no decision or reason supplied".into();
+            }
             let preview = decisions::rehearse_change(
                 self.writable()?,
                 &native_request,
@@ -1108,6 +1185,9 @@ impl ToolStudio {
                 &native_request,
                 &preview,
             );
+            if comparison_only {
+                display.ready_to_adopt = false;
+            }
             if now > self.now {
                 display.ready_to_adopt = false;
                 display
@@ -1128,6 +1208,7 @@ impl ToolStudio {
             input: input.clone(),
             now,
             clock_date: self.date(),
+            comparison_only,
             candidates,
         });
         Ok(())
@@ -1922,4 +2003,147 @@ fn open_regular_file(path: &Path) -> Result<std::fs::File, String> {
         return Err("提案超过 1 MiB 限制".into());
     }
     std::fs::File::open(path).map_err(message)
+}
+
+/// Create the prevalidated default hierarchy without following a swapped
+/// ancestor. Unix walks/mkdirs relative to pinned descriptors; Windows retains
+/// no-delete-sharing directory handles for every ancestor until creation ends.
+pub(crate) fn create_private_data_directory(
+    path: &Path,
+    #[cfg(test)] mut before_create: impl FnMut(&Path),
+) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    use std::path::Component;
+    if !path.is_absolute() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "data directory must be absolute",
+        ));
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::ffi::CString;
+        use std::fs::File;
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::raw::{c_char, c_int};
+        use std::os::unix::ffi::OsStrExt;
+        // These platform flags match the project's existing no-follow store.
+        #[cfg(target_os = "linux")]
+        const FLAGS: c_int = 0o200000 | 0o400000 | 0o2000000;
+        #[cfg(target_os = "macos")]
+        const FLAGS: c_int = 0x0010_0000 | 0x0000_0100 | 0x0100_0000;
+        #[cfg(target_os = "linux")]
+        type DirectoryMode = u32;
+        #[cfg(target_os = "macos")]
+        type DirectoryMode = u16;
+        extern "C" {
+            fn openat(directory: c_int, path: *const c_char, flags: c_int, ...) -> c_int;
+            fn mkdirat(directory: c_int, path: *const c_char, mode: DirectoryMode) -> c_int;
+        }
+        let mut parent = File::open("/")?;
+        #[cfg(test)]
+        let mut current = PathBuf::from("/");
+        for component in path.components() {
+            let name = match component {
+                Component::RootDir => continue,
+                Component::Normal(name) => name,
+                _ => {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        "invalid directory component",
+                    ))
+                }
+            };
+            #[cfg(test)]
+            current.push(name);
+            let name = CString::new(name.as_bytes())
+                .map_err(|_| Error::new(ErrorKind::InvalidInput, "directory contains NUL"))?;
+            let mut fd = unsafe { openat(parent.as_raw_fd(), name.as_ptr(), FLAGS) };
+            if fd < 0 {
+                let error = Error::last_os_error();
+                if error.kind() != ErrorKind::NotFound {
+                    return Err(error);
+                }
+                #[cfg(test)]
+                before_create(&current);
+                if unsafe { mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } < 0 {
+                    let error = Error::last_os_error();
+                    if error.kind() != ErrorKind::AlreadyExists {
+                        return Err(error);
+                    }
+                }
+                parent.sync_all()?;
+                fd = unsafe { openat(parent.as_raw_fd(), name.as_ptr(), FLAGS) };
+            }
+            if fd < 0 {
+                return Err(Error::last_os_error());
+            }
+            parent = unsafe { File::from_raw_fd(fd) };
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        use std::fs::{File, OpenOptions};
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        fn pin(path: &Path) -> std::io::Result<File> {
+            let handle = OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(path)?;
+            let metadata = handle.metadata()?;
+            if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "data directory is not a real directory",
+                ));
+            }
+            Ok(handle)
+        }
+        let mut current = PathBuf::new();
+        let mut guards = Vec::new();
+        for component in path.components() {
+            match component {
+                Component::Prefix(prefix) => {
+                    current.push(prefix.as_os_str());
+                    continue;
+                }
+                Component::RootDir | Component::Normal(_) => current.push(component.as_os_str()),
+                _ => {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        "invalid directory component",
+                    ))
+                }
+            }
+            match pin(&current) {
+                Ok(handle) => guards.push(handle),
+                Err(error) if error.kind() == ErrorKind::NotFound && !guards.is_empty() => {
+                    #[cfg(test)]
+                    before_create(&current);
+                    match std::fs::create_dir(&current) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+                        Err(error) => return Err(error),
+                    }
+                    guards.push(pin(&current)?);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        Err(Error::new(
+            ErrorKind::Unsupported,
+            "safe default directory creation is unavailable on this platform",
+        ))
+    }
 }
