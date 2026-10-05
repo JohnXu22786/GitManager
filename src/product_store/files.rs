@@ -262,7 +262,9 @@ mod unix {
     #[cfg(target_os = "macos")]
     const SAFE: c_int = 0x100 | 0x1000000 | 0x4;
     extern "C" {
-        fn openat(fd: c_int, path: *const c_char, flags: c_int, mode: c_uint) -> c_int;
+        // The mode is variadic: Apple ARM64 passes it on the stack, unlike
+        // fixed arguments. Keep the libc ABI and its C integer promotion.
+        fn openat(fd: c_int, path: *const c_char, flags: c_int, ...) -> c_int;
         fn mkdirat(fd: c_int, path: *const c_char, mode: c_uint) -> c_int;
         fn renameat(old: c_int, a: *const c_char, new: c_int, b: *const c_char) -> c_int;
         fn linkat(
@@ -287,7 +289,14 @@ mod unix {
     }
     pub fn open(parent: &File, path: &OsStr, flags: c_int, mode: c_uint) -> io::Result<File> {
         let path = name(path)?;
-        let fd = unsafe { openat(parent.as_raw_fd(), path.as_ptr(), flags | SAFE, mode) };
+        let fd = unsafe {
+            openat(
+                parent.as_raw_fd(),
+                path.as_ptr(),
+                flags | SAFE,
+                mode as c_int,
+            )
+        };
         status(fd)?;
         Ok(unsafe { File::from_raw_fd(fd) })
     }

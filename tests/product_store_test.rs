@@ -416,3 +416,47 @@ fn invalid_initial_runtime_is_rejected_before_creating_a_directory() {
     assert!(!path.exists());
     create(&path).load().unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn created_store_files_keep_private_usable_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("tool");
+    let store = create(&path);
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+        0o700
+    );
+    for entry in fs::read_dir(&path).unwrap() {
+        let entry = entry.unwrap();
+        let metadata = entry.metadata().unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(
+            metadata.permissions().mode() & 0o7777,
+            0o600,
+            "incorrect creation mode for {:?}",
+            entry.file_name()
+        );
+    }
+    let reopened = ProductStore::open(&path).unwrap();
+    let before = reopened.load().unwrap();
+    let saved = store
+        .apply(
+            before.revision,
+            "write",
+            &add("Ada"),
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(reopened.load().unwrap(), saved);
+    for entry in fs::read_dir(&path).unwrap() {
+        let entry = entry.unwrap();
+        assert_eq!(
+            entry.metadata().unwrap().permissions().mode() & 0o7777,
+            0o600,
+            "incorrect replacement mode for {:?}",
+            entry.file_name()
+        );
+    }
+}
