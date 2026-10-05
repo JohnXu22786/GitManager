@@ -1817,6 +1817,57 @@ impl ScenarioSpec {
             ),
         )
     }
+    /// Stable synthetic execution namespace. Full source, schema and inputs stay
+    /// in run bindings; instrumentation and implementation names cannot alter
+    /// IDs of earlier created records. Existing seed records retain exact IDs.
+    pub fn operation_namespace(&self) -> Result<Digest> {
+        self.seed.validate()?;
+        validate_day(self.clock_day)?;
+        let mut records: Vec<_> = self.seed.records.iter().collect();
+        records.sort_by(|a, b| (&a.entity, &a.id).cmp(&(&b.entity, &b.id)));
+        canonical_digest(
+            IdentityDomain::Input,
+            &(
+                "semantic-replay/2",
+                &self.seed.project_id,
+                self.seed.generation,
+                records,
+                &self.seed.events,
+                self.clock_day,
+                self.random_seed,
+            ),
+        )
+    }
+    /// Shared replay-only driver. Adding/reordering action-bearing inputs changes
+    /// mutation ordinals and needs explicit semantic correspondence; it is not
+    /// silently treated as equivalent. This does not allocate live store IDs.
+    pub fn replay_operation_ids(&self) -> Result<Vec<Id>> {
+        bounded(self.inputs.len())?;
+        let namespace = self.operation_namespace()?;
+        let mut mutation = 0usize;
+        self.inputs
+            .iter()
+            .enumerate()
+            .map(|(index, input)| {
+                validate_input_shape(input)?;
+                let id = if matches!(
+                    input,
+                    SemanticInput::Invoke { .. }
+                        | SemanticInput::Control { .. }
+                        | SemanticInput::Activate { .. }
+                        | SemanticInput::Submit { .. }
+                ) {
+                    let id = format!("replay-mutation-{}-{mutation}", namespace.as_str());
+                    mutation += 1;
+                    id
+                } else {
+                    format!("replay-step-{}-{index}", namespace.as_str())
+                };
+                check_id(&id)?;
+                Ok(id)
+            })
+            .collect()
+    }
     pub fn validate(&self, app: &AppDefinition) -> Result<()> {
         version(self.version)?;
         check_id(&self.id)?;
@@ -1953,6 +2004,15 @@ pub enum PropertyTerm {
         observable: Id,
         value_type: Type,
     },
+    ViewRows {
+        point: Id,
+        entity: Id,
+    },
+    ViewColumn {
+        point: Id,
+        column: Id,
+        value_type: Type,
+    },
     OutputCount {
         point: Id,
         output: Id,
@@ -2025,6 +2085,21 @@ impl PropertyTerm {
                 check_id(observable)?;
                 standalone_type(value_type, 0)?;
                 value_type.clone()
+            }
+            Self::ViewRows { point, entity } => {
+                check_id(point)?;
+                check_id(entity)?;
+                Type::list(Type::reference(entity))
+            }
+            Self::ViewColumn {
+                point,
+                column,
+                value_type,
+            } => {
+                check_id(point)?;
+                check_id(column)?;
+                standalone_type(value_type, 1)?;
+                Type::list(value_type.clone())
             }
             Self::OutputCount { point, output } => {
                 check_id(point)?;
@@ -2219,6 +2294,13 @@ pub struct ViewObservation {
     pub enabled_actions: BTreeSet<Id>,
     pub form_values: Values,
 }
+/// Runtime-derived type provenance for real list/detail rows, even when empty.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewSchema {
+    pub entity: Id,
+    pub columns: BTreeMap<Id, Type>,
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Observation {
@@ -2228,6 +2310,9 @@ pub struct Observation {
     pub values: Values,
     pub value_types: BTreeMap<Id, Type>,
     pub view: ViewObservation,
+    /// Old evidence has no typed view provenance; view properties stay unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_schema: Option<ViewSchema>,
     pub outputs: Vec<LocalArtifact>,
 }
 impl Observation {
@@ -2944,7 +3029,15 @@ pub enum DecisionOutcome {
 pub enum DecisionStatus {
     Active,
     Pending,
-    Superseded { by: Id },
+    Superseded {
+        by: Id,
+    },
+    /// Terminal retained history, created only by the trusted recovery controller
+    /// after compatible recovery and remaining-intention checks. The identifier
+    /// binds its real adoption receipt, not a successor preference or model claim.
+    Withdrawn {
+        adoption: Id,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2984,9 +3077,13 @@ impl ScopedDecision {
             !self.supersedes.contains(&self.id),
             "decision supersedes itself",
         )?;
-        if let DecisionStatus::Superseded { by } = &self.status {
-            check_id(by)?;
-            require(by != &self.id, "decision retires itself")?;
+        match &self.status {
+            DecisionStatus::Superseded { by } => {
+                check_id(by)?;
+                require(by != &self.id, "decision retires itself")?;
+            }
+            DecisionStatus::Withdrawn { adoption } => check_id(adoption)?,
+            DecisionStatus::Active | DecisionStatus::Pending => {}
         }
         if matches!(
             self.outcome,
@@ -3101,6 +3198,10 @@ pub struct SemanticMapping {
 #[serde(deny_unknown_fields)]
 pub struct ScenarioMapping {
     pub original: Digest,
+    /// Exact accepted source ArtifactRef.program_digest. An absent legacy value
+    /// is usable only when the trusted host resolves the original unambiguously.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_program: Option<Digest>,
     pub replacement: ScenarioSpec,
     pub explanation: String,
 }
@@ -3135,7 +3236,7 @@ impl EvolutionProposal {
         let mut originals = BTreeSet::new();
         for scenario in &self.scenarios {
             require(
-                originals.insert(&scenario.original),
+                originals.insert((&scenario.original, &scenario.source_program)),
                 "ambiguous scenario replacement",
             )?;
             scenario.replacement.validate_structure()?;
@@ -3271,6 +3372,17 @@ pub struct SelectedScenario {
     pub disclosure: Disclosure,
     pub scenario: ScenarioSpec,
 }
+/// Portable selected context, not an execution certificate or disclosure consent.
+/// The host must populate this only from verified accepted packages/reruns.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptedSceneContext {
+    pub decision: Id,
+    pub source: ArtifactRef,
+    pub scenario: Digest,
+    pub observations: Vec<Observation>,
+    pub disclosure: Disclosure,
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DevelopmentContext {
@@ -3288,9 +3400,13 @@ pub struct DevelopmentRequest {
     pub project_id: Id,
     pub operation: DevelopmentOperation,
     pub request: String,
+    /// Discover: baseline, candidate, then selected accepted-history artifacts.
+    /// Other operations: current source last after any historical sources.
     pub sources: Vec<CapturedProgram>,
     pub context: DevelopmentContext,
     pub examples: Vec<SelectedScenario>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepted_scenes: Vec<AcceptedSceneContext>,
     pub decisions: DecisionGraph,
     pub unknowns: Vec<UnknownBoundary>,
     pub required_capabilities: BTreeSet<Id>,
@@ -3321,6 +3437,30 @@ impl DevelopmentRequest {
                 "change request lacks actual source",
             )?;
         }
+        if self.operation == DevelopmentOperation::Discover {
+            require(
+                self.sources.len() >= 2,
+                "discovery needs an ordered baseline/candidate pair",
+            )?;
+            require(
+                self.sources[0].program.id == self.sources[1].program.id,
+                "discovery primary pair names different applications",
+            )?;
+            for (index, source) in self.sources.iter().enumerate().skip(2) {
+                require(
+                    !self.sources[..index]
+                        .iter()
+                        .any(|s| s.artifact == source.artifact),
+                    "duplicate discovery historical source",
+                )?;
+                require(
+                    self.accepted_scenes
+                        .iter()
+                        .any(|s| s.source == source.artifact),
+                    "discovery historical source lacks selected accepted context",
+                )?;
+            }
+        }
         validate_record_refs(&self.context.selected)?;
         if let Some(view) = &self.context.view {
             check_id(view)?;
@@ -3334,6 +3474,91 @@ impl DevelopmentRequest {
         }
         for example in &self.examples {
             example.scenario.validate_structure()?;
+        }
+        bounded(self.accepted_scenes.len())?;
+        serialized_bound(&self.accepted_scenes, MAX_WIRE_BYTES)?;
+        let mut accepted_keys = BTreeSet::new();
+        for accepted in &self.accepted_scenes {
+            check_id(&accepted.decision)?;
+            accepted.source.validate()?;
+            let decision = self
+                .decisions
+                .decisions
+                .iter()
+                .find(|d| d.id == accepted.decision)
+                .ok_or_else(|| ContractError("accepted scene names an unknown decision".into()))?;
+            require(
+                decision.scenarios.contains(&accepted.scenario),
+                "accepted scene is not a decision scenario",
+            )?;
+            let source = self
+                .sources
+                .iter()
+                .find(|s| s.artifact == accepted.source)
+                .ok_or_else(|| {
+                    ContractError("accepted scene source is not captured in the request".into())
+                })?;
+            let selected = self
+                .examples
+                .iter()
+                .find(|e| {
+                    e.scenario.identity().ok().as_ref() == Some(&accepted.scenario)
+                        && e.disclosure == accepted.disclosure
+                })
+                .ok_or_else(|| {
+                    ContractError("accepted scene is not selected with this disclosure".into())
+                })?;
+            require(
+                selected.scenario.seed.project_id == self.project_id,
+                "accepted scene belongs to another project",
+            )?;
+            selected.scenario.validate(&source.program)?;
+            require(
+                accepted_keys.insert((
+                    &accepted.decision,
+                    &accepted.source.program_digest,
+                    &accepted.scenario,
+                )),
+                "duplicate accepted scene context",
+            )?;
+            bounded(accepted.observations.len())?;
+            let points: Vec<_> = selected
+                .scenario
+                .inputs
+                .iter()
+                .filter_map(|input| {
+                    if let SemanticInput::Observe { point } = input {
+                        Some(point)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            require(
+                !points.is_empty()
+                    && points
+                        == accepted
+                            .observations
+                            .iter()
+                            .map(|o| &o.point)
+                            .collect::<Vec<_>>(),
+                "accepted observations do not match the selected scene",
+            )?;
+            let observable_types = source.program.observable_types()?;
+            for observation in &accepted.observations {
+                observation.validate()?;
+                require(
+                    observation.value_types == observable_types,
+                    "accepted observable types do not match their source",
+                )?;
+                let expected_view = source.program.view_schema(&observation.view.view)?;
+                if let Some(schema) = &observation.view_schema {
+                    require(
+                        expected_view.as_ref() == Some(schema),
+                        "accepted view schema does not belong to its source",
+                    )?;
+                }
+            }
         }
         Ok(())
     }
@@ -3774,6 +3999,48 @@ impl PropertyTerm {
                 validate_value(value, value_type, 0).ok()?;
                 Some(value.clone())
             }
+            Self::ViewRows { point: id, entity } => {
+                let observed = point(id)?;
+                if &observed.view_schema.as_ref()?.entity != entity {
+                    return None;
+                }
+                Some(DataValue::List {
+                    item_type: Type::reference(entity),
+                    items: observed
+                        .view
+                        .rows
+                        .iter()
+                        .map(|row| DataValue::Reference {
+                            entity: row.record.entity.clone(),
+                            record: row.record.record.clone(),
+                        })
+                        .collect(),
+                })
+            }
+            Self::ViewColumn {
+                point: id,
+                column,
+                value_type,
+            } => {
+                let observed = point(id)?;
+                if observed.view_schema.as_ref()?.columns.get(column)? != value_type {
+                    return None;
+                }
+                let items = observed
+                    .view
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        let value = row.cells.get(column)?;
+                        validate_value(value, value_type, 0).ok()?;
+                        Some(value.clone())
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                Some(DataValue::List {
+                    item_type: value_type.clone(),
+                    items,
+                })
+            }
             Self::OutputCount { point: id, output } => {
                 let outputs: Vec<_> = point(id)?
                     .outputs
@@ -4169,7 +4436,7 @@ fn validate_observation_limits(observation: &Observation, limits: &RuntimeLimits
 }
 
 /// Untrusted reconciliation suggestion. Candidate IDs are resolved by the host;
-/// the model is never asked to author authoritative source/artifact digests.
+/// references to captured digests are checked, never authoritative model proof.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvolutionSuggestion {
@@ -4185,6 +4452,8 @@ pub struct EvolutionSuggestion {
 #[serde(deny_unknown_fields)]
 pub struct SuggestedScenarioMapping {
     pub original: Digest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_program: Option<Digest>,
     pub replacement_json: String,
     pub explanation: String,
 }
@@ -4195,6 +4464,7 @@ impl SuggestedScenarioMapping {
         replacement.validate_structure()?;
         Ok(ScenarioMapping {
             original: self.original.clone(),
+            source_program: self.source_program.clone(),
             replacement,
             explanation: self.explanation.clone(),
         })
@@ -4251,7 +4521,7 @@ impl EvolutionSuggestion {
         for mapping in &self.scenarios {
             mapping.decode()?;
             require(
-                originals.insert(&mapping.original),
+                originals.insert((&mapping.original, &mapping.source_program)),
                 "ambiguous scenario replacement",
             )?;
         }
@@ -4281,12 +4551,12 @@ impl EvolutionSuggestion {
         }
         for retired in &self.proposed_retirement {
             require(
-                request
-                    .decisions
-                    .decisions
-                    .iter()
-                    .any(|d| &d.id == retired && d.status == DecisionStatus::Active),
-                "only an active decision can be proposed for retirement",
+                self.needs.contains(retired)
+                    && request.decisions.decisions.iter().any(|d| {
+                        &d.id == retired
+                            && matches!(d.status, DecisionStatus::Active | DecisionStatus::Pending)
+                    }),
+                "retirement proposals must name a current listed need",
             )?;
         }
         let obligations: BTreeSet<_> = request
@@ -4323,6 +4593,30 @@ impl EvolutionSuggestion {
             known_scenarios.insert(example.scenario.identity()?);
         }
         for mapping in &self.scenarios {
+            let accepted_sources: BTreeSet<_> = request
+                .accepted_scenes
+                .iter()
+                .filter(|s| s.scenario == mapping.original)
+                .map(|s| &s.source.program_digest)
+                .collect();
+            if let Some(source) = &mapping.source_program {
+                require(
+                    request
+                        .sources
+                        .iter()
+                        .any(|s| &s.artifact.program_digest == source),
+                    "scenario mapping names an unknown source program",
+                )?;
+                require(
+                    accepted_sources.is_empty() || accepted_sources.contains(source),
+                    "scenario mapping source does not match the accepted scene",
+                )?;
+            } else {
+                require(
+                    accepted_sources.len() <= 1,
+                    "scenario mapping needs an explicit source program",
+                )?;
+            }
             require(
                 known_scenarios.contains(&mapping.original),
                 "evolution replaces an unknown scenario",
@@ -4352,6 +4646,42 @@ fn validate_output_columns(columns: &[FieldDefinition]) -> Result<()> {
 }
 
 impl AppDefinition {
+    /// Derive row/cell types from validated executable view expressions.
+    pub fn view_schema(&self, view: &str) -> Result<Option<ViewSchema>> {
+        self.validate()?;
+        let view = self
+            .views
+            .iter()
+            .find(|v| v.id == view)
+            .ok_or_else(|| ContractError("unknown view".into()))?;
+        let (entity, columns) = match &view.kind {
+            ViewKind::List {
+                entity, columns, ..
+            }
+            | ViewKind::Detail {
+                entity, columns, ..
+            } => (entity, columns),
+            ViewKind::Form { .. } => return Ok(None),
+        };
+        let mut validator = Validator {
+            app: self,
+            nodes: 0,
+        };
+        let env = BTreeMap::from([("row".into(), Type::reference(entity))]);
+        let columns = columns
+            .iter()
+            .map(|column| {
+                Ok((
+                    column.id.clone(),
+                    validator.expr(&column.value, &env, 0, true)?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        Ok(Some(ViewSchema {
+            entity: entity.clone(),
+            columns,
+        }))
+    }
     /// Static declared types for host observations, including null/empty results.
     pub fn observable_types(&self) -> Result<BTreeMap<Id, Type>> {
         self.validate()?;
@@ -4388,6 +4718,27 @@ impl Observation {
             validate_value(value, value_type, 0)?;
         }
         validate_view_observation(&self.view)?;
+        if let Some(schema) = &self.view_schema {
+            check_id(&schema.entity)?;
+            bounded(schema.columns.len())?;
+            for (column, typ) in &schema.columns {
+                check_id(column)?;
+                standalone_type(typ, 0)?;
+            }
+            for row in &self.view.rows {
+                require(
+                    row.record.entity == schema.entity && row.cells.len() == schema.columns.len(),
+                    "view row/schema mismatch",
+                )?;
+                for (column, typ) in &schema.columns {
+                    let value = row
+                        .cells
+                        .get(column)
+                        .ok_or_else(|| ContractError("view schema column missing".into()))?;
+                    validate_value(value, typ, 0)?;
+                }
+            }
+        }
         bounded(self.outputs.len())?;
         for output in &self.outputs {
             output.validate()?;

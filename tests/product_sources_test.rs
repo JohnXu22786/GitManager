@@ -154,6 +154,7 @@ fn request(task: &Task) -> DevelopmentRequest {
             session_digest: None,
         },
         examples: vec![],
+        accepted_scenes: vec![],
         decisions: DecisionGraph {
             version: 1,
             revision: 0,
