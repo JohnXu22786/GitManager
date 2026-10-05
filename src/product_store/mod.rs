@@ -269,14 +269,56 @@ impl ProductStore {
             operations: BTreeMap::new(),
             artifacts: vec![],
         };
+        // Ordinary creation and recovery share the same fresh-only activation.
+        Self::create_recovered(path, &snapshot)
+    }
+    /// Recover a complete snapshot into a new directory. This never replaces
+    /// current work and is not a behavior rollback on current business data.
+    /// Snapshots with intention references need `create_recovered_with` so the
+    /// trusted host can verify and restore their immutable packages first.
+    pub fn create_recovered(path: impl AsRef<Path>, snapshot: &ProjectSnapshot) -> Result<Self> {
+        if !snapshot.decisions.decisions.is_empty()
+            || snapshot
+                .adoptions
+                .iter()
+                .any(|a| !a.plan.evidence.is_empty())
+        {
+            return Err(StoreError::Invalid(
+                "this recovery needs its verified intention packages; use the complete backup"
+                    .into(),
+            ));
+        }
+        Self::create_recovered_with(path, snapshot, |_| Ok(()))
+    }
+
+    /// Trusted host-only recovery boundary. Validate the complete intention
+    /// bundle before calling, then restore and verify it in `before_activate`.
+    /// The callback receives a fresh, pinned store without a CURRENT pointer;
+    /// it must not grant authority to imported check flags. Callback failure
+    /// leaves an unactivated folder, never overwrites a destination and never
+    /// deletes the original project or any backup.
+    pub fn create_recovered_with<F>(
+        path: impl AsRef<Path>,
+        snapshot: &ProjectSnapshot,
+        before_activate: F,
+    ) -> Result<Self>
+    where
+        F: FnOnce(&ProductStore) -> Result<()>,
+    {
         snapshot.validate()?;
-        LocalRuntime::default().start(
-            program,
+        if canonical_bytes(snapshot)?.len() > MAX_STORE_BYTES {
+            return Err(StoreError::Invalid(
+                "recovery snapshot exceeds the byte limit".into(),
+            ));
+        }
+        LocalRuntime::default().resume(
+            snapshot.program()?,
             &snapshot.data,
             &snapshot.session,
-            clock_day,
+            snapshot.clock_day,
             0,
             RuntimeLimits::default(),
+            &snapshot.artifacts,
         )?;
         let (parent, name) = Self::location(path.as_ref())?;
         let root = parent.create_child(&name)?;
@@ -286,13 +328,86 @@ impl ProductStore {
             name,
         };
         let _lock = store.root.lock()?;
+        store.require_unactivated()?;
+        before_activate(&store)?;
+        store.pinned()?;
         store.save(
-            &snapshot,
+            snapshot,
+            false,
             #[cfg(test)]
             None,
         )?;
         Ok(store)
     }
+
+    fn require_unactivated(&self) -> Result<()> {
+        match self.root.read("CURRENT", MAX_STORE_BYTES) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+            Ok(_) => Err(StoreError::Conflict(
+                "destination already contains a project; choose a new location".into(),
+            )),
+        }
+    }
+
+    /// Store bounded canonical JSON in the fixed immutable extension namespace.
+    /// This is content storage only: the intention layer validates the object
+    /// type, references and provenance; CURRENT remains activation authority.
+    pub fn stage_extension(&self, bytes: &[u8]) -> Result<Digest> {
+        self.pinned()?;
+        let digest = Self::extension_digest(bytes)?;
+        let name = format!("extension-{}.json", digest.as_str());
+        match self.root.publish(&name, bytes, false) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                if self.read_extension(&digest)? != bytes {
+                    return Err(StoreError::Corrupt(
+                        "immutable intention object collision".into(),
+                    ));
+                }
+                // A previous or concurrent publisher may have renamed the
+                // object without completing its directory sync yet.
+                self.root.sync()?;
+            }
+            Err(e) => return Err(e.into()),
+        }
+        self.pinned()?;
+        Ok(digest)
+    }
+
+    /// Read exactly the requested bounded, canonical, content-addressed object.
+    pub fn read_extension(&self, digest: &Digest) -> Result<Vec<u8>> {
+        self.pinned()?;
+        let bytes = self.root.read(
+            &format!("extension-{}.json", digest.as_str()),
+            MAX_WIRE_BYTES,
+        )?;
+        if Self::extension_digest(&bytes)? != *digest {
+            return Err(StoreError::Corrupt(
+                "intention object checksum mismatch".into(),
+            ));
+        }
+        self.pinned()?;
+        Ok(bytes)
+    }
+
+    fn extension_digest(bytes: &[u8]) -> Result<Digest> {
+        if bytes.len() > MAX_WIRE_BYTES {
+            return Err(StoreError::Invalid(
+                "intention object exceeds the byte limit".into(),
+            ));
+        }
+        let value: serde_json::Value = json::parse(bytes)?;
+        if canonical_bytes(&value)? != bytes {
+            return Err(StoreError::Corrupt(
+                "intention object is not canonical JSON".into(),
+            ));
+        }
+        // Canonical equality makes this exactly bytes_digest(Evidence, bytes),
+        // matching the typed intention object's canonical identity.
+        Ok(canonical_digest(IdentityDomain::Evidence, &value)?)
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let (parent, name) = Self::location(path.as_ref())?;
         let root = parent.child(&name)?;
@@ -350,9 +465,13 @@ impl ProductStore {
     fn save(
         &self,
         snapshot: &ProjectSnapshot,
+        replace_current: bool,
         #[cfg(test)] fault: Option<FaultPoint>,
     ) -> Result<()> {
         self.pinned()?;
+        if !replace_current {
+            self.require_unactivated()?;
+        }
         snapshot.validate()?;
         let bytes = canonical_bytes(snapshot)?;
         if bytes.len() > MAX_STORE_BYTES {
@@ -387,8 +506,10 @@ impl ProductStore {
         if fault == Some(FaultPoint::BeforePointer) {
             return Err(StoreError::Interrupted(FaultPoint::BeforePointer));
         }
+        // The preflight avoids staging into a known competing project; only
+        // atomic no-clobber publication closes a subsequent activation race.
         self.root
-            .publish("CURRENT", &canonical_bytes(&pointer)?, true)?;
+            .publish("CURRENT", &canonical_bytes(&pointer)?, replace_current)?;
         #[cfg(test)]
         if fault == Some(FaultPoint::AfterPointer) {
             return Err(StoreError::Interrupted(FaultPoint::AfterPointer));
@@ -481,6 +602,7 @@ impl ProductStore {
         );
         self.save(
             &snapshot,
+            true,
             #[cfg(test)]
             fault,
         )?;
@@ -660,7 +782,11 @@ impl ProductStore {
         // values are retained byte-for-byte, including later optional fields.
         current.data = merged_data(target, &current.data)?;
         current.active_revision = target_revision.clone();
-        current.session = SessionState::initial(&target.program)?;
+        // A decision-only save must not discard the work-in-progress session.
+        // A genuinely different program still starts with its own valid state.
+        if target_revision != previous {
+            current.session = SessionState::initial(&target.program)?;
+        }
         current.decisions = decisions.clone();
         current.revision = current
             .revision
@@ -690,6 +816,7 @@ impl ProductStore {
         )?;
         self.save(
             &current,
+            true,
             #[cfg(test)]
             None,
         )?;
