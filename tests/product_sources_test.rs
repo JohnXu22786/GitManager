@@ -24,11 +24,19 @@ use std::{
     time::{Duration, Instant},
 };
 
+// All Task fixtures use the process-global config root below. Hold a lease
+// for the entire fixture, so another test cannot replace tasks.json while a
+// capture reloads it. The production registry's write lock does not cover
+// concurrent readers, and Windows replacement can reject such open handles.
+static REGISTRY_FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct Task {
     _dir: tempfile::TempDir,
     root: PathBuf,
     record: tasks::TaskRecord,
     adapter: TaskSourceAdapter,
+    // Last field: keep ownership through unlink and temporary-directory cleanup.
+    _registry: std::sync::MutexGuard<'static, ()>,
 }
 // TaskRegistry remains the actual production authority, but tests must never
 // use the caller's own task configuration. Initialize once before any fixture
@@ -47,6 +55,9 @@ fn isolate_registry() {
 }
 impl Task {
     fn new() -> Self {
+        let registry = REGISTRY_FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         isolate_registry();
         let dir = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(dir.path()).unwrap();
@@ -87,6 +98,7 @@ impl Task {
             root,
             record,
             adapter,
+            _registry: registry,
         }
     }
     fn capture(&self) -> CapturedProgram {
@@ -575,4 +587,47 @@ fn hardlinked_program_and_completion_are_rejected_on_each_supported_platform() {
     )
     .unwrap();
     assert!(task.adapter.capture_current().is_err());
+}
+
+#[test]
+fn registry_fixture_lease_covers_watcher_use_and_cleanup() {
+    use std::sync::{mpsc, TryLockError};
+    let task = Task::new();
+    let first_id = task.record.id.clone();
+    let mut watcher = SourceWatcher::new(task.adapter.clone()).unwrap();
+    assert!(matches!(next(&mut watcher), SourceUpdate::Captured(_)));
+    let (attempted_tx, attempted_rx) = mpsc::sync_channel(0);
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        // This is an actual attempted fixture acquisition, not a timed guess
+        // that the second thread has started. It must fail while the first
+        // fixture still owns the shared process-global registry.
+        assert!(matches!(
+            REGISTRY_FIXTURE_LOCK.try_lock(),
+            Err(TryLockError::WouldBlock)
+        ));
+        attempted_tx.send(()).unwrap();
+        let second = Task::new();
+        second.capture().validate().unwrap();
+        ready_tx.send(second.record.id.clone()).unwrap();
+    });
+    attempted_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    task.change();
+    let SourceUpdate::Captured(changed) = next(&mut watcher) else {
+        panic!("edited source was not captured")
+    };
+    assert_eq!(changed.program.label, "New actual source");
+    drop(watcher);
+    drop(task);
+    let second_id = ready_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    worker.join().unwrap();
+    let _registry = REGISTRY_FIXTURE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let registry = tasks::TaskRegistry::load();
+    assert!(registry.load_error().is_none());
+    assert!(registry
+        .entries()
+        .iter()
+        .all(|entry| entry.id != first_id && entry.id != second_id));
 }
