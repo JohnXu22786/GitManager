@@ -29,6 +29,82 @@ impl Output {
         }
     }
 }
+// Darwin kill(-pgid, signal) skips zombies and can return EPERM when the
+// retained leader is the only member. Never suppress EPERM by errno alone.
+// Apple XNU: bsd/kern/kern_sig.c, killpg1() and its SZOMB filter.
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+fn group_signal_result(
+    error: std::io::Error,
+    darwin: bool,
+    only_owned_zombie: impl FnOnce() -> Result<bool, String>,
+) -> Result<(), String> {
+    if error.raw_os_error() == Some(3) {
+        return Ok(());
+    } // ESRCH
+    if darwin && error.raw_os_error() == Some(1) {
+        // EPERM
+        match only_owned_zombie() {
+            Ok(true) => return Ok(()),
+            Ok(false) => (),
+            Err(detail) => {
+                return Err(format!(
+                    "{error}; owned group verification failed: {detail}"
+                ))
+            }
+        }
+    }
+    Err(error.to_string())
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn group_is_only_owner(owner: u32, bytes: i32, members: &[i32]) -> Result<bool, String> {
+    let width = std::mem::size_of::<i32>();
+    if owner <= 1
+        || owner > i32::MAX as u32
+        || bytes <= 0
+        || bytes as usize % width != 0
+        || bytes as usize >= std::mem::size_of_val(members)
+    {
+        return Err("empty, invalid or possibly truncated group membership".into());
+    }
+    let count = bytes as usize / width;
+    let pids = &members[..count];
+    if pids.iter().any(|pid| *pid <= 1) {
+        return Err("invalid group member PID".into());
+    }
+    // This deliberately does not exempt additional members, even zombies:
+    // only our still-unreaped leader has independently established identity.
+    Ok(pids == [owner as i32])
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_group_is_only_owner(owner: u32) -> Result<bool, String> {
+    #[link(name = "proc")]
+    unsafe extern "C" {
+        fn proc_listpids(kind: u32, group: u32, buffer: *mut std::ffi::c_void, bytes: i32) -> i32;
+    }
+    // PROC_PGRP_ONLY=2 restricts this kernel snapshot to our held group. It
+    // includes zombies. No command lines, environment, paths or credentials
+    // are requested. A full buffer, error or any extra PID fails closed.
+    // Apple XNU: sys/proc_info.h; kern/proc_info.c; wrappers/libproc/libproc.c.
+    let mut members = [0i32; 1024];
+    let bytes = unsafe {
+        proc_listpids(
+            2,
+            owner,
+            members.as_mut_ptr().cast(),
+            std::mem::size_of_val(&members) as i32,
+        )
+    };
+    if bytes <= 0 {
+        return Err(format!(
+            "group snapshot unavailable: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    group_is_only_owner(owner, bytes, &members)
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn run(
     _: Command,
@@ -109,11 +185,23 @@ pub(crate) fn run(
             exited_without_reaping(self.child.id())?;
             let group_error = if unsafe { kill(-(self.child.id() as i32), 9) } < 0 {
                 let error = std::io::Error::last_os_error();
-                if error.raw_os_error() == Some(3) {
-                    None
-                } else {
-                    Some(error.to_string())
-                }
+                group_signal_result(error, cfg!(target_os = "macos"), || {
+                    #[cfg(target_os = "macos")]
+                    {
+                        // Recheck terminal ownership without reaping. The
+                        // leader therefore still reserves this exact PGID
+                        // throughout the group snapshot and signal decision.
+                        if !exited_without_reaping(self.child.id())? {
+                            return Ok(false);
+                        }
+                        darwin_group_is_only_owner(self.child.id())
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        Ok(false)
+                    }
+                })
+                .err()
             } else {
                 None
             };
@@ -325,4 +413,48 @@ pub(crate) fn run(
         out.detail = error;
     }
     out
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+    #[test]
+    fn darwin_eperm_requires_proof_of_only_the_owned_zombie() {
+        let denied = || std::io::Error::from_raw_os_error(1);
+        assert!(group_signal_result(denied(), true, || Ok(true)).is_ok());
+        assert!(group_signal_result(denied(), true, || Ok(false)).is_err());
+        assert!(
+            group_signal_result(denied(), true, || Err("membership unavailable".into())).is_err()
+        );
+        assert!(
+            group_signal_result(denied(), false, || panic!("Linux must not suppress EPERM"))
+                .is_err()
+        );
+        assert!(
+            group_signal_result(std::io::Error::from_raw_os_error(22), true, || panic!(
+                "unrelated errors must not inspect groups"
+            ))
+            .is_err()
+        );
+        assert!(
+            group_signal_result(std::io::Error::from_raw_os_error(3), true, || panic!(
+                "missing group needs no exception"
+            ))
+            .is_ok()
+        );
+    }
+    #[test]
+    fn group_evidence_rejects_truncation_foreign_and_additional_members() {
+        assert!(group_is_only_owner(42, 4, &[42, 0, 0]).unwrap());
+        assert!(!group_is_only_owner(42, 4, &[43, 0, 0]).unwrap());
+        assert!(!group_is_only_owner(42, 8, &[42, 43, 0]).unwrap());
+        for bytes in [-1, 0, 1, 3, 12, 16] {
+            assert!(
+                group_is_only_owner(42, bytes, &[42, 0, 0]).is_err(),
+                "{bytes}"
+            );
+        }
+        assert!(group_is_only_owner(0, 4, &[0, 0, 0]).is_err());
+        assert!(group_is_only_owner(42, 4, &[-1, 0, 0]).is_err());
+    }
 }
