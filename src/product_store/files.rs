@@ -155,7 +155,11 @@ impl Directory {
         {
             let flags = if write { unix::RDWR } else { 0 } | if create { unix::CREATE } else { 0 };
             let file = unix::open(&self.file, name, flags, 0o600)?;
-            if !file.metadata()?.is_file() {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = file.metadata()?;
+            // An opened old CURRENT can have zero links after atomic
+            // replacement. Its pinned bytes remain safe to finish reading.
+            if !metadata.is_file() || metadata.nlink() > 1 {
                 return Err(unsafe_path());
             }
             Ok(file)
@@ -206,7 +210,7 @@ impl Directory {
                 if replace {
                     unix::rename(&self.file, &temp, OsStr::new(name))?;
                 } else {
-                    unix::link(&self.file, &temp, OsStr::new(name))?;
+                    unix::rename_new(&self.file, &temp, OsStr::new(name))?;
                 }
                 self.sync()
             })();
@@ -267,13 +271,6 @@ mod unix {
         fn openat(fd: c_int, path: *const c_char, flags: c_int, ...) -> c_int;
         fn mkdirat(fd: c_int, path: *const c_char, mode: c_uint) -> c_int;
         fn renameat(old: c_int, a: *const c_char, new: c_int, b: *const c_char) -> c_int;
-        fn linkat(
-            old: c_int,
-            a: *const c_char,
-            new: c_int,
-            b: *const c_char,
-            flags: c_int,
-        ) -> c_int;
         fn unlinkat(fd: c_int, path: *const c_char, flags: c_int) -> c_int;
     }
     fn name(value: &OsStr) -> io::Result<CString> {
@@ -316,18 +313,55 @@ mod unix {
             )
         })
     }
-    pub fn link(parent: &File, a: &OsStr, b: &OsStr) -> io::Result<()> {
+    // Publish without replacing an existing immutable name and without a
+    // two-hard-link crash window. Unsupported filesystems fail explicitly.
+    pub fn rename_new(parent: &File, a: &OsStr, b: &OsStr) -> io::Result<()> {
         let a = name(a)?;
         let b = name(b)?;
-        status(unsafe {
-            linkat(
-                parent.as_raw_fd(),
-                a.as_ptr(),
-                parent.as_raw_fd(),
-                b.as_ptr(),
-                0,
-            )
-        })
+        #[cfg(target_os = "linux")]
+        {
+            extern "C" {
+                fn renameat2(
+                    old: c_int,
+                    a: *const c_char,
+                    new: c_int,
+                    b: *const c_char,
+                    flags: c_uint,
+                ) -> c_int;
+            }
+            const RENAME_NOREPLACE: c_uint = 1;
+            status(unsafe {
+                renameat2(
+                    parent.as_raw_fd(),
+                    a.as_ptr(),
+                    parent.as_raw_fd(),
+                    b.as_ptr(),
+                    RENAME_NOREPLACE,
+                )
+            })
+        }
+        #[cfg(target_os = "macos")]
+        {
+            extern "C" {
+                fn renameatx_np(
+                    old: c_int,
+                    a: *const c_char,
+                    new: c_int,
+                    b: *const c_char,
+                    flags: c_uint,
+                ) -> c_int;
+            }
+            const RENAME_EXCL: c_uint = 4;
+            status(unsafe {
+                renameatx_np(
+                    parent.as_raw_fd(),
+                    a.as_ptr(),
+                    parent.as_raw_fd(),
+                    b.as_ptr(),
+                    RENAME_EXCL,
+                )
+            })
+        }
     }
     pub fn unlink(parent: &File, path: &OsStr) -> io::Result<()> {
         let path = name(path)?;
@@ -351,6 +385,18 @@ mod windows {
         {
             Err(unsafe_path())
         } else {
+            if !directory {
+                let mut information = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+                if unsafe {
+                    GetFileInformationByHandle(file.as_raw_handle() as _, information.as_mut_ptr())
+                } == 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                if unsafe { information.assume_init() }.nNumberOfLinks > 1 {
+                    return Err(unsafe_path());
+                }
+            }
             Ok(file)
         }
     }
