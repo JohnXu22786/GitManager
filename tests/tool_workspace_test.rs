@@ -242,7 +242,7 @@ fn rule_choices_emit_typed_scope_and_unresolved_intent_without_activation() {
             ("decision.defer", DecisionChoice::Defer),
         ] {
             let model = fixture::model();
-            let view = fixture::project_view(&model);
+            let mut view = fixture::project_view(&model);
             let mut h = EguiHarness::new(Vec2::new(900.0, 1800.0));
             let mut state = ToolWorkspace::default();
             click(&mut h, &mut state, &view, "record.select.order-1");
@@ -255,6 +255,19 @@ fn rule_choices_emit_typed_scope_and_unresolved_intent_without_activation() {
                 "等材料时怎么计算才合适？",
             );
             click(&mut h, &mut state, &view, scope_key);
+            let rehearsal_request = click(&mut h, &mut state, &view, "change.rehearse")
+                .request
+                .unwrap();
+            let mut preview = fixture::rehearsal(rehearsal_request.context.clone());
+            preview.scope.kind = scope;
+            let status = OperationStatus {
+                delivery_id: 2,
+                context: rehearsal_request.context,
+                outcome: OperationOutcome::PreviewReady,
+            };
+            view.rehearsal = Some(&preview);
+            view.operation = Some(&status);
+            view.next_operation_id = "operation-2";
             let req = click(&mut h, &mut state, &view, choice_key)
                 .request
                 .unwrap();
@@ -886,7 +899,7 @@ fn opening_another_path_does_not_replace_the_unsubmitted_creation_location() {
 }
 
 #[test]
-fn rule_requests_require_the_text_and_reason_expected_by_the_decision_layer() {
+fn rule_requests_require_request_and_observation_before_deferring_without_reason() {
     let model = fixture::model();
     let view = fixture::project_view(&model);
     let mut h = EguiHarness::new(Vec2::new(900.0, 2100.0));
@@ -906,16 +919,27 @@ fn rule_requests_require_the_text_and_reason_expected_by_the_decision_layer() {
     assert!(click(&mut h, &mut state, &view, "decision.defer")
         .request
         .is_none());
-    type_in(
-        &mut h,
-        &mut state,
-        &view,
-        "change.reason",
-        "还不能判断哪一种合适",
-    );
-    assert!(click(&mut h, &mut state, &view, "decision.defer")
+    let req = click(&mut h, &mut state, &view, "change.rehearse")
         .request
-        .is_some());
+        .unwrap();
+    let preview = fixture::rehearsal(req.context.clone());
+    let status = OperationStatus {
+        delivery_id: 1,
+        context: req.context,
+        outcome: OperationOutcome::PreviewReady,
+    };
+    let observed = WorkspaceView {
+        rehearsal: Some(&preview),
+        operation: Some(&status),
+        next_operation_id: "operation-2",
+        ..view
+    };
+    let request = click(&mut h, &mut state, &observed, "decision.defer")
+        .request
+        .unwrap();
+    assert!(
+        matches!(request.action, WorkspaceAction::SaveDecision { choice: DecisionChoice::Defer, input, .. } if input.rationale.is_empty() && input.scope == ScopeKind::SingleRecord)
+    );
 }
 
 fn fill_change_text(h: &mut EguiHarness, state: &mut ToolWorkspace, view: &WorkspaceView<'_>) {
@@ -926,17 +950,30 @@ fn fill_change_text(h: &mut EguiHarness, state: &mut ToolWorkspace, view: &Works
         "change.request",
         "想比较等待时的两种日期安排",
     );
-    type_in(
-        h,
-        state,
-        view,
-        "change.reason",
-        "需要选择符合实际做法的结果",
-    );
 }
 fn begin_change(h: &mut EguiHarness, state: &mut ToolWorkspace, view: &WorkspaceView<'_>) {
     click(h, state, view, "record.change");
     fill_change_text(h, state, view);
+    choose_first_result(h, state, view);
+}
+fn choose_first_result(h: &mut EguiHarness, state: &mut ToolWorkspace, view: &WorkspaceView<'_>) {
+    let mut compare_view = WorkspaceView {
+        next_operation_id: "comparison-operation",
+        ..*view
+    };
+    let req = click(h, state, &compare_view, "change.rehearse")
+        .request
+        .unwrap();
+    assert!(matches!(req.action, WorkspaceAction::Compare { .. }));
+    let preview = fixture::rehearsal(req.context.clone());
+    let status = OperationStatus {
+        delivery_id: 1,
+        context: req.context,
+        outcome: OperationOutcome::PreviewReady,
+    };
+    compare_view.rehearsal = Some(&preview);
+    compare_view.operation = Some(&status);
+    click(h, state, &compare_view, "candidate.choose.a");
 }
 
 #[test]
@@ -1118,6 +1155,7 @@ fn explicit_rule_dimensions_survive_scope_switch_and_invalidate_old_preview() {
         "change.request",
         "把此计时用于以后记录",
     );
+    choose_first_result(&mut h, &mut state, &view);
     type_in(
         &mut h,
         &mut state,
@@ -1165,4 +1203,130 @@ fn explicit_rule_dimensions_survive_scope_switch_and_invalidate_old_preview() {
         vec![RuleKey::DeliveryTarget, RuleKey::Timer]
     );
     assert_eq!(input.scope, ScopeKind::FutureRecords);
+}
+
+#[test]
+fn first_comparison_needs_only_request_and_shows_no_scope_or_reason_form() {
+    let model = fixture::model();
+    let view = fixture::project_view(&model);
+    let mut h = EguiHarness::new(Vec2::new(900.0, 2200.0));
+    let mut state = ToolWorkspace::default();
+    click(&mut h, &mut state, &view, "record.select.order-1");
+    click(&mut h, &mut state, &view, "record.change");
+    let first = frame(&mut h, &mut state, &view);
+    assert!(!first.controls.contains_key("scope.single"));
+    assert!(!first.controls.contains_key("change.reason"));
+    type_in(
+        &mut h,
+        &mut state,
+        &view,
+        "change.request",
+        "等材料时别算我拖延",
+    );
+    let request = click(&mut h, &mut state, &view, "change.rehearse").request;
+    let WorkspaceAction::Compare { input } = request
+        .expect("an optional rationale must not block copied execution")
+        .action
+    else {
+        panic!("comparison-only action expected")
+    };
+    assert_eq!(input.scope, ScopeKind::SingleRecord);
+    assert!(input.rationale.is_empty());
+    assert!(input.supersedes.is_empty());
+}
+
+#[test]
+fn ordinary_creation_prefills_a_private_location_without_typing_a_path() {
+    let view = fixture::entry_view();
+    let mut h = EguiHarness::new(Vec2::new(900.0, 1500.0));
+    let mut state = ToolWorkspace::default();
+    click(&mut h, &mut state, &view, "entry.create");
+    type_in(
+        &mut h,
+        &mut state,
+        &view,
+        "project.name",
+        "My ordinary work",
+    );
+    let result = click(&mut h, &mut state, &view, "project.submit");
+    let WorkspaceAction::CreateProject { name, location, .. } =
+        result.request.expect("name should suffice").action
+    else {
+        panic!("create expected")
+    };
+    assert_eq!(name, "My ordinary work");
+    assert!(std::path::Path::new(&location).is_absolute());
+    assert!(location.contains("GitManager"));
+}
+
+#[test]
+fn folder_picker_cancel_keeps_draft_and_explicit_choice_uses_new_child() {
+    for choice in [None, Some(std::path::PathBuf::from("/chosen-folder"))] {
+        let view = fixture::entry_view();
+        let mut h = EguiHarness::new(Vec2::new(900.0, 1500.0));
+        let mut state = ToolWorkspace::default();
+        click(&mut h, &mut state, &view, "entry.create");
+        type_in(&mut h, &mut state, &view, "project.name", "Kept draft");
+        type_in(
+            &mut h,
+            &mut state,
+            &view,
+            "project.location",
+            "/original-parent/draft",
+        );
+        state.set_folder_choice_for_test(choice.clone());
+        let picked = click(&mut h, &mut state, &view, "project.choose_folder");
+        assert!(picked.request.is_none());
+        if choice.is_none() {
+            assert!(picked
+                .text
+                .iter()
+                .any(|text| text.contains("已取消或系统选择器不可用")));
+        }
+        let req = click(&mut h, &mut state, &view, "project.submit")
+            .request
+            .unwrap();
+        let WorkspaceAction::CreateProject { name, location, .. } = req.action else {
+            panic!("create expected")
+        };
+        assert_eq!(name, "Kept draft");
+        if let Some(parent) = choice {
+            assert_eq!(
+                std::path::Path::new(&location).parent(),
+                Some(parent.as_path())
+            );
+            assert_ne!(std::path::Path::new(&location), parent);
+        } else {
+            assert_eq!(location, "/original-parent/draft");
+        }
+    }
+}
+
+#[test]
+fn change_request_and_optional_reason_keep_focus_across_character_frames() {
+    let model = fixture::model();
+    let view = fixture::project_view(&model);
+    let mut h = EguiHarness::new(Vec2::new(900.0, 2500.0));
+    let mut state = ToolWorkspace::default();
+    click(&mut h, &mut state, &view, "record.select.order-1");
+    click(&mut h, &mut state, &view, "record.change");
+    click(&mut h, &mut state, &view, "change.request");
+    for ch in "native request".chars() {
+        h.text(&ch.to_string());
+        frame(&mut h, &mut state, &view);
+    }
+    choose_first_result(&mut h, &mut state, &view);
+    click(&mut h, &mut state, &view, "change.reason");
+    for ch in "optional reason".chars() {
+        h.text(&ch.to_string());
+        frame(&mut h, &mut state, &view);
+    }
+    let req = click(&mut h, &mut state, &view, "change.rehearse")
+        .request
+        .unwrap();
+    let WorkspaceAction::Rehearse { input } = req.action else {
+        panic!("scoped proof expected")
+    };
+    assert_eq!(input.original_request, "native request");
+    assert_eq!(input.rationale, "optional reason");
 }

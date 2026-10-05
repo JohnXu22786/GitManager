@@ -940,7 +940,6 @@ fn cancel_back_and_project_switch_hide_old_evidence_without_writes() {
     ui_click(&mut h, &mut ui, &mut s, "record.select.record-1");
     ui_click(&mut h, &mut ui, &mut s, "record.change");
     ui_type(&mut h, &mut ui, &mut s, "change.request", "保持这份要求");
-    ui_type(&mut h, &mut ui, &mut s, "change.reason", "比较本地结果");
     ui_click(&mut h, &mut ui, &mut s, "change.rehearse");
     ui_click(&mut h, &mut ui, &mut s, "back");
     assert_eq!(s.snapshot().unwrap(), &before);
@@ -1468,4 +1467,344 @@ fn unreadable_git_metadata_is_not_proof_that_location_is_outside_a_repository() 
         "{outcome:?}"
     );
     assert!(!location.exists());
+}
+
+#[test]
+fn optional_reason_is_a_truthful_system_audit_and_keeps_original_request() {
+    let (_dir, mut s) = open_fixture();
+    let mut i = input(&s, ScopeKind::SingleRecord);
+    i.rationale.clear();
+    let original = i.original_request.clone();
+    assert_eq!(adopt(&mut s, i, 1, 2), OperationOutcome::Committed);
+    let decision = &s.snapshot().unwrap().decisions[0];
+    assert_eq!(
+        decision.rationale,
+        "System audit: no reason supplied; user selected this outcome"
+    );
+    assert_eq!(
+        s.workspace_view().decision_requests[&decision.decision_id],
+        original
+    );
+}
+
+#[test]
+fn outcome_first_widgets_require_fresh_scoped_proof_before_saving() {
+    let (dir, mut s) = open_fixture();
+    let before = s.snapshot().unwrap().clone();
+    let mut h = egui_harness::EguiHarness::new(egui::vec2(1000.0, 3000.0));
+    let mut ui = tool_workspace::ToolWorkspace::default();
+    ui_click(&mut h, &mut ui, &mut s, "record.select.record-1");
+    ui_click(&mut h, &mut ui, &mut s, "record.change");
+    ui_type(
+        &mut h,
+        &mut ui,
+        &mut s,
+        "change.request",
+        "等材料的时候别算我拖延",
+    );
+    ui_click(&mut h, &mut ui, &mut s, "change.rehearse");
+    assert_eq!(s.snapshot().unwrap(), &before);
+    let first = s.workspace_view().rehearsal.unwrap().clone();
+    assert_eq!(first.scope.kind, ScopeKind::SingleRecord);
+    assert!(first.candidates.iter().all(|c| !c.evidence.is_empty()));
+    let out = ui_frame(&mut h, &mut ui, &s);
+    assert!(!out.controls.contains_key("scope.future"));
+    assert!(!out.controls.contains_key("change.reason"));
+    ui_click(
+        &mut h,
+        &mut ui,
+        &mut s,
+        &format!("candidate.choose.{}", first.candidates[1].candidate_id),
+    );
+    ui_click(&mut h, &mut ui, &mut s, "scope.future");
+    assert!(!ui_frame(&mut h, &mut ui, &s)
+        .controls
+        .iter()
+        .any(|(key, c)| key.starts_with("candidate.adopt.") && c.enabled));
+    assert_eq!(s.snapshot().unwrap(), &before);
+    ui_click(&mut h, &mut ui, &mut s, "change.rehearse");
+    let scoped = s.workspace_view().rehearsal.unwrap().clone();
+    assert_ne!(first.preview_id, scoped.preview_id);
+    assert_eq!(scoped.scope.kind, ScopeKind::FutureRecords);
+    assert!(scoped.scope.frozen_record_ids.is_empty());
+    assert_ne!(
+        first.candidates[1].evidence[0].run_id,
+        scoped.candidates[1].evidence[0].run_id
+    );
+    ui_click(
+        &mut h,
+        &mut ui,
+        &mut s,
+        &format!("candidate.adopt.{}", scoped.candidates[1].candidate_id),
+    );
+    let saved = s.snapshot().unwrap().clone();
+    assert_eq!(saved.records, before.records);
+    assert_eq!(saved.event_history, before.event_history);
+    assert_eq!(saved.decisions.len(), before.decisions.len() + 1);
+    assert_eq!(
+        saved.decisions.last().unwrap().rationale,
+        "System audit: no reason supplied; user selected this outcome"
+    );
+    send(&mut s, WorkspaceAction::CloseProject, None, 100);
+    send(
+        &mut s,
+        WorkspaceAction::OpenProject {
+            location: dir.path().join("project").display().to_string(),
+        },
+        None,
+        101,
+    );
+    assert_eq!(s.snapshot().unwrap(), &saved);
+}
+
+#[test]
+fn all_pending_outcomes_without_reason_preserve_scoped_history_on_reopen() {
+    for (choice, audit) in [
+        (
+            DecisionChoice::Both,
+            "System audit: no reason supplied; user selected both needed",
+        ),
+        (
+            DecisionChoice::Neither,
+            "System audit: no reason supplied; user selected neither fits",
+        ),
+        (
+            DecisionChoice::Defer,
+            "System audit: no reason supplied; user deferred this decision",
+        ),
+    ] {
+        let (dir, mut s) = open_fixture();
+        let before = s.snapshot().unwrap().clone();
+        let mut i = input(&s, ScopeKind::SingleRecord);
+        i.rationale.clear();
+        i.unresolved_questions = vec!["What about completed work?".into()];
+        assert_eq!(
+            send(
+                &mut s,
+                WorkspaceAction::SaveDecision {
+                    choice,
+                    input: i,
+                    preview_id: None,
+                    candidate_id: None
+                },
+                Some("record-1"),
+                2
+            ),
+            OperationOutcome::Committed
+        );
+        let saved = s.snapshot().unwrap().clone();
+        assert_eq!(saved.records, before.records);
+        assert_eq!(saved.event_history, before.event_history);
+        assert_eq!(saved.behavior_revisions, before.behavior_revisions);
+        assert_eq!(saved.rule_bindings, before.rule_bindings);
+        let d = saved.decisions.last().unwrap();
+        assert_eq!(d.choice, choice);
+        assert_eq!(d.status, DecisionStatus::Pending);
+        assert_eq!(d.rationale, audit);
+        assert_eq!(
+            d.scope.as_ref().unwrap().frozen_record_ids,
+            vec!["record-1"]
+        );
+        assert_eq!(d.unresolved_questions, vec!["What about completed work?"]);
+        send(&mut s, WorkspaceAction::CloseProject, None, 3);
+        send(
+            &mut s,
+            WorkspaceAction::OpenProject {
+                location: dir.path().join("project").display().to_string(),
+            },
+            None,
+            4,
+        );
+        assert_eq!(s.snapshot().unwrap(), &saved);
+    }
+}
+
+#[test]
+fn comparison_only_controller_proof_cannot_adopt_or_smuggle_scope() {
+    let (_dir, mut s) = open_fixture();
+    let before = s.snapshot().unwrap().clone();
+    let mut i = input(&s, ScopeKind::SingleRecord);
+    i.rationale.clear();
+    assert_eq!(
+        send(
+            &mut s,
+            WorkspaceAction::Compare { input: i.clone() },
+            Some("record-1"),
+            2
+        ),
+        OperationOutcome::PreviewReady
+    );
+    let preview = s.workspace_view().rehearsal.unwrap().clone();
+    assert!(!preview.candidates[1].ready_to_adopt);
+    assert!(matches!(
+        send(
+            &mut s,
+            WorkspaceAction::SaveDecision {
+                choice: DecisionChoice::Adopt,
+                input: i.clone(),
+                preview_id: Some(preview.preview_id),
+                candidate_id: Some(preview.candidates[1].candidate_id.clone()),
+            },
+            Some("record-1"),
+            2
+        ),
+        OperationOutcome::Rejected(_)
+    ));
+    i.scope = ScopeKind::AllExistingAndFuture;
+    assert!(matches!(
+        send(
+            &mut s,
+            WorkspaceAction::Compare { input: i },
+            Some("record-1"),
+            3
+        ),
+        OperationOutcome::Rejected(_)
+    ));
+    assert_eq!(s.snapshot().unwrap(), &before);
+}
+
+#[test]
+fn default_creation_validates_missing_ancestors_before_writing() {
+    const CHILD: &str = "GITMANAGER_V01_DEFAULT_LOCATION_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let dir = temp_dir();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "default_creation_validates_missing_ancestors_before_writing",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("HOME", dir.path())
+            .env("LOCALAPPDATA", dir.path().join("private-app-data"))
+            .env("XDG_DATA_HOME", dir.path().join("private-app-data"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let root = default_tool_data_directory().unwrap();
+    assert!(!root.exists());
+    let destination = root.join("fresh-project");
+    let mut ordinary = ToolStudio::new();
+    assert!(matches!(
+        send(
+            &mut ordinary,
+            WorkspaceAction::CreateProject {
+                name: "Unsafe temporary default".into(),
+                location: destination.display().to_string(),
+                spec: studio_order_template(),
+            },
+            None,
+            1
+        ),
+        OperationOutcome::Rejected(_)
+    ));
+    assert!(
+        !root.exists(),
+        "temporary defaults must be rejected before directories are created"
+    );
+    let mut s = studio();
+    let action = WorkspaceAction::CreateProject {
+        name: "Ordinary name".into(),
+        location: destination.display().to_string(),
+        spec: studio_order_template(),
+    };
+    assert_eq!(
+        send(&mut s, action.clone(), None, 1),
+        OperationOutcome::PreviewReady
+    );
+    let original = s.snapshot().unwrap().clone();
+    send(&mut s, WorkspaceAction::CloseProject, None, 2);
+    assert!(matches!(
+        send(&mut s, action, None, 3),
+        OperationOutcome::Rejected(_) | OperationOutcome::Failed(_)
+    ));
+    assert_eq!(
+        tool_store::ProjectStore::open(destination)
+            .unwrap()
+            .load()
+            .unwrap(),
+        tool_store::StoreLoad::Writable(original)
+    );
+    let mut fresh = studio();
+    assert!(matches!(
+        send(
+            &mut fresh,
+            WorkspaceAction::CreateProject {
+                name: "Bad".into(),
+                location: root
+                    .join("missing-manual-parent/project")
+                    .display()
+                    .to_string(),
+                spec: studio_order_template()
+            },
+            None,
+            1
+        ),
+        OperationOutcome::Rejected(_)
+    ));
+    assert!(!root.join("missing-manual-parent").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn default_directory_creation_cannot_follow_swapped_ancestor() {
+    let dir = temp_dir();
+    let checked = dir.path().join("checked");
+    let pinned = dir.path().join("original-parent");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&checked).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    let mut swapped = false;
+    let result = tool_studio::create_private_data_directory(&checked.join("app/data"), |_| {
+        if !swapped {
+            std::fs::rename(&checked, &pinned).unwrap();
+            std::os::unix::fs::symlink(&outside, &checked).unwrap();
+            swapped = true;
+        }
+    });
+    assert!(
+        !outside.join("app").exists(),
+        "creation must not follow a newly inserted ancestor symlink"
+    );
+    assert!(swapped);
+    result.unwrap();
+    assert!(pinned.join("app/data").is_dir());
+}
+
+#[test]
+fn second_name_only_creation_renews_only_a_confirmed_creation_draft() {
+    let mut s = studio();
+    let mut h = egui_harness::EguiHarness::new(egui::vec2(900.0, 1600.0));
+    let mut ui = tool_workspace::ToolWorkspace::default();
+    let mut created = Vec::new();
+    for name in ["First tool", "Second tool"] {
+        ui_click(&mut h, &mut ui, &mut s, "entry.create");
+        ui_type(&mut h, &mut ui, &mut s, "project.name", name);
+        ui_click(&mut h, &mut ui, &mut s, "project.submit");
+        let location = s.workspace_view().location.unwrap().to_string();
+        let saved = s.snapshot().unwrap().clone();
+        assert_eq!(saved.project_name, name);
+        assert!(saved.records.is_empty());
+        created.push((location, saved));
+        ui_click(&mut h, &mut ui, &mut s, "project.close");
+    }
+    assert_ne!(created[0].0, created[1].0);
+    assert_ne!(created[0].1.project_id, created[1].1.project_id);
+    for (location, snapshot) in created {
+        assert_eq!(
+            tool_store::ProjectStore::open(&location)
+                .unwrap()
+                .load()
+                .unwrap(),
+            tool_store::StoreLoad::Writable(snapshot)
+        );
+        std::fs::remove_dir_all(location).unwrap();
+    }
 }
