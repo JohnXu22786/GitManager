@@ -421,6 +421,7 @@ fn accepted_properties_require_actual_observation_and_artifact_content() {
             DataValue::Integer { value: 1 },
         )]),
         view: empty_view(),
+        view_schema: None,
         outputs: vec![artifact],
     };
     assert_eq!(property.evaluate(&[observation.clone()]), Some(true));
@@ -555,6 +556,7 @@ fn request_identity_and_response_matching_include_active_intentions() {
             session_digest: None,
         },
         examples: vec![],
+        accepted_scenes: vec![],
         decisions: DecisionGraph {
             version: 1,
             revision: 0,
@@ -703,6 +705,7 @@ fn evidence() -> RunEvidence {
                 DataValue::Integer { value: 0 },
             )]),
             view: empty_view(),
+            view_schema: None,
             outputs: vec![],
         }],
         limits: RuntimeLimits::default(),
@@ -965,6 +968,7 @@ fn nested_inputs_are_bounded_in_receipts_and_development_context() {
             session_digest: None,
         },
         examples: vec![],
+        accepted_scenes: vec![],
         decisions: DecisionGraph {
             version: 1,
             revision: 0,
@@ -1055,6 +1059,7 @@ fn evolution_mapping_cannot_embed_an_invalid_replacement_scenario() {
         mappings: vec![],
         scenarios: vec![ScenarioMapping {
             original: scenario().identity().unwrap(),
+            source_program: None,
             replacement,
             explanation: "Retain the original need".into(),
         }],
@@ -1127,6 +1132,7 @@ fn development_result_validates_producer_metadata() {
             session_digest: None,
         },
         examples: vec![],
+        accepted_scenes: vec![],
         decisions: DecisionGraph {
             version: 1,
             revision: 0,
@@ -1287,6 +1293,7 @@ fn reconciliation_results_bind_known_needs_mappings_and_replacement_scenes() {
             disclosure: Disclosure::Synthetic,
             scenario: scene.clone(),
         }],
+        accepted_scenes: vec![],
         decisions: DecisionGraph {
             version: 1,
             revision: 1,

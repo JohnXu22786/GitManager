@@ -36,20 +36,29 @@ impl Output {
 fn group_signal_result(
     error: std::io::Error,
     darwin: bool,
-    only_owned_zombie: impl FnOnce() -> Result<bool, String>,
+    mut only_owned_zombie: impl FnMut() -> Result<bool, String>,
 ) -> Result<(), String> {
     if error.raw_os_error() == Some(3) {
         return Ok(());
     } // ESRCH
     if darwin && error.raw_os_error() == Some(1) {
         // EPERM
-        match only_owned_zombie() {
-            Ok(true) => return Ok(()),
-            Ok(false) => (),
-            Err(detail) => {
-                return Err(format!(
-                    "{error}; owned group verification failed: {detail}"
-                ))
+        // XNU hides P_REF_DEAD processes from killpg before waitid can see
+        // SZOMB (kern_exit.c: proc_prepareexit/proc_exit). Only a not-yet-
+        // terminal owned leader may be rechecked; proof errors fail closed.
+        // At most 100 checks and 99 five-millisecond pauses, without reaping.
+        for attempt in 0..100 {
+            match only_owned_zombie() {
+                Ok(true) => return Ok(()),
+                Ok(false) if attempt < 99 => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Ok(false) => (),
+                Err(detail) => {
+                    return Err(format!(
+                        "{error}; owned group verification failed: {detail}"
+                    ))
+                }
             }
         }
     }
@@ -194,7 +203,10 @@ pub(crate) fn run(
                         if !exited_without_reaping(self.child.id())? {
                             return Ok(false);
                         }
-                        darwin_group_is_only_owner(self.child.id())
+                        if !darwin_group_is_only_owner(self.child.id())? {
+                            return Err("group contains another member".into());
+                        }
+                        Ok(true)
                     }
                     #[cfg(not(target_os = "macos"))]
                     {
@@ -418,6 +430,46 @@ pub(crate) fn run(
 #[cfg(test)]
 mod cleanup_tests {
     use super::*;
+    #[test]
+    fn darwin_eperm_rechecks_a_leader_transitioning_to_waitable() {
+        // Darwin can stop finding the exiting leader for killpg before
+        // waitid observes SZOMB. Keep ownership until the proof is complete.
+        let checks = std::cell::Cell::new(0);
+        let result = group_signal_result(std::io::Error::from_raw_os_error(1), true, || {
+            checks.set(checks.get() + 1);
+            if checks.get() < 4 {
+                return Ok(false);
+            }
+            group_is_only_owner(42, 4, &[42, 0, 0])
+        });
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(checks.get(), 4);
+    }
+    #[test]
+    fn darwin_terminal_recheck_is_bounded_and_proof_errors_stop_it() {
+        let checks = std::cell::Cell::new(0);
+        let result = group_signal_result(std::io::Error::from_raw_os_error(1), true, || {
+            checks.set(checks.get() + 1);
+            Ok(false)
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            checks.get(),
+            100,
+            "nonterminal ownership must not spin forever"
+        );
+        checks.set(0);
+        let result = group_signal_result(std::io::Error::from_raw_os_error(1), true, || {
+            checks.set(checks.get() + 1);
+            Err("ownership or sole-member proof unavailable".into())
+        });
+        assert!(result.unwrap_err().contains("proof unavailable"));
+        assert_eq!(
+            checks.get(),
+            1,
+            "failed proof must not be retried or ignored"
+        );
+    }
     #[test]
     fn darwin_eperm_requires_proof_of_only_the_owned_zombie() {
         let denied = || std::io::Error::from_raw_os_error(1);

@@ -109,6 +109,73 @@ fn invalid_recovery_and_interrupted_activation_never_publish_current() {
     assert_eq!(store.load().unwrap(), before);
 }
 #[test]
+fn recovery_activation_cannot_replace_a_competing_current_pointer() {
+    let dir = tempfile::tempdir().unwrap();
+    let original_path = dir.path().join("original");
+    let original = create(&original_path);
+    let existing = original
+        .apply(
+            0,
+            "original",
+            &add("Existing work"),
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    let recovery = original
+        .apply(
+            existing.revision,
+            "later",
+            &add("Recovery work"),
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    let other_path = dir.path().join("other");
+    ProductStore::create_recovered(&other_path, &existing).unwrap();
+    let pointer = fs::read(other_path.join("CURRENT")).unwrap();
+    assert!(ProductStore::create(&other_path, &capture(organizer()), 20000).is_err());
+    assert_eq!(fs::read(other_path.join("CURRENT")).unwrap(), pointer);
+    let target = dir.path().join("recovered");
+    // Deterministically install an already-committed project after the fresh
+    // target is pinned, reproducing the activation side of a creation race.
+    let result = ProductStore::create_recovered_with(&target, &recovery, |_| {
+        for entry in fs::read_dir(&other_path)? {
+            let entry = entry?;
+            if entry.file_name() != ".write.lock" {
+                fs::copy(entry.path(), target.join(entry.file_name()))?;
+            }
+        }
+        Ok(())
+    });
+    assert!(result.is_err(), "recovery replaced a competing project");
+    assert_eq!(fs::read(target.join("CURRENT")).unwrap(), pointer);
+    assert_eq!(
+        fs::read_dir(&target).unwrap().count(),
+        fs::read_dir(&other_path).unwrap().count(),
+        "a rejected fresh activation must not stage an extra snapshot"
+    );
+    assert_eq!(
+        ProductStore::open(&target).unwrap().load().unwrap(),
+        existing
+    );
+    assert_eq!(original.load().unwrap(), recovery);
+    assert_eq!(fs::read(other_path.join("CURRENT")).unwrap(), pointer);
+    let invalid_target = dir.path().join("invalid-current");
+    assert!(
+        ProductStore::create_recovered_with(&invalid_target, &recovery, |_| {
+            fs::write(
+                invalid_target.join("CURRENT"),
+                b"interrupted competing project",
+            )?;
+            Ok(())
+        })
+        .is_err()
+    );
+    assert_eq!(
+        fs::read(invalid_target.join("CURRENT")).unwrap(),
+        b"interrupted competing project"
+    );
+}
+#[test]
 fn extension_objects_are_canonical_bounded_and_content_addressed() {
     let dir = tempfile::tempdir().unwrap();
     let store = create(&dir.path().join("source"));

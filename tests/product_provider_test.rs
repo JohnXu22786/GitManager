@@ -312,7 +312,14 @@ fn nonzero_quota_and_network_are_not_success() {
 fn stdout_stderr_and_result_files_are_bounded() {
     for mode in ["stdout_overflow", "stderr_overflow", "oversize_file"] {
         let f = Fixture::new(ProviderKind::Codex, mode);
-        assert_eq!(f.run("bound").state, JobState::OutputLimit, "{mode}");
+        let receipt = f.run("bound");
+        assert_eq!(
+            receipt.state,
+            JobState::OutputLimit,
+            "{mode}: detail={:?}, exit_code={:?}",
+            receipt.detail,
+            receipt.exit_code
+        );
     }
 }
 #[cfg(any(target_os = "linux", target_os = "macos"))]

@@ -269,29 +269,8 @@ impl ProductStore {
             operations: BTreeMap::new(),
             artifacts: vec![],
         };
-        snapshot.validate()?;
-        LocalRuntime::default().start(
-            program,
-            &snapshot.data,
-            &snapshot.session,
-            clock_day,
-            0,
-            RuntimeLimits::default(),
-        )?;
-        let (parent, name) = Self::location(path.as_ref())?;
-        let root = parent.create_child(&name)?;
-        let store = Self {
-            parent: Arc::new(parent),
-            root: Arc::new(root),
-            name,
-        };
-        let _lock = store.root.lock()?;
-        store.save(
-            &snapshot,
-            #[cfg(test)]
-            None,
-        )?;
-        Ok(store)
+        // Ordinary creation and recovery share the same fresh-only activation.
+        Self::create_recovered(path, &snapshot)
     }
     /// Recover a complete snapshot into a new directory. This never replaces
     /// current work and is not a behavior rollback on current business data.
@@ -349,14 +328,26 @@ impl ProductStore {
             name,
         };
         let _lock = store.root.lock()?;
+        store.require_unactivated()?;
         before_activate(&store)?;
         store.pinned()?;
         store.save(
             snapshot,
+            false,
             #[cfg(test)]
             None,
         )?;
         Ok(store)
+    }
+
+    fn require_unactivated(&self) -> Result<()> {
+        match self.root.read("CURRENT", MAX_STORE_BYTES) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+            Ok(_) => Err(StoreError::Conflict(
+                "destination already contains a project; choose a new location".into(),
+            )),
+        }
     }
 
     /// Store bounded canonical JSON in the fixed immutable extension namespace.
@@ -474,9 +465,13 @@ impl ProductStore {
     fn save(
         &self,
         snapshot: &ProjectSnapshot,
+        replace_current: bool,
         #[cfg(test)] fault: Option<FaultPoint>,
     ) -> Result<()> {
         self.pinned()?;
+        if !replace_current {
+            self.require_unactivated()?;
+        }
         snapshot.validate()?;
         let bytes = canonical_bytes(snapshot)?;
         if bytes.len() > MAX_STORE_BYTES {
@@ -511,8 +506,10 @@ impl ProductStore {
         if fault == Some(FaultPoint::BeforePointer) {
             return Err(StoreError::Interrupted(FaultPoint::BeforePointer));
         }
+        // The preflight avoids staging into a known competing project; only
+        // atomic no-clobber publication closes a subsequent activation race.
         self.root
-            .publish("CURRENT", &canonical_bytes(&pointer)?, true)?;
+            .publish("CURRENT", &canonical_bytes(&pointer)?, replace_current)?;
         #[cfg(test)]
         if fault == Some(FaultPoint::AfterPointer) {
             return Err(StoreError::Interrupted(FaultPoint::AfterPointer));
@@ -605,6 +602,7 @@ impl ProductStore {
         );
         self.save(
             &snapshot,
+            true,
             #[cfg(test)]
             fault,
         )?;
@@ -818,6 +816,7 @@ impl ProductStore {
         )?;
         self.save(
             &current,
+            true,
             #[cfg(test)]
             None,
         )?;
