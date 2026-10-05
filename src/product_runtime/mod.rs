@@ -16,8 +16,8 @@ use std::sync::{
 };
 use std::time::Instant;
 
-pub const RUNTIME_VERSION: &str = "local-interpreter/1";
-pub const DRIVER_VERSION: &str = "semantic-input/1";
+pub const RUNTIME_VERSION: &str = "local-interpreter/2";
+pub const DRIVER_VERSION: &str = "semantic-input/2";
 type Result<T> = std::result::Result<T, AdapterError>;
 fn invalid(message: &str) -> AdapterError {
     AdapterError::Invalid(ContractError(message.into()))
@@ -252,8 +252,10 @@ impl LocalRuntime {
         let mut state = EvidenceState::Observed;
         let mut errors = Vec::new();
         let mut uncovered = Vec::new();
-        for (index, input) in scenario.inputs.iter().enumerate() {
-            let operation = format!("replay-{}-{index}", scenario.input_identity()?.as_str());
+        // The shared replay driver excludes observation instrumentation from
+        // mutation identity. Live apply/store IDs are supplied by their caller.
+        let operations = scenario.replay_operation_ids()?;
+        for (input, operation) in scenario.inputs.iter().zip(operations) {
             if let Err(error) = self.apply(&mut run, input, &operation) {
                 state = if matches!(
                     error,

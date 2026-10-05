@@ -203,6 +203,7 @@ pub(super) fn observe(
         session_digest: state.session.identity()?,
         values,
         value_types: app.observable_types()?,
+        view_schema: app.view_schema(&view.view)?,
         view,
         outputs: state.outputs.clone(),
     };
