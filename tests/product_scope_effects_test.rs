@@ -766,3 +766,51 @@ fn completion_cannot_claim_an_archive_event_that_never_happened() {
         .insert(origin, forged);
     assert!(snapshot.validate().is_err());
 }
+
+#[test]
+fn every_writer_of_a_completed_durable_result_requires_protection() {
+    fn with_reset(pause: bool) -> CapturedProgram {
+        let mut raw = serde_json::to_value(program(pause).program).unwrap();
+        raw["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"reset","label":"Reset derived result","parameters":{"row":{"kind":"reference","entity":"job"}},"guards":[],"steps":[{"kind":"update","record":var("row"),"values":{"production":int(99)}}],"ensures":[]}));
+        capture(raw)
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let store = ProductStore::create(dir.path().join("tool"), &with_reset(false), 20000).unwrap();
+    let before = store.load().unwrap();
+    let mut req = request(&before, ScopePopulation::FutureWork);
+    assert!(store
+        .prepare_scoped_change(&with_reset(true), &req, "uncovered")
+        .is_err());
+    req.operations.insert("reset".into());
+    req.patches.push(EffectPatchRequest {
+        destination: EffectDestination::Update {
+            action: "reset".into(),
+            path: vec![0],
+            field: "production".into(),
+        },
+        entity: "job".into(),
+        subject: "row".into(),
+        value_type: Type::Integer,
+    });
+    let prepared = store
+        .prepare_scoped_change(&with_reset(true), &req, "protected")
+        .unwrap();
+    store.adopt_scoped(before.revision, &prepared).unwrap();
+    let job = add(&store, "job", "Completed work");
+    action(&store, "wait", "wait", &job);
+    tick(&store, "days", 20003);
+    let completed = action(&store, "complete", "complete", &job);
+    let reset = action(&store, "reset", "reset", &job);
+    assert_eq!(
+        row(&reset, &job).values["production"],
+        row(&completed, &job).values["production"]
+    );
+    let mut corrupted = reset;
+    corrupted.data.records[0]
+        .values
+        .insert("production".into(), DataValue::Integer { value: 99 });
+    corrupted.data.events.last_mut().unwrap().changes[0]
+        .after
+        .insert("production".into(), DataValue::Integer { value: 99 });
+    assert!(corrupted.validate().is_err());
+}

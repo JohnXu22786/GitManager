@@ -28,7 +28,9 @@ structural rewrites, foreign-row writes, durable aliases of scoped values, share
 loop membership, unsupported conditions, ambiguous slot mappings and unsafe
 completion/output ordering are refused with a forward-repair explanation.
 Shared output definitions require every affected emission to be explicitly
-covered. This is not arbitrary application composition.
+covered. Every writer of a protected durable result must also be enumerated;
+an uncovered correction/reset cannot silently overwrite completed work. This is
+not arbitrary application composition.
 
 ## Host integration
 
@@ -69,7 +71,10 @@ Protected cohort fields, saved values and provenance are scenario validity
 data. Reduction cannot erase them. Unknown correspondence between a synthetic
 seed and a real frozen cohort remains unverified. Additive schema projection
 of an authenticated accepted seed is checked separately and cannot change its
-business facts. The initialized seed of a managed evolution remains authenticated
+business facts. When an authenticated original seed exactly matches retained
+initialization inputs, replay applies those independently regenerated metadata
+receipts and binds evidence to the resulting actual seed. Unknown synthetic
+correspondence is still rejected. The initialized seed of a managed evolution remains authenticated
 through its exact retained basis and source after later edits and restart.
 
 ## Persistence, upgrades and recovery

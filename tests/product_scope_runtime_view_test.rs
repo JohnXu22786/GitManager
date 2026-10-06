@@ -972,4 +972,229 @@ fn discovery_admits_the_matching_second_layer_seed_for_both_sources() {
         );
     }
     assert!(!report.questions.is_empty(), "{:?}", report);
+    let adopted = store.adopt_scoped(current.revision, &second).unwrap();
+    let completed = action(&store, "complete-two-layers", "complete", &job);
+    assert!(completed.data.generation > adopted.data.generation);
+    let context = ScopedExecutionContext::committed(&completed).unwrap();
+    context
+        .verify_seed(
+            current.program().unwrap(),
+            &completed.data,
+            completed.clock_day,
+        )
+        .unwrap();
+    let historical = ScenarioSpec {
+        seed: completed.data.clone(),
+        session: completed.session.clone(),
+        clock_day: completed.clock_day,
+        ..scene
+    };
+    let run = LocalRuntime::default()
+        .replay_admitted(
+            current.program().unwrap(),
+            &historical,
+            &completed.decisions,
+            RuntimeLimits::default(),
+            "earlier-envelope",
+            Some(&context),
+        )
+        .unwrap();
+    assert_eq!(run.state, EvidenceState::Observed);
+}
+
+#[test]
+fn independent_promises_cross_only_authenticated_layer_initialization() {
+    fn keep_commitment(store: &ProductStore, engine: &DecisionEngine<LocalRuntime>, id: &str) {
+        let current = store.load().unwrap();
+        let scene = ScenarioSpec {
+            version: 1,
+            id: id.into(),
+            label: "Customer commitment remains fixed".into(),
+            seed: current.data.clone(),
+            session: current.session.clone(),
+            clock_day: current.clock_day,
+            random_seed: 42,
+            inputs: vec![
+                invoke("export", &[]),
+                SemanticInput::Observe {
+                    point: "result".into(),
+                },
+            ],
+            validity: vec![],
+        };
+        let accepted = engine
+            .accept_current_scene(&current, &scene, Disclosure::Synthetic)
+            .unwrap();
+        // This is explicitly an independent property promise, not an inferred
+        // downgrade of any concrete chosen timing or reminder outcome.
+        let choice = Choice {
+            id: id.into(),
+            request: "Keep this customer's original promised date".into(),
+            rationale: None,
+            scope: DecisionScope {
+                operations: ["export".into()].into_iter().collect(),
+                population: Population::All,
+                conditions: Values::new(),
+                excluded_records: vec![],
+                unknowns: vec![],
+            },
+            outcome: DecisionOutcome::KeepCurrent,
+            obligations: vec![AcceptedProperty {
+                id: format!("date-{id}"),
+                description: "The promised date remains unchanged".into(),
+                predicate: PropertyPredicate::Equal {
+                    left: PropertyTerm::OutputColumn {
+                        point: "result".into(),
+                        output: "sheet".into(),
+                        column: "promised".into(),
+                        value_type: Type::Date,
+                    },
+                    right: PropertyTerm::Literal {
+                        value_type: Type::list(Type::Date),
+                        value: DataValue::List {
+                            item_type: Type::Date,
+                            items: vec![DataValue::Date { days: 20020 }],
+                        },
+                    },
+                },
+            }],
+            binding: IntentionBinding::PropertiesOnly,
+        };
+        let change = engine
+            .prepare_choice(
+                store,
+                current.program().unwrap(),
+                choice,
+                vec![accepted],
+                &format!("accept-{id}"),
+            )
+            .unwrap();
+        engine.adopt(store, &change).unwrap();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tool");
+    let store = ProductStore::create(&path, &program(false), 20000).unwrap();
+    let job = add(&store, "job", "Customer work");
+    action(&store, "wait", "wait", &job);
+    let engine = DecisionEngine::new(LocalRuntime::default(), IntentArchive::new(store.clone()));
+    keep_commitment(&store, &engine, "ordinary-promise");
+    let current = store.load().unwrap();
+    let first = store
+        .prepare_scoped_change(
+            &program(true),
+            &request(&current, ScopePopulation::All),
+            "first",
+        )
+        .unwrap();
+    let context = ScopedExecutionContext::prepared(&current, &first).unwrap();
+    let mut mapped = current.data.clone();
+    mapped.schema = first.seed().schema.clone();
+    let (_, initialized) = context
+        .project_seed(
+            current.program().unwrap(),
+            &current.data,
+            first.target(),
+            &mapped,
+            current.clock_day,
+        )
+        .unwrap();
+    assert_eq!(&initialized, first.seed());
+    let mut tampered = mapped.clone();
+    tampered.records[0]
+        .values
+        .insert("promised".into(), DataValue::Date { days: 20099 });
+    assert!(context
+        .project_seed(
+            current.program().unwrap(),
+            &current.data,
+            first.target(),
+            &tampered,
+            current.clock_day
+        )
+        .is_err());
+    let mut unknown = current.data.clone();
+    unknown.records[0]
+        .values
+        .insert("name".into(), text("Unrelated synthetic work"));
+    let mut unknown_mapped = unknown.clone();
+    unknown_mapped.schema = mapped.schema;
+    assert!(context
+        .project_seed(
+            current.program().unwrap(),
+            &unknown,
+            first.target(),
+            &unknown_mapped,
+            current.clock_day
+        )
+        .is_err());
+    let change = engine
+        .prepare_managed_change(&store, first, &[], "first")
+        .unwrap();
+    engine.adopt(&store, &change).unwrap();
+    keep_commitment(&store, &engine, "managed-promise");
+    let current = store.load().unwrap();
+    let mut raw = serde_json::to_value(program(true).program).unwrap();
+    raw["views"][0]["kind"]["columns"][3]["value"] = serde_json::to_value(boolean(false)).unwrap();
+    raw["actions"][6]["steps"][0]["columns"]["reminder"] =
+        serde_json::to_value(boolean(false)).unwrap();
+    let req = ScopeRequest {
+        population: ScopePopulation::All,
+        operations: ["export".into()].into_iter().collect(),
+        excluded_records: vec![],
+        lifecycles: vec![LifecycleBinding {
+            entity: "job".into(),
+            completed: field("record", "done"),
+            source: current.active_revision.clone(),
+        }],
+        patches: vec![
+            EffectPatchRequest {
+                destination: EffectDestination::ViewColumn {
+                    view: "work".into(),
+                    column: "reminder".into(),
+                },
+                entity: "job".into(),
+                subject: "row".into(),
+                value_type: Type::Boolean,
+            },
+            EffectPatchRequest {
+                destination: EffectDestination::EmitColumn {
+                    action: "export".into(),
+                    path: vec![0],
+                    column: "reminder".into(),
+                },
+                entity: "job".into(),
+                subject: "row".into(),
+                value_type: Type::Boolean,
+            },
+        ],
+    };
+    let second = store
+        .prepare_scoped_change(&capture(raw), &req, "second")
+        .unwrap();
+    let change = engine
+        .prepare_managed_change(&store, second, &[], "second")
+        .unwrap();
+    let adopted = engine.adopt(&store, &change).unwrap();
+    assert_eq!(adopted.decisions, current.decisions);
+    let reopened = ProductStore::open(&path).unwrap();
+    let engine = DecisionEngine::new(
+        LocalRuntime::default(),
+        IntentArchive::new(reopened.clone()),
+    );
+    let report = engine.check_current(&reopened.load().unwrap()).unwrap();
+    assert_eq!(report.disposition, CheckDisposition::Ready);
+    assert_eq!(
+        report
+            .checks
+            .iter()
+            .filter(|c| c.state == CheckState::Satisfied)
+            .count(),
+        2
+    );
+    let exported = apply(&reopened, "actual-export", invoke("export", &[]));
+    assert_eq!(
+        exported.artifacts.last().unwrap().rows[0]["promised"],
+        DataValue::Date { days: 20020 }
+    );
+    product_backup::VerifiedBackup::capture(&reopened).unwrap();
 }

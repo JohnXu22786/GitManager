@@ -212,23 +212,26 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         graph: &DecisionGraph,
         limits: RuntimeLimits,
         id: &str,
-    ) -> Result<(RunEvidence, Vec<ScopeContext>)> {
-        let context = self.scope_context()?.project_seed(
+    ) -> Result<(RunEvidence, Vec<ScopeContext>, ScenarioSpec)> {
+        let (context, seed) = self.scope_context()?.project_seed(
             source,
             &original.seed,
             target,
             &mapped.seed,
             mapped.clock_day,
         )?;
-        execute_admitted(
+        let mut actual = mapped.clone();
+        actual.seed = seed;
+        let (run, contexts) = execute_admitted(
             &self.runtime,
             target,
-            mapped,
+            &actual,
             graph,
             limits,
             id,
             Some(&context),
-        )
+        )?;
+        Ok((run, contexts, actual))
     }
     fn capture_mapped_scene(
         &self,
@@ -239,7 +242,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         disclosure: Disclosure,
         limits: RuntimeLimits,
     ) -> Result<(AcceptedScene, Vec<ScopeContext>)> {
-        let (run, contexts) = self.execute_mapped_scene(
+        let (run, contexts, actual) = self.execute_mapped_scene(
             source,
             original,
             target,
@@ -254,7 +257,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         Ok((
             AcceptedScene {
                 program: target.clone(),
-                scenario: mapped.clone(),
+                scenario: actual,
                 evidence: run,
                 disclosure,
                 bind_outcome: true,
@@ -646,7 +649,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 return Ok(exercised);
             }
         };
-        let (run, target_contexts) = match self.execute_mapped_scene(
+        let (run, target_contexts, mapped) = match self.execute_mapped_scene(
             &scene.program,
             &scene.scenario,
             target,

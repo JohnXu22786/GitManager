@@ -200,7 +200,18 @@ fn producer_manifest<'a>(
 /// event, then enforce monotonic seals against the actual append-only events.
 /// No missing value is repaired by evaluating today's changed formula.
 pub(super) fn verify_history(snapshot: &ProjectSnapshot) -> Result<()> {
-    for (id, layer) in &snapshot.scope.layers {
+    verify_history_layers(
+        snapshot,
+        &snapshot.scope.layers.keys().cloned().collect::<Vec<_>>(),
+    )
+}
+pub(super) fn verify_history_layers(snapshot: &ProjectSnapshot, layers: &[Digest]) -> Result<()> {
+    for id in layers {
+        let layer = snapshot
+            .scope
+            .layers
+            .get(id)
+            .ok_or_else(|| error("history layer proof missing"))?;
         let receipt = snapshot
             .scope
             .initializations
@@ -329,6 +340,25 @@ pub(super) fn verify_history(snapshot: &ProjectSnapshot) -> Result<()> {
                     if value_bool(&expected, &sealed)? {
                         if after != expected {
                             return Err(error("completed result seal was modified"));
+                        }
+                        for index in 0..layer.patches.len() {
+                            let patch = effective_patch(snapshot, source, id, index)?;
+                            if patch.request.entity == row.entity {
+                                if let EffectDestination::Update { field, .. }
+                                | EffectDestination::CreateValue { field, .. } =
+                                    &patch.request.destination
+                                {
+                                    if before
+                                        .and_then(|values| values.get(field))
+                                        .unwrap_or(&DataValue::Null)
+                                        != change.after.get(field).unwrap_or(&DataValue::Null)
+                                    {
+                                        return Err(error(
+                                            "completed durable result changed after its seal",
+                                        ));
+                                    }
+                                }
+                            }
                         }
                     } else if value_bool(&after, &sealed)? {
                         let source = producer_manifest(snapshot, &event.program)

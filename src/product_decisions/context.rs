@@ -119,7 +119,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                     )?,
                     None => mapping.scenario(&scene.scenario, &target.program)?,
                 };
-                let (replay, target_contexts) = self.execute_mapped_scene(
+                let (replay, target_contexts, mapped) = self.execute_mapped_scene(
                     &scene.program,
                     &scene.scenario,
                     target,
@@ -422,7 +422,9 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                     &current.program()?.program,
                     &replacement.replacement,
                 )?;
-                let (actual, _) = self.execute_scene(
+                let (actual, _, mapped) = self.execute_mapped_scene(
+                    &original.program,
+                    &original.scenario,
                     current.program()?,
                     &mapped,
                     &current.decisions,

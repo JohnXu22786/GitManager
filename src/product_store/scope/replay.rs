@@ -103,9 +103,10 @@ impl ScopedExecutionContext {
         }
         Ok(())
     }
-    /// Permit only the deterministic additive schema projection of an already
-    /// authenticated scene seed. Business values, identities and history remain
-    /// exact; arbitrary metadata-bearing synthetic seeds are never admitted.
+    /// Authenticate the ordinary additive mapping, then apply only exact
+    /// retained initialization transitions whose frozen input equals this seed.
+    /// Business values, identities and events remain unchanged. Return the
+    /// actual replay seed so evidence never names a different scenario.
     pub fn project_seed(
         &self,
         source: &CapturedProgram,
@@ -113,7 +114,7 @@ impl ScopedExecutionContext {
         target: &CapturedProgram,
         mapped: &DataSnapshot,
         day: i32,
-    ) -> Result<Self> {
+    ) -> Result<(Self, DataSnapshot)> {
         self.verify_seed(source, original, day)?;
         if crate::product_runtime::has_protected_fields(target)
             && !self.known_seed(&original.identity()?)?
@@ -139,9 +140,47 @@ impl ScopedExecutionContext {
                 "scope scene mapping changed protected seed facts",
             ));
         }
+        let mut initialized = original.clone();
+        let mut lineage = vec![];
+        let mut seen = BTreeSet::new();
+        let mut next = Some(revision(target)?);
+        while let Some(id) = next {
+            if !seen.insert(id.clone()) {
+                return Err(compiler::error("cyclic scope projection lineage"));
+            }
+            let Some(manifest) = self.snapshot.scope.compositions.get(&id) else {
+                break;
+            };
+            lineage.push(manifest);
+            next = manifest.previous.clone();
+        }
+        for manifest in lineage.into_iter().rev() {
+            if initialized.identity()? != manifest.basis.data.identity()? {
+                continue;
+            }
+            let target = program(&self.snapshot, &manifest.output)?;
+            initialized = if manifest.transition == ScopeTransition::Adoption {
+                let id = manifest
+                    .layers
+                    .last()
+                    .ok_or_else(|| compiler::error("initialization layer missing"))?;
+                let layer = &self.snapshot.scope.layers[id];
+                let (data, receipt) = history::initialize(&self.snapshot, layer, target)?;
+                if !self.snapshot.scope.initializations.contains(&receipt) {
+                    return Err(compiler::error(
+                        "initialization projection differs from retained receipt",
+                    ));
+                }
+                data
+            } else {
+                merged_data(target, &initialized)?
+            };
+        }
+        let initialized = merged_data(target, &initialized)?;
         let mut result = self.clone();
-        result.projected_seeds.insert(mapped.identity()?);
-        Ok(result)
+        result.projected_seeds.insert(initialized.identity()?);
+        result.verify_seed(target, &initialized, day)?;
+        Ok((result, initialized))
     }
     pub fn verify_seed(
         &self,
@@ -213,20 +252,15 @@ impl ScopedExecutionContext {
         projected.active_revision = id;
         projected.data = data.clone();
         projected.clock_day = day;
-        projected
-            .scope
-            .layers
-            .retain(|id, _| manifest.layers.contains(id));
-        projected
-            .scope
-            .initializations
-            .retain(|r| manifest.layers.contains(&r.layer));
-        for layer in projected.scope.layers.values() {
+        // Verify only this target's obligations, but retain all independently
+        // verified producer proofs needed to check real later business events.
+        for id in &manifest.layers {
+            let layer = &projected.scope.layers[id];
             if data.generation < layer.basis.data.generation {
                 return Err(compiler::error("scene precedes the frozen cohort and needs explicit source-qualified correspondence"));
             }
         }
-        history::verify_history(&projected)
+        history::verify_history_layers(&projected, &manifest.layers)
     }
 }
 impl ReplayAdmission for ScopedExecutionContext {

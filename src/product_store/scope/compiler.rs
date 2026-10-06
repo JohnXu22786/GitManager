@@ -583,6 +583,82 @@ fn check_dependencies(app: &AppDefinition, entity_id: &str, changed: &str) -> Re
     }
     Ok(())
 }
+fn check_durable_writers(app: &AppDefinition, patches: &[EffectPatchRequest]) -> Result<()> {
+    fn visit(
+        app: &AppDefinition,
+        action: &str,
+        steps: &[Statement],
+        prefix: &[usize],
+        mut env: BTreeMap<Id, Type>,
+        patches: &[EffectPatchRequest],
+    ) -> Result<()> {
+        for (index, statement) in steps.iter().enumerate() {
+            let mut path = prefix.to_vec();
+            path.push(index);
+            match statement {
+                Statement::Update { record, values } => {
+                    let entity = match record {
+                        Expr::Variable { name } => match env.get(name) {
+                            Some(Type::Reference { entity }) => Some(entity),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    for protected in patches {
+                        let field = match &protected.destination {
+                            EffectDestination::Update { field, .. }
+                            | EffectDestination::CreateValue { field, .. } => field,
+                            _ => continue,
+                        };
+                        if values.contains_key(field)
+                            && entity.is_none_or(|entity| entity == &protected.entity)
+                            && !patches.iter().any(|patch| {
+                                patch.entity == protected.entity
+                                    && patch.destination
+                                        == (EffectDestination::Update {
+                                            action: action.into(),
+                                            path: path.clone(),
+                                            field: field.clone(),
+                                        })
+                            })
+                        {
+                            return Err(error("a durable result has an uncovered writer; explicitly reconcile every operation that can overwrite completed work"));
+                        }
+                    }
+                }
+                Statement::ForEach {
+                    items,
+                    binding,
+                    steps,
+                } => {
+                    let mut inner = env.clone();
+                    if let Some(entity) = list_entity(items, app, &env) {
+                        inner.insert(binding.clone(), Type::reference(&entity));
+                    } else {
+                        inner.remove(binding);
+                    }
+                    visit(app, action, steps, &path, inner, patches)?;
+                }
+                Statement::Create { entity, bind, .. } => {
+                    env.insert(bind.clone(), Type::reference(entity));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    for action in &app.actions {
+        visit(
+            app,
+            &action.id,
+            &action.steps,
+            &[],
+            action.parameters.clone(),
+            patches,
+        )?;
+    }
+    Ok(())
+}
 fn check_completion_order(app: &AppDefinition) -> Result<()> {
     fn visit(steps: &[Statement], mut emitted: bool) -> Result<bool> {
         for step in steps {
@@ -659,6 +735,8 @@ pub(super) fn derive_patches(
     }
     check_output_coverage(baseline, &request.patches)?;
     check_output_coverage(candidate, &request.patches)?;
+    check_durable_writers(baseline, &request.patches)?;
+    check_durable_writers(candidate, &request.patches)?;
     let mut masked = baseline.clone();
     let mut seen = BTreeSet::new();
     let mut patches = vec![];
@@ -878,6 +956,7 @@ pub(super) fn validate_mappings(
             })
             .collect();
         check_output_coverage(&candidate.program, &mapped)?;
+        check_durable_writers(&candidate.program, &mapped)?;
         for p in &mapped {
             if let EffectDestination::Update { field, .. }
             | EffectDestination::CreateValue { field, .. } = &p.destination
