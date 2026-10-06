@@ -292,10 +292,30 @@ fn concrete_outcome_gate_checks_offered_alternatives_too() {
     let mut next = filtered();
     next["observables"].as_array_mut().unwrap().push(json!({"id":"extra","label":"Extra","value":json!({"kind":"literal","value_type":{"kind":"integer"},"value":{"kind":"integer","value":9}})}));
     let candidate = capture(next);
-    let report = discover_with(&store, &candidate, &capture(replacement()), &s);
+    let request = request(&store, &candidate);
+    let mut result = response(&request, &capture(replacement()), &s);
+    result.response.hypotheses[0].sources[0].pointer = "/observables/1".into();
+    // This alternative is newly supplied by the fixture provider, rather than
+    // one of the request's already captured sources. Bind that exact provenance.
+    let alternative = CapturedProgram::capture(
+        result.response.candidates[0].source_json.as_bytes(),
+        &request.project_id,
+        result.producer.clone(),
+        None,
+    )
+    .unwrap();
+    let report = discover(
+        &request,
+        &result,
+        &policy(&store),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
     assert!(report.questions.is_empty());
-    assert!(report.checks.iter().any(|c| c.state == CheckState::Violated
-        && c.binding.artifact == capture(replacement()).artifact));
+    assert!(report
+        .checks
+        .iter()
+        .any(|c| c.state == CheckState::Violated && c.binding.artifact == alternative.artifact));
     assert!(report
         .log
         .iter()
@@ -711,10 +731,13 @@ fn real_backup_recovery_preserves_exact_nonbinary_packages_and_question_history(
     use product_locations::RecentTools;
     for outcome in [DecisionOutcome::EitherAcceptable, DecisionOutcome::Deferred] {
         let dir = tempfile::tempdir().unwrap();
+        // Match the recovery helpers' no-symlink selected-folder boundary,
+        // including macOS temporary directories reached through /var aliases.
+        let root = std::fs::canonicalize(dir.path()).unwrap();
         let a = capture(filtered());
         let b = capture(replacement());
         let s = workflow(&a);
-        let store = ProductStore::create(dir.path().join("tool"), &a, 20000).unwrap();
+        let store = ProductStore::create(root.join("tool"), &a, 20000).unwrap();
         save(
             &store,
             outcome,
@@ -726,15 +749,15 @@ fn real_backup_recovery_preserves_exact_nonbinary_packages_and_question_history(
         let original_context = request(&store, &b);
         let backup = VerifiedBackup::capture(&store).unwrap();
         let bytes = backup.to_bytes().unwrap();
-        let recent = RecentTools::open(dir.path()).unwrap();
+        let recent = RecentTools::open(&root).unwrap();
         let imported = VerifiedBackup::from_bytes(&bytes).unwrap();
         let created = imported
-            .recover_tool(&dir.path().join("recovered"), &recent, 1)
+            .recover_tool(&root.join("recovered"), &recent, 1)
             .unwrap();
         assert!(created.registration.is_ok());
         drop(created);
         let opened = open_verified(
-            &dir.path().join("recovered"),
+            &root.join("recovered"),
             Some(&backup.summary().unwrap().identity),
         )
         .unwrap();
