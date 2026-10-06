@@ -1,10 +1,13 @@
 //! Source-bound hypotheses become questions only after independent execution.
 //! This module cannot adopt programs or mutate a daily-work store.
+mod history;
 mod provider;
 mod source;
 use crate::product_contract::*;
+use crate::product_decisions::CheckDisposition;
 use crate::product_runtime::LocalRuntime;
 use crate::product_scenarios::*;
+pub use history::VerifiedRetainedHistory;
 pub use provider::*;
 pub use source::{analyze_delta, SourceDelta};
 use std::{
@@ -28,7 +31,10 @@ pub struct DiscoveryPolicy {
     pub max_precheck_replays: usize,
     /// Host-approved workflow constraints replace untrusted provider oracles.
     pub workflow_validity: BTreeMap<Id, Vec<AcceptedProperty>>,
-    /// Previously accepted witnesses, addressed by the saved decision digest.
+    /// Genuine V07 scene-package history, loaded by the host from its store.
+    /// The package identity is never interpreted as a differential-witness hash.
+    pub retained_history: Option<VerifiedRetainedHistory>,
+    /// Genuine differential witnesses in their own identity domain.
     pub retained_witnesses: Vec<DifferentialWitness>,
     /// Exact selected artifact from the controller's verified adoption/history receipt.
     /// KeepCurrent alone does not identify which generated witness side was current.
@@ -44,6 +50,7 @@ impl Default for DiscoveryPolicy {
             max_comparisons: 64,
             max_precheck_replays: 256,
             workflow_validity: BTreeMap::new(),
+            retained_history: None,
             retained_witnesses: vec![],
             chosen_artifacts: BTreeMap::new(),
         }
@@ -191,6 +198,18 @@ struct ReplayBudget {
     cancelled: Arc<AtomicBool>,
 }
 impl ReplayBudget {
+    fn reserve(&self, count: usize) -> Result<(), AdapterError> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(AdapterError::Cancelled);
+        }
+        if count > self.remaining.get() {
+            return Err(AdapterError::BudgetExhausted(
+                "Discovery precheck replay budget exhausted".into(),
+            ));
+        }
+        self.remaining.set(self.remaining.get() - count);
+        Ok(())
+    }
     fn check(&self) -> Result<(), AdapterError> {
         if self.cancelled.load(Ordering::Acquire) {
             Err(AdapterError::Cancelled)
@@ -392,10 +411,22 @@ fn retained_history(
     runtime: &LocalRuntime,
     budget: &ReplayBudget,
     decision: &ScopedDecision,
-    prior: &DifferentialWitness,
+    prior: Option<&DifferentialWitness>,
     current_scene: &ScenarioSpec,
     runs: &mut Vec<RunEvidence>,
 ) -> Result<(ScenarioSpec, RunEvidence, RunEvidence), AdapterError> {
+    if let Some(history) = &policy.retained_history {
+        return history.pair(
+            decision,
+            current_scene,
+            request,
+            policy,
+            runtime,
+            budget,
+            runs,
+        );
+    }
+    let prior = prior.ok_or_else(|| invalid("accepted differential witness is missing"))?;
     let input = current_scene.input_identity()?;
     let primary_input = &prior.before.binding.input_digest;
     let accepted: Vec<_> = request
@@ -550,6 +581,30 @@ pub fn discover(
         remaining: Cell::new(policy.max_precheck_replays),
         cancelled: cancelled.clone(),
     };
+    let mut history_unverified = false;
+    if let Some(history) = &policy.retained_history {
+        match history
+            .verify(request, cancelled.clone(), &replay_budget)
+            .and_then(|()| {
+                history.check(
+                    candidate,
+                    cancelled.clone(),
+                    policy.search.runtime.clone(),
+                    &replay_budget,
+                )
+            }) {
+            Ok(checked) => {
+                history_unverified = history::append_check(&mut report, checked, true)
+                    == CheckDisposition::Unverified;
+            }
+            Err(error) => {
+                history_unverified = true;
+                report
+                    .unverified
+                    .push(format!("Saved intention gate is unavailable: {error:?}"));
+            }
+        }
+    }
     let (defects, unknown, runs) =
         check_requirements(candidate, request, policy, &runtime, &replay_budget)?;
     let missing_feature_coverage: Vec<_> = policy
@@ -611,6 +666,9 @@ pub fn discover(
         hypothesis_operations.insert(hypothesis.id.clone(), operations);
     }
     let mut blocked = BTreeSet::new();
+    if history_unverified {
+        blocked.extend(relevant_actions.iter().cloned());
+    }
     let mut pending = BTreeMap::<Id, Vec<&ScopedDecision>>::new();
     'decision_checks: for decision in request
         .decisions
@@ -618,6 +676,33 @@ pub fn discover(
         .iter()
         .filter(|d| matches!(d.status, DecisionStatus::Active | DecisionStatus::Pending))
     {
+        if decision.status == DecisionStatus::Active
+            && policy
+                .retained_history
+                .as_ref()
+                .is_some_and(|h| h.contains(decision))
+        {
+            // The authoritative V07 gate above checks every active concrete or
+            // property-only intention with its own source-qualified mappings.
+            continue;
+        }
+        if policy.retained_history.is_none()
+            && request
+                .accepted_scenes
+                .iter()
+                .any(|scene| scene.decision == decision.id)
+            && !policy
+                .retained_witnesses
+                .iter()
+                .any(|w| w.identity().ok().as_ref() == Some(&decision.witness))
+        {
+            blocked.extend(decision.scope.operations.iter().cloned());
+            report.unverified.push(format!(
+                "Decision {} has portable scene context but no verified retained package",
+                decision.id
+            ));
+            continue;
+        }
         for action in &relevant_actions {
             if let Err(error) = replay_budget.check() {
                 blocked.extend(relevant_actions.iter().cloned());
@@ -852,7 +937,14 @@ pub fn discover(
             Ok(())
         };
         for decision in pending.get(&hypothesis.id).into_iter().flatten() {
-            if let Some(prior) = policy
+            if policy
+                .retained_history
+                .as_ref()
+                .is_some_and(|h| h.contains(decision))
+            {
+                // Every exact packaged scene is retained below. A concrete
+                // chosen package need not contain an invented rejected side.
+            } else if let Some(prior) = policy
                 .retained_witnesses
                 .iter()
                 .find(|w| w.identity().ok().as_ref() == Some(&decision.witness))
@@ -994,6 +1086,40 @@ pub fn discover(
             }
             let alternative = &candidates[id];
             let alternative_unverified_before = report.unverified.len();
+            if let Some(history) = &policy.retained_history {
+                let state = match history.check(
+                    alternative,
+                    cancelled.clone(),
+                    policy.search.runtime.clone(),
+                    &replay_budget,
+                ) {
+                    Ok(checked) => history::append_check(&mut report, checked, false),
+                    Err(error) => {
+                        report.unverified.push(format!(
+                            "Alternative {id} intention gate unavailable: {error:?}"
+                        ));
+                        CheckDisposition::Unverified
+                    }
+                };
+                if state != CheckDisposition::Ready {
+                    entry.disposition = if state == CheckDisposition::RepairRequired {
+                        Disposition::Settled
+                    } else {
+                        Disposition::Unverified
+                    };
+                    entry.state = if state == CheckDisposition::RepairRequired {
+                        EvidenceState::Observed
+                    } else {
+                        EvidenceState::Inconclusive
+                    };
+                    entry.explanation = if state == CheckDisposition::RepairRequired {
+                        format!("Alternative {id} requires repair of an approved intention; it is not a preference option")
+                    } else {
+                        format!("Alternative {id} has unverified saved intentions")
+                    };
+                    continue;
+                }
+            }
             let (defects, unknown, runs) =
                 check_requirements(alternative, request, policy, &runtime, &replay_budget)?;
             report.runs.extend(runs);
@@ -1005,7 +1131,12 @@ pub fn discover(
             // valid product choice, even if the model labels it unresolved.
             let mut permitted = true;
             for decision in request.decisions.decisions.iter().filter(|d| {
-                d.status == DecisionStatus::Active && (!d.obligations.is_empty() || is_chosen(d))
+                d.status == DecisionStatus::Active
+                    && (!d.obligations.is_empty() || is_chosen(d))
+                    && !policy
+                        .retained_history
+                        .as_ref()
+                        .is_some_and(|h| h.contains(d))
             }) {
                 if let Err(error) = replay_budget.check() {
                     permitted = false;
@@ -1287,10 +1418,15 @@ pub fn discover(
                         .push(format!("Retained checks incomplete: {error:?}"));
                     break;
                 }
-                if let Some(prior) = policy
+                let prior = policy
                     .retained_witnesses
                     .iter()
-                    .find(|w| w.identity().ok().as_ref() == Some(&decision.witness))
+                    .find(|w| w.identity().ok().as_ref() == Some(&decision.witness));
+                if prior.is_some()
+                    || policy
+                        .retained_history
+                        .as_ref()
+                        .is_some_and(|h| h.contains(decision))
                 {
                     for (index, witness) in witnesses.iter().enumerate() {
                         let (historical_scene, expected_before, expected_after) =
@@ -1314,19 +1450,21 @@ pub fn discover(
                                     // primary accepted workflow's actual failures.
                                     // These are diagnostics only, not correspondence
                                     // evidence for the scene whose history is missing.
-                                    let primary = checked_scene(
-                                        &prior.scenario,
-                                        true,
-                                        &[witness.before_program(), witness.after_program()],
-                                        policy,
-                                    );
-                                    for (source, id) in [
-                                        (witness.before_program(), "retained-before"),
-                                        (witness.after_program(), "retained-after"),
-                                    ] {
-                                        match replay_budget.replay(&runtime, source, &primary, &request.decisions, policy.search.runtime.clone(), id) {
+                                    if let Some(prior) = prior {
+                                        let primary = checked_scene(
+                                            &prior.scenario,
+                                            true,
+                                            &[witness.before_program(), witness.after_program()],
+                                            policy,
+                                        );
+                                        for (source, id) in [
+                                            (witness.before_program(), "retained-before"),
+                                            (witness.after_program(), "retained-after"),
+                                        ] {
+                                            match replay_budget.replay(&runtime, source, &primary, &request.decisions, policy.search.runtime.clone(), id) {
                                             Ok(run) => report.runs.push(run),
                                             Err(error) => report.unverified.push(format!("Primary accepted workflow replay unavailable: {error:?}")),
+                                        }
                                         }
                                     }
                                     continue;

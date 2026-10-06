@@ -1,6 +1,27 @@
 //! Portable context for a fresh development invocation. No prior chat is used.
 use super::*;
 impl<R: RuntimeAdapter> DecisionEngine<R> {
+    /// Read-only authoritative discovery gate. Compose the same retained,
+    /// source-qualified mappings used by adoption, then independently verify
+    /// concrete outcomes AND extra predicates before offering this executable.
+    /// This creates no adoption authority and writes no archive objects.
+    pub fn check_discovery_candidate(
+        &mut self,
+        current: &ProjectSnapshot,
+        target: &CapturedProgram,
+        mappings: &[SemanticMapping],
+        limits: RuntimeLimits,
+    ) -> Result<CheckReport> {
+        current.validate()?;
+        limits.validate()?;
+        validate_withdrawal_history(current)?;
+        let previous = std::mem::replace(&mut self.limits, limits);
+        let result = self
+            .compose_for_current(current, target, mappings)
+            .and_then(|mappings| self.check_bound(&current.decisions, target, &mappings));
+        self.limits = previous;
+        result
+    }
     /// Build a current-program modification/reconciliation request. Discovery
     /// callers use `inherit_request` to preserve their exact baseline/candidate.
     pub fn development_request(
@@ -91,6 +112,16 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             })
         {
             let scenes = self.archive.load(&decision.witness)?;
+            if scenes
+                .iter()
+                .map(|scene| scene.scenario.identity())
+                .collect::<std::result::Result<Vec<_>, _>>()?
+                != decision.scenarios
+            {
+                return Err(invalid(
+                    "accepted scene identities differ from the decision",
+                ));
+            }
             let binding = validate_scene_bindings(decision, &scenes)?;
             binding_index.push(serde_json::json!({"decision":decision.id,"binding":binding}));
             for scene in scenes {
