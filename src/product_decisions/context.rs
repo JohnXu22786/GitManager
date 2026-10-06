@@ -180,8 +180,13 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         }
         ScopedExecutionContext::prepared(current, prepared)?;
         let previous = self.pending_scope.replace(Some(prepared.clone()));
+        let previous_correspondences = self
+            .pending_correspondences
+            .replace(prepared.correspondences.clone());
         let result = self.check_discovery_candidate(current, target, mappings, limits);
         self.pending_scope.replace(previous);
+        self.pending_correspondences
+            .replace(previous_correspondences);
         result
     }
     pub fn check_discovery_candidate(

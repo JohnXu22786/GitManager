@@ -2723,3 +2723,119 @@ fn fresh_scoped_discovery_retains_creation_identity_without_pending_history() {
     }
     assert_eq!(store.load().unwrap(), current);
 }
+
+#[test]
+fn prepared_discovery_restores_correspondence_state_on_the_same_engine() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
+    let job = add(&store, "job", "Accepted current work");
+    action(&store, "wait", "wait", &job);
+    tick(&store, "days", 20003);
+    let current = store.load().unwrap();
+    let scene = ScenarioSpec {
+        version: 1,
+        id: "original-current".into(),
+        label: "Keep this experienced timing".into(),
+        seed: current.data.clone(),
+        session: current.session.clone(),
+        clock_day: current.clock_day,
+        random_seed: 42,
+        inputs: vec![
+            invoke("calculate", &[("row", reference(&job))]),
+            invoke("complete", &[("row", reference(&job))]),
+            invoke("export", &[]),
+            SemanticInput::Observe {
+                point: "result".into(),
+            },
+        ],
+        validity: vec![],
+    };
+    let mut engine =
+        DecisionEngine::new(LocalRuntime::default(), IntentArchive::new(store.clone()));
+    let accepted = engine
+        .accept_current_scene(&current, &scene, Disclosure::Synthetic)
+        .unwrap();
+    let choice = Choice {
+        id: "current-promise".into(),
+        request: "Keep this actual production timing".into(),
+        rationale: None,
+        scope: DecisionScope {
+            operations: ["calculate".into(), "complete".into(), "export".into()]
+                .into_iter()
+                .collect(),
+            population: Population::All,
+            conditions: Values::new(),
+            excluded_records: vec![],
+            unknowns: vec![],
+        },
+        outcome: DecisionOutcome::KeepCurrent,
+        obligations: vec![],
+        binding: IntentionBinding::ObservedOutcome,
+    };
+    let choice = engine
+        .prepare_choice(
+            &store,
+            current.program().unwrap(),
+            choice,
+            vec![accepted],
+            "keep-current",
+        )
+        .unwrap();
+    engine.adopt(&store, &choice).unwrap();
+    add(&store, "later", "Real work after the accepted scene");
+    let current = store.load().unwrap();
+    let future = store
+        .prepare_scoped_change(
+            &program(true),
+            &request(&current, ScopePopulation::FutureWork),
+            "future",
+        )
+        .unwrap();
+    let checked = engine
+        .check_prepared_discovery_candidate(
+            &current,
+            future.target(),
+            &future,
+            &[],
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(checked.disposition, CheckDisposition::Ready);
+    assert_eq!(
+        engine.check_current(&current).unwrap().disposition,
+        CheckDisposition::Ready
+    );
+    let incompatible = store
+        .prepare_scoped_change(
+            &program(true),
+            &request(&current, ScopePopulation::All),
+            "different-rule",
+        )
+        .unwrap();
+    let checked = engine
+        .check_prepared_discovery_candidate(
+            &current,
+            incompatible.target(),
+            &incompatible,
+            &[],
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(checked.disposition, CheckDisposition::RepairRequired);
+    assert_eq!(
+        engine.check_current(&current).unwrap().disposition,
+        CheckDisposition::Ready
+    );
+    let invalid = RuntimeLimits {
+        fuel: 0,
+        ..Default::default()
+    };
+    assert!(engine
+        .check_prepared_discovery_candidate(&current, future.target(), &future, &[], invalid)
+        .is_err());
+    assert_eq!(
+        engine.check_current(&current).unwrap().disposition,
+        CheckDisposition::Ready
+    );
+    assert_eq!(store.load().unwrap(), current);
+}
