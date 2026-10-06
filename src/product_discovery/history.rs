@@ -261,11 +261,11 @@ impl VerifiedRetainedHistory {
         let contexts: Vec<_> = self.pending_scenes(decision).collect();
         // Labels/scene IDs are annotations, while accepted validity remains
         // binding. Distinct historical sources can name the same input scene.
-        let key = |scene: &ScenarioSpec| {
-            canonical_digest(
+        let key = |scene: &ScenarioSpec| -> Result<Digest, AdapterError> {
+            Ok(canonical_digest(
                 IdentityDomain::Scenario,
-                &(scene.input_identity()?, &scene.validity),
-            )
+                &(scene_equivalence_key(scene)?, &scene.validity),
+            )?)
         };
         let mut scenes = BTreeMap::new();
         for context in &contexts {
@@ -326,6 +326,7 @@ impl VerifiedRetainedHistory {
             runs.push(side.replay().clone());
             outcomes.push(RetainedRun {
                 original,
+                compared_input: selected.input_identity()?,
                 correspondence: side.replay().clone(),
                 mappings: side.mappings().to_vec(),
             });
@@ -342,12 +343,14 @@ impl VerifiedRetainedHistory {
 pub(super) struct RetainedRun {
     pub original: RunEvidence,
     pub correspondence: RunEvidence,
+    compared_input: Digest,
     pub mappings: Vec<SemanticMapping>,
 }
 impl RetainedRun {
     pub fn direct(run: RunEvidence) -> Self {
         Self {
             original: run.clone(),
+            compared_input: run.binding.input_digest.clone(),
             correspondence: run,
             mappings: vec![],
         }
@@ -414,7 +417,7 @@ impl RetainedRun {
             && self.correspondence.state == EvidenceState::Observed
             && run.binding.runtime_version == self.original.binding.runtime_version
             && run.binding.driver_version == self.original.binding.driver_version
-            && run.binding.input_digest == self.correspondence.binding.input_digest
+            && run.binding.input_digest == self.compared_input
             && run.observations.len() == self.original.observations.len()
     }
 }

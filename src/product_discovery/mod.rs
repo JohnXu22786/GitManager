@@ -1652,11 +1652,7 @@ pub fn discover(
                                             Some(expected_first),
                                             Some(expected_second),
                                         ) = (
-                                            retained_target(
-                                                &current_target,
-                                                original_before,
-                                                &expected_before.correspondence,
-                                            ),
+                                            retained_target(&current_target, original_before, a),
                                             expected_before
                                                 .target(&current_target, original_before),
                                             expected_after.target(&current_target, original_before),

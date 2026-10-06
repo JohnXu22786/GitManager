@@ -849,6 +849,9 @@ fn mapped_nonbinary_history_survives_restart_without_reasking_or_hiding_new_resu
         let mut other_scene = s.clone();
         other_scene.id = "second-source-scene".into();
         other_scene.label = "The other implementation's retained scene".into();
+        *other_scene.inputs.last_mut().unwrap() = SemanticInput::Observe {
+            point: "other-done".into(),
+        };
         save(
             &store,
             outcome,
