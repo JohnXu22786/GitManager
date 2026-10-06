@@ -11,6 +11,18 @@ pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
     {
         return Err(error("invalid scope-state version or inventory"));
     }
+    // Retained-basis reconstruction consults earlier compositions before the
+    // semantic composition pass below. Reject broken references first so no
+    // corrupted import/restart can turn those proof lookups into indexing panics.
+    for manifest in state.compositions.values() {
+        if manifest
+            .layers
+            .iter()
+            .any(|id| !state.layers.contains_key(id))
+        {
+            return Err(error("composition references a missing layer proof"));
+        }
+    }
     let mut declared = BTreeMap::new();
     for source in &snapshot.programs {
         let source_id = revision(source)?;

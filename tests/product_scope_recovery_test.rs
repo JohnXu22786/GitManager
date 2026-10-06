@@ -252,3 +252,74 @@ fn durable_slot_retargeting_cannot_unprotect_completed_original_fields() {
         .is_err());
     assert_eq!(store.load().unwrap(), current);
 }
+
+#[test]
+fn corrupted_earlier_composition_references_fail_before_recovery_activation() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
+    let before = store.load().unwrap();
+    let first = store
+        .prepare_scoped_change(
+            &program(true),
+            &request(&before, ScopePopulation::All),
+            "first",
+        )
+        .unwrap();
+    let first = store.adopt_scoped(before.revision, &first).unwrap();
+    add(&store, "job", "Continuing work");
+    let before = store.load().unwrap();
+    let mut raw = serde_json::to_value(program(true).program).unwrap();
+    raw["actions"][6]["steps"][0]["columns"]["reminder"] =
+        serde_json::to_value(boolean(false)).unwrap();
+    raw["views"][0]["kind"]["columns"][3]["value"] = serde_json::to_value(boolean(false)).unwrap();
+    let req = ScopeRequest {
+        population: ScopePopulation::All,
+        operations: ["export".into()].into_iter().collect(),
+        excluded_records: vec![],
+        lifecycles: vec![LifecycleBinding {
+            entity: "job".into(),
+            completed: field("record", "done"),
+            source: before.active_revision.clone(),
+        }],
+        patches: vec![
+            EffectPatchRequest {
+                destination: EffectDestination::EmitColumn {
+                    action: "export".into(),
+                    path: vec![0],
+                    column: "reminder".into(),
+                },
+                entity: "job".into(),
+                subject: "row".into(),
+                value_type: Type::Boolean,
+            },
+            EffectPatchRequest {
+                destination: EffectDestination::ViewColumn {
+                    view: "work".into(),
+                    column: "reminder".into(),
+                },
+                entity: "job".into(),
+                subject: "row".into(),
+                value_type: Type::Boolean,
+            },
+        ],
+    };
+    let second = store
+        .prepare_scoped_change(&capture(raw), &req, "second")
+        .unwrap();
+    let healthy = store.adopt_scoped(before.revision, &second).unwrap();
+    let mut corrupted = healthy.clone();
+    let absent = canonical_digest(IdentityDomain::Adoption, &"absent-layer-proof").unwrap();
+    assert!(!corrupted.scope.layers.contains_key(&absent));
+    corrupted
+        .scope
+        .compositions
+        .get_mut(&first.active_revision)
+        .unwrap()
+        .layers[0] = absent;
+    assert!(corrupted.validate().is_err());
+    let destination = dir.path().join("rejected-recovery");
+    assert!(ProductStore::create_recovered_with(&destination, &corrupted, |_| Ok(())).is_err());
+    assert!(!destination.exists());
+    assert_eq!(store.load().unwrap(), healthy);
+    add(&store, "later", "Still usable after rejected recovery");
+}
