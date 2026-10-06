@@ -202,7 +202,7 @@ impl VerifiedRetainedHistory {
         &self,
         target: &CapturedProgram,
         cancelled: Arc<AtomicBool>,
-        limits: RuntimeLimits,
+        policy: &DiscoveryPolicy,
         budget: &ReplayBudget,
     ) -> Result<CheckReport, AdapterError> {
         // Composition replays applicable originals, then V07 replays each old
@@ -220,7 +220,7 @@ impl VerifiedRetainedHistory {
             LocalRuntime::with_cancellation(cancelled),
             IntentArchive::new(self.store.clone()),
         );
-        engine
+        let mut checked = engine
             .check_discovery_candidate(
                 &self.current,
                 target,
@@ -228,9 +228,57 @@ impl VerifiedRetainedHistory {
                     .get(&canonical_digest(IdentityDomain::Source, target)?)
                     .map(Vec::as_slice)
                     .unwrap_or(&[]),
-                limits,
+                policy.search.runtime.clone(),
             )
-            .map_err(unavailable)
+            .map_err(unavailable)?;
+        // These are the actual mapped target executions returned by V07.
+        // Workflow validity is a pure post-execution predicate, so evaluate it
+        // here without fabricating another run or weakening the saved binding.
+        let mut workflow_checks = vec![];
+        for run in &checked.runs {
+            let evidence = run.identity()?;
+            let Some(origin) = checked
+                .checks
+                .iter()
+                .find(|check| check.evidence.as_ref() == Some(&evidence))
+            else {
+                continue;
+            };
+            let operations =
+                input_operations(run.trace.iter().map(|step| &step.input), &target.program);
+            let mut seen = BTreeSet::new();
+            for property in operations
+                .iter()
+                .filter_map(|operation| policy.workflow_validity.get(operation))
+                .flatten()
+            {
+                let property_digest = property.identity()?;
+                if !seen.insert(property_digest.clone()) {
+                    continue;
+                }
+                let state = if run.state != EvidenceState::Observed {
+                    CheckState::Unknown
+                } else {
+                    match property.evaluate(&run.observations) {
+                        Some(true) => continue,
+                        Some(false) => CheckState::Failed,
+                        None => CheckState::Unknown,
+                    }
+                };
+                let mut check = origin.clone();
+                check.property_digest = property_digest;
+                check.state = state;
+                check.explanation = format!("Host-approved workflow validity {} was not satisfied on the mapped accepted scene", property.id);
+                workflow_checks.push(check);
+                if state == CheckState::Failed {
+                    checked.disposition = CheckDisposition::RepairRequired;
+                } else if checked.disposition == CheckDisposition::Ready {
+                    checked.disposition = CheckDisposition::Unverified;
+                }
+            }
+        }
+        checked.checks.extend(workflow_checks);
+        Ok(checked)
     }
     pub(super) fn pending_scenes<'a>(
         &'a self,

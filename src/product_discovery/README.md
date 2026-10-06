@@ -56,7 +56,11 @@ program, or call a provider automatically when an app opens.
    associate renamed hypotheses, and their independently executed target traces
    establish correspondence. Historical values are sampled from the original
    evidence using the source-qualified semantic names; no RunEvidence or output
-   receipt is rewritten to appear as a target execution. All scene objects and
+   receipt is rewritten to appear as a target execution. Explicit renames that
+   collide with unchanged historical identities are unavailable, so a renamed
+   channel cannot erase another retained outcome. Current host workflow
+   predicates are also evaluated on the actual mapped target runs before either
+   a candidate or an alternative is offered. All scene objects and
    mappings remain reachable in V07's ordinary intention bundle, so no new
    persistence object or backup schema is required.
    Missing, incompatible or unrepresentable saved channels remain unknown,

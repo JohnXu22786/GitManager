@@ -134,8 +134,13 @@ fn scope_context(policy: &DiscoveryPolicy, operation: &str) -> ScopeContext {
     context
 }
 fn scenario_operations(s: &ScenarioSpec, p: &AppDefinition) -> BTreeSet<Id> {
-    s.inputs
-        .iter()
+    input_operations(s.inputs.iter(), p)
+}
+fn input_operations<'a>(
+    inputs: impl Iterator<Item = &'a SemanticInput>,
+    p: &AppDefinition,
+) -> BTreeSet<Id> {
+    inputs
         .filter_map(|i| match i {
             SemanticInput::Invoke { action, .. } => Some(action.clone()),
             SemanticInput::Activate { view, binding, .. } => p
@@ -641,14 +646,8 @@ pub fn discover(
     if let Some(history) = &policy.retained_history {
         match history
             .verify(request, cancelled.clone(), &replay_budget)
-            .and_then(|()| {
-                history.check(
-                    candidate,
-                    cancelled.clone(),
-                    policy.search.runtime.clone(),
-                    &replay_budget,
-                )
-            }) {
+            .and_then(|()| history.check(candidate, cancelled.clone(), policy, &replay_budget))
+        {
             Ok(checked) => {
                 history_unverified = history::append_check(&mut report, checked, true)
                     == CheckDisposition::Unverified;
@@ -1161,20 +1160,16 @@ pub fn discover(
             let alternative = &candidates[id];
             let alternative_unverified_before = report.unverified.len();
             if let Some(history) = &policy.retained_history {
-                let state = match history.check(
-                    alternative,
-                    cancelled.clone(),
-                    policy.search.runtime.clone(),
-                    &replay_budget,
-                ) {
-                    Ok(checked) => history::append_check(&mut report, checked, false),
-                    Err(error) => {
-                        report.unverified.push(format!(
-                            "Alternative {id} intention gate unavailable: {error:?}"
-                        ));
-                        CheckDisposition::Unverified
-                    }
-                };
+                let state =
+                    match history.check(alternative, cancelled.clone(), policy, &replay_budget) {
+                        Ok(checked) => history::append_check(&mut report, checked, false),
+                        Err(error) => {
+                            report.unverified.push(format!(
+                                "Alternative {id} intention gate unavailable: {error:?}"
+                            ));
+                            CheckDisposition::Unverified
+                        }
+                    };
                 if state != CheckDisposition::Ready {
                     entry.disposition = if state == CheckDisposition::RepairRequired {
                         Disposition::Settled

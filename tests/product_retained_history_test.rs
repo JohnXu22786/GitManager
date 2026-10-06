@@ -1001,3 +1001,154 @@ fn genuine_legacy_witness_requires_explicit_properties_only_to_allow_concrete_ch
     assert!(properties.defects.is_empty());
     assert_eq!(properties.questions.len(), 1);
 }
+
+#[test]
+fn implicit_historical_channel_collisions_remain_unverified() {
+    let dir = tempfile::tempdir().unwrap();
+    let integer = |value| json!({"kind":"literal","value_type":{"kind":"integer"},"value":{"kind":"integer","value":value}});
+    let mut source = filtered();
+    source["state"].as_array_mut().unwrap().push(json!({"id":"result","label":"Result","value_type":{"kind":"integer"},"initial":{"kind":"integer","value":0}}));
+    source["actions"][1]["steps"] =
+        json!([{"kind":"set_state","state":"result","value":integer(1)}]);
+    source["observables"] = json!([{"id":"x","label":"X","value":{"kind":"state","state":"result"}},{"id":"y","label":"Y","value":{"kind":"if","condition":{"kind":"equal","left":{"kind":"state","state":"result"},"right":integer(1)},"then_value":integer(10),"else_value":integer(20)}}]);
+    let a = capture(source.clone());
+    source["actions"][1]["steps"][0]["value"] = integer(2);
+    let b = capture(source.clone());
+    let s = scenario(
+        &a,
+        vec![
+            invoke("collect", Values::new()),
+            SemanticInput::Observe {
+                point: "done".into(),
+            },
+        ],
+    );
+    let store = ProductStore::create(dir.path().join("tool"), &a, 20000).unwrap();
+    save(
+        &store,
+        DecisionOutcome::Deferred,
+        IntentionBinding::ObservedOutcome,
+        vec![],
+        vec![accepted(&a, &s), accepted(&b, &s)],
+    );
+    source["actions"][1]["steps"][0]["value"] = integer(1);
+    source["observables"] =
+        json!([{"id":"y","label":"Y","value":{"kind":"state","state":"result"}}]);
+    let target = capture(source);
+    let mapping = SemanticMapping {
+        from: SemanticKey {
+            kind: SemanticKind::Observable,
+            entity: None,
+            id: "x".into(),
+        },
+        to: SemanticKey {
+            kind: SemanticKind::Observable,
+            entity: None,
+            id: "y".into(),
+        },
+    };
+    let e = engine(&store);
+    let change = e
+        .prepare_change(&store, &target, &[mapping], "rename-collision")
+        .unwrap();
+    let saved = e.adopt(&store, &change).unwrap();
+    assert!(
+        VerifiedRetainedHistory::load(&store).is_err(),
+        "the implicit old y must not be silently merged with x→y"
+    );
+    assert_eq!(store.load().unwrap(), saved);
+}
+
+#[test]
+fn host_workflow_validity_checks_mapped_intentions_on_candidates_and_alternatives() {
+    for invalid_candidate in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let integer = |value| json!({"kind":"literal","value_type":{"kind":"integer"},"value":{"kind":"integer","value":value}});
+        let mut source = filtered();
+        source["state"].as_array_mut().unwrap().push(json!({"id":"probe_value","label":"Probe","value_type":{"kind":"integer"},"initial":{"kind":"integer","value":0}}));
+        source["observables"].as_array_mut().unwrap().push(json!({"id":"probe_count","label":"Probe count","value":{"kind":"state","state":"probe_value"}}));
+        source["actions"].as_array_mut().unwrap().push(json!({"id":"probe","label":"Probe","parameters":{},"guards":[],"steps":[{"kind":"set_state","state":"probe_value","value":integer(1)}],"ensures":[]}));
+        let a = capture(source.clone());
+        let s = workflow(&a);
+        let store = ProductStore::create(dir.path().join("tool"), &a, 20000).unwrap();
+        save(
+            &store,
+            DecisionOutcome::KeepCurrent,
+            IntentionBinding::PropertiesOnly,
+            vec![positive_count()],
+            vec![accepted(&a, &s)],
+        );
+        source["actions"][1]["id"] = json!("gather");
+        let renamed = capture(source.clone());
+        let mapping = SemanticMapping {
+            from: SemanticKey {
+                kind: SemanticKind::Action,
+                entity: None,
+                id: "collect".into(),
+            },
+            to: SemanticKey {
+                kind: SemanticKind::Action,
+                entity: None,
+                id: "gather".into(),
+            },
+        };
+        let e = engine(&store);
+        let change = e
+            .prepare_change(&store, &renamed, &[mapping], "rename-workflow")
+            .unwrap();
+        e.adopt(&store, &change).unwrap();
+        let mut candidate = source.clone();
+        candidate["actions"][3]["steps"][0]["value"] = integer(2);
+        let mut other = source;
+        let invalid = if invalid_candidate {
+            &mut candidate
+        } else {
+            &mut other
+        };
+        invalid["actions"][1]["steps"] = replacement()["actions"][1]["steps"].clone();
+        let candidate = capture(candidate);
+        let other = capture(other);
+        let r = request(&store, &candidate);
+        let probe = scenario(
+            &a,
+            vec![
+                invoke("probe", Values::new()),
+                SemanticInput::Observe {
+                    point: "done".into(),
+                },
+            ],
+        );
+        let mut out = response(&r, &other, &probe);
+        out.response.hypotheses[0].action = "probe".into();
+        out.response.hypotheses[0].observable = "probe_count".into();
+        out.response.hypotheses[0].sources[0].pointer = "/actions/3/steps/0".into();
+        let mut p = policy(&store);
+        p.workflow_validity.insert(
+            "gather".into(),
+            vec![AcceptedProperty {
+                id: "two-selected".into(),
+                description: "Approved collection workflow selects both people".into(),
+                predicate: PropertyPredicate::Equal {
+                    left: PropertyTerm::Observed {
+                        point: "done".into(),
+                        observable: "selected_count".into(),
+                        value_type: Type::Integer,
+                    },
+                    right: PropertyTerm::Literal {
+                        value_type: Type::Integer,
+                        value: DataValue::Integer { value: 2 },
+                    },
+                },
+            }],
+        );
+        let report = discover(&r, &out, &p, Arc::new(AtomicBool::new(false))).unwrap();
+        assert!(report.questions.is_empty());
+        assert!(report
+            .checks
+            .iter()
+            .any(|c| c.state == CheckState::Failed && c.explanation.contains("two-selected")));
+        if invalid_candidate {
+            assert!(!report.defects.is_empty());
+        }
+    }
+}
