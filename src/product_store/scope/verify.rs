@@ -232,6 +232,23 @@ pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
         {
             return Err(error("scoped plan link mismatch"));
         }
+        let mut decision_ids = BTreeSet::new();
+        for id in &matching[0].decisions {
+            let decision = snapshot
+                .decisions
+                .decisions
+                .iter()
+                .find(|d| &d.id == id)
+                .ok_or_else(|| error("scoped receipt decision missing"))?;
+            if !decision_ids.insert(id)
+                || decision.scope != linked.plan.scope
+                || !matches!(&decision.outcome,DecisionOutcome::Accept{artifact} if artifact==&target.artifact.program_digest)
+            {
+                return Err(error(
+                    "scoped decision does not bind this exact frozen outcome",
+                ));
+            }
+        }
         let layer = state
             .layers
             .values()

@@ -637,7 +637,17 @@ pub fn discover(
         normalizations: vec![],
         log: vec![],
     };
+    let admission = policy
+        .retained_history
+        .as_ref()
+        .map(VerifiedRetainedHistory::replay_admission)
+        .transpose()?;
     let runtime = LocalRuntime::with_cancellation(cancelled.clone());
+    let runtime = if let Some(admission) = &admission {
+        runtime.with_admission(admission.clone())
+    } else {
+        runtime
+    };
     let replay_budget = ReplayBudget {
         remaining: Cell::new(policy.max_precheck_replays),
         cancelled: cancelled.clone(),
@@ -945,6 +955,11 @@ pub fn discover(
         candidates.insert(c.id.clone(), captured);
     }
     let engine = ComparisonEngine::new(cancelled.clone());
+    let engine = if let Some(admission) = &admission {
+        engine.with_admission(admission.clone())
+    } else {
+        engine
+    };
     let mut comparisons = 0usize;
     let mut witness_scene_cache = BTreeMap::new();
     for hypothesis in &result.response.hypotheses {

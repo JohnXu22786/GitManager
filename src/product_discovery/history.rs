@@ -4,6 +4,8 @@ use crate::product_decisions::{
     CheckDisposition, CheckReport, DecisionEngine, IntentArchive, IntentionBinding,
     VerifiedDiscoveryScene,
 };
+use crate::product_runtime::ReplayAdmission;
+use crate::product_store::scope::{PreparedScopedChange, ScopedExecutionContext};
 use crate::product_store::{ProductStore, ProjectSnapshot};
 
 /// Loaded only through V07's independently replayed projection. No provider or
@@ -20,6 +22,7 @@ pub struct VerifiedRetainedHistory {
     /// Host-proposed mappings are validated and exercised by V07, never trusted
     /// as evidence. Each proposal is bound to one exact captured target.
     target_mappings: BTreeMap<Digest, Vec<SemanticMapping>>,
+    prepared_targets: BTreeMap<Digest, PreparedScopedChange>,
 }
 impl std::fmt::Debug for VerifiedRetainedHistory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -69,6 +72,7 @@ impl VerifiedRetainedHistory {
             projection_replays,
             mapped_scenes,
             target_mappings: BTreeMap::new(),
+            prepared_targets: BTreeMap::new(),
         })
     }
     /// A rename suggestion is not a passing check. Discovery independently
@@ -87,6 +91,35 @@ impl VerifiedRetainedHistory {
         self.target_mappings
             .insert(canonical_digest(IdentityDomain::Source, target)?, mappings);
         Ok(())
+    }
+    pub fn map_prepared_target(
+        &mut self,
+        prepared: PreparedScopedChange,
+        mappings: Vec<SemanticMapping>,
+    ) -> Result<(), AdapterError> {
+        if self.store.load().map_err(unavailable)? != self.current {
+            return Err(unavailable("prepared-target basis changed"));
+        }
+        ScopedExecutionContext::prepared(&self.current, &prepared)
+            .map_err(unavailable)?
+            .admit_target(prepared.target())
+            .map_err(unavailable)?;
+        self.map_target(prepared.target(), mappings)?;
+        self.prepared_targets.insert(
+            canonical_digest(IdentityDomain::Source, prepared.target())?,
+            prepared,
+        );
+        Ok(())
+    }
+    pub(super) fn replay_admission(&self) -> Result<Arc<dyn ReplayAdmission>, AdapterError> {
+        let mut contexts =
+            vec![ScopedExecutionContext::committed(&self.current).map_err(unavailable)?];
+        for prepared in self.prepared_targets.values() {
+            contexts.push(
+                ScopedExecutionContext::prepared(&self.current, prepared).map_err(unavailable)?,
+            );
+        }
+        Ok(Arc::new(HistoryAdmission { contexts }))
     }
     fn projection(
         engine: &DecisionEngine<LocalRuntime>,
@@ -220,17 +253,29 @@ impl VerifiedRetainedHistory {
             LocalRuntime::with_cancellation(cancelled),
             IntentArchive::new(self.store.clone()),
         );
-        let mut checked = engine
-            .check_discovery_candidate(
+        let target_id = canonical_digest(IdentityDomain::Source, target)?;
+        let mappings = self
+            .target_mappings
+            .get(&target_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let mut checked = if let Some(prepared) = self.prepared_targets.get(&target_id) {
+            engine.check_prepared_discovery_candidate(
                 &self.current,
                 target,
-                self.target_mappings
-                    .get(&canonical_digest(IdentityDomain::Source, target)?)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]),
+                prepared,
+                mappings,
                 policy.search.runtime.clone(),
             )
-            .map_err(unavailable)?;
+        } else {
+            engine.check_discovery_candidate(
+                &self.current,
+                target,
+                mappings,
+                policy.search.runtime.clone(),
+            )
+        }
+        .map_err(unavailable)?;
         // These are the actual mapped target executions returned by V07.
         // Workflow validity is a pure post-execution predicate, so evaluate it
         // here without fabricating another run or weakening the saved binding.
@@ -495,4 +540,42 @@ pub(super) fn append_check(
     report.checks.extend(checked.checks);
     report.runs.extend(checked.runs);
     disposition
+}
+
+struct HistoryAdmission {
+    contexts: Vec<ScopedExecutionContext>,
+}
+impl ReplayAdmission for HistoryAdmission {
+    fn validate_seed(
+        &self,
+        source: &CapturedProgram,
+        data: &DataSnapshot,
+        day: i32,
+    ) -> Result<(), AdapterError> {
+        if !crate::product_runtime::has_protected_fields(source) {
+            return Ok(());
+        }
+        let context = self
+            .contexts
+            .iter()
+            .find(|context| context.contains_managed_source(source))
+            .ok_or_else(|| unavailable("scoped source has no verified host preparation"))?;
+        context.validate_seed(source, data, day)
+    }
+    fn validate_state(
+        &self,
+        source: &CapturedProgram,
+        data: &DataSnapshot,
+        day: i32,
+    ) -> Result<(), AdapterError> {
+        if !crate::product_runtime::has_protected_fields(source) {
+            return Ok(());
+        }
+        let context = self
+            .contexts
+            .iter()
+            .find(|context| context.contains_managed_source(source))
+            .ok_or_else(|| unavailable("scoped source has no verified host preparation"))?;
+        context.validate_state(source, data, day)
+    }
 }

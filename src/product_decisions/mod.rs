@@ -9,9 +9,10 @@ mod recovery;
 mod replay;
 use crate::product_contract::*;
 use crate::product_runtime::LocalRuntime;
+use crate::product_store::scope::{PreparedScopedChange, ScopedExecutionContext};
 use crate::product_store::{PreparedAdoption, ProductStore, ProjectSnapshot, StoreError};
 pub use archive::IntentArchive;
-pub use bundle::{validate_bundle, IntentionBundle};
+pub use bundle::{upgrade_bundle_binding, validate_bundle, IntentionBundle};
 pub use context::VerifiedDiscoveryScene;
 pub use evolution::{EvolutionDraft, ReconciliationRequest};
 pub use mapping::ImplementationMapping;
@@ -20,6 +21,7 @@ use recovery::{validate_withdrawal_delta, validate_withdrawal_history};
 use replay::*;
 pub use replay::{accept_scene, scope_match, AcceptedScene, ScopeAssessment};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::fmt;
 type Result<T> = std::result::Result<T, DecisionError>;
@@ -109,6 +111,7 @@ impl CheckReport {
 }
 /// Kept opaque: only this host can prepare it, and commit repeats the checks.
 pub struct VerifiedChange {
+    scoped: Option<PreparedScopedChange>,
     prepared: PreparedAdoption,
     revision: u64,
     target: CapturedProgram,
@@ -133,6 +136,7 @@ pub struct DecisionEngine<R: RuntimeAdapter> {
     runtime: R,
     archive: IntentArchive,
     limits: RuntimeLimits,
+    pending_scope: RefCell<Option<PreparedScopedChange>>,
 }
 impl<R: RuntimeAdapter> DecisionEngine<R> {
     pub fn new(runtime: R, archive: IntentArchive) -> Self {
@@ -140,6 +144,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             runtime,
             archive,
             limits: RuntimeLimits::default(),
+            pending_scope: RefCell::new(None),
         }
     }
     /// Read the recorded promise kind for presentation; this is not execution proof.
@@ -168,6 +173,202 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             Some(digest) => self.archive.load_mappings(digest, &target.artifact),
             None => Ok(vec![]),
         }
+    }
+    fn scope_context(&self) -> Result<ScopedExecutionContext> {
+        let current = self.archive.snapshot()?;
+        Ok(
+            if let Some(prepared) = self.pending_scope.borrow().as_ref() {
+                ScopedExecutionContext::prepared(&current, prepared)?
+            } else {
+                ScopedExecutionContext::committed(&current)?
+            },
+        )
+    }
+    fn execute_scene(
+        &self,
+        program: &CapturedProgram,
+        scenario: &ScenarioSpec,
+        graph: &DecisionGraph,
+        limits: RuntimeLimits,
+        id: &str,
+    ) -> Result<(RunEvidence, Vec<ScopeContext>)> {
+        let context = self.scope_context()?;
+        execute_admitted(
+            &self.runtime,
+            program,
+            scenario,
+            graph,
+            limits,
+            id,
+            Some(&context),
+        )
+    }
+    fn execute_mapped_scene(
+        &self,
+        source: &CapturedProgram,
+        original: &ScenarioSpec,
+        target: &CapturedProgram,
+        mapped: &ScenarioSpec,
+        graph: &DecisionGraph,
+        limits: RuntimeLimits,
+        id: &str,
+    ) -> Result<(RunEvidence, Vec<ScopeContext>)> {
+        let context = self.scope_context()?.project_seed(
+            source,
+            &original.seed,
+            target,
+            &mapped.seed,
+            mapped.clock_day,
+        )?;
+        execute_admitted(
+            &self.runtime,
+            target,
+            mapped,
+            graph,
+            limits,
+            id,
+            Some(&context),
+        )
+    }
+    fn capture_mapped_scene(
+        &self,
+        source: &CapturedProgram,
+        original: &ScenarioSpec,
+        target: &CapturedProgram,
+        mapped: &ScenarioSpec,
+        disclosure: Disclosure,
+        limits: RuntimeLimits,
+    ) -> Result<(AcceptedScene, Vec<ScopeContext>)> {
+        let (run, contexts) = self.execute_mapped_scene(
+            source,
+            original,
+            target,
+            mapped,
+            &empty_graph(),
+            limits,
+            "accepted",
+        )?;
+        if run.state != EvidenceState::Observed {
+            return Err(invalid("mapped accepted scene must execute completely"));
+        }
+        Ok((
+            AcceptedScene {
+                program: target.clone(),
+                scenario: mapped.clone(),
+                evidence: run,
+                disclosure,
+                bind_outcome: true,
+            },
+            contexts,
+        ))
+    }
+    pub fn accept_current_scene(
+        &self,
+        current: &ProjectSnapshot,
+        scenario: &ScenarioSpec,
+        disclosure: Disclosure,
+    ) -> Result<AcceptedScene> {
+        ScopedExecutionContext::committed(current)?.verify_seed(
+            current.program()?,
+            &scenario.seed,
+            scenario.clock_day,
+        )?;
+        Ok(self
+            .capture_admitted_scene(
+                current.program()?,
+                scenario,
+                disclosure,
+                self.limits.clone(),
+            )?
+            .0)
+    }
+    fn capture_admitted_scene(
+        &self,
+        program: &CapturedProgram,
+        scenario: &ScenarioSpec,
+        disclosure: Disclosure,
+        limits: RuntimeLimits,
+    ) -> Result<(AcceptedScene, Vec<ScopeContext>)> {
+        let (run, contexts) =
+            self.execute_scene(program, scenario, &empty_graph(), limits, "accepted")?;
+        if run.state != EvidenceState::Observed {
+            return Err(invalid("accepted scene must execute completely"));
+        }
+        Ok((
+            AcceptedScene {
+                program: program.clone(),
+                scenario: scenario.clone(),
+                evidence: run,
+                disclosure,
+                bind_outcome: true,
+            },
+            contexts,
+        ))
+    }
+    fn with_scoped<T>(
+        &self,
+        prepared: Option<PreparedScopedChange>,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let old = self.pending_scope.replace(prepared);
+        let result = f();
+        self.pending_scope.replace(old);
+        result
+    }
+    pub fn accept_scoped_scene(
+        &self,
+        store: &ProductStore,
+        prepared: &PreparedScopedChange,
+        scenario: &ScenarioSpec,
+        disclosure: Disclosure,
+    ) -> Result<AcceptedScene> {
+        ScopedExecutionContext::prepared(&store.load()?, prepared)?;
+        self.with_scoped(Some(prepared.clone()), || {
+            Ok(self
+                .capture_admitted_scene(
+                    prepared.target(),
+                    scenario,
+                    disclosure,
+                    self.limits.clone(),
+                )?
+                .0)
+        })
+    }
+    pub fn prepare_scoped_choice(
+        &self,
+        store: &ProductStore,
+        prepared: PreparedScopedChange,
+        choice: Choice,
+        scenes: Vec<AcceptedScene>,
+        id: &str,
+    ) -> Result<VerifiedChange> {
+        if prepared.operation_id() != id
+            || choice.scope != *prepared.scope()
+            || !matches!(&choice.outcome,DecisionOutcome::Accept{artifact} if artifact==&prepared.target().artifact.program_digest)
+        {
+            return Err(invalid(
+                "scoped choice must name the exact experienced compiled result and frozen scope",
+            ));
+        }
+        let target = prepared.target().clone();
+        self.with_scoped(Some(prepared), || {
+            self.prepare_choice(store, &target, choice, scenes, id)
+        })
+    }
+    pub fn prepare_managed_change(
+        &self,
+        store: &ProductStore,
+        prepared: PreparedScopedChange,
+        mappings: &[SemanticMapping],
+        id: &str,
+    ) -> Result<VerifiedChange> {
+        if prepared.operation_id() != id {
+            return Err(invalid("managed preparation operation mismatch"));
+        }
+        let target = prepared.target().clone();
+        self.with_scoped(Some(prepared), || {
+            self.prepare_change(store, &target, mappings, id)
+        })
     }
     pub fn check_current(&self, current: &ProjectSnapshot) -> Result<CheckReport> {
         validate_withdrawal_history(current)?;
@@ -243,6 +444,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         target: &CapturedProgram,
         mappings: &[ImplementationMapping],
     ) -> Result<CheckReport> {
+        self.scope_context()?.admit_target(target)?;
         graph.validate()?;
         target.validate()?;
         self.runtime.validate(target)?;
@@ -362,8 +564,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             .cloned()
             .collect();
         let mapping = Mapping::new(&scene.program.program, &target.program, &relevant)?;
-        let (prior, contexts) = execute(
-            &self.runtime,
+        let (prior, contexts) = self.execute_scene(
             &scene.program,
             &scene.scenario,
             graph,
@@ -445,8 +646,9 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 return Ok(exercised);
             }
         };
-        let (run, target_contexts) = match execute(
-            &self.runtime,
+        let (run, target_contexts) = match self.execute_mapped_scene(
+            &scene.program,
+            &scene.scenario,
             target,
             &mapped,
             graph,
@@ -534,8 +736,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         graph: &DecisionGraph,
     ) -> Result<(RunEvidence, Vec<ScopeContext>)> {
         scene.validate()?;
-        let result = execute(
-            &self.runtime,
+        let result = self.execute_scene(
             &scene.program,
             &scene.scenario,
             graph,
@@ -975,18 +1176,23 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             expected_session: current.session.identity()?,
             current_source: current.program()?.binding.clone(),
             target: target.artifact.clone(),
-            scope: DecisionScope {
-                operations: target
-                    .program
-                    .actions
-                    .iter()
-                    .map(|a| a.id.clone())
-                    .collect(),
-                population: Population::All,
-                conditions: Values::new(),
-                excluded_records: vec![],
-                unknowns: vec![],
-            },
+            scope: self
+                .pending_scope
+                .borrow()
+                .as_ref()
+                .map(|p| p.scope().clone())
+                .unwrap_or_else(|| DecisionScope {
+                    operations: target
+                        .program
+                        .actions
+                        .iter()
+                        .map(|a| a.id.clone())
+                        .collect(),
+                    population: Population::All,
+                    conditions: Values::new(),
+                    excluded_records: vec![],
+                    unknowns: vec![],
+                }),
             compatibility,
             required_decisions: next
                 .decisions
@@ -1006,6 +1212,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         self.verify_destination_packages(store, current, &next, &plan)?;
         let prepared = store.prepare_adoption(plan, target)?;
         Ok(VerifiedChange {
+            scoped: self.pending_scope.borrow().clone(),
             prepared,
             revision: current.revision,
             target: target.clone(),
@@ -1017,12 +1224,8 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         })
     }
     pub fn adopt(&self, store: &ProductStore, change: &VerifiedChange) -> Result<ProjectSnapshot> {
-        Ok(store.adopt_verified(
-            change.revision,
-            &change.prepared,
-            &change.target,
-            &change.decisions,
-            |current, target, next, plan| {
+        self.with_scoped(change.scoped.clone(), || {
+            let verify = |current, target, next, plan| {
                 if canonical_digest(IdentityDomain::Data, current)? != change.expected_snapshot
                     || self.runtime.capabilities().version != change.runtime
                     || next != &change.decisions
@@ -1065,7 +1268,24 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                     ));
                 }
                 Ok(())
-            },
-        )?)
+            };
+            Ok(if let Some(scoped) = &change.scoped {
+                store.adopt_scoped_verified(
+                    change.revision,
+                    scoped,
+                    &change.prepared,
+                    &change.decisions,
+                    verify,
+                )?
+            } else {
+                store.adopt_verified(
+                    change.revision,
+                    &change.prepared,
+                    &change.target,
+                    &change.decisions,
+                    verify,
+                )?
+            })
+        })
     }
 }

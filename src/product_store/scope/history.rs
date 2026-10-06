@@ -459,7 +459,13 @@ pub(super) fn verify_history(snapshot: &ProjectSnapshot) -> Result<()> {
                 }
             }
         }
-        for original in &layer.basis.data.records {
+        for original in layer.basis.data.records.iter().filter(|r| {
+            layer
+                .request
+                .lifecycles
+                .iter()
+                .any(|l| l.entity == r.entity)
+        }) {
             if !snapshot
                 .data
                 .records
@@ -471,4 +477,93 @@ pub(super) fn verify_history(snapshot: &ProjectSnapshot) -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub(super) fn presentation(
+    snapshot: &ProjectSnapshot,
+) -> Result<crate::product_protocol::PreservedHistory> {
+    use crate::product_protocol::{HistoryOrigin, PreservedHistory, PreservedResult};
+    let mut result = PreservedHistory {
+        results: vec![],
+        events: snapshot.data.events.clone(),
+    };
+    for (id, layer) in &snapshot.scope.layers {
+        for row in &snapshot.data.records {
+            if !layer
+                .request
+                .lifecycles
+                .iter()
+                .any(|l| l.entity == row.entity)
+                || !value_bool(&row.values, &key(id, &row.entity, "sealed"))?
+            {
+                continue;
+            }
+            let day = match row.values.get(&key(id, &row.entity, "day")) {
+                Some(DataValue::Date { days }) => *days,
+                _ => return Err(error("preserved day is missing")),
+            };
+            let origin = match row.values.get(&key(id, &row.entity, "origin")) {
+                Some(DataValue::Text { value }) if value == "CapturedAtAdoption" => {
+                    HistoryOrigin::CapturedAtAdoption
+                }
+                Some(DataValue::Text { value }) if value == "ObservedAtCompletion" => {
+                    HistoryOrigin::ObservedAtCompletion
+                }
+                Some(DataValue::Text { value }) if value == "ObservedAtArchive" => {
+                    HistoryOrigin::ObservedAtArchive
+                }
+                _ => return Err(error("preserved origin is missing")),
+            };
+            let event = if origin == HistoryOrigin::CapturedAtAdoption {
+                None
+            } else {
+                snapshot.data.events.iter().find(|e| {
+                    e.changes.iter().any(|c| {
+                        c.entity == row.entity
+                            && c.record == row.id
+                            && !c
+                                .before
+                                .as_ref()
+                                .and_then(|v| v.get(&key(id, &row.entity, "sealed")))
+                                .is_some_and(|v| *v == DataValue::Boolean { value: true })
+                            && c.after.get(&key(id, &row.entity, "sealed"))
+                                == Some(&DataValue::Boolean { value: true })
+                    })
+                })
+            };
+            let producer = event.map(|e| e.program.clone()).unwrap_or(
+                program(snapshot, &layer.basis.active)?
+                    .artifact
+                    .program_digest
+                    .clone(),
+            );
+            for patch in &layer.patches {
+                if patch.request.entity == row.entity && projection(&patch.request.destination) {
+                    let label = match &patch.request.destination {
+                        EffectDestination::ViewColumn { view, column } => {
+                            format!("{view}: {column}")
+                        }
+                        EffectDestination::EmitColumn { action, column, .. } => {
+                            format!("{action}: {column}")
+                        }
+                        _ => unreachable!(),
+                    };
+                    result.results.push(PreservedResult {
+                        record: row_ref(row),
+                        label,
+                        value: row
+                            .values
+                            .get(&saved_key(id, patch)?)
+                            .cloned()
+                            .ok_or_else(|| error("preserved value missing"))?,
+                        day,
+                        origin: origin.clone(),
+                        program: producer.clone(),
+                        event: event.map(|e| e.id.clone()),
+                    });
+                }
+            }
+        }
+    }
+    Ok(result)
 }

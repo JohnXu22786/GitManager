@@ -13,6 +13,7 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path};
 use std::sync::Arc;
+pub(crate) use upgrade::LegacyUpgrade;
 pub use upgrade::{UpgradeProgress, UpgradeSummary};
 
 const MAGIC: &str = "gitmanager.generated-project";

@@ -1251,6 +1251,7 @@ fn add_provenance(
             }
             let origin = key(id, &p.entity, "origin");
             let day = key(id, &p.entity, "day");
+            let record = key(id, &p.entity, "record");
             let values = [
                 (
                     origin.clone(),
@@ -1274,6 +1275,12 @@ fn add_provenance(
                         value: Box::new(field(&p.subject, &day)),
                         fallback: Box::new(Expr::Today),
                     },
+                ),
+                (
+                    record,
+                    "Source record",
+                    Type::reference(&p.entity),
+                    variable(&p.subject),
                 ),
             ];
             match &p.destination {
@@ -1331,7 +1338,7 @@ fn add_provenance(
                         steps: &mut [Statement],
                         output: &str,
                         subject: &str,
-                        values: &[(Id, &str, Type, Expr); 2],
+                        values: &[(Id, &str, Type, Expr); 3],
                     ) -> Result<()> {
                         for step in steps {
                             match step {

@@ -2,6 +2,8 @@
 mod compiler;
 mod contract;
 mod history;
+mod replay;
+pub use replay::ScopedExecutionContext;
 mod verify;
 use super::*;
 use crate::product_runtime::{DRIVER_VERSION, RUNTIME_VERSION};
@@ -582,6 +584,16 @@ impl ProductStore {
         current.data = prepared.initialized.clone();
         current.active_revision = prepared.manifest.output.clone();
         current.session = SessionState::initial(&prepared.target.program)?;
+        let activated_decisions: Vec<_> = decisions
+            .decisions
+            .iter()
+            .filter(|d| {
+                d.status == DecisionStatus::Active
+                    && d.scope == prepared.scope
+                    && !current.decisions.decisions.iter().any(|old| old.id == d.id)
+            })
+            .map(|d| d.id.clone())
+            .collect();
         current.decisions = decisions.clone();
         current.revision = current
             .revision
@@ -594,6 +606,7 @@ impl ProductStore {
             revision: current.revision,
         });
         current.scope.adoptions.push(ScopedAdoptionReceipt {
+            decisions: activated_decisions,
             plan: adoption.plan.identity()?,
             composition: canonical_digest(IdentityDomain::Adoption, &prepared.manifest)?,
             initialization: prepared
@@ -636,5 +649,26 @@ pub(super) fn reject_unmanaged_target(
         Ok(())
     } else {
         compiler::reject_reserved(&target.program)
+    }
+}
+
+impl ProductStore {
+    /// The daily renderer gets preserved results only after full snapshot and
+    /// history validation. Raw isolated interpreter views carry no such claim.
+    pub fn runtime_view(&self) -> Result<crate::product_protocol::RuntimeView> {
+        let snapshot = self.load()?;
+        let runtime = LocalRuntime::default();
+        let run = runtime.resume(
+            snapshot.program()?,
+            &snapshot.data,
+            &snapshot.session,
+            snapshot.clock_day,
+            0,
+            RuntimeLimits::default(),
+            &snapshot.artifacts,
+        )?;
+        let mut view = runtime.view_model(&run)?;
+        view.history = history::presentation(&snapshot)?;
+        Ok(view)
     }
 }

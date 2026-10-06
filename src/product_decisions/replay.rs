@@ -205,6 +205,25 @@ pub(super) fn execute<R: RuntimeAdapter>(
     limits: RuntimeLimits,
     id: &str,
 ) -> Result<(RunEvidence, Vec<ScopeContext>)> {
+    execute_admitted(runtime, program, scenario, graph, limits, id, None)
+}
+pub(super) fn execute_admitted<R: RuntimeAdapter>(
+    runtime: &R,
+    program: &CapturedProgram,
+    scenario: &ScenarioSpec,
+    graph: &DecisionGraph,
+    limits: RuntimeLimits,
+    id: &str,
+    admission: Option<&dyn crate::product_runtime::ReplayAdmission>,
+) -> Result<(RunEvidence, Vec<ScopeContext>)> {
+    if crate::product_runtime::has_protected_fields(program) && admission.is_none() {
+        return Err(DecisionError::Unverified(
+            "Scoped scenes require verified source, cohort and completed-result provenance".into(),
+        ));
+    }
+    if let Some(admission) = admission {
+        admission.validate_seed(program, &scenario.seed, scenario.clock_day)?;
+    }
     runtime.validate(program)?;
     scenario.validate(&program.program)?;
     graph.validate()?;
@@ -241,6 +260,7 @@ pub(super) fn execute<R: RuntimeAdapter>(
         uncovered: vec![],
     };
     let mut contexts = vec![];
+    let mut clock_day = scenario.clock_day;
     let operation_ids = scenario.replay_operation_ids()?;
     for (index, input) in scenario.inputs.iter().enumerate() {
         let before = runtime.data(&run).clone();
@@ -261,6 +281,14 @@ pub(super) fn execute<R: RuntimeAdapter>(
             }
         }
         let after = runtime.data(&run);
+        if let SemanticInput::AdvanceClock { days } = input {
+            clock_day = clock_day
+                .checked_add(i32::try_from(*days).map_err(|_| invalid("clock overflow"))?)
+                .ok_or_else(|| invalid("clock overflow"))?;
+        }
+        if let Some(admission) = admission {
+            admission.validate_state(program, after, clock_day)?;
+        }
         // Actual event provenance resolves UI bindings and collection changes. An
         // action with no identifiable record stays unknown for record-scoped rules.
         for event in after.events.iter().filter(|e| e.operation_id == op) {
@@ -281,6 +309,27 @@ pub(super) fn execute<R: RuntimeAdapter>(
                 }
                 SemanticInput::Activate { row: Some(row), .. } => refs.push(row.clone()),
                 _ => {}
+            }
+            if admission.is_some()
+                && !event.outputs.is_empty()
+                && crate::product_runtime::has_protected_fields(program)
+            {
+                let observed = runtime.observe(&run, "scope-output-correspondence")?;
+                for output in observed
+                    .outputs
+                    .iter()
+                    .filter(|o| event.outputs.contains(&o.digest))
+                {
+                    for row in &output.rows {
+                        for (field, value) in row {
+                            if field.starts_with(crate::product_runtime::PROTECTED_FIELD_PREFIX)
+                                && field.ends_with("_record")
+                            {
+                                input_references(value, &mut refs);
+                            }
+                        }
+                    }
+                }
             }
             refs.sort_by(|a, b| (&a.entity, &a.record).cmp(&(&b.entity, &b.record)));
             refs.dedup();

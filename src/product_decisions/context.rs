@@ -119,8 +119,9 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                     )?,
                     None => mapping.scenario(&scene.scenario, &target.program)?,
                 };
-                let (replay, target_contexts) = execute(
-                    &self.runtime,
+                let (replay, target_contexts) = self.execute_mapped_scene(
+                    &scene.program,
+                    &scene.scenario,
                     target,
                     &mapped,
                     &current.decisions,
@@ -164,6 +165,25 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
     /// source-qualified mappings used by adoption, then independently verify
     /// concrete outcomes AND extra predicates before offering this executable.
     /// This creates no adoption authority and writes no archive objects.
+    pub fn check_prepared_discovery_candidate(
+        &mut self,
+        current: &ProjectSnapshot,
+        target: &CapturedProgram,
+        prepared: &PreparedScopedChange,
+        mappings: &[SemanticMapping],
+        limits: RuntimeLimits,
+    ) -> Result<CheckReport> {
+        if prepared.target() != target {
+            return Err(invalid(
+                "prepared discovery target differs from the exact captured candidate",
+            ));
+        }
+        ScopedExecutionContext::prepared(current, prepared)?;
+        let previous = self.pending_scope.replace(Some(prepared.clone()));
+        let result = self.check_discovery_candidate(current, target, mappings, limits);
+        self.pending_scope.replace(previous);
+        result
+    }
     pub fn check_discovery_candidate(
         &mut self,
         current: &ProjectSnapshot,
@@ -285,8 +305,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             binding_index.push(serde_json::json!({"decision":decision.id,"binding":binding}));
             for scene in scenes {
                 relevant_scenes.push(scene.clone());
-                let (run, _) = execute(
-                    &self.runtime,
+                let (run, _) = self.execute_scene(
                     &scene.program,
                     &scene.scenario,
                     &current.decisions,
@@ -385,8 +404,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                     &current.program()?.program,
                     &replacement.replacement,
                 )?;
-                let (actual, _) = execute(
-                    &self.runtime,
+                let (actual, _) = self.execute_scene(
                     current.program()?,
                     &mapped,
                     &current.decisions,

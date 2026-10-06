@@ -26,6 +26,9 @@ pub struct IntentArchive {
     store: ProductStore,
 }
 impl IntentArchive {
+    pub(super) fn snapshot(&self) -> Result<ProjectSnapshot> {
+        Ok(self.store.load()?)
+    }
     pub fn new(store: ProductStore) -> Self {
         Self { store }
     }

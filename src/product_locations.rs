@@ -22,6 +22,8 @@ const MAX_RECENT_TOOLS: usize = 512;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IssueKind {
+    UpgradeRequired,
+    RestartRequired,
     Unavailable,
     UnsafePath,
     Corrupt,
@@ -43,6 +45,8 @@ pub type Result<T> = std::result::Result<T, OperationIssue>;
 impl OperationIssue {
     pub(crate) fn new(kind: IssueKind, detail: impl ToString) -> Self {
         let (message, next_step) = match kind {
+            IssueKind::UpgradeRequired => ("This generated tool needs a local format upgrade before editing.", "Use the upgrade/open flow. Original snapshots and backups are retained; restart after the verified upgrade."),
+            IssueKind::RestartRequired => ("The format upgrade finished; this open session is no longer writable.", "Restart the tool and open its verified current snapshot before continuing."),
             IssueKind::Unavailable => ("This location is not available.", "Reconnect the drive or choose an available folder. Your saved work has not been replaced."),
             IssueKind::UnsafePath => ("This location cannot be used safely.", "Choose the original folder or a new ordinary folder, rather than a linked or replaced location."),
             IssueKind::Corrupt => ("These saved bytes could not be verified.", "Keep this copy. Open a verified backup or choose another saved copy; do not replace current work."),
@@ -83,6 +87,8 @@ impl From<StoreError> for OperationIssue {
         let kind = match &error {
             StoreError::Io(e) => return Self::from(io::Error::new(e.kind(), error.to_string())),
             StoreError::UnsupportedFormat(_) => IssueKind::Unsupported,
+            StoreError::UpgradeRequired => IssueKind::UpgradeRequired,
+            StoreError::RestartRequired => IssueKind::RestartRequired,
             StoreError::Incompatible(_) | StoreError::Runtime(_) => IssueKind::Incompatible,
             StoreError::Conflict(_) => IssueKind::Collision,
             _ => IssueKind::Corrupt,

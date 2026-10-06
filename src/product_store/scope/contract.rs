@@ -1,7 +1,7 @@
 use super::*;
 
 pub const COMPILER_VERSION: u32 = 1;
-pub const RESERVED_PREFIX: &str = "gm_scope_";
+pub const RESERVED_PREFIX: &str = crate::product_runtime::PROTECTED_FIELD_PREFIX;
 pub const MAX_LAYERS: usize = 16;
 
 /// Suggestions carry no authority. The host resolves and verifies them against
@@ -166,6 +166,7 @@ pub struct MetadataInitializationReceipt {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScopedAdoptionReceipt {
+    pub decisions: Vec<Id>,
     pub plan: Digest,
     pub composition: Digest,
     pub initialization: Option<Digest>,
@@ -209,6 +210,9 @@ pub struct PreparedScopedChange {
     pub(super) scope: DecisionScope,
 }
 impl PreparedScopedChange {
+    pub fn operation_id(&self) -> &str {
+        &self.manifest.operation
+    }
     pub fn target(&self) -> &CapturedProgram {
         &self.target
     }

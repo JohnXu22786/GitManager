@@ -16,6 +16,32 @@ use std::sync::{
 };
 use std::time::Instant;
 
+pub const PROTECTED_FIELD_PREFIX: &str = "gm_scope_";
+/// Host admission is separate from executable semantics. The interpreter still
+/// executes one ordinary program; this hook validates retained scope provenance.
+pub trait ReplayAdmission: Send + Sync {
+    fn validate_seed(
+        &self,
+        program: &CapturedProgram,
+        data: &DataSnapshot,
+        day: i32,
+    ) -> Result<()> {
+        self.validate_state(program, data, day)
+    }
+    fn validate_state(
+        &self,
+        program: &CapturedProgram,
+        data: &DataSnapshot,
+        day: i32,
+    ) -> Result<()>;
+}
+pub fn has_protected_fields(program: &CapturedProgram) -> bool {
+    program.program.entities.iter().any(|e| {
+        e.fields
+            .iter()
+            .any(|f| f.id.starts_with(PROTECTED_FIELD_PREFIX))
+    })
+}
 pub const RUNTIME_VERSION: &str = "local-interpreter/3";
 pub const DRIVER_VERSION: &str = "semantic-input/3";
 type Result<T> = std::result::Result<T, AdapterError>;
@@ -45,6 +71,7 @@ fn diagnostic(error: &AdapterError) -> String {
 #[derive(Clone, Default)]
 pub struct LocalRuntime {
     cancelled: Arc<AtomicBool>,
+    admission: Option<Arc<dyn ReplayAdmission>>,
 }
 #[derive(Clone)]
 struct State {
@@ -159,7 +186,14 @@ impl Meter {
 }
 impl LocalRuntime {
     pub fn with_cancellation(cancelled: Arc<AtomicBool>) -> Self {
-        Self { cancelled }
+        Self {
+            cancelled,
+            admission: None,
+        }
+    }
+    pub fn with_admission(mut self, admission: Arc<dyn ReplayAdmission>) -> Self {
+        self.admission = Some(admission);
+        self
     }
     /// Host-only bounded evaluation for metadata initialization. This uses the
     /// production evaluator, validates the expression in a typed action, and
@@ -273,6 +307,10 @@ impl LocalRuntime {
             observation: observation.view,
             artifacts: observation.outputs,
             retained_records: run.state.data.records.clone(),
+            history: crate::product_protocol::PreservedHistory {
+                results: vec![],
+                events: run.state.data.events.clone(),
+            },
             read_only: false,
             issues: vec![],
         })
@@ -287,6 +325,32 @@ impl LocalRuntime {
         limits: RuntimeLimits,
         id: &str,
     ) -> Result<RunEvidence> {
+        self.replay_admitted(
+            program,
+            scenario,
+            decisions,
+            limits,
+            id,
+            self.admission.as_deref(),
+        )
+    }
+    pub fn replay_admitted(
+        &self,
+        program: &CapturedProgram,
+        scenario: &ScenarioSpec,
+        decisions: &DecisionGraph,
+        limits: RuntimeLimits,
+        id: &str,
+        admission: Option<&dyn ReplayAdmission>,
+    ) -> Result<RunEvidence> {
+        if has_protected_fields(program) && admission.is_none() {
+            return Err(AdapterError::Unsupported(
+                "Protected scope history needs a verified host admission context".into(),
+            ));
+        }
+        if let Some(admission) = admission {
+            admission.validate_seed(program, &scenario.seed, scenario.clock_day)?;
+        }
         if !valid_id(id) {
             return Err(invalid("invalid run ID"));
         }
@@ -318,7 +382,13 @@ impl LocalRuntime {
         // mutation identity. Live apply/store IDs are supplied by their caller.
         let operations = scenario.replay_operation_ids()?;
         for (input, operation) in scenario.inputs.iter().zip(operations) {
-            if let Err(error) = self.apply(&mut run, input, &operation) {
+            let applied = self.apply(&mut run, input, &operation).and_then(|step| {
+                if let Some(admission) = admission {
+                    admission.validate_state(program, self.data(&run), run.clock_day())?;
+                }
+                Ok(step)
+            });
+            if let Err(error) = applied {
                 state = if matches!(
                     error,
                     AdapterError::Cancelled | AdapterError::BudgetExhausted(_)

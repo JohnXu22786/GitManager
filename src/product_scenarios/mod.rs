@@ -395,6 +395,7 @@ impl Default for SearchBudget {
 #[derive(Clone)]
 pub struct ComparisonEngine {
     cancelled: Arc<AtomicBool>,
+    admission: Option<Arc<dyn crate::product_runtime::ReplayAdmission>>,
 }
 /// Count through a capped writer rather than allocating another full run copy.
 fn bounded_evidence_size(value: &impl Serialize, limit: usize) -> Option<usize> {
@@ -491,7 +492,17 @@ fn direction(a: &DataValue, b: &DataValue) -> Result<DifferenceShape, AdapterErr
 }
 impl ComparisonEngine {
     pub fn new(cancelled: Arc<AtomicBool>) -> Self {
-        Self { cancelled }
+        Self {
+            cancelled,
+            admission: None,
+        }
+    }
+    pub fn with_admission(
+        mut self,
+        admission: Arc<dyn crate::product_runtime::ReplayAdmission>,
+    ) -> Self {
+        self.admission = Some(admission);
+        self
     }
     pub fn compare(
         &self,
@@ -527,7 +538,14 @@ impl ComparisonEngine {
             return Ok(report);
         }
         for (source, id) in [(before, "before-run"), (after, "after-run")] {
-            match runtime.replay(source, scenario, decisions, limits.clone(), id) {
+            match runtime.replay_admitted(
+                source,
+                scenario,
+                decisions,
+                limits.clone(),
+                id,
+                self.admission.as_deref(),
+            ) {
                 Ok(run) => report.runs.push(run),
                 Err(error) => {
                     report.state = classify(&error);
@@ -843,7 +861,7 @@ impl ComparisonEngine {
             );
         } else {
             best.diagnostics.push(
-                "1-minimal under the declared structural reductions; not a global optimum".into(),
+                "1-minimal under the declared unprotected structural reductions; protected cohort/history data are retained; not a global optimum".into(),
             );
         }
         let verified = best.witness.as_mut().unwrap();
@@ -908,6 +926,13 @@ fn deletions(
     scenario.validate_structure()?;
     let mut result = vec![];
     for i in 0..scenario.seed.records.len() {
+        if scenario.seed.records[i]
+            .values
+            .keys()
+            .any(|key| key.starts_with(crate::product_runtime::PROTECTED_FIELD_PREFIX))
+        {
+            continue;
+        }
         result.push(Deletion::Record(i));
         if result.len() > MAX_ITEMS {
             return Ok(result);
@@ -921,6 +946,9 @@ fn deletions(
     }
     for (index, record) in scenario.seed.records.iter().enumerate() {
         for field in record.values.keys() {
+            if field.starts_with(crate::product_runtime::PROTECTED_FIELD_PREFIX) {
+                continue;
+            }
             if [before, after].iter().all(|p| {
                 p.program
                     .entities

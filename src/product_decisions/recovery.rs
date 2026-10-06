@@ -165,3 +165,69 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         Ok(result)
     }
 }
+
+impl<R: RuntimeAdapter> DecisionEngine<R> {
+    /// Withdraw exact behavior layers on current data. Their own accepted
+    /// decisions retire; unrelated active promises are independently replayed.
+    pub fn prepare_scoped_withdrawal(
+        &self,
+        store: &ProductStore,
+        layers: &[Digest],
+        id: &str,
+    ) -> Result<VerifiedChange> {
+        let current = store.load()?;
+        let prepared = store.prepare_scoped_withdrawal(layers, id)?;
+        let mut retire = BTreeSet::new();
+        for layer in layers {
+            let manifest = current
+                .scope
+                .layers
+                .get(layer)
+                .ok_or_else(|| invalid("unknown scope layer"))?;
+            let adoption = current
+                .adoptions
+                .iter()
+                .find(|a| a.plan.id == manifest.operation)
+                .ok_or_else(|| invalid("scope layer adoption missing"))?;
+            let receipt = current
+                .scope
+                .adoptions
+                .iter()
+                .find(|r| r.revision == adoption.revision)
+                .ok_or_else(|| invalid("scoped decision receipt missing"))?;
+            retire.extend(receipt.decisions.iter().cloned());
+        }
+        let mut next = current.decisions.clone();
+        for decision in &mut next.decisions {
+            if retire.contains(&decision.id) {
+                if decision.status != DecisionStatus::Active {
+                    return Err(invalid("only an active scoped intention can be withdrawn"));
+                }
+                decision.status = DecisionStatus::Withdrawn {
+                    adoption: id.into(),
+                };
+                decision.revision = decision
+                    .revision
+                    .checked_add(1)
+                    .ok_or_else(|| invalid("decision revision overflow"))?;
+            }
+        }
+        next.revision = next
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| invalid("decision revision overflow"))?;
+        let target = prepared.target().clone();
+        let mappings = self.compose_for_current(&current, &target, &[])?;
+        self.with_scoped(Some(prepared), || {
+            self.prepare(
+                store,
+                &current,
+                &target,
+                next,
+                mappings,
+                retire.into_iter().collect(),
+                id,
+            )
+        })
+    }
+}

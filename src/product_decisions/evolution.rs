@@ -258,8 +258,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             let mut obligations = vec![];
             let mut exercised = BTreeSet::new();
             for original in self.archive.load(&decision.witness)? {
-                let (prior, contexts) = execute(
-                    &self.runtime,
+                let (prior, contexts) = self.execute_scene(
                     &original.program,
                     &original.scenario,
                     &request.decisions,
@@ -299,8 +298,9 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 } else {
                     mapping.scenario(&original.scenario, &candidate.program)?
                 };
-                let (mut checked, target_contexts) = capture_scene(
-                    &self.runtime,
+                let (mut checked, target_contexts) = self.capture_mapped_scene(
+                    &original.program,
+                    &original.scenario,
                     &candidate,
                     &replacement,
                     original.disclosure,
