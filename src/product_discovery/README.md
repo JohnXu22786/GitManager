@@ -30,17 +30,33 @@ program, or call a provider automatically when an app opens.
    needs an independent behavioral requirement case covering it; declaration
    alone cannot establish that an alternative implements the feature. Active chosen outcomes without
    predicate obligations are checked against their selected retained witness side.
+   Missing, incompatible or unrepresentable saved channels remain unknown,
+   rather than an observed intention violation.
+   Additional chosen scenes use their exact selected-source `accepted_scenes`
+   context after an independent archived-source replay; their check identities
+   bind those verified historical observations.
    For KeepCurrent, supply chosen_artifacts only from the controller's verified
    historical adoption/selection receipt; an ambiguous side remains unverified.
    Model claims do not populate
    these fields. Scope predicates not independently resolved stay unknown.
-   `workflow_validity` contains independent workflow constraints; proposed model
-   scenario validity is not treated as an accepted oracle.
+   `workflow_validity` contains independent workflow constraints for the
+   operations actually executed by either compared program, not the provider's
+   chosen action label. They apply to every current scene/replay/reduction and
+   independent requirement, chosen-outcome and obligation precheck;
+   trusted historical constraints are also retained. Proposed model scenario
+   validity is discarded rather than treated as an accepted oracle. Executed
+   producer operations also determine relevant retained intentions, so a new
+   consumer label cannot reissue their unchanged choices or exclude an
+   associated producer-only retained scene. `ChoiceQuestion.action` is a
+   grouping/context hint, not adoption-scope authority: use the actual verified
+   source scenes, independent intention checks and the user's explicit scope.
 5. Retain the entire report, including failed/inconclusive runs and hypothesis
    logs. Display questions from immutable `VerifiedWitness` artifacts. Both
    compared programs, seed, actions, output bytes, typed observations, original
    scenario and its original runs, reduction audit, and final single-deletion
-   certificate are available.
+   certificate are available. A present target that exceeds sampling limits
+  makes a reduction inconclusive; it cannot be labeled invalid to complete a
+  1-minimality certificate.
    A provider receipt is authorship provenance, never execution evidence.
 6. Recheck actual source identity before showing/adopting results.
    `VerifiedWitness::matches_sources` compares exact captured artifacts. The
@@ -50,7 +66,11 @@ program, or call a provider automatically when an app opens.
 ## Search and proof boundaries
 
 - Source analysis compares actual typed source by semantic component and follows
-  action/state/entity/view/output references. A comparison first checks the actual
+  action/state/entity/view/output references in proposed and applicable retained
+  scene contexts, including directly invoked producer actions and every
+  declared observable actually evaluated by Observe. A provider cannot hide another observable or a changed view by
+  omitting a label or navigation.
+  A comparison first checks the actual
   baseline/candidate outcomes on the same observation target; hypothetical third
   programs cannot invent behavior changes for equivalent edits. Newly required
   features have a separate path with two complete implementations. It ignores only declared display
@@ -65,7 +85,13 @@ program, or call a provider automatically when an app opens.
   repair; unknown applicability/execution does not become an approved option.
 - Distinctions are sampled from real declared observables, actual local outputs,
   or typed view rows/cells. Identity/provenance-only data-digest changes are not
-  business differences. The runtime's actual transactions remain in the traces.
+  business differences. One-sided missing or incompatible typed channels remain
+  explicitly unverified rather than silently equal. Channel presence is checked
+  separately from sample construction, including cumulative export-size limits;
+  both captured declarations
+  are considered so removed channels cannot disappear from coverage. The
+  runtime's actual transactions remain in the traces. An executed contrast
+  outside the supported targets remains explicitly unverified.
 - Each comparison uses the same copied data, session, clock, RNG and inputs.
   Failed prefixes are preserved. Preview never resumes historical export receipts
   or writes a live store. Runtime limits, cancellation at every replay boundary, precheck limits, comparison limits, trial
@@ -81,7 +107,10 @@ program, or call a provider automatically when an app opens.
   property binds the actual final observations. For a previously considered
   choice, reduction retains both initial target outcomes so it cannot erase the
   condition that produces a genuinely new third result. Whole material vectors
-  keep a consistent saved-side correspondence across observations. A new
+  keep a consistent saved-side correspondence across observations. Executed,
+  unrepresented view controls, action availability and output layout also
+  constrain retained equality; unexplained changes cannot be called settled.
+  These channels do not create a fabricated executable property. A new
   combination of individually familiar values gets a host-derived compound
   executable property; its reduction cannot discard required coordinates.
 - `complete` means every remaining permitted single reduction from the final
@@ -102,12 +131,35 @@ program, or call a provider automatically when an app opens.
   hypotheses whose primary labels differ. All targets are checked before settled
   outcomes are suppressed. An earlier familiar contrast cannot hide a later
   newly executed consequence. Complete retained scenes are also checked even
-  when the provider omits one of their observation points; a newly measured
+  when the provider omits every revealing observation and reports equal
+  outcomes. Every selected scenario digest of an applicable accepted decision,
+  not only its primary witness scene, is an independent search input. Missing
+  historical correspondence remains unverified. Search does not wait for a
+  provider witness; a newly measured
   retained outcome gets its own independently minimized witness. Settlement is
   keyed by source pair and scene, so one checked context cannot settle another.
+  Additional accepted inputs use their own `accepted_scenes` outcomes, matched
+  to the original source pair and independently replayed from the supplied
+  archived sources. Primary-scene values cannot settle or reopen another
+  accepted initial condition; missing or mismatched history remains unknown.
+  History lookup tolerates observation renaming/removal without changing
+  effective inputs or initial conditions; actual replayed trace correspondence
+  still decides settlement. Ambiguous or unmatched additional history never
+  silently falls back to the primary scene.
+  Actual alternative channels also receive presence, type and representability
+  checks, including unchanged captured channels and alternative-only
+  declarations. The captured-change filter limits choice generation, not this
+  independent coverage check.
+- Unsupported material view/action/selection or output-layout contrasts remain
+  explicit in coverage even when a supported contrast also yields a witness,
+  or comparisons run without a witness. This check uses original executed
+  source and alternative observations, independently of saved decisions; it
+  does not invent a property for the unsupported channel.
 - Related hypotheses for the same action/observable or actual contrast are
-  grouped; identical
-  executable scenes are deduplicated while all hypothesis dispositions remain in
+  grouped. Exact source-pair/scene matches do not depend on provider action
+  labels. A bridging hypothesis merges the entire connected group, preserving
+  ordered hypothesis associations, unknowns and distinct evidence; identical
+  executable scenes are deduplicated while final dispositions remain in
   the log. Comparison-budget exhaustion remains in coverage diagnostics even
   when another completed comparison produced a valid witness. A model's
   defect/requested-change classification remains a suggestion

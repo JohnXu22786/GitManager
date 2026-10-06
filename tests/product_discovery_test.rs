@@ -210,6 +210,24 @@ fn saved_decision(
     outcome: DecisionOutcome,
     obligations: Vec<AcceptedProperty>,
 ) -> DifferentialWitness {
+    saved_decision_for_target(
+        r,
+        out,
+        outcome,
+        obligations,
+        product_scenarios::ObservationTarget::Observable {
+            point: "done".into(),
+            observable: "selected_count".into(),
+        },
+    )
+}
+fn saved_decision_for_target(
+    r: &mut DevelopmentRequest,
+    out: &DevelopmentResult,
+    outcome: DecisionOutcome,
+    obligations: Vec<AcceptedProperty>,
+    target: product_scenarios::ObservationTarget,
+) -> DifferentialWitness {
     let scene = out.response.hypotheses[0].scenario().unwrap();
     let observed = product_scenarios::ComparisonEngine::new(Arc::new(AtomicBool::new(false)))
         .compare(
@@ -217,10 +235,7 @@ fn saved_decision(
             &r.sources[1],
             &scene,
             &r.decisions,
-            product_scenarios::ObservationTarget::Observable {
-                point: "done".into(),
-                observable: "selected_count".into(),
-            },
+            target,
             RuntimeLimits::default(),
         )
         .unwrap()
@@ -2226,6 +2241,24 @@ fn different_primary_labels_group_the_same_executed_multi_observable_contrast() 
 
 #[test]
 fn changed_retained_points_cannot_be_hidden_by_omitting_proposed_observations() {
+    assert_omitted_retained_observation_is_discovered(0);
+}
+
+#[test]
+fn equal_provider_observations_do_not_skip_changed_retained_scenes() {
+    assert_omitted_retained_observation_is_discovered(1);
+}
+
+#[test]
+fn consumer_labels_do_not_exclude_revealing_producer_only_history() {
+    assert_omitted_retained_observation_with_consumer(1, true);
+}
+
+fn assert_omitted_retained_observation_is_discovered(final_value: i64) {
+    assert_omitted_retained_observation_with_consumer(final_value, false);
+}
+
+fn assert_omitted_retained_observation_with_consumer(final_value: i64, consumer: bool) {
     let (mut request, mut result) = input();
     let mut before = filtered();
     let integer = |value| json!({"kind":"literal","value_type":{"kind":"integer"},"value":{"kind":"integer","value":value}});
@@ -2261,13 +2294,20 @@ fn changed_retained_points_cannot_be_hidden_by_omitting_proposed_observations() 
         vec![],
     );
     let prior_scene = prior.scenario.identity().unwrap();
-    after["actions"][1]["steps"][0]["value"] = json!({"kind":"if","condition":{"kind":"equal","left":{"kind":"state","state":"calls"},"right":integer(0)},"then_value":integer(2),"else_value":integer(0)});
+    after["actions"][1]["steps"][0]["value"] = json!({"kind":"if","condition":{"kind":"equal","left":{"kind":"state","state":"calls"},"right":integer(0)},"then_value":integer(2),"else_value":integer(final_value)});
     request.sources[1] = capture(after);
     result.response.candidates[1].source_json =
         String::from_utf8(request.sources[1].source_bytes.clone()).unwrap();
     result.response.hypotheses[0].sources[0].raw_digest =
         request.sources[1].artifact.raw_digest.clone();
     scene.inputs.remove(1);
+    if consumer {
+        result.response.hypotheses[0].action = "export_people".into();
+        scene.inputs.insert(
+            scene.inputs.len() - 1,
+            invoke("export_people", Values::new()),
+        );
+    }
     result.response.hypotheses[0].scenario_json = serde_json::to_string(&scene).unwrap();
     refresh(&request, &mut result);
     let report = run(
@@ -2371,4 +2411,1136 @@ fn withdrawn_decisions_keep_terminal_history_without_becoming_live_requirements(
     assert!(result.validate_for(&request).is_err());
     result.response.evolutions[0].proposed_retirement = vec!["older".into()];
     assert!(result.validate_for(&request).is_err());
+}
+
+#[test]
+fn missing_or_incompatible_observed_channels_remain_explicitly_unverified() {
+    for case in ["omitted_export", "changed_type", "removed_secondary"] {
+        let (mut request, mut result) = input();
+        let mut before = filtered();
+        if case == "removed_secondary" {
+            before["observables"].as_array_mut().unwrap().push(json!({
+                "id":"secondary", "label":"Secondary", "value":{
+                    "kind":"literal", "value_type":{"kind":"integer"},
+                    "value":{"kind":"integer","value":10}
+                }
+            }));
+        }
+        let mut after = before.clone();
+        let (action, pointer) = match case {
+            "omitted_export" => {
+                after["actions"][2]["steps"] = json!([{"kind":"set_state","state":"selected","value":{"kind":"state","state":"selected"}}]);
+                ("export_people", "/actions/2/steps")
+            }
+            "changed_type" => {
+                after["observables"][0]["value"] = json!({"kind":"literal","value_type":{"kind":"text"},"value":{"kind":"text","value":"one"}});
+                ("collect", "/observables/0/value")
+            }
+            "removed_secondary" => {
+                after["observables"].as_array_mut().unwrap().pop();
+                ("collect", "/observables/1")
+            }
+            _ => unreachable!(),
+        };
+        request.sources = vec![capture(before.clone()), capture(after.clone())];
+        result.response.candidates[0].source_json = serde_json::to_string(&before).unwrap();
+        result.response.candidates[1].source_json = serde_json::to_string(&after).unwrap();
+        let hypothesis = &mut result.response.hypotheses[0];
+        hypothesis.action = action.into();
+        // A removed node's locus must reference the exact baseline bytes.
+        hypothesis.sources[0].raw_digest = request.sources
+            [usize::from(case != "removed_secondary")]
+        .artifact
+        .raw_digest
+        .clone();
+        hypothesis.sources[0].pointer = pointer.into();
+        hypothesis.scenario_json = serde_json::to_string(&scenario(
+            &request.sources[0],
+            vec![
+                add("Ada"),
+                invoke("collect", Values::new()),
+                invoke("export_people", Values::new()),
+                SemanticInput::Observe {
+                    point: "done".into(),
+                },
+            ],
+        ))
+        .unwrap();
+        refresh(&request, &mut result);
+        let report = run(&request, &result, DiscoveryPolicy::default());
+        assert_eq!(
+            report
+                .runs
+                .iter()
+                .filter(|r| r.id.starts_with("captured-"))
+                .count(),
+            2,
+            "{case}"
+        );
+        assert!(report
+            .runs
+            .iter()
+            .filter(|r| r.id.starts_with("captured-"))
+            .all(|r| r.state == EvidenceState::Observed));
+        assert!(report.questions.is_empty(), "{case}");
+        assert!(
+            !report.unverified.is_empty(),
+            "missing uncertainty for {case}"
+        );
+        assert_eq!(report.log[0].disposition, Disposition::Unverified, "{case}");
+    }
+}
+
+#[test]
+fn retained_view_navigation_participates_in_changed_source_relevance() {
+    let (mut request, mut result) = input();
+    let mut before = filtered();
+    let mut secondary = before["views"][0].clone();
+    secondary["id"] = json!("review_people");
+    let secondary_index = before["views"].as_array().unwrap().len();
+    before["views"].as_array_mut().unwrap().push(secondary);
+    let mut after = before.clone();
+    after["views"][secondary_index]["kind"]["rows"]["sort"][0]["descending"] = json!(true);
+    request.sources = vec![capture(before.clone()), capture(after.clone())];
+    result.response.candidates[0].source_json = serde_json::to_string(&before).unwrap();
+    result.response.candidates[1].source_json = serde_json::to_string(&after).unwrap();
+    let mut scene = scenario(
+        &request.sources[0],
+        vec![
+            add("Ada"),
+            add("Zoe"),
+            invoke("collect", Values::new()),
+            SemanticInput::Navigate {
+                view: "review_people".into(),
+            },
+            SemanticInput::Observe {
+                point: "done".into(),
+            },
+        ],
+    );
+    result.response.hypotheses[0].scenario_json = serde_json::to_string(&scene).unwrap();
+    result.response.hypotheses[0].sources[0].raw_digest =
+        request.sources[1].artifact.raw_digest.clone();
+    result.response.hypotheses[0].sources[0].pointer =
+        format!("/views/{secondary_index}/kind/rows");
+    refresh(&request, &mut result);
+    let prior = saved_decision_for_target(
+        &mut request,
+        &result,
+        DecisionOutcome::EitherAcceptable,
+        vec![],
+        product_scenarios::ObservationTarget::ViewRows {
+            point: "done".into(),
+        },
+    );
+    let prior_scene = prior.scenario.identity().unwrap();
+    after["views"][secondary_index]["kind"]["rows"]["predicate"] = json!({"kind":"equal","left":field(var("item"),"name"),"right":{"kind":"literal","value_type":{"kind":"text"},"value":{"kind":"text","value":"Ada"}}});
+    request.sources[1] = capture(after);
+    result.response.candidates[1].source_json =
+        String::from_utf8(request.sources[1].source_bytes.clone()).unwrap();
+    result.response.hypotheses[0].sources[0].raw_digest =
+        request.sources[1].artifact.raw_digest.clone();
+    scene.inputs.remove(3);
+    result.response.hypotheses[0].scenario_json = serde_json::to_string(&scene).unwrap();
+    refresh(&request, &mut result);
+    let report = run(
+        &request,
+        &result,
+        DiscoveryPolicy {
+            retained_witnesses: vec![prior],
+            ..DiscoveryPolicy::default()
+        },
+    );
+    assert_eq!(report.questions.len(), 1);
+    assert!(report.questions[0]
+        .witnesses
+        .iter()
+        .any(|w| w.initial_scenario().identity().unwrap() == prior_scene
+            && w.witness()
+                .after
+                .observations
+                .iter()
+                .any(|o| o.view.view == "review_people" && o.view.rows.len() == 1)));
+}
+
+#[test]
+fn cumulative_export_sampling_limits_remain_unverified_not_absent() {
+    let (mut request, mut result) = input();
+    let mut before = filtered();
+    before["state"].as_array_mut().unwrap().push(json!({
+        "id":"export_values", "label":"Export values", "value_type":{"kind":"list","item":{"kind":"integer"}},
+        "initial":{"kind":"list","item_type":{"kind":"integer"},"items":vec![json!({"kind":"integer","value":0});6000]}
+    }));
+    before["actions"][2]["steps"][0]["items"] = json!({"kind":"state","state":"export_values"});
+    before["actions"][2]["steps"][0]["columns"]["name"] = text("before");
+    let mut after = before.clone();
+    after["actions"][2]["steps"][0]["columns"]["name"] = text("after");
+    request.sources = vec![capture(before.clone()), capture(after.clone())];
+    result.response.candidates[0].source_json = serde_json::to_string(&before).unwrap();
+    result.response.candidates[1].source_json = serde_json::to_string(&after).unwrap();
+    let hypothesis = &mut result.response.hypotheses[0];
+    hypothesis.action = "export_people".into();
+    hypothesis.sources[0].raw_digest = request.sources[1].artifact.raw_digest.clone();
+    hypothesis.sources[0].pointer = "/actions/2/steps/0/columns/name".into();
+    hypothesis.scenario_json = serde_json::to_string(&scenario(
+        &request.sources[0],
+        vec![
+            invoke("export_people", Values::new()),
+            invoke("export_people", Values::new()),
+            SemanticInput::Observe {
+                point: "done".into(),
+            },
+        ],
+    ))
+    .unwrap();
+    refresh(&request, &mut result);
+    let report = run(
+        &request,
+        &result,
+        DiscoveryPolicy {
+            search: product_scenarios::SearchBudget {
+                runtime: RuntimeLimits {
+                    fuel: 10_000_000,
+                    elapsed_millis: 60_000,
+                    ..RuntimeLimits::default()
+                },
+                ..product_scenarios::SearchBudget::default()
+            },
+            ..DiscoveryPolicy::default()
+        },
+    );
+    let captured: Vec<_> = report
+        .runs
+        .iter()
+        .filter(|r| r.id.starts_with("captured-"))
+        .collect();
+    assert_eq!(captured.len(), 2);
+    for run in &captured {
+        assert_eq!(run.state, EvidenceState::Observed, "{:?}", run.errors);
+        let outputs = &run.observations[0].outputs;
+        assert_eq!(outputs.len(), 2);
+        assert!(outputs.iter().all(|output| output.rows.len() == 6000));
+    }
+    assert_ne!(
+        captured[0].observations[0].outputs[0].rows[0],
+        captured[1].observations[0].outputs[0].rows[0]
+    );
+    assert!(report.questions.is_empty());
+    assert!(!report.unverified.is_empty());
+    assert_eq!(report.log[0].disposition, Disposition::Unverified);
+}
+
+#[test]
+fn downstream_consumer_hypotheses_include_executed_producer_actions() {
+    let (request, mut result) = input();
+    result.response.hypotheses[0].action = "export_people".into();
+    let report = run(&request, &result, DiscoveryPolicy::default());
+    assert_eq!(report.questions.len(), 1);
+    assert_eq!(report.questions[0].action, "export_people");
+    assert!(report.questions[0].witnesses.iter().any(|w| {
+        let before = &w.witness().before.observations;
+        let after = &w.witness().after.observations;
+        before.iter().zip(after).any(|(a, b)| {
+            !a.outputs.is_empty()
+                && !b.outputs.is_empty()
+                && a.outputs.iter().map(|o| o.rows.len()).sum::<usize>()
+                    != b.outputs.iter().map(|o| o.rows.len()).sum::<usize>()
+        })
+    }));
+}
+
+#[test]
+fn executed_view_changes_outside_sample_targets_remain_explicitly_unverified() {
+    let (mut request, mut result) = input();
+    let mut after = filtered();
+    after["views"][0]["actions"][0]["enabled"] = json!({"kind":"literal","value_type":{"kind":"boolean"},"value":{"kind":"boolean","value":false}});
+    request.sources[1] = capture(after);
+    result.response.candidates[1].source_json =
+        String::from_utf8(request.sources[1].source_bytes.clone()).unwrap();
+    result.response.hypotheses[0].sources[0].raw_digest =
+        request.sources[1].artifact.raw_digest.clone();
+    result.response.hypotheses[0].sources[0].pointer = "/views/0/actions/0/enabled".into();
+    refresh(&request, &mut result);
+    let report = run(&request, &result, DiscoveryPolicy::default());
+    let captured: Vec<_> = report
+        .runs
+        .iter()
+        .filter(|r| r.id.starts_with("captured-"))
+        .collect();
+    assert_eq!(captured.len(), 2);
+    assert!(captured.iter().all(|r| r.state == EvidenceState::Observed));
+    assert_ne!(
+        captured[0].observations[0].view.enabled_actions,
+        captured[1].observations[0].view.enabled_actions
+    );
+    assert!(report.questions.is_empty());
+    assert!(!report.unverified.is_empty());
+    assert_eq!(report.log[0].disposition, Disposition::Unverified);
+}
+
+#[test]
+fn additional_chosen_scenes_use_verified_selected_context() {
+    for history in ["verified", "forged"] {
+        let (mut request, mut result) = multiple_observable_input();
+        let selected = request.sources[1].artifact.program_digest.clone();
+        let prior = saved_decision(
+            &mut request,
+            &result,
+            DecisionOutcome::Accept { artifact: selected },
+            vec![],
+        );
+        let mut additional = request.examples[0].scenario.clone();
+        additional.id = "chosen-additional".into();
+        additional.clock_day += 1;
+        let digest = additional.identity().unwrap();
+        let actual = product_runtime::LocalRuntime::default()
+            .replay(
+                &request.sources[1],
+                &additional,
+                &request.decisions,
+                RuntimeLimits::default(),
+                "accepted-selected",
+            )
+            .unwrap();
+        assert_eq!(actual.state, EvidenceState::Observed);
+        let mut observations = actual.observations;
+        if history == "forged" {
+            observations[0]
+                .values
+                .insert("secondary".into(), DataValue::Integer { value: 99 });
+        }
+        request.decisions.decisions[0]
+            .scenarios
+            .push(digest.clone());
+        request.examples.push(SelectedScenario {
+            disclosure: Disclosure::Synthetic,
+            scenario: additional,
+        });
+        request.accepted_scenes.push(AcceptedSceneContext {
+            decision: "saved".into(),
+            source: request.sources[1].artifact.clone(),
+            scenario: digest,
+            observations,
+            disclosure: Disclosure::Synthetic,
+        });
+        refresh(&request, &mut result);
+        let report = run(
+            &request,
+            &result,
+            DiscoveryPolicy {
+                retained_witnesses: vec![prior],
+                ..DiscoveryPolicy::default()
+            },
+        );
+        assert!(report.defects.is_empty());
+        assert!(report.questions.is_empty());
+        assert!(report
+            .runs
+            .iter()
+            .any(|run| run.id == "accepted-history-selected"
+                && run.origin == ExecutionOrigin::ProductionRuntime
+                && run.state == EvidenceState::Observed));
+        if history == "verified" {
+            assert_eq!(report.checks.len(), 2);
+            assert!(report
+                .checks
+                .iter()
+                .all(|check| check.state == CheckState::Satisfied));
+            assert!(report.unverified.is_empty(), "{:?}", report.unverified);
+        } else {
+            assert!(!report.unverified.is_empty());
+        }
+    }
+}
+
+#[test]
+fn chosen_outcome_channel_loss_is_unknown_not_an_observed_violation() {
+    for side in ["current", "alternative"] {
+        for change in ["removed", "retyped"] {
+            let (mut request, mut result) = input();
+            for index in 0..2 {
+                let mut program: Value =
+                    serde_json::from_slice(&request.sources[index].source_bytes).unwrap();
+                program["observables"].as_array_mut().unwrap().push(json!({"id":"secondary","label":"Secondary","value":{"kind":"literal","value_type":{"kind":"integer"},"value":{"kind":"integer","value":7}}}));
+                request.sources[index] = capture(program);
+                result.response.candidates[index].source_json =
+                    String::from_utf8(request.sources[index].source_bytes.clone()).unwrap();
+            }
+            result.response.hypotheses[0].sources[0].raw_digest =
+                request.sources[1].artifact.raw_digest.clone();
+            refresh(&request, &mut result);
+            let selected = request.sources[1].artifact.program_digest.clone();
+            let prior = saved_decision(
+                &mut request,
+                &result,
+                DecisionOutcome::Accept { artifact: selected },
+                vec![],
+            );
+            let mut modified: Value =
+                serde_json::from_slice(&request.sources[1].source_bytes).unwrap();
+            if change == "removed" {
+                modified["observables"].as_array_mut().unwrap().pop();
+            } else {
+                modified["observables"][1]["value"] = json!({"kind":"literal","value_type":{"kind":"text"},"value":{"kind":"text","value":"seven"}});
+            }
+            let modified = capture(modified);
+            if side == "current" {
+                request.sources[1] = modified.clone();
+            }
+            result.response.candidates[usize::from(side == "current")].source_json =
+                String::from_utf8(modified.source_bytes.clone()).unwrap();
+            result.response.hypotheses[0].sources[0].raw_digest =
+                request.sources[1].artifact.raw_digest.clone();
+            refresh(&request, &mut result);
+            let report = run(
+                &request,
+                &result,
+                DiscoveryPolicy {
+                    retained_witnesses: vec![prior],
+                    ..DiscoveryPolicy::default()
+                },
+            );
+            assert!(
+                report.defects.is_empty(),
+                "{side}/{change}: {:?}",
+                report.defects
+            );
+            assert!(!report.unverified.is_empty(), "{side}/{change}");
+            assert!(report.questions.is_empty());
+            if side == "current" {
+                assert!(report
+                    .checks
+                    .iter()
+                    .any(|check| check.state == CheckState::Unknown));
+            }
+            assert!(report
+                .log
+                .iter()
+                .all(|entry| entry.disposition != Disposition::Settled));
+        }
+    }
+}
+
+#[test]
+fn every_accepted_scene_is_searched_when_provider_omits_the_new_outcome() {
+    assert_additional_scene_history(true, "verified", "original");
+}
+
+#[test]
+fn additional_accepted_scenes_use_their_own_verified_history() {
+    for history in ["verified", "missing", "forged"] {
+        assert_additional_scene_history(false, history, "original");
+    }
+}
+
+#[test]
+fn additional_scene_instrumentation_does_not_reopen_a_settled_choice() {
+    for instrumentation in ["renamed", "removed_observe", "inert"] {
+        assert_additional_scene_history(false, "verified", instrumentation);
+    }
+}
+
+fn assert_additional_scene_history(changed: bool, history: &str, instrumentation: &str) {
+    let (mut request, mut result) = input();
+    let integer = |value| json!({"kind":"literal","value_type":{"kind":"integer"},"value":{"kind":"integer","value":value}});
+    let mut before = filtered();
+    before["state"].as_array_mut().unwrap().extend([
+        json!({"id":"result","label":"Result","value_type":{"kind":"integer"},"initial":{"kind":"integer","value":0}}),
+        json!({"id":"special","label":"Special","value_type":{"kind":"boolean"},"initial":{"kind":"boolean","value":false}}),
+    ]);
+    before["observables"][0]["value"] = json!({"kind":"state","state":"result"});
+    before["actions"][1]["steps"] = json!([{"kind":"set_state","state":"result","value":{"kind":"if","condition":{"kind":"state","state":"special"},"then_value":integer(3),"else_value":integer(1)}}]);
+    let mut after = before.clone();
+    after["actions"][1]["steps"][0]["value"] = json!({"kind":"if","condition":{"kind":"state","state":"special"},"then_value":integer(2),"else_value":integer(0)});
+    request.sources = vec![capture(before), capture(after.clone())];
+    for index in 0..2 {
+        result.response.candidates[index].source_json =
+            String::from_utf8(request.sources[index].source_bytes.clone()).unwrap();
+    }
+    let scene = scenario(
+        &request.sources[0],
+        vec![
+            invoke("collect", Values::new()),
+            SemanticInput::Observe {
+                point: "done".into(),
+            },
+        ],
+    );
+    result.response.hypotheses[0].scenario_json = serde_json::to_string(&scene).unwrap();
+    result.response.hypotheses[0].sources[0].raw_digest =
+        request.sources[1].artifact.raw_digest.clone();
+    refresh(&request, &mut result);
+    let prior = saved_decision(
+        &mut request,
+        &result,
+        DecisionOutcome::EitherAcceptable,
+        vec![],
+    );
+    request.decisions.decisions[0].status = DecisionStatus::Pending;
+    let mut additional = scene;
+    additional.id = "additional-accepted-scene".into();
+    additional
+        .session
+        .values
+        .insert("special".into(), DataValue::Boolean { value: true });
+    if instrumentation == "removed_observe" {
+        additional.inputs.push(SemanticInput::Observe {
+            point: "duplicate".into(),
+        });
+    }
+    if instrumentation != "original" {
+        let mut proposed = additional.clone();
+        match instrumentation {
+            "renamed" => {
+                proposed.inputs[1] = SemanticInput::Observe {
+                    point: "renamed".into(),
+                };
+            }
+            "removed_observe" => {
+                proposed.inputs.pop();
+            }
+            _ => {
+                proposed.inputs.insert(
+                    0,
+                    SemanticInput::Control {
+                        view: "people".into(),
+                        control: "search_input".into(),
+                        value: string(""),
+                    },
+                );
+            }
+        }
+        result.response.hypotheses[0].scenario_json = serde_json::to_string(&proposed).unwrap();
+    }
+    let additional_digest = additional.identity().unwrap();
+    request.decisions.decisions[0]
+        .scenarios
+        .push(additional_digest.clone());
+    request.examples.push(SelectedScenario {
+        disclosure: Disclosure::Synthetic,
+        scenario: additional.clone(),
+    });
+    if history != "missing" {
+        for source in &request.sources {
+            let observed = product_runtime::LocalRuntime::default()
+                .replay(
+                    source,
+                    &additional,
+                    &request.decisions,
+                    RuntimeLimits::default(),
+                    "accepted-additional",
+                )
+                .unwrap();
+            assert_eq!(observed.state, EvidenceState::Observed);
+            let mut observations = observed.observations;
+            if history == "forged" {
+                observations[0]
+                    .values
+                    .insert("selected_count".into(), DataValue::Integer { value: 99 });
+            }
+            request.accepted_scenes.push(AcceptedSceneContext {
+                decision: "saved".into(),
+                source: source.artifact.clone(),
+                scenario: additional_digest.clone(),
+                observations,
+                disclosure: Disclosure::Synthetic,
+            });
+        }
+    }
+    if changed {
+        let old = request.sources[1].clone();
+        after["actions"][1]["steps"][0]["value"] = json!({"kind":"if","condition":{"kind":"state","state":"special"},"then_value":integer(4),"else_value":integer(0)});
+        request.sources[1] = capture(after);
+        request.sources.push(old);
+    }
+    result.response.candidates[1].source_json =
+        String::from_utf8(request.sources[1].source_bytes.clone()).unwrap();
+    result.response.hypotheses[0].sources[0].raw_digest =
+        request.sources[1].artifact.raw_digest.clone();
+    refresh(&request, &mut result);
+    let report = run(
+        &request,
+        &result,
+        DiscoveryPolicy {
+            retained_witnesses: vec![prior],
+            ..DiscoveryPolicy::default()
+        },
+    );
+    assert!(report
+        .runs
+        .iter()
+        .any(|r| r.id == "captured-retained-candidate"
+            && r.binding.scenario_digest == additional_digest
+            && r.state == EvidenceState::Observed
+            && r.observations[0].values["selected_count"]
+                == DataValue::Integer {
+                    value: if changed { 4 } else { 2 }
+                }));
+    if !changed {
+        assert!(report.questions.is_empty(), "{history}: {:?}", report.log);
+        if history == "verified" && instrumentation != "inert" {
+            assert_eq!(report.log[0].disposition, Disposition::Settled);
+            for id in ["accepted-history-before", "accepted-history-after"] {
+                assert!(report.runs.iter().any(|run| run.id == id
+                    && run.origin == ExecutionOrigin::ProductionRuntime
+                    && run.state == EvidenceState::Observed
+                    && run.binding.input_digest
+                        == request.examples[1].scenario.input_identity().unwrap()));
+            }
+        } else {
+            assert!(!report.unverified.is_empty(), "{history}");
+            assert_eq!(report.log[0].disposition, Disposition::Unverified);
+        }
+        return;
+    }
+    assert_eq!(report.questions.len(), 1, "{:?}", report.unverified);
+    assert!(report.questions[0]
+        .witnesses
+        .iter()
+        .any(
+            |w| w.initial_scenario().identity().unwrap() == additional_digest
+                && w.witness()
+                    .after
+                    .observations
+                    .iter()
+                    .any(|o| o.values["selected_count"]
+                        == DataValue::Integer {
+                            value: if changed { 4 } else { 2 }
+                        })
+        ));
+}
+
+#[test]
+fn unchanged_captured_channels_still_validate_alternative_types_and_presence() {
+    for change in ["removed", "retyped", "added"] {
+        let (mut request, mut result) = input();
+        for index in 0..2 {
+            let mut program: Value =
+                serde_json::from_slice(&request.sources[index].source_bytes).unwrap();
+            program["views"][0]["kind"]["selection"] = Value::Null;
+            program["observables"].as_array_mut().unwrap().push(json!({"id":"secondary","label":"Secondary","value":{"kind":"literal","value_type":{"kind":"integer"},"value":{"kind":"integer","value":7}}}));
+            request.sources[index] = capture(program);
+            result.response.candidates[index].source_json =
+                String::from_utf8(request.sources[index].source_bytes.clone()).unwrap();
+        }
+        let mut alternative: Value =
+            serde_json::from_slice(&request.sources[0].source_bytes).unwrap();
+        match change {
+            "removed" => {
+                alternative["observables"].as_array_mut().unwrap().pop();
+            }
+            "retyped" => {
+                alternative["observables"][1]["value"] = json!({"kind":"literal","value_type":{"kind":"text"},"value":{"kind":"text","value":"seven"}});
+            }
+            _ => {
+                alternative["observables"][1]["id"] = json!("alternative_only");
+            }
+        }
+        result.response.candidates[0].source_json = serde_json::to_string(&alternative).unwrap();
+        result.response.hypotheses[0].sources[0].raw_digest =
+            request.sources[1].artifact.raw_digest.clone();
+        refresh(&request, &mut result);
+        let report = run(&request, &result, DiscoveryPolicy::default());
+        assert_eq!(report.questions.len(), 1, "{change}");
+        assert!(
+            report
+                .unverified
+                .iter()
+                .any(|message| message.contains("secondary")),
+            "{change}: {:?}",
+            report.unverified
+        );
+        if change == "added" {
+            assert!(report
+                .unverified
+                .iter()
+                .any(|message| message.contains("alternative_only")));
+        }
+        assert_eq!(report.log[0].state, EvidenceState::Inconclusive, "{change}");
+        assert!(report.questions[0]
+            .witnesses
+            .iter()
+            .all(|w| w.initial_runs().0.state == EvidenceState::Observed
+                && w.initial_runs().1.state == EvidenceState::Observed));
+    }
+}
+
+#[test]
+fn supported_comparisons_do_not_hide_unrepresented_material_without_history() {
+    let (mut request, mut result) = input();
+    // Isolate the supported count/export contrast from selection presentation.
+    for index in 0..2 {
+        let mut program: Value =
+            serde_json::from_slice(&request.sources[index].source_bytes).unwrap();
+        program["views"][0]["kind"]["selection"] = Value::Null;
+        request.sources[index] = capture(program);
+        result.response.candidates[index].source_json =
+            String::from_utf8(request.sources[index].source_bytes.clone()).unwrap();
+    }
+    result.response.hypotheses[0].sources[0].raw_digest =
+        request.sources[1].artifact.raw_digest.clone();
+    refresh(&request, &mut result);
+    assert!(run(&request, &result, DiscoveryPolicy::default())
+        .unverified
+        .is_empty());
+    for change in ["toolbar_action", "row_action", "output_format"] {
+        for side in ["candidate", "alternative", "alternative_only"] {
+            let (mut request, mut result) = input();
+            if change == "row_action" {
+                for index in 0..2 {
+                    let mut program: Value =
+                        serde_json::from_slice(&request.sources[index].source_bytes).unwrap();
+                    let mut binding = program["views"][0]["actions"][0].clone();
+                    binding["id"] = json!("row_export");
+                    binding["placement"] = json!("row");
+                    program["views"][0]["actions"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(binding);
+                    request.sources[index] = capture(program);
+                    result.response.candidates[index].source_json =
+                        String::from_utf8(request.sources[index].source_bytes.clone()).unwrap();
+                }
+            }
+            let source = usize::from(side != "alternative");
+            let mut program: Value =
+                serde_json::from_slice(&request.sources[source].source_bytes).unwrap();
+            if change == "output_format" {
+                program["outputs"][0]["format"] = json!("json");
+            } else {
+                let index = usize::from(change == "row_action");
+                program["views"][0]["actions"][index]["enabled"] = json!({"kind":"literal","value_type":{"kind":"boolean"},"value":{"kind":"boolean","value":false}});
+            }
+            let modified = capture(program);
+            if side == "candidate" {
+                request.sources[1] = modified.clone();
+            }
+            result.response.candidates[usize::from(side == "candidate")].source_json =
+                String::from_utf8(modified.source_bytes.clone()).unwrap();
+            result.response.hypotheses[0].sources[0].raw_digest =
+                request.sources[1].artifact.raw_digest.clone();
+            refresh(&request, &mut result);
+            let report = run(&request, &result, DiscoveryPolicy::default());
+            let channel = match change {
+                "toolbar_action" => "done/actions",
+                "row_action" => "done/row_actions",
+                _ => "done/output/0/format",
+            };
+            assert!(
+                report
+                    .unverified
+                    .iter()
+                    .any(|message| message.contains(channel)),
+                "{change}/{side}: {:?}",
+                report.unverified
+            );
+            assert_eq!(
+                report.log[0].state,
+                EvidenceState::Inconclusive,
+                "{change}/{side}"
+            );
+            if side == "alternative_only" {
+                assert!(report.questions.is_empty(), "{change}/{side}");
+                assert_eq!(
+                    report.log[0].disposition,
+                    Disposition::Unverified,
+                    "{change}/{side}"
+                );
+            } else {
+                assert_eq!(report.questions.len(), 1, "{change}/{side}");
+                assert!(report.questions[0]
+                    .witnesses
+                    .iter()
+                    .all(|w| w.witness().before.state == EvidenceState::Observed
+                        && w.witness().after.state == EvidenceState::Observed));
+            }
+        }
+    }
+}
+
+#[test]
+fn familiar_contrasts_do_not_settle_new_unrepresented_material_changes() {
+    for change in ["toolbar_action", "row_action", "output_format"] {
+        let (mut request, mut result) = input();
+        if change == "row_action" {
+            for index in 0..2 {
+                let mut program: Value =
+                    serde_json::from_slice(&request.sources[index].source_bytes).unwrap();
+                let mut binding = program["views"][0]["actions"][0].clone();
+                binding["id"] = json!("row_export");
+                binding["placement"] = json!("row");
+                program["views"][0]["actions"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(binding);
+                request.sources[index] = capture(program);
+                result.response.candidates[index].source_json =
+                    String::from_utf8(request.sources[index].source_bytes.clone()).unwrap();
+            }
+            result.response.hypotheses[0].sources[0].raw_digest =
+                request.sources[1].artifact.raw_digest.clone();
+            refresh(&request, &mut result);
+        }
+        let prior = saved_decision(
+            &mut request,
+            &result,
+            DecisionOutcome::EitherAcceptable,
+            vec![],
+        );
+        let expected = prior.after.observations.clone();
+        let mut after: Value = serde_json::from_slice(&request.sources[1].source_bytes).unwrap();
+        if change == "output_format" {
+            after["outputs"][0]["format"] = json!("json");
+        } else {
+            let index = usize::from(change == "row_action");
+            after["views"][0]["actions"][index]["enabled"] = json!({"kind":"literal","value_type":{"kind":"boolean"},"value":{"kind":"boolean","value":false}});
+        }
+        request.sources[1] = capture(after);
+        result.response.candidates[1].source_json =
+            String::from_utf8(request.sources[1].source_bytes.clone()).unwrap();
+        result.response.hypotheses[0].sources[0].raw_digest =
+            request.sources[1].artifact.raw_digest.clone();
+        refresh(&request, &mut result);
+        let report = run(
+            &request,
+            &result,
+            DiscoveryPolicy {
+                retained_witnesses: vec![prior],
+                ..DiscoveryPolicy::default()
+            },
+        );
+        assert!(
+            report.runs.iter().any(|r| r.id == "retained-after"
+                && r.state == EvidenceState::Observed
+                && r.observations
+                    .iter()
+                    .zip(&expected)
+                    .any(|(a, b)| a.view != b.view || a.outputs != b.outputs)),
+            "{change}"
+        );
+        assert!(
+            report.questions.is_empty(),
+            "unrepresented change cannot become an invented choice: {change}"
+        );
+        assert!(!report.unverified.is_empty(), "{change}");
+        assert_eq!(
+            report.log[0].disposition,
+            Disposition::Unverified,
+            "{change}"
+        );
+    }
+}
+
+#[test]
+fn retained_search_preserves_history_and_obeys_current_workflow_validity() {
+    for action in ["collect", "export_people"] {
+        assert_current_retained_workflow_validity(action);
+    }
+}
+fn assert_current_retained_workflow_validity(hypothesis_action: &str) {
+    let (mut request, mut result) = input();
+    let observed_count = PropertyTerm::Observed {
+        point: "done".into(),
+        observable: "selected_count".into(),
+        value_type: Type::Integer,
+    };
+    let mut scene = result.response.hypotheses[0].scenario().unwrap();
+    scene.validity.push(AcceptedProperty {
+        id: "historical-upper-bound".into(),
+        description: "The approved scene has fewer than three collected rows".into(),
+        predicate: PropertyPredicate::Less {
+            left: observed_count.clone(),
+            right: PropertyTerm::Literal {
+                value_type: Type::Integer,
+                value: DataValue::Integer { value: 3 },
+            },
+        },
+    });
+    result.response.hypotheses[0].scenario_json = serde_json::to_string(&scene).unwrap();
+    let prior = saved_decision(
+        &mut request,
+        &result,
+        DecisionOutcome::EitherAcceptable,
+        vec![],
+    );
+    let prior_digest = prior.identity().unwrap();
+    result.response.hypotheses[0].action = hypothesis_action.into();
+    let mut after: Value = serde_json::from_slice(&request.sources[1].source_bytes).unwrap();
+    let unfiltered = after["actions"][1]["steps"][0]["value"].clone();
+    after["actions"][1]["steps"][0]["value"] = json!({"kind":"if","condition":{"kind":"equal","left":{"kind":"state","state":"search"},"right":text("")},"then_value":unfiltered,"else_value":{"kind":"literal","value_type":{"kind":"list","item":{"kind":"reference","entity":"person"}},"value":empty("person")}});
+    request.sources[1] = capture(after);
+    result.response.candidates[1].source_json =
+        String::from_utf8(request.sources[1].source_bytes.clone()).unwrap();
+    result.response.hypotheses[0].sources[0].raw_digest =
+        request.sources[1].artifact.raw_digest.clone();
+    scene
+        .inputs
+        .retain(|input| !matches!(input, SemanticInput::Control { .. }));
+    result.response.hypotheses[0].scenario_json = serde_json::to_string(&scene).unwrap();
+    refresh(&request, &mut result);
+    let positive = AcceptedProperty {
+        id: "current-positive-count".into(),
+        description: "Legitimate comparison work must collect at least one row".into(),
+        predicate: PropertyPredicate::Less {
+            left: PropertyTerm::Literal {
+                value_type: Type::Integer,
+                value: DataValue::Integer { value: 0 },
+            },
+            right: observed_count,
+        },
+    };
+    let mut checked_scene = prior.scenario.clone();
+    checked_scene.validity.push(positive.clone());
+    let report = run(
+        &request,
+        &result,
+        DiscoveryPolicy {
+            retained_witnesses: vec![prior.clone()],
+            workflow_validity: [("collect".into(), vec![positive])].into_iter().collect(),
+            ..DiscoveryPolicy::default()
+        },
+    );
+    assert!(
+        report.questions.is_empty(),
+        "an invalid retained workflow cannot create a choice"
+    );
+    assert!(!report.unverified.is_empty());
+    let invalid = report
+        .runs
+        .iter()
+        .find(|run| run.id == "captured-retained-candidate")
+        .unwrap();
+    assert_ne!(invalid.state, EvidenceState::Observed);
+    assert_eq!(
+        invalid.binding.scenario_digest,
+        checked_scene.identity().unwrap()
+    );
+    assert!(invalid
+        .observations
+        .iter()
+        .any(|o| o.values["selected_count"] == DataValue::Integer { value: 0 }));
+    assert_eq!(prior.identity().unwrap(), prior_digest);
+}
+
+#[test]
+fn relabeling_a_consumer_does_not_reask_a_settled_executed_producer() {
+    let (mut request, mut result) = input();
+    let prior = saved_decision(
+        &mut request,
+        &result,
+        DecisionOutcome::EitherAcceptable,
+        vec![],
+    );
+    result.response.hypotheses[0].action = "export_people".into();
+    refresh(&request, &mut result);
+    let report = run(
+        &request,
+        &result,
+        DiscoveryPolicy {
+            retained_witnesses: vec![prior],
+            ..DiscoveryPolicy::default()
+        },
+    );
+    assert!(report.questions.is_empty());
+    assert_eq!(report.log[0].disposition, Disposition::Settled);
+}
+
+#[test]
+fn different_action_labels_group_the_same_verified_contrast() {
+    let (request, mut result) = input();
+    let mut consumer = result.response.hypotheses[0].clone();
+    consumer.id = "export-perspective".into();
+    consumer.action = "export_people".into();
+    consumer
+        .unknowns
+        .push("Export scope remains undecided".into());
+    result.response.hypotheses.push(consumer);
+    let report = run(&request, &result, DiscoveryPolicy::default());
+    assert_eq!(report.questions.len(), 1);
+    assert_eq!(
+        report.questions[0].hypotheses,
+        vec!["choice", "export-perspective"]
+    );
+    assert!(report.questions[0]
+        .unknowns
+        .contains(&"Export scope remains undecided".into()));
+    assert_eq!(report.log[1].disposition, Disposition::Grouped);
+    assert!(!report.questions[0].witnesses.is_empty());
+}
+
+#[test]
+fn a_bridge_hypothesis_merges_every_connected_evidence_group() {
+    let (request, mut result) = input();
+    let mut clear = filtered();
+    clear["actions"][1]["steps"][0] = json!({"kind":"set_state","state":"selected","value":{"kind":"literal","value_type":{"kind":"list","item":{"kind":"reference","entity":"person"}},"value":empty("person")}});
+    result.response.candidates.push(GeneratedCandidate {
+        id: "clear".into(),
+        source_json: serde_json::to_string(&clear).unwrap(),
+    });
+    result.response.hypotheses[0].unknowns = vec!["first boundary".into()];
+    let mut other = result.response.hypotheses[0].clone();
+    other.id = "clear-export".into();
+    other.action = "export_people".into();
+    other.alternatives = vec!["clear".into(), "replace".into()];
+    other.unknowns = vec!["second boundary".into()];
+    let mut bridge = result.response.hypotheses[0].clone();
+    bridge.id = "bridge".into();
+    bridge.alternatives = vec!["retain".into(), "clear".into(), "replace".into()];
+    bridge.unknowns = vec!["bridge boundary".into()];
+    result.response.hypotheses.extend([other, bridge]);
+    let report = run(&request, &result, DiscoveryPolicy::default());
+    assert_eq!(report.questions.len(), 1);
+    let question = &report.questions[0];
+    assert_eq!(
+        question.hypotheses,
+        vec!["choice", "clear-export", "bridge"]
+    );
+    assert_eq!(
+        question.unknowns,
+        vec!["first boundary", "second boundary", "bridge boundary"]
+    );
+    assert_eq!(
+        question
+            .witnesses
+            .iter()
+            .map(|w| w.before_program().artifact.program_digest.clone())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        2
+    );
+    assert_eq!(
+        report
+            .log
+            .iter()
+            .filter(|l| l.disposition == Disposition::Question)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn current_workflow_constraints_apply_to_requirement_and_intention_prechecks() {
+    for check in ["requirement", "obligation", "chosen"] {
+        let (mut request, mut result) = input();
+        let mut policy = DiscoveryPolicy::default();
+        let mut bad = filtered();
+        let observed_count = PropertyTerm::Observed {
+            point: "done".into(),
+            observable: "selected_count".into(),
+            value_type: Type::Integer,
+        };
+        if check == "chosen" {
+            let selected = request.sources[1].artifact.program_digest.clone();
+            let prior = saved_decision(
+                &mut request,
+                &result,
+                DecisionOutcome::Accept { artifact: selected },
+                vec![],
+            );
+            request.decisions.decisions[0].scope.operations =
+                ["export_people".into()].into_iter().collect();
+            policy.retained_witnesses.push(prior);
+            let filtered_rows = bad["actions"][1]["steps"][0]["items"].clone();
+            bad["actions"][2]["steps"].as_array_mut().unwrap().insert(
+                0,
+                json!({"kind":"set_state","state":"selected","value":filtered_rows}),
+            );
+            policy.workflow_validity.insert(
+                "export_people".into(),
+                vec![AcceptedProperty {
+                    id: "current-export-minimum".into(),
+                    description: "The current legitimate workflow requires two collected rows"
+                        .into(),
+                    predicate: PropertyPredicate::Not {
+                        value: Box::new(PropertyPredicate::Less {
+                            left: observed_count.clone(),
+                            right: PropertyTerm::Literal {
+                                value_type: Type::Integer,
+                                value: DataValue::Integer { value: 2 },
+                            },
+                        }),
+                    },
+                }],
+            );
+        } else {
+            bad["actions"][2]["steps"] = json!([{"kind":"set_state","state":"search","value":{"kind":"state","state":"search"}}]);
+            policy.workflow_validity.insert(
+                "export_people".into(),
+                vec![AcceptedProperty {
+                    id: "current-export-positive".into(),
+                    description: "A legitimate export must emit at least one row".into(),
+                    predicate: PropertyPredicate::Less {
+                        left: PropertyTerm::Literal {
+                            value_type: Type::Integer,
+                            value: DataValue::Integer { value: 0 },
+                        },
+                        right: PropertyTerm::OutputCount {
+                            point: "done".into(),
+                            output: "roster".into(),
+                        },
+                    },
+                }],
+            );
+            if check == "requirement" {
+                policy.requirements.push(RequirementCase {
+                    id: "checked-export".into(),
+                    scenario: scenario(
+                        &request.sources[0],
+                        vec![
+                            add("Ada"),
+                            invoke("collect", Values::new()),
+                            invoke("export_people", Values::new()),
+                            SemanticInput::Observe {
+                                point: "done".into(),
+                            },
+                        ],
+                    ),
+                    properties: vec![count_is(1)],
+                });
+            } else {
+                let property = AcceptedProperty {
+                    id: "positive-selection".into(),
+                    description: "Preserve a positive selected count".into(),
+                    predicate: PropertyPredicate::Less {
+                        left: PropertyTerm::Literal {
+                            value_type: Type::Integer,
+                            value: DataValue::Integer { value: 0 },
+                        },
+                        right: observed_count,
+                    },
+                };
+                let prior = saved_decision(
+                    &mut request,
+                    &result,
+                    DecisionOutcome::EitherAcceptable,
+                    vec![property],
+                );
+                request.decisions.decisions[0].scope.operations =
+                    ["export_people".into()].into_iter().collect();
+                policy.retained_witnesses.push(prior);
+            }
+        }
+        result.response.candidates.push(GeneratedCandidate {
+            id: "bad-precheck".into(),
+            source_json: serde_json::to_string(&bad).unwrap(),
+        });
+        result.response.hypotheses[0].alternatives = vec!["bad-precheck".into(), "replace".into()];
+        let mut scene = result.response.hypotheses[0].scenario().unwrap();
+        scene.inputs.retain(|input| !matches!(input, SemanticInput::Invoke { action, .. } if action == "export_people"));
+        result.response.hypotheses[0].scenario_json = serde_json::to_string(&scene).unwrap();
+        refresh(&request, &mut result);
+        let report = run(&request, &result, policy);
+        assert!(
+            report.questions.is_empty(),
+            "invalid {check} precheck allowed a preference"
+        );
+        assert!(!report.unverified.is_empty(), "{check}");
+        assert!(
+            report
+                .runs
+                .iter()
+                .any(|r| r.state != EvidenceState::Observed),
+            "{check}"
+        );
+    }
 }

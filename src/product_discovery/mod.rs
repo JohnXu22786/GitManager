@@ -79,6 +79,8 @@ pub struct HypothesisLog {
 #[derive(Clone, Debug)]
 pub struct ChoiceQuestion {
     pub id: Id,
+    /// Hypothesis grouping/context label, not adoption scope authority. Retained
+    /// witnesses can exercise its producer; inspect their actual source scenes.
     pub action: Id,
     pub observable: Id,
     pub statement: String,
@@ -156,6 +158,34 @@ fn scenario_operations(s: &ScenarioSpec, p: &AppDefinition) -> BTreeSet<Id> {
         })
         .collect()
 }
+/// Add host constraints for the operations actually exercised by either side.
+/// Provider validity is discarded; verified historical constraints are retained.
+fn checked_scene(
+    scene: &ScenarioSpec,
+    preserve_history: bool,
+    programs: &[&CapturedProgram],
+    policy: &DiscoveryPolicy,
+) -> ScenarioSpec {
+    let mut checked = scene.clone();
+    if !preserve_history {
+        checked.validity.clear();
+    }
+    let operations: BTreeSet<_> = programs
+        .iter()
+        .flat_map(|program| scenario_operations(scene, &program.program))
+        .collect();
+    for operation in operations {
+        if let Some(properties) = policy.workflow_validity.get(&operation) {
+            for property in properties {
+                if !checked.validity.contains(property) {
+                    checked.validity.push(property.clone());
+                }
+            }
+        }
+    }
+    checked
+}
+
 struct ReplayBudget {
     remaining: Cell<usize>,
     cancelled: Arc<AtomicBool>,
@@ -217,7 +247,7 @@ fn check_requirements(
         match budget.replay(
             runtime,
             program,
-            &requirement.scenario,
+            &checked_scene(&requirement.scenario, true, &[program], policy),
             &request.decisions,
             policy.search.runtime.clone(),
             "requirement-run",
@@ -305,43 +335,170 @@ fn check_chosen(
     runtime: &LocalRuntime,
     budget: &ReplayBudget,
     id: &str,
+    history_runs: &mut Vec<RunEvidence>,
 ) -> Result<(RunEvidence, CheckState, Digest), AdapterError> {
-    let expected = chosen_evidence(decision, policy)?;
-    if scene.input_identity()? != expected.binding.input_digest {
-        return Err(AdapterError::Unsupported(format!(
-            "Decision {} has no chosen concrete outcome for this additional scene",
-            decision.id
-        )));
-    }
+    let primary = chosen_evidence(decision, policy)?;
+    let expected = if scene.input_identity()? == primary.binding.input_digest {
+        primary.clone()
+    } else {
+        replay_accepted_outcome(
+            request,
+            policy,
+            runtime,
+            budget,
+            decision,
+            scene,
+            &primary.binding.artifact,
+            "accepted-history-selected",
+            history_runs,
+        )?
+    };
     let run = budget.replay(
         runtime,
         program,
-        scene,
+        &checked_scene(scene, true, &[program], policy),
         &request.decisions,
         policy.search.runtime.clone(),
         id,
     )?;
-    let comparable = run.binding.runtime_version == expected.binding.runtime_version
-        && run.binding.driver_version == expected.binding.driver_version
-        && run
-            .observations
-            .iter()
-            .zip(&expected.observations)
-            .all(|(a, b)| a.view_schema == b.view_schema);
+    let comparable = comparable_outcomes(&run, &expected);
     let state = if run.state != EvidenceState::Observed {
         CheckState::Failed
     } else if !comparable {
         CheckState::Unknown
-    } else if same_outcomes(&run, expected) {
+    } else if same_outcomes(&run, &expected) {
         CheckState::Satisfied
     } else {
         CheckState::Violated
     };
     let obligation = canonical_digest(
         IdentityDomain::Decision,
-        &(&decision.witness, &expected.binding.artifact.program_digest),
+        &(
+            &decision.witness,
+            &expected.binding.artifact.program_digest,
+            expected.identity()?,
+        ),
     )?;
     Ok((run, state, obligation))
+}
+
+/// Additional accepted scenes need their own original source-qualified outcomes.
+/// Context is portable input, not proof: replay both archived sources and match
+/// every observation before using it to settle or establish a novel result.
+#[allow(clippy::too_many_arguments)]
+fn retained_history(
+    request: &DevelopmentRequest,
+    policy: &DiscoveryPolicy,
+    runtime: &LocalRuntime,
+    budget: &ReplayBudget,
+    decision: &ScopedDecision,
+    prior: &DifferentialWitness,
+    current_scene: &ScenarioSpec,
+    runs: &mut Vec<RunEvidence>,
+) -> Result<(ScenarioSpec, RunEvidence, RunEvidence), AdapterError> {
+    let input = current_scene.input_identity()?;
+    let primary_input = &prior.before.binding.input_digest;
+    let accepted: Vec<_> = request
+        .examples
+        .iter()
+        .filter(|example| {
+            example
+                .scenario
+                .identity()
+                .ok()
+                .is_some_and(|id| decision.scenarios.contains(&id))
+        })
+        .map(|example| &example.scenario)
+        .collect();
+    let selected = if &input == primary_input {
+        &prior.scenario
+    } else if let Some(scene) = accepted
+        .iter()
+        .find(|scene| scene.input_identity().ok().as_ref() == Some(&input))
+    {
+        *scene
+    } else {
+        // This selects possible history only. Actual point correspondence is
+        // established later from replayed traces, never from this key alone.
+        let key = history_execution_key(current_scene)?;
+        let mut matching = BTreeMap::new();
+        for scene in std::iter::once(&prior.scenario).chain(accepted.iter().copied()) {
+            if history_execution_key(scene)? == key {
+                matching.entry(scene.input_identity()?).or_insert(scene);
+            }
+        }
+        if matching.len() == 1 {
+            *matching.values().next().unwrap()
+        } else if matching.len() > 1
+            || accepted
+                .iter()
+                .any(|scene| scene.input_identity().ok().as_ref() != Some(primary_input))
+        {
+            return Err(AdapterError::Unsupported(format!(
+                "Decision {} additional accepted history correspondence is unresolved",
+                decision.id
+            )));
+        } else {
+            &prior.scenario
+        }
+    };
+    if selected.input_identity()? == *primary_input {
+        return Ok((
+            prior.scenario.clone(),
+            prior.before.clone(),
+            prior.after.clone(),
+        ));
+    }
+    let mut expected = vec![];
+    for (artifact, id) in [
+        (&prior.before.binding.artifact, "accepted-history-before"),
+        (&prior.after.binding.artifact, "accepted-history-after"),
+    ] {
+        expected.push(replay_accepted_outcome(
+            request, policy, runtime, budget, decision, selected, artifact, id, runs,
+        )?);
+    }
+    let after = expected.pop().unwrap();
+    let before = expected.pop().unwrap();
+    Ok((selected.clone(), before, after))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replay_accepted_outcome(
+    request: &DevelopmentRequest,
+    policy: &DiscoveryPolicy,
+    runtime: &LocalRuntime,
+    budget: &ReplayBudget,
+    decision: &ScopedDecision,
+    scene: &ScenarioSpec,
+    artifact: &ArtifactRef,
+    id: &str,
+    runs: &mut Vec<RunEvidence>,
+) -> Result<RunEvidence, AdapterError> {
+    let digest = scene.identity()?;
+    let context = request.accepted_scenes.iter().find(|context| context.decision == decision.id && context.scenario == digest && &context.source == artifact)
+        .ok_or_else(|| AdapterError::Unsupported(format!("Decision {} has no source-qualified historical outcome for accepted scene {digest:?}", decision.id)))?;
+    let source = request
+        .sources
+        .iter()
+        .find(|source| &source.artifact == artifact)
+        .ok_or_else(|| {
+            AdapterError::Unsupported("Accepted historical source is unavailable".into())
+        })?;
+    let run = budget.replay(
+        runtime,
+        source,
+        &checked_scene(scene, true, &[source], policy),
+        &request.decisions,
+        policy.search.runtime.clone(),
+        id,
+    )?;
+    let verified = run.state == EvidenceState::Observed && run.observations == context.observations;
+    runs.push(run.clone());
+    if !verified {
+        return Err(AdapterError::Unsupported(format!("Decision {} historical scene {digest:?} observations could not be independently verified", decision.id)));
+    }
+    Ok(run)
 }
 
 /// Input sources are ordered baseline then current captured candidate. Neither
@@ -436,6 +593,23 @@ pub fn discover(
         .flat_map(|d| d.scope.operations.iter().cloned())
         .chain(result.response.hypotheses.iter().map(|h| h.action.clone()))
         .collect();
+    let mut hypothesis_operations = BTreeMap::new();
+    let mut hypothesis_groups = BTreeMap::new();
+    let mut hypothesis_positions = BTreeMap::new();
+    for (index, hypothesis) in result.response.hypotheses.iter().enumerate() {
+        hypothesis_groups.insert(
+            hypothesis.id.clone(),
+            canonical_digest(
+                IdentityDomain::Decision,
+                &(&hypothesis.action, &hypothesis.observable),
+            )?,
+        );
+        hypothesis_positions.insert(hypothesis.id.clone(), index);
+        let scene = hypothesis.scenario()?;
+        let mut operations = scenario_operations(&scene, &before.program);
+        operations.extend(scenario_operations(&scene, &candidate.program));
+        hypothesis_operations.insert(hypothesis.id.clone(), operations);
+    }
     let mut blocked = BTreeSet::new();
     let mut pending = BTreeMap::<Id, Vec<&ScopedDecision>>::new();
     'decision_checks: for decision in request
@@ -493,6 +667,7 @@ pub fn discover(
                         &runtime,
                         &replay_budget,
                         "chosen-outcome",
+                        &mut report.runs,
                     ) {
                         Ok((run, state, property_digest)) => {
                             if state == CheckState::Violated {
@@ -536,7 +711,7 @@ pub fn discover(
                 || matches!(decision.outcome, DecisionOutcome::EitherAcceptable)
             {
                 for h in &result.response.hypotheses {
-                    if &h.action == action {
+                    if &h.action == action || hypothesis_operations[&h.id].contains(action) {
                         pending.entry(h.id.clone()).or_default().push(decision);
                     }
                 }
@@ -548,7 +723,7 @@ pub fn discover(
                 match replay_budget.replay(
                     &runtime,
                     candidate,
-                    &scene.scenario,
+                    &checked_scene(&scene.scenario, true, &[candidate], policy),
                     &request.decisions,
                     policy.search.runtime.clone(),
                     "decision-run",
@@ -616,8 +791,10 @@ pub fn discover(
     }
     let engine = ComparisonEngine::new(cancelled.clone());
     let mut comparisons = 0usize;
+    let mut witness_scene_cache = BTreeMap::new();
     for hypothesis in &result.response.hypotheses {
         let unverified_before = report.unverified.len();
+        let mut material_unknowns = BTreeMap::new();
         let mut entry = HypothesisLog {
             hypothesis: hypothesis.id.clone(),
             suggestion: hypothesis.statement.clone(),
@@ -644,14 +821,6 @@ pub fn discover(
             report.log.push(entry);
             continue;
         }
-        if !source::relevant(&report.delta, before, candidate, hypothesis)? {
-            entry.disposition = Disposition::Irrelevant;
-            entry.explanation =
-                "Hypothesis has no changed reachable source locus for this action/observation"
-                    .into();
-            report.log.push(entry);
-            continue;
-        }
         let exact = hypothesis
             .alternatives
             .iter()
@@ -663,80 +832,158 @@ pub fn discover(
             report.log.push(entry);
             continue;
         };
-        let mut scene = hypothesis.scenario()?;
+        let scene = checked_scene(&hypothesis.scenario()?, false, &[before, candidate], policy);
         let mut hypothesis_search = policy.search.clone();
         hypothesis_search.retain_initial_outcomes |= pending.contains_key(&hypothesis.id);
-        scene.validity = policy
-            .workflow_validity
-            .get(&hypothesis.action)
-            .cloned()
-            .unwrap_or_default();
-        if !scenario_operations(&scene, &candidate.program).contains(&hypothesis.action) {
-            entry.disposition = Disposition::Irrelevant;
-            entry.explanation = "Scenario never performs the hypothesized action".into();
+        // Retained scenes are independent search inputs. A provider can omit
+        // every revealing observation, so they cannot depend on its witness.
+        let mut source_scenes = vec![(scene, false)];
+        let mut scene_indices = BTreeMap::from([(source_scenes[0].0.identity()?, 0usize)]);
+        let mut capture_unavailable = false;
+        let mut retain_scene = |scene: &ScenarioSpec| -> Result<(), AdapterError> {
+            let retained = checked_scene(scene, true, &[before, candidate], policy);
+            let identity = retained.identity()?;
+            if let Some(index) = scene_indices.get(&identity) {
+                source_scenes[*index].1 = true;
+            } else {
+                scene_indices.insert(identity, source_scenes.len());
+                source_scenes.push((retained, true));
+            }
+            Ok(())
+        };
+        for decision in pending.get(&hypothesis.id).into_iter().flatten() {
+            if let Some(prior) = policy
+                .retained_witnesses
+                .iter()
+                .find(|w| w.identity().ok().as_ref() == Some(&decision.witness))
+            {
+                retain_scene(&prior.scenario)?;
+            } else {
+                capture_unavailable = true;
+                report.unverified.push(format!(
+                    "Accepted witness for {} is unavailable",
+                    decision.id
+                ));
+            }
+            // A decision can accept more scenes than its primary witness.
+            // Every selected, hash-bound scene is an independent search input.
+            for digest in &decision.scenarios {
+                if let Some(example) = request
+                    .examples
+                    .iter()
+                    .find(|example| example.scenario.identity().ok().as_ref() == Some(digest))
+                {
+                    retain_scene(&example.scenario)?;
+                } else {
+                    capture_unavailable = true;
+                    report
+                        .unverified
+                        .push(format!("Accepted scene for {} is unavailable", decision.id));
+                }
+            }
+        }
+        let mut relevant_scenes = vec![];
+        for (scene, retained) in source_scenes {
+            // The provider's consumer label cannot exclude an associated,
+            // hash-bound producer scene (including a minimized observation).
+            if (retained
+                || scenario_operations(&scene, &candidate.program).contains(&hypothesis.action))
+                && source::relevant(&report.delta, before, candidate, hypothesis, &scene)?
+            {
+                relevant_scenes.push(scene);
+            }
+        }
+        if relevant_scenes.is_empty() {
+            if !capture_unavailable {
+                entry.disposition = Disposition::Irrelevant;
+                entry.explanation = "No proposed or retained scene performs this action with a changed reachable source locus".into();
+            } else {
+                entry.explanation = "Accepted scene source relevance is unavailable".into();
+            }
             report.log.push(entry);
             continue;
         }
-        let new_feature = policy.required_actions.iter().any(|id| {
-            !before.program.actions.iter().any(|a| &a.id == id)
-                && scenario_operations(&scene, &candidate.program).contains(id)
-        });
-        let baseline_run = replay_budget.replay(
-            &runtime,
-            before,
-            &scene,
-            &request.decisions,
-            policy.search.runtime.clone(),
-            "captured-baseline",
-        );
-        let candidate_run = replay_budget.replay(
-            &runtime,
-            candidate,
-            &scene,
-            &request.decisions,
-            policy.search.runtime.clone(),
-            "captured-candidate",
-        );
-        let anchored = matches!((&baseline_run,&candidate_run),(Ok(a),Ok(b)) if a.state==EvidenceState::Observed&&b.state==EvidenceState::Observed&&!same_outcomes(a,b));
-        let unchanged =
-            matches!((&baseline_run,&candidate_run),(Ok(a),Ok(b)) if same_outcomes(a,b));
-        let current_ran = matches!(&candidate_run,Ok(b) if b.state==EvidenceState::Observed);
-        let captured_observations = match (&baseline_run, &candidate_run) {
-            (Ok(a), Ok(b))
-                if a.state == EvidenceState::Observed && b.state == EvidenceState::Observed =>
-            {
-                Some((a.observations.clone(), b.observations.clone()))
+        let mut captured_scenes = vec![];
+        for (index, scene) in relevant_scenes.into_iter().enumerate() {
+            let new_feature = policy.required_actions.iter().any(|id| {
+                !before.program.actions.iter().any(|a| &a.id == id)
+                    && scenario_operations(&scene, &candidate.program).contains(id)
+            });
+            let baseline_run = replay_budget.replay(
+                &runtime,
+                before,
+                &scene,
+                &request.decisions,
+                policy.search.runtime.clone(),
+                if index == 0 {
+                    "captured-baseline"
+                } else {
+                    "captured-retained-baseline"
+                },
+            );
+            let candidate_run = replay_budget.replay(
+                &runtime,
+                candidate,
+                &scene,
+                &request.decisions,
+                policy.search.runtime.clone(),
+                if index == 0 {
+                    "captured-candidate"
+                } else {
+                    "captured-retained-candidate"
+                },
+            );
+            let anchored = matches!((&baseline_run,&candidate_run),(Ok(a),Ok(b)) if a.state==EvidenceState::Observed&&b.state==EvidenceState::Observed&&!same_outcomes(a,b));
+            let unchanged =
+                matches!((&baseline_run,&candidate_run),(Ok(a),Ok(b)) if same_outcomes(a,b));
+            let current_ran = matches!(&candidate_run,Ok(b) if b.state==EvidenceState::Observed);
+            let captured_observations = match (&baseline_run, &candidate_run) {
+                (Ok(a), Ok(b))
+                    if a.state == EvidenceState::Observed && b.state == EvidenceState::Observed =>
+                {
+                    Some((a.observations.clone(), b.observations.clone()))
+                }
+                _ => None,
+            };
+            if let Some((a, b)) = &captured_observations {
+                let channels = unrepresented_differences(a, b);
+                if !channels.is_empty() {
+                    material_unknowns.insert((before.binding.identity()?, candidate.binding.identity()?, scene_equivalence_key(&scene)?), format!("Captured source executions differ in material channels without executable property terms: {}", channels.join(", ")));
+                }
             }
-            _ => None,
-        };
-        for result in [baseline_run, candidate_run] {
-            match result {
-                Ok(run) => report.runs.push(run),
-                Err(e) => entry.explanation = format!("Captured-source replay unavailable: {e:?}"),
+            for result in [baseline_run, candidate_run] {
+                match result {
+                    Ok(run) => report.runs.push(run),
+                    Err(e) => report
+                        .unverified
+                        .push(format!("Captured-source replay unavailable: {e:?}")),
+                }
+            }
+            if unchanged {
+                continue;
+            }
+            if anchored || (new_feature && current_ran) {
+                captured_scenes.push((scene, new_feature, captured_observations));
+            } else {
+                capture_unavailable = true;
+                report.unverified.push("Actual edited behavior could not be linked to a valid source comparison or independently required new feature".into());
             }
         }
-        if unchanged {
+        if capture_unavailable {
+            report.unverified.extend(material_unknowns.into_values());
+            entry.explanation =
+                "Applicable captured scenes could not all be independently checked".into();
+            report.log.push(entry);
+            continue;
+        }
+        if captured_scenes.is_empty() {
             entry.disposition = Disposition::NoWitness;
             entry.state = EvidenceState::NoDifferenceFound;
-            entry.explanation="Actual captured edit has identical outcomes in this scenario; generated alternatives cannot invent a choice".into();
+            entry.explanation = "Actual captured edit has identical outcomes in the checked scenes; generated alternatives cannot invent a choice".into();
             report.log.push(entry);
             continue;
         }
-        if !anchored && !(new_feature && current_ran) {
-            entry.disposition = Disposition::Unverified;
-            entry.explanation="Actual edited behavior could not be linked to a valid source comparison or independently required new feature".into();
-            report.unverified.push(entry.explanation.clone());
-            report.log.push(entry);
-            continue;
-        }
-        let points: Vec<_> = scene
-            .inputs
-            .iter()
-            .filter_map(|i| match i {
-                SemanticInput::Observe { point } => Some(point.clone()),
-                _ => None,
-            })
-            .collect();
+        let comparisons_before_hypothesis = comparisons;
         let mut witnesses = vec![];
         let mut exhausted = false;
         for id in hypothesis.alternatives.iter().filter(|id| *id != exact) {
@@ -807,6 +1054,7 @@ pub fn discover(
                                 &runtime,
                                 &replay_budget,
                                 "alternative-chosen-outcome",
+                                &mut report.runs,
                             ) {
                                 Ok((run, state, _)) => {
                                     if state != CheckState::Satisfied {
@@ -837,7 +1085,7 @@ pub fn discover(
                         match replay_budget.replay(
                             &runtime,
                             alternative,
-                            &example.scenario,
+                            &checked_scene(&example.scenario, true, &[alternative], policy),
                             &request.decisions,
                             policy.search.runtime.clone(),
                             "alternative-obligation",
@@ -895,97 +1143,127 @@ pub fn discover(
                 }
                 continue;
             }
-            'points: for point in &points {
-                let mut targets: Vec<_> = candidate
-                    .program
-                    .observables
+            'scenes: for (scene, new_feature, captured_observations) in &captured_scenes {
+                let scene = checked_scene(scene, true, &[alternative, candidate], policy);
+                let mut channels_checked = false;
+                let points: Vec<_> = scene
+                    .inputs
                     .iter()
-                    .map(|observable| ObservationTarget::Observable {
-                        point: point.clone(),
-                        observable: observable.id.clone(),
+                    .filter_map(|input| match input {
+                        SemanticInput::Observe { point } => Some(point.clone()),
+                        _ => None,
                     })
                     .collect();
-                for output in &candidate.program.outputs {
-                    targets.push(ObservationTarget::OutputCount {
-                        point: point.clone(),
-                        output: output.id.clone(),
-                    });
-                    for column in &output.columns {
-                        targets.push(ObservationTarget::OutputColumn {
-                            point: point.clone(),
-                            output: output.id.clone(),
-                            column: column.id.clone(),
-                        });
-                    }
-                }
-                targets.push(ObservationTarget::ViewRows {
-                    point: point.clone(),
-                });
-                let mut columns = BTreeSet::new();
-                for view in &candidate.program.views {
-                    if let Some(schema) = candidate.program.view_schema(&view.id)? {
-                        columns.extend(schema.columns.keys().cloned());
-                    }
-                }
-                for column in columns {
-                    targets.push(ObservationTarget::ViewColumn {
-                        point: point.clone(),
-                        column,
-                    });
-                }
-                for target in targets {
-                    if !new_feature
-                        && !captured_observations
-                            .as_ref()
-                            .is_some_and(|(a, b)| target.differs(a, b) == Some(true))
-                    {
-                        continue;
-                    }
-                    if comparisons >= policy.max_comparisons {
-                        exhausted = true;
-                        break 'points;
-                    }
-                    comparisons += 1;
-                    let comparison = engine.minimize(
-                        alternative,
-                        candidate,
-                        &scene,
-                        &request.decisions,
-                        target,
-                        hypothesis_search.clone(),
-                    )?;
-                    entry.state = comparison.state;
-                    if !matches!(
-                        comparison.state,
-                        EvidenceState::Observed | EvidenceState::NoDifferenceFound
-                    ) {
-                        report.unverified.push(format!(
-                            "Alternative {id} comparison is unverified: {:?}",
-                            comparison.state
-                        ));
-                        report
-                            .unverified
-                            .extend(comparison.diagnostics.iter().cloned());
-                    }
-                    report.runs.extend(comparison.runs);
-                    if let Some(witness) = comparison.witness {
-                        if witness
-                            .witness()
-                            .minimization
-                            .as_ref()
-                            .is_some_and(|m| !m.complete)
-                        {
-                            report.unverified.extend(
-                                comparison
-                                    .diagnostics
-                                    .iter()
-                                    .filter(|s| s.contains("incomplete"))
-                                    .cloned(),
-                            );
+                for point in &points {
+                    // Only actual captured changes may generate new choice witnesses.
+                    for target in comparison_targets(&[before, candidate], point)? {
+                        if !*new_feature {
+                            match captured_observations
+                                .as_ref()
+                                .and_then(|(a, b)| target.differs(a, b))
+                            {
+                                Some(true) => {}
+                                Some(false) => continue,
+                                None => {
+                                    // Both absent means no channel was emitted at this
+                                    // point. Failed/over-limit samples or one-sided and
+                                    // incompatible evidence are unavailable, never equal.
+                                    if !captured_observations.as_ref().is_some_and(|(a, b)| {
+                                        target.channel_presence(a) == Some(false)
+                                            && target.channel_presence(b) == Some(false)
+                                    }) {
+                                        report.unverified.push(format!("Captured target {target:?} is unavailable or has incompatible types"));
+                                    }
+                                    continue;
+                                }
+                            }
                         }
-                        witnesses.push(witness);
+                        if comparisons >= policy.max_comparisons {
+                            exhausted = true;
+                            break 'scenes;
+                        }
+                        comparisons += 1;
+                        let comparison = engine.minimize(
+                            alternative,
+                            candidate,
+                            &scene,
+                            &request.decisions,
+                            target,
+                            hypothesis_search.clone(),
+                        )?;
+                        if !channels_checked {
+                            let original = comparison
+                                .witness
+                                .as_ref()
+                                .map(|w| w.initial_runs())
+                                .or_else(|| {
+                                    Some((
+                                        comparison.runs.iter().find(|r| r.id == "before-run")?,
+                                        comparison.runs.iter().find(|r| r.id == "after-run")?,
+                                    ))
+                                });
+                            if let Some((a, b)) = original.filter(|(a, b)| {
+                                a.state == EvidenceState::Observed
+                                    && b.state == EvidenceState::Observed
+                            }) {
+                                channels_checked = true;
+                                for point in &points {
+                                    for channel in comparison_targets(
+                                        &[before, alternative, candidate],
+                                        point,
+                                    )? {
+                                        if channel
+                                            .differs(&a.observations, &b.observations)
+                                            .is_none()
+                                            && !(channel.channel_presence(&a.observations)
+                                                == Some(false)
+                                                && channel.channel_presence(&b.observations)
+                                                    == Some(false))
+                                        {
+                                            report.unverified.push(format!("Alternative {id} target {channel:?} is unavailable or has incompatible types"));
+                                        }
+                                    }
+                                }
+                                let channels =
+                                    unrepresented_differences(&a.observations, &b.observations);
+                                if !channels.is_empty() {
+                                    material_unknowns.insert((alternative.binding.identity()?, candidate.binding.identity()?, scene_equivalence_key(&scene)?), format!("Alternative {id} executions differ in material channels without executable property terms: {}", channels.join(", ")));
+                                }
+                            }
+                        }
+                        entry.state = comparison.state;
+                        if !matches!(
+                            comparison.state,
+                            EvidenceState::Observed | EvidenceState::NoDifferenceFound
+                        ) {
+                            report.unverified.push(format!(
+                                "Alternative {id} comparison is unverified: {:?}",
+                                comparison.state
+                            ));
+                            report
+                                .unverified
+                                .extend(comparison.diagnostics.iter().cloned());
+                        }
+                        report.runs.extend(comparison.runs);
+                        if let Some(witness) = comparison.witness {
+                            if witness
+                                .witness()
+                                .minimization
+                                .as_ref()
+                                .is_some_and(|m| !m.complete)
+                            {
+                                report.unverified.extend(
+                                    comparison
+                                        .diagnostics
+                                        .iter()
+                                        .filter(|s| s.contains("incomplete"))
+                                        .cloned(),
+                                );
+                            }
+                            witnesses.push(witness);
+                        }
+                        entry.explanation = comparison.diagnostics.join("; ");
                     }
-                    entry.explanation = comparison.diagnostics.join("; ");
                 }
             }
         }
@@ -1015,10 +1293,55 @@ pub fn discover(
                     .find(|w| w.identity().ok().as_ref() == Some(&decision.witness))
                 {
                     for (index, witness) in witnesses.iter().enumerate() {
+                        let (historical_scene, expected_before, expected_after) =
+                            match retained_history(
+                                request,
+                                policy,
+                                &runtime,
+                                &replay_budget,
+                                decision,
+                                prior,
+                                witness.initial_scenario(),
+                                &mut report.runs,
+                            ) {
+                                Ok(history) => history,
+                                Err(error) => {
+                                    unavailable = true;
+                                    report.unverified.push(format!(
+                                        "Accepted scene history is unverified: {error:?}"
+                                    ));
+                                    // Missing additional history cannot erase the
+                                    // primary accepted workflow's actual failures.
+                                    // These are diagnostics only, not correspondence
+                                    // evidence for the scene whose history is missing.
+                                    let primary = checked_scene(
+                                        &prior.scenario,
+                                        true,
+                                        &[witness.before_program(), witness.after_program()],
+                                        policy,
+                                    );
+                                    for (source, id) in [
+                                        (witness.before_program(), "retained-before"),
+                                        (witness.after_program(), "retained-after"),
+                                    ] {
+                                        match replay_budget.replay(&runtime, source, &primary, &request.decisions, policy.search.runtime.clone(), id) {
+                                            Ok(run) => report.runs.push(run),
+                                            Err(error) => report.unverified.push(format!("Primary accepted workflow replay unavailable: {error:?}")),
+                                        }
+                                    }
+                                    continue;
+                                }
+                            };
+                        let retained_scene = checked_scene(
+                            &historical_scene,
+                            true,
+                            &[witness.before_program(), witness.after_program()],
+                            policy,
+                        );
                         let a = replay_budget.replay(
                             &runtime,
                             witness.before_program(),
-                            &prior.scenario,
+                            &retained_scene,
                             &request.decisions,
                             policy.search.runtime.clone(),
                             "retained-before",
@@ -1026,15 +1349,15 @@ pub fn discover(
                         let b = replay_budget.replay(
                             &runtime,
                             witness.after_program(),
-                            &prior.scenario,
+                            &retained_scene,
                             &request.decisions,
                             policy.search.runtime.clone(),
                             "retained-after",
                         );
                         match (&a, &b) {
                             (Ok(a), Ok(b))
-                                if comparable_outcomes(a, &prior.before)
-                                    && comparable_outcomes(b, &prior.after) =>
+                                if comparable_outcomes(a, &expected_before)
+                                    && comparable_outcomes(b, &expected_after) =>
                             {
                                 let pair_key = (
                                     witness.before_program().binding.identity()?,
@@ -1044,19 +1367,19 @@ pub fn discover(
                                 let retained_key = (
                                     pair_key.0.clone(),
                                     pair_key.1.clone(),
-                                    scene_equivalence_key(&prior.scenario)?,
+                                    scene_equivalence_key(&retained_scene)?,
                                 );
                                 let (original_before, original_after) = witness.initial_runs();
                                 let profile = retained_profile(
                                     original_before,
                                     original_after,
-                                    &prior.before,
-                                    &prior.after,
+                                    &expected_before,
+                                    &expected_after,
                                 );
                                 // The provider's observation subset cannot hide a changed
                                 // point already observed by our complete retained replay.
                                 let replay_profile =
-                                    retained_profile(a, b, &prior.before, &prior.after);
+                                    retained_profile(a, b, &expected_before, &expected_after);
                                 if profile.is_none() || replay_profile.is_none() {
                                     unavailable = true;
                                     report.unverified.push("Retained material observation correspondence is unresolved".into());
@@ -1066,7 +1389,7 @@ pub fn discover(
                                 }
                                 for (key, initial_scene, profile) in [
                                     (&pair_key, witness.initial_scenario(), profile.as_ref()),
-                                    (&retained_key, &prior.scenario, replay_profile.as_ref()),
+                                    (&retained_key, &retained_scene, replay_profile.as_ref()),
                                 ] {
                                     if let Some(property) = profile.and_then(|p| p.novel.clone()) {
                                         if !replacements.contains_key(key) {
@@ -1115,7 +1438,7 @@ pub fn discover(
                                         if let Some(prior_target) = retained_target(
                                             &current_target,
                                             original_before,
-                                            &prior.before,
+                                            &expected_before,
                                         ) {
                                             let current_pair = (
                                                 current_target
@@ -1123,8 +1446,8 @@ pub fn discover(
                                                 current_target.sample(&original_after.observations),
                                             );
                                             let expected_pair = (
-                                                prior_target.sample(&prior.before.observations),
-                                                prior_target.sample(&prior.after.observations),
+                                                prior_target.sample(&expected_before.observations),
+                                                prior_target.sample(&expected_after.observations),
                                             );
                                             let replay_pair = (
                                                 prior_target.sample(&a.observations),
@@ -1146,11 +1469,10 @@ pub fn discover(
                                                     prior_target,
                                                     ObservationTarget::ViewRows { .. }
                                                         | ObservationTarget::ViewColumn { .. }
-                                                ) && prior
-                                                    .before
+                                                ) && expected_before
                                                     .observations
                                                     .iter()
-                                                    .chain(&prior.after.observations)
+                                                    .chain(&expected_after.observations)
                                                     .any(|o| {
                                                         o.point == prior_target.point()
                                                             && o.view_schema.is_none()
@@ -1169,13 +1491,15 @@ pub fn discover(
                                                 && same_pair(&current_pair, &expected_pair)
                                                 && same_pair(&replay_pair, &expected_pair)
                                             {
-                                                let direct = scene_equivalence_key(&scene)?
-                                                    == scene_equivalence_key(&prior.scenario)?
-                                                    || scene_equivalence_key(
-                                                        &witness.witness().scenario,
-                                                    )? == scene_equivalence_key(
-                                                        &prior.scenario,
-                                                    )?;
+                                                let direct = scene_equivalence_key(
+                                                    witness.initial_scenario(),
+                                                )? == scene_equivalence_key(
+                                                    &retained_scene,
+                                                )? || scene_equivalence_key(
+                                                    &witness.witness().scenario,
+                                                )? == scene_equivalence_key(
+                                                    &retained_scene,
+                                                )?;
                                                 if direct {
                                                     matched.insert(index);
                                                     settled_pairs.insert(pair_key.clone());
@@ -1187,7 +1511,7 @@ pub fn discover(
                                                     let normalized = engine.minimize(
                                                         witness.before_program(),
                                                         witness.after_program(),
-                                                        &prior.scenario,
+                                                        &retained_scene,
                                                         &request.decisions,
                                                         prior_target,
                                                         hypothesis_search.clone(),
@@ -1246,6 +1570,7 @@ pub fn discover(
                 }
             }
             if unavailable {
+                report.unverified.extend(material_unknowns.into_values());
                 entry.disposition = Disposition::Unverified;
                 entry.explanation="Saved outcome equivalence is unverified; unavailable execution or correspondence is not evidence of a new choice".into();
                 report.unverified.push(entry.explanation.clone());
@@ -1263,7 +1588,11 @@ pub fn discover(
                     .into_iter()
                     .filter_map(|(key, w)| (!settled_pairs.contains(&key)).then_some(w)),
             );
+            // Only complete independently matched profiles can settle these
+            // channels; a supported witness on another pair/scene cannot.
+            material_unknowns.retain(|key, _| !settled_pairs.contains(key));
             if had_witnesses && witnesses.is_empty() {
+                report.unverified.extend(material_unknowns.into_values());
                 if report.unverified.len() > unverified_before || exhausted {
                     entry.disposition = Disposition::Unverified;
                     entry.state = EvidenceState::Inconclusive;
@@ -1278,7 +1607,15 @@ pub fn discover(
                 continue;
             }
         }
+        report.unverified.extend(material_unknowns.into_values());
         if witnesses.is_empty() {
+            if comparisons == comparisons_before_hypothesis
+                && entry.disposition != Disposition::Settled
+                && report.unverified.len() == unverified_before
+                && !exhausted
+            {
+                report.unverified.push("Captured executions differ, but no supported target comparison established what changed".into());
+            }
             if report.unverified.len() > unverified_before || exhausted {
                 entry.disposition = Disposition::Unverified;
                 entry.state = EvidenceState::Inconclusive;
@@ -1306,32 +1643,99 @@ pub fn discover(
             report.log.push(entry);
             continue;
         }
-        let key = canonical_digest(
-            IdentityDomain::Decision,
-            &(&hypothesis.action, &hypothesis.observable),
-        )?;
-        if let Some(question) = report.questions.iter_mut().find(|q| {
-            q.id == format!("choice-{}", key.as_str())
-                || (q.action == hypothesis.action
-                    && q.witnesses
-                        .iter()
-                        .any(|known| witnesses.iter().any(|new| same_executed_scene(known, new))))
-        }) {
+        let key = hypothesis_groups[&hypothesis.id].clone();
+        let mut connected_contexts = BTreeSet::from([key.clone()]);
+        let mut connected_scenes = witnesses
+            .iter()
+            .map(|w| verified_scene_key(w, &mut witness_scene_cache))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let question_scenes = report
+            .questions
+            .iter()
+            .map(|q| {
+                q.witnesses
+                    .iter()
+                    .map(|w| verified_scene_key(w, &mut witness_scene_cache))
+                    .collect::<Result<BTreeSet<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let question_contexts: Vec<BTreeSet<_>> = report
+            .questions
+            .iter()
+            .map(|q| {
+                q.hypotheses
+                    .iter()
+                    .map(|id| hypothesis_groups[id].clone())
+                    .collect()
+            })
+            .collect();
+        let mut matching = BTreeSet::new();
+        // A new hypothesis can bridge several existing cards. Close the whole
+        // connected component, rather than merging only its first match.
+        loop {
+            let previous = matching.len();
+            for index in 0..report.questions.len() {
+                if !matching.contains(&index)
+                    && (!question_scenes[index].is_disjoint(&connected_scenes)
+                        || !question_contexts[index].is_disjoint(&connected_contexts))
+                {
+                    matching.insert(index);
+                    connected_scenes.extend(question_scenes[index].iter().cloned());
+                    connected_contexts.extend(question_contexts[index].iter().cloned());
+                }
+            }
+            if matching.len() == previous {
+                break;
+            }
+        }
+        if let Some(&first) = matching.iter().next() {
+            let mut groups = vec![];
+            let mut remaining = vec![];
+            for (index, question) in report.questions.drain(..).enumerate() {
+                if matching.contains(&index) {
+                    groups.push(question);
+                } else {
+                    remaining.push(question);
+                }
+            }
+            let mut question = groups.remove(0);
+            let mut known = question_scenes[first].clone();
+            for other in groups {
+                question.hypotheses.extend(other.hypotheses);
+                for witness in other.witnesses {
+                    if known.insert(verified_scene_key(&witness, &mut witness_scene_cache)?) {
+                        question.witnesses.push(witness);
+                    }
+                }
+            }
             question.hypotheses.push(hypothesis.id.clone());
-            for unknown in &hypothesis.unknowns {
-                if !question.unknowns.contains(unknown) {
-                    question.unknowns.push(unknown.clone());
+            question
+                .hypotheses
+                .sort_by_key(|id| hypothesis_positions[id]);
+            question.hypotheses.dedup();
+            question.unknowns.clear();
+            for id in &question.hypotheses {
+                for unknown in &result.response.hypotheses[hypothesis_positions[id]].unknowns {
+                    if !question.unknowns.contains(unknown) {
+                        question.unknowns.push(unknown.clone());
+                    }
                 }
             }
             for witness in witnesses {
-                if !question
-                    .witnesses
-                    .iter()
-                    .any(|w| same_executed_scene(w, &witness))
-                {
+                if known.insert(verified_scene_key(&witness, &mut witness_scene_cache)?) {
                     question.witnesses.push(witness);
                 }
             }
+            for prior_entry in &mut report.log {
+                if prior_entry.disposition == Disposition::Question
+                    && prior_entry.hypothesis != question.hypotheses[0]
+                    && question.hypotheses.contains(&prior_entry.hypothesis)
+                {
+                    prior_entry.disposition = Disposition::Grouped;
+                }
+            }
+            remaining.insert(first, question);
+            report.questions = remaining;
             entry.disposition = Disposition::Grouped;
         } else {
             report.questions.push(ChoiceQuestion {
@@ -1363,10 +1767,80 @@ pub fn discover(
     Ok(report)
 }
 
-fn same_executed_scene(a: &VerifiedWitness, b: &VerifiedWitness) -> bool {
-    a.before_program() == b.before_program()
-        && a.after_program() == b.after_program()
-        && matches!((scene_equivalence_key(&a.witness().scenario),scene_equivalence_key(&b.witness().scenario)),(Ok(a),Ok(b)) if a==b)
+/// Enumerate declared channels independently of whether one source changed them.
+/// Alternative-only declarations still create coverage obligations.
+fn comparison_targets(
+    programs: &[&CapturedProgram],
+    point: &str,
+) -> Result<Vec<ObservationTarget>, AdapterError> {
+    let observables: BTreeSet<_> = programs
+        .iter()
+        .flat_map(|p| p.program.observables.iter().map(|o| o.id.clone()))
+        .collect();
+    let mut targets: Vec<_> = observables
+        .into_iter()
+        .map(|observable| ObservationTarget::Observable {
+            point: point.into(),
+            observable,
+        })
+        .collect();
+    let mut outputs = BTreeMap::<Id, BTreeSet<Id>>::new();
+    let mut columns = BTreeSet::new();
+    for program in programs {
+        for output in &program.program.outputs {
+            outputs
+                .entry(output.id.clone())
+                .or_default()
+                .extend(output.columns.iter().map(|c| c.id.clone()));
+        }
+        for view in &program.program.views {
+            if let Some(schema) = program.program.view_schema(&view.id)? {
+                columns.extend(schema.columns.keys().cloned());
+            }
+        }
+    }
+    for (output, columns) in outputs {
+        targets.push(ObservationTarget::OutputCount {
+            point: point.into(),
+            output: output.clone(),
+        });
+        for column in columns {
+            targets.push(ObservationTarget::OutputColumn {
+                point: point.into(),
+                output: output.clone(),
+                column,
+            });
+        }
+    }
+    targets.push(ObservationTarget::ViewRows {
+        point: point.into(),
+    });
+    for column in columns {
+        targets.push(ObservationTarget::ViewColumn {
+            point: point.into(),
+            column,
+        });
+    }
+    Ok(targets)
+}
+
+fn verified_scene_key(
+    witness: &VerifiedWitness,
+    cache: &mut BTreeMap<Digest, Digest>,
+) -> Result<(Digest, Digest, Digest), AdapterError> {
+    let bound_scene = &witness.witness().before.binding.scenario_digest;
+    let scene = if let Some(key) = cache.get(bound_scene) {
+        key.clone()
+    } else {
+        let key = scene_equivalence_key(&witness.witness().scenario)?;
+        cache.insert(bound_scene.clone(), key.clone());
+        key
+    };
+    Ok((
+        witness.before_program().binding.identity()?,
+        witness.after_program().binding.identity()?,
+        scene,
+    ))
 }
 
 fn comparable_outcomes(actual: &RunEvidence, prior: &RunEvidence) -> bool {
@@ -1380,7 +1854,58 @@ fn comparable_outcomes(actual: &RunEvidence, prior: &RunEvidence) -> bool {
             .observations
             .iter()
             .zip(&prior.observations)
-            .all(|(a, b)| a.view_schema == b.view_schema)
+            .all(|(a, b)| {
+                if a.point != b.point
+                    || a.view_schema != b.view_schema
+                    || a.value_types != b.value_types
+                {
+                    return false;
+                }
+                let mut targets: Vec<_> = a
+                    .value_types
+                    .keys()
+                    .map(|observable| ObservationTarget::Observable {
+                        point: a.point.clone(),
+                        observable: observable.clone(),
+                    })
+                    .collect();
+                let mut outputs = BTreeMap::<Id, BTreeSet<Id>>::new();
+                for artifact in a.outputs.iter().chain(&b.outputs) {
+                    outputs
+                        .entry(artifact.output.clone())
+                        .or_default()
+                        .extend(artifact.columns.iter().map(|column| column.id.clone()));
+                }
+                for (output, columns) in outputs {
+                    targets.push(ObservationTarget::OutputCount {
+                        point: a.point.clone(),
+                        output: output.clone(),
+                    });
+                    for column in columns {
+                        targets.push(ObservationTarget::OutputColumn {
+                            point: a.point.clone(),
+                            output: output.clone(),
+                            column,
+                        });
+                    }
+                }
+                if let Some(schema) = &a.view_schema {
+                    targets.push(ObservationTarget::ViewRows {
+                        point: a.point.clone(),
+                    });
+                    for column in schema.columns.keys() {
+                        targets.push(ObservationTarget::ViewColumn {
+                            point: a.point.clone(),
+                            column: column.clone(),
+                        });
+                    }
+                }
+                targets.iter().all(|target| {
+                    target
+                        .differs(std::slice::from_ref(a), std::slice::from_ref(b))
+                        .is_some()
+                })
+            })
 }
 fn same_outcomes(actual: &RunEvidence, prior: &RunEvidence) -> bool {
     actual.state == EvidenceState::Observed
@@ -1534,6 +2059,26 @@ fn retained_target(
     };
     Some(target)
 }
+/// History lookup ignores Observe instrumentation but preserves every effective
+/// input and initial condition. A key match is not execution/settlement proof.
+fn history_execution_key(scene: &ScenarioSpec) -> Result<Digest, AdapterError> {
+    let inputs: Vec<_> = scene
+        .inputs
+        .iter()
+        .filter(|input| !matches!(input, SemanticInput::Observe { .. }))
+        .collect();
+    Ok(canonical_digest(
+        IdentityDomain::Input,
+        &(
+            &scene.seed,
+            &scene.session,
+            scene.clock_day,
+            scene.random_seed,
+            inputs,
+        ),
+    )?)
+}
+
 /// This key is only for independently replayed/reduced scene equivalence, never
 /// an execution binding. Observation point names are annotations, not effects.
 fn scene_equivalence_key(scene: &ScenarioSpec) -> Result<Digest, AdapterError> {
@@ -1621,6 +2166,107 @@ fn observation_groups(run: &RunEvidence) -> Vec<ObservationGroup<'_>> {
     groups
 }
 
+/// Material channels without a property term still constrain settlement. They
+/// may establish an unknown boundary, never a fabricated executable predicate.
+fn unrepresented_material(observation: &Observation) -> Option<BTreeMap<String, Digest>> {
+    fn add(
+        values: &mut BTreeMap<String, Digest>,
+        key: String,
+        value: &impl serde::Serialize,
+    ) -> Option<()> {
+        values.insert(
+            key,
+            canonical_digest(IdentityDomain::Observation, value).ok()?,
+        );
+        Some(())
+    }
+    let mut values = BTreeMap::new();
+    add(&mut values, "view".into(), &observation.view.view)?;
+    add(&mut values, "selection".into(), &observation.view.selected)?;
+    add(
+        &mut values,
+        "actions".into(),
+        &observation.view.enabled_actions,
+    )?;
+    for (id, value) in &observation.view.controls {
+        add(&mut values, format!("control/{id}"), value)?;
+    }
+    for (id, value) in &observation.view.form_values {
+        add(&mut values, format!("form/{id}"), value)?;
+    }
+    let mut row_actions: Vec<_> = observation
+        .view
+        .rows
+        .iter()
+        .filter(|row| !row.enabled_actions.is_empty())
+        .map(|row| (&row.record.entity, &row.record.record, &row.enabled_actions))
+        .collect();
+    row_actions.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    add(&mut values, "row_actions".into(), &row_actions)?;
+    for (index, artifact) in observation.outputs.iter().enumerate() {
+        add(&mut values, format!("output/{index}/id"), &artifact.output)?;
+        add(
+            &mut values,
+            format!("output/{index}/format"),
+            &artifact.format,
+        )?;
+        add(
+            &mut values,
+            format!("output/{index}/columns"),
+            &artifact.columns,
+        )?;
+        add(
+            &mut values,
+            format!("output/{index}/rows"),
+            &artifact.rows.len(),
+        )?;
+    }
+    Some(values)
+}
+
+/// A supported scalar contrast does not cover simultaneous controls, actions,
+/// selections or output layout changes. Retain that boundary even without saved
+/// decisions and before reductions can erase the original extra consequence.
+fn unrepresented_differences(before: &[Observation], after: &[Observation]) -> Vec<String> {
+    fn channels(observation: &Observation) -> Option<BTreeMap<String, Digest>> {
+        let mut channels = unrepresented_material(observation)?;
+        let mut counts = BTreeMap::<&Id, usize>::new();
+        for artifact in &observation.outputs {
+            *counts.entry(&artifact.output).or_default() += 1;
+        }
+        for (index, artifact) in observation.outputs.iter().enumerate() {
+            // For one artifact, OutputCount represents its row count exactly.
+            // Multiple artifact partitions/order are not represented by totals.
+            if counts[&artifact.output] == 1 {
+                channels.remove(&format!("output/{index}/rows"));
+            }
+        }
+        Some(channels)
+    }
+    let mut differences = BTreeSet::new();
+    if before.len() != after.len() {
+        differences.insert("observation correspondence".into());
+    }
+    for (a, b) in before.iter().zip(after) {
+        if a.point != b.point {
+            differences.insert("observation correspondence".into());
+        }
+        match (channels(a), channels(b)) {
+            (Some(left), Some(right)) => {
+                for key in left.keys().chain(right.keys()) {
+                    if left.get(key) != right.get(key) {
+                        differences.insert(format!("{}/{key}", a.point));
+                    }
+                }
+            }
+            _ => {
+                differences.insert("material channel extraction unavailable".into());
+            }
+        }
+    }
+    differences.into_iter().collect()
+}
+
 struct RetainedProfile {
     matches: bool,
     novel: Option<AcceptedProperty>,
@@ -1656,8 +2302,49 @@ fn retained_profile(
         .flat_map(|o| o.view_schema.iter().flat_map(|s| s.columns.keys().cloned()))
         .collect();
     let mut coordinates = vec![];
+    let mut opaque_coordinates = vec![];
     for observation in &before.observations {
         let point = &observation.point;
+        let current_channels = [
+            unrepresented_material(observation)?,
+            unrepresented_material(after.observations.iter().find(|o| &o.point == point)?)?,
+        ];
+        let point_target = ObservationTarget::ViewRows {
+            point: point.clone(),
+        };
+        if let Some(old) = retained_target(&point_target, before, expected_before) {
+            let old_channels = [
+                unrepresented_material(
+                    expected_before
+                        .observations
+                        .iter()
+                        .find(|o| o.point == old.point())?,
+                )?,
+                unrepresented_material(
+                    expected_after
+                        .observations
+                        .iter()
+                        .find(|o| o.point == old.point())?,
+                )?,
+            ];
+            let channels = [
+                &current_channels[0],
+                &current_channels[1],
+                &old_channels[0],
+                &old_channels[1],
+            ];
+            let keys: BTreeSet<_> = channels.iter().flat_map(|m| m.keys()).collect();
+            for key in keys {
+                let values = channels.map(|m| m.get(key).cloned());
+                // A common context change on both sides is not a new contrast.
+                if values[0] != values[1] || values[2] != values[3] {
+                    opaque_coordinates.push(values);
+                }
+            }
+        } else if current_channels[0] != current_channels[1] {
+            return None;
+        }
+
         let mut targets: Vec<_> = observables
             .iter()
             .map(|observable| ObservationTarget::Observable {
@@ -1726,6 +2413,7 @@ fn retained_profile(
         coordinates
             .iter()
             .all(|c| c[a].1 == c[b].1 && c[a].2 == c[b].2)
+            && opaque_coordinates.iter().all(|c| c[a] == c[b])
     };
     let matches = (equal(0, 2) && equal(1, 3)) || (equal(0, 3) && equal(1, 2));
     let mut novel = None;

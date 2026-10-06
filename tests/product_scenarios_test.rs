@@ -817,3 +817,95 @@ fn evidence_overflow_retains_an_executed_failed_reduction_receipt() {
     assert!(receipt.diagnostics.iter().any(|s| s.contains("omitted")));
     assert!(!witness.witness().minimization.as_ref().unwrap().complete);
 }
+
+#[test]
+fn unrepresentable_valid_reductions_cannot_certify_one_minimality() {
+    let mut before = filtered();
+    before["state"].as_array_mut().unwrap().push(json!({
+        "id":"export_values", "label":"Export values", "value_type":{"kind":"list","item":{"kind":"integer"}},
+        "initial":{"kind":"list","item_type":{"kind":"integer"},"items":(0..6000).map(|value|json!({"kind":"integer","value":value})).collect::<Vec<_>>()}
+    }));
+    before["actions"].as_array_mut().unwrap().push(json!({
+        "id":"narrow", "label":"Narrow rows", "parameters":{},"guards":[],"ensures":[],
+        "steps":[{"kind":"set_state","state":"export_values","value":{"kind":"filter","items":{"kind":"state","state":"export_values"},"binding":"n","predicate":{"kind":"less","left":var("n"),"right":{"kind":"literal","value_type":{"kind":"integer"},"value":{"kind":"integer","value":4000}}}}}]
+    }));
+    before["actions"][2]["steps"][0]["items"] = json!({"kind":"state","state":"export_values"});
+    before["actions"][2]["steps"][0]["columns"]["name"] = text("before");
+    let mut after = before.clone();
+    after["actions"][2]["steps"][0]["columns"]["name"] = text("after");
+    let (before, after) = (capture(before), capture(after));
+    let mut scene = scenario(
+        &before,
+        vec![
+            invoke("narrow", Values::new()),
+            invoke("export_people", Values::new()),
+            invoke("export_people", Values::new()),
+            SemanticInput::Observe {
+                point: "done".into(),
+            },
+        ],
+    );
+    scene.validity.push(AcceptedProperty {
+        id: "enough-rows".into(),
+        description: "Retain at least 8000 actually emitted rows".into(),
+        predicate: PropertyPredicate::Not {
+            value: Box::new(PropertyPredicate::Less {
+                left: PropertyTerm::OutputCount {
+                    point: "done".into(),
+                    output: "roster".into(),
+                },
+                right: PropertyTerm::Literal {
+                    value_type: Type::Integer,
+                    value: DataValue::Integer { value: 8000 },
+                },
+            }),
+        },
+    });
+    let report = engine()
+        .minimize(
+            &before,
+            &after,
+            &scene,
+            &decisions(),
+            ObservationTarget::OutputColumn {
+                point: "done".into(),
+                output: "roster".into(),
+                column: "name".into(),
+            },
+            SearchBudget {
+                runtime: RuntimeLimits {
+                    fuel: 10_000_000,
+                    elapsed_millis: 60_000,
+                    ..RuntimeLimits::default()
+                },
+                ..SearchBudget::default()
+            },
+        )
+        .unwrap();
+    let witness = report.witness.unwrap();
+    let trial = witness
+        .reduction_audit()
+        .iter()
+        .find(|a| a.trial.operation == "delete input 0")
+        .unwrap();
+    assert_eq!(trial.runs.len(), 2);
+    for run in &trial.runs {
+        assert_eq!(run.state, EvidenceState::Observed, "{:?}", run.errors);
+        assert_eq!(scene.validity[0].evaluate(&run.observations), Some(true));
+        assert_eq!(
+            run.observations[0]
+                .outputs
+                .iter()
+                .map(|a| a.rows.len())
+                .sum::<usize>(),
+            12_000
+        );
+    }
+    assert_ne!(
+        trial.runs[0].observations[0].outputs[0].rows[0],
+        trial.runs[1].observations[0].outputs[0].rows[0]
+    );
+    assert_eq!(trial.trial.outcome, ReductionOutcome::Inconclusive);
+    assert!(!witness.witness().minimization.as_ref().unwrap().complete);
+    assert!(report.diagnostics.iter().any(|s| s.contains("incomplete")));
+}

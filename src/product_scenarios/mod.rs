@@ -52,6 +52,66 @@ impl ObservationTarget {
         let (_, b_type, b) = self.sample(after)?;
         (a_type == b_type).then_some(a != b)
     }
+    /// Presence is independent of whether a bounded typed sample can be built.
+    /// In particular, several valid exports can exceed one aggregated list's
+    /// size limit; that is unavailable sampling, not an absent output channel.
+    pub(crate) fn channel_presence(&self, observations: &[Observation]) -> Option<bool> {
+        if let Self::Property { property } = self {
+            let PropertyPredicate::And { values } = &property.predicate else {
+                return None;
+            };
+            // Each host coordinate is independently required by sample(). Do
+            // not infer required channels through conditional Boolean trees.
+            let mut unknown = false;
+            for value in values {
+                let (PropertyPredicate::Equal { left, right }
+                | PropertyPredicate::Less { left, right }) = value
+                else {
+                    return None;
+                };
+                for term in [left, right] {
+                    match term_channel_presence(term, observations) {
+                        Some(false) => return Some(false),
+                        Some(true) => {}
+                        None => unknown = true,
+                    }
+                }
+            }
+            return (!unknown).then_some(true);
+        }
+        let Some(observation) = observations.iter().find(|o| o.point == self.point()) else {
+            return Some(false);
+        };
+        observation.validate().ok()?;
+        Some(match self {
+            Self::Observable { observable, .. } => {
+                observation.values.contains_key(observable)
+                    || observation.value_types.contains_key(observable)
+            }
+            Self::OutputCount { output, .. } => {
+                observation.outputs.iter().any(|a| &a.output == output)
+            }
+            Self::OutputColumn { output, column, .. } => observation
+                .outputs
+                .iter()
+                .any(|a| &a.output == output && a.columns.iter().any(|c| &c.id == column)),
+            Self::ViewRows { .. } => {
+                observation.view_schema.is_some() || !observation.view.rows.is_empty()
+            }
+            Self::ViewColumn { column, .. } => {
+                observation
+                    .view_schema
+                    .as_ref()
+                    .is_some_and(|s| s.columns.contains_key(column))
+                    || observation
+                        .view
+                        .rows
+                        .iter()
+                        .any(|r| r.cells.contains_key(column))
+            }
+            Self::Property { .. } => unreachable!(),
+        })
+    }
     /// Read actual typed observations, including declared types for empty/null cells.
     pub(crate) fn sample(
         &self,
@@ -218,6 +278,42 @@ impl ObservationTarget {
             }
         })
     }
+}
+
+// Presence does not resolve a value or exceed the sampler's aggregate bounds.
+fn term_channel_presence(term: &PropertyTerm, observations: &[Observation]) -> Option<bool> {
+    let target = match term {
+        PropertyTerm::Literal { .. } => return Some(true),
+        PropertyTerm::Count { value } => return term_channel_presence(value, observations),
+        PropertyTerm::Observed {
+            point, observable, ..
+        } => ObservationTarget::Observable {
+            point: point.clone(),
+            observable: observable.clone(),
+        },
+        PropertyTerm::OutputCount { point, output } => ObservationTarget::OutputCount {
+            point: point.clone(),
+            output: output.clone(),
+        },
+        PropertyTerm::OutputColumn {
+            point,
+            output,
+            column,
+            ..
+        } => ObservationTarget::OutputColumn {
+            point: point.clone(),
+            output: output.clone(),
+            column: column.clone(),
+        },
+        PropertyTerm::ViewRows { point, .. } => ObservationTarget::ViewRows {
+            point: point.clone(),
+        },
+        PropertyTerm::ViewColumn { point, column, .. } => ObservationTarget::ViewColumn {
+            point: point.clone(),
+            column: column.clone(),
+        },
+    };
+    target.channel_presence(observations)
 }
 
 /// Only this module can mint the wrapper; consumers get immutable artifacts.
@@ -675,7 +771,15 @@ impl ComparisonEngine {
                         .iter()
                         .any(|run| target.sample(&run.observations).is_none())
                 {
-                    ReductionOutcome::InvalidScenario
+                    if trial
+                        .runs
+                        .iter()
+                        .any(|run| target.channel_presence(&run.observations) == Some(false))
+                    {
+                        ReductionOutcome::InvalidScenario
+                    } else {
+                        ReductionOutcome::Inconclusive
+                    }
                 } else if !reduced
                     .inputs
                     .iter()
@@ -685,9 +789,7 @@ impl ComparisonEngine {
                 } else {
                     match trial.state {
                         EvidenceState::NoDifferenceFound => ReductionOutcome::DifferenceLost,
-                        EvidenceState::Failed | EvidenceState::Unsupported => {
-                            ReductionOutcome::InvalidScenario
-                        }
+                        EvidenceState::Failed => ReductionOutcome::InvalidScenario,
                         _ => ReductionOutcome::Inconclusive,
                     }
                 };

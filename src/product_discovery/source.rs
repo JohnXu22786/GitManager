@@ -125,14 +125,27 @@ pub(super) fn relevant(
     before: &CapturedProgram,
     after: &CapturedProgram,
     h: &ChoiceHypothesis,
+    scenario: &ScenarioSpec,
 ) -> Result<bool, AdapterError> {
     let mut reachable = BTreeSet::from([
         format!("actions/{}", h.action),
         format!("observables/{}", h.observable),
     ]);
-    let scenario = h.scenario()?;
+    // Observe executes every declared observable, not only the provider's
+    // preferred label. Removing/changing another channel is still reachable.
+    reachable.extend([before, after].into_iter().flat_map(|source| {
+        source
+            .program
+            .observables
+            .iter()
+            .map(|o| format!("observables/{}", o.id))
+    }));
     reachable.insert(format!("views/{}", scenario.session.view));
     for input in &scenario.inputs {
+        if let SemanticInput::Invoke { action, .. } = input {
+            reachable.insert(format!("actions/{action}"));
+        }
+
         if let SemanticInput::Navigate { view }
         | SemanticInput::Control { view, .. }
         | SemanticInput::Activate { view, .. }
