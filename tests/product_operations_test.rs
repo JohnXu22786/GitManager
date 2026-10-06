@@ -385,38 +385,93 @@ fn backup_checksums_do_not_authorize_bad_bundle_references_or_runtime_data() {
 #[test]
 fn checkpoints_capture_only_consistent_committed_snapshots_during_writes() {
     use product_backup::VerifiedBackup;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
-    let store = create(&root.join("source"));
+    let path = root.join("source");
+    let store = create(&path);
     let initial = store.load().unwrap();
+    // Make legitimate try-lock contention deterministic, rather than relying
+    // on a fork/scheduling window elsewhere in the parallel test process.
+    let directory = product_files::Directory::open(&path).unwrap();
+    let held = directory.lock().unwrap();
     let writer = store.clone();
+    let (start, next) = mpsc::sync_channel(1);
+    let (saved, completed) = mpsc::sync_channel(1);
+    let (busy, saw_busy) = mpsc::sync_channel(1);
     let thread = std::thread::spawn(move || {
-        let mut committed = vec![initial];
         for i in 0..24 {
-            let saved = writer
-                .apply(
+            if next.recv_timeout(Duration::from_secs(30)).is_err() {
+                return;
+            }
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut retries = 0;
+            let result = loop {
+                let result = writer.apply(
                     i,
                     &format!("write-{i}"),
                     &add(&format!("Record {i}")),
                     RuntimeLimits::default(),
-                )
-                .unwrap();
-            committed.push(saved);
+                );
+                let contention = matches!(&result, Err(StoreError::Io(error))
+                    if matches!(error.get_ref().and_then(|inner|
+                        inner.downcast_ref::<fs::TryLockError>()),
+                        Some(fs::TryLockError::WouldBlock)));
+                if !contention || Instant::now() >= deadline {
+                    break result;
+                }
+                retries += 1;
+                if i == 0 && retries == 1 {
+                    busy.send(()).unwrap();
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            let failed = result.is_err();
+            if saved.send(result).is_err() || failed {
+                return;
+            }
         }
-        committed
     });
-    let mut captures = Vec::new();
-    for _ in 0..12 {
-        captures.push(VerifiedBackup::capture(&store).unwrap());
+    start.send(()).unwrap();
+    if let Err(wait) = saw_busy.recv_timeout(Duration::from_secs(30)) {
+        match completed.try_recv() {
+            Ok(Err(error)) => panic!("snapshot writer failed before contention: {error:?}"),
+            Ok(Ok(_)) => panic!("snapshot writer bypassed the deliberately held lock"),
+            Err(result) => {
+                panic!("snapshot writer never reported contention: {wait:?}; result={result:?}")
+            }
+        }
     }
-    let committed = thread.join().unwrap();
-    for backup in captures {
+    let first_capture = VerifiedBackup::capture(&store).unwrap();
+    assert_eq!(first_capture.snapshot(), &initial);
+    drop(held);
+    let mut previous = completed
+        .recv_timeout(Duration::from_secs(30))
+        .expect("snapshot writer did not finish after releasing its lock")
+        .expect("snapshot writer failed after bounded lock-contention retry");
+    for _ in 1..24 {
+        // Each capture races one real commit. Waiting for that commit only
+        // AFTER capture prevents the writer finishing all work beforehand.
+        start.send(()).unwrap();
+        let backup = VerifiedBackup::capture(&store).unwrap();
+        let current = completed
+            .recv_timeout(Duration::from_secs(30))
+            .expect("snapshot writer stalled or exited")
+            .expect("snapshot writer failed; only typed lock contention is retryable");
         assert!(
-            committed.contains(backup.snapshot()),
+            backup.snapshot() == &previous || backup.snapshot() == &current,
             "backup mixed data from separate commits"
         );
         VerifiedBackup::from_bytes(&backup.to_bytes().unwrap()).unwrap();
+        previous = current;
     }
+    thread.join().unwrap();
+    assert_eq!(previous.data.records.len(), 24);
+    assert_eq!(
+        VerifiedBackup::capture(&store).unwrap().snapshot(),
+        &previous
+    );
 }
 
 #[test]
@@ -741,6 +796,20 @@ fn recovery_registration_cannot_inherit_an_unrelocated_instances_checkpoints() {
     );
 }
 
+fn report_alias_branch(test: &str, aliases: bool) {
+    use std::io::Write;
+    writeln!(
+        std::io::stdout().lock(),
+        "ALIAS-COVERAGE {test}: {}",
+        if aliases {
+            "case-insensitive assertions passed"
+        } else {
+            "case-sensitive assertions passed; case-insensitive branch unrun"
+        }
+    )
+    .unwrap();
+}
+
 #[test]
 fn recovery_refuses_a_listed_case_alias_before_activation() {
     use product_locations::RecentTools;
@@ -779,6 +848,7 @@ fn recovery_refuses_a_listed_case_alias_before_activation() {
         ProductStore::open(&moved).unwrap().load().unwrap(),
         *backup.snapshot()
     );
+    report_alias_branch("fresh-recovery", aliases);
 }
 
 #[test]
@@ -800,7 +870,8 @@ fn recent_relocation_cannot_merge_a_recovered_instance_through_an_alias() {
     let alias = root.join("RECOVERED");
     // On a case-sensitive volume, verify the exact-directory collision; on
     // case-insensitive volumes, exercise the distinct-spelling alias directly.
-    let selected = if alias.exists() { &alias } else { &recovered };
+    let aliases = alias.exists();
+    let selected = if aliases { &alias } else { &recovered };
     assert_eq!(recent.remember(selected, 3).unwrap(), recovered_id);
     assert_eq!(recent.list().unwrap().len(), 2);
     let before = fs::read(root.join("recent-tools.json")).unwrap();
@@ -809,6 +880,7 @@ fn recent_relocation_cannot_merge_a_recovered_instance_through_an_alias() {
     recent.relocate(&original_id, &moved, 5).unwrap();
     assert_eq!(recent.remember(&moved, 6).unwrap(), original_id);
     assert_eq!(result.store.load().unwrap(), *backup.snapshot());
+    report_alias_branch("recent-relocation", aliases);
 }
 
 #[cfg(unix)]
@@ -1290,7 +1362,7 @@ use std::path::Path;
 #[test]
 fn concurrent_pointer_replacement_keeps_open_readers_valid() {
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc, Arc,
     };
     use std::time::{Duration, Instant};
@@ -1299,15 +1371,25 @@ fn concurrent_pointer_replacement_keeps_open_readers_valid() {
     let files = product_files::Directory::open(&path).unwrap();
     files.publish("CURRENT", b"first", false).unwrap();
     let fault = std::env::var("GITMANAGER_POINTER_WRITER_FAULT").ok();
-    let timeout = if fault.as_deref() == Some("timeout") {
+    let stall_timeout = if fault.as_deref() == Some("timeout") {
         Duration::from_millis(20)
     } else {
         Duration::from_secs(30)
     };
+    // This tests correctness during 1,000 durable publications, not disk
+    // throughput. A stalled writer still fails after 30s without progress;
+    // the separate finite total cap also catches indefinitely slow progress.
+    let total_timeout = if fault.as_deref() == Some("timeout") {
+        stall_timeout
+    } else {
+        Duration::from_secs(120)
+    };
     let cancelled = Arc::new(AtomicBool::new(false));
     let worker_cancelled = cancelled.clone();
+    let published = Arc::new(AtomicUsize::new(0));
+    let worker_published = published.clone();
     let (start, ready) = mpsc::sync_channel(1);
-    let writer = std::thread::spawn(move || {
+    let writer = std::thread::spawn(move || -> io::Result<()> {
         ready.recv().unwrap();
         match fault.as_deref() {
             Some("panic") => panic!("injected pointer writer failure"),
@@ -1315,29 +1397,49 @@ fn concurrent_pointer_replacement_keeps_open_readers_valid() {
             _ => {}
         }
         if worker_cancelled.load(Ordering::Acquire) {
-            return;
+            return Ok(());
         }
-        let writer = product_files::Directory::open(&path).unwrap();
+        let writer = product_files::Directory::open(&path)?;
         for i in 0..1000 {
             if worker_cancelled.load(Ordering::Acquire) {
-                return;
+                return Ok(());
             }
-            writer
-                .publish(
-                    "CURRENT",
-                    if i % 2 == 0 { b"first" } else { b"other" },
-                    true,
-                )
-                .unwrap();
+            writer.publish(
+                "CURRENT",
+                if i % 2 == 0 { b"first" } else { b"other" },
+                true,
+            )?;
+            worker_published.store(i + 1, Ordering::Release);
         }
+        Ok(())
     });
-    let deadline = Instant::now() + timeout;
+    if let Some(path) = std::env::var_os("GITMANAGER_POINTER_READY") {
+        fs::write(path, b"ready").unwrap();
+    }
+    let started = Instant::now();
+    let mut last_progress = started;
+    let mut count = 0;
     start.send(()).unwrap();
     let mut failure_count = 0usize;
     let mut first_failure = None;
-    // is_finished covers both successful completion and an unwinding writer.
-    // Keep diagnostics bounded even if every read fails.
-    while !writer.is_finished() && Instant::now() < deadline {
+    // is_finished covers success and panic. Keep both diagnostics and polling
+    // bounded; a tight filesystem-read loop must not starve the writer.
+    while !writer.is_finished() {
+        let now = Instant::now();
+        let current = published.load(Ordering::Acquire);
+        if current != count {
+            count = current;
+            last_progress = now;
+        }
+        if (now.duration_since(last_progress) >= stall_timeout
+            || now.duration_since(started) >= total_timeout)
+            && !writer.is_finished()
+        {
+            cancelled.store(true, Ordering::Release);
+            // Joining unfinished I/O could itself hang the regression.
+            panic!("pointer writer exceeded its deadline: published {count}/1000, elapsed {:?}, no progress {:?}; first read failure: {first_failure:?}",
+                now.duration_since(started), now.duration_since(last_progress));
+        }
         match files.read("CURRENT", 16) {
             Ok(bytes) => assert!(bytes == b"first" || bytes == b"other"),
             Err(error) => {
@@ -1345,19 +1447,18 @@ fn concurrent_pointer_replacement_keeps_open_readers_valid() {
                 first_failure.get_or_insert(error);
             }
         }
+        std::thread::sleep(Duration::from_millis(1));
     }
-    if !writer.is_finished() {
-        cancelled.store(true, Ordering::Release);
-        // Joining an unfinished I/O operation could itself hang the test.
-        panic!("pointer writer exceeded its deadline of {timeout:?}");
+    match writer.join() {
+        Ok(result) => result.expect("pointer publication failed"),
+        Err(panic) => std::panic::resume_unwind(panic),
     }
-    if let Err(panic) = writer.join() {
-        std::panic::resume_unwind(panic);
-    }
+    assert_eq!(published.load(Ordering::Acquire), 1000);
     assert_eq!(
         failure_count, 0,
         "an atomically replaced pointer must remain readable; first failure: {first_failure:?}"
     );
+    assert_eq!(files.read("CURRENT", 16).unwrap(), b"other");
 }
 
 #[test]
@@ -1522,6 +1623,8 @@ fn pointer_writer_failure_and_timeout_are_bounded() {
         ("timeout", "pointer writer exceeded its deadline"),
     ] {
         let log = tempfile::NamedTempFile::new().unwrap();
+        let signals = tempfile::tempdir().unwrap();
+        let ready = signals.path().join("ready");
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -1529,32 +1632,57 @@ fn pointer_writer_failure_and_timeout_are_bounded() {
                 "--nocapture",
             ])
             .env("GITMANAGER_POINTER_WRITER_FAULT", fault)
+            .env("GITMANAGER_POINTER_READY", &ready)
+            // Preserve the actual panic/error text without making symbolizing
+            // this large test binary part of the fault-completion deadline.
+            .env("RUST_BACKTRACE", "0")
             .stdout(Stdio::null())
             .stderr(Stdio::from(log.reopen().unwrap()))
             .spawn()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let startup_deadline = Instant::now() + Duration::from_secs(30);
+        let mut completion_deadline = None;
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
                 break status;
             }
-            if Instant::now() >= deadline {
-                child.kill().unwrap();
-                child.wait().unwrap();
-                panic!("pointer regression child hung after {fault}");
+            if completion_deadline.is_none() && ready.exists() {
+                completion_deadline = Some(Instant::now() + Duration::from_secs(5));
+            }
+            if Instant::now() >= completion_deadline.unwrap_or(startup_deadline) {
+                let phase = if completion_deadline.is_some() {
+                    "after ready"
+                } else {
+                    "before ready"
+                };
+                // A concurrent exit can make kill fail; retain both the exit
+                // result and the bounded actual child diagnostic either way.
+                let kill = child.kill();
+                let exit = child.wait();
+                let mut diagnostic = String::new();
+                log.reopen()
+                    .unwrap()
+                    .take(32 * 1024)
+                    .read_to_string(&mut diagnostic)
+                    .unwrap();
+                panic!("pointer regression child exceeded {phase} deadline for {fault}; kill={kill:?}, exit={exit:?}, diagnostic={diagnostic}");
             }
             std::thread::sleep(Duration::from_millis(5));
         };
-        assert!(
-            !status.success(),
-            "the injected {fault} must remain a failing test"
-        );
         let mut diagnostic = String::new();
         log.reopen()
             .unwrap()
             .take(32 * 1024)
             .read_to_string(&mut diagnostic)
             .unwrap();
+        assert!(
+            ready.exists(),
+            "pointer fault child exited before fixture readiness: {status:?}; {diagnostic}"
+        );
+        assert!(
+            !status.success(),
+            "the injected {fault} must remain a failing test; {diagnostic}"
+        );
         assert!(
             diagnostic.contains(expected),
             "missing actual {fault} diagnosis: {diagnostic}"
