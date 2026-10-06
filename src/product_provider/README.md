@@ -14,8 +14,13 @@ A payload property such as `passed` is ordinary untrusted data.
    accepts provider-proposed permissions, or falls back to another provider/API.
 2. `probe` runs only bounded `--version`, `--help`, `exec --help` (Codex), and
    `login status` / `auth status`. It hashes the executable and probe output.
-   There is no persistent readiness cache: `submit` repeats the probes and checks
-   the executable/configuration evidence against the prepared job.
+   There is no persistent readiness cache: `submit` repeats the probes and
+   compares the executable content and version/help/auth diagnostic outputs
+   against the prepared job. It separately rechecks invocation arguments and
+   the four environment values (`HOME`, `PATH`, `LANG`, `LC_ALL`). These
+   fingerprints are not attestations of effective configuration, the tool
+   catalog, injected context or isolation. A configuration change that leaves
+   diagnostic outputs unchanged can go undetected.
 3. `prepare(ProviderRequest)` requires a supported profile. It reserves a unique
    request ID, generates a random per-job nonce, saves the exact input/schema and
    disclosure, and returns `PreparedJob`. It makes no model request.
@@ -58,23 +63,34 @@ context discovery. **Neither reviewed live CLI is currently advertised with
 that capability.** Help/auth probes are insufficient to establish it.
 
 `TrustedHarness` is a separate opt-in profile. The CLI and administrator-managed
-configuration can apply hooks, plugins/MCP, and host context. This can read or
+configuration may apply hooks, plugins/MCP, and host context. This may read or
 transmit files outside the job directory and make network calls. The CLI itself
-retains ordinary OS-user access and existing authentication. Known supported
-restrictions are requested; effective host configuration and sandbox enforcement
-remain unverified. The exact notice is part of the approval digest. Generic
+retains ordinary OS-user access and existing authentication. Restrictions are
+requested; effective configuration and sandbox enforcement remain unverified,
+and the effective tool catalog and injected context remain unknown. These are
+possible capabilities, not evidence that extra files were read or transmitted.
+The exact notice is part of the approval digest. Generic
 approval to send fictional prompt data is not approval for this broader profile.
+
+The application-controlled input is the prepared prompt, transport instructions,
+correlation fields and output schema. The saved input/schema digests identify
+those bytes, not all context the CLI may supply to a model. Data-category labels
+describe the caller's intended projection; they do not sanitize or confine it.
+`DataOnly` and `TrustedHarness` are transport capability labels, not installed
+CLI named profiles.
 
 - Codex adapter version: exactly `codex-cli 0.159.2`. Uses non-daemon `exec`,
   stdin, JSONL, a generated envelope schema, `--output-last-message`, ephemeral
   state, ignored user config/rules, read-only sandbox and no approval escalation.
-  Known shell/execution, hook, app, plugin, browser, computer, image, multi-agent
-  and skill-integration features are disabled. These switches reduce known
-  access; they are **not** a proof of a tool-free or confined-disclosure profile.
+  It requests disabling known shell/execution, hook, app, plugin, browser,
+  computer, image, multi-agent and skill-integration features. Help probes check
+  generic `--disable` syntax, not acceptance or enforcement of each feature name.
+  These requests are **not** proof of a tool-free or confined-disclosure profile.
 - Claude adapter version: exactly `2.1.286 (Claude Code)`. Uses print/JSON/schema,
-  stdin, an explicit unique session, restricted/safe mode, empty built-in tools,
-  disallowed tools, strict empty MCP, empty setting sources, disabled hooks,
-  disabled Chrome/session persistence, denied permission prompts and one turn.
+  stdin and an explicit unique session. Requests restricted/safe mode, empty
+  built-in tools, disallowed tools, strict empty MCP, empty setting sources,
+  disabled hooks, disabled Chrome/session persistence, denied permission prompts
+  and one turn.
   Managed hooks may still apply. `--bare` is intentionally not used: current docs
   say it ignores subscription auth and requires API credentials.
 - Both adapters require existing subscription auth. API-key/third-party auth is
@@ -96,6 +112,8 @@ approval to send fictional prompt data is not approval for this broader profile.
   duplicate JSON keys, stale correlations, partial publication and mismatched
   routes. The application/CLI and same-UID host are trust boundaries; this is
   not tamper-proof storage against a malicious process with the same user rights.
+- Rejection of tool/unsupported items in returned Codex JSONL occurs after
+  execution. It does not prevent prior tool use or loading additional context.
 
 ## Protocol and provenance
 
