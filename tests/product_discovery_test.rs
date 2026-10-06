@@ -2818,7 +2818,8 @@ fn chosen_outcome_channel_loss_is_unknown_not_an_observed_violation() {
             result.response.hypotheses[0].sources[0].raw_digest =
                 request.sources[1].artifact.raw_digest.clone();
             refresh(&request, &mut result);
-            let selected = request.sources[1].artifact.program_digest.clone();
+            let selected_source = request.sources[1].clone();
+            let selected = selected_source.artifact.program_digest.clone();
             let prior = saved_decision(
                 &mut request,
                 &result,
@@ -2835,6 +2836,16 @@ fn chosen_outcome_channel_loss_is_unknown_not_an_observed_violation() {
             let modified = capture(modified);
             if side == "current" {
                 request.sources[1] = modified.clone();
+                // Keep the actual selected source and its observed scene so
+                // history replay succeeds before testing channel availability.
+                request.accepted_scenes.push(AcceptedSceneContext {
+                    decision: "saved".into(),
+                    source: selected_source.artifact.clone(),
+                    scenario: prior.scenario.identity().unwrap(),
+                    observations: prior.after.observations.clone(),
+                    disclosure: Disclosure::Synthetic,
+                });
+                request.sources.push(selected_source);
             }
             result.response.candidates[usize::from(side == "current")].source_json =
                 String::from_utf8(modified.source_bytes.clone()).unwrap();
