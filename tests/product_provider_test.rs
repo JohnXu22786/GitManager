@@ -464,6 +464,55 @@ fn real_endpoint_never_infers_data_only_from_help_or_authentication() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
+fn trusted_harness_discloses_limits_of_unchanged_probe_fingerprints() {
+    for kind in [ProviderKind::Codex, ProviderKind::Claude] {
+        let f = Fixture::new(kind, "good");
+        // The production policy still runs only the synthetic fixture's probes.
+        let transport = ProviderTransport::new(
+            f.root.join("policy"),
+            kind,
+            f.transport.executable().to_owned(),
+            f.root.join("fixture-home"),
+        )
+        .unwrap();
+        let mut r = request("diagnostics", kind);
+        r.profile = CapabilityProfile::TrustedHarness;
+        let p = transport.prepare(r).unwrap();
+        assert!(!p.capabilities.supports(CapabilityProfile::DataOnly));
+        let notice = &p.disclosure.capability_notice;
+        for limitation in [
+            "application-controlled input",
+            "Requested controls",
+            "version/help/auth diagnostic outputs",
+            "not isolation or effective-configuration attestations",
+            "Configuration changes with unchanged diagnostic outputs can go undetected",
+            "effective tool catalog and injected context remain unknown",
+        ] {
+            assert!(notice.contains(limitation), "{kind:?}: {limitation}");
+        }
+
+        // Fixture behavior changes without changing its executable or readiness
+        // output. Equality is a diagnostic recheck, not a configuration check.
+        fs::write(
+            f.transport.executable().with_extension("json"),
+            serde_json::to_vec(&json!({"provider": kind, "mode": "quota"})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(p.capabilities, transport.probe());
+        let mut incomplete_disclosure = p.disclosure.clone();
+        incomplete_disclosure.capability_notice.clear();
+        let mut consent = approval(&p);
+        consent.disclosure_digest = incomplete_disclosure.digest();
+        assert!(transport.submit(p, &consent).is_err());
+        assert!(!f
+            .root
+            .join("policy/diagnostics/fixture-invocation.json")
+            .exists());
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
 fn corrupted_receipts_and_unfinished_publication_do_not_panic_or_pass() {
     let f = Fixture::new(ProviderKind::Claude, "good");
     let p = f.prepare("corrupt");
