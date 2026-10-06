@@ -118,8 +118,55 @@ impl VerifiedRetainedHistory {
             contexts.push(
                 ScopedExecutionContext::prepared(&self.current, prepared).map_err(unavailable)?,
             );
+            for scene in &self.mapped_scenes {
+                if let Ok((_, Some(context))) = self.projected_scene_context(
+                    self.current.program().map_err(unavailable)?,
+                    prepared.target(),
+                    scene.mapped(),
+                ) {
+                    contexts.push(context);
+                }
+            }
         }
         Ok(Arc::new(HistoryAdmission { contexts }))
+    }
+    /// Host-authenticated preparation only: both compared executables receive
+    /// this same actual scenario. Unknown correspondence remains unavailable.
+    pub(super) fn project_comparison_scene(
+        &self,
+        before: &CapturedProgram,
+        target: &CapturedProgram,
+        scene: &ScenarioSpec,
+    ) -> Result<ScenarioSpec, AdapterError> {
+        Ok(self.projected_scene_context(before, target, scene)?.0)
+    }
+    fn projected_scene_context(
+        &self,
+        before: &CapturedProgram,
+        target: &CapturedProgram,
+        scene: &ScenarioSpec,
+    ) -> Result<(ScenarioSpec, Option<ScopedExecutionContext>), AdapterError> {
+        let target_id = canonical_digest(IdentityDomain::Source, target)?;
+        let Some(prepared) = self.prepared_targets.get(&target_id) else {
+            return Ok((scene.clone(), None));
+        };
+        if before != self.current.program().map_err(unavailable)? || prepared.target() != target {
+            return Err(unavailable(
+                "scene projection does not name the exact current/prepared pair",
+            ));
+        }
+        let context =
+            ScopedExecutionContext::prepared(&self.current, prepared).map_err(unavailable)?;
+        let mapped = crate::product_runtime::merged_data(target, &scene.seed)?;
+        let (context, seed) = context
+            .project_seed(before, &scene.seed, target, &mapped, scene.clock_day)
+            .map_err(unavailable)?;
+        context
+            .verify_seed(before, &seed, scene.clock_day)
+            .map_err(unavailable)?;
+        let mut actual = scene.clone();
+        actual.seed = seed;
+        Ok((actual, Some(context)))
     }
     fn projection(
         engine: &DecisionEngine<LocalRuntime>,
@@ -360,9 +407,21 @@ impl VerifiedRetainedHistory {
                 &(scene_equivalence_key(scene)?, &scene.validity),
             )?)
         };
+        let source = request
+            .sources
+            .first()
+            .ok_or_else(|| unavailable("current source missing"))?;
+        let target = request
+            .sources
+            .get(1)
+            .ok_or_else(|| unavailable("candidate source missing"))?;
+        let projected: Vec<_> = contexts
+            .iter()
+            .map(|context| self.project_comparison_scene(source, target, context.mapped()))
+            .collect::<Result<_, _>>()?;
         let mut scenes = BTreeMap::new();
-        for context in &contexts {
-            scenes.insert(key(context.mapped())?, context.mapped());
+        for scene in &projected {
+            scenes.insert(key(scene)?, scene);
         }
         let exact: Vec<_> = scenes
             .values()
@@ -388,17 +447,18 @@ impl VerifiedRetainedHistory {
         let digest = key(selected)?;
         let sides: Vec<_> = contexts
             .into_iter()
-            .filter(|c| key(c.mapped()).ok().as_ref() == Some(&digest))
+            .zip(projected.iter())
+            .filter(|(_, scene)| key(scene).ok().as_ref() == Some(&digest))
             .collect();
         if sides.len() != 2
-            || sides[0].original().binding.artifact == sides[1].original().binding.artifact
+            || sides[0].0.original().binding.artifact == sides[1].0.original().binding.artifact
         {
             return Err(unavailable(
                 "nonbinary history needs both real source-qualified outcomes",
             ));
         }
         let mut outcomes = vec![];
-        for (index, side) in sides.iter().enumerate() {
+        for (index, (side, projected)) in sides.iter().enumerate() {
             let original = replay_accepted_outcome(
                 request,
                 policy,
@@ -414,13 +474,36 @@ impl VerifiedRetainedHistory {
                 },
                 runs,
             )?;
-            // This actual current-source replay supplies trace correspondence;
-            // its values never replace the original accepted side's values.
-            runs.push(side.replay().clone());
+            // Receipt initialization changes the actual compared seed, never
+            // the historical accepted outcome. Re-execute correspondence on
+            // that actual input instead of relabeling an earlier run binding.
+            let correspondence = if *projected != side.mapped() {
+                let run = budget.replay(
+                    runtime,
+                    source,
+                    projected,
+                    &request.decisions,
+                    policy.search.runtime.clone(),
+                    if index == 0 {
+                        "retained-projected-first"
+                    } else {
+                        "retained-projected-second"
+                    },
+                )?;
+                if run.state != EvidenceState::Observed {
+                    return Err(unavailable(
+                        "initialized historical correspondence did not execute",
+                    ));
+                }
+                run
+            } else {
+                side.replay().clone()
+            };
+            runs.push(correspondence.clone());
             outcomes.push(RetainedRun {
                 original,
                 compared_input: selected.input_identity()?,
-                correspondence: side.replay().clone(),
+                correspondence,
                 mappings: side.mappings().to_vec(),
             });
         }

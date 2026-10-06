@@ -463,7 +463,16 @@ fn dangerous_dependency(value: &serde_json::Value, field: &str) -> bool {
             let kind = m.get("kind").and_then(|v| v.as_str());
             if matches!(
                 kind,
-                Some("query" | "filter" | "any" | "all" | "contains" | "set_state" | "collection")
+                Some(
+                    "query"
+                        | "filter"
+                        | "map"
+                        | "any"
+                        | "all"
+                        | "contains"
+                        | "set_state"
+                        | "collection"
+                )
             ) && mentions(value, field)
             {
                 return true;
@@ -506,6 +515,9 @@ fn sink_dependencies(steps: &[Statement], changed: &str) -> bool {
     for step in steps {
         match step {
             Statement::Update { record, values } => {
+                if foreign_read(record, changed, None) {
+                    return true;
+                }
                 let subject = match record {
                     Expr::Variable { name } => Some(name.as_str()),
                     _ => None,
@@ -539,14 +551,25 @@ fn sink_dependencies(steps: &[Statement], changed: &str) -> bool {
                     return true;
                 }
             }
-            Statement::ForEach { steps, .. } => {
-                if sink_dependencies(steps, changed) {
+            Statement::Archive { record } => {
+                if foreign_read(record, changed, None) {
+                    return true;
+                }
+            }
+            Statement::ForEach { items, steps, .. } => {
+                if foreign_read(items, changed, None) || sink_dependencies(steps, changed) {
                     return true;
                 }
             }
             Statement::Emit {
-                binding, columns, ..
+                items,
+                binding,
+                columns,
+                ..
             } => {
+                if foreign_read(items, changed, None) {
+                    return true;
+                }
                 if columns
                     .values()
                     .any(|v| foreign_read(v, changed, Some(binding)))
@@ -571,6 +594,15 @@ fn check_dependencies(app: &AppDefinition, entity_id: &str, changed: &str) -> Re
             .iter()
             .any(|e| mentions(&serde_json::to_value(e).expect("typed expression"), changed))
         || dangerous_dependency(&serde_json::to_value(app)?, changed)
+        || app.views.iter().any(|view| {
+            view.actions.iter().any(|binding| {
+                foreign_read(&binding.enabled, changed, None)
+                    || binding
+                        .arguments
+                        .values()
+                        .any(|value| foreign_read(value, changed, None))
+            })
+        })
         || app.actions.iter().any(|a| {
             sink_dependencies(&a.steps, changed)
                 || a.guards
@@ -912,6 +944,21 @@ pub(super) fn validate_mappings(
             return Err(error(
                 "protected-slot mapping does not name the current source slot",
             ));
+        }
+        match (&current.request.destination, &mapping.to) {
+            (
+                EffectDestination::Update { field: from, .. },
+                EffectDestination::Update { field: to, .. },
+            )
+            | (
+                EffectDestination::CreateValue { field: from, .. },
+                EffectDestination::CreateValue { field: to, .. },
+            ) if from != to => {
+                return Err(error(
+                    "durable field retargeting needs an explicit preservation migration",
+                ));
+            }
+            _ => {}
         }
         if !destinations.insert(canonical_bytes(&mapping.to)?) {
             return Err(error(

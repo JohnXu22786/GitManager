@@ -29,7 +29,9 @@ loop membership, unsupported conditions, ambiguous slot mappings and unsafe
 completion/output ordering are refused with a forward-repair explanation.
 Shared output definitions require every affected emission to be explicitly
 covered. Every writer of a protected durable result must also be enumerated;
-an uncovered correction/reset cannot silently overwrite completed work. This is
+an uncovered correction/reset cannot silently overwrite completed work.
+Changed durable values cannot be forwarded through view-action arguments or
+used to route unrelated write targets, collection membership or outputs. This is
 not arbitrary application composition.
 
 ## Host integration
@@ -53,15 +55,24 @@ not arbitrary application composition.
    ScopeSlotMapping for every retained protected slot. Pass the resulting handle
    to prepare_managed_change. ProjectSnapshot::editable_scope_context provides
    an honestly host-authored ordinary live-rule capture and every retained slot.
-   Slot coordinates refer to the pre-instrumentation business shell, bound to
+   Durable fields cannot be retargeted without an explicit preservation
+   migration; supported expression and unrelated structural changes remain
+   possible. Slot coordinates refer to the pre-instrumentation business shell, bound to
    the exact compiled source; they are not compiled JSON pointers. Modify and
    Reconcile requests include this editable source before the unchanged compiled
    current source. Discover preserves its exact source pair and receives only
-   slot guidance. Source-count or complete-context overflow fails explicitly
+   slot guidance. Source-count or complete-context overflow fails explicitly.
+   For a new reconciliation design, pass the actual provider result and matching
+   opaque preparation to develop_prepared_evolution. Its draft retains both the
+   authored and compiled captures and carries that preparation through
+   prepare_evolution, including exact successors and requested supersessions
 7. Discovery loads VerifiedRetainedHistory from the store. Register prospective
    managed targets with map_prepared_target. Source-only mapping cannot supply
    scope authority. Both replay and comparison receive the verified admission
-   registry; stale requests remain unverified
+   registry; stale requests remain unverified. Matching pending inputs receive
+   independently regenerated initialization before both compared replays.
+   Original accepted outcomes stay original; projected correspondence is actually
+   executed against the shared initialized input
 8. Withdraw exact layers through DecisionEngine::prepare_scoped_withdrawal.
    It compiles remaining behavior on current data and retires only associated
    active intentions. Already withdrawn or superseded intentions keep their

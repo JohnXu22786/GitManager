@@ -1085,6 +1085,20 @@ pub fn discover(
         }
         let mut captured_scenes = vec![];
         for (index, scene) in relevant_scenes.into_iter().enumerate() {
+            let scene = if let Some(history) = &policy.retained_history {
+                match history.project_comparison_scene(before, candidate, &scene) {
+                    Ok(scene) => scene,
+                    Err(error) => {
+                        capture_unavailable = true;
+                        report.unverified.push(format!(
+                            "Accepted scene initialization is unavailable: {error:?}"
+                        ));
+                        continue;
+                    }
+                }
+            } else {
+                scene
+            };
             let new_feature = policy.required_actions.iter().any(|id| {
                 !before.program.actions.iter().any(|a| &a.id == id)
                     && scenario_operations(&scene, &candidate.program).contains(id)

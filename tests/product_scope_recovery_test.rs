@@ -192,3 +192,63 @@ fn mapped_new_expression_and_structural_evolution_keep_history_usable() {
         2
     );
 }
+
+#[test]
+fn durable_slot_retargeting_cannot_unprotect_completed_original_fields() {
+    fn with_copy(pause: bool) -> CapturedProgram {
+        let mut raw = serde_json::to_value(program(pause).program).unwrap();
+        raw["entities"][0]["fields"].as_array_mut().unwrap().push(serde_json::json!({"id":"copied","label":"Other result","value_type":{"kind":"integer"}}));
+        raw["actions"][0]["steps"][0]["values"]["copied"] = serde_json::to_value(int(0)).unwrap();
+        capture(raw)
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let store = ProductStore::create(dir.path().join("tool"), &with_copy(false), 20000).unwrap();
+    let before = store.load().unwrap();
+    let first = store
+        .prepare_scoped_change(
+            &with_copy(true),
+            &request(&before, ScopePopulation::All),
+            "first",
+        )
+        .unwrap();
+    let layer = first.layer_id().unwrap().unwrap();
+    store.adopt_scoped(before.revision, &first).unwrap();
+    let job = add(&store, "job", "Completed");
+    action(&store, "complete", "complete", &job);
+    let current = store.load().unwrap();
+    let mut raw = serde_json::to_value(with_copy(true).program).unwrap();
+    for action in [3, 4] {
+        let values = raw["actions"][action]["steps"][0]["values"]
+            .as_object_mut()
+            .unwrap();
+        let value = values.remove("production").unwrap();
+        values.insert("copied".into(), value);
+    }
+    raw["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"reset_original","label":"Reset original","parameters":{"row":{"kind":"reference","entity":"job"}},"guards":[],"steps":[{"kind":"update","record":var("row"),"values":{"production":int(99)}}],"ensures":[]}));
+    let candidate = capture(raw);
+    let source = canonical_digest(IdentityDomain::Source, &candidate).unwrap();
+    let mappings: Vec<_> = current.scope.layers[&layer]
+        .patches
+        .iter()
+        .enumerate()
+        .map(|(patch, p)| {
+            let mut to = p.request.destination.clone();
+            if let EffectDestination::Update { field, .. } = &mut to {
+                *field = "copied".into();
+            }
+            ScopeSlotMapping {
+                layer: layer.clone(),
+                patch,
+                from_source: current.active_revision.clone(),
+                from: p.request.destination.clone(),
+                to_source: source.clone(),
+                to,
+                subject: p.request.subject.clone(),
+            }
+        })
+        .collect();
+    assert!(store
+        .prepare_managed_evolution(&candidate, &mappings, "retarget")
+        .is_err());
+    assert_eq!(store.load().unwrap(), current);
+}

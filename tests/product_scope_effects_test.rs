@@ -814,3 +814,65 @@ fn every_writer_of_a_completed_durable_result_requires_protection() {
         .insert("production".into(), DataValue::Integer { value: 99 });
     assert!(corrupted.validate().is_err());
 }
+
+#[test]
+fn scoped_values_cannot_route_unscoped_bindings_targets_or_output_membership() {
+    fn routed(pause: bool, route: &str) -> CapturedProgram {
+        let mut raw = serde_json::to_value(program(pause).program).unwrap();
+        raw["entities"][0]["fields"].as_array_mut().unwrap().push(serde_json::json!({"id":"copied","label":"Copied result","value_type":{"kind":"integer"}}));
+        raw["actions"][0]["steps"][0]["values"]["copied"] = serde_json::to_value(int(0)).unwrap();
+        let positive = Expr::Less {
+            left: Box::new(int(0)),
+            right: Box::new(field("source", "production")),
+        };
+        let extra = match route {
+            "binding" => {
+                serde_json::json!({"id":"copy_result","label":"Copy result","parameters":{"target":{"kind":"reference","entity":"job"},"value":{"kind":"integer"}},"guards":[],"steps":[{"kind":"update","record":var("target"),"values":{"copied":var("value")}}],"ensures":[]})
+            }
+            "target" => {
+                serde_json::json!({"id":"copy_result","label":"Route write","parameters":{"source":{"kind":"reference","entity":"job"},"target":{"kind":"reference","entity":"job"}},"guards":[],"steps":[{"kind":"update","record":{"kind":"if","condition":positive,"then_value":var("target"),"else_value":var("source")},"values":{"copied":int(99)}}],"ensures":[]})
+            }
+            "output" => {
+                raw["outputs"].as_array_mut().unwrap().push(serde_json::json!({"id":"audit","label":"Audit","format":"csv","columns":[{"id":"name","label":"Name","value_type":{"kind":"text"}}]}));
+                let empty = lit(
+                    DataValue::List {
+                        item_type: Type::reference("job"),
+                        items: vec![],
+                    },
+                    Type::list(Type::reference("job")),
+                );
+                serde_json::json!({"id":"copy_result","label":"Route output","parameters":{"source":{"kind":"reference","entity":"job"}},"guards":[],"steps":[{"kind":"emit","output":"audit","items":{"kind":"if","condition":positive,"then_value":raw["views"][0]["kind"]["rows"].clone(),"else_value":empty},"binding":"audit_row","columns":{"name":field("audit_row","name")}}],"ensures":[]})
+            }
+            _ => unreachable!(),
+        };
+        raw["actions"].as_array_mut().unwrap().push(extra);
+        if route == "binding" {
+            raw["views"][0]["actions"] = serde_json::json!([{"id":"copy_result","label":"Copy derived result","placement":"row","action":"copy_result","arguments":{"target":var("row"),"value":field("row","production")},"enabled":boolean(true)}]);
+        }
+        capture(raw)
+    }
+    for route in ["binding", "target", "output"] {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            ProductStore::create(dir.path().join("tool"), &routed(false, route), 20000).unwrap();
+        let selected = add(&store, "selected", "Selected");
+        add(&store, "excluded", "Excluded");
+        let before = store.load().unwrap();
+        let req = request(
+            &before,
+            ScopePopulation::SelectedUnfinished {
+                records: vec![RecordRef {
+                    entity: selected.entity,
+                    record: selected.id,
+                }],
+            },
+        );
+        assert!(
+            store
+                .prepare_scoped_change(&routed(true, route), &req, "unsafe-route")
+                .is_err(),
+            "{route}"
+        );
+        assert_eq!(store.load().unwrap(), before);
+    }
+}

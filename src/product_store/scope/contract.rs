@@ -216,6 +216,10 @@ impl PreparedScopedChange {
     pub fn target(&self) -> &CapturedProgram {
         &self.target
     }
+    /// Exact ordinary input capture, with its original author provenance.
+    pub fn candidate(&self) -> &CapturedProgram {
+        &self.candidate
+    }
     pub fn seed(&self) -> &DataSnapshot {
         &self.initialized
     }

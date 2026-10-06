@@ -1198,3 +1198,480 @@ fn independent_promises_cross_only_authenticated_layer_initialization() {
     );
     product_backup::VerifiedBackup::capture(&reopened).unwrap();
 }
+
+#[test]
+fn managed_reconciliation_preserves_real_scenes_and_exact_supersessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
+    let job = add(&store, "job", "Real waiting work");
+    action(&store, "wait", "wait", &job);
+    tick(&store, "days", 20003);
+    let before = store.load().unwrap();
+    let first = store
+        .prepare_scoped_change(
+            &program(true),
+            &request(&before, ScopePopulation::All),
+            "scope",
+        )
+        .unwrap();
+    store.adopt_scoped(before.revision, &first).unwrap();
+    let engine = DecisionEngine::new(LocalRuntime::default(), IntentArchive::new(store.clone()));
+    for (id, calculate) in [("timing", true), ("reporting", false)] {
+        let current = store.load().unwrap();
+        let mut inputs = vec![];
+        if calculate {
+            inputs.push(invoke("calculate", &[("row", reference(&job))]));
+        }
+        inputs.extend([
+            invoke("export", &[]),
+            SemanticInput::Observe {
+                point: "result".into(),
+            },
+        ]);
+        let scene = ScenarioSpec {
+            version: 1,
+            id: id.into(),
+            label: id.into(),
+            seed: current.data.clone(),
+            session: current.session.clone(),
+            clock_day: current.clock_day,
+            random_seed: 42,
+            inputs,
+            validity: vec![],
+        };
+        let accepted = engine
+            .accept_current_scene(&current, &scene, Disclosure::Synthetic)
+            .unwrap();
+        let choice = Choice {
+            id: id.into(),
+            request: "Preserve the experienced timing and report".into(),
+            rationale: None,
+            scope: DecisionScope {
+                operations: if calculate {
+                    ["calculate".into(), "export".into()].into_iter().collect()
+                } else {
+                    ["export".into()].into_iter().collect()
+                },
+                population: Population::All,
+                conditions: Values::new(),
+                excluded_records: vec![],
+                unknowns: vec![],
+            },
+            outcome: DecisionOutcome::KeepCurrent,
+            obligations: vec![],
+            binding: IntentionBinding::ObservedOutcome,
+        };
+        let change = engine
+            .prepare_choice(
+                &store,
+                current.program().unwrap(),
+                choice,
+                vec![accepted],
+                &format!("accept-{id}"),
+            )
+            .unwrap();
+        engine.adopt(&store, &change).unwrap();
+    }
+    let current = store.load().unwrap();
+    let request = engine
+        .reconciliation_request(
+            &current,
+            "reconcile",
+            "Add a real materials log while preserving both experienced needs",
+            &["timing".into(), "reporting".into()],
+        )
+        .unwrap();
+    let mut raw = serde_json::to_value(program(true).program).unwrap();
+    raw["entities"].as_array_mut().unwrap().push(serde_json::json!({"id":"material","label":"Materials","fields":[{"id":"name","label":"Material","value_type":{"kind":"text"}}],"unique":[],"constraints":[]}));
+    raw["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"log_material","label":"Log material","parameters":{"name":{"kind":"text"}},"guards":[],"steps":[{"kind":"create","entity":"material","bind":"created","values":{"name":var("name")}}],"ensures":[]}));
+    let producer = Producer::Fixture {
+        name: "Explicit managed reconciliation response".into(),
+    };
+    let source_json = serde_json::to_string(&raw).unwrap();
+    let authored = CapturedProgram::capture(
+        source_json.as_bytes(),
+        "scope-project",
+        producer.clone(),
+        None,
+    )
+    .unwrap();
+    let response = DevelopmentResult {
+        producer: producer.clone(),
+        response: DevelopmentResponse {
+            version: 1,
+            request_digest: request.identity().unwrap(),
+            candidates: vec![GeneratedCandidate {
+                id: "new-design".into(),
+                source_json,
+            }],
+            hypotheses: vec![],
+            evolutions: vec![EvolutionSuggestion {
+                id: "reconciled".into(),
+                candidate: "new-design".into(),
+                needs: vec!["timing".into(), "reporting".into()],
+                proposed_retirement: vec!["timing".into()],
+                preserved_obligations: vec![],
+                mappings: vec![],
+                scenarios: vec![],
+            }],
+            unsupported: vec![],
+        },
+    };
+    let make_prepared = |current: &product_store::ProjectSnapshot, source: &CapturedProgram| {
+        let editable = current.editable_scope_context().unwrap().unwrap();
+        let to_source = canonical_digest(IdentityDomain::Source, source).unwrap();
+        let mappings: Vec<_> = editable
+            .slots
+            .iter()
+            .map(|slot| ScopeSlotMapping {
+                layer: slot.layer.clone(),
+                patch: slot.patch,
+                from_source: current.active_revision.clone(),
+                from: slot.destination.clone(),
+                to_source: to_source.clone(),
+                to: slot.destination.clone(),
+                subject: slot.subject.clone(),
+            })
+            .collect();
+        store
+            .prepare_managed_evolution(source, &mappings, "adopt-design")
+            .unwrap()
+    };
+    let prepared = make_prepared(&current, &authored);
+    let mut other = raw.clone();
+    other["label"] = serde_json::json!("Different raw candidate");
+    let other = CapturedProgram::capture(
+        &serde_json::to_vec(&other).unwrap(),
+        "scope-project",
+        producer,
+        None,
+    )
+    .unwrap();
+    assert!(engine
+        .develop_prepared_evolution(
+            response.clone(),
+            &request,
+            "reconciled",
+            make_prepared(&current, &other),
+            &|| false
+        )
+        .is_err());
+    let draft = engine
+        .develop_prepared_evolution(
+            response.clone(),
+            &request,
+            "reconciled",
+            prepared.clone(),
+            &|| false,
+        )
+        .unwrap();
+    assert_eq!(draft.authored_candidate(), &authored);
+    assert_eq!(draft.candidate(), prepared.target());
+    assert_ne!(
+        draft.candidate().binding.producer,
+        authored.binding.producer
+    );
+    tick(&store, "later-clock", 20004);
+    assert!(engine
+        .prepare_evolution(&store, &draft, "adopt-design")
+        .is_err());
+    assert!(engine
+        .develop_prepared_evolution(response.clone(), &request, "reconciled", prepared, &|| {
+            false
+        })
+        .is_err());
+    let current = store.load().unwrap();
+    let request = engine
+        .reconciliation_request(
+            &current,
+            "fresh-reconcile",
+            "Preserve both needs and add materials",
+            &["timing".into(), "reporting".into()],
+        )
+        .unwrap();
+    let mut response = response;
+    response.response.request_digest = request.identity().unwrap();
+    let draft = engine
+        .develop_prepared_evolution(
+            response,
+            &request,
+            "reconciled",
+            make_prepared(&current, &authored),
+            &|| false,
+        )
+        .unwrap();
+    let change = engine
+        .prepare_evolution(&store, &draft, "adopt-design")
+        .unwrap();
+    let adopted = engine.adopt(&store, &change).unwrap();
+    assert_eq!(
+        adopted
+            .decisions
+            .decisions
+            .iter()
+            .find(|d| d.id == "timing")
+            .unwrap()
+            .status,
+        DecisionStatus::Superseded {
+            by: "reconciled".into()
+        }
+    );
+    assert_eq!(
+        adopted
+            .decisions
+            .decisions
+            .iter()
+            .find(|d| d.id == "reporting")
+            .unwrap()
+            .status,
+        DecisionStatus::Active
+    );
+    assert_eq!(
+        engine.check_current(&adopted).unwrap().disposition,
+        CheckDisposition::Ready
+    );
+    let continued = apply(
+        &store,
+        "material",
+        invoke("log_material", &[("name", text("Oak"))]),
+    );
+    assert!(continued
+        .data
+        .records
+        .iter()
+        .any(|r| r.entity == "material"));
+    product_backup::VerifiedBackup::capture(&store).unwrap();
+}
+
+#[test]
+fn pending_history_uses_authenticated_initialization_for_shared_discovery_input() {
+    use product_discovery::{discover, DiscoveryPolicy, VerifiedRetainedHistory};
+    use std::sync::{atomic::AtomicBool, Arc};
+    let dir = tempfile::tempdir().unwrap();
+    let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
+    let job = add(&store, "job", "Waiting work");
+    action(&store, "wait", "wait", &job);
+    tick(&store, "days", 20003);
+    let current = store.load().unwrap();
+    let scene = ScenarioSpec {
+        version: 1,
+        id: "retained-waiting".into(),
+        label: "Waiting interval".into(),
+        seed: current.data.clone(),
+        session: current.session.clone(),
+        clock_day: current.clock_day,
+        random_seed: 42,
+        inputs: vec![
+            invoke("export", &[]),
+            SemanticInput::Observe {
+                point: "result".into(),
+            },
+        ],
+        validity: vec![],
+    };
+    let engine = DecisionEngine::new(LocalRuntime::default(), IntentArchive::new(store.clone()));
+    let scenes = [program(false), program(true)]
+        .iter()
+        .map(|source| {
+            accept_scene(
+                &LocalRuntime::default(),
+                source,
+                &scene,
+                Disclosure::Synthetic,
+                RuntimeLimits::default(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let choice = Choice {
+        id: "pending-timing".into(),
+        request: "Keep this unresolved waiting-time distinction".into(),
+        rationale: None,
+        scope: DecisionScope {
+            operations: ["export".into()].into_iter().collect(),
+            population: Population::All,
+            conditions: Values::new(),
+            excluded_records: vec![],
+            unknowns: vec![],
+        },
+        outcome: DecisionOutcome::Deferred,
+        obligations: vec![],
+        binding: IntentionBinding::ObservedOutcome,
+    };
+    let change = engine
+        .prepare_choice(
+            &store,
+            current.program().unwrap(),
+            choice,
+            scenes,
+            "save-pending",
+        )
+        .unwrap();
+    let current = engine.adopt(&store, &change).unwrap();
+    let mut raw = serde_json::to_value(program(true).program).unwrap();
+    for pointer in [
+        "/actions/3/steps/0/values/production",
+        "/actions/4/steps/0/values/production",
+        "/actions/6/steps/0/columns/production",
+        "/views/0/kind/columns/1/value",
+    ] {
+        let value = raw.pointer(pointer).unwrap().clone();
+        *raw.pointer_mut(pointer).unwrap() =
+            serde_json::json!({"kind":"add","left":value,"right":int(1)});
+    }
+    let prepared = store
+        .prepare_scoped_change(
+            &capture(raw),
+            &request(&current, ScopePopulation::All),
+            "new-timing",
+        )
+        .unwrap();
+    let projected = ScenarioSpec {
+        seed: prepared.seed().clone(),
+        ..scene.clone()
+    };
+    let request = engine
+        .inherit_request(
+            &current,
+            DevelopmentRequest {
+                version: 1,
+                id: "discover-pending-scope".into(),
+                project_id: current.data.project_id.clone(),
+                operation: DevelopmentOperation::Discover,
+                request: "Compare a new waiting-time interpretation".into(),
+                sources: vec![
+                    current.program().unwrap().clone(),
+                    prepared.target().clone(),
+                ],
+                context: DevelopmentContext {
+                    view: Some("work".into()),
+                    selected: vec![],
+                    recent_inputs: vec![],
+                    data_digest: Some(current.data.identity().unwrap()),
+                    session_digest: Some(current.session.identity().unwrap()),
+                },
+                examples: vec![],
+                accepted_scenes: vec![],
+                decisions: current.decisions.clone(),
+                unknowns: vec![],
+                required_capabilities: Default::default(),
+            },
+        )
+        .unwrap();
+    let response = DevelopmentResult {
+        producer: Producer::Fixture {
+            name: "Explicit pending scope response".into(),
+        },
+        response: DevelopmentResponse {
+            version: 1,
+            request_digest: request.identity().unwrap(),
+            candidates: vec![
+                GeneratedCandidate {
+                    id: "before".into(),
+                    source_json: String::from_utf8(current.program().unwrap().source_bytes.clone())
+                        .unwrap(),
+                },
+                GeneratedCandidate {
+                    id: "after".into(),
+                    source_json: String::from_utf8(prepared.target().source_bytes.clone()).unwrap(),
+                },
+            ],
+            hypotheses: vec![ChoiceHypothesis {
+                id: "new-waiting-choice".into(),
+                statement: "This rule produces another real waiting-time result".into(),
+                kind: HypothesisKind::UnresolvedChoice,
+                action: "export".into(),
+                observable: "production".into(),
+                sources: vec![SourceLocus {
+                    relative_path: prepared.target().binding.program_path.clone(),
+                    raw_digest: prepared.target().artifact.raw_digest.clone(),
+                    pointer: "/views/0/kind/columns/1/value".into(),
+                }],
+                alternatives: vec!["before".into(), "after".into()],
+                related_decisions: vec!["pending-timing".into()],
+                scenario_json: serde_json::to_string(&projected).unwrap(),
+                unknowns: vec![],
+            }],
+            evolutions: vec![],
+            unsupported: vec![],
+        },
+    };
+    let mut history = VerifiedRetainedHistory::load(&store).unwrap();
+    let missing = discover(
+        &request,
+        &response,
+        &DiscoveryPolicy {
+            retained_history: Some(history.clone()),
+            ..Default::default()
+        },
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    assert!(missing.questions.is_empty());
+    assert!(!missing.unverified.is_empty());
+    history
+        .map_prepared_target(prepared.clone(), vec![])
+        .unwrap();
+    let mut altered = serde_json::to_value(prepared.target().program.clone()).unwrap();
+    altered["label"] = serde_json::json!("Different scoped target");
+    let altered = CapturedProgram::capture(
+        &serde_json::to_vec(&altered).unwrap(),
+        "scope-project",
+        prepared.target().binding.producer.clone(),
+        None,
+    )
+    .unwrap();
+    let mut mismatched_request = request.clone();
+    mismatched_request.sources[1] = altered.clone();
+    let mut mismatched_response = response.clone();
+    mismatched_response.response.request_digest = mismatched_request.identity().unwrap();
+    mismatched_response.response.candidates[1].source_json =
+        String::from_utf8(altered.source_bytes.clone()).unwrap();
+    mismatched_response.response.hypotheses[0].sources[0].raw_digest =
+        altered.artifact.raw_digest.clone();
+    let mismatched = discover(
+        &mismatched_request,
+        &mismatched_response,
+        &DiscoveryPolicy {
+            retained_history: Some(history.clone()),
+            ..Default::default()
+        },
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    assert!(mismatched.questions.is_empty());
+    assert!(!mismatched.unverified.is_empty());
+    let report = discover(
+        &request,
+        &response,
+        &DiscoveryPolicy {
+            retained_history: Some(history.clone()),
+            ..Default::default()
+        },
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    assert!(!report.questions.is_empty(), "{:?}", report);
+    assert!(report
+        .runs
+        .iter()
+        .any(|run| run.binding.artifact == prepared.target().artifact
+            && run.binding.data_digest == projected.seed.identity().unwrap()
+            && run.state == EvidenceState::Observed));
+    assert!(report
+        .runs
+        .iter()
+        .any(|run| run.id.starts_with("retained-projected-")
+            && run.binding.data_digest == projected.seed.identity().unwrap()
+            && run.state == EvidenceState::Observed));
+    for source in [program(false), program(true)] {
+        assert!(report
+            .runs
+            .iter()
+            .any(|run| run.binding.artifact == source.artifact
+                && run.binding.data_digest == scene.seed.identity().unwrap()
+                && run.state == EvidenceState::Observed));
+    }
+    action(&store, "later-work", "resume", &job);
+    assert!(history.map_prepared_target(prepared, vec![]).is_err());
+}
