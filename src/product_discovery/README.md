@@ -30,6 +30,39 @@ program, or call a provider automatically when an app opens.
    needs an independent behavioral requirement case covering it; declaration
    alone cannot establish that an alternative implements the feature. Active chosen outcomes without
    predicate obligations are checked against their selected retained witness side.
+   Legacy witness-only concrete choices also require the genuine witness and,
+   for KeepCurrent, the exact selected-artifact mapping. `witness_bindings`
+   permits an explicit PropertiesOnly independent promise with nonempty
+   demonstrated predicates; absence retains ObservedOutcome. Predicate presence
+   never silently changes the binding, and missing history stays unverified.
+   For V07 store-backed intentions, set `retained_history` using
+   `VerifiedRetainedHistory::load(&store)` and build the exact discovery request
+   with `DecisionEngine::inherit_request`. This opaque host-only adapter reloads
+   the committed snapshot and independently reproduces the immutable packages;
+   portable request context alone is not authority. It preserves explicit
+   ObservedOutcome versus PropertiesOnly binding. The authoritative V07 gate
+   checks concrete outcomes AND additional predicates on the actual candidate
+   and every competing executable before an option can be offered.
+   `map_target` supplies optional host-proposed semantic renames for one exact
+   captured target; they are composed with source-qualified retained mappings
+   and independently checked, never accepted as equivalence claims.
+   A new snapshot requires reloading the adapter; missing, stale, corrupt or
+   ambiguous history blocks questions rather than fabricating a selected side.
+   V07 Scenes-package IDs and differential-witness IDs are separate domains.
+   Concrete choices need only their real selected scenes. Nonbinary history
+   retains both actual source-qualified scenes and feeds them to the existing
+   independent replay/reduction/correspondence checks. `discovery_scenes` supplies
+   opaque verified pending-scene projections from V07. Their mapped operations
+   associate renamed hypotheses, and their independently executed target traces
+   establish correspondence. Historical values are sampled from the original
+   evidence using the source-qualified semantic names; no RunEvidence or output
+   receipt is rewritten to appear as a target execution. Explicit renames that
+   collide with unchanged historical identities are unavailable, so a renamed
+   channel cannot erase another retained outcome. Current host workflow
+   predicates are also evaluated on the actual mapped target runs before either
+   a candidate or an alternative is offered. All scene objects and
+   mappings remain reachable in V07's ordinary intention bundle, so no new
+   persistence object or backup schema is required.
    Missing, incompatible or unrepresentable saved channels remain unknown,
    rather than an observed intention violation.
    Additional chosen scenes use their exact selected-source `accepted_scenes`
@@ -117,7 +150,8 @@ program, or call a provider automatically when an app opens.
   witness was tested and lost the distinction or invalidated the workflow. It
   does not mean globally shortest. Unfinished searches report smallest found and
   incomplete; no witness is finite search coverage, not universal equivalence.
-- No-preference/deferred outcomes need a retained accepted witness. Its outcomes
+- No-preference/deferred outcomes need a retained accepted witness or the two
+  real source-qualified sides of a verified V07 scene package. Its outcomes
   are rerun before suppressing an unchanged scene. Redundant scene inputs are
   matched through independently retained reduction evidence and their original
   executed outcomes, not only provider

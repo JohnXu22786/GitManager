@@ -43,11 +43,47 @@ impl Mapping {
                 ));
             }
         }
-        Ok(Self {
+        let mapping = Self {
             mappings: mappings.to_vec(),
             source_views: source.views.clone(),
             target_views: target.views.clone(),
-        })
+        };
+        // An explicit rename must not merge with an unchanged identity. Check
+        // implicit destinations too, for active checks, pending projections
+        // and adoption alike, even when two observed values happen to match.
+        for (kind, ids) in [
+            (
+                SemanticKind::Observable,
+                source
+                    .observables
+                    .iter()
+                    .map(|value| &value.id)
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                SemanticKind::Output,
+                source.outputs.iter().map(|value| &value.id).collect(),
+            ),
+            (
+                SemanticKind::View,
+                source.views.iter().map(|value| &value.id).collect(),
+            ),
+            (
+                SemanticKind::Action,
+                source.actions.iter().map(|value| &value.id).collect(),
+            ),
+        ] {
+            let mut projected = BTreeSet::new();
+            if ids
+                .into_iter()
+                .any(|id| !projected.insert(mapping.id(kind, id)))
+            {
+                return Err(DecisionError::Unverified(
+                    "Retained semantic mapping collides with an unchanged identity".into(),
+                ));
+            }
+        }
+        Ok(mapping)
     }
     pub fn id(&self, kind: SemanticKind, id: &str) -> Id {
         self.mappings
