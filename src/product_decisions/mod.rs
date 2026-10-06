@@ -345,6 +345,33 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         scenes: Vec<AcceptedScene>,
         id: &str,
     ) -> Result<VerifiedChange> {
+        self.prepare_scoped_choice_resolving(store, prepared, choice, scenes, &[], id)
+    }
+    /// Resolve exact pending choices through the same frozen scoped target.
+    /// Historical decisions are superseded only by the unchanged resolution gate.
+    pub fn prepare_scoped_resolution(
+        &self,
+        store: &ProductStore,
+        prepared: PreparedScopedChange,
+        choice: Choice,
+        scenes: Vec<AcceptedScene>,
+        resolves: &[Id],
+        id: &str,
+    ) -> Result<VerifiedChange> {
+        if resolves.is_empty() {
+            return Err(invalid("resolution needs exact pending decision IDs"));
+        }
+        self.prepare_scoped_choice_resolving(store, prepared, choice, scenes, resolves, id)
+    }
+    fn prepare_scoped_choice_resolving(
+        &self,
+        store: &ProductStore,
+        prepared: PreparedScopedChange,
+        choice: Choice,
+        scenes: Vec<AcceptedScene>,
+        resolves: &[Id],
+        id: &str,
+    ) -> Result<VerifiedChange> {
         if prepared.operation_id() != id
             || choice.scope != *prepared.scope()
             || !matches!(&choice.outcome,DecisionOutcome::Accept{artifact} if artifact==&prepared.target().artifact.program_digest)
@@ -355,7 +382,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         }
         let target = prepared.target().clone();
         self.with_scoped(Some(prepared), || {
-            self.prepare_choice(store, &target, choice, scenes, id)
+            self.prepare_choice_resolving(store, &target, choice, scenes, resolves, id)
         })
     }
     pub fn prepare_managed_change(

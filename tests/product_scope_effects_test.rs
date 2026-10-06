@@ -876,3 +876,95 @@ fn scoped_values_cannot_route_unscoped_bindings_targets_or_output_membership() {
         assert_eq!(store.load().unwrap(), before);
     }
 }
+
+#[test]
+fn completion_capture_rejects_writes_across_an_emitting_loop_back_edge() {
+    fn loop_emit(pause: bool) -> CapturedProgram {
+        let mut raw = serde_json::to_value(program(pause).program).unwrap();
+        let query = raw["actions"][6]["steps"][0]["items"].clone();
+        let mut emit = raw["actions"][6]["steps"][0].clone();
+        emit["binding"] = serde_json::json!("out");
+        emit["columns"] = serde_json::json!({"name":field("out","name"),"production":elapsed("out",pause),"promised":field("out","promised"),"reminder":field("out","waiting")});
+        raw["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"loop_emit","label":"Complete and emit per iteration","parameters":{"target":{"kind":"reference","entity":"job"}},"guards":[],"steps":[{"kind":"for_each","items":query,"binding":"each","steps":[{"kind":"update","record":var("target"),"values":{"done":boolean(true),"waited":{"kind":"add","left":field("target","waited"),"right":int(1)}}},emit]}],"ensures":[]}));
+        capture(raw)
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let store = ProductStore::create(dir.path().join("tool"), &loop_emit(false), 20000).unwrap();
+    add(&store, "first", "First");
+    add(&store, "second", "Second");
+    let before = store.load().unwrap();
+    let mut req = request(&before, ScopePopulation::FutureWork);
+    req.operations.insert("loop_emit".into());
+    req.patches.push(EffectPatchRequest {
+        destination: EffectDestination::EmitColumn {
+            action: "loop_emit".into(),
+            path: vec![0, 1],
+            column: "production".into(),
+        },
+        entity: "job".into(),
+        subject: "out".into(),
+        value_type: Type::Integer,
+    });
+    assert!(store
+        .prepare_scoped_change(&loop_emit(true), &req, "unsafe-loop")
+        .is_err());
+    assert_eq!(store.load().unwrap(), before);
+}
+
+#[test]
+fn preserved_projections_reject_parameters_in_prior_and_mapped_expressions() {
+    fn parameterized(pause: bool, depends: bool) -> CapturedProgram {
+        let mut raw = serde_json::to_value(program(pause).program).unwrap();
+        for action in raw["actions"].as_array_mut().unwrap() {
+            action["parameters"]["delta"] = serde_json::json!({"kind":"integer"});
+        }
+        if depends {
+            raw["actions"][6]["steps"][0]["columns"]["production"] =
+                serde_json::json!({"kind":"add","left":elapsed("row",pause),"right":var("delta")});
+        }
+        capture(raw)
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let store =
+        ProductStore::create(dir.path().join("prior"), &parameterized(false, true), 20000).unwrap();
+    let before = store.load().unwrap();
+    assert!(store
+        .prepare_scoped_change(
+            &parameterized(true, false),
+            &request(&before, ScopePopulation::FutureWork),
+            "prior-parameter"
+        )
+        .is_err());
+    assert_eq!(store.load().unwrap(), before);
+    let store = ProductStore::create(dir.path().join("mapped"), &program(false), 20000).unwrap();
+    let before = store.load().unwrap();
+    let scoped = store
+        .prepare_scoped_change(
+            &program(true),
+            &request(&before, ScopePopulation::FutureWork),
+            "scope",
+        )
+        .unwrap();
+    let layer = scoped.layer_id().unwrap().unwrap();
+    let current = store.adopt_scoped(before.revision, &scoped).unwrap();
+    let candidate = parameterized(true, true);
+    let target = canonical_digest(IdentityDomain::Source, &candidate).unwrap();
+    let mappings: Vec<_> = current.scope.layers[&layer]
+        .patches
+        .iter()
+        .enumerate()
+        .map(|(patch, p)| ScopeSlotMapping {
+            layer: layer.clone(),
+            patch,
+            from_source: current.active_revision.clone(),
+            from: p.request.destination.clone(),
+            to_source: target.clone(),
+            to: p.request.destination.clone(),
+            subject: p.request.subject.clone(),
+        })
+        .collect();
+    assert!(store
+        .prepare_managed_evolution(&candidate, &mappings, "mapped-parameter")
+        .is_err());
+    assert_eq!(store.load().unwrap(), current);
+}

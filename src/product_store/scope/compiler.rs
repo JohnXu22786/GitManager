@@ -696,7 +696,13 @@ fn check_completion_order(app: &AppDefinition) -> Result<()> {
         for step in steps {
             match step {
         Statement::Emit{..}=>emitted=true,
-        Statement::ForEach{steps,..}=>{let nested=visit(steps,emitted)?;emitted|=nested;},
+        Statement::ForEach{steps,..}=>{
+            let nested=visit(steps,emitted)?;
+            // An emitted body can run again. Its back edge carries the output
+            // barrier even when the first iteration started before any output.
+            if nested && !emitted { visit(steps,true)?; }
+            emitted|=nested;
+        },
         Statement::Create{..}|Statement::Update{..}|Statement::Archive{..}|Statement::Collection{target:CollectionTarget::Field{..},..} if emitted=>return Err(error("a business write follows output; completion capture requires a compatible final-output action")),
         _=>{}
     }
@@ -807,9 +813,10 @@ pub(super) fn derive_patches(
             };
             inert(typ)?;
             if projection(&p.destination)
-                && env
-                    .iter()
-                    .any(|(id, _)| id != &p.subject && expression_variable(&after, id))
+                && env.iter().any(|(id, _)| {
+                    id != &p.subject
+                        && (expression_variable(&before, id) || expression_variable(&after, id))
+                })
             {
                 return Err(error("saved projection depends on an action parameter"));
             }
@@ -982,6 +989,15 @@ pub(super) fn validate_mappings(
                 &env,
                 true,
             )?;
+            if projection(&p.destination)
+                && env
+                    .keys()
+                    .any(|id| id != &p.subject && expression_variable(&expression, id))
+            {
+                return Err(error(
+                    "mapped saved projection depends on an action parameter",
+                ));
+            }
         }
     }
     if previous

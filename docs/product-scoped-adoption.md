@@ -26,7 +26,9 @@ deterministic composition has honest ExternalAuthor provenance.
 The compiler checks complete action/view shells and dependencies. Partial
 structural rewrites, foreign-row writes, durable aliases of scoped values, shared selection dependencies, changed
 loop membership, unsupported conditions, ambiguous slot mappings and unsafe
-completion/output ordering are refused with a forward-repair explanation.
+completion/output ordering (including loop back edges) are refused with a
+forward-repair explanation. Preserved projections on either side and after
+mapping must be independent of action parameters.
 Shared output definitions require every affected emission to be explicitly
 covered. Every writer of a protected durable result must also be enumerated;
 an uncovered correction/reset cannot silently overwrite completed work.
@@ -47,7 +49,9 @@ not arbitrary application composition.
    seed is not scoped execution evidence
 4. Capture the experienced result with DecisionEngine::accept_scoped_scene, then
    use prepare_scoped_choice. The choice names the compiled artifact and frozen
-   scope. Concrete outcomes stay binding when additional predicates are supplied
+   scope. Concrete outcomes stay binding when additional predicates are supplied.
+   Use prepare_scoped_resolution for exact pending decision IDs; it retains the
+   same frozen target and the existing successor/supersession checks
 5. Adopt through DecisionEngine::adopt. Under the store lock it rechecks the full
    basis, regenerates composition/initialization, replays intentions and installs
    one snapshot through the existing atomic CURRENT pointer

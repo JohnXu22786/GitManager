@@ -1672,6 +1672,52 @@ fn pending_history_uses_authenticated_initialization_for_shared_discovery_input(
                 && run.binding.data_digest == scene.seed.identity().unwrap()
                 && run.state == EvidenceState::Observed));
     }
+    let accepted = engine
+        .accept_scoped_scene(
+            &store,
+            &prepared,
+            &selected_scene(&prepared, &job),
+            Disclosure::Synthetic,
+        )
+        .unwrap();
+    let choice = Choice {
+        id: "resolved-timing".into(),
+        request: "Adopt the experienced new waiting rule".into(),
+        rationale: None,
+        scope: prepared.scope().clone(),
+        outcome: DecisionOutcome::Accept {
+            artifact: prepared.target().artifact.program_digest.clone(),
+        },
+        obligations: vec![],
+        binding: IntentionBinding::ObservedOutcome,
+    };
+    let resolution = engine
+        .prepare_scoped_resolution(
+            &store,
+            prepared.clone(),
+            choice,
+            vec![accepted],
+            &["pending-timing".into()],
+            "new-timing",
+        )
+        .unwrap();
+    let adopted = engine.adopt(&store, &resolution).unwrap();
+    assert_eq!(
+        adopted
+            .decisions
+            .decisions
+            .iter()
+            .find(|d| d.id == "pending-timing")
+            .unwrap()
+            .status,
+        DecisionStatus::Superseded {
+            by: "resolved-timing".into()
+        }
+    );
+    assert_eq!(
+        engine.check_current(&adopted).unwrap().disposition,
+        CheckDisposition::Ready
+    );
     action(&store, "later-work", "resume", &job);
     assert!(history.map_prepared_target(prepared, vec![]).is_err());
 }
