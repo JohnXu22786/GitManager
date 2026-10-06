@@ -834,7 +834,15 @@ impl<'a> Validator<'a> {
         bounded(values.len())?;
         for (field, value) in values {
             let typ = &self.field(entity, field)?.value_type;
-            self.expect(value, env, typ, depth, true)?;
+            let actual = self.expr(value, env, depth, true)?;
+            // Optional storage accepts a computed non-null inner value as well
+            // as an explicitly optional expression. Other expression contexts
+            // retain exact typing; the evaluator stores the same typed value.
+            require(
+                &actual == typ
+                    || matches!(typ, Type::Optional { item } if item.as_ref() == &actual),
+                format!("assignment type mismatch: expected {typ:?}, found {actual:?}"),
+            )?;
         }
         if create {
             for field in &self.entity(entity)?.fields {

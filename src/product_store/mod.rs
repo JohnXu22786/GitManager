@@ -2,6 +2,8 @@
 //! activation pointer. Legacy order projects are never read or rewritten here.
 mod files;
 mod json;
+pub mod scope;
+mod upgrade;
 use crate::product_contract::*;
 use crate::product_runtime::{merged_data, LocalRuntime};
 use serde::{Deserialize, Serialize};
@@ -11,9 +13,10 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path};
 use std::sync::Arc;
+pub use upgrade::{UpgradeProgress, UpgradeSummary};
 
 const MAGIC: &str = "gitmanager.generated-project";
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 const MAX_STORE_BYTES: usize = 16 * 1024 * 1024;
 type Result<T> = std::result::Result<T, StoreError>;
 #[derive(Debug)]
@@ -21,6 +24,8 @@ pub enum StoreError {
     Io(io::Error),
     Invalid(String),
     UnsupportedFormat(u32),
+    UpgradeRequired,
+    RestartRequired,
     Conflict(String),
     Incompatible(CompatibilityReport),
     Runtime(AdapterError),
@@ -60,6 +65,8 @@ pub enum FaultPoint {
     AfterObject,
     BeforePointer,
     AfterPointer,
+    AfterUpgradeObject,
+    AfterUpgradeJournal,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +99,7 @@ pub struct ProjectSnapshot {
     pub adoptions: Vec<AdoptionReceipt>,
     pub operations: BTreeMap<Id, OperationReceipt>,
     pub artifacts: Vec<LocalArtifact>,
+    pub scope: scope::ScopeState,
 }
 fn revision(program: &CapturedProgram) -> std::result::Result<Digest, ContractError> {
     canonical_digest(IdentityDomain::Source, program)
@@ -190,6 +198,7 @@ impl ProjectSnapshot {
         if self.artifacts.iter().map(|a| a.bytes.len()).sum::<usize>() > MAX_OUTPUT_BYTES {
             return Err(StoreError::Invalid("retained output byte limit".into()));
         }
+        scope::verify_snapshot(self)?;
         Ok(())
     }
 }
@@ -220,6 +229,7 @@ pub struct ProductStore {
     parent: Arc<files::Directory>,
     root: Arc<files::Directory>,
     name: std::ffi::OsString,
+    upgrade_requires_reopen: Arc<std::sync::atomic::AtomicBool>,
 }
 impl ProductStore {
     fn location(path: &Path) -> Result<(files::Directory, std::ffi::OsString)> {
@@ -268,6 +278,7 @@ impl ProductStore {
             adoptions: vec![],
             operations: BTreeMap::new(),
             artifacts: vec![],
+            scope: scope::ScopeState::default(),
         };
         // Ordinary creation and recovery share the same fresh-only activation.
         Self::create_recovered(path, &snapshot)
@@ -326,6 +337,7 @@ impl ProductStore {
             parent: Arc::new(parent),
             root: Arc::new(root),
             name,
+            upgrade_requires_reopen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let _lock = store.root.lock()?;
         store.require_unactivated()?;
@@ -415,6 +427,7 @@ impl ProductStore {
             parent: Arc::new(parent),
             root: Arc::new(root),
             name,
+            upgrade_requires_reopen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
     fn pinned(&self) -> Result<()> {
@@ -426,10 +439,19 @@ impl ProductStore {
         Ok(())
     }
     pub fn load(&self) -> Result<ProjectSnapshot> {
+        if self
+            .upgrade_requires_reopen
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(StoreError::RestartRequired);
+        }
         self.pinned()?;
         let pointer: Pointer = json::parse(&self.root.read("CURRENT", 16 * 1024)?)?;
         if pointer.magic != MAGIC {
             return Err(StoreError::Corrupt("not a generated-tool project".into()));
+        }
+        if pointer.version == 1 {
+            return Err(StoreError::UpgradeRequired);
         }
         if pointer.version != FORMAT {
             return Err(StoreError::UnsupportedFormat(pointer.version));
@@ -573,6 +595,7 @@ impl ProductStore {
                 "project changed; reload before applying this input".into(),
             ));
         }
+        let before = snapshot.clone();
         let runtime = LocalRuntime::default();
         let mut run = runtime.resume(
             snapshot.program()?,
@@ -600,6 +623,7 @@ impl ProductStore {
                 revision: snapshot.revision,
             },
         );
+        scope::verify_transition(&before, &snapshot)?;
         self.save(
             &snapshot,
             true,
@@ -766,6 +790,13 @@ impl ProductStore {
                 "project changed after adoption rehearsal".into(),
             ));
         }
+        if !current.scope.layers.is_empty() && revision(target)? != current.active_revision {
+            return Err(StoreError::Invalid(
+                "Managed history requires a verified scoped or managed-evolution preparation"
+                    .into(),
+            ));
+        }
+        scope::reject_unmanaged_target(&current, target)?;
         self.check_plan(&current, &prepared.plan, target)?;
         decisions.validate()?;
         verify(&current, target, decisions, &prepared.plan)?;

@@ -16,8 +16,8 @@ use std::sync::{
 };
 use std::time::Instant;
 
-pub const RUNTIME_VERSION: &str = "local-interpreter/2";
-pub const DRIVER_VERSION: &str = "semantic-input/2";
+pub const RUNTIME_VERSION: &str = "local-interpreter/3";
+pub const DRIVER_VERSION: &str = "semantic-input/3";
 type Result<T> = std::result::Result<T, AdapterError>;
 fn invalid(message: &str) -> AdapterError {
     AdapterError::Invalid(ContractError(message.into()))
@@ -160,6 +160,68 @@ impl Meter {
 impl LocalRuntime {
     pub fn with_cancellation(cancelled: Arc<AtomicBool>) -> Self {
         Self { cancelled }
+    }
+    /// Host-only bounded evaluation for metadata initialization. This uses the
+    /// production evaluator, validates the expression in a typed action, and
+    /// never creates a transaction or modifies a business record.
+    pub(crate) fn evaluate_record_projection(
+        &self,
+        program: &CapturedProgram,
+        data: &DataSnapshot,
+        row: &RecordRef,
+        binding: &str,
+        expression: &Expr,
+        expected: &Type,
+        day: i32,
+    ) -> Result<DataValue> {
+        program.validate()?;
+        data.validate()?;
+        validate_day(day)?;
+        if data.project_id != program.binding.project_id || !valid_id(binding) {
+            return Err(invalid("projection project or binding mismatch"));
+        }
+        let value = DataValue::Reference {
+            entity: row.entity.clone(),
+            record: row.record.clone(),
+        };
+        eval::record(data, &value)?;
+        let mut app = program.program.clone();
+        let mut id = "gm_scope_projection".to_owned();
+        while app.actions.iter().any(|a| a.id == id) {
+            id.push('_');
+        }
+        app.actions.push(ActionDefinition {
+            id,
+            label: "Host projection type check".into(),
+            parameters: BTreeMap::from([(binding.to_owned(), Type::reference(&row.entity))]),
+            guards: vec![],
+            ensures: vec![],
+            steps: vec![Statement::Assert {
+                condition: Expr::Equal {
+                    left: Box::new(expression.clone()),
+                    right: Box::new(expression.clone()),
+                },
+                message: "Projection type check".into(),
+            }],
+        });
+        app.validate()?;
+        let session = SessionState::initial(&program.program)?;
+        let limits = RuntimeLimits::default();
+        let mut meter = Meter::new(limits.clone(), limits.fuel, self.cancelled.clone());
+        let env = Env::from([(binding.to_owned(), (Type::reference(&row.entity), value))]);
+        let mut evaluator = Eval {
+            app: &program.program,
+            data,
+            session: &session,
+            day,
+            meter: &mut meter,
+        };
+        if evaluator.typ(expression, &env)? != *expected {
+            return Err(invalid("projection result type mismatch"));
+        }
+        let result = evaluator.eval(expression, &env)?;
+        validate_value(&result, expected, 0)?;
+        Ok(result)
     }
     pub fn compatibility_at(
         &self,
