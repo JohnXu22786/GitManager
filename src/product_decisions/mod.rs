@@ -12,6 +12,7 @@ use crate::product_runtime::LocalRuntime;
 use crate::product_store::{PreparedAdoption, ProductStore, ProjectSnapshot, StoreError};
 pub use archive::IntentArchive;
 pub use bundle::{validate_bundle, IntentionBundle};
+pub use context::VerifiedDiscoveryScene;
 pub use evolution::{EvolutionDraft, ReconciliationRequest};
 pub use mapping::ImplementationMapping;
 use mapping::Mapping;

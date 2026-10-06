@@ -3,6 +3,8 @@
 mod fixture;
 #[path = "../src/product_contract.rs"]
 mod product_contract;
+#[path = "../src/product_decisions/mod.rs"]
+mod product_decisions;
 #[path = "../src/product_discovery/mod.rs"]
 mod product_discovery;
 #[path = "../src/product_protocol.rs"]
@@ -13,8 +15,11 @@ mod product_provider;
 mod product_runtime;
 #[path = "../src/product_scenarios/mod.rs"]
 mod product_scenarios;
+#[path = "../src/product_store/mod.rs"]
+mod product_store;
 use fixture::*;
 use product_contract::*;
+use product_decisions::IntentionBinding;
 use product_discovery::*;
 use serde_json::{json, Value};
 use std::{
@@ -290,17 +295,30 @@ fn count_is(n: i64) -> AcceptedProperty {
     }
 }
 
+fn independent_properties(prior: DifferentialWitness) -> DiscoveryPolicy {
+    DiscoveryPolicy {
+        chosen_artifacts: [(
+            "saved".into(),
+            prior.before.binding.artifact.program_digest.clone(),
+        )]
+        .into(),
+        retained_witnesses: vec![prior],
+        witness_bindings: [("saved".into(), IntentionBinding::PropertiesOnly)].into(),
+        ..DiscoveryPolicy::default()
+    }
+}
+
 #[test]
 fn explicit_requirement_violations_are_defects_never_preference_questions() {
     let (mut r, mut out) = input();
-    saved_decision(
+    let prior = saved_decision(
         &mut r,
         &out,
         DecisionOutcome::KeepCurrent,
         vec![count_is(2)],
     );
     refresh(&r, &mut out);
-    let report = run(&r, &out, DiscoveryPolicy::default());
+    let report = run(&r, &out, independent_properties(prior.clone()));
     assert!(report.questions.is_empty());
     assert!(!report.defects.is_empty());
     assert!(report
@@ -332,14 +350,14 @@ fn satisfied_settled_and_deferred_scenes_do_not_reask() {
     }
     let (mut r, mut out) = input();
     let artifact = r.sources[1].artifact.program_digest.clone();
-    saved_decision(
+    let prior = saved_decision(
         &mut r,
         &out,
         DecisionOutcome::Accept { artifact },
         vec![count_is(1)],
     );
     refresh(&r, &mut out);
-    let report = run(&r, &out, DiscoveryPolicy::default());
+    let report = run(&r, &out, independent_properties(prior.clone()));
     assert!(report.questions.is_empty());
     assert!(report.defects.is_empty());
     assert!(report
@@ -351,7 +369,7 @@ fn satisfied_settled_and_deferred_scenes_do_not_reask() {
 #[test]
 fn missing_decision_scene_is_unknown_and_unrelated_scope_does_not_block() {
     let (mut r, mut out) = input();
-    saved_decision(
+    let prior = saved_decision(
         &mut r,
         &out,
         DecisionOutcome::KeepCurrent,
@@ -359,7 +377,7 @@ fn missing_decision_scene_is_unknown_and_unrelated_scope_does_not_block() {
     );
     r.examples.clear();
     refresh(&r, &mut out);
-    let report = run(&r, &out, DiscoveryPolicy::default());
+    let report = run(&r, &out, independent_properties(prior.clone()));
     assert!(report.questions.is_empty());
     assert!(!report.unverified.is_empty());
     r.examples.push(SelectedScenario {
@@ -386,7 +404,7 @@ fn missing_decision_scene_is_unknown_and_unrelated_scope_does_not_block() {
         },
     }];
     refresh(&r, &mut out);
-    let report = run(&r, &out, DiscoveryPolicy::default());
+    let report = run(&r, &out, independent_properties(prior.clone()));
     assert_eq!(report.questions.len(), 1);
 }
 
@@ -405,7 +423,7 @@ fn missing_new_feature_is_not_a_competing_implementation() {
 #[test]
 fn provider_labels_do_not_override_host_requirement_checks() {
     let (mut r, mut out) = input();
-    saved_decision(
+    let prior = saved_decision(
         &mut r,
         &out,
         DecisionOutcome::KeepCurrent,
@@ -413,7 +431,7 @@ fn provider_labels_do_not_override_host_requirement_checks() {
     );
     refresh(&r, &mut out);
     out.response.hypotheses[0].kind = HypothesisKind::RequestedChange;
-    let report = run(&r, &out, DiscoveryPolicy::default());
+    let report = run(&r, &out, independent_properties(prior.clone()));
     assert!(report.questions.is_empty());
     assert!(!report.defects.is_empty());
 }
@@ -589,7 +607,7 @@ fn changed_pending_outcomes_reopen_but_unavailable_saved_proof_stays_unknown() {
 #[test]
 fn all_saved_obligations_are_rechecked_even_if_provider_mentions_none() {
     let (mut r, mut out) = input();
-    saved_decision(
+    let prior = saved_decision(
         &mut r,
         &out,
         DecisionOutcome::KeepCurrent,
@@ -598,7 +616,7 @@ fn all_saved_obligations_are_rechecked_even_if_provider_mentions_none() {
     r.context.recent_inputs.clear();
     out.response.hypotheses.clear();
     refresh(&r, &mut out);
-    let report = run(&r, &out, DiscoveryPolicy::default());
+    let report = run(&r, &out, independent_properties(prior.clone()));
     assert!(!report.defects.is_empty());
     assert!(report.questions.is_empty());
     assert!(!report.checks.is_empty());
@@ -735,6 +753,24 @@ fn unrelated_approved_obligation_rejects_whole_program_alternative() {
             },
         },
     };
+    let rejected = capture(alt);
+    let prior = product_scenarios::ComparisonEngine::new(Arc::new(AtomicBool::new(false)))
+        .compare(
+            &r.sources[0],
+            &rejected,
+            &scene,
+            &r.decisions,
+            product_scenarios::ObservationTarget::ViewColumn {
+                point: "done".into(),
+                column: "name".into(),
+            },
+            RuntimeLimits::default(),
+        )
+        .unwrap()
+        .witness
+        .unwrap()
+        .witness()
+        .clone();
     r.examples.push(SelectedScenario {
         disclosure: Disclosure::Synthetic,
         scenario: scene.clone(),
@@ -755,11 +791,24 @@ fn unrelated_approved_obligation_rejects_whole_program_alternative() {
         status: DecisionStatus::Active,
         obligations: vec![property],
         scenarios: vec![scene.identity().unwrap()],
-        witness: canonical_digest(IdentityDomain::Evidence, &"approved name").unwrap(),
+        witness: prior.identity().unwrap(),
         supersedes: vec![],
     });
     refresh(&r, &mut out);
-    let report = run(&r, &out, DiscoveryPolicy::default());
+    let report = run(
+        &r,
+        &out,
+        DiscoveryPolicy {
+            retained_witnesses: vec![prior],
+            witness_bindings: [("name-intent".into(), IntentionBinding::PropertiesOnly)].into(),
+            chosen_artifacts: [(
+                "name-intent".into(),
+                r.sources[0].artifact.program_digest.clone(),
+            )]
+            .into(),
+            ..DiscoveryPolicy::default()
+        },
+    );
     assert!(report.defects.is_empty());
     assert!(report.questions.is_empty());
 }
@@ -2769,7 +2818,8 @@ fn chosen_outcome_channel_loss_is_unknown_not_an_observed_violation() {
             result.response.hypotheses[0].sources[0].raw_digest =
                 request.sources[1].artifact.raw_digest.clone();
             refresh(&request, &mut result);
-            let selected = request.sources[1].artifact.program_digest.clone();
+            let selected_source = request.sources[1].clone();
+            let selected = selected_source.artifact.program_digest.clone();
             let prior = saved_decision(
                 &mut request,
                 &result,
@@ -2786,6 +2836,16 @@ fn chosen_outcome_channel_loss_is_unknown_not_an_observed_violation() {
             let modified = capture(modified);
             if side == "current" {
                 request.sources[1] = modified.clone();
+                // Keep the actual selected source and its observed scene so
+                // history replay succeeds before testing channel availability.
+                request.accepted_scenes.push(AcceptedSceneContext {
+                    decision: "saved".into(),
+                    source: selected_source.artifact.clone(),
+                    scenario: prior.scenario.identity().unwrap(),
+                    observations: prior.after.observations.clone(),
+                    disclosure: Disclosure::Synthetic,
+                });
+                request.sources.push(selected_source);
             }
             result.response.candidates[usize::from(side == "current")].source_json =
                 String::from_utf8(modified.source_bytes.clone()).unwrap();

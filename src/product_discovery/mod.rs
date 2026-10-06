@@ -1,10 +1,14 @@
 //! Source-bound hypotheses become questions only after independent execution.
 //! This module cannot adopt programs or mutate a daily-work store.
+mod history;
 mod provider;
 mod source;
 use crate::product_contract::*;
+use crate::product_decisions::{CheckDisposition, IntentionBinding};
 use crate::product_runtime::LocalRuntime;
 use crate::product_scenarios::*;
+use history::RetainedRun;
+pub use history::VerifiedRetainedHistory;
 pub use provider::*;
 pub use source::{analyze_delta, SourceDelta};
 use std::{
@@ -28,8 +32,14 @@ pub struct DiscoveryPolicy {
     pub max_precheck_replays: usize,
     /// Host-approved workflow constraints replace untrusted provider oracles.
     pub workflow_validity: BTreeMap<Id, Vec<AcceptedProperty>>,
-    /// Previously accepted witnesses, addressed by the saved decision digest.
+    /// Genuine V07 scene-package history, loaded by the host from its store.
+    /// The package identity is never interpreted as a differential-witness hash.
+    pub retained_history: Option<VerifiedRetainedHistory>,
+    /// Genuine differential witnesses in their own identity domain.
     pub retained_witnesses: Vec<DifferentialWitness>,
+    /// Explicit host promise kind for genuine legacy witnesses. Absence keeps
+    /// concrete choices concrete; predicates alone never imply PropertiesOnly.
+    pub witness_bindings: BTreeMap<Id, IntentionBinding>,
     /// Exact selected artifact from the controller's verified adoption/history receipt.
     /// KeepCurrent alone does not identify which generated witness side was current.
     pub chosen_artifacts: BTreeMap<Id, Digest>,
@@ -44,7 +54,9 @@ impl Default for DiscoveryPolicy {
             max_comparisons: 64,
             max_precheck_replays: 256,
             workflow_validity: BTreeMap::new(),
+            retained_history: None,
             retained_witnesses: vec![],
+            witness_bindings: BTreeMap::new(),
             chosen_artifacts: BTreeMap::new(),
         }
     }
@@ -122,8 +134,13 @@ fn scope_context(policy: &DiscoveryPolicy, operation: &str) -> ScopeContext {
     context
 }
 fn scenario_operations(s: &ScenarioSpec, p: &AppDefinition) -> BTreeSet<Id> {
-    s.inputs
-        .iter()
+    input_operations(s.inputs.iter(), p)
+}
+fn input_operations<'a>(
+    inputs: impl Iterator<Item = &'a SemanticInput>,
+    p: &AppDefinition,
+) -> BTreeSet<Id> {
+    inputs
         .filter_map(|i| match i {
             SemanticInput::Invoke { action, .. } => Some(action.clone()),
             SemanticInput::Activate { view, binding, .. } => p
@@ -191,6 +208,18 @@ struct ReplayBudget {
     cancelled: Arc<AtomicBool>,
 }
 impl ReplayBudget {
+    fn reserve(&self, count: usize) -> Result<(), AdapterError> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(AdapterError::Cancelled);
+        }
+        if count > self.remaining.get() {
+            return Err(AdapterError::BudgetExhausted(
+                "Discovery precheck replay budget exhausted".into(),
+            ));
+        }
+        self.remaining.set(self.remaining.get() - count);
+        Ok(())
+    }
     fn check(&self) -> Result<(), AdapterError> {
         if self.cancelled.load(Ordering::Acquire) {
             Err(AdapterError::Cancelled)
@@ -291,6 +320,10 @@ fn is_chosen(decision: &ScopedDecision) -> bool {
             DecisionOutcome::Accept { .. } | DecisionOutcome::KeepCurrent
         )
 }
+fn binds_chosen_outcome(decision: &ScopedDecision, policy: &DiscoveryPolicy) -> bool {
+    is_chosen(decision)
+        && policy.witness_bindings.get(&decision.id) != Some(&IntentionBinding::PropertiesOnly)
+}
 fn chosen_evidence<'a>(
     decision: &ScopedDecision,
     policy: &'a DiscoveryPolicy,
@@ -339,7 +372,28 @@ fn check_chosen(
 ) -> Result<(RunEvidence, CheckState, Digest), AdapterError> {
     let primary = chosen_evidence(decision, policy)?;
     let expected = if scene.input_identity()? == primary.binding.input_digest {
-        primary.clone()
+        let source = request
+            .sources
+            .iter()
+            .find(|source| source.artifact == primary.binding.artifact)
+            .ok_or_else(|| {
+                AdapterError::Unsupported("Selected historical source is unavailable".into())
+            })?;
+        let replay = budget.replay(
+            runtime,
+            source,
+            &checked_scene(scene, true, &[source], policy),
+            &request.decisions,
+            policy.search.runtime.clone(),
+            "accepted-selected-witness",
+        )?;
+        history_runs.push(replay.clone());
+        if replay.state != EvidenceState::Observed || replay.observations != primary.observations {
+            return Err(AdapterError::Unsupported(
+                "Selected historical witness cannot be independently reproduced".into(),
+            ));
+        }
+        replay
     } else {
         replay_accepted_outcome(
             request,
@@ -353,6 +407,15 @@ fn check_chosen(
             history_runs,
         )?
     };
+    if decision
+        .obligations
+        .iter()
+        .any(|property| property.evaluate(&expected.observations) != Some(true))
+    {
+        return Err(AdapterError::Unsupported(
+            "Saved predicates were not demonstrated by the selected historical outcome".into(),
+        ));
+    }
     let run = budget.replay(
         runtime,
         program,
@@ -362,8 +425,10 @@ fn check_chosen(
         id,
     )?;
     let comparable = comparable_outcomes(&run, &expected);
-    let state = if run.state != EvidenceState::Observed {
+    let mut state = if run.state != EvidenceState::Observed {
         CheckState::Failed
+    } else if !binds_chosen_outcome(decision, policy) {
+        CheckState::Satisfied
     } else if !comparable {
         CheckState::Unknown
     } else if same_outcomes(&run, &expected) {
@@ -371,10 +436,21 @@ fn check_chosen(
     } else {
         CheckState::Violated
     };
+    if run.state == EvidenceState::Observed {
+        for property in &decision.obligations {
+            match property.evaluate(&run.observations) {
+                Some(false) => state = CheckState::Violated,
+                None if state == CheckState::Satisfied => state = CheckState::Unknown,
+                _ => {}
+            }
+        }
+    }
     let obligation = canonical_digest(
         IdentityDomain::Decision,
         &(
             &decision.witness,
+            binds_chosen_outcome(decision, policy),
+            &decision.obligations,
             &expected.binding.artifact.program_digest,
             expected.identity()?,
         ),
@@ -392,10 +468,22 @@ fn retained_history(
     runtime: &LocalRuntime,
     budget: &ReplayBudget,
     decision: &ScopedDecision,
-    prior: &DifferentialWitness,
+    prior: Option<&DifferentialWitness>,
     current_scene: &ScenarioSpec,
     runs: &mut Vec<RunEvidence>,
-) -> Result<(ScenarioSpec, RunEvidence, RunEvidence), AdapterError> {
+) -> Result<(ScenarioSpec, RetainedRun, RetainedRun), AdapterError> {
+    if let Some(history) = &policy.retained_history {
+        return history.pair(
+            decision,
+            current_scene,
+            request,
+            policy,
+            runtime,
+            budget,
+            runs,
+        );
+    }
+    let prior = prior.ok_or_else(|| invalid("accepted differential witness is missing"))?;
     let input = current_scene.input_identity()?;
     let primary_input = &prior.before.binding.input_digest;
     let accepted: Vec<_> = request
@@ -445,8 +533,8 @@ fn retained_history(
     if selected.input_identity()? == *primary_input {
         return Ok((
             prior.scenario.clone(),
-            prior.before.clone(),
-            prior.after.clone(),
+            RetainedRun::direct(prior.before.clone()),
+            RetainedRun::direct(prior.after.clone()),
         ));
     }
     let mut expected = vec![];
@@ -460,7 +548,11 @@ fn retained_history(
     }
     let after = expected.pop().unwrap();
     let before = expected.pop().unwrap();
-    Ok((selected.clone(), before, after))
+    Ok((
+        selected.clone(),
+        RetainedRun::direct(before),
+        RetainedRun::direct(after),
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -550,6 +642,24 @@ pub fn discover(
         remaining: Cell::new(policy.max_precheck_replays),
         cancelled: cancelled.clone(),
     };
+    let mut history_unverified = false;
+    if let Some(history) = &policy.retained_history {
+        match history
+            .verify(request, cancelled.clone(), &replay_budget)
+            .and_then(|()| history.check(candidate, cancelled.clone(), policy, &replay_budget))
+        {
+            Ok(checked) => {
+                history_unverified = history::append_check(&mut report, checked, true)
+                    == CheckDisposition::Unverified;
+            }
+            Err(error) => {
+                history_unverified = true;
+                report
+                    .unverified
+                    .push(format!("Saved intention gate is unavailable: {error:?}"));
+            }
+        }
+    }
     let (defects, unknown, runs) =
         check_requirements(candidate, request, policy, &runtime, &replay_budget)?;
     let missing_feature_coverage: Vec<_> = policy
@@ -611,6 +721,9 @@ pub fn discover(
         hypothesis_operations.insert(hypothesis.id.clone(), operations);
     }
     let mut blocked = BTreeSet::new();
+    if history_unverified {
+        blocked.extend(relevant_actions.iter().cloned());
+    }
     let mut pending = BTreeMap::<Id, Vec<&ScopedDecision>>::new();
     'decision_checks: for decision in request
         .decisions
@@ -618,6 +731,48 @@ pub fn discover(
         .iter()
         .filter(|d| matches!(d.status, DecisionStatus::Active | DecisionStatus::Pending))
     {
+        if decision.status == DecisionStatus::Active
+            && policy
+                .retained_history
+                .as_ref()
+                .is_some_and(|h| h.contains(decision))
+        {
+            // The authoritative V07 gate above checks every active concrete or
+            // property-only intention with its own source-qualified mappings.
+            continue;
+        }
+        if decision.status == DecisionStatus::Pending {
+            if let Some(history) = &policy.retained_history {
+                let operations = history.pending_operations(decision);
+                for hypothesis in &result.response.hypotheses {
+                    if operations.contains(&hypothesis.action)
+                        || !operations.is_disjoint(&hypothesis_operations[&hypothesis.id])
+                    {
+                        pending
+                            .entry(hypothesis.id.clone())
+                            .or_default()
+                            .push(decision);
+                    }
+                }
+                continue;
+            }
+        }
+        if is_chosen(decision)
+            && (!policy
+                .retained_witnesses
+                .iter()
+                .any(|w| w.identity().ok().as_ref() == Some(&decision.witness))
+                || (policy.witness_bindings.get(&decision.id)
+                    == Some(&IntentionBinding::PropertiesOnly)
+                    && decision.obligations.is_empty()))
+        {
+            blocked.extend(decision.scope.operations.iter().cloned());
+            report.unverified.push(format!(
+                "Decision {} has no verified retained history or explicit nonempty binding",
+                decision.id
+            ));
+            continue;
+        }
         for action in &relevant_actions {
             if let Err(error) = replay_budget.check() {
                 blocked.extend(relevant_actions.iter().cloned());
@@ -656,7 +811,7 @@ pub fn discover(
                 ));
                 continue;
             }
-            if decision.obligations.is_empty() && is_chosen(decision) {
+            if is_chosen(decision) {
                 for scene in scenes.iter().flatten() {
                     match check_chosen(
                         candidate,
@@ -672,7 +827,7 @@ pub fn discover(
                         Ok((run, state, property_digest)) => {
                             if state == CheckState::Violated {
                                 report.defects.push(format!(
-                                    "Active decision {} violates its chosen concrete outcome",
+                                    "Active decision {} violates its accepted outcome or predicates",
                                     decision.id
                                 ));
                                 blocked.insert(action.clone());
@@ -692,7 +847,7 @@ pub fn discover(
                                 state,
                                 binding: run.binding.clone(),
                                 evidence: Some(run.identity()?),
-                                explanation: "Independently replayed the accepted concrete outcome"
+                                explanation: "Independently replayed the selected outcome with its explicit binding and predicates"
                                     .into(),
                             });
                             report.runs.push(run);
@@ -852,7 +1007,17 @@ pub fn discover(
             Ok(())
         };
         for decision in pending.get(&hypothesis.id).into_iter().flatten() {
-            if let Some(prior) = policy
+            if policy
+                .retained_history
+                .as_ref()
+                .is_some_and(|h| h.contains(decision))
+            {
+                let history = policy.retained_history.as_ref().unwrap();
+                for scene in history.pending_scenes(decision) {
+                    retain_scene(scene.mapped())?;
+                }
+                continue;
+            } else if let Some(prior) = policy
                 .retained_witnesses
                 .iter()
                 .find(|w| w.identity().ok().as_ref() == Some(&decision.witness))
@@ -994,6 +1159,36 @@ pub fn discover(
             }
             let alternative = &candidates[id];
             let alternative_unverified_before = report.unverified.len();
+            if let Some(history) = &policy.retained_history {
+                let state =
+                    match history.check(alternative, cancelled.clone(), policy, &replay_budget) {
+                        Ok(checked) => history::append_check(&mut report, checked, false),
+                        Err(error) => {
+                            report.unverified.push(format!(
+                                "Alternative {id} intention gate unavailable: {error:?}"
+                            ));
+                            CheckDisposition::Unverified
+                        }
+                    };
+                if state != CheckDisposition::Ready {
+                    entry.disposition = if state == CheckDisposition::RepairRequired {
+                        Disposition::Settled
+                    } else {
+                        Disposition::Unverified
+                    };
+                    entry.state = if state == CheckDisposition::RepairRequired {
+                        EvidenceState::Observed
+                    } else {
+                        EvidenceState::Inconclusive
+                    };
+                    entry.explanation = if state == CheckDisposition::RepairRequired {
+                        format!("Alternative {id} requires repair of an approved intention; it is not a preference option")
+                    } else {
+                        format!("Alternative {id} has unverified saved intentions")
+                    };
+                    continue;
+                }
+            }
             let (defects, unknown, runs) =
                 check_requirements(alternative, request, policy, &runtime, &replay_budget)?;
             report.runs.extend(runs);
@@ -1005,7 +1200,12 @@ pub fn discover(
             // valid product choice, even if the model labels it unresolved.
             let mut permitted = true;
             for decision in request.decisions.decisions.iter().filter(|d| {
-                d.status == DecisionStatus::Active && (!d.obligations.is_empty() || is_chosen(d))
+                d.status == DecisionStatus::Active
+                    && (!d.obligations.is_empty() || is_chosen(d))
+                    && !policy
+                        .retained_history
+                        .as_ref()
+                        .is_some_and(|h| h.contains(d))
             }) {
                 if let Err(error) = replay_budget.check() {
                     permitted = false;
@@ -1044,7 +1244,7 @@ pub fn discover(
                         .iter()
                         .find(|s| s.scenario.identity().ok().as_ref() == Some(digest))
                     {
-                        if decision.obligations.is_empty() && is_chosen(decision) {
+                        if is_chosen(decision) {
                             match check_chosen(
                                 alternative,
                                 &example.scenario,
@@ -1287,10 +1487,15 @@ pub fn discover(
                         .push(format!("Retained checks incomplete: {error:?}"));
                     break;
                 }
-                if let Some(prior) = policy
+                let prior = policy
                     .retained_witnesses
                     .iter()
-                    .find(|w| w.identity().ok().as_ref() == Some(&decision.witness))
+                    .find(|w| w.identity().ok().as_ref() == Some(&decision.witness));
+                if prior.is_some()
+                    || policy
+                        .retained_history
+                        .as_ref()
+                        .is_some_and(|h| h.contains(decision))
                 {
                     for (index, witness) in witnesses.iter().enumerate() {
                         let (historical_scene, expected_before, expected_after) =
@@ -1314,19 +1519,21 @@ pub fn discover(
                                     // primary accepted workflow's actual failures.
                                     // These are diagnostics only, not correspondence
                                     // evidence for the scene whose history is missing.
-                                    let primary = checked_scene(
-                                        &prior.scenario,
-                                        true,
-                                        &[witness.before_program(), witness.after_program()],
-                                        policy,
-                                    );
-                                    for (source, id) in [
-                                        (witness.before_program(), "retained-before"),
-                                        (witness.after_program(), "retained-after"),
-                                    ] {
-                                        match replay_budget.replay(&runtime, source, &primary, &request.decisions, policy.search.runtime.clone(), id) {
+                                    if let Some(prior) = prior {
+                                        let primary = checked_scene(
+                                            &prior.scenario,
+                                            true,
+                                            &[witness.before_program(), witness.after_program()],
+                                            policy,
+                                        );
+                                        for (source, id) in [
+                                            (witness.before_program(), "retained-before"),
+                                            (witness.after_program(), "retained-after"),
+                                        ] {
+                                            match replay_budget.replay(&runtime, source, &primary, &request.decisions, policy.search.runtime.clone(), id) {
                                             Ok(run) => report.runs.push(run),
                                             Err(error) => report.unverified.push(format!("Primary accepted workflow replay unavailable: {error:?}")),
+                                        }
                                         }
                                     }
                                     continue;
@@ -1356,8 +1563,8 @@ pub fn discover(
                         );
                         match (&a, &b) {
                             (Ok(a), Ok(b))
-                                if comparable_outcomes(a, &expected_before)
-                                    && comparable_outcomes(b, &expected_after) =>
+                                if expected_before.comparable(a)
+                                    && expected_after.comparable(b) =>
                             {
                                 let pair_key = (
                                     witness.before_program().binding.identity()?,
@@ -1435,10 +1642,15 @@ pub fn discover(
                                 if !original_replaced && !retained_replaced {
                                     if let Some(current_target) = witness_target(witness.witness())
                                     {
-                                        if let Some(prior_target) = retained_target(
-                                            &current_target,
-                                            original_before,
-                                            &expected_before,
+                                        if let (
+                                            Some(prior_target),
+                                            Some(expected_first),
+                                            Some(expected_second),
+                                        ) = (
+                                            retained_target(&current_target, original_before, a),
+                                            expected_before
+                                                .target(&current_target, original_before),
+                                            expected_after.target(&current_target, original_before),
                                         ) {
                                             let current_pair = (
                                                 current_target
@@ -1446,8 +1658,10 @@ pub fn discover(
                                                 current_target.sample(&original_after.observations),
                                             );
                                             let expected_pair = (
-                                                prior_target.sample(&expected_before.observations),
-                                                prior_target.sample(&expected_after.observations),
+                                                expected_first
+                                                    .sample(&expected_before.original.observations),
+                                                expected_second
+                                                    .sample(&expected_after.original.observations),
                                             );
                                             let replay_pair = (
                                                 prior_target.sample(&a.observations),
@@ -1470,9 +1684,10 @@ pub fn discover(
                                                     ObservationTarget::ViewRows { .. }
                                                         | ObservationTarget::ViewColumn { .. }
                                                 ) && expected_before
+                                                    .original
                                                     .observations
                                                     .iter()
-                                                    .chain(&expected_after.observations)
+                                                    .chain(&expected_after.original.observations)
                                                     .any(|o| {
                                                         o.point == prior_target.point()
                                                             && o.view_schema.is_none()
@@ -2276,31 +2491,54 @@ struct RetainedProfile {
 fn retained_profile(
     before: &RunEvidence,
     after: &RunEvidence,
-    expected_before: &RunEvidence,
-    expected_after: &RunEvidence,
+    expected_before: &RetainedRun,
+    expected_after: &RetainedRun,
 ) -> Option<RetainedProfile> {
     // Include all typed channels, including ones absent from the first side.
-    let observations: Vec<_> = [before, after, expected_before, expected_after]
+    let observations: Vec<_> = [before, after]
         .into_iter()
         .flat_map(|run| run.observations.iter())
         .collect();
-    let observables: BTreeSet<_> = observations
+    let mut observables: BTreeSet<_> = observations
         .iter()
         .flat_map(|o| o.value_types.keys().cloned())
         .collect();
-    let outputs: BTreeSet<_> = observations
+    let mut outputs: BTreeSet<_> = observations
         .iter()
         .flat_map(|o| o.outputs.iter().map(|a| a.output.clone()))
         .collect();
-    let output_columns: BTreeSet<_> = observations
+    let mut output_columns: BTreeSet<_> = observations
         .iter()
         .flat_map(|o| o.outputs.iter())
         .flat_map(|a| a.columns.iter().map(|c| (a.output.clone(), c.id.clone())))
         .collect();
-    let view_columns: BTreeSet<_> = observations
+    let mut view_columns: BTreeSet<_> = observations
         .iter()
         .flat_map(|o| o.view_schema.iter().flat_map(|s| s.columns.keys().cloned()))
         .collect();
+    for historical in [expected_before, expected_after] {
+        for observation in &historical.original.observations {
+            for id in observation.value_types.keys() {
+                observables.insert(historical.forward(SemanticKind::Observable, id));
+            }
+            for output in &observation.outputs {
+                let id = historical.forward(SemanticKind::Output, &output.output);
+                outputs.insert(id.clone());
+                output_columns.extend(
+                    output
+                        .columns
+                        .iter()
+                        .map(|column| (id.clone(), column.id.clone())),
+                );
+            }
+            view_columns.extend(
+                observation
+                    .view_schema
+                    .iter()
+                    .flat_map(|schema| schema.columns.keys().cloned()),
+            );
+        }
+    }
     let mut coordinates = vec![];
     let mut opaque_coordinates = vec![];
     for observation in &before.observations {
@@ -2312,19 +2550,24 @@ fn retained_profile(
         let point_target = ObservationTarget::ViewRows {
             point: point.clone(),
         };
-        if let Some(old) = retained_target(&point_target, before, expected_before) {
+        if let (Some(old_before), Some(old_after)) = (
+            expected_before.target(&point_target, before),
+            expected_after.target(&point_target, before),
+        ) {
             let old_channels = [
-                unrepresented_material(
+                expected_before.material(
                     expected_before
+                        .original
                         .observations
                         .iter()
-                        .find(|o| o.point == old.point())?,
+                        .find(|o| o.point == old_before.point())?,
                 )?,
-                unrepresented_material(
+                expected_after.material(
                     expected_after
+                        .original
                         .observations
                         .iter()
-                        .find(|o| o.point == old.point())?,
+                        .find(|o| o.point == old_after.point())?,
                 )?,
             ];
             let channels = [
@@ -2377,20 +2620,23 @@ fn retained_profile(
         for target in targets {
             let current_before = target.sample_term(&before.observations);
             let current_after = target.sample_term(&after.observations);
-            let old = match retained_target(&target, before, expected_before) {
-                Some(old) => old,
-                None if matches!((&current_before,&current_after),(Some((_,a,x)),Some((_,b,y))) if a==b&&x==y)
+            let (old_before, old_after) = match (
+                expected_before.target(&target, before),
+                expected_after.target(&target, before),
+            ) {
+                (Some(a), Some(b)) => (a, b),
+                _ if matches!((&current_before,&current_after),(Some((_,a,x)),Some((_,b,y))) if a==b&&x==y)
                     || (current_before.is_none() && current_after.is_none()) =>
                 {
                     continue
                 }
-                None => return None,
+                _ => return None,
             };
             let values = [
                 current_before,
                 current_after,
-                old.sample_term(&expected_before.observations),
-                old.sample_term(&expected_after.observations),
+                old_before.sample_term(&expected_before.original.observations),
+                old_after.sample_term(&expected_after.original.observations),
             ];
             if values.iter().all(Option::is_none) {
                 continue;
