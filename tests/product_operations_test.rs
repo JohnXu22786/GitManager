@@ -1,8 +1,14 @@
 //! Hand-authored component checks, not controller/native-user acceptance.
 #[path = "fixtures/product_runtime/mod.rs"]
 mod fixture;
+#[path = "../src/product_backup.rs"]
+mod product_backup;
 #[path = "../src/product_contract.rs"]
 mod product_contract;
+#[path = "../src/product_decisions/mod.rs"]
+mod product_decisions;
+#[path = "../src/product_locations.rs"]
+mod product_locations;
 #[path = "../src/product_protocol.rs"]
 mod product_protocol;
 #[path = "../src/product_runtime/mod.rs"]
@@ -13,6 +19,1017 @@ use fixture::*;
 use product_contract::*;
 use product_store::*;
 use std::fs;
+
+fn backup_source(root: &Path) -> ProductStore {
+    let store = create(&root.join("source"));
+    let first = store
+        .apply(0, "first", &add("Ada"), RuntimeLimits::default())
+        .unwrap();
+    let mut source = organizer();
+    source["entities"][0]["fields"].as_array_mut().unwrap().push(serde_json::json!({"id":"note","label":"Note","value_type":{"kind":"optional","item":{"kind":"text"}}}));
+    source["actions"][0]["steps"][0]["values"]["note"] = serde_json::json!({"kind":"literal","value_type":{"kind":"optional","item":{"kind":"text"}},"value":{"kind":"text","value":"Later fact"}});
+    let program = capture(source);
+    let plan = store.prepare_switch(&program, "switch").unwrap();
+    let adopted = store
+        .adopt(first.revision, &plan, &program, &first.decisions)
+        .unwrap();
+    let later = store
+        .apply(
+            adopted.revision,
+            "later",
+            &add("Ian"),
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    let selected = store
+        .apply(
+            later.revision,
+            "select",
+            &invoke("collect", Values::new()),
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    store
+        .apply(
+            selected.revision,
+            "export",
+            &invoke("export_people", Values::new()),
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    store
+}
+
+#[test]
+fn verified_backups_recover_later_work_and_outputs_in_a_fresh_process() {
+    use product_backup::VerifiedBackup;
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let store = backup_source(&root);
+    let saved = store.load().unwrap();
+    let backup = VerifiedBackup::capture(&store).unwrap();
+    assert_eq!(backup.snapshot(), &saved);
+    let file = root.join("my-tool.gmbak");
+    backup.export_new(&file).unwrap();
+    let bytes = fs::read(&file).unwrap();
+    assert!(backup.export_new(&file).is_err());
+    assert_eq!(fs::read(&file).unwrap(), bytes);
+    assert!(backup.recover_new(&root.join("source")).is_err());
+    assert_eq!(store.load().unwrap(), saved);
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "backup_recovery_child_probe"])
+        .env("GITMANAGER_BACKUP_PROBE", &file)
+        .status()
+        .unwrap();
+    assert!(child.success());
+    let recovered = product_backup::open_verified(&root.join("fresh-recovery"), None).unwrap();
+    assert_eq!(
+        recovered.snapshot.data.records.len(),
+        saved.data.records.len() + 1
+    );
+    assert_eq!(recovered.snapshot.artifacts, saved.artifacts);
+    assert_eq!(
+        &recovered.snapshot.data.events[..saved.data.events.len()],
+        saved.data.events
+    );
+    assert_eq!(
+        recovered.snapshot.data.records[1].values["note"],
+        string("Later fact")
+    );
+    assert_eq!(fs::read(&file).unwrap(), bytes);
+    assert_eq!(store.load().unwrap(), saved);
+}
+
+#[test]
+fn backup_recovery_child_probe() {
+    let Some(file) = std::env::var_os("GITMANAGER_BACKUP_PROBE") else {
+        return;
+    };
+    let file = std::path::PathBuf::from(file);
+    let backup = product_backup::VerifiedBackup::read(&file).unwrap();
+    let recent = product_locations::RecentTools::open(file.parent().unwrap()).unwrap();
+    let created = backup
+        .recover_tool(&file.parent().unwrap().join("fresh-recovery"), &recent, 1)
+        .unwrap();
+    let id = created.registration.unwrap();
+    assert_eq!(recent.list().unwrap()[0].tool.id, id);
+    let recovered = created.store;
+    let saved = recovered.load().unwrap();
+    assert_eq!(&saved, backup.snapshot());
+    recovered
+        .apply(
+            saved.revision,
+            "continued",
+            &add("Fresh process"),
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+}
+
+#[test]
+fn recovered_intention_history_is_reachable_and_rechecked_by_a_fresh_engine() {
+    use product_backup::VerifiedBackup;
+    use product_decisions::{
+        accept_scene, Choice, DecisionEngine, IntentArchive, IntentionBinding,
+    };
+    use product_runtime::LocalRuntime;
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let source = root.join("source");
+    let program = capture(organizer());
+    let store = ProductStore::create(&source, &program, 20000).unwrap();
+    let runtime = LocalRuntime::default();
+    let engine = DecisionEngine::new(LocalRuntime::default(), IntentArchive::new(store.clone()));
+    let choice = |id: &str, operation: &str, outcome| Choice {
+        id: id.into(),
+        request: format!("Keep the observed {operation} work"),
+        rationale: None,
+        scope: DecisionScope {
+            operations: [operation.into()].into_iter().collect(),
+            population: Population::All,
+            conditions: Values::new(),
+            excluded_records: vec![],
+            unknowns: vec![],
+        },
+        outcome,
+        obligations: vec![],
+        binding: IntentionBinding::ObservedOutcome,
+    };
+    let accepted = scenario(
+        &program,
+        vec![
+            add("Accepted scene"),
+            SemanticInput::Observe {
+                point: "result".into(),
+            },
+        ],
+    );
+    let scene = accept_scene(
+        &runtime,
+        &program,
+        &accepted,
+        Disclosure::Synthetic,
+        RuntimeLimits::default(),
+    )
+    .unwrap();
+    let change = engine
+        .prepare_choice(
+            &store,
+            &program,
+            choice("keep-create", "add_person", DecisionOutcome::KeepCurrent),
+            vec![scene],
+            "accept-create",
+        )
+        .unwrap();
+    engine.adopt(&store, &change).unwrap();
+    let exported = scenario(
+        &program,
+        vec![
+            add("Accepted export"),
+            invoke("collect", Values::new()),
+            invoke("export_people", Values::new()),
+            SemanticInput::Observe {
+                point: "exported".into(),
+            },
+        ],
+    );
+    let scene = accept_scene(
+        &runtime,
+        &program,
+        &exported,
+        Disclosure::Synthetic,
+        RuntimeLimits::default(),
+    )
+    .unwrap();
+    let deferred = engine
+        .prepare_choice(
+            &store,
+            &program,
+            choice("later-export", "export_people", DecisionOutcome::Deferred),
+            vec![scene],
+            "defer-export",
+        )
+        .unwrap();
+    let current = engine.adopt(&store, &deferred).unwrap();
+    let current = store
+        .apply(
+            current.revision,
+            "daily-record",
+            &add("Later real work"),
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    let selected = store
+        .apply(
+            current.revision,
+            "daily-select",
+            &invoke("collect", Values::new()),
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    let saved = store
+        .apply(
+            selected.revision,
+            "daily-output",
+            &invoke("export_people", Values::new()),
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(saved.decisions.decisions.len(), 2);
+    let backup = VerifiedBackup::capture(&store).unwrap();
+    assert!(backup.summary().unwrap().intention_objects >= 2);
+    let file = root.join("with-intentions.gmbak");
+    backup.export_new(&file).unwrap();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "backup_recovery_child_probe"])
+        .env("GITMANAGER_BACKUP_PROBE", &file)
+        .status()
+        .unwrap();
+    assert!(child.success());
+    let target = root.join("fresh-recovery");
+    let reopened = ProductStore::open(&target).unwrap();
+    let resumed = reopened.load().unwrap();
+    assert_eq!(resumed.decisions, saved.decisions);
+    assert_eq!(resumed.adoptions, saved.adoptions);
+    assert_eq!(resumed.data.records.len(), saved.data.records.len() + 1);
+    assert_eq!(resumed.artifacts, saved.artifacts);
+    let recovered_bundle = IntentArchive::new(reopened.clone())
+        .export_for(&resumed)
+        .unwrap();
+    assert_eq!(
+        recovered_bundle.snapshot_digest(),
+        &canonical_digest(IdentityDomain::Data, &resumed).unwrap()
+    );
+    assert_eq!(
+        recovered_bundle.object_count(),
+        backup.summary().unwrap().intention_objects
+    );
+    let fresh = DecisionEngine::new(
+        LocalRuntime::default(),
+        IntentArchive::new(reopened.clone()),
+    );
+    assert_eq!(
+        fresh
+            .intention_binding(&saved.decisions.decisions[0])
+            .unwrap(),
+        IntentionBinding::ObservedOutcome
+    );
+    // A later adoption uses the recovered packages through the real engine,
+    // rerunning earlier obligations rather than accepting imported pass flags.
+    let scene = accept_scene(
+        &runtime,
+        &program,
+        &accepted,
+        Disclosure::Synthetic,
+        RuntimeLimits::default(),
+    )
+    .unwrap();
+    let followup = fresh
+        .prepare_choice(
+            &reopened,
+            &program,
+            choice("after-recovery", "add_person", DecisionOutcome::KeepCurrent),
+            vec![scene],
+            "rechecked",
+        )
+        .unwrap();
+    let checked = fresh.adopt(&reopened, &followup).unwrap();
+    assert_eq!(checked.data, resumed.data);
+    assert_eq!(checked.artifacts, resumed.artifacts);
+    assert_eq!(checked.decisions.decisions.len(), 3);
+    assert_eq!(store.load().unwrap(), saved);
+    // Missing or damaged retained packages block opening and further backup.
+    let witness = &saved.decisions.decisions[0].witness;
+    let object = target.join(format!("extension-{}.json", witness.as_str()));
+    fs::write(&object, b"damaged intention").unwrap();
+    assert!(product_backup::open_verified(&target, None).is_err());
+    assert!(VerifiedBackup::capture(&reopened).is_err());
+    assert_eq!(fs::read(&object).unwrap(), b"damaged intention");
+}
+
+#[test]
+fn backup_intake_rejects_corruption_future_versions_and_oversized_files() {
+    use product_backup::{VerifiedBackup, MAX_BACKUP_BYTES};
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let store = create(&root.join("source"));
+    let before = store.load().unwrap();
+    let backup = VerifiedBackup::capture(&store).unwrap();
+    let bytes = backup.to_bytes().unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let mut future = value.clone();
+    future["version"] = 99.into();
+    let mut corrupt = value.clone();
+    corrupt["payload"]["snapshot"]["revision"] = 200.into();
+    let mut extra = value;
+    extra["../../escape"] = "untrusted".into();
+    for bad in [
+        canonical_bytes(&future).unwrap(),
+        canonical_bytes(&corrupt).unwrap(),
+        canonical_bytes(&extra).unwrap(),
+        b"{unfinished".to_vec(),
+        [bytes.clone(), b" ".to_vec()].concat(),
+    ] {
+        assert!(VerifiedBackup::from_bytes(&bad).is_err());
+    }
+    let huge = root.join("huge.gmbak");
+    fs::File::create(&huge)
+        .unwrap()
+        .set_len(MAX_BACKUP_BYTES as u64 + 1)
+        .unwrap();
+    assert!(VerifiedBackup::read(&huge).is_err());
+    assert_eq!(store.load().unwrap(), before);
+    assert!(!root.join("escape").exists());
+}
+
+#[test]
+fn backup_checksums_do_not_authorize_bad_bundle_references_or_runtime_data() {
+    use product_backup::VerifiedBackup;
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let store = create(&root.join("source"));
+    let bytes = VerifiedBackup::capture(&store).unwrap().to_bytes().unwrap();
+    let original: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let mut cases = Vec::new();
+    let mut wrong = original.clone();
+    wrong["payload"]["intentions"]["snapshot"] = "0".repeat(64).into();
+    cases.push(wrong);
+    let mut future = original.clone();
+    future["payload"]["intentions"]["version"] = 99.into();
+    cases.push(future);
+    let mut extra = original.clone();
+    extra["payload"]["intentions"]["objects"] =
+        serde_json::json!([{ "digest": "0".repeat(64), "bytes": [123, 125] }]);
+    cases.push(extra);
+    let mut huge = original.clone();
+    huge["payload"]["intentions"]["objects"] = serde_json::json!(vec![
+        serde_json::json!({ "digest": "0".repeat(64), "bytes": [123, 125] });
+        513
+    ]);
+    cases.push(huge);
+    let mut invalid = original;
+    invalid["payload"]["snapshot"]["session"]["view"] = "absent-view".into();
+    cases.push(invalid);
+    for mut value in cases {
+        value["digest"] = serde_json::to_value(
+            canonical_digest(IdentityDomain::Evidence, &value["payload"]).unwrap(),
+        )
+        .unwrap();
+        assert!(VerifiedBackup::from_bytes(&canonical_bytes(&value).unwrap()).is_err());
+    }
+    let duplicate = [b"{\"version\":1,".as_slice(), &bytes[1..]].concat();
+    assert!(VerifiedBackup::from_bytes(&duplicate).is_err());
+    assert!(store.load().is_ok());
+}
+
+#[test]
+fn checkpoints_capture_only_consistent_committed_snapshots_during_writes() {
+    use product_backup::VerifiedBackup;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let path = root.join("source");
+    let store = create(&path);
+    let initial = store.load().unwrap();
+    // Make legitimate try-lock contention deterministic, rather than relying
+    // on a fork/scheduling window elsewhere in the parallel test process.
+    let directory = product_files::Directory::open(&path).unwrap();
+    let held = directory.lock().unwrap();
+    let writer = store.clone();
+    let (start, next) = mpsc::sync_channel(1);
+    let (saved, completed) = mpsc::sync_channel(1);
+    let (busy, saw_busy) = mpsc::sync_channel(1);
+    let thread = std::thread::spawn(move || {
+        for i in 0..24 {
+            if next.recv_timeout(Duration::from_secs(30)).is_err() {
+                return;
+            }
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut retries = 0;
+            let result = loop {
+                let result = writer.apply(
+                    i,
+                    &format!("write-{i}"),
+                    &add(&format!("Record {i}")),
+                    RuntimeLimits::default(),
+                );
+                let contention = matches!(&result, Err(StoreError::Io(error))
+                    if matches!(error.get_ref().and_then(|inner|
+                        inner.downcast_ref::<fs::TryLockError>()),
+                        Some(fs::TryLockError::WouldBlock)));
+                if !contention || Instant::now() >= deadline {
+                    break result;
+                }
+                retries += 1;
+                if i == 0 && retries == 1 {
+                    busy.send(()).unwrap();
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            let failed = result.is_err();
+            if saved.send(result).is_err() || failed {
+                return;
+            }
+        }
+    });
+    start.send(()).unwrap();
+    if let Err(wait) = saw_busy.recv_timeout(Duration::from_secs(30)) {
+        match completed.try_recv() {
+            Ok(Err(error)) => panic!("snapshot writer failed before contention: {error:?}"),
+            Ok(Ok(_)) => panic!("snapshot writer bypassed the deliberately held lock"),
+            Err(result) => {
+                panic!("snapshot writer never reported contention: {wait:?}; result={result:?}")
+            }
+        }
+    }
+    let first_capture = VerifiedBackup::capture(&store).unwrap();
+    assert_eq!(first_capture.snapshot(), &initial);
+    drop(held);
+    let mut previous = completed
+        .recv_timeout(Duration::from_secs(30))
+        .expect("snapshot writer did not finish after releasing its lock")
+        .expect("snapshot writer failed after bounded lock-contention retry");
+    for _ in 1..24 {
+        // Each capture races one real commit. Waiting for that commit only
+        // AFTER capture prevents the writer finishing all work beforehand.
+        start.send(()).unwrap();
+        let backup = VerifiedBackup::capture(&store).unwrap();
+        let current = completed
+            .recv_timeout(Duration::from_secs(30))
+            .expect("snapshot writer stalled or exited")
+            .expect("snapshot writer failed; only typed lock contention is retryable");
+        assert!(
+            backup.snapshot() == &previous || backup.snapshot() == &current,
+            "backup mixed data from separate commits"
+        );
+        VerifiedBackup::from_bytes(&backup.to_bytes().unwrap()).unwrap();
+        previous = current;
+    }
+    thread.join().unwrap();
+    assert_eq!(previous.data.records.len(), 24);
+    assert_eq!(
+        VerifiedBackup::capture(&store).unwrap().snapshot(),
+        &previous
+    );
+}
+
+#[test]
+fn backup_capture_ignores_an_interrupted_uncommitted_snapshot() {
+    use product_backup::VerifiedBackup;
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let store = create(&root.join("source"));
+    let committed = store
+        .apply(0, "saved", &add("Saved"), RuntimeLimits::default())
+        .unwrap();
+    let before = VerifiedBackup::capture(&store).unwrap();
+    assert!(store
+        .apply_with_fault(
+            committed.revision,
+            "interrupted",
+            &add("Uncommitted"),
+            RuntimeLimits::default(),
+            FaultPoint::AfterObject
+        )
+        .is_err());
+    let after = VerifiedBackup::capture(&store).unwrap();
+    assert_eq!(after.snapshot(), &committed);
+    assert_eq!(after.digest(), before.digest());
+    assert_eq!(after.to_bytes().unwrap(), before.to_bytes().unwrap());
+}
+
+#[test]
+fn doctor_offers_only_verified_instance_checkpoints_and_preserves_corruption() {
+    use product_backup::{doctor, CheckpointShelf};
+    use product_locations::{RecentTools, ToolIdentity, ToolLocations};
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let locations = ToolLocations::chosen(&root).unwrap();
+    let store = create(&root.join("source"));
+    let saved = store
+        .apply(0, "save", &add("Saved"), RuntimeLimits::default())
+        .unwrap();
+    let identity = ToolIdentity::from_snapshot(&saved).unwrap();
+    let recent = RecentTools::open(&root).unwrap();
+    let instance = recent.remember(&root.join("source"), 1).unwrap();
+    let shelf = CheckpointShelf::for_tool(&locations, &identity, &instance).unwrap();
+    let first = shelf.capture(&store).unwrap();
+    assert_eq!(first.digest, shelf.capture(&store).unwrap().digest);
+    let later = store
+        .apply(
+            saved.revision,
+            "later",
+            &add("Later"),
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    let last = shelf.capture(&store).unwrap();
+    let current_pointer = fs::read(root.join("source/CURRENT")).unwrap();
+    fs::write(&last.path, b"interrupted final backup").unwrap();
+    fs::write(
+        shelf.path().join(".pending-unfinished"),
+        b"not a checkpoint",
+    )
+    .unwrap();
+    // Untrusted directory names must not reach byte-indexing panics.
+    fs::write(
+        shelf
+            .path()
+            .join(format!("checkpoint-{}x.gmbak", "é".repeat(42))),
+        b"untrusted",
+    )
+    .unwrap();
+    fs::write(root.join("source/CURRENT"), b"broken current").unwrap();
+    let report = doctor(&root.join("source"), &identity, &shelf);
+    assert!(report.current.is_none());
+    assert!(report.issue.is_some());
+    let recovered = report.recovery.unwrap();
+    assert_eq!(recovered.snapshot(), &saved);
+    assert!(!report.checkpoint_issues.is_empty());
+    recovered.recover_new(&root.join("recovered")).unwrap();
+    assert_eq!(
+        fs::read(root.join("source/CURRENT")).unwrap(),
+        b"broken current"
+    );
+    assert_eq!(fs::read(&last.path).unwrap(), b"interrupted final backup");
+    assert_eq!(later.data.records.len(), 2);
+    fs::write(root.join("source/CURRENT"), &current_pointer).unwrap();
+    let pointer: serde_json::Value = serde_json::from_slice(&current_pointer).unwrap();
+    let object = root.join("source").join(format!(
+        "object-{}.json",
+        pointer["object"].as_str().unwrap()
+    ));
+    fs::write(&object, b"broken snapshot object").unwrap();
+    assert!(doctor(&root.join("source"), &identity, &shelf)
+        .recovery
+        .is_some());
+    assert_eq!(fs::read(&object).unwrap(), b"broken snapshot object");
+    fs::write(&first.path, b"also corrupt").unwrap();
+    assert!(doctor(&root.join("source"), &identity, &shelf)
+        .recovery
+        .is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn backup_files_refuse_link_redirection_and_leave_targets_unchanged() {
+    use product_backup::VerifiedBackup;
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let store = create(&root.join("source"));
+    let backup = VerifiedBackup::capture(&store).unwrap();
+    let original = root.join("original.gmbak");
+    backup.export_new(&original).unwrap();
+    let bytes = fs::read(&original).unwrap();
+    let link = root.join("linked.gmbak");
+    symlink(&original, &link).unwrap();
+    assert!(VerifiedBackup::read(&link).is_err());
+    assert!(backup.export_new(&link).is_err());
+    let outside = tempfile::tempdir().unwrap();
+    symlink(outside.path(), root.join("redirected-parent")).unwrap();
+    assert!(backup
+        .recover_new(&root.join("redirected-parent/recovery"))
+        .is_err());
+    assert!(!outside.path().join("recovery").exists());
+    fs::hard_link(&original, root.join("hard.gmbak")).unwrap();
+    assert!(VerifiedBackup::read(&original).is_err());
+    assert_eq!(fs::read(&original).unwrap(), bytes);
+}
+
+#[test]
+fn locations_keep_explicit_choices_and_refuse_unsafe_or_unavailable_folders() {
+    use product_locations::ToolLocations;
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    assert!(ToolLocations::chosen(root.join("missing")).is_err());
+    let chosen = ToolLocations::chosen(&root).unwrap();
+    let first = chosen.new_tool_path().unwrap();
+    let second = chosen.new_tool_path().unwrap();
+    assert_eq!(first.parent(), Some(root.as_path()));
+    assert_ne!(first, second);
+    create(&first);
+    assert!(ProductStore::create(&first, &capture(organizer()), 20000).is_err());
+    fs::write(root.join("file"), b"preserve").unwrap();
+    assert!(ToolLocations::chosen(root.join("file")).is_err());
+    assert!(ToolLocations::chosen(root.join("../escape")).is_err());
+    for name in [
+        "CON",
+        "aux.txt",
+        "COM¹.log",
+        "stream:secret",
+        "trailing.",
+        "wild*card",
+    ] {
+        assert_eq!(
+            product_locations::SelectedFile::new(&root.join(name))
+                .err()
+                .unwrap()
+                .kind,
+            product_locations::IssueKind::UnsafePath
+        );
+    }
+    #[cfg(unix)]
+    assert_eq!(
+        product_locations::SelectedFile::new(&root.join("back\\slash"))
+            .err()
+            .unwrap()
+            .kind,
+        product_locations::IssueKind::UnsafePath
+    );
+    let default = ToolLocations::create_default_at(&root.join("private/tools")).unwrap();
+    assert!(default
+        .new_tool_path()
+        .unwrap()
+        .starts_with(root.join("private/tools")));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(root.join("private/tools"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+}
+
+#[test]
+fn recent_tools_survive_restart_and_require_deliberate_identity_checked_relocation() {
+    use product_locations::{RecentAvailability, RecentTools};
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let settings = root.join("settings");
+    fs::create_dir(&settings).unwrap();
+    let recent = RecentTools::open(&settings).unwrap();
+    let path = root.join("tool");
+    let store = create(&path);
+    let id = recent.remember(&path, 10).unwrap();
+    drop(store);
+    let moved = root.join("moved");
+    fs::rename(&path, &moved).unwrap();
+    let reopened = RecentTools::open(&settings).unwrap();
+    assert_eq!(
+        reopened.list().unwrap()[0].availability,
+        RecentAvailability::Missing
+    );
+    reopened.relocate(&id, &moved, 20).unwrap();
+    let entry = reopened.list().unwrap().remove(0);
+    assert_eq!(entry.availability, RecentAvailability::Located);
+    assert_eq!(entry.tool.path, moved);
+    let foreign = root.join("foreign");
+    let mut program = capture(organizer());
+    program.binding.project_id = "other-project".into();
+    ProductStore::create(&foreign, &program, 20000).unwrap();
+    assert!(reopened.relocate(&id, &foreign, 30).is_err());
+    assert_eq!(reopened.list().unwrap()[0].tool.path, moved);
+    fs::write(moved.join("CURRENT"), b"broken").unwrap();
+    assert_eq!(
+        reopened.list().unwrap()[0].availability,
+        RecentAvailability::Unverified
+    );
+    assert_eq!(fs::read(moved.join("CURRENT")).unwrap(), b"broken");
+}
+
+#[test]
+fn a_recovered_copy_at_a_relocated_tools_old_path_gets_a_distinct_instance() {
+    use product_locations::RecentTools;
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let original = root.join("original");
+    let store = create(&original);
+    let snapshot = store.load().unwrap();
+    let recent = RecentTools::open(&root).unwrap();
+    let old_id = recent.remember(&original, 1).unwrap();
+    drop(store);
+    let moved = root.join("moved");
+    fs::rename(&original, &moved).unwrap();
+    recent.relocate(&old_id, &moved, 2).unwrap();
+    ProductStore::create_recovered(&original, &snapshot).unwrap();
+    let new_id = recent.remember(&original, 3).unwrap();
+    assert_ne!(
+        old_id, new_id,
+        "separate recovered instances must not share a checkpoint shelf"
+    );
+    let entries = RecentTools::open(&root).unwrap().list().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(recent.remember(&moved, 4).unwrap(), old_id);
+    assert_eq!(recent.remember(&original, 5).unwrap(), new_id);
+}
+
+#[test]
+fn recovery_registration_cannot_inherit_an_unrelocated_instances_checkpoints() {
+    use product_backup::{CheckpointShelf, VerifiedBackup};
+    use product_locations::{RecentTools, ToolIdentity, ToolLocations};
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let original = root.join("original");
+    let store = create(&original);
+    let older = VerifiedBackup::capture(&store).unwrap();
+    let recent = RecentTools::open(&root).unwrap();
+    let old_id = recent.remember(&original, 1).unwrap();
+    let current = store
+        .apply(
+            0,
+            "newer",
+            &add("Newer original work"),
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    let identity = ToolIdentity::from_snapshot(&current).unwrap();
+    let locations = ToolLocations::chosen(&root).unwrap();
+    let old_shelf = CheckpointShelf::for_tool(&locations, &identity, &old_id).unwrap();
+    old_shelf.capture(&store).unwrap();
+    drop(store);
+    let moved = root.join("moved-without-updating-recents");
+    fs::rename(&original, &moved).unwrap();
+    let before = fs::read(root.join("recent-tools.json")).unwrap();
+    let issue = older.recover_tool(&original, &recent, 2).err().unwrap();
+    assert_eq!(issue.kind, product_locations::IssueKind::Collision);
+    assert!(
+        !original.exists(),
+        "refusal must precede creating the recovered target"
+    );
+    assert_eq!(fs::read(root.join("recent-tools.json")).unwrap(), before);
+    assert_eq!(ProductStore::open(&moved).unwrap().load().unwrap(), current);
+    let destination = root.join("separate-recovery");
+    let created = older.recover_tool(&destination, &recent, 3).unwrap();
+    let recovered_id = created.registration.unwrap();
+    assert_ne!(recovered_id, old_id);
+    assert_eq!(created.store.load().unwrap(), *older.snapshot());
+    let recovered_shelf = CheckpointShelf::for_tool(&locations, &identity, &recovered_id).unwrap();
+    assert!(recovered_shelf
+        .newest_verified()
+        .unwrap()
+        .recovery
+        .is_none());
+    recovered_shelf.capture(&created.store).unwrap();
+    fs::write(destination.join("CURRENT"), b"damaged").unwrap();
+    assert_eq!(
+        product_backup::doctor(&destination, &identity, &recovered_shelf)
+            .recovery
+            .unwrap()
+            .snapshot(),
+        older.snapshot()
+    );
+    assert_eq!(
+        old_shelf
+            .newest_verified()
+            .unwrap()
+            .recovery
+            .unwrap()
+            .snapshot(),
+        &current
+    );
+    let entries = recent.list().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(
+        entries
+            .iter()
+            .find(|entry| entry.tool.id == old_id)
+            .unwrap()
+            .availability,
+        product_locations::RecentAvailability::Missing
+    );
+}
+
+fn report_alias_branch(test: &str, aliases: bool) {
+    use std::io::Write;
+    writeln!(
+        std::io::stdout().lock(),
+        "ALIAS-COVERAGE {test}: {}",
+        if aliases {
+            "case-insensitive assertions passed"
+        } else {
+            "case-sensitive assertions passed; case-insensitive branch unrun"
+        }
+    )
+    .unwrap();
+}
+
+#[test]
+fn recovery_refuses_a_listed_case_alias_before_activation() {
+    use product_locations::RecentTools;
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let original = root.join("original");
+    let store = create(&original);
+    let backup = product_backup::VerifiedBackup::capture(&store).unwrap();
+    let recent = RecentTools::open(&root).unwrap();
+    let original_id = recent.remember(&original, 1).unwrap();
+    // Exercise whichever filesystem semantics the actual platform provides.
+    let alias = root.join("ORIGINAL");
+    let aliases = alias.exists();
+    drop(store);
+    let moved = root.join("moved");
+    fs::rename(&original, &moved).unwrap();
+    let before = fs::read(root.join("recent-tools.json")).unwrap();
+    let result = backup.recover_tool(&alias, &recent, 2);
+    if aliases {
+        assert!(
+            result.is_err(),
+            "case alias cannot inherit an old recent identity"
+        );
+        assert!(
+            !alias.join("CURRENT").exists(),
+            "alias refusal must happen before activation"
+        );
+        assert_eq!(fs::read(root.join("recent-tools.json")).unwrap(), before);
+    } else {
+        let created = result.unwrap();
+        assert_ne!(created.registration.unwrap(), original_id);
+        assert!(!original.exists());
+        assert_eq!(created.store.load().unwrap(), *backup.snapshot());
+    }
+    assert_eq!(
+        ProductStore::open(&moved).unwrap().load().unwrap(),
+        *backup.snapshot()
+    );
+    report_alias_branch("fresh-recovery", aliases);
+}
+
+#[test]
+fn recent_relocation_cannot_merge_a_recovered_instance_through_an_alias() {
+    use product_locations::RecentTools;
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let original = root.join("original");
+    let store = create(&original);
+    let backup = product_backup::VerifiedBackup::capture(&store).unwrap();
+    let recent = RecentTools::open(&root).unwrap();
+    let original_id = recent.remember(&original, 1).unwrap();
+    drop(store);
+    let moved = root.join("moved-original");
+    fs::rename(&original, &moved).unwrap();
+    let recovered = root.join("recovered");
+    let result = backup.recover_tool(&recovered, &recent, 2).unwrap();
+    let recovered_id = result.registration.unwrap();
+    let alias = root.join("RECOVERED");
+    // On a case-sensitive volume, verify the exact-directory collision; on
+    // case-insensitive volumes, exercise the distinct-spelling alias directly.
+    let aliases = alias.exists();
+    let selected = if aliases { &alias } else { &recovered };
+    assert_eq!(recent.remember(selected, 3).unwrap(), recovered_id);
+    assert_eq!(recent.list().unwrap().len(), 2);
+    let before = fs::read(root.join("recent-tools.json")).unwrap();
+    assert!(recent.relocate(&original_id, selected, 4).is_err());
+    assert_eq!(fs::read(root.join("recent-tools.json")).unwrap(), before);
+    recent.relocate(&original_id, &moved, 5).unwrap();
+    assert_eq!(recent.remember(&moved, 6).unwrap(), original_id);
+    assert_eq!(result.store.load().unwrap(), *backup.snapshot());
+    report_alias_branch("recent-relocation", aliases);
+}
+
+#[cfg(unix)]
+#[test]
+fn recovery_does_not_activate_when_recent_folder_is_replaced() {
+    use product_locations::RecentTools;
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let source = create(&root.join("source"));
+    let saved = source.load().unwrap();
+    let settings = root.join("settings");
+    fs::create_dir(&settings).unwrap();
+    let recent = RecentTools::open(&settings).unwrap();
+    recent.remember(&root.join("source"), 1).unwrap();
+    let previous = fs::read(settings.join("recent-tools.json")).unwrap();
+    let destination = root.join("fresh");
+    let moved = root.join("moved-settings");
+    let result = recent.create_and_remember(&destination, 2, |verify_instance| {
+        ProductStore::create_recovered_with(&destination, &saved, |_| {
+            fs::rename(&settings, &moved).unwrap();
+            fs::create_dir(&settings).unwrap();
+            verify_instance().map_err(|e| StoreError::Conflict(e.to_string()))
+        })
+        .map_err(Into::into)
+    });
+    assert!(
+        result.is_err(),
+        "unverified recent-folder identity must prevent activation"
+    );
+    assert!(!destination.join("CURRENT").exists());
+    assert_eq!(fs::read(moved.join("recent-tools.json")).unwrap(), previous);
+    assert!(!settings.join("recent-tools.json").exists());
+    assert_eq!(source.load().unwrap(), saved);
+}
+
+#[test]
+fn recovered_data_survives_recent_registration_failure_and_retry() {
+    use product_locations::RecentTools;
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let source = root.join("source");
+    let store = create(&source);
+    let backup = product_backup::VerifiedBackup::capture(&store).unwrap();
+    let recent = RecentTools::open(&root).unwrap();
+    recent.remember(&source, 1).unwrap();
+    let metadata = root.join("recent-tools.json");
+    let previous = fs::read(&metadata).unwrap();
+    let destination = root.join("fresh");
+    let result = recent
+        .create_and_remember(&destination, 2, |verify_instance| {
+            let recovered = backup.recover_checked(&destination, verify_instance)?;
+            // Model an index-write failure after successful fresh activation.
+            fs::hard_link(&metadata, root.join("metadata-alias")).unwrap();
+            Ok(recovered)
+        })
+        .unwrap();
+    let issue = result.registration.unwrap_err();
+    assert!(issue.message.contains("was saved"));
+    assert!(issue.next_step.contains("Do not repeat recovery"));
+    assert_eq!(result.store.load().unwrap(), *backup.snapshot());
+    assert_eq!(
+        product_backup::open_verified(&destination, None)
+            .unwrap()
+            .snapshot,
+        *backup.snapshot()
+    );
+    assert_eq!(fs::read(&metadata).unwrap(), previous);
+    assert_eq!(store.load().unwrap(), *backup.snapshot());
+    // A corrupt/inaccessible index must stop a later recovery before creation.
+    let another = root.join("another");
+    assert!(backup.recover_tool(&another, &recent, 3).is_err());
+    assert!(!another.exists());
+    assert_eq!(fs::read(&metadata).unwrap(), previous);
+}
+
+#[test]
+fn recent_metadata_corruption_and_future_versions_are_preserved() {
+    use product_locations::RecentTools;
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let recent = RecentTools::open(&root).unwrap();
+    let project = root.join("tool");
+    create(&project);
+    recent.remember(&project, 1).unwrap();
+    let path = root.join("recent-tools.json");
+    let original = fs::read(&path).unwrap();
+    let mut future: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    future["version"] = 99.into();
+    for invalid in [
+        b"{partial".to_vec(),
+        canonical_bytes(&future).unwrap(),
+        vec![b'x'; 1024 * 1024 + 1],
+    ] {
+        fs::write(&path, &invalid).unwrap();
+        assert!(recent.list().is_err());
+        assert!(recent.remember(&project, 2).is_err());
+        assert_eq!(fs::read(&path).unwrap(), invalid);
+    }
+    fs::write(&path, &original).unwrap();
+    assert_eq!(recent.list().unwrap().len(), 1);
+    let mut full: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    let template = full["entries"][0].clone();
+    full["entries"] = serde_json::Value::Array(
+        (0..512)
+            .map(|i| {
+                let mut entry = template.clone();
+                entry["id"] =
+                    serde_json::to_value(canonical_digest(IdentityDomain::Evidence, &i).unwrap())
+                        .unwrap();
+                entry["path"] = serde_json::to_value(root.join(format!("remembered-{i}"))).unwrap();
+                entry
+            })
+            .collect(),
+    );
+    let full = canonical_bytes(&full).unwrap();
+    fs::write(&path, &full).unwrap();
+    let issue = recent.remember(&project, 3).unwrap_err();
+    assert_eq!(issue.kind, product_locations::IssueKind::Limit);
+    assert!(issue.next_step.contains("folder picker"));
+    assert_eq!(fs::read(&path).unwrap(), full);
+    assert!(ProductStore::open(&project).unwrap().load().is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn location_and_recent_links_cannot_redirect_reads_or_writes() {
+    use product_locations::{RecentTools, ToolLocations};
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    symlink(outside.path(), root.join("redirect")).unwrap();
+    assert!(ToolLocations::chosen(root.join("redirect")).is_err());
+    let target = outside.path().join("private");
+    fs::write(&target, b"preserved").unwrap();
+    fs::hard_link(&target, root.join("recent-tools.json")).unwrap();
+    assert!(RecentTools::open(&root).unwrap().list().is_err());
+    assert_eq!(fs::read(&target).unwrap(), b"preserved");
+    let locations = ToolLocations::chosen(&root).unwrap();
+    let parked = root.with_file_name(format!(
+        "{}-parked",
+        root.file_name().unwrap().to_string_lossy()
+    ));
+    fs::rename(&root, &parked).unwrap();
+    symlink(outside.path(), &root).unwrap();
+    assert!(locations.new_tool_path().is_err());
+    fs::remove_file(&root).unwrap();
+    fs::rename(&parked, &root).unwrap();
+}
 
 fn create(path: &std::path::Path) -> ProductStore {
     ProductStore::create(path, &capture(organizer()), 20000).unwrap()
@@ -268,6 +1285,8 @@ fn recovery_without_extension_verification_refuses_references() {
         .unwrap();
     let destination = dir.path().join("recovery");
     assert!(ProductStore::create_recovered(&destination, &current).is_err());
+    assert!(product_backup::VerifiedBackup::capture(&store).is_err());
+    assert!(product_backup::open_verified(&dir.path().join("source"), None).is_err());
     assert!(!destination.exists());
     assert_eq!(store.load().unwrap(), current);
 }
@@ -343,7 +1362,7 @@ use std::path::Path;
 #[test]
 fn concurrent_pointer_replacement_keeps_open_readers_valid() {
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc, Arc,
     };
     use std::time::{Duration, Instant};
@@ -352,15 +1371,25 @@ fn concurrent_pointer_replacement_keeps_open_readers_valid() {
     let files = product_files::Directory::open(&path).unwrap();
     files.publish("CURRENT", b"first", false).unwrap();
     let fault = std::env::var("GITMANAGER_POINTER_WRITER_FAULT").ok();
-    let timeout = if fault.as_deref() == Some("timeout") {
+    let stall_timeout = if fault.as_deref() == Some("timeout") {
         Duration::from_millis(20)
     } else {
         Duration::from_secs(30)
     };
+    // This tests correctness during 1,000 durable publications, not disk
+    // throughput. A stalled writer still fails after 30s without progress;
+    // the separate finite total cap also catches indefinitely slow progress.
+    let total_timeout = if fault.as_deref() == Some("timeout") {
+        stall_timeout
+    } else {
+        Duration::from_secs(120)
+    };
     let cancelled = Arc::new(AtomicBool::new(false));
     let worker_cancelled = cancelled.clone();
+    let published = Arc::new(AtomicUsize::new(0));
+    let worker_published = published.clone();
     let (start, ready) = mpsc::sync_channel(1);
-    let writer = std::thread::spawn(move || {
+    let writer = std::thread::spawn(move || -> io::Result<()> {
         ready.recv().unwrap();
         match fault.as_deref() {
             Some("panic") => panic!("injected pointer writer failure"),
@@ -368,29 +1397,49 @@ fn concurrent_pointer_replacement_keeps_open_readers_valid() {
             _ => {}
         }
         if worker_cancelled.load(Ordering::Acquire) {
-            return;
+            return Ok(());
         }
-        let writer = product_files::Directory::open(&path).unwrap();
+        let writer = product_files::Directory::open(&path)?;
         for i in 0..1000 {
             if worker_cancelled.load(Ordering::Acquire) {
-                return;
+                return Ok(());
             }
-            writer
-                .publish(
-                    "CURRENT",
-                    if i % 2 == 0 { b"first" } else { b"other" },
-                    true,
-                )
-                .unwrap();
+            writer.publish(
+                "CURRENT",
+                if i % 2 == 0 { b"first" } else { b"other" },
+                true,
+            )?;
+            worker_published.store(i + 1, Ordering::Release);
         }
+        Ok(())
     });
-    let deadline = Instant::now() + timeout;
+    if let Some(path) = std::env::var_os("GITMANAGER_POINTER_READY") {
+        fs::write(path, b"ready").unwrap();
+    }
+    let started = Instant::now();
+    let mut last_progress = started;
+    let mut count = 0;
     start.send(()).unwrap();
     let mut failure_count = 0usize;
     let mut first_failure = None;
-    // is_finished covers both successful completion and an unwinding writer.
-    // Keep diagnostics bounded even if every read fails.
-    while !writer.is_finished() && Instant::now() < deadline {
+    // is_finished covers success and panic. Keep both diagnostics and polling
+    // bounded; a tight filesystem-read loop must not starve the writer.
+    while !writer.is_finished() {
+        let now = Instant::now();
+        let current = published.load(Ordering::Acquire);
+        if current != count {
+            count = current;
+            last_progress = now;
+        }
+        if (now.duration_since(last_progress) >= stall_timeout
+            || now.duration_since(started) >= total_timeout)
+            && !writer.is_finished()
+        {
+            cancelled.store(true, Ordering::Release);
+            // Joining unfinished I/O could itself hang the regression.
+            panic!("pointer writer exceeded its deadline: published {count}/1000, elapsed {:?}, no progress {:?}; first read failure: {first_failure:?}",
+                now.duration_since(started), now.duration_since(last_progress));
+        }
         match files.read("CURRENT", 16) {
             Ok(bytes) => assert!(bytes == b"first" || bytes == b"other"),
             Err(error) => {
@@ -398,19 +1447,18 @@ fn concurrent_pointer_replacement_keeps_open_readers_valid() {
                 first_failure.get_or_insert(error);
             }
         }
+        std::thread::sleep(Duration::from_millis(1));
     }
-    if !writer.is_finished() {
-        cancelled.store(true, Ordering::Release);
-        // Joining an unfinished I/O operation could itself hang the test.
-        panic!("pointer writer exceeded its deadline of {timeout:?}");
+    match writer.join() {
+        Ok(result) => result.expect("pointer publication failed"),
+        Err(panic) => std::panic::resume_unwind(panic),
     }
-    if let Err(panic) = writer.join() {
-        std::panic::resume_unwind(panic);
-    }
+    assert_eq!(published.load(Ordering::Acquire), 1000);
     assert_eq!(
         failure_count, 0,
         "an atomically replaced pointer must remain readable; first failure: {first_failure:?}"
     );
+    assert_eq!(files.read("CURRENT", 16).unwrap(), b"other");
 }
 
 #[test]
@@ -575,6 +1623,8 @@ fn pointer_writer_failure_and_timeout_are_bounded() {
         ("timeout", "pointer writer exceeded its deadline"),
     ] {
         let log = tempfile::NamedTempFile::new().unwrap();
+        let signals = tempfile::tempdir().unwrap();
+        let ready = signals.path().join("ready");
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -582,32 +1632,57 @@ fn pointer_writer_failure_and_timeout_are_bounded() {
                 "--nocapture",
             ])
             .env("GITMANAGER_POINTER_WRITER_FAULT", fault)
+            .env("GITMANAGER_POINTER_READY", &ready)
+            // Preserve the actual panic/error text without making symbolizing
+            // this large test binary part of the fault-completion deadline.
+            .env("RUST_BACKTRACE", "0")
             .stdout(Stdio::null())
             .stderr(Stdio::from(log.reopen().unwrap()))
             .spawn()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let startup_deadline = Instant::now() + Duration::from_secs(30);
+        let mut completion_deadline = None;
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
                 break status;
             }
-            if Instant::now() >= deadline {
-                child.kill().unwrap();
-                child.wait().unwrap();
-                panic!("pointer regression child hung after {fault}");
+            if completion_deadline.is_none() && ready.exists() {
+                completion_deadline = Some(Instant::now() + Duration::from_secs(5));
+            }
+            if Instant::now() >= completion_deadline.unwrap_or(startup_deadline) {
+                let phase = if completion_deadline.is_some() {
+                    "after ready"
+                } else {
+                    "before ready"
+                };
+                // A concurrent exit can make kill fail; retain both the exit
+                // result and the bounded actual child diagnostic either way.
+                let kill = child.kill();
+                let exit = child.wait();
+                let mut diagnostic = String::new();
+                log.reopen()
+                    .unwrap()
+                    .take(32 * 1024)
+                    .read_to_string(&mut diagnostic)
+                    .unwrap();
+                panic!("pointer regression child exceeded {phase} deadline for {fault}; kill={kill:?}, exit={exit:?}, diagnostic={diagnostic}");
             }
             std::thread::sleep(Duration::from_millis(5));
         };
-        assert!(
-            !status.success(),
-            "the injected {fault} must remain a failing test"
-        );
         let mut diagnostic = String::new();
         log.reopen()
             .unwrap()
             .take(32 * 1024)
             .read_to_string(&mut diagnostic)
             .unwrap();
+        assert!(
+            ready.exists(),
+            "pointer fault child exited before fixture readiness: {status:?}; {diagnostic}"
+        );
+        assert!(
+            !status.success(),
+            "the injected {fault} must remain a failing test; {diagnostic}"
+        );
         assert!(
             diagnostic.contains(expected),
             "missing actual {fault} diagnosis: {diagnostic}"
