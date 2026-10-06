@@ -151,7 +151,8 @@ impl ProviderTransport {
         &self.endpoint.executable
     }
     /// Runs only bounded version/help/auth status commands, with cleared env.
-    /// No cached successful probe can survive an executable or config change.
+    /// Submission rechecks executable content and diagnostic outputs, not
+    /// effective configuration, the tool catalog, or injected context.
     pub fn probe(&self) -> ProviderCapabilities {
         self.endpoint.probe(&self.root)
     }
@@ -183,7 +184,14 @@ impl ProviderTransport {
         let (stdin, schema) = adapter::wire(&request, &nonce)?;
         let capability_notice = match request.profile {
             CapabilityProfile::DataOnly => "Requires an established no-tools, no-MCP, no-hooks, no-plugins and no-host-context profile; not an OS sandbox for the installed CLI itself.",
-            CapabilityProfile::TrustedHarness => "Trusted-Harness is NOT tool-free or confined data disclosure. The installed CLI and administrator-managed configuration can apply hooks, plugins/MCP and host context, potentially reading or transmitting files outside this job and making network calls. We request supported restrictions and disable known integrations, but effective configuration and sandbox enforcement are unverified. The CLI itself retains ordinary OS-user access and existing authentication. Model-service communication is separate from tool subprocess network restrictions. Approve only if you trust this installed Harness and its configuration.",
+            CapabilityProfile::TrustedHarness => concat!(
+                "Trusted-Harness is NOT tool-free or confined data disclosure. ",
+                "The application-controlled input is the prepared prompt, transport instructions, correlation fields and output schema. Their digests bind these bytes, not the CLI's full model context. ",
+                "Requested controls aim to restrict known tools and integrations; effective configuration and sandbox enforcement are unverified. ",
+                "Before submission, we recheck executable content, version/help/auth diagnostic outputs, invocation arguments and HOME/PATH/LANG/LC_ALL values. These fingerprints are not isolation or effective-configuration attestations. Configuration changes with unchanged diagnostic outputs can go undetected. The effective tool catalog and injected context remain unknown. ",
+                "The installed CLI and administrator-managed configuration may apply hooks, plugins/MCP and host context, potentially reading or transmitting files outside this job and making network calls. The CLI itself retains ordinary OS-user access and existing authentication. Model-service communication is separate from tool subprocess network restrictions. ",
+                "Approve only if you trust this installed Harness and its configuration.",
+            ),
         };
         let command_digest =
             self.endpoint
