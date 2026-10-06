@@ -253,3 +253,25 @@ pub enum ScopeTransition {
     Withdrawal,
     Evolution,
 }
+
+/// Read-only editing guidance. This is not a preparation or adoption authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScopeEditableContext {
+    /// Exact compiled source whose ordinary logical coordinates are described.
+    pub compiled_source: Digest,
+    /// Honest host-authored live-rule projection with no protected metadata.
+    pub editable: CapturedProgram,
+    pub slots: Vec<ScopeEditableSlot>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ScopeEditableSlot {
+    pub layer: Digest,
+    pub patch: usize,
+    pub active: bool,
+    /// Logical location before host instrumentation, not a JSON pointer into
+    /// the compiled source. The compiled_source binds its verified manifest.
+    pub destination: EffectDestination,
+    pub entity: Id,
+    pub subject: Id,
+    pub value_type: Type,
+}

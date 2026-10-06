@@ -197,12 +197,18 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 .ok_or_else(|| invalid("scoped decision receipt missing"))?;
             retire.extend(receipt.decisions.iter().cloned());
         }
+        // A promise can have been explicitly retired before its executable
+        // layer. Preserve that terminal decision and its original receipt.
+        retire.retain(|id| {
+            current
+                .decisions
+                .decisions
+                .iter()
+                .any(|d| &d.id == id && d.status == DecisionStatus::Active)
+        });
         let mut next = current.decisions.clone();
         for decision in &mut next.decisions {
             if retire.contains(&decision.id) {
-                if decision.status != DecisionStatus::Active {
-                    return Err(invalid("only an active scoped intention can be withdrawn"));
-                }
                 decision.status = DecisionStatus::Withdrawn {
                     adoption: id.into(),
                 };

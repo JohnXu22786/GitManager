@@ -555,12 +555,16 @@ impl ReplayAdmission for HistoryAdmission {
         if !crate::product_runtime::has_protected_fields(source) {
             return Ok(());
         }
-        let context = self
-            .contexts
+        // Several independently verified contexts can contain the same
+        // baseline source. Admission is the exact source-and-data pair, not
+        // the first source match (a newer preparation may initialize a seed).
+        self.contexts
             .iter()
-            .find(|context| context.contains_managed_source(source))
-            .ok_or_else(|| unavailable("scoped source has no verified host preparation"))?;
-        context.validate_seed(source, data, day)
+            .filter(|context| context.contains_managed_source(source))
+            .find_map(|context| context.validate_seed(source, data, day).ok())
+            .ok_or_else(|| {
+                unavailable("scoped source and data have no matching verified host context")
+            })
     }
     fn validate_state(
         &self,
@@ -571,11 +575,15 @@ impl ReplayAdmission for HistoryAdmission {
         if !crate::product_runtime::has_protected_fields(source) {
             return Ok(());
         }
-        let context = self
-            .contexts
+        // Several independently verified contexts can contain the same
+        // baseline source. Admission is the exact source-and-data pair, not
+        // the first source match (a newer preparation may initialize a seed).
+        self.contexts
             .iter()
-            .find(|context| context.contains_managed_source(source))
-            .ok_or_else(|| unavailable("scoped source has no verified host preparation"))?;
-        context.validate_state(source, data, day)
+            .filter(|context| context.contains_managed_source(source))
+            .find_map(|context| context.validate_state(source, data, day).ok())
+            .ok_or_else(|| {
+                unavailable("scoped source and data have no matching verified host context")
+            })
     }
 }

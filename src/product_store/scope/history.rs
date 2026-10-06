@@ -305,6 +305,27 @@ pub(super) fn verify_history(snapshot: &ProjectSnapshot) -> Result<()> {
                     if value_bool(&after, &member)? != value_bool(&expected, &member)? {
                         return Err(error("cohort membership changed after creation"));
                     }
+                    // Terminal facts require a seal independently of whether
+                    // the event claims to have produced one.
+                    let source = producer_manifest(snapshot, &event.program)
+                        .ok_or_else(|| error("business event source is not verified"))?;
+                    let producer = program(snapshot, &source.output)?;
+                    let mut event_data = snapshot.data.clone();
+                    let event_row = event_data
+                        .records
+                        .iter_mut()
+                        .find(|r| row_ref(r) == reference)
+                        .unwrap();
+                    event_row.values = change.after.clone();
+                    event_row.archived = change.archived;
+                    if (change.archived
+                        || completed(producer, &event_data, &reference, lifecycle, event.day)?)
+                        && !value_bool(&after, &sealed)?
+                    {
+                        return Err(error(
+                            "terminal business event omitted its required result seal",
+                        ));
+                    }
                     if value_bool(&expected, &sealed)? {
                         if after != expected {
                             return Err(error("completed result seal was modified"));
@@ -325,6 +346,9 @@ pub(super) fn verify_history(snapshot: &ProjectSnapshot) -> Result<()> {
                             == Some(&DataValue::Text {
                                 value: "ObservedAtArchive".into(),
                             });
+                        if archive && !change.archived {
+                            return Err(error("archive provenance requires a real archive event"));
+                        }
                         if !archive
                             && origin
                                 != Some(&DataValue::Text {
@@ -442,8 +466,17 @@ pub(super) fn verify_history(snapshot: &ProjectSnapshot) -> Result<()> {
                 {
                     return Err(error("terminal completed work cannot be silently reopened"));
                 }
-                if row.archived && !is_sealed {
-                    return Err(error("archived result was not preserved"));
+                if !is_sealed
+                    && (row.archived
+                        || completed(
+                            snapshot.program()?,
+                            &snapshot.data,
+                            &reference,
+                            lifecycle,
+                            snapshot.clock_day,
+                        )?)
+                {
+                    return Err(error("terminal result was not preserved"));
                 }
                 if is_sealed {
                     for patch in &layer.patches {

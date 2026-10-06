@@ -510,7 +510,17 @@ fn sink_dependencies(steps: &[Statement], changed: &str) -> bool {
                     Expr::Variable { name } => Some(name.as_str()),
                     _ => None,
                 };
-                if values.values().any(|v| foreign_read(v, changed, subject)) {
+                // A durable alias can later cross a row boundary through a
+                // different field name. Keep this bounded compiler sound by
+                // rejecting propagation into any other stored field.
+                if values.iter().any(|(field, value)| {
+                    foreign_read(value, changed, subject)
+                        || (field != changed
+                            && mentions(
+                                &serde_json::to_value(value).expect("typed expression"),
+                                changed,
+                            ))
+                }) {
                     return true;
                 }
             }
@@ -569,7 +579,7 @@ fn check_dependencies(app: &AppDefinition, entity_id: &str, changed: &str) -> Re
                     .any(|e| foreign_read(e, changed, None))
         })
     {
-        return Err(error("changed durable value influences a foreign-row write, shared selection, state, constraint or uniqueness rule"));
+        return Err(error("changed durable value influences another stored field, a foreign-row write, shared selection, state, constraint or uniqueness rule"));
     }
     Ok(())
 }

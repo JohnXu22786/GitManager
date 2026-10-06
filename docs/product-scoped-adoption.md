@@ -24,7 +24,7 @@ deterministic composition has honest ExternalAuthor provenance.
   implementation while retaining every protected result slot
 
 The compiler checks complete action/view shells and dependencies. Partial
-structural rewrites, foreign-row writes, shared selection dependencies, changed
+structural rewrites, foreign-row writes, durable aliases of scoped values, shared selection dependencies, changed
 loop membership, unsupported conditions, ambiguous slot mappings and unsafe
 completion/output ordering are refused with a forward-repair explanation.
 Shared output definitions require every affected emission to be explicitly
@@ -49,20 +49,28 @@ covered. This is not arbitrary application composition.
    one snapshot through the existing atomic CURRENT pointer
 6. For structural evolution, first use prepare_managed_evolution with an exact
    ScopeSlotMapping for every retained protected slot. Pass the resulting handle
-   to prepare_managed_change
+   to prepare_managed_change. ProjectSnapshot::editable_scope_context provides
+   an honestly host-authored ordinary live-rule capture and every retained slot.
+   Slot coordinates refer to the pre-instrumentation business shell, bound to
+   the exact compiled source; they are not compiled JSON pointers. Modify and
+   Reconcile requests include this editable source before the unchanged compiled
+   current source. Discover preserves its exact source pair and receives only
+   slot guidance. Source-count or complete-context overflow fails explicitly
 7. Discovery loads VerifiedRetainedHistory from the store. Register prospective
    managed targets with map_prepared_target. Source-only mapping cannot supply
    scope authority. Both replay and comparison receive the verified admission
    registry; stale requests remain unverified
 8. Withdraw exact layers through DecisionEngine::prepare_scoped_withdrawal.
    It compiles remaining behavior on current data and retires only associated
-   intentions. It never restores an old database snapshot
+   active intentions. Already withdrawn or superseded intentions keep their
+   original history. It never restores an old database snapshot
 
 Protected cohort fields, saved values and provenance are scenario validity
 data. Reduction cannot erase them. Unknown correspondence between a synthetic
 seed and a real frozen cohort remains unverified. Additive schema projection
 of an authenticated accepted seed is checked separately and cannot change its
-business facts.
+business facts. The initialized seed of a managed evolution remains authenticated
+through its exact retained basis and source after later edits and restart.
 
 ## Persistence, upgrades and recovery
 

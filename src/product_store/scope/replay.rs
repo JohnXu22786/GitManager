@@ -78,7 +78,7 @@ impl ScopedExecutionContext {
         Ok(Self {
             snapshot: working,
             adoption_target: prepared.manifest.output.clone(),
-            projected_seeds: BTreeSet::new(),
+            projected_seeds: BTreeSet::from([checked.initialized.identity()?]),
         })
     }
     pub fn contains_managed_source(&self, source: &CapturedProgram) -> bool {
@@ -159,6 +159,23 @@ impl ScopedExecutionContext {
         self.verify_state(target, data, day)
     }
     fn known_seed(&self, digest: &Digest) -> Result<bool> {
+        // Evolution and withdrawal add no layer initialization receipt. Their
+        // exact initialized seeds remain reproducible from verified immutable
+        // basis/source pairs after restart and subsequent business writes.
+        for manifest in self.snapshot.scope.compositions.values() {
+            if matches!(
+                manifest.transition,
+                ScopeTransition::Evolution | ScopeTransition::Withdrawal
+            ) && merged_data(
+                program(&self.snapshot, &manifest.output)?,
+                &manifest.basis.data,
+            )?
+            .identity()?
+                == *digest
+            {
+                return Ok(true);
+            }
+        }
         Ok(self.projected_seeds.contains(digest)
             || self.snapshot.data.identity()? == *digest
             || self

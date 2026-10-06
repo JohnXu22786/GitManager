@@ -672,3 +672,47 @@ impl ProductStore {
         Ok(view)
     }
 }
+
+impl ProjectSnapshot {
+    /// Supply a fresh author with ordinary editable rules and complete logical
+    /// slot coordinates, without exposing frozen data or authoring authority.
+    pub fn editable_scope_context(&self) -> Result<Option<ScopeEditableContext>> {
+        self.validate()?;
+        let Some(manifest) = self.scope.compositions.get(&self.active_revision) else {
+            return Ok(None);
+        };
+        let app = compiler::business_program(self)?;
+        compiler::reject_reserved(&app)?;
+        let editable = CapturedProgram::capture(
+            &canonical_bytes(&app)?,
+            &self.data.project_id,
+            Producer::ExternalAuthor {
+                description: format!(
+                    "Host-authored editable live-rule projection of {}",
+                    self.active_revision.as_str()
+                ),
+            },
+            None,
+        )?;
+        let mut slots = vec![];
+        for id in &manifest.layers {
+            for index in 0..self.scope.layers[id].patches.len() {
+                let patch = compiler::effective_patch(self, manifest, id, index)?;
+                slots.push(ScopeEditableSlot {
+                    layer: id.clone(),
+                    patch: index,
+                    active: manifest.active.contains(id),
+                    destination: patch.request.destination,
+                    entity: patch.request.entity,
+                    subject: patch.request.subject,
+                    value_type: patch.request.value_type,
+                });
+            }
+        }
+        Ok(Some(ScopeEditableContext {
+            compiled_source: self.active_revision.clone(),
+            editable,
+            slots,
+        }))
+    }
+}

@@ -666,3 +666,103 @@ fn unpatched_shared_export_cannot_be_labelled_as_preserved_history() {
         .is_err());
     assert_eq!(store.load().unwrap(), before);
 }
+
+#[test]
+fn durable_aliases_cannot_carry_scoped_values_into_foreign_rows() {
+    fn aliases(pause: bool) -> CapturedProgram {
+        let mut raw = serde_json::to_value(program(pause).program).unwrap();
+        for field in ["cached", "copied"] {
+            raw["entities"][0]["fields"].as_array_mut().unwrap().push(
+                serde_json::json!({"id":field,"label":field,"value_type":{"kind":"integer"}}),
+            );
+            raw["actions"][0]["steps"][0]["values"][field] = serde_json::to_value(int(0)).unwrap();
+        }
+        raw["actions"].as_array_mut().unwrap().extend([
+            serde_json::json!({"id":"cache_result","label":"Cache locally","parameters":{"row":{"kind":"reference","entity":"job"}},"guards":[],"steps":[{"kind":"update","record":var("row"),"values":{"cached":field("row","production")}}],"ensures":[]}),
+            serde_json::json!({"id":"copy_cached","label":"Copy cached result","parameters":{"source":{"kind":"reference","entity":"job"},"target":{"kind":"reference","entity":"job"}},"guards":[],"steps":[{"kind":"update","record":var("target"),"values":{"copied":field("source","cached")}}],"ensures":[]})]);
+        capture(raw)
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let store = ProductStore::create(dir.path().join("tool"), &aliases(false), 20000).unwrap();
+    let selected = add(&store, "selected", "Selected");
+    add(&store, "other", "Other");
+    let before = store.load().unwrap();
+    let req = request(
+        &before,
+        ScopePopulation::SelectedUnfinished {
+            records: vec![RecordRef {
+                entity: selected.entity,
+                record: selected.id,
+            }],
+        },
+    );
+    assert!(store
+        .prepare_scoped_change(&aliases(true), &req, "unsafe-alias")
+        .is_err());
+    assert_eq!(store.load().unwrap(), before);
+}
+fn completed_scope_snapshot() -> product_store::ProjectSnapshot {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
+    let before = store.load().unwrap();
+    let prepared = store
+        .prepare_scoped_change(
+            &program(true),
+            &request(&before, ScopePopulation::FutureWork),
+            "scope",
+        )
+        .unwrap();
+    store.adopt_scoped(before.revision, &prepared).unwrap();
+    let row = add(&store, "born", "Later");
+    action(&store, "waiting", "wait", &row);
+    tick(&store, "days", 20003);
+    action(&store, "complete", "complete", &row)
+}
+#[test]
+fn terminal_work_cannot_erase_its_required_completion_seal() {
+    let mut snapshot = completed_scope_snapshot();
+    let event = snapshot
+        .data
+        .events
+        .iter_mut()
+        .find(|e| e.operation_id == "complete")
+        .unwrap();
+    let change = &mut event.changes[0];
+    let prior = change.before.as_ref().unwrap();
+    change.after.retain(|key, _| !key.starts_with("gm_scope_"));
+    change.after.extend(
+        prior
+            .iter()
+            .filter(|(key, _)| key.starts_with("gm_scope_"))
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    snapshot.data.records[0].values = change.after.clone();
+    assert!(snapshot.validate().is_err());
+}
+#[test]
+fn completion_cannot_claim_an_archive_event_that_never_happened() {
+    let mut snapshot = completed_scope_snapshot();
+    assert!(!snapshot.data.records[0].archived);
+    let origin = snapshot.data.records[0]
+        .values
+        .keys()
+        .find(|key| key.starts_with("gm_scope_") && key.ends_with("_origin"))
+        .unwrap()
+        .clone();
+    let forged = DataValue::Text {
+        value: "ObservedAtArchive".into(),
+    };
+    snapshot.data.records[0]
+        .values
+        .insert(origin.clone(), forged.clone());
+    snapshot
+        .data
+        .events
+        .iter_mut()
+        .find(|e| e.operation_id == "complete")
+        .unwrap()
+        .changes[0]
+        .after
+        .insert(origin, forged);
+    assert!(snapshot.validate().is_err());
+}

@@ -365,6 +365,24 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 });
             }
         }
+        if let Some(editable) = current.editable_scope_context()? {
+            let editing = request.operation != DevelopmentOperation::Discover;
+            if editing && !request.sources.iter().any(|p| p == &editable.editable) {
+                request.sources.push(editable.editable.clone());
+            }
+            // Discover's extra sources must remain accepted-scene artifacts.
+            // It receives the slot index, while modification/reconciliation
+            // also carries the honest ordinary capture as an actual source.
+            let index = serde_json::json!({
+                "compiled_source": editable.compiled_source,
+                "editable_source": if editing { Some(canonical_digest(IdentityDomain::Source, &editable.editable)?) } else { None },
+                "slots": editable.slots,
+            });
+            request.request.push_str(&format!(
+                "\nHost-verified editing guide: slots use pre-instrumentation logical coordinates bound to compiled_source, not compiled JSON pointers. Edit ordinary rules; never author protected metadata. Map every retained slot to the exact new ordinary source, including inactive history slots. The host must prepare and recheck the complete result. {}",
+                String::from_utf8(canonical_bytes(&index)?).map_err(|_| invalid("scope editing index encoding failed"))?
+            ));
+        }
         // Discover preserves its primary pair; other transports bind the last source.
         if request.operation != DevelopmentOperation::Discover {
             request.sources.retain(|p| {
