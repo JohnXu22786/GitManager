@@ -27,7 +27,9 @@ The compiler checks complete action/view shells and dependencies. Partial
 structural rewrites, foreign-row writes, durable aliases of scoped values, shared selection dependencies, changed
 loop membership, unsupported conditions, ambiguous slot mappings and unsafe
 completion/output ordering (including loop back edges) are refused with a
-forward-repair explanation. Preserved projections on either side and after
+forward-repair explanation. A protected entity keeps one completed-work
+predicate across retained layers; redefining that lifecycle is unsupported.
+Preserved projections on either side and after
 mapping must be independent of action parameters.
 Shared output definitions require every affected emission to be explicitly
 covered. Every writer of a protected durable result must also be enumerated;

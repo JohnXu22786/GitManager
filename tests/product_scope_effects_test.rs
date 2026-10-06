@@ -1032,3 +1032,71 @@ fn historical_row_verification_allows_valid_unique_value_reuse() {
         .is_err());
     assert_eq!(reopened.load().unwrap(), before);
 }
+
+#[test]
+fn incompatible_lifecycle_cannot_reopen_an_earlier_sealed_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tool");
+    let store = ProductStore::create(&path, &program(false), 20000).unwrap();
+    let job = add(&store, "job", "Waiting completed work");
+    action(&store, "wait", "wait", &job);
+    tick(&store, "days", 20003);
+    let before = store.load().unwrap();
+    let first = store
+        .prepare_scoped_change(
+            &program(true),
+            &request(&before, ScopePopulation::All),
+            "first",
+        )
+        .unwrap();
+    store.adopt_scoped(before.revision, &first).unwrap();
+    action(&store, "complete", "complete", &job);
+    let sealed = apply(&store, "saved-export", invoke("export", &[]));
+    assert_eq!(
+        sealed.artifacts.last().unwrap().rows[0]["production"],
+        DataValue::Integer { value: 0 }
+    );
+    let mut raw = serde_json::to_value(program(true).program).unwrap();
+    for pointer in [
+        "/actions/3/steps/0/values/production",
+        "/actions/4/steps/0/values/production",
+        "/actions/6/steps/0/columns/production",
+        "/views/0/kind/columns/1/value",
+    ] {
+        let value = raw.pointer(pointer).unwrap().clone();
+        *raw.pointer_mut(pointer).unwrap() =
+            serde_json::json!({"kind":"add","left":value,"right":int(9)});
+    }
+    for population in [
+        ScopePopulation::All,
+        ScopePopulation::SelectedUnfinished {
+            records: vec![RecordRef {
+                entity: job.entity.clone(),
+                record: job.id.clone(),
+            }],
+        },
+    ] {
+        let mut later = request(&sealed, population);
+        later.lifecycles[0].completed = Expr::And {
+            values: vec![
+                field("record", "done"),
+                Expr::Not {
+                    value: Box::new(field("record", "waiting")),
+                },
+            ],
+        };
+        assert!(store
+            .prepare_scoped_change(&capture(raw.clone()), &later, "must-not-reopen")
+            .is_err());
+        assert_eq!(store.load().unwrap(), sealed);
+    }
+    let reopened = ProductStore::open(&path).unwrap();
+    let later = add(&reopened, "later", "Continued legitimate work");
+    action(&reopened, "later-calculate", "calculate", &later);
+    let result = apply(&reopened, "later-export", invoke("export", &[]));
+    assert_eq!(
+        result.artifacts.last().unwrap().rows[0]["production"],
+        DataValue::Integer { value: 0 }
+    );
+    assert_eq!(row(&result, &job).values, row(&sealed, &job).values);
+}

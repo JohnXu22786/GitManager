@@ -575,7 +575,7 @@ pub(super) fn verify_history_frames(
                 }
             }
         }
-        for original in layer.basis.data.records.iter().filter(|r| {
+        for original in basis_data.records.iter().filter(|r| {
             layer
                 .request
                 .lifecycles

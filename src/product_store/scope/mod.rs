@@ -67,6 +67,15 @@ fn request_valid(snapshot: &ProjectSnapshot, request: &ScopeRequest) -> Result<(
         if lifecycle.source != snapshot.active_revision || !entities.insert(&lifecycle.entity) {
             return Err(compiler::error("stale or duplicate completion binding"));
         }
+        if snapshot
+            .scope
+            .layers
+            .values()
+            .flat_map(|layer| &layer.request.lifecycles)
+            .any(|prior| prior.entity == lifecycle.entity && prior.completed != lifecycle.completed)
+        {
+            return Err(compiler::error("completion meaning differs from protected entity history; lifecycle redefinition requires an explicit preservation design"));
+        }
         compiler::own_row(
             &lifecycle.completed,
             "record",

@@ -2550,3 +2550,176 @@ fn first_scope_can_be_rehearsed_and_retained_before_any_live_layer_exists() {
     assert!(actual.scope.layers.is_empty());
     product_backup::VerifiedBackup::capture(&recovered).unwrap();
 }
+
+#[test]
+fn fresh_scoped_discovery_retains_creation_identity_without_pending_history() {
+    use product_discovery::{discover, DiscoveryPolicy, VerifiedRetainedHistory};
+    use std::sync::{atomic::AtomicBool, Arc};
+    let dir = tempfile::tempdir().unwrap();
+    let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
+    add(
+        &store,
+        "existing",
+        "Existing work changes the metadata-bearing seed",
+    );
+    let current = store.load().unwrap();
+    assert!(current.decisions.decisions.is_empty());
+    let prepared = store
+        .prepare_scoped_change(
+            &program(true),
+            &request(&current, ScopePopulation::FutureWork),
+            "prospective",
+        )
+        .unwrap();
+    let mut scene = ScenarioSpec {
+        version: 1,
+        id: "fresh-created-reference".into(),
+        label: "New waiting work with an existing seed row".into(),
+        seed: current.data.clone(),
+        session: current.session.clone(),
+        clock_day: current.clock_day,
+        random_seed: 42,
+        inputs: vec![invoke(
+            "add",
+            &[
+                ("name", text("Scene work")),
+                ("promised", DataValue::Date { days: 20020 }),
+            ],
+        )],
+        validity: vec![],
+    };
+    let runtime = LocalRuntime::default();
+    let mut run = runtime
+        .start(
+            current.program().unwrap(),
+            &scene.seed,
+            &scene.session,
+            scene.clock_day,
+            scene.random_seed,
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    runtime
+        .apply(
+            &mut run,
+            &scene.inputs[0],
+            &scene.replay_operation_ids().unwrap()[0],
+        )
+        .unwrap();
+    let created = runtime
+        .data(&run)
+        .records
+        .iter()
+        .find(|r| r.values["name"] == text("Scene work"))
+        .unwrap()
+        .clone();
+    scene.inputs.extend([
+        invoke("wait", &[("row", reference(&created))]),
+        SemanticInput::AdvanceClock { days: 3 },
+        invoke("calculate", &[("row", reference(&created))]),
+        invoke("complete", &[("row", reference(&created))]),
+        invoke("export", &[]),
+        SemanticInput::Observe {
+            point: "result".into(),
+        },
+    ]);
+    let engine = DecisionEngine::new(LocalRuntime::default(), IntentArchive::new(store.clone()));
+    let request = engine
+        .inherit_request(
+            &current,
+            DevelopmentRequest {
+                version: 1,
+                id: "fresh-scope-discovery".into(),
+                project_id: current.data.project_id.clone(),
+                operation: DevelopmentOperation::Discover,
+                request: "Compare waiting-time rules on newly created work".into(),
+                sources: vec![
+                    current.program().unwrap().clone(),
+                    prepared.target().clone(),
+                ],
+                context: DevelopmentContext {
+                    view: Some("work".into()),
+                    selected: vec![],
+                    recent_inputs: vec![],
+                    data_digest: Some(current.data.identity().unwrap()),
+                    session_digest: Some(current.session.identity().unwrap()),
+                },
+                examples: vec![],
+                accepted_scenes: vec![],
+                decisions: current.decisions.clone(),
+                unknowns: vec![],
+                required_capabilities: Default::default(),
+            },
+        )
+        .unwrap();
+    let response = DevelopmentResult {
+        producer: Producer::Fixture {
+            name: "Fresh source-qualified scope comparison".into(),
+        },
+        response: DevelopmentResponse {
+            version: 1,
+            request_digest: request.identity().unwrap(),
+            candidates: vec![
+                GeneratedCandidate {
+                    id: "before".into(),
+                    source_json: String::from_utf8(current.program().unwrap().source_bytes.clone())
+                        .unwrap(),
+                },
+                GeneratedCandidate {
+                    id: "after".into(),
+                    source_json: String::from_utf8(prepared.target().source_bytes.clone()).unwrap(),
+                },
+            ],
+            hypotheses: vec![ChoiceHypothesis {
+                id: "waiting-rule".into(),
+                statement: "Waiting can pause production for future work".into(),
+                kind: HypothesisKind::UnresolvedChoice,
+                action: "export".into(),
+                observable: "production".into(),
+                sources: vec![SourceLocus {
+                    relative_path: prepared.target().binding.program_path.clone(),
+                    raw_digest: prepared.target().artifact.raw_digest.clone(),
+                    pointer: "/views/0/kind/columns/1/value".into(),
+                }],
+                alternatives: vec!["before".into(), "after".into()],
+                related_decisions: vec![],
+                scenario_json: serde_json::to_string(&scene).unwrap(),
+                unknowns: vec![],
+            }],
+            evolutions: vec![],
+            unsupported: vec![],
+        },
+    };
+    let mut history = VerifiedRetainedHistory::load(&store).unwrap();
+    history
+        .map_prepared_target(prepared.clone(), vec![])
+        .unwrap();
+    let report = discover(
+        &request,
+        &response,
+        &DiscoveryPolicy {
+            retained_history: Some(history),
+            ..Default::default()
+        },
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    assert!(!report.questions.is_empty(), "{:?}", report);
+    for (id, value) in [("captured-baseline", 3), ("captured-candidate", 0)] {
+        let run = report.runs.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(run.state, EvidenceState::Observed, "{:?}", run.errors);
+        assert!(run.observations[0]
+            .view
+            .rows
+            .iter()
+            .any(|r| r.record.record == created.id));
+        let row = run.observations[0].outputs[0]
+            .rows
+            .iter()
+            .find(|r| r["name"] == text("Scene work"))
+            .unwrap();
+        assert_eq!(row["production"], DataValue::Integer { value });
+        assert_ne!(run.binding.scenario_digest, scene.identity().unwrap());
+    }
+    assert_eq!(store.load().unwrap(), current);
+}

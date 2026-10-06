@@ -8,6 +8,8 @@ use crate::product_runtime::ReplayAdmission;
 use crate::product_store::scope::{PreparedScopedChange, ScopedExecutionContext};
 use crate::product_store::{ProductStore, ProjectSnapshot};
 
+type ProjectionRegistry = Arc<std::sync::RwLock<BTreeMap<Digest, ScopedExecutionContext>>>;
+
 /// Loaded only through V07's independently replayed projection. No provider or
 /// deserialized public flags can construct this authority. The saved package
 /// identities remain unchanged and reachable through the ordinary intent bundle.
@@ -20,6 +22,7 @@ pub struct VerifiedRetainedHistory {
     projection_replays: usize,
     mapped_scenes: Vec<VerifiedDiscoveryScene>,
     replay_context: ScopedExecutionContext,
+    projected_contexts: ProjectionRegistry,
     /// Host-proposed mappings are validated and exercised by V07, never trusted
     /// as evidence. Each proposal is bound to one exact captured target.
     target_mappings: BTreeMap<Digest, Vec<SemanticMapping>>,
@@ -76,6 +79,7 @@ impl VerifiedRetainedHistory {
             projection_replays,
             mapped_scenes,
             replay_context,
+            projected_contexts: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             target_mappings: BTreeMap::new(),
             prepared_targets: BTreeMap::new(),
         })
@@ -135,7 +139,10 @@ impl VerifiedRetainedHistory {
                 }
             }
         }
-        Ok(Arc::new(HistoryAdmission { contexts }))
+        Ok(Arc::new(HistoryAdmission {
+            contexts,
+            projected_contexts: self.projected_contexts.clone(),
+        }))
     }
     /// Host-authenticated preparation only: both compared executables receive
     /// this same actual scenario. Unknown correspondence remains unavailable.
@@ -145,7 +152,27 @@ impl VerifiedRetainedHistory {
         target: &CapturedProgram,
         scene: &ScenarioSpec,
     ) -> Result<ScenarioSpec, AdapterError> {
-        Ok(self.projected_scene_context(before, target, scene)?.0)
+        let (scene, context) = self.projected_scene_context(before, target, scene)?;
+        if let Some(context) = context {
+            let key = scene.identity()?;
+            let mut registry = self
+                .projected_contexts
+                .write()
+                .map_err(|_| unavailable("projected scene admission lock is poisoned"))?;
+            if let Some(existing) = registry.get(&key) {
+                if existing.correspondence_proofs() != context.correspondence_proofs() {
+                    return Err(unavailable(
+                        "projected scene has ambiguous admission context",
+                    ));
+                }
+            } else {
+                if registry.len() >= MAX_ITEMS {
+                    return Err(unavailable("projected scene admission exceeds bounds"));
+                }
+                registry.insert(key, context);
+            }
+        }
+        Ok(scene)
     }
     fn projected_scene_context(
         &self,
@@ -635,6 +662,7 @@ pub(super) fn append_check(
 
 struct HistoryAdmission {
     contexts: Vec<ScopedExecutionContext>,
+    projected_contexts: ProjectionRegistry,
 }
 impl ReplayAdmission for HistoryAdmission {
     fn replay_operation_ids(
@@ -642,14 +670,22 @@ impl ReplayAdmission for HistoryAdmission {
         source: &CapturedProgram,
         scenario: &ScenarioSpec,
     ) -> Result<Vec<Id>, AdapterError> {
+        let projected = self
+            .projected_contexts
+            .read()
+            .map_err(|_| unavailable("projected scene admission lock is poisoned"))?;
         let mut result = None;
-        let explicit = self.contexts.iter().any(|context| {
-            context.has_scenario_correspondence(scenario)
-                && context
-                    .validate_seed(source, &scenario.seed, scenario.clock_day)
-                    .is_ok()
-        });
-        for context in &self.contexts {
+        let explicit = self
+            .contexts
+            .iter()
+            .chain(projected.values())
+            .any(|context| {
+                context.has_scenario_correspondence(scenario)
+                    && context
+                        .validate_seed(source, &scenario.seed, scenario.clock_day)
+                        .is_ok()
+            });
+        for context in self.contexts.iter().chain(projected.values()) {
             if explicit && !context.has_scenario_correspondence(scenario) {
                 continue;
             }
@@ -690,8 +726,13 @@ impl ReplayAdmission for HistoryAdmission {
         // Several independently verified contexts can contain the same
         // baseline source. Admission is the exact source-and-data pair, not
         // the first source match (a newer preparation may initialize a seed).
+        let projected = self
+            .projected_contexts
+            .read()
+            .map_err(|_| unavailable("projected scene admission lock is poisoned"))?;
         self.contexts
             .iter()
+            .chain(projected.values())
             .filter(|context| context.contains_managed_source(source))
             .find_map(|context| context.validate_seed(source, data, day).ok())
             .ok_or_else(|| {
@@ -710,8 +751,13 @@ impl ReplayAdmission for HistoryAdmission {
         // Several independently verified contexts can contain the same
         // baseline source. Admission is the exact source-and-data pair, not
         // the first source match (a newer preparation may initialize a seed).
+        let projected = self
+            .projected_contexts
+            .read()
+            .map_err(|_| unavailable("projected scene admission lock is poisoned"))?;
         self.contexts
             .iter()
+            .chain(projected.values())
             .filter(|context| context.contains_managed_source(source))
             .find_map(|context| context.validate_state(source, data, day).ok())
             .ok_or_else(|| {
