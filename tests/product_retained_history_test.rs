@@ -2,12 +2,16 @@
 //! Fixture responses are not live AI or native desktop acceptance evidence.
 #[path = "fixtures/product_runtime/mod.rs"]
 mod fixture;
+#[path = "../src/product_backup.rs"]
+mod product_backup;
 #[path = "../src/product_contract.rs"]
 mod product_contract;
 #[path = "../src/product_decisions/mod.rs"]
 mod product_decisions;
 #[path = "../src/product_discovery/mod.rs"]
 mod product_discovery;
+#[path = "../src/product_locations.rs"]
+mod product_locations;
 #[path = "../src/product_protocol.rs"]
 mod product_protocol;
 #[path = "../src/product_provider/mod.rs"]
@@ -699,4 +703,107 @@ fn removed_observable_is_unknown_and_exact_host_rename_mapping_is_replayed() {
     let unknown = discover(&r, &out, &policy(&store), Arc::new(AtomicBool::new(false))).unwrap();
     assert!(unknown.questions.is_empty());
     assert!(!unknown.unverified.is_empty());
+}
+
+#[test]
+fn real_backup_recovery_preserves_exact_nonbinary_packages_and_question_history() {
+    use product_backup::{open_verified, VerifiedBackup};
+    use product_locations::RecentTools;
+    for outcome in [DecisionOutcome::EitherAcceptable, DecisionOutcome::Deferred] {
+        let dir = tempfile::tempdir().unwrap();
+        let a = capture(filtered());
+        let b = capture(replacement());
+        let s = workflow(&a);
+        let store = ProductStore::create(dir.path().join("tool"), &a, 20000).unwrap();
+        save(
+            &store,
+            outcome,
+            IntentionBinding::ObservedOutcome,
+            vec![],
+            vec![accepted(&a, &s), accepted(&b, &s)],
+        );
+        let saved = store.load().unwrap();
+        let original_context = request(&store, &b);
+        let backup = VerifiedBackup::capture(&store).unwrap();
+        let bytes = backup.to_bytes().unwrap();
+        let recent = RecentTools::open(dir.path()).unwrap();
+        let imported = VerifiedBackup::from_bytes(&bytes).unwrap();
+        let created = imported
+            .recover_tool(&dir.path().join("recovered"), &recent, 1)
+            .unwrap();
+        assert!(created.registration.is_ok());
+        drop(created);
+        let opened = open_verified(
+            &dir.path().join("recovered"),
+            Some(&backup.summary().unwrap().identity),
+        )
+        .unwrap();
+        assert_eq!(opened.snapshot, saved);
+        assert_eq!(
+            VerifiedBackup::capture(&opened.store)
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+            bytes
+        );
+        assert_eq!(
+            request(&opened.store, &b).accepted_scenes,
+            original_context.accepted_scenes
+        );
+        let report = discover_with(&opened.store, &b, &a, &s);
+        assert!(report.questions.is_empty());
+        assert!(report.unverified.is_empty(), "{:?}", report.unverified);
+        assert!(report
+            .log
+            .iter()
+            .any(|l| l.disposition == Disposition::Settled));
+        // Recovery has its own store and complete history. Continuing ordinary
+        // work there does not overwrite the original or require an AI service.
+        opened
+            .store
+            .apply(
+                opened.snapshot.revision,
+                "after-recovery",
+                &add("Later"),
+                RuntimeLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(store.load().unwrap(), saved);
+    }
+}
+
+#[test]
+fn a_stale_snapshot_or_exhausted_history_budget_cannot_offer_a_question() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = capture(filtered());
+    let b = capture(replacement());
+    let s = workflow(&a);
+    let store = ProductStore::create(dir.path().join("tool"), &a, 20000).unwrap();
+    save(
+        &store,
+        DecisionOutcome::Deferred,
+        IntentionBinding::ObservedOutcome,
+        vec![],
+        vec![accepted(&a, &s), accepted(&b, &s)],
+    );
+    let r = request(&store, &b);
+    let frozen = policy(&store);
+    let out = response(&r, &a, &s);
+    let mut limited = frozen.clone();
+    limited.max_precheck_replays = 1;
+    let report = discover(&r, &out, &limited, Arc::new(AtomicBool::new(false))).unwrap();
+    assert!(report.questions.is_empty());
+    assert!(!report.unverified.is_empty());
+    let before = store.load().unwrap();
+    store
+        .apply(
+            before.revision,
+            "new-work",
+            &add("New"),
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    let report = discover(&r, &out, &frozen, Arc::new(AtomicBool::new(false))).unwrap();
+    assert!(report.questions.is_empty());
+    assert!(!report.unverified.is_empty());
 }

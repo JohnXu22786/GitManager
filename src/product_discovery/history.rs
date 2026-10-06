@@ -122,6 +122,16 @@ impl VerifiedRetainedHistory {
         if self.store.load().map_err(unavailable)? != self.current
             || request.decisions != self.current.decisions
             || request.sources.first() != Some(self.current.program().map_err(unavailable)?)
+            || request
+                .context
+                .data_digest
+                .as_ref()
+                .is_some_and(|digest| self.current.data.identity().ok().as_ref() != Some(digest))
+            || request
+                .context
+                .session_digest
+                .as_ref()
+                .is_some_and(|digest| self.current.session.identity().ok().as_ref() != Some(digest))
         {
             return Err(unavailable(
                 "the request or stored revision differs from the captured history",
