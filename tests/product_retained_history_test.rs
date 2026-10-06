@@ -807,3 +807,194 @@ fn a_stale_snapshot_or_exhausted_history_budget_cannot_offer_a_question() {
     assert!(report.questions.is_empty());
     assert!(!report.unverified.is_empty());
 }
+
+#[test]
+fn stripping_all_portable_context_still_cannot_downgrade_concrete_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = capture(filtered());
+    let b = capture(replacement());
+    let s = workflow(&a);
+    let store = ProductStore::create(dir.path().join("tool"), &a, 20000).unwrap();
+    save(
+        &store,
+        DecisionOutcome::KeepCurrent,
+        IntentionBinding::ObservedOutcome,
+        vec![positive_count()],
+        vec![accepted(&a, &s)],
+    );
+    let mut r = request(&store, &b);
+    r.accepted_scenes.clear();
+    let report = discover(
+        &r,
+        &response(&r, &a, &s),
+        &DiscoveryPolicy::default(),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    assert!(report.questions.is_empty());
+    assert!(!report.unverified.is_empty());
+    assert!(report
+        .checks
+        .iter()
+        .all(|c| c.state != CheckState::Satisfied));
+}
+#[test]
+fn mapped_nonbinary_history_survives_restart_without_reasking_or_hiding_new_results() {
+    for outcome in [DecisionOutcome::EitherAcceptable, DecisionOutcome::Deferred] {
+        let dir = tempfile::tempdir().unwrap();
+        let a = capture(filtered());
+        let b = capture(replacement());
+        let s = workflow(&a);
+        let store = ProductStore::create(dir.path().join("tool"), &a, 20000).unwrap();
+        let mut other_scene = s.clone();
+        other_scene.id = "second-source-scene".into();
+        other_scene.label = "The other implementation's retained scene".into();
+        save(
+            &store,
+            outcome,
+            IntentionBinding::ObservedOutcome,
+            vec![],
+            vec![accepted(&a, &s), accepted(&b, &other_scene)],
+        );
+        let rename = |mut p: Value| {
+            p["actions"][1]["id"] = json!("gather");
+            p["observables"][0]["id"] = json!("picked_count");
+            capture(p)
+        };
+        let current = rename(filtered());
+        let candidate = rename(replacement());
+        let mappings = vec![
+            SemanticMapping {
+                from: SemanticKey {
+                    kind: SemanticKind::Action,
+                    entity: None,
+                    id: "collect".into(),
+                },
+                to: SemanticKey {
+                    kind: SemanticKind::Action,
+                    entity: None,
+                    id: "gather".into(),
+                },
+            },
+            SemanticMapping {
+                from: SemanticKey {
+                    kind: SemanticKind::Observable,
+                    entity: None,
+                    id: "selected_count".into(),
+                },
+                to: SemanticKey {
+                    kind: SemanticKind::Observable,
+                    entity: None,
+                    id: "picked_count".into(),
+                },
+            },
+        ];
+        let e = engine(&store);
+        let plan = e
+            .prepare_change(&store, &current, &mappings, "rename-pending")
+            .unwrap();
+        e.adopt(&store, &plan).unwrap();
+        drop(store);
+        let store = ProductStore::open(dir.path().join("tool")).unwrap();
+        let mut mapped = s.clone();
+        for input in &mut mapped.inputs {
+            if let SemanticInput::Invoke { action, .. } = input {
+                if action == "collect" {
+                    *action = "gather".into();
+                }
+            }
+        }
+        for novel in [false, true] {
+            let next = if novel {
+                let mut v = replacement();
+                v["actions"][1]["steps"][0]["value"] = json!({"kind":"literal","value_type":{"kind":"list","item":{"kind":"reference","entity":"person"}},"value":empty("person")});
+                rename(v)
+            } else {
+                candidate.clone()
+            };
+            let r = request(&store, &next);
+            let mut out = response(&r, &current, &mapped);
+            out.response.hypotheses[0].action = "gather".into();
+            out.response.hypotheses[0].observable = "picked_count".into();
+            let report =
+                discover(&r, &out, &policy(&store), Arc::new(AtomicBool::new(false))).unwrap();
+            assert_eq!(
+                report.questions.len(),
+                usize::from(novel),
+                "{:?}",
+                report.unverified
+            );
+            if !novel {
+                assert!(report.unverified.is_empty(), "{:?}", report.unverified);
+                assert!(report
+                    .log
+                    .iter()
+                    .any(|l| l.disposition == Disposition::Settled));
+            }
+        }
+    }
+}
+
+#[test]
+fn genuine_legacy_witness_requires_explicit_properties_only_to_allow_concrete_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = capture(filtered());
+    let b = capture(replacement());
+    let s = workflow(&a);
+    let store = ProductStore::create(dir.path().join("tool"), &a, 20000).unwrap();
+    let mut r = request(&store, &b);
+    let witness = product_scenarios::ComparisonEngine::new(Arc::new(AtomicBool::new(false)))
+        .compare(
+            &a,
+            &b,
+            &s,
+            &r.decisions,
+            product_scenarios::ObservationTarget::Observable {
+                point: "done".into(),
+                observable: "selected_count".into(),
+            },
+            RuntimeLimits::default(),
+        )
+        .unwrap()
+        .witness
+        .unwrap()
+        .witness()
+        .clone();
+    r.decisions.decisions.push(ScopedDecision {
+        id: "legacy".into(),
+        revision: 1,
+        request: "Keep selected result".into(),
+        rationale: None,
+        scope: DecisionScope {
+            operations: ["collect".into()].into(),
+            population: Population::All,
+            conditions: Values::new(),
+            excluded_records: vec![],
+            unknowns: vec![],
+        },
+        outcome: DecisionOutcome::KeepCurrent,
+        status: DecisionStatus::Active,
+        obligations: vec![positive_count()],
+        scenarios: vec![s.identity().unwrap()],
+        witness: witness.identity().unwrap(),
+        supersedes: vec![],
+    });
+    r.examples.push(SelectedScenario {
+        disclosure: Disclosure::Synthetic,
+        scenario: s.clone(),
+    });
+    let mut p = DiscoveryPolicy {
+        retained_witnesses: vec![witness],
+        chosen_artifacts: [("legacy".into(), a.artifact.program_digest.clone())].into(),
+        ..DiscoveryPolicy::default()
+    };
+    let out = response(&r, &a, &s);
+    let concrete = discover(&r, &out, &p, Arc::new(AtomicBool::new(false))).unwrap();
+    assert!(concrete.questions.is_empty());
+    assert!(!concrete.defects.is_empty());
+    p.witness_bindings
+        .insert("legacy".into(), IntentionBinding::PropertiesOnly);
+    let properties = discover(&r, &out, &p, Arc::new(AtomicBool::new(false))).unwrap();
+    assert!(properties.defects.is_empty());
+    assert_eq!(properties.questions.len(), 1);
+}

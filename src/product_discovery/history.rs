@@ -2,6 +2,7 @@
 use super::*;
 use crate::product_decisions::{
     CheckDisposition, CheckReport, DecisionEngine, IntentArchive, IntentionBinding,
+    VerifiedDiscoveryScene,
 };
 use crate::product_store::{ProductStore, ProjectSnapshot};
 
@@ -15,6 +16,7 @@ pub struct VerifiedRetainedHistory {
     context: DevelopmentRequest,
     bindings: BTreeMap<Id, IntentionBinding>,
     projection_replays: usize,
+    mapped_scenes: Vec<VerifiedDiscoveryScene>,
     /// Host-proposed mappings are validated and exercised by V07, never trusted
     /// as evidence. Each proposal is bound to one exact captured target.
     target_mappings: BTreeMap<Digest, Vec<SemanticMapping>>,
@@ -37,6 +39,7 @@ impl VerifiedRetainedHistory {
             DecisionEngine::new(LocalRuntime::default(), IntentArchive::new(store.clone()));
         let context = Self::projection(&engine, &current)?;
         let bindings = Self::bindings(&engine, &current)?;
+        let mapped_scenes = engine.discovery_scenes(&current).map_err(unavailable)?;
         let projection_replays = current
             .decisions
             .decisions
@@ -50,12 +53,21 @@ impl VerifiedRetainedHistory {
                 .iter()
                 .map(|mapping| mapping.scenarios.len())
                 .sum::<usize>();
+        let projection_replays = projection_replays
+            + current
+                .decisions
+                .decisions
+                .iter()
+                .filter(|d| d.status == DecisionStatus::Pending)
+                .map(|d| d.scenarios.len() * 2)
+                .sum::<usize>();
         Ok(Self {
             store: store.clone(),
             current,
             context,
             bindings,
             projection_replays,
+            mapped_scenes,
             target_mappings: BTreeMap::new(),
         })
     }
@@ -143,7 +155,13 @@ impl VerifiedRetainedHistory {
             IntentArchive::new(self.store.clone()),
         );
         let fresh = Self::projection(&engine, &self.current)?;
-        if fresh != self.context || Self::bindings(&engine, &self.current)? != self.bindings {
+        if fresh != self.context
+            || Self::bindings(&engine, &self.current)? != self.bindings
+            || engine
+                .discovery_scenes(&self.current)
+                .map_err(unavailable)?
+                != self.mapped_scenes
+        {
             return Err(unavailable("the independently reproduced history changed"));
         }
         if request.accepted_scenes != self.context.accepted_scenes {
@@ -214,6 +232,19 @@ impl VerifiedRetainedHistory {
             )
             .map_err(unavailable)
     }
+    pub(super) fn pending_scenes<'a>(
+        &'a self,
+        decision: &'a ScopedDecision,
+    ) -> impl Iterator<Item = &'a VerifiedDiscoveryScene> {
+        self.mapped_scenes
+            .iter()
+            .filter(move |s| s.decision() == decision.id && s.package() == &decision.witness)
+    }
+    pub(super) fn pending_operations(&self, decision: &ScopedDecision) -> BTreeSet<Id> {
+        self.pending_scenes(decision)
+            .flat_map(|s| s.operations().iter().cloned())
+            .collect()
+    }
     pub(super) fn pair(
         &self,
         decision: &ScopedDecision,
@@ -223,25 +254,22 @@ impl VerifiedRetainedHistory {
         runtime: &LocalRuntime,
         budget: &ReplayBudget,
         runs: &mut Vec<RunEvidence>,
-    ) -> Result<(ScenarioSpec, RunEvidence, RunEvidence), AdapterError> {
+    ) -> Result<(ScenarioSpec, RetainedRun, RetainedRun), AdapterError> {
         if !self.contains(decision) {
             return Err(unavailable("decision/package identity is not verified"));
         }
-        let contexts: Vec<_> = self
-            .context
-            .accepted_scenes
-            .iter()
-            .filter(|s| s.decision == decision.id)
-            .collect();
+        let contexts: Vec<_> = self.pending_scenes(decision).collect();
+        // Labels/scene IDs are annotations, while accepted validity remains
+        // binding. Distinct historical sources can name the same input scene.
+        let key = |scene: &ScenarioSpec| {
+            canonical_digest(
+                IdentityDomain::Scenario,
+                &(scene.input_identity()?, &scene.validity),
+            )
+        };
         let mut scenes = BTreeMap::new();
         for context in &contexts {
-            let selected = self
-                .context
-                .examples
-                .iter()
-                .find(|e| e.scenario.identity().ok().as_ref() == Some(&context.scenario))
-                .ok_or_else(|| unavailable("accepted input is missing"))?;
-            scenes.insert(context.scenario.clone(), &selected.scenario);
+            scenes.insert(key(context.mapped())?, context.mapped());
         }
         let exact: Vec<_> = scenes
             .values()
@@ -264,39 +292,130 @@ impl VerifiedRetainedHistory {
                 "accepted history correspondence is ambiguous or missing",
             ));
         };
-        let digest = selected.identity()?;
+        let digest = key(selected)?;
         let sides: Vec<_> = contexts
             .into_iter()
-            .filter(|c| c.scenario == digest)
+            .filter(|c| key(c.mapped()).ok().as_ref() == Some(&digest))
             .collect();
-        if sides.len() != 2 || sides[0].source == sides[1].source {
+        if sides.len() != 2
+            || sides[0].original().binding.artifact == sides[1].original().binding.artifact
+        {
             return Err(unavailable(
                 "nonbinary history needs both real source-qualified outcomes",
             ));
         }
-        let before = replay_accepted_outcome(
-            request,
-            policy,
-            runtime,
-            budget,
-            decision,
-            selected,
-            &sides[0].source,
-            "retained-package-first",
-            runs,
-        )?;
-        let after = replay_accepted_outcome(
-            request,
-            policy,
-            runtime,
-            budget,
-            decision,
-            selected,
-            &sides[1].source,
-            "retained-package-second",
-            runs,
-        )?;
+        let mut outcomes = vec![];
+        for (index, side) in sides.iter().enumerate() {
+            let original = replay_accepted_outcome(
+                request,
+                policy,
+                runtime,
+                budget,
+                decision,
+                side.scenario(),
+                &side.original().binding.artifact,
+                if index == 0 {
+                    "retained-package-first"
+                } else {
+                    "retained-package-second"
+                },
+                runs,
+            )?;
+            // This actual current-source replay supplies trace correspondence;
+            // its values never replace the original accepted side's values.
+            runs.push(side.replay().clone());
+            outcomes.push(RetainedRun {
+                original,
+                correspondence: side.replay().clone(),
+                mappings: side.mappings().to_vec(),
+            });
+        }
+        let after = outcomes.pop().unwrap();
+        let before = outcomes.pop().unwrap();
         Ok((selected.clone(), before, after))
+    }
+}
+
+/// Original execution evidence plus a separately executed target trace used
+/// only for correspondence. Semantic names are projected during sampling; no
+/// historical RunEvidence, output receipt or immutable identity is rewritten.
+pub(super) struct RetainedRun {
+    pub original: RunEvidence,
+    pub correspondence: RunEvidence,
+    pub mappings: Vec<SemanticMapping>,
+}
+impl RetainedRun {
+    pub fn direct(run: RunEvidence) -> Self {
+        Self {
+            original: run.clone(),
+            correspondence: run,
+            mappings: vec![],
+        }
+    }
+    pub fn forward(&self, kind: SemanticKind, id: &str) -> Id {
+        self.mappings
+            .iter()
+            .find(|m| m.from.kind == kind && m.from.id == id)
+            .map(|m| m.to.id.clone())
+            .unwrap_or_else(|| id.into())
+    }
+    pub fn target(
+        &self,
+        target: &ObservationTarget,
+        current: &RunEvidence,
+    ) -> Option<ObservationTarget> {
+        let mut old = retained_target(target, current, &self.correspondence)?;
+        let reverse = |kind, id: &mut Id| {
+            if let Some(mapping) = self
+                .mappings
+                .iter()
+                .find(|m| m.to.kind == kind && m.to.id == *id)
+            {
+                *id = mapping.from.id.clone();
+            }
+        };
+        match &mut old {
+            ObservationTarget::Observable { observable, .. } => {
+                reverse(SemanticKind::Observable, observable)
+            }
+            ObservationTarget::OutputCount { output, .. }
+            | ObservationTarget::OutputColumn { output, .. } => {
+                reverse(SemanticKind::Output, output)
+            }
+            _ => {}
+        }
+        Some(old)
+    }
+    pub fn material(&self, observation: &Observation) -> Option<BTreeMap<String, Digest>> {
+        let mut profile = unrepresented_material(observation)?;
+        profile.insert(
+            "view".into(),
+            canonical_digest(
+                IdentityDomain::Observation,
+                &self.forward(SemanticKind::View, &observation.view.view),
+            )
+            .ok()?,
+        );
+        for (index, artifact) in observation.outputs.iter().enumerate() {
+            profile.insert(
+                format!("output/{index}/id"),
+                canonical_digest(
+                    IdentityDomain::Observation,
+                    &self.forward(SemanticKind::Output, &artifact.output),
+                )
+                .ok()?,
+            );
+        }
+        Some(profile)
+    }
+    pub fn comparable(&self, run: &RunEvidence) -> bool {
+        run.state == EvidenceState::Observed
+            && self.original.state == EvidenceState::Observed
+            && self.correspondence.state == EvidenceState::Observed
+            && run.binding.runtime_version == self.original.binding.runtime_version
+            && run.binding.driver_version == self.original.binding.driver_version
+            && run.binding.input_digest == self.correspondence.binding.input_digest
+            && run.observations.len() == self.original.observations.len()
     }
 }
 

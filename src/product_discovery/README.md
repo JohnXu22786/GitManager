@@ -30,6 +30,11 @@ program, or call a provider automatically when an app opens.
    needs an independent behavioral requirement case covering it; declaration
    alone cannot establish that an alternative implements the feature. Active chosen outcomes without
    predicate obligations are checked against their selected retained witness side.
+   Legacy witness-only concrete choices also require the genuine witness and,
+   for KeepCurrent, the exact selected-artifact mapping. `witness_bindings`
+   permits an explicit PropertiesOnly independent promise with nonempty
+   demonstrated predicates; absence retains ObservedOutcome. Predicate presence
+   never silently changes the binding, and missing history stays unverified.
    For V07 store-backed intentions, set `retained_history` using
    `VerifiedRetainedHistory::load(&store)` and build the exact discovery request
    with `DecisionEngine::inherit_request`. This opaque host-only adapter reloads
@@ -46,7 +51,12 @@ program, or call a provider automatically when an app opens.
    V07 Scenes-package IDs and differential-witness IDs are separate domains.
    Concrete choices need only their real selected scenes. Nonbinary history
    retains both actual source-qualified scenes and feeds them to the existing
-   independent replay/reduction/correspondence checks. All scene objects and
+   independent replay/reduction/correspondence checks. `discovery_scenes` supplies
+   opaque verified pending-scene projections from V07. Their mapped operations
+   associate renamed hypotheses, and their independently executed target traces
+   establish correspondence. Historical values are sampled from the original
+   evidence using the source-qualified semantic names; no RunEvidence or output
+   receipt is rewritten to appear as a target execution. All scene objects and
    mappings remain reachable in V07's ordinary intention bundle, so no new
    persistence object or backup schema is required.
    Missing, incompatible or unrepresentable saved channels remain unknown,
