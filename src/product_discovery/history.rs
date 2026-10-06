@@ -19,6 +19,7 @@ pub struct VerifiedRetainedHistory {
     bindings: BTreeMap<Id, IntentionBinding>,
     projection_replays: usize,
     mapped_scenes: Vec<VerifiedDiscoveryScene>,
+    replay_context: ScopedExecutionContext,
     /// Host-proposed mappings are validated and exercised by V07, never trusted
     /// as evidence. Each proposal is bound to one exact captured target.
     target_mappings: BTreeMap<Digest, Vec<SemanticMapping>>,
@@ -43,6 +44,9 @@ impl VerifiedRetainedHistory {
         let context = Self::projection(&engine, &current)?;
         let bindings = Self::bindings(&engine, &current)?;
         let mapped_scenes = engine.discovery_scenes(&current).map_err(unavailable)?;
+        let replay_context = engine
+            .retained_replay_context(&current)
+            .map_err(unavailable)?;
         let projection_replays = current
             .decisions
             .decisions
@@ -71,6 +75,7 @@ impl VerifiedRetainedHistory {
             bindings,
             projection_replays,
             mapped_scenes,
+            replay_context,
             target_mappings: BTreeMap::new(),
             prepared_targets: BTreeMap::new(),
         })
@@ -112,11 +117,13 @@ impl VerifiedRetainedHistory {
         Ok(())
     }
     pub(super) fn replay_admission(&self) -> Result<Arc<dyn ReplayAdmission>, AdapterError> {
-        let mut contexts =
-            vec![ScopedExecutionContext::committed(&self.current).map_err(unavailable)?];
+        let mut contexts = vec![self.replay_context.clone()];
         for prepared in self.prepared_targets.values() {
             contexts.push(
-                ScopedExecutionContext::prepared(&self.current, prepared).map_err(unavailable)?,
+                ScopedExecutionContext::prepared(&self.current, prepared)
+                    .map_err(unavailable)?
+                    .with_correspondences(&self.replay_context.correspondence_proofs())
+                    .map_err(unavailable)?,
             );
             for scene in &self.mapped_scenes {
                 if let Ok((_, Some(context))) = self.projected_scene_context(
@@ -155,17 +162,18 @@ impl VerifiedRetainedHistory {
                 "scene projection does not name the exact current/prepared pair",
             ));
         }
-        let context =
-            ScopedExecutionContext::prepared(&self.current, prepared).map_err(unavailable)?;
-        let mapped = crate::product_runtime::merged_data(target, &scene.seed)?;
-        let (context, seed) = context
-            .project_seed(before, &scene.seed, target, &mapped, scene.clock_day)
+        let context = ScopedExecutionContext::prepared(&self.current, prepared)
+            .map_err(unavailable)?
+            .with_correspondences(&self.replay_context.correspondence_proofs())
+            .map_err(unavailable)?;
+        let mut mapped = scene.clone();
+        mapped.seed = crate::product_runtime::merged_data(target, &scene.seed)?;
+        let (context, actual) = context
+            .project_scenario(before, scene, target, &mapped)
             .map_err(unavailable)?;
         context
-            .verify_seed(before, &seed, scene.clock_day)
+            .verify_seed(before, &actual.seed, actual.clock_day)
             .map_err(unavailable)?;
-        let mut actual = scene.clone();
-        actual.seed = seed;
         Ok((actual, Some(context)))
     }
     fn projection(
@@ -629,6 +637,47 @@ struct HistoryAdmission {
     contexts: Vec<ScopedExecutionContext>,
 }
 impl ReplayAdmission for HistoryAdmission {
+    fn replay_operation_ids(
+        &self,
+        source: &CapturedProgram,
+        scenario: &ScenarioSpec,
+    ) -> Result<Vec<Id>, AdapterError> {
+        let mut result = None;
+        let explicit = self.contexts.iter().any(|context| {
+            context.has_scenario_correspondence(scenario)
+                && context
+                    .validate_seed(source, &scenario.seed, scenario.clock_day)
+                    .is_ok()
+        });
+        for context in &self.contexts {
+            if explicit && !context.has_scenario_correspondence(scenario) {
+                continue;
+            }
+            if context
+                .validate_seed(source, &scenario.seed, scenario.clock_day)
+                .is_err()
+            {
+                continue;
+            }
+            let ids = context.replay_operation_ids(source, scenario)?;
+            if result.as_ref().is_some_and(|prior| prior != &ids) {
+                return Err(unavailable(
+                    "ambiguous historical replay operation identity",
+                ));
+            }
+            result = Some(ids);
+        }
+        if let Some(ids) = result {
+            return Ok(ids);
+        }
+        if crate::product_runtime::has_protected_fields(source) {
+            return Err(unavailable(
+                "scoped replay operation identity is unverified",
+            ));
+        }
+        Ok(scenario.replay_operation_ids()?)
+    }
+
     fn validate_seed(
         &self,
         source: &CapturedProgram,

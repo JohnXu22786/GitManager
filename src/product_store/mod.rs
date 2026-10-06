@@ -768,12 +768,104 @@ impl ProductStore {
     where
         F: FnOnce(&ProjectSnapshot, &CapturedProgram, &DecisionGraph, &AdoptionPlan) -> Result<()>,
     {
+        self.adopt_verified_inner(
+            expected_revision,
+            prepared,
+            target,
+            decisions,
+            None,
+            &BTreeMap::new(),
+            verify,
+        )
+    }
+    pub(crate) fn adopt_correspondence_verified<F>(
+        &self,
+        expected_revision: u64,
+        prepared: &PreparedAdoption,
+        target: &CapturedProgram,
+        decisions: &DecisionGraph,
+        correspondences: &BTreeMap<Digest, scope::ScopeCorrespondence>,
+        verify: F,
+    ) -> Result<ProjectSnapshot>
+    where
+        F: FnOnce(&ProjectSnapshot, &CapturedProgram, &DecisionGraph, &AdoptionPlan) -> Result<()>,
+    {
+        self.adopt_verified_inner(
+            expected_revision,
+            prepared,
+            target,
+            decisions,
+            None,
+            correspondences,
+            verify,
+        )
+    }
+    /// Retain replay authority for an experienced prospective implementation,
+    /// while the ordinary decision commit keeps the exact current executable.
+    pub fn adopt_rehearsal_verified<F>(
+        &self,
+        expected_revision: u64,
+        prepared: &PreparedAdoption,
+        target: &CapturedProgram,
+        decisions: &DecisionGraph,
+        rehearsal: &scope::PreparedScopedChange,
+        recorded_decisions: &[Id],
+        correspondences: &BTreeMap<Digest, scope::ScopeCorrespondence>,
+        verify: F,
+    ) -> Result<ProjectSnapshot>
+    where
+        F: FnOnce(&ProjectSnapshot, &CapturedProgram, &DecisionGraph, &AdoptionPlan) -> Result<()>,
+    {
+        self.adopt_verified_inner(
+            expected_revision,
+            prepared,
+            target,
+            decisions,
+            Some((rehearsal, recorded_decisions)),
+            correspondences,
+            verify,
+        )
+    }
+    fn adopt_verified_inner<F>(
+        &self,
+        expected_revision: u64,
+        prepared: &PreparedAdoption,
+        target: &CapturedProgram,
+        decisions: &DecisionGraph,
+        rehearsal: Option<(&scope::PreparedScopedChange, &[Id])>,
+        correspondences: &BTreeMap<Digest, scope::ScopeCorrespondence>,
+        verify: F,
+    ) -> Result<ProjectSnapshot>
+    where
+        F: FnOnce(&ProjectSnapshot, &CapturedProgram, &DecisionGraph, &AdoptionPlan) -> Result<()>,
+    {
         let _lock = self.root.lock()?;
         let mut current = self.load()?;
-        let request = canonical_digest(
-            IdentityDomain::Adoption,
-            &(&prepared.plan, target, decisions),
-        )?;
+        let request = if let Some((proof, ids)) = rehearsal {
+            canonical_digest(
+                IdentityDomain::Adoption,
+                &(
+                    "record-managed-rehearsal/1",
+                    &prepared.plan,
+                    target,
+                    decisions,
+                    scope::rehearsal_request(proof, ids)?,
+                ),
+            )?
+        } else {
+            canonical_digest(
+                IdentityDomain::Adoption,
+                &(&prepared.plan, target, decisions),
+            )?
+        };
+        let request = if correspondences.is_empty() {
+            request
+        } else {
+            canonical_digest(
+                IdentityDomain::Adoption,
+                &("scope-correspondence/1", &request, correspondences),
+            )?
+        };
         if let Some(receipt) = current.operations.get(&prepared.plan.id) {
             return if receipt.request == request {
                 Ok(current)
@@ -801,6 +893,9 @@ impl ProductStore {
         self.check_plan(&current, &prepared.plan, target)?;
         decisions.validate()?;
         verify(&current, target, decisions, &prepared.plan)?;
+        if let Some((proof, ids)) = rehearsal {
+            scope::retain_rehearsal(&mut current, proof, decisions, ids, &prepared.plan)?;
+        }
         let previous = current.active_revision.clone();
         let target_revision = revision(target)?;
         if !current
@@ -838,6 +933,8 @@ impl ProductStore {
                 revision: current.revision,
             },
         );
+        let revision = current.revision;
+        scope::retain_correspondences(&mut current, correspondences, &prepared.plan.id, revision)?;
         LocalRuntime::default().start(
             target,
             &current.data,

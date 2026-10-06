@@ -181,6 +181,52 @@ pub struct ScopeState {
     pub compositions: BTreeMap<Digest, CompositionManifest>,
     pub initializations: Vec<MetadataInitializationReceipt>,
     pub adoptions: Vec<ScopedAdoptionReceipt>,
+    /// Replay-only prospective implementations; never the active layer set.
+    pub rehearsals: BTreeMap<Digest, ManagedRehearsal>,
+    pub correspondences: BTreeMap<Digest, ScopeCorrespondenceReceipt>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedRehearsal {
+    pub version: u32,
+    pub manifest: CompositionManifest,
+    pub seed: Digest,
+    pub layer: Option<ScopeLayer>,
+    pub initialization: Option<MetadataInitializationReceipt>,
+    pub compatibility: CompatibilityReport,
+    pub recorded_by: Id,
+    pub recorded_revision: u64,
+    pub witnesses: BTreeMap<Id, Digest>,
+}
+/// A replay input correspondence, never a live initialization receipt.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeCorrespondence {
+    pub source: CapturedProgram,
+    pub original: DataSnapshot,
+    pub target: Digest,
+    pub day: i32,
+    pub projected: Digest,
+    pub operation_seed: Digest,
+    pub scenario: Option<ScopeScenarioCorrespondence>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeScenarioCorrespondence {
+    pub original: ScenarioSpec,
+    pub projected: ScenarioSpec,
+}
+impl ScopeCorrespondence {
+    pub fn identity(&self) -> Result<Digest> {
+        Ok(canonical_digest(IdentityDomain::Scenario, self)?)
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeCorrespondenceReceipt {
+    pub proof: ScopeCorrespondence,
+    pub operation: Id,
+    pub revision: u64,
 }
 impl Default for ScopeState {
     fn default() -> Self {
@@ -190,6 +236,8 @@ impl Default for ScopeState {
             compositions: BTreeMap::new(),
             initializations: vec![],
             adoptions: vec![],
+            rehearsals: BTreeMap::new(),
+            correspondences: BTreeMap::new(),
         }
     }
 }
@@ -208,6 +256,7 @@ pub struct PreparedScopedChange {
     pub(super) receipt: Option<MetadataInitializationReceipt>,
     pub(super) compatibility: CompatibilityReport,
     pub(super) scope: DecisionScope,
+    pub(crate) correspondences: BTreeMap<Digest, ScopeCorrespondence>,
 }
 impl PreparedScopedChange {
     pub fn operation_id(&self) -> &str {

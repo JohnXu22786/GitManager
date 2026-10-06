@@ -9,7 +9,9 @@ mod recovery;
 mod replay;
 use crate::product_contract::*;
 use crate::product_runtime::LocalRuntime;
-use crate::product_store::scope::{PreparedScopedChange, ScopedExecutionContext};
+use crate::product_store::scope::{
+    PreparedScopedChange, ScopeCorrespondence, ScopedExecutionContext,
+};
 use crate::product_store::{PreparedAdoption, ProductStore, ProjectSnapshot, StoreError};
 pub use archive::IntentArchive;
 pub use bundle::{upgrade_bundle_binding, validate_bundle, IntentionBundle};
@@ -22,7 +24,7 @@ use replay::*;
 pub use replay::{accept_scene, scope_match, AcceptedScene, ScopeAssessment};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 type Result<T> = std::result::Result<T, DecisionError>;
 #[derive(Debug)]
@@ -112,6 +114,8 @@ impl CheckReport {
 /// Kept opaque: only this host can prepare it, and commit repeats the checks.
 pub struct VerifiedChange {
     scoped: Option<PreparedScopedChange>,
+    rehearsal: Option<(PreparedScopedChange, Vec<Id>)>,
+    correspondences: BTreeMap<Digest, ScopeCorrespondence>,
     prepared: PreparedAdoption,
     revision: u64,
     target: CapturedProgram,
@@ -137,6 +141,8 @@ pub struct DecisionEngine<R: RuntimeAdapter> {
     archive: IntentArchive,
     limits: RuntimeLimits,
     pending_scope: RefCell<Option<PreparedScopedChange>>,
+    pending_rehearsal: RefCell<Option<(PreparedScopedChange, Vec<Id>)>>,
+    pending_correspondences: RefCell<BTreeMap<Digest, ScopeCorrespondence>>,
 }
 impl<R: RuntimeAdapter> DecisionEngine<R> {
     pub fn new(runtime: R, archive: IntentArchive) -> Self {
@@ -145,6 +151,8 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             archive,
             limits: RuntimeLimits::default(),
             pending_scope: RefCell::new(None),
+            pending_rehearsal: RefCell::new(None),
+            pending_correspondences: RefCell::new(BTreeMap::new()),
         }
     }
     /// Read the recorded promise kind for presentation; this is not execution proof.
@@ -176,12 +184,48 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
     }
     fn scope_context(&self) -> Result<ScopedExecutionContext> {
         let current = self.archive.snapshot()?;
-        Ok(
-            if let Some(prepared) = self.pending_scope.borrow().as_ref() {
-                ScopedExecutionContext::prepared(&current, prepared)?
-            } else {
-                ScopedExecutionContext::committed(&current)?
-            },
+        let context = if let Some(prepared) = self.pending_scope.borrow().as_ref() {
+            if self.pending_rehearsal.borrow().is_some() {
+                return Err(invalid(
+                    "rehearsal retention and activation cannot share an authority context",
+                ));
+            }
+            ScopedExecutionContext::prepared(&current, prepared)?
+        } else if let Some((prepared, _)) = self.pending_rehearsal.borrow().as_ref() {
+            ScopedExecutionContext::rehearsed(&current, prepared)?
+        } else {
+            ScopedExecutionContext::committed(&current)?
+        };
+        Ok(context.with_correspondences(&self.pending_correspondences.borrow())?)
+    }
+    pub(crate) fn retained_replay_context(
+        &self,
+        current: &ProjectSnapshot,
+    ) -> Result<ScopedExecutionContext> {
+        if self.pending_scope.borrow().is_some()
+            || self.pending_rehearsal.borrow().is_some()
+            || self.archive.snapshot()? != *current
+        {
+            return Err(invalid(
+                "retained replay context does not match the committed snapshot",
+            ));
+        }
+        self.scope_context()
+    }
+    fn compare_outcome(
+        &self,
+        expected: &AcceptedScene,
+        actual_source: &CapturedProgram,
+        actual: &[Observation],
+        mapping: &Mapping,
+    ) -> Result<Option<bool>> {
+        let context = self.scope_context()?;
+        same_outcome(
+            expected.observations(),
+            actual,
+            mapping,
+            &context.provenance_columns(expected.program())?,
+            &context.provenance_columns(actual_source)?,
         )
     }
     fn execute_scene(
@@ -213,15 +257,12 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         limits: RuntimeLimits,
         id: &str,
     ) -> Result<(RunEvidence, Vec<ScopeContext>, ScenarioSpec)> {
-        let (context, seed) = self.scope_context()?.project_seed(
-            source,
-            &original.seed,
-            target,
-            &mapped.seed,
-            mapped.clock_day,
-        )?;
-        let mut actual = mapped.clone();
-        actual.seed = seed;
+        let (context, actual) = self
+            .scope_context()?
+            .project_scenario(source, original, target, mapped)?;
+        self.pending_correspondences
+            .borrow_mut()
+            .extend(context.correspondence_proofs());
         let (run, contexts) = execute_admitted(
             &self.runtime,
             target,
@@ -308,15 +349,103 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             contexts,
         ))
     }
+    fn with_correspondences<T>(
+        &self,
+        proofs: BTreeMap<Digest, ScopeCorrespondence>,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let old = self.pending_correspondences.replace(proofs);
+        let result = f();
+        self.pending_correspondences.replace(old);
+        result
+    }
     fn with_scoped<T>(
         &self,
         prepared: Option<PreparedScopedChange>,
         f: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
+        let proofs = prepared
+            .as_ref()
+            .map(|p| p.correspondences.clone())
+            .unwrap_or_default();
         let old = self.pending_scope.replace(prepared);
-        let result = f();
+        let result = self.with_correspondences(proofs, f);
         self.pending_scope.replace(old);
         result
+    }
+    fn with_rehearsal<T>(
+        &self,
+        rehearsal: Option<(PreparedScopedChange, Vec<Id>)>,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let proofs = rehearsal
+            .as_ref()
+            .map(|(p, _)| p.correspondences.clone())
+            .unwrap_or_else(|| self.pending_correspondences.borrow().clone());
+        let old = self.pending_rehearsal.replace(rehearsal);
+        let result = self.with_correspondences(proofs, f);
+        self.pending_rehearsal.replace(old);
+        result
+    }
+    /// Record a nonbinary preference about two actually experienced verified
+    /// implementations. Pending scope stays descriptive; no effect is adopted.
+    pub fn prepare_rehearsed_choice(
+        &self,
+        store: &ProductStore,
+        prepared: PreparedScopedChange,
+        choice: Choice,
+        scenes: Vec<AcceptedScene>,
+        resolves: &[Id],
+        id: &str,
+    ) -> Result<VerifiedChange> {
+        let current = store.load()?;
+        ScopedExecutionContext::rehearsed(&current, &prepared)?;
+        if !matches!(
+            choice.outcome,
+            DecisionOutcome::EitherAcceptable
+                | DecisionOutcome::BothNeeded
+                | DecisionOutcome::NeitherFits
+                | DecisionOutcome::Deferred
+        ) || prepared.target().artifact == current.program()?.artifact
+            || !scenes
+                .iter()
+                .any(|scene| scene.program == *current.program().expect("validated source"))
+            || !scenes
+                .iter()
+                .any(|scene| scene.program == *prepared.target())
+            || scenes.iter().any(|scene| {
+                scene.program != *current.program().expect("validated source")
+                    && scene.program != *prepared.target()
+            })
+        {
+            return Err(invalid("retained nonbinary rehearsal needs both exact experienced source-qualified alternatives"));
+        }
+        let recorded = vec![choice.id.clone()];
+        self.with_rehearsal(Some((prepared, recorded)), || {
+            self.prepare_choice_resolving(store, current.program()?, choice, scenes, resolves, id)
+        })
+    }
+    /// Experience the current executable on the same authenticated copied
+    /// input as a prospective scoped alternative; no live data is initialized.
+    pub fn accept_prepared_current_scene(
+        &self,
+        store: &ProductStore,
+        prepared: &PreparedScopedChange,
+        scenario: &ScenarioSpec,
+        disclosure: Disclosure,
+    ) -> Result<AcceptedScene> {
+        let current = store.load()?;
+        ScopedExecutionContext::prepared(&current, prepared)?;
+        self.with_scoped(Some(prepared.clone()), || {
+            Ok(self
+                .capture_admitted_scene(
+                    current.program()?,
+                    scenario,
+                    disclosure,
+                    self.limits.clone(),
+                )?
+                .0)
+        })
     }
     pub fn accept_scoped_scene(
         &self,
@@ -735,7 +864,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             // Choosing a concrete outcome still binds its observed consequences when no
             // separately authored predicate list exists. Empty is never vacuous proof.
             if decision.obligations.is_empty() || scene.bind_outcome {
-                result = same_outcome(scene.observations(), &run.observations, &mapping)?;
+                result = self.compare_outcome(scene, target, &run.observations, &mapping)?;
             }
             if result != Some(false) {
                 for p in &decision.obligations {
@@ -1241,8 +1370,21 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         validate_withdrawal_delta(current, &next, &plan)?;
         self.verify_destination_packages(store, current, &next, &plan)?;
         let prepared = store.prepare_adoption(plan, target)?;
+        let correspondences: BTreeMap<_, _> = self
+            .pending_correspondences
+            .borrow()
+            .iter()
+            .filter(|(id, _)| !current.scope.correspondences.contains_key(*id))
+            .map(|(id, proof)| (id.clone(), proof.clone()))
+            .collect();
+        let mut scoped = self.pending_scope.borrow().clone();
+        if let Some(scoped) = &mut scoped {
+            scoped.correspondences = correspondences.clone();
+        }
         Ok(VerifiedChange {
-            scoped: self.pending_scope.borrow().clone(),
+            scoped,
+            correspondences,
+            rehearsal: self.pending_rehearsal.borrow().clone(),
             prepared,
             revision: current.revision,
             target: target.clone(),
@@ -1255,66 +1397,82 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
     }
     pub fn adopt(&self, store: &ProductStore, change: &VerifiedChange) -> Result<ProjectSnapshot> {
         self.with_scoped(change.scoped.clone(), || {
-            let verify = |current, target, next, plan| {
-                if canonical_digest(IdentityDomain::Data, current)? != change.expected_snapshot
-                    || self.runtime.capabilities().version != change.runtime
-                    || next != &change.decisions
-                    || target != &change.target
-                    || plan != change.prepared.plan()
-                {
-                    return Err(StoreError::Conflict(
-                        "Intention rehearsal changed; recheck current source, data and runtime"
-                            .into(),
-                    ));
-                }
-                validate_withdrawal_history(current)
-                    .and_then(|_| validate_withdrawal_delta(current, next, plan))
-                    .map_err(|e| StoreError::Invalid(e.to_string()))?;
-                self.verify_destination_packages(store, current, next, plan)
-                    .map_err(|e| StoreError::Invalid(e.to_string()))?;
-                for decision in &next.decisions {
-                    if !current
-                        .decisions
-                        .decisions
-                        .iter()
-                        .any(|old| old.id == decision.id && old.witness == decision.witness)
-                    {
-                        for scene in self
-                            .archive
-                            .load(&decision.witness)
-                            .map_err(|e| StoreError::Invalid(e.to_string()))?
-                        {
-                            self.reproduce_scene(&scene, next)
+            self.with_rehearsal(change.rehearsal.clone(), || {
+                self.with_correspondences(change.correspondences.clone(), || {
+                    let verify =
+                        |current, target, next, plan| {
+                            if canonical_digest(IdentityDomain::Data, current)?
+                                != change.expected_snapshot
+                                || self.runtime.capabilities().version != change.runtime
+                                || next != &change.decisions
+                                || target != &change.target
+                                || plan != change.prepared.plan()
+                            {
+                                return Err(StoreError::Conflict(
+                            "Intention rehearsal changed; recheck current source, data and runtime"
+                                .into(),
+                        ));
+                            }
+                            validate_withdrawal_history(current)
+                                .and_then(|_| validate_withdrawal_delta(current, next, plan))
                                 .map_err(|e| StoreError::Invalid(e.to_string()))?;
-                        }
-                    }
-                }
-                let report = self
-                    .check_bound(next, target, &change.mappings)
-                    .map_err(|e| StoreError::Invalid(e.to_string()))?;
-                if report.disposition != CheckDisposition::Ready {
-                    return Err(StoreError::Invalid(
-                        "Current implementation fails independent intention replay".into(),
-                    ));
-                }
-                Ok(())
-            };
-            Ok(if let Some(scoped) = &change.scoped {
-                store.adopt_scoped_verified(
-                    change.revision,
-                    scoped,
-                    &change.prepared,
-                    &change.decisions,
-                    verify,
-                )?
-            } else {
-                store.adopt_verified(
-                    change.revision,
-                    &change.prepared,
-                    &change.target,
-                    &change.decisions,
-                    verify,
-                )?
+                            self.verify_destination_packages(store, current, next, plan)
+                                .map_err(|e| StoreError::Invalid(e.to_string()))?;
+                            for decision in &next.decisions {
+                                if !current.decisions.decisions.iter().any(|old| {
+                                    old.id == decision.id && old.witness == decision.witness
+                                }) {
+                                    for scene in self
+                                        .archive
+                                        .load(&decision.witness)
+                                        .map_err(|e| StoreError::Invalid(e.to_string()))?
+                                    {
+                                        self.reproduce_scene(&scene, next)
+                                            .map_err(|e| StoreError::Invalid(e.to_string()))?;
+                                    }
+                                }
+                            }
+                            let report = self
+                                .check_bound(next, target, &change.mappings)
+                                .map_err(|e| StoreError::Invalid(e.to_string()))?;
+                            if report.disposition != CheckDisposition::Ready {
+                                return Err(StoreError::Invalid(
+                                    "Current implementation fails independent intention replay"
+                                        .into(),
+                                ));
+                            }
+                            Ok(())
+                        };
+                    Ok(if let Some(scoped) = &change.scoped {
+                        store.adopt_scoped_verified(
+                            change.revision,
+                            scoped,
+                            &change.prepared,
+                            &change.decisions,
+                            verify,
+                        )?
+                    } else if let Some((proof, ids)) = &change.rehearsal {
+                        store.adopt_rehearsal_verified(
+                            change.revision,
+                            &change.prepared,
+                            &change.target,
+                            &change.decisions,
+                            proof,
+                            ids,
+                            &change.correspondences,
+                            verify,
+                        )?
+                    } else {
+                        store.adopt_correspondence_verified(
+                            change.revision,
+                            &change.prepared,
+                            &change.target,
+                            &change.decisions,
+                            &change.correspondences,
+                            verify,
+                        )?
+                    })
+                })
             })
         })
     }

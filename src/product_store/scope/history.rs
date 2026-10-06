@@ -37,6 +37,31 @@ pub(super) fn completed(
         Err(error("completion predicate is not Boolean"))
     }
 }
+fn completed_historical(
+    program: &CapturedProgram,
+    data: &DataSnapshot,
+    row: &RecordRef,
+    lifecycle: &LifecycleBinding,
+    day: i32,
+    change: &RecordChange,
+) -> Result<bool> {
+    let value = LocalRuntime::default().evaluate_historical_record_projection(
+        program,
+        data,
+        row,
+        &change.after,
+        change.archived,
+        "record",
+        &lifecycle.completed,
+        &Type::Boolean,
+        day,
+    )?;
+    if let DataValue::Boolean { value } = value {
+        Ok(value)
+    } else {
+        Err(error("completion predicate is not Boolean"))
+    }
+}
 pub(super) fn initialize(
     snapshot: &ProjectSnapshot,
     layer: &ScopeLayer,
@@ -44,14 +69,60 @@ pub(super) fn initialize(
 ) -> Result<(DataSnapshot, MetadataInitializationReceipt)> {
     let id = layer.identity()?;
     let before = &layer.basis.data;
+    let (after, additions) = initialize_frame(
+        snapshot,
+        layer,
+        &id,
+        before,
+        &layer.basis.active,
+        target,
+        layer.basis.day,
+        "CapturedAtAdoption",
+    )?;
+    let receipt = MetadataInitializationReceipt {
+        operation: layer.operation.clone(),
+        layer: id,
+        before_data: before.identity()?,
+        after_data: after.identity()?,
+        before_schema: before.schema_identity()?,
+        after_schema: after.schema_identity()?,
+        additions,
+        business_projection: canonical_digest(IdentityDomain::Data, &before.records)?,
+        original_events: canonical_digest(IdentityDomain::Data, &before.events)?,
+        original_records: before.records.len(),
+        capture_day: layer.basis.day,
+        capture_program: program(snapshot, &layer.basis.active)?
+            .artifact
+            .program_digest
+            .clone(),
+        prior_snapshot: layer.basis.snapshot.clone(),
+        adoption_revision: layer
+            .basis
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| error("revision exhausted"))?,
+    };
+    Ok((after, receipt))
+}
+/// Derive system cells at an authenticated historical replay input. The
+/// caller retains a separate correspondence proof; this is not a live receipt.
+pub(super) fn initialize_frame(
+    snapshot: &ProjectSnapshot,
+    layer: &ScopeLayer,
+    id: &Digest,
+    before: &DataSnapshot,
+    source: &Digest,
+    target: &CapturedProgram,
+    day: i32,
+    origin: &str,
+) -> Result<(DataSnapshot, Vec<MetadataAddition>)> {
     let mut after = merged_data(target, before)?;
-    let baseline = program(snapshot, &layer.basis.active)?;
-    let mut baseline_app =
-        if let Some(manifest) = snapshot.scope.compositions.get(&layer.basis.active) {
-            envelope_app(snapshot, manifest)?
-        } else {
-            baseline.program.clone()
-        };
+    let baseline = program(snapshot, source)?;
+    let mut baseline_app = if let Some(manifest) = snapshot.scope.compositions.get(source) {
+        envelope_app(snapshot, manifest)?
+    } else {
+        baseline.program.clone()
+    };
     let mut additions = vec![];
     for row in &before.records {
         let Some(lifecycle) = layer
@@ -63,8 +134,7 @@ pub(super) fn initialize(
             continue;
         };
         let reference = row_ref(row);
-        let sealed =
-            row.archived || completed(baseline, before, &reference, lifecycle, layer.basis.day)?;
+        let sealed = row.archived || completed(baseline, before, &reference, lifecycle, day)?;
         let mut values = Values::from([
             (
                 key(&id, &row.entity, "member"),
@@ -78,16 +148,11 @@ pub(super) fn initialize(
             ),
         ]);
         if sealed {
-            values.insert(
-                key(&id, &row.entity, "day"),
-                DataValue::Date {
-                    days: layer.basis.day,
-                },
-            );
+            values.insert(key(&id, &row.entity, "day"), DataValue::Date { days: day });
             values.insert(
                 key(&id, &row.entity, "origin"),
                 DataValue::Text {
-                    value: "CapturedAtAdoption".into(),
+                    value: origin.into(),
                 },
             );
             for patch in &layer.patches {
@@ -100,7 +165,7 @@ pub(super) fn initialize(
                         &patch.request.subject,
                         &expression,
                         &patch.request.value_type,
-                        layer.basis.day,
+                        day,
                     )?;
                     values.insert(saved_key(&id, patch)?, value);
                 }
@@ -137,27 +202,13 @@ pub(super) fn initialize(
     {
         return Err(error("initialization changed existing business facts"));
     }
-    let receipt = MetadataInitializationReceipt {
-        operation: layer.operation.clone(),
-        layer: id,
-        before_data: before.identity()?,
-        after_data: after.identity()?,
-        before_schema: before.schema_identity()?,
-        after_schema: after.schema_identity()?,
-        additions,
-        business_projection: canonical_digest(IdentityDomain::Data, &business)?,
-        original_events: canonical_digest(IdentityDomain::Data, &before.events)?,
-        original_records: before.records.len(),
-        capture_day: layer.basis.day,
-        capture_program: baseline.artifact.program_digest.clone(),
-        prior_snapshot: layer.basis.snapshot.clone(),
-        adoption_revision: layer
-            .basis
-            .revision
-            .checked_add(1)
-            .ok_or_else(|| error("revision exhausted"))?,
-    };
-    Ok((after, receipt))
+    Ok((after, additions))
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ReplayFrame {
+    pub layer: Digest,
+    pub before: DataSnapshot,
+    pub additions: Vec<MetadataAddition>,
 }
 fn value_bool(values: &Values, key: &str) -> Result<bool> {
     match values.get(key) {
@@ -166,7 +217,7 @@ fn value_bool(values: &Values, key: &str) -> Result<bool> {
         _ => Err(error("damaged protected Boolean")),
     }
 }
-fn metadata_keys(id: &Digest, layer: &ScopeLayer, entity: &str) -> Result<Vec<Id>> {
+pub(super) fn metadata_keys(id: &Digest, layer: &ScopeLayer, entity: &str) -> Result<Vec<Id>> {
     let mut keys = vec![
         key(id, entity, "member"),
         key(id, entity, "sealed"),
@@ -192,9 +243,9 @@ fn producer_manifest<'a>(
     snapshot
         .programs
         .iter()
-        .find(|p| &p.artifact.program_digest == digest)
-        .and_then(|p| super::super::revision(p).ok())
-        .and_then(|id| snapshot.scope.compositions.get(&id))
+        .filter(|p| &p.artifact.program_digest == digest)
+        .filter_map(|p| super::super::revision(p).ok())
+        .find_map(|id| snapshot.scope.compositions.get(&id))
 }
 /// Reconstruct every protected cell from its initialization or real creation
 /// event, then enforce monotonic seals against the actual append-only events.
@@ -206,6 +257,13 @@ pub(super) fn verify_history(snapshot: &ProjectSnapshot) -> Result<()> {
     )
 }
 pub(super) fn verify_history_layers(snapshot: &ProjectSnapshot, layers: &[Digest]) -> Result<()> {
+    verify_history_frames(snapshot, layers, &[])
+}
+pub(super) fn verify_history_frames(
+    snapshot: &ProjectSnapshot,
+    layers: &[Digest],
+    frames: &[ReplayFrame],
+) -> Result<()> {
     for id in layers {
         let layer = snapshot
             .scope
@@ -218,7 +276,10 @@ pub(super) fn verify_history_layers(snapshot: &ProjectSnapshot, layers: &[Digest
             .iter()
             .find(|r| &r.layer == id)
             .ok_or_else(|| error("initialization receipt missing"))?;
-        if !snapshot.data.events.starts_with(&layer.basis.data.events) {
+        let frame = frames.iter().find(|frame| &frame.layer == id);
+        let basis_data = frame.map(|f| &f.before).unwrap_or(&layer.basis.data);
+        let additions = frame.map(|f| &f.additions).unwrap_or(&receipt.additions);
+        if !snapshot.data.events.starts_with(&basis_data.events) {
             return Err(error("pre-adoption business event history changed"));
         }
         for lifecycle in &layer.request.lifecycles {
@@ -232,12 +293,7 @@ pub(super) fn verify_history_layers(snapshot: &ProjectSnapshot, layers: &[Digest
                 let keys = metadata_keys(id, layer, &row.entity)?;
                 let member = key(id, &row.entity, "member");
                 let sealed = key(id, &row.entity, "sealed");
-                let before_row = layer
-                    .basis
-                    .data
-                    .records
-                    .iter()
-                    .find(|r| row_ref(r) == reference);
+                let before_row = basis_data.records.iter().find(|r| row_ref(r) == reference);
                 if let Some(original) = before_row {
                     if original.created_program != row.created_program
                         || row.revision < original.revision
@@ -249,7 +305,7 @@ pub(super) fn verify_history_layers(snapshot: &ProjectSnapshot, layers: &[Digest
                         ));
                     }
                 }
-                let initialization = receipt.additions.iter().find(|a| a.record == reference);
+                let initialization = additions.iter().find(|a| a.record == reference);
                 let mut expected = if before_row.is_some() {
                     initialization
                         .ok_or_else(|| error("existing row has no metadata receipt"))?
@@ -272,7 +328,7 @@ pub(super) fn verify_history_layers(snapshot: &ProjectSnapshot, layers: &[Digest
                     .data
                     .events
                     .iter()
-                    .filter(|e| e.sequence > layer.basis.data.generation)
+                    .filter(|e| e.sequence > basis_data.generation)
                 {
                     let Some(change) = event
                         .changes
@@ -321,16 +377,15 @@ pub(super) fn verify_history_layers(snapshot: &ProjectSnapshot, layers: &[Digest
                     let source = producer_manifest(snapshot, &event.program)
                         .ok_or_else(|| error("business event source is not verified"))?;
                     let producer = program(snapshot, &source.output)?;
-                    let mut event_data = snapshot.data.clone();
-                    let event_row = event_data
-                        .records
-                        .iter_mut()
-                        .find(|r| row_ref(r) == reference)
-                        .unwrap();
-                    event_row.values = change.after.clone();
-                    event_row.archived = change.archived;
                     if (change.archived
-                        || completed(producer, &event_data, &reference, lifecycle, event.day)?)
+                        || completed_historical(
+                            producer,
+                            &snapshot.data,
+                            &reference,
+                            lifecycle,
+                            event.day,
+                            change,
+                        )?)
                         && !value_bool(&after, &sealed)?
                     {
                         return Err(error(
@@ -388,16 +443,16 @@ pub(super) fn verify_history_layers(snapshot: &ProjectSnapshot, layers: &[Digest
                             return Err(error("invalid completion provenance"));
                         }
                         let producer = program(snapshot, &source.output)?;
-                        let mut data = snapshot.data.clone();
-                        let r = data
-                            .records
-                            .iter_mut()
-                            .find(|r| row_ref(r) == reference)
-                            .unwrap();
-                        r.values = change.after.clone();
-                        r.archived = change.archived;
+                        let mut projection_values = change.after.clone();
                         if !(archive && change.archived)
-                            && !completed(producer, &data, &reference, lifecycle, event.day)?
+                            && !completed_historical(
+                                producer,
+                                &snapshot.data,
+                                &reference,
+                                lifecycle,
+                                event.day,
+                                change,
+                            )?
                         {
                             return Err(error("result sealed without a real terminal transition"));
                         }
@@ -420,17 +475,12 @@ pub(super) fn verify_history_layers(snapshot: &ProjectSnapshot, layers: &[Digest
                                 .transpose()?
                                 .unwrap_or(false)
                             {
-                                let r = data
-                                    .records
-                                    .iter_mut()
-                                    .find(|r| row_ref(r) == reference)
-                                    .unwrap();
                                 for key in metadata_keys(other, other_layer, &row.entity)? {
                                     if key != compiler::key(other, &row.entity, "member") {
-                                        r.values.remove(&key);
+                                        projection_values.remove(&key);
                                     }
                                 }
-                                r.values
+                                projection_values
                                     .insert(other_sealed, DataValue::Boolean { value: false });
                             }
                         }
@@ -449,15 +499,18 @@ pub(super) fn verify_history_layers(snapshot: &ProjectSnapshot, layers: &[Digest
                                 validate_value(value, &patch.request.value_type, 0)?;
                                 let expression =
                                     slot(&mut producer_app, &patch.request.destination)?.clone();
-                                let observed = LocalRuntime::default().evaluate_record_projection(
-                                    producer,
-                                    &data,
-                                    &reference,
-                                    &patch.request.subject,
-                                    &expression,
-                                    &patch.request.value_type,
-                                    event.day,
-                                )?;
+                                let observed = LocalRuntime::default()
+                                    .evaluate_historical_record_projection(
+                                        producer,
+                                        &snapshot.data,
+                                        &reference,
+                                        &projection_values,
+                                        change.archived,
+                                        &patch.request.subject,
+                                        &expression,
+                                        &patch.request.value_type,
+                                        event.day,
+                                    )?;
                                 if *value != observed {
                                     return Err(error(
                                         "saved result differs from its actual producing expression",

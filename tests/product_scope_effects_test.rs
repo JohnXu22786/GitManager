@@ -968,3 +968,67 @@ fn preserved_projections_reject_parameters_in_prior_and_mapped_expressions() {
         .is_err());
     assert_eq!(store.load().unwrap(), current);
 }
+
+#[test]
+fn historical_row_verification_allows_valid_unique_value_reuse() {
+    fn unique(pause: bool) -> CapturedProgram {
+        let mut raw = serde_json::to_value(program(pause).program).unwrap();
+        raw["entities"][0]["unique"] = serde_json::json!([["name"]]);
+        raw["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"rename","label":"Correct work name","parameters":{"row":{"kind":"reference","entity":"job"},"name":{"kind":"text"}},"guards":[],"steps":[{"kind":"update","record":var("row"),"values":{"name":var("name")}}],"ensures":[]}));
+        capture(raw)
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tool");
+    let store = ProductStore::create(&path, &unique(false), 20000).unwrap();
+    let before = store.load().unwrap();
+    let prepared = store
+        .prepare_scoped_change(
+            &unique(true),
+            &request(&before, ScopePopulation::FutureWork),
+            "scope",
+        )
+        .unwrap();
+    store.adopt_scoped(before.revision, &prepared).unwrap();
+    let first = add(&store, "first", "first");
+    action(&store, "wait", "wait", &first);
+    tick(&store, "days", 20003);
+    action(&store, "complete", "complete", &first);
+    let exported = apply(&store, "original-export", invoke("export", &[]));
+    apply(
+        &store,
+        "rename",
+        invoke(
+            "rename",
+            &[("row", reference(&first)), ("name", text("second"))],
+        ),
+    );
+    let reused = add(&store, "reused", "first");
+    let current = store.load().unwrap();
+    assert_eq!(row(&current, &first).values["name"], text("second"));
+    assert_eq!(row(&current, &reused).values["name"], text("first"));
+    assert_eq!(current.artifacts, exported.artifacts);
+    assert_eq!(
+        row(&current, &first).values["production"],
+        DataValue::Integer { value: 0 }
+    );
+    let reopened = ProductStore::open(&path).unwrap();
+    let latest = apply(&reopened, "continued-export", invoke("export", &[]));
+    assert_eq!(latest.artifacts.last().unwrap().rows.len(), 2);
+    assert_eq!(
+        latest.artifacts.last().unwrap().rows[0]["production"],
+        DataValue::Integer { value: 0 }
+    );
+    let before = reopened.load().unwrap();
+    assert!(reopened
+        .apply(
+            before.revision,
+            "invalid-duplicate",
+            &invoke(
+                "rename",
+                &[("row", reference(&reused)), ("name", text("second"))]
+            ),
+            RuntimeLimits::default()
+        )
+        .is_err());
+    assert_eq!(reopened.load().unwrap(), before);
+}

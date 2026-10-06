@@ -8,6 +8,8 @@ pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
         || state.compositions.len() > MAX_ITEMS
         || state.initializations.len() != state.layers.len()
         || state.adoptions.len() > MAX_ITEMS
+        || state.rehearsals.len() > MAX_ITEMS
+        || state.correspondences.len() > MAX_ITEMS
     {
         return Err(error("invalid scope-state version or inventory"));
     }
@@ -21,6 +23,17 @@ pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
             .any(|id| !state.layers.contains_key(id))
         {
             return Err(error("composition references a missing layer proof"));
+        }
+    }
+    for proof in state.rehearsals.values() {
+        let own = proof.layer.as_ref().map(ScopeLayer::identity).transpose()?;
+        if proof
+            .manifest
+            .layers
+            .iter()
+            .any(|id| !state.layers.contains_key(id) && own.as_ref() != Some(id))
+        {
+            return Err(error("rehearsal references a missing layer proof"));
         }
     }
     let mut declared = BTreeMap::new();
@@ -41,7 +54,7 @@ pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
                     }
                 }
             }
-        } else {
+        } else if !state.rehearsals.contains_key(&source_id) {
             compiler::reject_reserved(&source.program)?;
         }
     }
@@ -61,9 +74,9 @@ pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
         {
             return Err(error("orphan composition metadata"));
         }
-        for p in &snapshot.programs {
-            compiler::reject_reserved(&p.program)?;
-        }
+        compiler::reject_reserved(&snapshot.program()?.program)?;
+        rehearsal::validate(snapshot)?;
+        correspondence::validate(snapshot)?;
         return Ok(());
     }
     if !state.compositions.contains_key(&snapshot.active_revision) {
@@ -302,6 +315,8 @@ pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
             return Err(error("initialized-data compatibility receipt mismatch"));
         }
     }
+    rehearsal::validate(snapshot)?;
+    correspondence::validate(snapshot)?;
     history::verify_history(snapshot)
 }
 

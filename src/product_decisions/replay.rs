@@ -261,7 +261,11 @@ pub(super) fn execute_admitted<R: RuntimeAdapter>(
     };
     let mut contexts = vec![];
     let mut clock_day = scenario.clock_day;
-    let operation_ids = scenario.replay_operation_ids()?;
+    let operation_ids = if let Some(admission) = admission {
+        admission.replay_operation_ids(program, scenario)?
+    } else {
+        scenario.replay_operation_ids()?
+    };
     for (index, input) in scenario.inputs.iter().enumerate() {
         let before = runtime.data(&run).clone();
         let op = operation_ids[index].clone();
@@ -433,6 +437,8 @@ pub(super) fn same_outcome(
     expected: &[Observation],
     actual: &[Observation],
     mapping: &Mapping,
+    before_provenance: &crate::product_store::scope::ProvenanceColumns,
+    after_provenance: &crate::product_store::scope::ProvenanceColumns,
 ) -> Result<Option<bool>> {
     // Missing information does not erase a definite violation elsewhere.
     let mut unknown = expected.len() != actual.len();
@@ -465,6 +471,9 @@ pub(super) fn same_outcome(
                     return Ok(Some(false));
                 }
                 for (column, value_type) in &before.columns {
+                    if before_provenance.view(&old.view.view, column) {
+                        continue;
+                    }
                     match after.columns.get(column) {
                         Some(found) if found != value_type => return Ok(Some(false)),
                         None => unknown = true,
@@ -497,6 +506,9 @@ pub(super) fn same_outcome(
                 _ => {}
             }
             for (column, value) in &a.cells {
+                if before_provenance.view(&old.view.view, column) {
+                    continue;
+                }
                 match b.cells.get(column) {
                     Some(actual) if value != actual => return Ok(Some(false)),
                     None => unknown = true,
@@ -552,13 +564,32 @@ pub(super) fn same_outcome(
             }
             for (a, b) in expected.into_iter().zip(matches) {
                 if a.format != b.format
-                    || a.rows != b.rows
+                    || a.rows
+                        .iter()
+                        .map(|row| {
+                            row.iter()
+                                .filter(|(column, _)| !before_provenance.output(&a.output, column))
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>()
+                        != b.rows
+                            .iter()
+                            .map(|row| {
+                                row.iter()
+                                    .filter(|(column, _)| {
+                                        !after_provenance.output(&b.output, column)
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .collect::<Vec<_>>()
                     || a.columns
                         .iter()
+                        .filter(|c| !before_provenance.output(&a.output, &c.id))
                         .map(|c| (&c.id, &c.value_type))
                         .collect::<Vec<_>>()
                         != b.columns
                             .iter()
+                            .filter(|c| !after_provenance.output(&b.output, &c.id))
                             .map(|c| (&c.id, &c.value_type))
                             .collect::<Vec<_>>()
                 {

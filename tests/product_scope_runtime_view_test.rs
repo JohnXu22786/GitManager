@@ -1272,6 +1272,11 @@ fn managed_reconciliation_preserves_real_scenes_and_exact_supersessions() {
             .unwrap();
         engine.adopt(&store, &change).unwrap();
     }
+    let later_work = add(
+        &store,
+        "before-new-design",
+        "Later work before structural evolution",
+    );
     let current = store.load().unwrap();
     let request = engine
         .reconciliation_request(
@@ -1404,6 +1409,11 @@ fn managed_reconciliation_preserves_real_scenes_and_exact_supersessions() {
         .prepare_evolution(&store, &draft, "adopt-design")
         .unwrap();
     let adopted = engine.adopt(&store, &change).unwrap();
+    assert!(adopted
+        .data
+        .records
+        .iter()
+        .any(|record| record.id == later_work.id));
     assert_eq!(
         adopted
             .decisions
@@ -1507,7 +1517,13 @@ fn pending_history_uses_authenticated_initialization_for_shared_discovery_input(
             "save-pending",
         )
         .unwrap();
-    let current = engine.adopt(&store, &change).unwrap();
+    engine.adopt(&store, &change).unwrap();
+    let later = add(
+        &store,
+        "intervening-history-work",
+        "Work after the pending scenes",
+    );
+    let current = store.load().unwrap();
     let mut raw = serde_json::to_value(program(true).program).unwrap();
     for pointer in [
         "/actions/3/steps/0/values/production",
@@ -1526,10 +1542,20 @@ fn pending_history_uses_authenticated_initialization_for_shared_discovery_input(
             "new-timing",
         )
         .unwrap();
-    let projected = ScenarioSpec {
-        seed: prepared.seed().clone(),
-        ..scene.clone()
-    };
+    let mut mapped = scene.clone();
+    mapped.seed = product_runtime::merged_data(prepared.target(), &scene.seed).unwrap();
+    let (_, projected) = ScopedExecutionContext::prepared(&current, &prepared)
+        .unwrap()
+        .project_scenario(
+            current.program().unwrap(),
+            &scene,
+            prepared.target(),
+            &mapped,
+        )
+        .unwrap();
+    assert_eq!(projected.seed.records.len(), scene.seed.records.len());
+    assert!(!projected.seed.records.iter().any(|r| r.id == later.id));
+    assert!(current.data.records.iter().any(|r| r.id == later.id));
     let request = engine
         .inherit_request(
             &current,
@@ -1720,4 +1746,807 @@ fn pending_history_uses_authenticated_initialization_for_shared_discovery_input(
     );
     action(&store, "later-work", "resume", &job);
     assert!(history.map_prepared_target(prepared, vec![]).is_err());
+}
+
+#[test]
+fn all_nonbinary_managed_rehearsals_survive_restart_recovery_without_activation() {
+    fn revised(offset: i64) -> CapturedProgram {
+        let mut raw = serde_json::to_value(program(true).program).unwrap();
+        for pointer in [
+            "/actions/3/steps/0/values/production",
+            "/actions/4/steps/0/values/production",
+            "/actions/6/steps/0/columns/production",
+            "/views/0/kind/columns/1/value",
+        ] {
+            let prior = raw.pointer(pointer).unwrap().clone();
+            *raw.pointer_mut(pointer).unwrap() =
+                serde_json::json!({"kind":"add","left":prior,"right":int(offset)});
+        }
+        capture(raw)
+    }
+    for outcome in [
+        DecisionOutcome::EitherAcceptable,
+        DecisionOutcome::BothNeeded,
+        DecisionOutcome::NeitherFits,
+        DecisionOutcome::Deferred,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tool");
+        let store = ProductStore::create(&path, &program(false), 20000).unwrap();
+        let before = store.load().unwrap();
+        let scope = store
+            .prepare_scoped_change(
+                &program(true),
+                &request(&before, ScopePopulation::All),
+                "initial-scope",
+            )
+            .unwrap();
+        store.adopt_scoped(before.revision, &scope).unwrap();
+        let job = add(&store, "job", "Waiting job");
+        action(&store, "wait", "wait", &job);
+        tick(&store, "days", 20003);
+        let current = store.load().unwrap();
+        let candidate = revised(1);
+        let editable = current.editable_scope_context().unwrap().unwrap();
+        let to_source = canonical_digest(IdentityDomain::Source, &candidate).unwrap();
+        let mappings: Vec<_> = editable
+            .slots
+            .iter()
+            .map(|slot| ScopeSlotMapping {
+                layer: slot.layer.clone(),
+                patch: slot.patch,
+                from_source: current.active_revision.clone(),
+                from: slot.destination.clone(),
+                to_source: to_source.clone(),
+                to: slot.destination.clone(),
+                subject: slot.subject.clone(),
+            })
+            .collect();
+        let proposal = store
+            .prepare_managed_evolution(&candidate, &mappings, "prospective-design")
+            .unwrap();
+        let engine =
+            DecisionEngine::new(LocalRuntime::default(), IntentArchive::new(store.clone()));
+        let prospective = selected_scene(&proposal, &job);
+        let baseline = ScenarioSpec {
+            seed: current.data.clone(),
+            session: current.session.clone(),
+            ..prospective.clone()
+        };
+        let a = engine
+            .accept_current_scene(&current, &baseline, Disclosure::Synthetic)
+            .unwrap();
+        let b = engine
+            .accept_scoped_scene(&store, &proposal, &prospective, Disclosure::Synthetic)
+            .unwrap();
+        assert_eq!(
+            a.observations()[0].outputs[0].rows[0]["production"],
+            DataValue::Integer { value: 0 }
+        );
+        assert_eq!(
+            b.observations()[0].outputs[0].rows[0]["production"],
+            DataValue::Integer { value: 1 }
+        );
+        let choice = Choice {
+            id: "pending".into(),
+            request: "Retain both actually experienced alternatives for this unresolved need"
+                .into(),
+            rationale: None,
+            scope: DecisionScope {
+                operations: ["calculate".into(), "complete".into(), "export".into()]
+                    .into_iter()
+                    .collect(),
+                population: Population::All,
+                conditions: Values::new(),
+                excluded_records: vec![],
+                unknowns: vec![],
+            },
+            outcome: outcome.clone(),
+            obligations: vec![],
+            binding: IntentionBinding::ObservedOutcome,
+        };
+        let change = engine
+            .prepare_rehearsed_choice(
+                &store,
+                proposal.clone(),
+                choice,
+                vec![a, b],
+                &[],
+                "record-nonbinary",
+            )
+            .unwrap();
+        let retained = engine.adopt(&store, &change).unwrap();
+        assert_eq!(retained.active_revision, current.active_revision);
+        assert_eq!(retained.data, current.data);
+        assert_eq!(retained.session, current.session);
+        assert_eq!(retained.clock_day, current.clock_day);
+        assert_eq!(retained.artifacts, current.artifacts);
+        assert_eq!(retained.scope.layers, current.scope.layers);
+        assert_eq!(retained.scope.compositions, current.scope.compositions);
+        assert_eq!(
+            retained.scope.initializations,
+            current.scope.initializations
+        );
+        assert_eq!(retained.scope.adoptions, current.scope.adoptions);
+        assert_eq!(retained.scope.rehearsals.len(), 1);
+        assert_eq!(retained.decisions.decisions[0].outcome, outcome);
+        assert_eq!(
+            retained.decisions.decisions[0].status,
+            DecisionStatus::Pending
+        );
+        assert_eq!(engine.adopt(&store, &change).unwrap(), retained);
+        let reopened = ProductStore::open(&path).unwrap();
+        let engine = DecisionEngine::new(
+            LocalRuntime::default(),
+            IntentArchive::new(reopened.clone()),
+        );
+        let portable = engine
+            .development_request(
+                &retained,
+                "inherit-pending",
+                DevelopmentOperation::Modify,
+                "Continue from both experienced alternatives",
+                DevelopmentContext {
+                    view: Some("work".into()),
+                    selected: vec![],
+                    recent_inputs: vec![],
+                    data_digest: Some(retained.data.identity().unwrap()),
+                    session_digest: Some(retained.session.identity().unwrap()),
+                },
+            )
+            .unwrap();
+        assert_eq!(portable.accepted_scenes.len(), 2);
+        assert_eq!(engine.discovery_scenes(&retained).unwrap().len(), 2);
+        assert!(engine
+            .prepare_change(&reopened, proposal.target(), &[], "no-latent-activation")
+            .is_err());
+        let backup = product_backup::VerifiedBackup::capture(&reopened).unwrap();
+        let backup =
+            product_backup::VerifiedBackup::from_bytes(&backup.to_bytes().unwrap()).unwrap();
+        let recovered = backup.recover_new(dir.path().join("recovered")).unwrap();
+        let recovered_snapshot = recovered.load().unwrap();
+        assert_eq!(recovered_snapshot, retained);
+        let engine = DecisionEngine::new(
+            LocalRuntime::default(),
+            IntentArchive::new(recovered.clone()),
+        );
+        assert_eq!(
+            engine.discovery_scenes(&recovered_snapshot).unwrap().len(),
+            2
+        );
+        let mut corrupt = recovered_snapshot.clone();
+        let proof = corrupt.scope.rehearsals.values_mut().next().unwrap();
+        proof.seed = canonical_digest(IdentityDomain::Data, &"invented-seed").unwrap();
+        assert!(corrupt.validate().is_err());
+        assert!(
+            ProductStore::create_recovered_with(dir.path().join("corrupt"), &corrupt, |_| Ok(()))
+                .is_err()
+        );
+        let later = add(&recovered, "later", "Later legitimate work");
+        let facts = recovered.load().unwrap();
+        assert!(engine
+            .prepare_managed_change(&recovered, proposal, &[], "prospective-design")
+            .is_err());
+        assert_eq!(recovered.load().unwrap(), facts);
+        let fresh = if outcome == DecisionOutcome::EitherAcceptable {
+            let source = revised(1);
+            let target = canonical_digest(IdentityDomain::Source, &source).unwrap();
+            let editable = facts.editable_scope_context().unwrap().unwrap();
+            let mappings: Vec<_> = editable
+                .slots
+                .iter()
+                .map(|slot| ScopeSlotMapping {
+                    layer: slot.layer.clone(),
+                    patch: slot.patch,
+                    from_source: facts.active_revision.clone(),
+                    from: slot.destination.clone(),
+                    to_source: target.clone(),
+                    to: slot.destination.clone(),
+                    subject: slot.subject.clone(),
+                })
+                .collect();
+            let prepared = recovered
+                .prepare_managed_evolution(&source, &mappings, "resolve-with-scope")
+                .unwrap();
+            assert_eq!(
+                prepared.target().artifact,
+                retained
+                    .scope
+                    .rehearsals
+                    .values()
+                    .next()
+                    .map(|proof| retained
+                        .programs
+                        .iter()
+                        .find(|p| canonical_digest(IdentityDomain::Source, *p).unwrap()
+                            == proof.manifest.output)
+                        .unwrap()
+                        .artifact
+                        .clone())
+                    .unwrap()
+            );
+            prepared
+        } else {
+            recovered
+                .prepare_scoped_change(
+                    &revised(2),
+                    &request(&facts, ScopePopulation::All),
+                    "resolve-with-scope",
+                )
+                .unwrap()
+        };
+        let accepted = engine
+            .accept_scoped_scene(
+                &recovered,
+                &fresh,
+                &selected_scene(&fresh, &job),
+                Disclosure::Synthetic,
+            )
+            .unwrap();
+        let choice=Choice{id:"resolved".into(),request:"Explicitly resolve the pending alternatives with this newly experienced revised rule".into(),rationale:None,scope:fresh.scope().clone(),outcome:DecisionOutcome::Accept{artifact:fresh.target().artifact.program_digest.clone()},obligations:vec![],binding:IntentionBinding::ObservedOutcome};
+        let resolution = engine
+            .prepare_scoped_resolution(
+                &recovered,
+                fresh,
+                choice,
+                vec![accepted],
+                &["pending".into()],
+                "resolve-with-scope",
+            )
+            .unwrap();
+        let adopted = engine.adopt(&recovered, &resolution).unwrap();
+        assert_eq!(adopted.data.events, facts.data.events);
+        assert_eq!(adopted.artifacts, facts.artifacts);
+        assert!(adopted.data.records.iter().any(|row| row.id == later.id));
+        assert_eq!(
+            adopted.decisions.decisions[0].status,
+            DecisionStatus::Superseded {
+                by: "resolved".into()
+            }
+        );
+        assert_eq!(
+            engine.check_current(&adopted).unwrap().disposition,
+            CheckDisposition::Ready
+        );
+        let continued = action(&recovered, "continued", "calculate", &later);
+        assert_eq!(
+            row(&continued, &later).values["production"],
+            DataValue::Integer {
+                value: if outcome == DecisionOutcome::EitherAcceptable {
+                    1
+                } else {
+                    2
+                }
+            }
+        );
+        product_backup::VerifiedBackup::capture(&recovered).unwrap();
+        assert_eq!(store.load().unwrap(), retained);
+    }
+}
+
+#[test]
+fn future_rehearsals_preserve_selected_promises_without_activating_cohorts() {
+    fn future_scene(source: &CapturedProgram, seed: &DataSnapshot) -> ScenarioSpec {
+        let mut scene = ScenarioSpec {
+            version: 1,
+            id: "future-scene".into(),
+            label: "New work after the future rule".into(),
+            seed: seed.clone(),
+            session: SessionState::initial(&source.program).unwrap(),
+            clock_day: 20003,
+            random_seed: 42,
+            inputs: vec![invoke(
+                "add",
+                &[
+                    ("name", text("New work")),
+                    ("promised", DataValue::Date { days: 20020 }),
+                ],
+            )],
+            validity: vec![],
+        };
+        let runtime = LocalRuntime::default();
+        let mut run = runtime
+            .start(
+                source,
+                &scene.seed,
+                &scene.session,
+                scene.clock_day,
+                scene.random_seed,
+                RuntimeLimits::default(),
+            )
+            .unwrap();
+        runtime
+            .apply(
+                &mut run,
+                &scene.inputs[0],
+                &scene.replay_operation_ids().unwrap()[0],
+            )
+            .unwrap();
+        let created = runtime
+            .data(&run)
+            .records
+            .iter()
+            .find(|r| r.values["name"] == text("New work"))
+            .unwrap();
+        scene.inputs.extend([
+            invoke("wait", &[("row", reference(created))]),
+            SemanticInput::AdvanceClock { days: 3 },
+            invoke("calculate", &[("row", reference(created))]),
+            invoke("complete", &[("row", reference(created))]),
+            invoke("export", &[]),
+            SemanticInput::Observe {
+                point: "result".into(),
+            },
+        ]);
+        scene
+    }
+
+    for outcome in [
+        DecisionOutcome::EitherAcceptable,
+        DecisionOutcome::BothNeeded,
+        DecisionOutcome::NeitherFits,
+        DecisionOutcome::Deferred,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
+        let selected = add(&store, "selected", "Selected waiting work");
+        let archived = add(&store, "archived", "Completed archived history");
+        action(&store, "completed-history", "complete", &archived);
+        action(&store, "archive-history", "archive", &archived);
+        action(&store, "wait", "wait", &selected);
+        tick(&store, "days", 20003);
+        let current = store.load().unwrap();
+        let first = store
+            .prepare_scoped_change(
+                &program(true),
+                &request(
+                    &current,
+                    ScopePopulation::SelectedUnfinished {
+                        records: vec![RecordRef {
+                            entity: selected.entity.clone(),
+                            record: selected.id.clone(),
+                        }],
+                    },
+                ),
+                "selected-rule",
+            )
+            .unwrap();
+        let engine =
+            DecisionEngine::new(LocalRuntime::default(), IntentArchive::new(store.clone()));
+        let original_scene = selected_scene(&first, &selected);
+        let original_source = first.target().clone();
+        let selected_scope = first.scope().clone();
+        let accepted = engine
+            .accept_scoped_scene(&store, &first, &original_scene, Disclosure::Synthetic)
+            .unwrap();
+        let choice = Choice {
+            id: "selected-promise".into(),
+            request: "Keep the experienced selected-row timing and customer commitment".into(),
+            rationale: None,
+            scope: first.scope().clone(),
+            outcome: DecisionOutcome::Accept {
+                artifact: first.target().artifact.program_digest.clone(),
+            },
+            obligations: vec![],
+            binding: IntentionBinding::ObservedOutcome,
+        };
+        let change = engine
+            .prepare_scoped_choice(&store, first, choice, vec![accepted], "selected-rule")
+            .unwrap();
+        let current = engine.adopt(&store, &change).unwrap();
+        let mut raw = serde_json::to_value(program(true).program).unwrap();
+        for pointer in [
+            "/actions/3/steps/0/values/production",
+            "/actions/4/steps/0/values/production",
+            "/actions/6/steps/0/columns/production",
+            "/views/0/kind/columns/1/value",
+        ] {
+            let prior = raw.pointer(pointer).unwrap().clone();
+            *raw.pointer_mut(pointer).unwrap() =
+                serde_json::json!({"kind":"add","left":prior,"right":int(1)});
+        }
+        let candidate = capture(raw);
+        let proposal = store
+            .prepare_scoped_change(
+                &candidate,
+                &request(&current, ScopePopulation::FutureWork),
+                "future-proposal",
+            )
+            .unwrap();
+        let context = ScopedExecutionContext::prepared(&current, &proposal).unwrap();
+        let columns = context.provenance_columns(proposal.target()).unwrap();
+        assert!(!columns.output("sheet", "production"));
+        assert!(!columns.output("sheet", "promised"));
+        assert!(!columns.outputs["sheet"].is_empty());
+        let mut forged = serde_json::to_value(proposal.target().program.clone()).unwrap();
+        forged["label"] = serde_json::json!("Unregistered source copying protected columns");
+        assert!(context.provenance_columns(&capture(forged)).is_err());
+        // A real business result change on the selected cohort still violates
+        // the concrete promise; host provenance normalization cannot hide it.
+        let editable = current.editable_scope_context().unwrap().unwrap();
+        let to_source = canonical_digest(IdentityDomain::Source, &candidate).unwrap();
+        let mappings: Vec<_> = editable
+            .slots
+            .iter()
+            .map(|slot| ScopeSlotMapping {
+                layer: slot.layer.clone(),
+                patch: slot.patch,
+                from_source: current.active_revision.clone(),
+                from: slot.destination.clone(),
+                to_source: to_source.clone(),
+                to: slot.destination.clone(),
+                subject: slot.subject.clone(),
+            })
+            .collect();
+        let wrong_cohort = store
+            .prepare_managed_evolution(&candidate, &mappings, "wrong-cohort")
+            .unwrap();
+        assert!(engine
+            .prepare_managed_change(&store, wrong_cohort, &[], "wrong-cohort")
+            .is_err());
+        assert_eq!(store.load().unwrap(), current);
+        // The future row is created by the actual production interpreter in
+        // both scenes. The selected row keeps its old rule in both sources.
+        let prospective = future_scene(proposal.target(), proposal.seed());
+        // Both scenes use the same business input; metadata initialization and
+        // each full raw source/input binding remain explicit.
+        let a = engine
+            .accept_prepared_current_scene(&store, &proposal, &prospective, Disclosure::Synthetic)
+            .unwrap();
+        let b = engine
+            .accept_scoped_scene(&store, &proposal, &prospective, Disclosure::Synthetic)
+            .unwrap();
+        let values = |scene: &AcceptedScene, name: &str| {
+            scene.observations()[0].outputs[0]
+                .rows
+                .iter()
+                .find(|row| row["name"] == text(name))
+                .unwrap()["production"]
+                .clone()
+        };
+        assert_eq!(
+            values(&a, "Selected waiting work"),
+            DataValue::Integer { value: 0 }
+        );
+        assert_eq!(
+            values(&b, "Selected waiting work"),
+            DataValue::Integer { value: 0 }
+        );
+        assert_eq!(values(&a, "New work"), DataValue::Integer { value: 3 });
+        assert_eq!(values(&b, "New work"), DataValue::Integer { value: 1 });
+        let raw_evidence = b.evidence().clone();
+        let pending_scope = proposal.scope().clone();
+        let choice = Choice {
+            id: "pending-future".into(),
+            request: "Keep these experienced future alternatives pending".into(),
+            rationale: None,
+            scope: pending_scope.clone(),
+            outcome: outcome.clone(),
+            obligations: vec![],
+            binding: IntentionBinding::ObservedOutcome,
+        };
+        let change = engine
+            .prepare_rehearsed_choice(
+                &store,
+                proposal.clone(),
+                choice,
+                vec![a, b],
+                &[],
+                "record-future",
+            )
+            .unwrap();
+        let saved = engine.adopt(&store, &change).unwrap();
+        assert_eq!(saved.data, current.data);
+        assert_eq!(saved.session, current.session);
+        assert_eq!(saved.clock_day, current.clock_day);
+        assert_eq!(saved.artifacts, current.artifacts);
+        assert_eq!(saved.active_revision, current.active_revision);
+        assert_eq!(saved.scope.layers, current.scope.layers);
+        assert_eq!(saved.scope.initializations, current.scope.initializations);
+        assert_eq!(saved.scope.compositions, current.scope.compositions);
+        assert_eq!(saved.scope.adoptions, current.scope.adoptions);
+        assert_eq!(saved.decisions.decisions[1].scope, pending_scope);
+        assert_eq!(saved.decisions.decisions[1].status, DecisionStatus::Pending);
+        assert_eq!(engine.adopt(&store, &change).unwrap(), saved);
+        let reopened = ProductStore::open(dir.path().join("tool")).unwrap();
+        let backup = product_backup::VerifiedBackup::capture(&reopened).unwrap();
+        let recovered = product_backup::VerifiedBackup::from_bytes(&backup.to_bytes().unwrap())
+            .unwrap()
+            .recover_new(dir.path().join("recovered"))
+            .unwrap();
+        assert_eq!(recovered.load().unwrap(), saved);
+        let engine = DecisionEngine::new(
+            LocalRuntime::default(),
+            IntentArchive::new(recovered.clone()),
+        );
+        let scenes = engine.discovery_scenes(&saved).unwrap();
+        assert_eq!(scenes.len(), 2);
+        assert!(scenes
+            .iter()
+            .any(|scene| scene.original().observations == raw_evidence.observations));
+        assert!(engine
+            .prepare_managed_change(&recovered, proposal, &[], "future-proposal")
+            .is_err());
+        let intervening = add(
+            &recovered,
+            "intervening-work",
+            "Actual work before resolution",
+        );
+        action(&recovered, "intervening-wait", "wait", &intervening);
+        let facts = recovered.load().unwrap();
+        let fresh = recovered
+            .prepare_scoped_change(
+                &candidate,
+                &request(&facts, ScopePopulation::FutureWork),
+                "accept-future",
+            )
+            .unwrap();
+        let scene = future_scene(fresh.target(), fresh.seed());
+        let accepted = engine
+            .accept_scoped_scene(&recovered, &fresh, &scene, Disclosure::Synthetic)
+            .unwrap();
+        let choice = Choice {
+            id: "future-resolved".into(),
+            request: "Adopt this freshly experienced future rule".into(),
+            rationale: None,
+            scope: fresh.scope().clone(),
+            outcome: DecisionOutcome::Accept {
+                artifact: fresh.target().artifact.program_digest.clone(),
+            },
+            obligations: vec![],
+            binding: IntentionBinding::ObservedOutcome,
+        };
+        let change = engine
+            .prepare_scoped_resolution(
+                &recovered,
+                fresh,
+                choice,
+                vec![accepted],
+                &["pending-future".into()],
+                "accept-future",
+            )
+            .unwrap();
+        let adopted = engine.adopt(&recovered, &change).unwrap();
+        assert_eq!(adopted.data.events, facts.data.events);
+        assert!(adopted.data.records.iter().any(|r| r.id == intervening.id));
+        assert!(!adopted.scope.correspondences.is_empty());
+        let mut forged = adopted.clone();
+        forged
+            .scope
+            .correspondences
+            .values_mut()
+            .next()
+            .unwrap()
+            .proof
+            .original
+            .records[0]
+            .values
+            .insert("name".into(), text("Forged historical input"));
+        assert!(forged.validate().is_err());
+        assert!(ProductStore::create_recovered_with(
+            dir.path().join("forged"),
+            &forged,
+            |_| Ok(())
+        )
+        .is_err());
+        let mut ambiguous = adopted.clone();
+        let mut receipt = ambiguous
+            .scope
+            .correspondences
+            .values()
+            .find(|r| r.proof.scenario.is_some())
+            .unwrap()
+            .clone();
+        receipt.proof.operation_seed =
+            canonical_digest(IdentityDomain::Data, &"forged-operation-origin").unwrap();
+        ambiguous
+            .scope
+            .correspondences
+            .insert(receipt.proof.identity().unwrap(), receipt);
+        assert!(ambiguous.validate().is_err());
+        assert_eq!(adopted.artifacts, saved.artifacts);
+        assert_eq!(adopted.decisions.decisions[0], saved.decisions.decisions[0]);
+        assert_eq!(
+            engine.check_current(&adopted).unwrap().disposition,
+            CheckDisposition::Ready
+        );
+        let future = add(&recovered, "real-future", "Real future work");
+        let actual = action(&recovered, "calculate-future", "calculate", &future);
+        assert_eq!(
+            row(&actual, &future).values["production"],
+            DataValue::Integer { value: 1 }
+        );
+        let actual = action(&recovered, "calculate-selected", "calculate", &selected);
+        assert_eq!(
+            row(&actual, &selected).values["production"],
+            DataValue::Integer { value: 0 }
+        );
+        // Replay the accepted future scene (which actually creates a row)
+        // across another later layer. Its original deterministic record ID must
+        // survive metadata projection, while a real selected ID is not guessed.
+        let current = recovered.load().unwrap();
+        let mut equivalent = serde_json::to_value(candidate.program.clone()).unwrap();
+        for pointer in [
+            "/actions/3/steps/0/values/production",
+            "/actions/4/steps/0/values/production",
+            "/actions/6/steps/0/columns/production",
+            "/views/0/kind/columns/1/value",
+        ] {
+            let value = equivalent.pointer(pointer).unwrap().clone();
+            *equivalent.pointer_mut(pointer).unwrap() = serde_json::json!({"kind":"if","condition":boolean(true),"then_value":value,"else_value":int(0)});
+        }
+        let third = recovered
+            .prepare_scoped_change(
+                &capture(equivalent),
+                &request(
+                    &current,
+                    ScopePopulation::SelectedUnfinished {
+                        records: vec![RecordRef {
+                            entity: future.entity.clone(),
+                            record: future.id.clone(),
+                        }],
+                    },
+                ),
+                "later-selected-implementation",
+            )
+            .unwrap();
+        let change = engine
+            .prepare_managed_change(&recovered, third, &[], "later-selected-implementation")
+            .unwrap();
+        let later_adoption = engine.adopt(&recovered, &change).unwrap();
+        assert_eq!(later_adoption.data.events, current.data.events);
+        assert_eq!(
+            engine.check_current(&later_adoption).unwrap().disposition,
+            CheckDisposition::Ready
+        );
+        // A durable successor scene can use this exact derived input after
+        // later real work; it keeps a separately bound original operation frame.
+        let current = recovered.load().unwrap();
+        let context = ScopedExecutionContext::committed(&current).unwrap();
+        let mut mapped = original_scene.clone();
+        mapped.seed =
+            product_runtime::merged_data(current.program().unwrap(), &original_scene.seed).unwrap();
+        let (_, projected) = context
+            .project_scenario(
+                &original_source,
+                &original_scene,
+                current.program().unwrap(),
+                &mapped,
+            )
+            .unwrap();
+        assert_ne!(
+            projected.identity().unwrap(),
+            original_scene.identity().unwrap()
+        );
+        let accepted = engine
+            .accept_current_scene(&current, &projected, Disclosure::Synthetic)
+            .unwrap();
+        let choice = Choice {
+            id: "continued-selected-promise".into(),
+            request: "Keep this newly experienced source-qualified selected result".into(),
+            rationale: None,
+            scope: selected_scope,
+            outcome: DecisionOutcome::KeepCurrent,
+            obligations: vec![],
+            binding: IntentionBinding::ObservedOutcome,
+        };
+        let change = engine
+            .prepare_choice(
+                &recovered,
+                current.program().unwrap(),
+                choice,
+                vec![accepted],
+                "save-derived-scene",
+            )
+            .unwrap();
+        let continued = engine.adopt(&recovered, &change).unwrap();
+        assert_eq!(continued.data, current.data);
+        let final_backup = product_backup::VerifiedBackup::capture(&recovered).unwrap();
+        let final_store = final_backup
+            .recover_new(dir.path().join("final-recovery"))
+            .unwrap();
+        let final_engine = DecisionEngine::new(
+            LocalRuntime::default(),
+            IntentArchive::new(final_store.clone()),
+        );
+        assert_eq!(
+            final_engine
+                .check_current(&final_store.load().unwrap())
+                .unwrap()
+                .disposition,
+            CheckDisposition::Ready
+        );
+    }
+}
+
+#[test]
+fn first_scope_can_be_rehearsed_and_retained_before_any_live_layer_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
+    let job = add(&store, "job", "Unscoped work");
+    action(&store, "wait", "wait", &job);
+    tick(&store, "days", 20003);
+    let before = store.load().unwrap();
+    let prepared = store
+        .prepare_scoped_change(
+            &program(true),
+            &request(&before, ScopePopulation::All),
+            "first-proposal",
+        )
+        .unwrap();
+    let engine = DecisionEngine::new(LocalRuntime::default(), IntentArchive::new(store.clone()));
+    let prospective = selected_scene(&prepared, &job);
+    let a = engine
+        .accept_prepared_current_scene(&store, &prepared, &prospective, Disclosure::Synthetic)
+        .unwrap();
+    let b = engine
+        .accept_scoped_scene(&store, &prepared, &prospective, Disclosure::Synthetic)
+        .unwrap();
+    let choice = Choice {
+        id: "first-pending".into(),
+        request: "Remember the experienced options before choosing a scope".into(),
+        rationale: None,
+        scope: prepared.scope().clone(),
+        outcome: DecisionOutcome::Deferred,
+        obligations: vec![],
+        binding: IntentionBinding::ObservedOutcome,
+    };
+    let change = engine
+        .prepare_rehearsed_choice(
+            &store,
+            prepared.clone(),
+            choice,
+            vec![a, b],
+            &[],
+            "record-first",
+        )
+        .unwrap();
+    let retained = engine.adopt(&store, &change).unwrap();
+    assert!(retained.scope.layers.is_empty());
+    assert!(retained.scope.compositions.is_empty());
+    assert_eq!(retained.data, before.data);
+    assert_eq!(retained.session, before.session);
+    assert_eq!(retained.active_revision, before.active_revision);
+    let reopened = ProductStore::open(dir.path().join("tool")).unwrap();
+    let recovered = product_backup::VerifiedBackup::capture(&reopened)
+        .unwrap()
+        .recover_new(dir.path().join("recovered"))
+        .unwrap();
+    let engine = DecisionEngine::new(
+        LocalRuntime::default(),
+        IntentArchive::new(recovered.clone()),
+    );
+    assert_eq!(
+        engine
+            .discovery_scenes(&recovered.load().unwrap())
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(engine
+        .prepare_change(
+            &recovered,
+            prepared.target(),
+            &[],
+            "cannot-activate-rehearsal"
+        )
+        .is_err());
+    let mut corrupt = retained.clone();
+    let proof = corrupt.scope.rehearsals.values_mut().next().unwrap();
+    proof.initialization.as_mut().unwrap().additions[0]
+        .values
+        .clear();
+    assert!(corrupt.validate().is_err());
+    let mut leaked = retained.clone();
+    leaked.data = prepared.seed().clone();
+    assert!(leaked.validate().is_err());
+    let later = add(&recovered, "later", "Unscoped continued work");
+    tick(&recovered, "later-days", 20005);
+    let actual = action(&recovered, "actual-calculate", "calculate", &later);
+    assert_eq!(
+        row(&actual, &later).values["production"],
+        DataValue::Integer { value: 2 }
+    );
+    assert!(actual.scope.layers.is_empty());
+    product_backup::VerifiedBackup::capture(&recovered).unwrap();
 }

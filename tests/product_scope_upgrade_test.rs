@@ -66,6 +66,8 @@ fn explicit_upgrade_preserves_format_one_bytes_and_requires_reopen() {
     let reopened = ProductStore::open(&path).unwrap();
     let current = reopened.load().unwrap();
     assert_eq!(current.version, 2);
+    assert!(current.scope.rehearsals.is_empty());
+    assert!(current.scope.correspondences.is_empty());
     assert_eq!(current.data.records.len(), 1);
     let current_pointer = fs::read(path.join("CURRENT")).unwrap();
     reopened.upgrade_generated_project(|_| {}).unwrap();

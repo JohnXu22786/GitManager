@@ -1,8 +1,13 @@
 //! Host-owned scoped executable composition and protected completion history.
 mod compiler;
 mod contract;
+mod correspondence;
 mod history;
+mod rehearsal;
 mod replay;
+pub(super) use correspondence::install as retain_correspondences;
+pub(super) use rehearsal::{rehearsal_request, retain_rehearsal};
+pub(crate) use replay::ProvenanceColumns;
 pub use replay::ScopedExecutionContext;
 mod verify;
 use super::*;
@@ -196,6 +201,7 @@ fn prepare(
     )?;
     let plan = make_plan(snapshot, &target, layer.scope(), id)?;
     Ok(PreparedScopedChange {
+        correspondences: BTreeMap::new(),
         adoption: plan,
         basis: layer.basis.snapshot.clone(),
         target,
@@ -260,6 +266,7 @@ fn prepare_withdrawal(
     };
     let adoption = make_plan(snapshot, &target, scope.clone(), id)?;
     Ok(PreparedScopedChange {
+        correspondences: BTreeMap::new(),
         basis: manifest.basis.snapshot.clone(),
         adoption,
         target,
@@ -331,6 +338,7 @@ fn prepare_evolution(
     };
     let adoption = make_plan(snapshot, &target, scope.clone(), id)?;
     Ok(PreparedScopedChange {
+        correspondences: BTreeMap::new(),
         basis: manifest.basis.snapshot.clone(),
         adoption,
         target,
@@ -504,7 +512,12 @@ impl ProductStore {
         let mut current = self.load()?;
         let request = canonical_digest(
             IdentityDomain::Adoption,
-            &(&adoption.plan, &prepared.manifest, decisions),
+            &(
+                &adoption.plan,
+                &prepared.manifest,
+                decisions,
+                &prepared.correspondences,
+            ),
         )?;
         if let Some(receipt) = current.operations.get(&adoption.plan.id) {
             return if receipt.request == request {
@@ -625,6 +638,13 @@ impl ProductStore {
                 revision: current.revision,
             },
         );
+        let revision = current.revision;
+        correspondence::install(
+            &mut current,
+            &prepared.correspondences,
+            &adoption.plan.id,
+            revision,
+        )?;
         self.save(
             &current,
             true,

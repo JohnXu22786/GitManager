@@ -20,6 +20,16 @@ pub const PROTECTED_FIELD_PREFIX: &str = "gm_scope_";
 /// Host admission is separate from executable semantics. The interpreter still
 /// executes one ordinary program; this hook validates retained scope provenance.
 pub trait ReplayAdmission: Send + Sync {
+    /// Keep synthetic record allocation tied to the authenticated original
+    /// business input when host-only metadata is added to a replay seed.
+    fn replay_operation_ids(
+        &self,
+        _program: &CapturedProgram,
+        scenario: &ScenarioSpec,
+    ) -> Result<Vec<Id>> {
+        Ok(scenario.replay_operation_ids()?)
+    }
+
     fn validate_seed(
         &self,
         program: &CapturedProgram,
@@ -210,6 +220,82 @@ impl LocalRuntime {
     ) -> Result<DataValue> {
         program.validate()?;
         data.validate()?;
+        self.evaluate_projection_inner(program, data, row, binding, expression, expected, day)
+    }
+    /// Evaluate an independently proven own-row historical expression. Validate
+    /// the coherent current data and every producer-row value first; global
+    /// constraints must not be applied to a mixture of historical/current rows.
+    pub(crate) fn evaluate_historical_record_projection(
+        &self,
+        program: &CapturedProgram,
+        data: &DataSnapshot,
+        row: &RecordRef,
+        values: &Values,
+        archived: bool,
+        binding: &str,
+        expression: &Expr,
+        expected: &Type,
+        day: i32,
+    ) -> Result<DataValue> {
+        program.validate()?;
+        data.validate()?;
+        if values.len() > MAX_ITEMS {
+            return Err(invalid("historical projection row exceeds bounds"));
+        }
+        let storage = data
+            .schema
+            .iter()
+            .find(|e| e.id == row.entity)
+            .ok_or_else(|| invalid("historical projection storage entity missing"))?;
+        for (id, value) in values {
+            let field = storage
+                .fields
+                .iter()
+                .find(|f| &f.id == id)
+                .ok_or_else(|| invalid("historical projection field missing"))?;
+            validate_value(value, &field.value_type, 0)?;
+        }
+        let producer = program
+            .program
+            .entities
+            .iter()
+            .find(|e| e.id == row.entity)
+            .ok_or_else(|| invalid("historical producer entity missing"))?;
+        for field in &producer.fields {
+            validate_value(
+                values.get(&field.id).unwrap_or(&DataValue::Null),
+                &field.value_type,
+                0,
+            )?;
+        }
+        let mut historical = data.clone();
+        let record = historical
+            .records
+            .iter_mut()
+            .find(|r| r.entity == row.entity && r.id == row.record)
+            .ok_or_else(|| invalid("historical projection record missing"))?;
+        record.values = values.clone();
+        record.archived = archived;
+        self.evaluate_projection_inner(
+            program,
+            &historical,
+            row,
+            binding,
+            expression,
+            expected,
+            day,
+        )
+    }
+    fn evaluate_projection_inner(
+        &self,
+        program: &CapturedProgram,
+        data: &DataSnapshot,
+        row: &RecordRef,
+        binding: &str,
+        expression: &Expr,
+        expected: &Type,
+        day: i32,
+    ) -> Result<DataValue> {
         validate_day(day)?;
         if data.project_id != program.binding.project_id || !valid_id(binding) {
             return Err(invalid("projection project or binding mismatch"));
@@ -380,7 +466,11 @@ impl LocalRuntime {
         let mut uncovered = Vec::new();
         // The shared replay driver excludes observation instrumentation from
         // mutation identity. Live apply/store IDs are supplied by their caller.
-        let operations = scenario.replay_operation_ids()?;
+        let operations = if let Some(admission) = admission {
+            admission.replay_operation_ids(program, scenario)?
+        } else {
+            scenario.replay_operation_ids()?
+        };
         for (input, operation) in scenario.inputs.iter().zip(operations) {
             let applied = self.apply(&mut run, input, &operation).and_then(|step| {
                 if let Some(admission) = admission {

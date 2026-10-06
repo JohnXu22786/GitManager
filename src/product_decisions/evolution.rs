@@ -362,8 +362,12 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 )?;
                 checked.bind_outcome = original.bind_outcome;
                 if (decision.obligations.is_empty() || original.bind_outcome)
-                    && same_outcome(original.observations(), checked.observations(), &mapping)?
-                        != Some(true)
+                    && self.compare_outcome(
+                        &original,
+                        &candidate,
+                        checked.observations(),
+                        &mapping,
+                    )? != Some(true)
                 {
                     return Err(DecisionError::Unverified(
                         "New design does not reproduce both accepted outcomes".into(),
@@ -434,6 +438,10 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             return Err(DecisionError::Unverified(
                 "New design fails an unrelated active intention".into(),
             ));
+        }
+        let mut scoped = scoped;
+        if let Some(prepared) = &mut scoped {
+            prepared.correspondences = self.pending_correspondences.borrow().clone();
         }
         Ok(EvolutionDraft {
             request: request.clone(),

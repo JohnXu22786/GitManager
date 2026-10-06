@@ -52,6 +52,13 @@ not arbitrary application composition.
    scope. Concrete outcomes stay binding when additional predicates are supplied.
    Use prepare_scoped_resolution for exact pending decision IDs; it retains the
    same frozen target and the existing successor/supersession checks
+   For EitherAcceptable, BothNeeded, NeitherFits or Deferred, use
+   prepare_rehearsed_choice with both actually experienced current/prospective
+   scenes. Capture the current side with accept_prepared_current_scene on the
+   same copied seed as accept_scoped_scene. It retains a bounded replay proof while leaving the live source,
+   data, schema, session and active layer set unchanged. This also works before
+   the first layer exists. Pending scope describes the proposal only. A later
+   Accept always needs a fresh preparation and exact pending resolution
 5. Adopt through DecisionEngine::adopt. Under the store lock it rechecks the full
    basis, regenerates composition/initialization, replays intentions and installs
    one snapshot through the existing atomic CURRENT pointer
@@ -89,13 +96,29 @@ of an authenticated accepted seed is checked separately and cannot change its
 business facts. When an authenticated original seed exactly matches retained
 initialization inputs, replay applies those independently regenerated metadata
 receipts and binds evidence to the resulting actual seed. Unknown synthetic
-correspondence is still rejected. The initialized seed of a managed evolution remains authenticated
+correspondence is still rejected. A genuine older project snapshot can receive
+a separate, source-qualified historical correspondence: only independently
+derived system cells are added at the original input. Every business record,
+event and day stays unchanged, and the exact compiled target executes.
+Historical replay captures are labelled CapturedForHistoricalReplay rather
+than presented as a real adoption receipt. Bounded typed proofs and original
+source/seed/scenario bindings survive restart and backup. Projected scenarios
+keep the original deterministic operation namespace, with distinct actual
+scenario/source evidence; live adoption freshness is unchanged.
+
+Concrete comparison excludes only compiler-added view/output provenance columns
+identified by independently regenerated manifests. All business cells, output
+row order/count, column types and predicates stay binding. Full raw observations,
+bytes and visible provenance remain retained.
+
+The initialized seed of a managed evolution remains authenticated
 through its exact retained basis and source after later edits and restart.
 
 ## Persistence, upgrades and recovery
 
 Generated-project format 2 embeds typed layers, compositions, initialization
-receipts and scoped adoption links. Ordinary reads accept only this current
+receipts, scoped adoption links, retained rehearsals and historical replay
+correspondences. Ordinary reads accept only this current
 format. The format-1 decoder is confined to explicit upgrade gates. Journals,
 old snapshot bytes and checkpoints are retained. Legacy order-tool formats are
 not changed.
