@@ -1047,13 +1047,11 @@ fn implicit_historical_channel_collisions_remain_unverified() {
             id: "y".into(),
         },
     };
-    let e = engine(&store);
-    let change = e
-        .prepare_change(&store, &target, &[mapping], "rename-collision")
-        .unwrap();
-    let saved = e.adopt(&store, &change).unwrap();
+    let saved = store.load().unwrap();
     assert!(
-        VerifiedRetainedHistory::load(&store).is_err(),
+        engine(&store)
+            .prepare_change(&store, &target, &[mapping], "rename-collision")
+            .is_err(),
         "the implicit old y must not be silently merged with x→y"
     );
     assert_eq!(store.load().unwrap(), saved);
@@ -1151,4 +1149,62 @@ fn host_workflow_validity_checks_mapped_intentions_on_candidates_and_alternative
             assert!(!report.defects.is_empty());
         }
     }
+}
+
+#[test]
+fn equal_valued_active_channels_cannot_collapse_through_an_implicit_mapping() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut source = filtered();
+    let mut duplicate = source["observables"][0].clone();
+    duplicate["id"] = json!("secondary");
+    duplicate["label"] = json!("Independent secondary count");
+    source["observables"]
+        .as_array_mut()
+        .unwrap()
+        .push(duplicate);
+    let current = capture(source.clone());
+    let scene = workflow(&current);
+    let store = ProductStore::create(dir.path().join("tool"), &current, 20000).unwrap();
+    save(
+        &store,
+        DecisionOutcome::KeepCurrent,
+        IntentionBinding::ObservedOutcome,
+        vec![],
+        vec![accepted(&current, &scene)],
+    );
+    let saved = store.load().unwrap();
+    source["observables"].as_array_mut().unwrap().remove(0);
+    let target = capture(source);
+    let mapping = SemanticMapping {
+        from: SemanticKey {
+            kind: SemanticKind::Observable,
+            entity: None,
+            id: "selected_count".into(),
+        },
+        to: SemanticKey {
+            kind: SemanticKind::Observable,
+            entity: None,
+            id: "secondary".into(),
+        },
+    };
+    let r = request(&store, &target);
+    let mut out = response(&r, &current, &scene);
+    out.response.hypotheses.clear();
+    let mut p = policy(&store);
+    p.retained_history
+        .as_mut()
+        .unwrap()
+        .map_target(&target, vec![mapping.clone()])
+        .unwrap();
+    let report = discover(&r, &out, &p, Arc::new(AtomicBool::new(false))).unwrap();
+    assert!(report.questions.is_empty());
+    assert!(!report.unverified.is_empty());
+    assert!(report
+        .checks
+        .iter()
+        .all(|c| c.state != CheckState::Satisfied));
+    assert!(engine(&store)
+        .prepare_change(&store, &target, &[mapping], "collapse-channels")
+        .is_err());
+    assert_eq!(store.load().unwrap(), saved);
 }

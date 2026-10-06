@@ -106,55 +106,6 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 }
                 let renames = bound.map(|m| m.mappings.clone()).unwrap_or_default();
                 let mapping = Mapping::new(&scene.program.program, &target.program, &renames)?;
-                // Explicit names must not merge with unchanged identities. A
-                // projection cannot discard another retained channel merely
-                // because only one side of the collision was renamed.
-                for (kind, ids) in [
-                    (
-                        SemanticKind::Observable,
-                        scene
-                            .program
-                            .program
-                            .observables
-                            .iter()
-                            .map(|v| &v.id)
-                            .collect::<Vec<_>>(),
-                    ),
-                    (
-                        SemanticKind::Output,
-                        scene
-                            .program
-                            .program
-                            .outputs
-                            .iter()
-                            .map(|v| &v.id)
-                            .collect(),
-                    ),
-                    (
-                        SemanticKind::View,
-                        scene.program.program.views.iter().map(|v| &v.id).collect(),
-                    ),
-                    (
-                        SemanticKind::Action,
-                        scene
-                            .program
-                            .program
-                            .actions
-                            .iter()
-                            .map(|v| &v.id)
-                            .collect(),
-                    ),
-                ] {
-                    let mut projected = BTreeSet::new();
-                    if ids
-                        .into_iter()
-                        .any(|id| !projected.insert(mapping.id(kind, id)))
-                    {
-                        return Err(DecisionError::Unverified(
-                            "Retained semantic mapping collides with an unchanged identity".into(),
-                        ));
-                    }
-                }
 
                 let mapped = match bound.and_then(|m| {
                     m.scenarios
