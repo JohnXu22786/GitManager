@@ -53,7 +53,7 @@ fn selected_scene(prepared: &PreparedScopedChange, row: &Record) -> ScenarioSpec
 }
 #[test]
 fn scoped_choice_replays_after_restart_backup_and_current_data_withdrawal() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let path = dir.path().join("tool");
     let store = ProductStore::create(&path, &program(false), 20000).unwrap();
     let selected = add(&store, "selected", "Selected");
@@ -149,7 +149,7 @@ fn scoped_choice_replays_after_restart_backup_and_current_data_withdrawal() {
 }
 #[test]
 fn scoped_replay_rejects_removed_provenance_and_reports_saved_origin() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
     let row = add(&store, "old", "Completed");
     action(&store, "finish", "complete", &row);
@@ -200,7 +200,7 @@ fn scoped_replay_rejects_removed_provenance_and_reports_saved_origin() {
 #[test]
 fn scoped_comparison_cannot_drop_protected_seed_or_claim_unguarded_evidence() {
     use std::sync::{atomic::AtomicBool, Arc};
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
     let row = add(&store, "selected", "Selected");
     action(&store, "wait", "wait", &row);
@@ -263,7 +263,7 @@ fn scoped_comparison_cannot_drop_protected_seed_or_claim_unguarded_evidence() {
 
 #[test]
 fn concrete_scoped_intention_survives_a_mapped_new_implementation() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
     let selected = add(&store, "selected", "Selected");
     action(&store, "wait", "wait", &selected);
@@ -454,7 +454,10 @@ fn verify_managed_discovery(
         response: DevelopmentResponse {
             version: 1,
             request_digest: request.identity().unwrap(),
-            candidates: vec![],
+            candidates: vec![GeneratedCandidate {
+                id: "candidate".into(),
+                source_json: String::from_utf8(request.sources[1].source_bytes.clone()).unwrap(),
+            }],
             hypotheses: vec![],
             evolutions: vec![],
             unsupported: vec![],
@@ -523,7 +526,7 @@ fn verify_managed_discovery(
 #[test]
 fn prepared_discovery_authority_goes_stale_when_daily_data_changes() {
     use product_discovery::VerifiedRetainedHistory;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
     let before = store.load().unwrap();
     let prepared = store
@@ -547,7 +550,7 @@ fn prepared_discovery_authority_goes_stale_when_daily_data_changes() {
 
 #[test]
 fn future_scoped_scene_uses_real_creation_provenance_for_later_operations() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
     let before = store.load().unwrap();
     let prepared = store
@@ -630,7 +633,7 @@ fn future_scoped_scene_uses_real_creation_provenance_for_later_operations() {
 
 #[test]
 fn a_retired_intention_does_not_trap_its_remaining_behavior_layer() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
     let selected = add(&store, "selected", "Selected");
     action(&store, "wait", "wait", &selected);
@@ -699,7 +702,7 @@ fn a_retired_intention_does_not_trap_its_remaining_behavior_layer() {
 
 #[test]
 fn fresh_development_receives_honest_editable_source_and_exact_slots() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
     let before = store.load().unwrap();
     let prepared = store
@@ -803,7 +806,7 @@ fn fresh_development_receives_honest_editable_source_and_exact_slots() {
 fn discovery_admits_the_matching_second_layer_seed_for_both_sources() {
     use product_discovery::{discover, DiscoveryPolicy, VerifiedRetainedHistory};
     use std::sync::{atomic::AtomicBool, Arc};
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
     let job = add(&store, "job", "Waiting work");
     action(&store, "wait", "wait", &job);
@@ -932,7 +935,7 @@ fn discovery_admits_the_matching_second_layer_seed_for_both_sources() {
                 statement: "Waiting reminders may remain visible or be hidden".into(),
                 kind: HypothesisKind::UnresolvedChoice,
                 action: "export".into(),
-                observable: "reminder".into(),
+                observable: "waiting_jobs".into(),
                 sources: vec![SourceLocus {
                     relative_path: second.target().binding.program_path.clone(),
                     raw_digest: second.target().artifact.raw_digest.clone(),
@@ -1071,7 +1074,7 @@ fn independent_promises_cross_only_authenticated_layer_initialization() {
             .unwrap();
         engine.adopt(store, &change).unwrap();
     }
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let path = dir.path().join("tool");
     let store = ProductStore::create(&path, &program(false), 20000).unwrap();
     let job = add(&store, "job", "Customer work");
@@ -1223,7 +1226,7 @@ fn independent_promises_cross_only_authenticated_layer_initialization() {
 
 #[test]
 fn managed_reconciliation_preserves_real_scenes_and_exact_supersessions() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
     let job = add(&store, "job", "Real waiting work");
     action(&store, "wait", "wait", &job);
@@ -1477,9 +1480,18 @@ fn managed_reconciliation_preserves_real_scenes_and_exact_supersessions() {
 
 #[test]
 fn pending_history_uses_authenticated_initialization_for_shared_discovery_input() {
+    check_pending_scoped_discovery(true);
+}
+
+#[test]
+fn repeated_scoped_history_ignores_only_verified_compiler_columns() {
+    check_pending_scoped_discovery(false);
+}
+
+fn check_pending_scoped_discovery(novel: bool) {
     use product_discovery::{discover, DiscoveryPolicy, VerifiedRetainedHistory};
     use std::sync::{atomic::AtomicBool, Arc};
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
     let job = add(&store, "job", "Waiting work");
     action(&store, "wait", "wait", &job);
@@ -1547,15 +1559,17 @@ fn pending_history_uses_authenticated_initialization_for_shared_discovery_input(
     );
     let current = store.load().unwrap();
     let mut raw = serde_json::to_value(program(true).program).unwrap();
-    for pointer in [
-        "/actions/3/steps/0/values/production",
-        "/actions/4/steps/0/values/production",
-        "/actions/6/steps/0/columns/production",
-        "/views/0/kind/columns/1/value",
-    ] {
-        let value = raw.pointer(pointer).unwrap().clone();
-        *raw.pointer_mut(pointer).unwrap() =
-            serde_json::json!({"kind":"add","left":value,"right":int(1)});
+    if novel {
+        for pointer in [
+            "/actions/3/steps/0/values/production",
+            "/actions/4/steps/0/values/production",
+            "/actions/6/steps/0/columns/production",
+            "/views/0/kind/columns/1/value",
+        ] {
+            let value = raw.pointer(pointer).unwrap().clone();
+            *raw.pointer_mut(pointer).unwrap() =
+                serde_json::json!({"kind":"add","left":value,"right":int(1)});
+        }
     }
     let prepared = store
         .prepare_scoped_change(
@@ -1629,7 +1643,7 @@ fn pending_history_uses_authenticated_initialization_for_shared_discovery_input(
                 statement: "This rule produces another real waiting-time result".into(),
                 kind: HypothesisKind::UnresolvedChoice,
                 action: "export".into(),
-                observable: "production".into(),
+                observable: "waiting_jobs".into(),
                 sources: vec![SourceLocus {
                     relative_path: prepared.target().binding.program_path.clone(),
                     raw_digest: prepared.target().artifact.raw_digest.clone(),
@@ -1699,7 +1713,41 @@ fn pending_history_uses_authenticated_initialization_for_shared_discovery_input(
         Arc::new(AtomicBool::new(false)),
     )
     .unwrap();
-    assert!(!report.questions.is_empty(), "{:?}", report);
+    if novel {
+        assert!(!report.questions.is_empty(), "{:?}", report);
+    } else {
+        assert!(report.questions.is_empty(), "{:?}", report);
+        assert!(
+            report
+                .log
+                .iter()
+                .any(|entry| entry.disposition == product_discovery::Disposition::Settled),
+            "{:?}",
+            report
+        );
+    }
+    assert!(report.unverified.is_empty(), "{:?}", report);
+    // Comparison projection never rewrites raw receipts or hides their visible
+    // provenance; every returned artifact still validates against its bytes.
+    for run in &report.runs {
+        run.validate().unwrap();
+        for observation in &run.observations {
+            for output in &observation.outputs {
+                output.validate().unwrap();
+            }
+        }
+    }
+    assert!(report
+        .runs
+        .iter()
+        .filter(|run| run.binding.artifact == prepared.target().artifact)
+        .flat_map(|run| &run.observations)
+        .flat_map(|observation| &observation.outputs)
+        .any(|output| output
+            .columns
+            .iter()
+            .any(|column| column.id.starts_with("gm_scope_"))));
+    assert_eq!(store.load().unwrap(), current);
     assert!(report
         .runs
         .iter()
@@ -1792,7 +1840,7 @@ fn all_nonbinary_managed_rehearsals_survive_restart_recovery_without_activation(
         DecisionOutcome::NeitherFits,
         DecisionOutcome::Deferred,
     ] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempdir();
         let path = dir.path().join("tool");
         let store = ProductStore::create(&path, &program(false), 20000).unwrap();
         let before = store.load().unwrap();
@@ -1997,13 +2045,32 @@ fn all_nonbinary_managed_rehearsals_survive_restart_recovery_without_activation(
                 )
                 .unwrap()
         };
+        let mut resolution_scene = selected_scene(&fresh, &job);
+        // A full-work evolution promises every action. Experience the remaining
+        // operations explicitly instead of inferring their coverage.
+        resolution_scene.inputs.splice(
+            0..0,
+            [
+                invoke("resume", &[("row", reference(&job))]),
+                invoke("wait", &[("row", reference(&job))]),
+            ],
+        );
+        let observation = resolution_scene.inputs.len() - 1;
+        resolution_scene.inputs.splice(
+            observation..observation,
+            [
+                invoke("archive", &[("row", reference(&job))]),
+                invoke(
+                    "add",
+                    &[
+                        ("name", text("Experienced new work")),
+                        ("promised", DataValue::Date { days: 20020 }),
+                    ],
+                ),
+            ],
+        );
         let accepted = engine
-            .accept_scoped_scene(
-                &recovered,
-                &fresh,
-                &selected_scene(&fresh, &job),
-                Disclosure::Synthetic,
-            )
+            .accept_scoped_scene(&recovered, &fresh, &resolution_scene, Disclosure::Synthetic)
             .unwrap();
         let choice=Choice{id:"resolved".into(),request:"Explicitly resolve the pending alternatives with this newly experienced revised rule".into(),rationale:None,scope:fresh.scope().clone(),outcome:DecisionOutcome::Accept{artifact:fresh.target().artifact.program_digest.clone()},obligations:vec![],binding:IntentionBinding::ObservedOutcome};
         let resolution = engine
@@ -2109,7 +2176,7 @@ fn future_rehearsals_preserve_selected_promises_without_activating_cohorts() {
         DecisionOutcome::NeitherFits,
         DecisionOutcome::Deferred,
     ] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempdir();
         let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
         let selected = add(&store, "selected", "Selected waiting work");
         let archived = add(&store, "archived", "Completed archived history");
@@ -2483,7 +2550,7 @@ fn future_rehearsals_preserve_selected_promises_without_activating_cohorts() {
 
 #[test]
 fn first_scope_can_be_rehearsed_and_retained_before_any_live_layer_exists() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
     let job = add(&store, "job", "Unscoped work");
     action(&store, "wait", "wait", &job);
@@ -2577,7 +2644,7 @@ fn first_scope_can_be_rehearsed_and_retained_before_any_live_layer_exists() {
 fn fresh_scoped_discovery_retains_creation_identity_without_pending_history() {
     use product_discovery::{discover, DiscoveryPolicy, VerifiedRetainedHistory};
     use std::sync::{atomic::AtomicBool, Arc};
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
     add(
         &store,
@@ -2697,7 +2764,7 @@ fn fresh_scoped_discovery_retains_creation_identity_without_pending_history() {
                 statement: "Waiting can pause production for future work".into(),
                 kind: HypothesisKind::UnresolvedChoice,
                 action: "export".into(),
-                observable: "production".into(),
+                observable: "waiting_jobs".into(),
                 sources: vec![SourceLocus {
                     relative_path: prepared.target().binding.program_path.clone(),
                     raw_digest: prepared.target().artifact.raw_digest.clone(),
@@ -2830,7 +2897,7 @@ fn fresh_scoped_discovery_retains_creation_identity_without_pending_history() {
 
 #[test]
 fn prepared_discovery_restores_correspondence_state_on_the_same_engine() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
     let job = add(&store, "job", "Accepted current work");
     action(&store, "wait", "wait", &job);
@@ -2957,7 +3024,7 @@ fn scoped_output_provenance_does_not_evaluate_intermediate_observables() {
         raw["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"reset_observation","label":"Finish export state","parameters":{},"guards":[],"steps":[{"kind":"set_state","state":"scratch","value":int(0)}],"ensures":[]}));
         capture(raw)
     }
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let store =
         ProductStore::create(dir.path().join("tool"), &deferred_observation(false), 20000).unwrap();
     let job = add(&store, "job", "Waiting export");
@@ -3035,7 +3102,7 @@ fn scoped_output_provenance_does_not_evaluate_intermediate_observables() {
 
 #[test]
 fn clock_only_scope_adoption_preserves_original_day_completed_scene() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let path = dir.path().join("tool");
     let store = ProductStore::create(&path, &program(false), 20000).unwrap();
     let job = add(&store, "job", "Completed before the clock changed");

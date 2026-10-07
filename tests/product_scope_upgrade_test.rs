@@ -1,3 +1,5 @@
+#[path = "../src/tool_proposal_input.rs"]
+mod bounded_intention_input;
 #[path = "fixtures/product_scope/mod.rs"]
 mod fixture;
 #[path = "../src/product_backup.rs"]
@@ -20,6 +22,38 @@ use product_store::*;
 use serde_json::json;
 use std::fs;
 
+#[test]
+fn local_intention_envelopes_keep_separate_bounded_intake() {
+    use bounded_intention_input::{parse_json_bytes, parse_json_bytes_with_limit};
+    let mut wire = vec![b'x'; MAX_WIRE_BYTES];
+    wire[0] = b'"';
+    *wire.last_mut().unwrap() = b'"';
+    assert!(parse_json_bytes(&wire).is_ok());
+    wire.insert(1, b'x');
+    assert!(parse_json_bytes(&wire).is_err());
+    assert!(parse_json_bytes_with_limit(&wire, MAX_INTENTION_OBJECT_BYTES).is_ok());
+
+    let dir = tempdir();
+    let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
+    let before = store.load().unwrap();
+    let object = store.stage_extension(&wire).unwrap();
+    assert_eq!(store.read_extension(&object).unwrap(), wire);
+    let mut local = vec![b'x'; MAX_INTENTION_OBJECT_BYTES];
+    local[0] = b'"';
+    *local.last_mut().unwrap() = b'"';
+    let object = store.stage_extension(&local).unwrap();
+    assert_eq!(store.read_extension(&object).unwrap(), local);
+    local.insert(1, b'x');
+    assert!(store.stage_extension(&local).is_err());
+    assert!(parse_json_bytes_with_limit(&local, MAX_INTENTION_OBJECT_BYTES).is_err());
+    for invalid in [b"{\"x\":1,\"x\":2}".as_slice(), b"{} {}".as_slice()] {
+        assert!(parse_json_bytes_with_limit(invalid, MAX_INTENTION_OBJECT_BYTES).is_err());
+    }
+    let deep = format!("{}0{}", "[".repeat(65), "]".repeat(65));
+    assert!(parse_json_bytes_with_limit(deep.as_bytes(), MAX_INTENTION_OBJECT_BYTES).is_err());
+    assert_eq!(store.load().unwrap(), before);
+}
+
 fn make_legacy(path: &std::path::Path) -> (ProductStore, Vec<u8>, Vec<u8>) {
     let store = ProductStore::create(path, &program(false), 20000).unwrap();
     add(&store, "first", "Original work");
@@ -39,7 +73,7 @@ fn make_legacy(path: &std::path::Path) -> (ProductStore, Vec<u8>, Vec<u8>) {
 }
 #[test]
 fn explicit_upgrade_preserves_format_one_bytes_and_requires_reopen() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let path = dir.path().join("old");
     let (store, pointer, old) = make_legacy(&path);
     assert!(matches!(store.load(), Err(StoreError::UpgradeRequired)));
@@ -82,7 +116,7 @@ fn upgrade_faults_are_idempotent_without_ordinary_edit_migration() {
         FaultPoint::BeforePointer,
         FaultPoint::AfterPointer,
     ] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempdir();
         let path = dir.path().join("old");
         let (store, _, _) = make_legacy(&path);
         assert!(store.upgrade_with_fault(|_| {}, fault).is_err());
@@ -97,7 +131,7 @@ fn upgrade_faults_are_idempotent_without_ordinary_edit_migration() {
 
 #[test]
 fn tool_open_reports_upgrade_and_verifies_identity_before_activation() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let path = dir.path().join("old");
     let (_, pointer, _) = make_legacy(&path);
     assert!(matches!(
@@ -137,7 +171,7 @@ fn legacy_backup_bytes(store: &ProductStore) -> Vec<u8> {
 }
 #[test]
 fn old_backup_upgrades_to_fresh_usable_recovery_and_preserves_original_bytes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let store = ProductStore::create(dir.path().join("source"), &program(false), 20000).unwrap();
     let record = add(&store, "old", "Original");
     let current = store.load().unwrap();
@@ -253,7 +287,7 @@ fn interrupted_old_backup_upgrade_retries_same_fresh_target_without_duplicate_wo
         FaultPoint::BeforePointer,
         FaultPoint::AfterPointer,
     ] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempdir();
         let source =
             ProductStore::create(dir.path().join("source"), &program(false), 20000).unwrap();
         add(&source, "old", "Original");
@@ -274,7 +308,7 @@ fn interrupted_old_backup_upgrade_retries_same_fresh_target_without_duplicate_wo
 
 #[test]
 fn legacy_backup_refuses_unknown_versions_and_corrupted_intention_links() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
     let bytes = legacy_backup_bytes(&store);
     let mut broken: serde_json::Value = serde_json::from_slice(&bytes).unwrap();

@@ -40,7 +40,7 @@ fn production(store: &ProductStore, row: &Record) -> i64 {
 }
 #[test]
 fn future_cohort_survives_waiting_edits_completion_and_mixed_export() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let path = dir.path().join("tool");
     let store = ProductStore::create(&path, &program(false), 20000).unwrap();
     let old = add(&store, "old", "Existing");
@@ -103,7 +103,7 @@ fn future_cohort_survives_waiting_edits_completion_and_mixed_export() {
 }
 #[test]
 fn selected_unfinished_population_is_frozen_and_preparation_goes_stale() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
     let selected = add(&store, "selected", "Selected");
     let other = add(&store, "other", "Other");
@@ -139,7 +139,7 @@ fn selected_unfinished_population_is_frozen_and_preparation_goes_stale() {
 }
 #[test]
 fn partial_structural_changes_and_raw_metadata_spoofing_are_rejected() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
     add(&store, "old", "Old");
     let before = store.load().unwrap();
@@ -189,7 +189,7 @@ fn optional_assignment_widening_preserves_types_nulls_and_atomic_constraints() {
     raw["actions"][3]["steps"][0]["values"]["optional_days"] =
         serde_json::to_value(elapsed("row", false)).unwrap();
     let p = capture(raw.clone());
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let store = ProductStore::create(dir.path().join("widened"), &p, 20000).unwrap();
     let r = add(&store, "add", "Optional assignment");
     assert_eq!(r.values["optional_days"], DataValue::Integer { value: 4 });
@@ -260,7 +260,7 @@ fn export_only_result_changes_do_not_modify_shared_selection_or_delete() {
     let mut source = contacts::organizer();
     source["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"delete_selected","label":"Archive selected","parameters":{},"guards":[],"steps":[{"kind":"for_each","items":{"kind":"state","state":"selected"},"binding":"person","steps":[{"kind":"archive","record":contacts::var("person")}]}],"ensures":[]}));
     let original = contacts::capture(source.clone());
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let store = ProductStore::create(dir.path().join("contacts"), &original, 20000).unwrap();
     apply(&store, "ada", contacts::add("Ada"));
     apply(&store, "bea", contacts::add("Bea"));
@@ -358,7 +358,7 @@ fn export_only_result_changes_do_not_modify_shared_selection_or_delete() {
 
 #[test]
 fn missing_birth_and_damaged_completed_values_fail_without_live_fallback() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
     let before = store.load().unwrap();
     let prepared = store
@@ -412,7 +412,7 @@ fn failed_mixed_transaction_rolls_back_fields_seals_outputs_and_stamps() {
         raw["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"batch_fail","label":"Atomic failed batch","parameters":{},"guards":[],"steps":[{"kind":"for_each","items":query,"binding":"item","steps":[{"kind":"update","record":var("item"),"values":{"production":elapsed("item",pause),"done":boolean(true)}}]},emit,{"kind":"assert","condition":boolean(false),"message":"Stop the entire transaction"}],"ensures":[]}));
         capture(raw)
     }
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let store = ProductStore::create(dir.path().join("tool"), &source(false), 20000).unwrap();
     add(&store, "old", "Old");
     let before = store.load().unwrap();
@@ -464,7 +464,7 @@ fn independent_operation_layer_does_not_corrupt_completion_or_withdrawal() {
         raw["observables"] = serde_json::json!([{"id":"show_summary","label":"Show summary","value":boolean(visible)}]);
         capture(raw)
     }
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let store = ProductStore::create(
         dir.path().join("tool"),
         &with_indicator(false, false),
@@ -537,7 +537,7 @@ fn foreign_subject_dependency_is_rejected_before_any_adoption() {
         raw["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"copy_result","label":"Copy to another job","parameters":{"source":{"kind":"reference","entity":"job"},"target":{"kind":"reference","entity":"job"}},"guards":[],"steps":[{"kind":"update","record":var("target"),"values":{"copied":field("source","production")}}],"ensures":[]}));
         capture(raw)
     }
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let store = ProductStore::create(dir.path().join("tool"), &coupled(false), 20000).unwrap();
     let row = add(&store, "first", "Selected");
     add(&store, "second", "Unselected");
@@ -592,7 +592,7 @@ fn completion_export_order_is_verified_before_activation() {
         capture(raw)
     }
     for unsafe_order in [false, true] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempdir();
         let store = ProductStore::create(
             dir.path().join("tool"),
             &combined(false, unsafe_order),
@@ -654,7 +654,7 @@ fn unpatched_shared_export_cannot_be_labelled_as_preserved_history() {
         raw["actions"].as_array_mut().unwrap().push(other);
         capture(raw)
     }
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let store = ProductStore::create(dir.path().join("tool"), &shared(false), 20000).unwrap();
     let before = store.load().unwrap();
     assert!(store
@@ -682,7 +682,7 @@ fn durable_aliases_cannot_carry_scoped_values_into_foreign_rows() {
             serde_json::json!({"id":"copy_cached","label":"Copy cached result","parameters":{"source":{"kind":"reference","entity":"job"},"target":{"kind":"reference","entity":"job"}},"guards":[],"steps":[{"kind":"update","record":var("target"),"values":{"copied":field("source","cached")}}],"ensures":[]})]);
         capture(raw)
     }
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let store = ProductStore::create(dir.path().join("tool"), &aliases(false), 20000).unwrap();
     let selected = add(&store, "selected", "Selected");
     add(&store, "other", "Other");
@@ -702,7 +702,7 @@ fn durable_aliases_cannot_carry_scoped_values_into_foreign_rows() {
     assert_eq!(store.load().unwrap(), before);
 }
 fn completed_scope_snapshot() -> product_store::ProjectSnapshot {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
     let before = store.load().unwrap();
     let prepared = store
@@ -774,7 +774,7 @@ fn every_writer_of_a_completed_durable_result_requires_protection() {
         raw["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"reset","label":"Reset derived result","parameters":{"row":{"kind":"reference","entity":"job"}},"guards":[],"steps":[{"kind":"update","record":var("row"),"values":{"production":int(99)}}],"ensures":[]}));
         capture(raw)
     }
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let store = ProductStore::create(dir.path().join("tool"), &with_reset(false), 20000).unwrap();
     let before = store.load().unwrap();
     let mut req = request(&before, ScopePopulation::FutureWork);
@@ -852,7 +852,7 @@ fn scoped_values_cannot_route_unscoped_bindings_targets_or_output_membership() {
         capture(raw)
     }
     for route in ["binding", "target", "output"] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempdir();
         let store =
             ProductStore::create(dir.path().join("tool"), &routed(false, route), 20000).unwrap();
         let selected = add(&store, "selected", "Selected");
@@ -888,7 +888,7 @@ fn completion_capture_rejects_writes_across_an_emitting_loop_back_edge() {
         raw["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"loop_emit","label":"Complete and emit per iteration","parameters":{"target":{"kind":"reference","entity":"job"}},"guards":[],"steps":[{"kind":"for_each","items":query,"binding":"each","steps":[{"kind":"update","record":var("target"),"values":{"done":boolean(true),"waited":{"kind":"add","left":field("target","waited"),"right":int(1)}}},emit]}],"ensures":[]}));
         capture(raw)
     }
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let store = ProductStore::create(dir.path().join("tool"), &loop_emit(false), 20000).unwrap();
     add(&store, "first", "First");
     add(&store, "second", "Second");
@@ -924,7 +924,7 @@ fn preserved_projections_reject_parameters_in_prior_and_mapped_expressions() {
         }
         capture(raw)
     }
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let store =
         ProductStore::create(dir.path().join("prior"), &parameterized(false, true), 20000).unwrap();
     let before = store.load().unwrap();
@@ -977,7 +977,7 @@ fn historical_row_verification_allows_valid_unique_value_reuse() {
         raw["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"rename","label":"Correct work name","parameters":{"row":{"kind":"reference","entity":"job"},"name":{"kind":"text"}},"guards":[],"steps":[{"kind":"update","record":var("row"),"values":{"name":var("name")}}],"ensures":[]}));
         capture(raw)
     }
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let path = dir.path().join("tool");
     let store = ProductStore::create(&path, &unique(false), 20000).unwrap();
     let before = store.load().unwrap();
@@ -1035,7 +1035,7 @@ fn historical_row_verification_allows_valid_unique_value_reuse() {
 
 #[test]
 fn incompatible_lifecycle_cannot_reopen_an_earlier_sealed_result() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let path = dir.path().join("tool");
     let store = ProductStore::create(&path, &program(false), 20000).unwrap();
     let job = add(&store, "job", "Waiting completed work");
@@ -1103,7 +1103,7 @@ fn incompatible_lifecycle_cannot_reopen_an_earlier_sealed_result() {
 
 #[test]
 fn managed_evolution_rejects_unstartable_initial_session_before_commit() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let path = dir.path().join("tool");
     let store = ProductStore::create(&path, &program(false), 20000).unwrap();
     let existing = add(&store, "existing", "Existing selectable work");

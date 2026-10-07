@@ -5,7 +5,9 @@ use crate::product_decisions::{
     VerifiedDiscoveryScene,
 };
 use crate::product_runtime::ReplayAdmission;
-use crate::product_store::scope::{PreparedScopedChange, ScopedExecutionContext};
+use crate::product_store::scope::{
+    PreparedScopedChange, ProvenanceColumns, ScopedExecutionContext,
+};
 use crate::product_store::{ProductStore, ProjectSnapshot};
 
 type ProjectionRegistry = Arc<std::sync::RwLock<BTreeMap<Digest, ScopedExecutionContext>>>;
@@ -38,6 +40,87 @@ impl std::fmt::Debug for VerifiedRetainedHistory {
 }
 fn unavailable(error: impl std::fmt::Display) -> AdapterError {
     AdapterError::Unsupported(format!("Retained intention history is unverified: {error}"))
+}
+/// Only the exact host-regenerated source may identify compiler-added columns.
+/// An ordinary source gets no exemption for names resembling system metadata.
+pub(super) fn comparison_columns(
+    policy: &DiscoveryPolicy,
+    source: &CapturedProgram,
+) -> Result<ProvenanceColumns, AdapterError> {
+    source.validate()?;
+    if let Some(history) = &policy.retained_history {
+        let id = canonical_digest(IdentityDomain::Source, source)?;
+        if let Some(prepared) = history.prepared_targets.get(&id) {
+            return ScopedExecutionContext::prepared(&history.current, prepared)
+                .and_then(|context| context.provenance_columns(source))
+                .map_err(unavailable);
+        }
+        return history
+            .replay_context
+            .provenance_columns(source)
+            .map_err(unavailable);
+    }
+    if crate::product_runtime::has_protected_fields(source) {
+        return Err(unavailable(
+            "comparison source has no verified compiler manifest",
+        ));
+    }
+    Ok(ProvenanceColumns::default())
+}
+
+/// A temporary material-comparison projection, never a RunEvidence or a saved
+/// artifact. The original runs and their complete byte receipts stay intact.
+pub(super) fn comparison_observations(
+    policy: &DiscoveryPolicy,
+    source: &CapturedProgram,
+    run: &RunEvidence,
+) -> Result<Vec<Observation>, AdapterError> {
+    if run.binding.source != source.binding || run.binding.artifact != source.artifact {
+        return Err(unavailable(
+            "comparison projection source differs from execution",
+        ));
+    }
+    let columns = comparison_columns(policy, source)?;
+    let mut observations = run.observations.clone();
+    for observation in &mut observations {
+        if let Some(schema) = &mut observation.view_schema {
+            schema
+                .columns
+                .retain(|column, _| !columns.view(&observation.view.view, column));
+        }
+        for row in &mut observation.view.rows {
+            row.cells
+                .retain(|column, _| !columns.view(&observation.view.view, column));
+        }
+        for artifact in &mut observation.outputs {
+            artifact.validate()?;
+            if artifact
+                .columns
+                .iter()
+                .any(|column| columns.output(&artifact.output, &column.id))
+            {
+                let fields = artifact
+                    .columns
+                    .iter()
+                    .filter(|column| !columns.output(&artifact.output, &column.id))
+                    .cloned()
+                    .collect();
+                let rows = artifact
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        row.iter()
+                            .filter(|(column, _)| !columns.output(&artifact.output, column))
+                            .map(|(column, value)| (column.clone(), value.clone()))
+                            .collect()
+                    })
+                    .collect();
+                *artifact =
+                    LocalArtifact::from_rows(&artifact.output, artifact.format, fields, rows)?;
+            }
+        }
+    }
+    Ok(observations)
 }
 impl VerifiedRetainedHistory {
     pub fn load(store: &ProductStore) -> Result<Self, AdapterError> {
@@ -535,8 +618,18 @@ impl VerifiedRetainedHistory {
                 side.replay().clone()
             };
             runs.push(correspondence.clone());
+            let original_source = request
+                .sources
+                .iter()
+                .find(|source| {
+                    source.binding == original.binding.source
+                        && source.artifact == original.binding.artifact
+                })
+                .ok_or_else(|| unavailable("retained comparison source is unavailable"))?;
+            let comparison = comparison_observations(policy, original_source, &original)?;
             outcomes.push(RetainedRun {
                 original,
+                comparison,
                 compared_input: selected.input_identity()?,
                 correspondence,
                 mappings: side.mappings().to_vec(),
@@ -553,6 +646,7 @@ impl VerifiedRetainedHistory {
 /// historical RunEvidence, output receipt or immutable identity is rewritten.
 pub(super) struct RetainedRun {
     pub original: RunEvidence,
+    pub comparison: Vec<Observation>,
     pub correspondence: RunEvidence,
     compared_input: Digest,
     pub mappings: Vec<SemanticMapping>,
@@ -561,6 +655,7 @@ impl RetainedRun {
     pub fn direct(run: RunEvidence) -> Self {
         Self {
             original: run.clone(),
+            comparison: run.observations.clone(),
             compared_input: run.binding.input_digest.clone(),
             correspondence: run,
             mappings: vec![],

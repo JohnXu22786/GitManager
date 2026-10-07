@@ -445,18 +445,9 @@ impl ScopedExecutionContext {
                 "an unverified raw seed cannot grant scope metadata authority",
             ));
         }
-        let mut expected = original.clone();
-        for entity in &target.program.entities {
-            if let Some(stored) = expected.schema.iter_mut().find(|e| e.id == entity.id) {
-                for field in &entity.fields {
-                    if !stored.fields.iter().any(|f| f.id == field.id) {
-                        stored.fields.push(field.clone());
-                    }
-                }
-            } else {
-                expected.schema.push(entity.clone());
-            }
-        }
+        // Use the interpreter's exact typed additive merge, including active
+        // entity labels and constraints, while preserving every business fact.
+        let expected = merged_data(target, original)?;
         if expected != *mapped {
             return Err(compiler::error(
                 "scope scene mapping changed protected seed facts",

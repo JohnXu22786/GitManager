@@ -151,6 +151,12 @@ publishes only the new-format pointer in a fresh destination. Exact interrupted
 attempts can resume there; an unrelated or later-used destination is never
 overwritten. Restart/open and recent-instance registration follow the upgrade.
 
+Provider and individual source documents retain the 1 MiB intake limit. Local
+intention envelopes can contain multiple complete captures and execution
+receipts, so they have a separate 16 MiB limit. Duplicate-member, nesting and
+trailing-input checks still apply. Intention bundles remain bounded at 32 MiB
+and backups at 64 MiB; exceeding a limit does not activate partial history.
+
 Imported historical evidence retains its original source and runtime identities.
 It is rerun before another behavior change; an upgrade never relabels old proof
 as current proof.

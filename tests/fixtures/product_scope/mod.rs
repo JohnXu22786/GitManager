@@ -4,6 +4,12 @@ use crate::product_store::{scope::*, ProductStore, ProjectSnapshot};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 
+pub fn tempdir() -> tempfile::TempDir {
+    // macOS's system temp path traverses /var. Select its real parent before
+    // the recovery tests exercise the production no-symlink path boundary.
+    tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap()
+}
+
 pub fn lit(value: DataValue, value_type: Type) -> Expr {
     Expr::Literal { value_type, value }
 }
@@ -86,7 +92,7 @@ pub fn program(pause: bool) -> CapturedProgram {
             {"id":"complete","label":"Complete work","parameters":{"row":{"kind":"reference","entity":"job"}},"guards":[],"steps":[{"kind":"update","record":var("row"),"values":{"production":elapsed("row",pause),"done":boolean(true)}}],"ensures":[]},
             {"id":"archive","label":"Archive work","parameters":{"row":{"kind":"reference","entity":"job"}},"guards":[],"steps":[{"kind":"archive","record":var("row")}],"ensures":[]},
             {"id":"export","label":"Export current and preserved results","parameters":{},"guards":[],"steps":[{"kind":"emit","output":"sheet","items":query,"binding":"row","columns":{"name":field("row","name"),"production":elapsed("row",pause),"promised":field("row","promised"),"reminder":field("row","waiting")}}],"ensures":[]}
-        ],"outputs":[{"id":"sheet","label":"Work results","format":"csv","columns":[{"id":"name","label":"Name","value_type":{"kind":"text"}},{"id":"production","label":"Production days","value_type":{"kind":"integer"}},{"id":"promised","label":"Customer commitment","value_type":{"kind":"date"}},{"id":"reminder","label":"Follow up materials","value_type":{"kind":"boolean"}}]}],"observables":[],
+        ],"outputs":[{"id":"sheet","label":"Work results","format":"csv","columns":[{"id":"name","label":"Name","value_type":{"kind":"text"}},{"id":"production","label":"Production days","value_type":{"kind":"integer"}},{"id":"promised","label":"Customer commitment","value_type":{"kind":"date"}},{"id":"reminder","label":"Follow up materials","value_type":{"kind":"boolean"}}]}],"observables":[{"id":"waiting_jobs","label":"Jobs waiting for materials","value":{"kind":"count","items":{"kind":"query","entity":"job","binding":"q","predicate":field("q","waiting"),"sort":[],"limit":1000,"include_archived":false}}}],
         "views":[{"id":"work","label":"Work","kind":{"kind":"list","entity":"job","rows":query,"columns":[{"id":"name","label":"Name","value":field("row","name")},{"id":"production","label":"Production days","value":elapsed("row",pause)},{"id":"promised","label":"Customer commitment","value":field("row","promised")},{"id":"reminder","label":"Follow up materials","value":field("row","waiting")}],"controls":[],"selection":null},"actions":[],"keys":[]}],"initial_view":"work"});
     capture(value)
 }

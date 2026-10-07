@@ -19,6 +19,9 @@ pub use upgrade::{UpgradeProgress, UpgradeSummary};
 const MAGIC: &str = "gitmanager.generated-project";
 const FORMAT: u32 = 2;
 const MAX_STORE_BYTES: usize = 16 * 1024 * 1024;
+/// Local envelopes retain multiple full captures and execution receipts. Each
+/// individual source/provider document still has its separate 1 MiB cap.
+pub(crate) const MAX_INTENTION_OBJECT_BYTES: usize = MAX_STORE_BYTES;
 type Result<T> = std::result::Result<T, StoreError>;
 #[derive(Debug)]
 pub enum StoreError {
@@ -393,7 +396,7 @@ impl ProductStore {
         self.pinned()?;
         let bytes = self.root.read(
             &format!("extension-{}.json", digest.as_str()),
-            MAX_WIRE_BYTES,
+            MAX_INTENTION_OBJECT_BYTES,
         )?;
         if Self::extension_digest(&bytes)? != *digest {
             return Err(StoreError::Corrupt(
@@ -405,7 +408,7 @@ impl ProductStore {
     }
 
     fn extension_digest(bytes: &[u8]) -> Result<Digest> {
-        if bytes.len() > MAX_WIRE_BYTES {
+        if bytes.len() > MAX_INTENTION_OBJECT_BYTES {
             return Err(StoreError::Invalid(
                 "intention object exceeds the byte limit".into(),
             ));

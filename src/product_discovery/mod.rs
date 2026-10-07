@@ -1135,7 +1135,10 @@ pub fn discover(
                 (Ok(a), Ok(b))
                     if a.state == EvidenceState::Observed && b.state == EvidenceState::Observed =>
                 {
-                    Some((a.observations.clone(), b.observations.clone()))
+                    Some((
+                        history::comparison_observations(policy, before, a)?,
+                        history::comparison_observations(policy, candidate, b)?,
+                    ))
                 }
                 _ => None,
             };
@@ -1385,7 +1388,7 @@ pub fn discover(
                     .collect();
                 for point in &points {
                     // Only actual captured changes may generate new choice witnesses.
-                    for target in comparison_targets(&[before, candidate], point)? {
+                    for target in comparison_targets(&[before, candidate], point, policy)? {
                         if !*new_feature {
                             match captured_observations
                                 .as_ref()
@@ -1440,6 +1443,7 @@ pub fn discover(
                                     for channel in comparison_targets(
                                         &[before, alternative, candidate],
                                         point,
+                                        policy,
                                     )? {
                                         if channel
                                             .differs(&a.observations, &b.observations)
@@ -1453,8 +1457,10 @@ pub fn discover(
                                         }
                                     }
                                 }
-                                let channels =
-                                    unrepresented_differences(&a.observations, &b.observations);
+                                let channels = unrepresented_differences(
+                                    &history::comparison_observations(policy, alternative, a)?,
+                                    &history::comparison_observations(policy, candidate, b)?,
+                                );
                                 if !channels.is_empty() {
                                     material_unknowns.insert((alternative.binding.identity()?, candidate.binding.identity()?, scene_equivalence_key(&scene)?), format!("Alternative {id} executions differ in material channels without executable property terms: {}", channels.join(", ")));
                                 }
@@ -1611,11 +1617,35 @@ pub fn discover(
                                     original_after,
                                     &expected_before,
                                     &expected_after,
+                                    &history::comparison_observations(
+                                        policy,
+                                        witness.before_program(),
+                                        original_before,
+                                    )?,
+                                    &history::comparison_observations(
+                                        policy,
+                                        witness.after_program(),
+                                        original_after,
+                                    )?,
                                 );
                                 // The provider's observation subset cannot hide a changed
                                 // point already observed by our complete retained replay.
-                                let replay_profile =
-                                    retained_profile(a, b, &expected_before, &expected_after);
+                                let replay_profile = retained_profile(
+                                    a,
+                                    b,
+                                    &expected_before,
+                                    &expected_after,
+                                    &history::comparison_observations(
+                                        policy,
+                                        witness.before_program(),
+                                        a,
+                                    )?,
+                                    &history::comparison_observations(
+                                        policy,
+                                        witness.after_program(),
+                                        b,
+                                    )?,
+                                );
                                 if profile.is_none() || replay_profile.is_none() {
                                     unavailable = true;
                                     report.unverified.push("Retained material observation correspondence is unresolved".into());
@@ -2016,6 +2046,7 @@ pub fn discover(
 fn comparison_targets(
     programs: &[&CapturedProgram],
     point: &str,
+    policy: &DiscoveryPolicy,
 ) -> Result<Vec<ObservationTarget>, AdapterError> {
     let observables: BTreeSet<_> = programs
         .iter()
@@ -2031,15 +2062,25 @@ fn comparison_targets(
     let mut outputs = BTreeMap::<Id, BTreeSet<Id>>::new();
     let mut columns = BTreeSet::new();
     for program in programs {
+        let provenance = history::comparison_columns(policy, program)?;
         for output in &program.program.outputs {
-            outputs
-                .entry(output.id.clone())
-                .or_default()
-                .extend(output.columns.iter().map(|c| c.id.clone()));
+            outputs.entry(output.id.clone()).or_default().extend(
+                output
+                    .columns
+                    .iter()
+                    .filter(|column| !provenance.output(&output.id, &column.id))
+                    .map(|c| c.id.clone()),
+            );
         }
         for view in &program.program.views {
             if let Some(schema) = program.program.view_schema(&view.id)? {
-                columns.extend(schema.columns.keys().cloned());
+                columns.extend(
+                    schema
+                        .columns
+                        .keys()
+                        .filter(|column| !provenance.view(&view.id, column))
+                        .cloned(),
+                );
             }
         }
     }
@@ -2519,15 +2560,14 @@ struct RetainedProfile {
 /// for the whole trace. Coordinate-wise mixing cannot count as a saved outcome.
 fn retained_profile(
     before: &RunEvidence,
-    after: &RunEvidence,
+    _after: &RunEvidence,
     expected_before: &RetainedRun,
     expected_after: &RetainedRun,
+    compared_before: &[Observation],
+    compared_after: &[Observation],
 ) -> Option<RetainedProfile> {
     // Include all typed channels, including ones absent from the first side.
-    let observations: Vec<_> = [before, after]
-        .into_iter()
-        .flat_map(|run| run.observations.iter())
-        .collect();
+    let observations: Vec<_> = compared_before.iter().chain(compared_after).collect();
     let mut observables: BTreeSet<_> = observations
         .iter()
         .flat_map(|o| o.value_types.keys().cloned())
@@ -2546,7 +2586,7 @@ fn retained_profile(
         .flat_map(|o| o.view_schema.iter().flat_map(|s| s.columns.keys().cloned()))
         .collect();
     for historical in [expected_before, expected_after] {
-        for observation in &historical.original.observations {
+        for observation in &historical.comparison {
             for id in observation.value_types.keys() {
                 observables.insert(historical.forward(SemanticKind::Observable, id));
             }
@@ -2570,11 +2610,11 @@ fn retained_profile(
     }
     let mut coordinates = vec![];
     let mut opaque_coordinates = vec![];
-    for observation in &before.observations {
+    for observation in compared_before {
         let point = &observation.point;
         let current_channels = [
             unrepresented_material(observation)?,
-            unrepresented_material(after.observations.iter().find(|o| &o.point == point)?)?,
+            unrepresented_material(compared_after.iter().find(|o| &o.point == point)?)?,
         ];
         let point_target = ObservationTarget::ViewRows {
             point: point.clone(),
@@ -2586,15 +2626,13 @@ fn retained_profile(
             let old_channels = [
                 expected_before.material(
                     expected_before
-                        .original
-                        .observations
+                        .comparison
                         .iter()
                         .find(|o| o.point == old_before.point())?,
                 )?,
                 expected_after.material(
                     expected_after
-                        .original
-                        .observations
+                        .comparison
                         .iter()
                         .find(|o| o.point == old_after.point())?,
                 )?,
@@ -2647,8 +2685,8 @@ fn retained_profile(
                 }),
         );
         for target in targets {
-            let current_before = target.sample_term(&before.observations);
-            let current_after = target.sample_term(&after.observations);
+            let current_before = target.sample_term(compared_before);
+            let current_after = target.sample_term(compared_after);
             let (old_before, old_after) = match (
                 expected_before.target(&target, before),
                 expected_after.target(&target, before),
@@ -2664,8 +2702,8 @@ fn retained_profile(
             let values = [
                 current_before,
                 current_after,
-                old_before.sample_term(&expected_before.original.observations),
-                old_after.sample_term(&expected_after.original.observations),
+                old_before.sample_term(&expected_before.comparison),
+                old_after.sample_term(&expected_after.comparison),
             ];
             if values.iter().all(Option::is_none) {
                 continue;

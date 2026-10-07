@@ -13,7 +13,7 @@ use product_contract::*;
 use product_store::{scope::*, FaultPoint, ProductStore};
 #[test]
 fn withdrawal_uses_current_data_and_keeps_later_completed_facts() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let path = dir.path().join("tool");
     let store = ProductStore::create(&path, &program(false), 20000).unwrap();
     let old = add(&store, "old", "Existing");
@@ -61,7 +61,7 @@ fn scoped_adoption_retry_is_atomic_and_initialization_is_not_repeated() {
         FaultPoint::BeforePointer,
         FaultPoint::AfterPointer,
     ] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempdir();
         let path = dir.path().join("tool");
         let store = ProductStore::create(&path, &program(false), 20000).unwrap();
         add(&store, "old", "Existing");
@@ -90,7 +90,7 @@ fn scoped_adoption_retry_is_atomic_and_initialization_is_not_repeated() {
 
 #[test]
 fn mapped_new_expression_and_structural_evolution_keep_history_usable() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
     let before = store.load().unwrap();
     let scoped = store
@@ -201,7 +201,7 @@ fn durable_slot_retargeting_cannot_unprotect_completed_original_fields() {
         raw["actions"][0]["steps"][0]["values"]["copied"] = serde_json::to_value(int(0)).unwrap();
         capture(raw)
     }
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let store = ProductStore::create(dir.path().join("tool"), &with_copy(false), 20000).unwrap();
     let before = store.load().unwrap();
     let first = store
@@ -255,7 +255,7 @@ fn durable_slot_retargeting_cannot_unprotect_completed_original_fields() {
 
 #[test]
 fn corrupted_earlier_composition_references_fail_before_recovery_activation() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
     let before = store.load().unwrap();
     let first = store

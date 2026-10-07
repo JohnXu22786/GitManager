@@ -63,7 +63,7 @@ impl IntentArchive {
             content,
         };
         let bytes = canonical_bytes(&object)?;
-        if bytes.len() > MAX_WIRE_BYTES {
+        if bytes.len() > crate::product_store::MAX_INTENTION_OBJECT_BYTES {
             return Err(invalid("intention object exceeds archive byte limit"));
         }
         let digest = canonical_digest(IdentityDomain::Evidence, &object)?;
@@ -108,7 +108,11 @@ impl IntentArchive {
     }
 }
 pub(super) fn decode(bytes: &[u8], digest: &Digest) -> Result<Content> {
-    let value = bounded_input::parse_json_bytes(bytes).map_err(|e| invalid(&e.to_string()))?;
+    let value = bounded_input::parse_json_bytes_with_limit(
+        bytes,
+        crate::product_store::MAX_INTENTION_OBJECT_BYTES,
+    )
+    .map_err(|e| invalid(&e.to_string()))?;
     let object: Object = serde_json::from_value(value).map_err(|e| invalid(&e.to_string()))?;
     if bytes != canonical_bytes(&object)?
         || object.version != 1
