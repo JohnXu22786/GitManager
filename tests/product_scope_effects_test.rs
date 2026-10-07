@@ -256,6 +256,131 @@ fn optional_assignment_widening_preserves_types_nulls_and_atomic_constraints() {
 #[path = "fixtures/product_runtime/mod.rs"]
 mod contacts;
 #[test]
+fn scoped_optional_updates_preserve_sealed_nulls_and_atomic_fields() {
+    fn source(pause: bool) -> serde_json::Value {
+        let mut raw = serde_json::to_value(program(pause).program).unwrap();
+        let fields = raw["entities"][0]["fields"].as_array_mut().unwrap();
+        fields.iter_mut().find(|f| f["id"] == "production").unwrap()["value_type"] =
+            serde_json::json!({"kind":"optional","item":{"kind":"integer"}});
+        for name in ["pair_a", "pair_b"] {
+            fields
+                .push(serde_json::json!({"id":name,"label":name,"value_type":{"kind":"integer"}}));
+        }
+        raw["entities"][0]["constraints"] = serde_json::json!([{
+            "kind":"equal","left":field("record","pair_a"),"right":field("record","pair_b")
+        }]);
+        raw["actions"][0]["steps"][0]["values"]["production"] = serde_json::json!({
+            "kind":"literal","value_type":{"kind":"optional","item":{"kind":"integer"}},"value":{"kind":"null"}
+        });
+        for name in ["pair_a", "pair_b"] {
+            raw["actions"][0]["steps"][0]["values"][name] = serde_json::to_value(int(0)).unwrap();
+            raw["actions"][3]["steps"][0]["values"][name] =
+                serde_json::to_value(elapsed("row", false)).unwrap();
+        }
+        raw["actions"].as_array_mut().unwrap().extend([
+            serde_json::json!({"id":"mark_done","label":"Keep the recorded result","parameters":{"row":{"kind":"reference","entity":"job"}},"guards":[],"steps":[{"kind":"update","record":var("row"),"values":{"done":boolean(true)}}],"ensures":[]}),
+            serde_json::json!({"id":"invalid_pair","label":"Invalid simultaneous update","parameters":{"row":{"kind":"reference","entity":"job"}},"guards":[],"steps":[{"kind":"update","record":var("row"),"values":{"pair_a":int(4),"pair_b":int(5)}}],"ensures":[]}),
+        ]);
+        raw
+    }
+    let raw = source(false);
+    let dir = tempdir();
+    let path = dir.path().join("optional-scope");
+    let store = ProductStore::create(&path, &capture(raw.clone()), 20000).unwrap();
+    let null = add(&store, "null", "Completed without a value");
+    action(&store, "seal-null", "mark_done", &null);
+    let value = add(&store, "value", "Completed with a value");
+    let live = add(&store, "live", "Selected unfinished");
+    let other = add(&store, "other", "Other unfinished");
+    action(&store, "wait", "wait", &live);
+    tick(&store, "two-days", 20002);
+    action(&store, "record-value", "calculate", &value);
+    action(&store, "seal-value", "mark_done", &value);
+    let before = store.load().unwrap();
+    let prepared = store
+        .prepare_scoped_change(
+            &capture(source(true)),
+            &request(
+                &before,
+                ScopePopulation::SelectedUnfinished {
+                    records: vec![RecordRef {
+                        entity: live.entity.clone(),
+                        record: live.id.clone(),
+                    }],
+                },
+            ),
+            "optional-scope",
+        )
+        .unwrap();
+    store.adopt_scoped(before.revision, &prepared).unwrap();
+    tick(&store, "three-days", 20003);
+    for (record, expected) in [
+        (&live, DataValue::Integer { value: 0 }),
+        (&other, DataValue::Integer { value: 3 }),
+        (&null, DataValue::Null),
+        (&value, DataValue::Integer { value: 2 }),
+    ] {
+        let before = store.load().unwrap();
+        let after = action(
+            &store,
+            &format!("calculate-{}", record.id),
+            "calculate",
+            record,
+        );
+        let actual = row(&after, record);
+        assert_eq!(actual.values["production"], expected);
+        assert_eq!(actual.values["pair_a"], DataValue::Integer { value: 3 });
+        assert_eq!(actual.values["pair_b"], DataValue::Integer { value: 3 });
+        assert_eq!(after.data.events.len(), before.data.events.len() + 1);
+    }
+    let before = store.load().unwrap();
+    assert!(store
+        .apply(
+            before.revision,
+            "invalid-pair",
+            &invoke("invalid_pair", &[("row", reference(&live))]),
+            RuntimeLimits::default()
+        )
+        .is_err());
+    assert_eq!(store.load().unwrap(), before);
+    assert_eq!(ProductStore::open(&path).unwrap().load().unwrap(), before);
+
+    let optional_null = raw["actions"][0]["steps"][0]["values"]["production"].clone();
+    let mixed = serde_json::json!({"kind":"if","condition":boolean(true),"then_value":optional_null,"else_value":int(7)});
+    // The same optional storage rule applies to both Create and Update, including
+    // nested assignment branches; it does not alter generic expression typing.
+    let mut assignment = raw.clone();
+    for action in [0, 3] {
+        assignment["actions"][action]["steps"][0]["values"]["production"] = serde_json::json!({"kind":"if","condition":boolean(false),"then_value":mixed,"else_value":int(9)});
+    }
+    let branch_store = ProductStore::create(
+        dir.path().join("branches"),
+        &capture(assignment.clone()),
+        20000,
+    )
+    .unwrap();
+    let r = add(&branch_store, "branch-create", "Optional branches");
+    assert_eq!(r.values["production"], DataValue::Integer { value: 9 });
+    assert_eq!(
+        row(&action(&branch_store, "branch-update", "calculate", &r), &r).values["production"],
+        DataValue::Integer { value: 9 }
+    );
+    for action in [0, 3] {
+        let mut bad = assignment.clone();
+        bad["actions"][action]["steps"][0]["values"]["production"]["then_value"]["else_value"] =
+            serde_json::to_value(lit(text("Wrong inner type"), Type::Text)).unwrap();
+        assert!(AppDefinition::parse(&serde_json::to_vec(&bad).unwrap()).is_err());
+        let mut bad_condition = assignment.clone();
+        bad_condition["actions"][action]["steps"][0]["values"]["production"]["condition"] =
+            serde_json::to_value(int(1)).unwrap();
+        assert!(AppDefinition::parse(&serde_json::to_vec(&bad_condition).unwrap()).is_err());
+    }
+    let mut generic = raw;
+    generic["views"][0]["kind"]["columns"][1]["value"] = mixed;
+    assert!(AppDefinition::parse(&serde_json::to_vec(&generic).unwrap()).is_err());
+}
+
+#[test]
 fn export_only_result_changes_do_not_modify_shared_selection_or_delete() {
     let mut source = contacts::organizer();
     source["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"delete_selected","label":"Archive selected","parameters":{},"guards":[],"steps":[{"kind":"for_each","items":{"kind":"state","state":"selected"},"binding":"person","steps":[{"kind":"archive","record":contacts::var("person")}]}],"ensures":[]}));

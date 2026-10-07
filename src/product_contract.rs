@@ -823,6 +823,37 @@ impl<'a> Validator<'a> {
             }
         })
     }
+    fn assignment(
+        &mut self,
+        value: &Expr,
+        env: &Environment,
+        expected: &Type,
+        depth: usize,
+    ) -> Result<()> {
+        // Storage supplies the expected optional type to each conditional
+        // branch. A sealed value may be Null while the live branch computes T.
+        // This does not widen If expressions outside an optional assignment.
+        if let (
+            Type::Optional { .. },
+            Expr::If {
+                condition,
+                then_value,
+                else_value,
+            },
+        ) = (expected, value)
+        {
+            self.node(depth)?;
+            self.expect(condition, env, &Type::Boolean, depth + 1, true)?;
+            self.assignment(then_value, env, expected, depth + 1)?;
+            return self.assignment(else_value, env, expected, depth + 1);
+        }
+        let actual = self.expr(value, env, depth, true)?;
+        require(
+            &actual == expected
+                || matches!(expected, Type::Optional { item } if item.as_ref() == &actual),
+            format!("assignment type mismatch: expected {expected:?}, found {actual:?}"),
+        )
+    }
     fn assignments(
         &mut self,
         entity: &str,
@@ -834,15 +865,10 @@ impl<'a> Validator<'a> {
         bounded(values.len())?;
         for (field, value) in values {
             let typ = &self.field(entity, field)?.value_type;
-            let actual = self.expr(value, env, depth, true)?;
             // Optional storage accepts a computed non-null inner value as well
-            // as an explicitly optional expression. Other expression contexts
-            // retain exact typing; the evaluator stores the same typed value.
-            require(
-                &actual == typ
-                    || matches!(typ, Type::Optional { item } if item.as_ref() == &actual),
-                format!("assignment type mismatch: expected {typ:?}, found {actual:?}"),
-            )?;
+            // as an explicitly optional expression, without splitting an atomic
+            // multi-field Create or Update into separate mutations.
+            self.assignment(value, env, typ, depth)?;
         }
         if create {
             for field in &self.entity(entity)?.fields {
