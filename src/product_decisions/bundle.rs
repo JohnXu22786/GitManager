@@ -1,6 +1,6 @@
 //! Portable immutable objects. Backup validation is not execution authority;
 //! restored intentions are always rerun before later behavior adoption.
-use super::archive::{decode, Content, Object};
+use super::archive::{decode, validate_rehearsal_scenes, Content, Object};
 use super::*;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -91,6 +91,7 @@ pub fn validate_bundle(snapshot: &ProjectSnapshot, bundle: &IntentionBundle) -> 
                         return Err(invalid("accepted scene belongs to another project"));
                     }
                 }
+                validate_rehearsal_scenes(snapshot, &object.digest, &scenes)?;
                 accepted.extend(scenes.clone());
                 let ids = scenes
                     .iter()

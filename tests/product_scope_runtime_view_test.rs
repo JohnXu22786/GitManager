@@ -1837,6 +1837,159 @@ fn check_pending_scoped_discovery(novel: bool) {
 }
 
 #[test]
+fn retained_rehearsals_bind_recording_births_and_exact_experienced_sources() {
+    let dir = tempdir();
+    let path = dir.path().join("tool");
+    let store = ProductStore::create(&path, &program(false), 20000).unwrap();
+    let job = add(&store, "job", "Waiting job");
+    action(&store, "wait", "wait", &job);
+    tick(&store, "days", 20003);
+    let engine = DecisionEngine::new(LocalRuntime::default(), IntentArchive::new(store.clone()));
+    let mut outputs = vec![];
+    for (index, outcome) in [DecisionOutcome::Deferred, DecisionOutcome::BothNeeded]
+        .into_iter()
+        .enumerate()
+    {
+        let current = store.load().unwrap();
+        let mut raw = serde_json::to_value(program(true).program).unwrap();
+        for pointer in [
+            "/actions/3/steps/0/values/production",
+            "/actions/4/steps/0/values/production",
+            "/actions/6/steps/0/columns/production",
+            "/views/0/kind/columns/1/value",
+        ] {
+            let prior = raw.pointer(pointer).unwrap().clone();
+            *raw.pointer_mut(pointer).unwrap() = serde_json::json!({
+                "kind":"add", "left":prior, "right":int(index as i64 + 1)
+            });
+        }
+        let prepared = store
+            .prepare_scoped_change(
+                &capture(raw),
+                &request(&current, ScopePopulation::All),
+                &format!("prospective-{index}"),
+            )
+            .unwrap();
+        outputs.push(canonical_digest(IdentityDomain::Source, prepared.target()).unwrap());
+        let prospective = selected_scene(&prepared, &job);
+        let baseline = ScenarioSpec {
+            seed: current.data.clone(),
+            session: current.session.clone(),
+            ..prospective.clone()
+        };
+        let a = engine
+            .accept_current_scene(&current, &baseline, Disclosure::Synthetic)
+            .unwrap();
+        let b = engine
+            .accept_scoped_scene(&store, &prepared, &prospective, Disclosure::Synthetic)
+            .unwrap();
+        assert_eq!(
+            b.observations()[0].outputs[0].rows[0]["production"],
+            DataValue::Integer {
+                value: index as i64 + 1
+            }
+        );
+        let choice = Choice {
+            id: format!("pending-{index}"),
+            request: "Retain this exact pair of experienced alternatives".into(),
+            rationale: None,
+            scope: prepared.scope().clone(),
+            outcome,
+            obligations: vec![],
+            binding: IntentionBinding::ObservedOutcome,
+        };
+        let change = engine
+            .prepare_rehearsed_choice(
+                &store,
+                prepared,
+                choice,
+                vec![a, b],
+                &[],
+                &format!("record-{index}"),
+            )
+            .unwrap();
+        let retained = engine.adopt(&store, &change).unwrap();
+        assert_eq!(retained.data, current.data);
+        assert_eq!(retained.session, current.session);
+        assert_eq!(retained.active_revision, current.active_revision);
+    }
+    let healthy = store.load().unwrap();
+    assert_eq!(healthy.scope.rehearsals.len(), 2);
+    assert!(healthy.scope.layers.is_empty());
+    assert!(healthy
+        .decisions
+        .decisions
+        .iter()
+        .all(|d| d.status == DecisionStatus::Pending));
+    let earlier = healthy.scope.rehearsals[&outputs[0]].witnesses.clone();
+    let mut borrowed = healthy.clone();
+    borrowed
+        .scope
+        .rehearsals
+        .get_mut(&outputs[1])
+        .unwrap()
+        .witnesses = earlier;
+    assert!(borrowed.validate().is_err());
+    let rejected = dir.path().join("borrowed-recovery");
+    assert!(ProductStore::create_recovered_with(&rejected, &borrowed, |_| Ok(())).is_err());
+    assert!(!rejected.exists());
+
+    // Keep the correct new decision ID but coherently substitute an existing
+    // valid package and its scenario references. Its exact source pair still
+    // belongs to the other prospective executable.
+    let mut substituted = healthy.clone();
+    let earlier = substituted.decisions.decisions[0].clone();
+    let later = &mut substituted.decisions.decisions[1];
+    later.witness = earlier.witness.clone();
+    later.scenarios = earlier.scenarios;
+    substituted
+        .scope
+        .rehearsals
+        .get_mut(&outputs[1])
+        .unwrap()
+        .witnesses = [(later.id.clone(), later.witness.clone())]
+        .into_iter()
+        .collect();
+    assert!(substituted.validate().is_ok());
+    assert!(IntentArchive::new(store.clone())
+        .export_for(&substituted)
+        .is_err());
+    let pointer_bytes = std::fs::read(path.join("CURRENT")).unwrap();
+    let mut pointer: serde_json::Value = serde_json::from_slice(&pointer_bytes).unwrap();
+    let digest = canonical_digest(IdentityDomain::Data, &substituted).unwrap();
+    std::fs::write(
+        path.join(format!("object-{}.json", digest.as_str())),
+        canonical_bytes(&substituted).unwrap(),
+    )
+    .unwrap();
+    pointer["object"] = serde_json::to_value(digest).unwrap();
+    std::fs::write(path.join("CURRENT"), canonical_bytes(&pointer).unwrap()).unwrap();
+    assert!(engine.discovery_scenes(&substituted).is_err());
+    assert!(product_backup::inspect_open(&path, None).is_err());
+    assert!(product_backup::VerifiedBackup::capture(&store).is_err());
+    std::fs::write(path.join("CURRENT"), pointer_bytes).unwrap();
+    assert_eq!(store.load().unwrap(), healthy);
+    let reopened = ProductStore::open(&path).unwrap();
+    let restored = product_backup::VerifiedBackup::capture(&reopened)
+        .unwrap()
+        .recover_new(&dir.path().join("healthy-recovery"))
+        .unwrap();
+    assert_eq!(restored.load().unwrap(), healthy);
+    let engine = DecisionEngine::new(
+        LocalRuntime::default(),
+        IntentArchive::new(restored.clone()),
+    );
+    assert_eq!(engine.discovery_scenes(&healthy).unwrap().len(), 4);
+    add(
+        &restored,
+        "later-work",
+        "Continued without activating either alternative",
+    );
+    assert!(restored.load().unwrap().scope.layers.is_empty());
+    assert_eq!(store.load().unwrap(), healthy);
+}
+
+#[test]
 fn all_nonbinary_managed_rehearsals_survive_restart_recovery_without_activation() {
     fn timing(outcome: &DecisionOutcome, phase: &str, started: &std::time::Instant) {
         use std::io::Write;

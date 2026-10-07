@@ -4,11 +4,16 @@ use compiler::error;
 struct AdoptionHistory<'a> {
     links: BTreeMap<Digest, (&'a AdoptionReceipt, &'a ScopedAdoptionReceipt)>,
 }
+#[derive(Default)]
+struct DecisionBirths {
+    active: BTreeSet<Id>,
+    pending: BTreeSet<Id>,
+}
 
 /// Recover only the host's existing graph transitions. Exact prior graph
 /// digests anchor births independently of editable required-ID arrays. The
 /// temporary reverse walk never changes retained terminal history.
-fn decision_births(snapshot: &ProjectSnapshot) -> Result<BTreeMap<u64, BTreeSet<Id>>> {
+fn decision_births(snapshot: &ProjectSnapshot) -> Result<BTreeMap<u64, DecisionBirths>> {
     let mut graph = snapshot.decisions.clone();
     let mut graph_identity = graph.identity()?;
     let mut births = BTreeMap::new();
@@ -24,7 +29,7 @@ fn decision_births(snapshot: &ProjectSnapshot) -> Result<BTreeMap<u64, BTreeSet<
                 "adoption requirements differ from its exact committed graph",
             ));
         }
-        let mut added = BTreeSet::new();
+        let mut added = DecisionBirths::default();
         if graph_identity != adoption.plan.expected_decisions {
             graph.revision = graph
                 .revision
@@ -76,7 +81,9 @@ fn decision_births(snapshot: &ProjectSnapshot) -> Result<BTreeMap<u64, BTreeSet<
                     return Err(error("decision birth rewrites earlier terminal history"));
                 }
                 if decision.status == DecisionStatus::Active {
-                    added.insert(decision.id);
+                    added.active.insert(decision.id);
+                } else {
+                    added.pending.insert(decision.id);
                 }
             }
             graph.validate()?;
@@ -183,7 +190,7 @@ fn adoption_history(snapshot: &ProjectSnapshot) -> Result<AdoptionHistory<'_>> {
                 .decisions
                 .iter()
                 .filter(|decision| {
-                    births[&linked.revision].contains(&decision.id)
+                    births[&linked.revision].active.contains(&decision.id)
                         && decision.scope == linked.plan.scope
                 })
                 .map(|decision| decision.id.clone())
@@ -218,6 +225,20 @@ fn adoption_history(snapshot: &ProjectSnapshot) -> Result<AdoptionHistory<'_>> {
             ));
         }
         active = linked.active.clone();
+    }
+    let mut rehearsal_operations = BTreeSet::new();
+    for proof in state.rehearsals.values() {
+        let witnesses = proof.witnesses.keys().cloned().collect();
+        if !rehearsal_operations.insert(&proof.recorded_by)
+            || births
+                .get(&proof.recorded_revision)
+                .map(|born| &born.pending)
+                != Some(&witnesses)
+        {
+            return Err(error(
+                "rehearsal witnesses differ from their exact recording decision births",
+            ));
+        }
     }
     if active != snapshot.active_revision
         || history.links.len() != state.compositions.len()
