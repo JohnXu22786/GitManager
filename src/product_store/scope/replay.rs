@@ -439,9 +439,8 @@ impl ScopedExecutionContext {
         day: i32,
     ) -> Result<(Self, DataSnapshot)> {
         self.verify_seed(source, original, day)?;
-        if crate::product_runtime::has_protected_fields(target)
-            && !self.known_seed(&original.identity()?)?
-        {
+        let authenticated = self.known_seed(&original.identity()?)?;
+        if crate::product_runtime::has_protected_fields(target) && !authenticated {
             return Err(compiler::error(
                 "an unverified raw seed cannot grant scope metadata authority",
             ));
@@ -506,7 +505,11 @@ impl ScopedExecutionContext {
         // target schemas on start; manufacturing another schema-only seed here
         // would lose durable provenance when an older scene is captured again.
         let mut result = self.clone();
-        result.projected_seeds.insert(initialized.identity()?);
+        // Ordinary synthetic scenes remain usable as ordinary scenes, but
+        // projecting one does not manufacture authority for a later layer.
+        if authenticated {
+            result.projected_seeds.insert(initialized.identity()?);
+        }
         if result.verify_seed(target, &initialized, day).is_err() {
             let derived =
                 correspondence::derive(self, source, original, target, day, &initialized)?;

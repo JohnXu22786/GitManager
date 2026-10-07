@@ -1127,6 +1127,28 @@ fn independent_promises_cross_only_authenticated_layer_initialization() {
             current.clock_day
         )
         .is_err());
+    // An ordinary scene may be synthetic, but a successful ordinary mapping
+    // cannot turn it into host-authenticated input for a subsequent layer.
+    let (ordinary_context, synthetic) = context
+        .project_seed(
+            current.program().unwrap(),
+            &unknown,
+            current.program().unwrap(),
+            &unknown,
+            current.clock_day,
+        )
+        .unwrap();
+    assert_eq!(synthetic, unknown);
+    assert!(ordinary_context
+        .project_seed(
+            current.program().unwrap(),
+            &synthetic,
+            first.target(),
+            &unknown_mapped,
+            current.clock_day,
+        )
+        .is_err());
+    assert_eq!(store.load().unwrap(), current);
     let change = engine
         .prepare_managed_change(&store, first, &[], "first")
         .unwrap();
@@ -1903,7 +1925,7 @@ fn all_nonbinary_managed_rehearsals_survive_restart_recovery_without_activation(
         let backup = product_backup::VerifiedBackup::capture(&reopened).unwrap();
         let backup =
             product_backup::VerifiedBackup::from_bytes(&backup.to_bytes().unwrap()).unwrap();
-        let recovered = backup.recover_new(dir.path().join("recovered")).unwrap();
+        let recovered = backup.recover_new(&dir.path().join("recovered")).unwrap();
         let recovered_snapshot = recovered.load().unwrap();
         assert_eq!(recovered_snapshot, retained);
         let engine = DecisionEngine::new(
@@ -2252,7 +2274,7 @@ fn future_rehearsals_preserve_selected_promises_without_activating_cohorts() {
         let backup = product_backup::VerifiedBackup::capture(&reopened).unwrap();
         let recovered = product_backup::VerifiedBackup::from_bytes(&backup.to_bytes().unwrap())
             .unwrap()
-            .recover_new(dir.path().join("recovered"))
+            .recover_new(&dir.path().join("recovered"))
             .unwrap();
         assert_eq!(recovered.load().unwrap(), saved);
         let engine = DecisionEngine::new(
@@ -2443,7 +2465,7 @@ fn future_rehearsals_preserve_selected_promises_without_activating_cohorts() {
         assert_eq!(continued.data, current.data);
         let final_backup = product_backup::VerifiedBackup::capture(&recovered).unwrap();
         let final_store = final_backup
-            .recover_new(dir.path().join("final-recovery"))
+            .recover_new(&dir.path().join("final-recovery"))
             .unwrap();
         let final_engine = DecisionEngine::new(
             LocalRuntime::default(),
@@ -2510,7 +2532,7 @@ fn first_scope_can_be_rehearsed_and_retained_before_any_live_layer_exists() {
     let reopened = ProductStore::open(dir.path().join("tool")).unwrap();
     let recovered = product_backup::VerifiedBackup::capture(&reopened)
         .unwrap()
-        .recover_new(dir.path().join("recovered"))
+        .recover_new(&dir.path().join("recovered"))
         .unwrap();
     let engine = DecisionEngine::new(
         LocalRuntime::default(),
@@ -3140,7 +3162,7 @@ fn clock_only_scope_adoption_preserves_original_day_completed_scene() {
     assert!(predating.validate().is_err());
     let reopened = ProductStore::open(&path).unwrap();
     let backup = product_backup::VerifiedBackup::capture(&reopened).unwrap();
-    let recovered = backup.recover_new(dir.path().join("recovered")).unwrap();
+    let recovered = backup.recover_new(&dir.path().join("recovered")).unwrap();
     let engine = DecisionEngine::new(
         LocalRuntime::default(),
         IntentArchive::new(recovered.clone()),
