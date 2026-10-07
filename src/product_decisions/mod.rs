@@ -8,7 +8,7 @@ mod mapping;
 mod recovery;
 mod replay;
 use crate::product_contract::*;
-use crate::product_runtime::LocalRuntime;
+use crate::product_runtime::{LocalRuntime, DRIVER_VERSION};
 use crate::product_store::scope::{
     PreparedScopedChange, ScopeCorrespondence, ScopedExecutionContext,
 };
