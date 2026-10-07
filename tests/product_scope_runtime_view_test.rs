@@ -1703,6 +1703,24 @@ fn check_pending_scoped_discovery(novel: bool) {
     .unwrap();
     assert!(mismatched.questions.is_empty());
     assert!(!mismatched.unverified.is_empty());
+    let mut forged = projected.clone();
+    forged.seed.records[0]
+        .values
+        .insert("name".into(), text("Unverified projected business value"));
+    let mut forged_response = response.clone();
+    forged_response.response.hypotheses[0].scenario_json = serde_json::to_string(&forged).unwrap();
+    let refused = discover(
+        &request,
+        &forged_response,
+        &DiscoveryPolicy {
+            retained_history: Some(history.clone()),
+            ..Default::default()
+        },
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    assert!(refused.questions.is_empty());
+    assert!(!refused.unverified.is_empty());
     let report = discover(
         &request,
         &response,
@@ -1820,6 +1838,14 @@ fn check_pending_scoped_discovery(novel: bool) {
 
 #[test]
 fn all_nonbinary_managed_rehearsals_survive_restart_recovery_without_activation() {
+    fn timing(outcome: &DecisionOutcome, phase: &str, started: &std::time::Instant) {
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
+            "scope_nonbinary_timing outcome={outcome:?} phase={phase} elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+    }
     fn revised(offset: i64) -> CapturedProgram {
         let mut raw = serde_json::to_value(program(true).program).unwrap();
         for pointer in [
@@ -1840,6 +1866,7 @@ fn all_nonbinary_managed_rehearsals_survive_restart_recovery_without_activation(
         DecisionOutcome::NeitherFits,
         DecisionOutcome::Deferred,
     ] {
+        let started = std::time::Instant::now();
         let dir = tempdir();
         let path = dir.path().join("tool");
         let store = ProductStore::create(&path, &program(false), 20000).unwrap();
@@ -1926,6 +1953,7 @@ fn all_nonbinary_managed_rehearsals_survive_restart_recovery_without_activation(
             )
             .unwrap();
         let retained = engine.adopt(&store, &change).unwrap();
+        timing(&outcome, "retained", &started);
         assert_eq!(retained.active_revision, current.active_revision);
         assert_eq!(retained.data, current.data);
         assert_eq!(retained.session, current.session);
@@ -1975,6 +2003,7 @@ fn all_nonbinary_managed_rehearsals_survive_restart_recovery_without_activation(
             product_backup::VerifiedBackup::from_bytes(&backup.to_bytes().unwrap()).unwrap();
         let recovered = backup.recover_new(&dir.path().join("recovered")).unwrap();
         let recovered_snapshot = recovered.load().unwrap();
+        timing(&outcome, "recovered", &started);
         assert_eq!(recovered_snapshot, retained);
         let engine = DecisionEngine::new(
             LocalRuntime::default(),
@@ -2084,6 +2113,7 @@ fn all_nonbinary_managed_rehearsals_survive_restart_recovery_without_activation(
             )
             .unwrap();
         let adopted = engine.adopt(&recovered, &resolution).unwrap();
+        timing(&outcome, "resolved", &started);
         assert_eq!(adopted.data.events, facts.data.events);
         assert_eq!(adopted.artifacts, facts.artifacts);
         assert!(adopted.data.records.iter().any(|row| row.id == later.id));
@@ -2110,6 +2140,7 @@ fn all_nonbinary_managed_rehearsals_survive_restart_recovery_without_activation(
         );
         product_backup::VerifiedBackup::capture(&recovered).unwrap();
         assert_eq!(store.load().unwrap(), retained);
+        timing(&outcome, "continued", &started);
     }
 }
 
@@ -3254,4 +3285,165 @@ fn clock_only_scope_adoption_preserves_original_day_completed_scene() {
         CheckDisposition::Ready
     );
     ProductStore::open(dir.path().join("recovered")).unwrap();
+}
+
+#[test]
+fn admission_cache_reuses_only_fresh_exact_contexts() {
+    use std::{io::Write, time::Instant};
+    fn with_session(pause: bool) -> CapturedProgram {
+        let mut raw = serde_json::to_value(program(pause).program).unwrap();
+        raw["state"].as_array_mut().unwrap().push(serde_json::json!({"id":"scratch","label":"Session counter","value_type":{"kind":"integer"},"initial":{"kind":"integer","value":0}}));
+        raw["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"change_session","label":"Change session","parameters":{},"guards":[],"steps":[{"kind":"set_state","state":"scratch","value":int(1)}],"ensures":[]}));
+        capture(raw)
+    }
+    fn ready(engine: &DecisionEngine<LocalRuntime>, store: &ProductStore) {
+        assert_eq!(
+            engine
+                .check_current(&store.load().unwrap())
+                .unwrap()
+                .disposition,
+            CheckDisposition::Ready
+        );
+    }
+    let dir = tempdir();
+    let path = dir.path().join("tool");
+    let store = ProductStore::create(&path, &with_session(false), 20000).unwrap();
+    let before = store.load().unwrap();
+    let prepared = store
+        .prepare_scoped_change(
+            &with_session(true),
+            &request(&before, ScopePopulation::All),
+            "initial-scope",
+        )
+        .unwrap();
+    store.adopt_scoped(before.revision, &prepared).unwrap();
+    let engine = DecisionEngine::new(LocalRuntime::default(), IntentArchive::new(store.clone()));
+    let start = Instant::now();
+    ready(&engine, &store);
+    let cold = start.elapsed();
+    let first = engine.scope_cache_stats();
+    let start = Instant::now();
+    ready(&engine, &store);
+    let warm = start.elapsed();
+    let second = engine.scope_cache_stats();
+    assert!(second.0 > first.0);
+    assert_eq!(second.1, first.1);
+    let _ = writeln!(
+        std::io::stderr(),
+        "scope_admission_cache cold_ms={} warm_ms={} hits={} builds={}",
+        cold.as_millis(),
+        warm.as_millis(),
+        second.0,
+        second.1
+    );
+
+    let job = add(&store, "job", "Actual work after cached admission");
+    ready(&engine, &store);
+    let after_data = engine.scope_cache_stats();
+    assert!(after_data.1 > second.1);
+    tick(&store, "new-day", 20002);
+    ready(&engine, &store);
+    let after_day = engine.scope_cache_stats();
+    assert!(after_day.1 > after_data.1);
+    let session = apply(&store, "session", invoke("change_session", &[]));
+    assert_eq!(
+        session.session.values["scratch"],
+        DataValue::Integer { value: 1 }
+    );
+    ready(&engine, &store);
+    let after_session = engine.scope_cache_stats();
+    assert!(after_session.1 > after_day.1);
+    let current = store.load().unwrap();
+    let scene = ScenarioSpec {
+        version: 1,
+        id: "cache-actual-scene".into(),
+        label: "Actual output after data, clock and session changes".into(),
+        seed: current.data.clone(),
+        session: current.session.clone(),
+        clock_day: current.clock_day,
+        random_seed: 42,
+        inputs: vec![
+            invoke("export", &[]),
+            SemanticInput::Observe {
+                point: "result".into(),
+            },
+        ],
+        validity: vec![],
+    };
+    let accepted = engine
+        .accept_current_scene(&current, &scene, Disclosure::Synthetic)
+        .unwrap();
+    assert_eq!(
+        accepted.observations()[0].outputs[0].rows[0]["production"],
+        DataValue::Integer { value: 2 }
+    );
+    let choice = Choice {
+        id: "cached-promise".into(),
+        request: "Keep this actual export".into(),
+        rationale: None,
+        scope: DecisionScope {
+            operations: ["export".into()].into_iter().collect(),
+            population: Population::All,
+            conditions: Values::new(),
+            excluded_records: vec![],
+            unknowns: vec![],
+        },
+        outcome: DecisionOutcome::KeepCurrent,
+        obligations: vec![],
+        binding: IntentionBinding::ObservedOutcome,
+    };
+    let change = engine
+        .prepare_choice(
+            &store,
+            current.program().unwrap(),
+            choice,
+            vec![accepted],
+            "save-promise",
+        )
+        .unwrap();
+    engine.adopt(&store, &change).unwrap();
+    ready(&engine, &store);
+    assert!(engine.scope_cache_stats().1 > after_session.1);
+
+    let current = store.load().unwrap();
+    let mut raw = serde_json::to_value(with_session(true).program).unwrap();
+    raw["label"] = serde_json::json!("Renamed workflow with preserved behavior");
+    let source = capture(raw);
+    let source_id = canonical_digest(IdentityDomain::Source, &source).unwrap();
+    let mappings: Vec<_> = current
+        .editable_scope_context()
+        .unwrap()
+        .unwrap()
+        .slots
+        .iter()
+        .map(|slot| ScopeSlotMapping {
+            layer: slot.layer.clone(),
+            patch: slot.patch,
+            from_source: current.active_revision.clone(),
+            from: slot.destination.clone(),
+            to_source: source_id.clone(),
+            to: slot.destination.clone(),
+            subject: slot.subject.clone(),
+        })
+        .collect();
+    let prepared = store
+        .prepare_managed_evolution(&source, &mappings, "rename")
+        .unwrap();
+    let change = engine
+        .prepare_managed_change(&store, prepared, &[], "rename")
+        .unwrap();
+    let changed = engine.adopt(&store, &change).unwrap();
+    assert_ne!(changed.active_revision, current.active_revision);
+    ready(&engine, &store);
+    let cached = engine.scope_cache_stats();
+    let pointer = std::fs::read(path.join("CURRENT")).unwrap();
+    std::fs::write(path.join("CURRENT"), b"{}").unwrap();
+    assert!(engine.check_current(&changed).is_err());
+    std::fs::write(path.join("CURRENT"), &pointer).unwrap();
+    ready(&engine, &store);
+    assert!(engine.scope_cache_stats().1 > cached.1);
+    assert_eq!(
+        row(&store.load().unwrap(), &job).values["name"],
+        text("Actual work after cached admission")
+    );
 }

@@ -137,6 +137,12 @@ membership, monotone seals and saved-value provenance. Preparations and atomic
 activation also validate the exact initial runtime session, including references;
 compatible data alone cannot authorize an unusable tool.
 
+Repeated intention admission can reuse one immutable context only after a fresh
+store load verifies the on-disk snapshot. Its key includes the full snapshot,
+pending preparation/rehearsal, correspondence inventory and runtime identity.
+Changed inputs, failed loads and temporary scope exits invalidate that reuse;
+actual scenario execution and current-data commit checks still run.
+
 Use ProductStore::runtime_view for daily presentation. Its preserved result/event
 inspector survives changes to ordinary application views. Exports carry result
 origin, capture day and source-record references. An adoption capture is labelled

@@ -257,7 +257,7 @@ impl Default for ScopeState {
 }
 /// Opaque preparation: source, seed, initialization and scope are regenerated
 /// under the store lock. Serializing a manifest never creates this authority.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedScopedChange {
     pub(super) basis: Digest,
     pub(super) adoption: PreparedAdoption,

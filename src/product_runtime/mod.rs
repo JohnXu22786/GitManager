@@ -760,5 +760,11 @@ pub(crate) fn merged_data(
     program: &CapturedProgram,
     current: &DataSnapshot,
 ) -> Result<DataSnapshot> {
+    merged_definition_data(&program.program, current)
+}
+pub(crate) fn merged_definition_data(
+    program: &AppDefinition,
+    current: &DataSnapshot,
+) -> Result<DataSnapshot> {
     compatibility::merge(program, current)
 }

@@ -173,6 +173,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         mappings: &[SemanticMapping],
         limits: RuntimeLimits,
     ) -> Result<CheckReport> {
+        self.clear_admission_cache();
         if prepared.target() != target {
             return Err(invalid(
                 "prepared discovery target differs from the exact captured candidate",
@@ -187,6 +188,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         self.pending_scope.replace(previous);
         self.pending_correspondences
             .replace(previous_correspondences);
+        self.clear_admission_cache();
         result
     }
     pub fn check_discovery_candidate(

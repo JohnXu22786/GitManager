@@ -145,18 +145,7 @@ impl Mapping {
     }
     pub fn context(&self, source: &ScenarioSpec, target: &AppDefinition) -> Result<ScenarioSpec> {
         let mut s = source.clone();
-        for e in &target.entities {
-            match s.seed.schema.iter_mut().find(|old| old.id == e.id) {
-                Some(old) => {
-                    for f in &e.fields {
-                        if !old.fields.iter().any(|x| x.id == f.id) {
-                            old.fields.push(f.clone());
-                        }
-                    }
-                }
-                None => s.seed.schema.push(e.clone()),
-            }
-        }
+        s.seed = crate::product_runtime::merged_definition_data(target, &s.seed)?;
         let mut session = SessionState::initial(target)?;
         for (key, value) in &s.session.values {
             if let Some(v) = session.values.get_mut(key) {

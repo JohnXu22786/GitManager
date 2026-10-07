@@ -213,13 +213,14 @@ impl VerifiedRetainedHistory {
                     .map_err(unavailable)?,
             );
             for scene in &self.mapped_scenes {
-                if let Ok((_, Some(context))) = self.projected_scene_context(
+                // Populate the same bounded registry used by projection and
+                // replay. A returned projected scene must not lose the proof
+                // independently regenerated from its retained original input.
+                let _ = self.project_comparison_scene(
                     self.current.program().map_err(unavailable)?,
                     prepared.target(),
                     scene.mapped(),
-                ) {
-                    contexts.push(context);
-                }
+                );
             }
         }
         Ok(Arc::new(HistoryAdmission {
@@ -271,6 +272,34 @@ impl VerifiedRetainedHistory {
             return Err(unavailable(
                 "scene projection does not name the exact current/prepared pair",
             ));
+        }
+        {
+            let registry = self
+                .projected_contexts
+                .read()
+                .map_err(|_| unavailable("projected scene admission lock is poisoned"))?;
+            let mut matched: Option<&ScopedExecutionContext> = None;
+            for context in registry.values().filter(|context| {
+                context.has_scenario_correspondence(scene) && context.admit_target(target).is_ok()
+            }) {
+                context
+                    .verify_seed(before, &scene.seed, scene.clock_day)
+                    .map_err(unavailable)?;
+                context
+                    .verify_seed(target, &scene.seed, scene.clock_day)
+                    .map_err(unavailable)?;
+                if matched.is_some_and(|prior| {
+                    prior.correspondence_proofs() != context.correspondence_proofs()
+                }) {
+                    return Err(unavailable(
+                        "projected scene has ambiguous regenerated authority",
+                    ));
+                }
+                matched = Some(context);
+            }
+            if let Some(context) = matched {
+                return Ok((scene.clone(), Some(context.clone())));
+            }
         }
         let context = ScopedExecutionContext::prepared(&self.current, prepared)
             .map_err(unavailable)?

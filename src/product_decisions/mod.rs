@@ -136,6 +136,19 @@ impl VerifiedChange {
         &self.target
     }
 }
+#[derive(PartialEq, Eq)]
+struct AdmissionKey {
+    current: ProjectSnapshot,
+    prepared: Option<PreparedScopedChange>,
+    rehearsal: Option<(PreparedScopedChange, Vec<Id>)>,
+    correspondences: BTreeMap<Digest, ScopeCorrespondence>,
+    runtime: RuntimeCapabilities,
+    driver: &'static str,
+}
+struct AdmissionCache {
+    key: AdmissionKey,
+    context: ScopedExecutionContext,
+}
 pub struct DecisionEngine<R: RuntimeAdapter> {
     runtime: R,
     archive: IntentArchive,
@@ -143,6 +156,13 @@ pub struct DecisionEngine<R: RuntimeAdapter> {
     pending_scope: RefCell<Option<PreparedScopedChange>>,
     pending_rehearsal: RefCell<Option<(PreparedScopedChange, Vec<Id>)>>,
     pending_correspondences: RefCell<BTreeMap<Digest, ScopeCorrespondence>>,
+    // One immutable admission result; every lookup still freshly loads and
+    // verifies CURRENT and its complete on-disk snapshot before comparing keys.
+    admission_cache: RefCell<Option<AdmissionCache>>,
+    #[cfg(test)]
+    admission_hits: std::cell::Cell<usize>,
+    #[cfg(test)]
+    admission_builds: std::cell::Cell<usize>,
 }
 impl<R: RuntimeAdapter> DecisionEngine<R> {
     pub fn new(runtime: R, archive: IntentArchive) -> Self {
@@ -153,6 +173,11 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             pending_scope: RefCell::new(None),
             pending_rehearsal: RefCell::new(None),
             pending_correspondences: RefCell::new(BTreeMap::new()),
+            admission_cache: RefCell::new(None),
+            #[cfg(test)]
+            admission_hits: std::cell::Cell::new(0),
+            #[cfg(test)]
+            admission_builds: std::cell::Cell::new(0),
         }
     }
     /// Read the recorded promise kind for presentation; this is not execution proof.
@@ -183,20 +208,56 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         }
     }
     fn scope_context(&self) -> Result<ScopedExecutionContext> {
-        let current = self.archive.snapshot()?;
-        let context = if let Some(prepared) = self.pending_scope.borrow().as_ref() {
-            if self.pending_rehearsal.borrow().is_some() {
+        let current = match self.archive.snapshot() {
+            Ok(current) => current,
+            Err(error) => {
+                self.clear_admission_cache();
+                return Err(error);
+            }
+        };
+        let key = AdmissionKey {
+            current,
+            prepared: self.pending_scope.borrow().clone(),
+            rehearsal: self.pending_rehearsal.borrow().clone(),
+            correspondences: self.pending_correspondences.borrow().clone(),
+            runtime: self.runtime.capabilities(),
+            driver: DRIVER_VERSION,
+        };
+        if let Some(cached) = self.admission_cache.borrow().as_ref() {
+            if cached.key == key {
+                #[cfg(test)]
+                self.admission_hits.set(self.admission_hits.get() + 1);
+                return Ok(cached.context.clone());
+            }
+        }
+        self.clear_admission_cache();
+        #[cfg(test)]
+        self.admission_builds.set(self.admission_builds.get() + 1);
+        let context = if let Some(prepared) = &key.prepared {
+            if key.rehearsal.is_some() {
                 return Err(invalid(
                     "rehearsal retention and activation cannot share an authority context",
                 ));
             }
-            ScopedExecutionContext::prepared(&current, prepared)?
-        } else if let Some((prepared, _)) = self.pending_rehearsal.borrow().as_ref() {
-            ScopedExecutionContext::rehearsed(&current, prepared)?
+            ScopedExecutionContext::prepared(&key.current, prepared)?
+        } else if let Some((prepared, _)) = &key.rehearsal {
+            ScopedExecutionContext::rehearsed(&key.current, prepared)?
         } else {
-            ScopedExecutionContext::committed(&current)?
+            ScopedExecutionContext::committed(&key.current)?
         };
-        Ok(context.with_correspondences(&self.pending_correspondences.borrow())?)
+        let context = context.with_correspondences(&key.correspondences)?;
+        self.admission_cache.replace(Some(AdmissionCache {
+            key,
+            context: context.clone(),
+        }));
+        Ok(context)
+    }
+    fn clear_admission_cache(&self) {
+        self.admission_cache.replace(None);
+    }
+    #[cfg(test)]
+    pub(crate) fn scope_cache_stats(&self) -> (usize, usize) {
+        (self.admission_hits.get(), self.admission_builds.get())
     }
     pub(crate) fn retained_replay_context(
         &self,
@@ -354,9 +415,11 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         proofs: BTreeMap<Digest, ScopeCorrespondence>,
         f: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
+        self.clear_admission_cache();
         let old = self.pending_correspondences.replace(proofs);
         let result = f();
         self.pending_correspondences.replace(old);
+        self.clear_admission_cache();
         result
     }
     fn with_scoped<T>(

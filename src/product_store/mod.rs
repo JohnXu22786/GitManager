@@ -217,7 +217,7 @@ struct Pointer {
 }
 /// Prepared locally against exact current identities. This is a rehearsal, not
 /// authorization: the host must obtain the user's choice before calling adopt.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedAdoption {
     plan: AdoptionPlan,
     expected_revision: u64,
