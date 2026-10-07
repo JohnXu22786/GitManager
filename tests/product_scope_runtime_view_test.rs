@@ -3317,6 +3317,32 @@ fn admission_cache_reuses_only_fresh_exact_contexts() {
         )
         .unwrap();
     store.adopt_scoped(before.revision, &prepared).unwrap();
+    // A fresh handle has no trusted proof result. Clones share only the one
+    // verified immutable entry; a separately opened handle verifies afresh.
+    let store = ProductStore::open(&path).unwrap();
+    assert_eq!(store.validation_cache_stats(), (0, 0));
+    let load_start = Instant::now();
+    let loaded = store.load().unwrap();
+    let cold_load = load_start.elapsed();
+    let validated = store.validation_cache_stats();
+    let load_start = Instant::now();
+    assert_eq!(store.clone().load().unwrap(), loaded);
+    let warm_load = load_start.elapsed();
+    let reused = store.validation_cache_stats();
+    assert!(reused.0 > validated.0);
+    assert_eq!(reused.1, validated.1);
+    let reopened = ProductStore::open(&path).unwrap();
+    assert_eq!(reopened.validation_cache_stats(), (0, 0));
+    assert_eq!(reopened.load().unwrap(), loaded);
+    assert_eq!(reopened.validation_cache_stats().1, 1);
+    let _ = writeln!(
+        std::io::stderr(),
+        "scope_snapshot_cache cold_load_ms={} warm_load_ms={} hits={} validations={}",
+        cold_load.as_millis(),
+        warm_load.as_millis(),
+        reused.0,
+        reused.1
+    );
     let engine = DecisionEngine::new(LocalRuntime::default(), IntentArchive::new(store.clone()));
     let start = Instant::now();
     ready(&engine, &store);
@@ -3446,4 +3472,210 @@ fn admission_cache_reuses_only_fresh_exact_contexts() {
         row(&store.load().unwrap(), &job).values["name"],
         text("Actual work after cached admission")
     );
+    let healthy = store.load().unwrap();
+    let pointer_json: serde_json::Value = serde_json::from_slice(&pointer).unwrap();
+    let object = path.join(format!(
+        "object-{}.json",
+        pointer_json["object"].as_str().unwrap()
+    ));
+    let bytes = std::fs::read(&object).unwrap();
+    let mut tampered: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    tampered["clock_day"] = serde_json::json!(healthy.clock_day + 1);
+    let prior_validation = store.validation_cache_stats().1;
+    std::fs::write(&object, serde_json::to_vec(&tampered).unwrap()).unwrap();
+    assert!(
+        store.load().is_err(),
+        "unchanged CURRENT cannot hide changed object bytes"
+    );
+    std::fs::write(&object, &bytes).unwrap();
+    assert_eq!(store.load().unwrap(), healthy);
+    assert!(store.validation_cache_stats().1 > prior_validation);
+
+    let alias = path.join("unexpected-hardlink");
+    std::fs::hard_link(&object, &alias).unwrap();
+    assert!(store.clone().load().is_err());
+    std::fs::remove_file(&alias).unwrap();
+    assert_eq!(store.load().unwrap(), healthy);
+    #[cfg(unix)]
+    {
+        let original = path.join("original-object");
+        std::fs::rename(&object, &original).unwrap();
+        std::os::unix::fs::symlink(&original, &object).unwrap();
+        assert!(store.load().is_err());
+        std::fs::remove_file(&object).unwrap();
+        std::fs::rename(&original, &object).unwrap();
+        assert_eq!(store.load().unwrap(), healthy);
+        let moved = dir.path().join("moved-tool");
+        std::fs::rename(&path, &moved).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(store.load().is_err());
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&moved, &path).unwrap();
+        assert_eq!(store.load().unwrap(), healthy);
+    }
+    let witness = &healthy.decisions.decisions[0].witness;
+    let extension = path.join(format!("extension-{}.json", witness.as_str()));
+    let archived = std::fs::read(&extension).unwrap();
+    std::fs::write(&extension, b"{}").unwrap();
+    assert_eq!(store.load().unwrap(), healthy);
+    assert!(match engine.check_current(&healthy) {
+        Err(_) => true,
+        Ok(report) => report.disposition != CheckDisposition::Ready,
+    });
+    assert!(product_backup::VerifiedBackup::capture(&store).is_err());
+    std::fs::write(&extension, &archived).unwrap();
+    ready(&engine, &store);
+    let backup = product_backup::VerifiedBackup::capture(&store).unwrap();
+    let recovered_path = dir.path().join("cache-recovery");
+    backup.recover_new(&recovered_path).unwrap();
+    let recovered = ProductStore::open(&recovered_path).unwrap();
+    assert_eq!(recovered.validation_cache_stats(), (0, 0));
+    assert_eq!(recovered.load().unwrap(), healthy);
+    let checked = recovered.validation_cache_stats();
+    assert_eq!(recovered.clone().load().unwrap(), healthy);
+    assert_eq!(recovered.validation_cache_stats().1, checked.1);
+    assert!(recovered.validation_cache_stats().0 > checked.0);
+
+    store.poison_validation_cache_for_test();
+    let checked = store.validation_cache_stats().1;
+    assert_eq!(store.load().unwrap(), healthy);
+    assert!(store.validation_cache_stats().1 > checked);
+    let checked = store.validation_cache_stats().1;
+    assert_eq!(store.clone().load().unwrap(), healthy);
+    assert!(store.validation_cache_stats().1 > checked);
+    assert_eq!(ProductStore::open(&path).unwrap().load().unwrap(), healthy);
+}
+
+#[test]
+fn scoped_receipts_cannot_claim_later_independent_intentions() {
+    let dir = tempdir();
+    let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
+    let selected = add(&store, "selected", "Selected");
+    action(&store, "wait", "wait", &selected);
+    tick(&store, "days", 20003);
+    let before = store.load().unwrap();
+    let prepared = store
+        .prepare_scoped_change(
+            &program(true),
+            &request(
+                &before,
+                ScopePopulation::SelectedUnfinished {
+                    records: vec![RecordRef {
+                        entity: selected.entity.clone(),
+                        record: selected.id.clone(),
+                    }],
+                },
+            ),
+            "scope",
+        )
+        .unwrap();
+    let layer = prepared.layer_id().unwrap().unwrap();
+    let scene = selected_scene(&prepared, &selected);
+    let scope = prepared.scope().clone();
+    let artifact = prepared.target().artifact.program_digest.clone();
+    let choice = |id: &str| Choice {
+        id: id.into(),
+        request: "Keep the experienced production result".into(),
+        rationale: None,
+        scope: scope.clone(),
+        outcome: DecisionOutcome::Accept {
+            artifact: artifact.clone(),
+        },
+        obligations: vec![],
+        binding: IntentionBinding::ObservedOutcome,
+    };
+    let engine = DecisionEngine::new(LocalRuntime::default(), IntentArchive::new(store.clone()));
+    let accepted = engine
+        .accept_scoped_scene(&store, &prepared, &scene, Disclosure::Synthetic)
+        .unwrap();
+    let first = engine
+        .prepare_scoped_choice(
+            &store,
+            prepared,
+            choice("original"),
+            vec![accepted],
+            "scope",
+        )
+        .unwrap();
+    let current = engine.adopt(&store, &first).unwrap();
+    let mut later_scene = scene;
+    later_scene.id = "later-independent-scene".into();
+    let accepted = engine
+        .accept_current_scene(&current, &later_scene, Disclosure::Synthetic)
+        .unwrap();
+    let later = engine
+        .prepare_choice(
+            &store,
+            current.program().unwrap(),
+            choice("independent"),
+            vec![accepted],
+            "record-independent",
+        )
+        .unwrap();
+    let healthy = engine.adopt(&store, &later).unwrap();
+    assert_eq!(healthy.scope.adoptions[0].decisions, vec!["original"]);
+    assert!(!healthy.adoptions[0]
+        .plan
+        .required_decisions
+        .contains(&"independent".into()));
+    assert!(healthy
+        .adoptions
+        .last()
+        .unwrap()
+        .plan
+        .required_decisions
+        .contains(&"independent".into()));
+
+    let mut claims_later = healthy.clone();
+    claims_later.scope.adoptions[0]
+        .decisions
+        .push("independent".into());
+    let mut loses_original = healthy.clone();
+    loses_original.scope.adoptions[0].decisions.clear();
+    for (index, corrupted) in [claims_later, loses_original].iter().enumerate() {
+        assert!(corrupted.validate().is_err());
+        let destination = dir.path().join(format!("forged-{index}"));
+        let activated = std::cell::Cell::new(false);
+        assert!(
+            ProductStore::create_recovered_with(&destination, corrupted, |_| {
+                activated.set(true);
+                Ok(())
+            })
+            .is_err()
+        );
+        assert!(!activated.get());
+        assert!(!destination.exists());
+        assert_eq!(store.load().unwrap(), healthy);
+    }
+    let backup = product_backup::VerifiedBackup::capture(&store).unwrap();
+    let restored = backup
+        .recover_new(&dir.path().join("healthy-recovery"))
+        .unwrap();
+    let restored_engine = DecisionEngine::new(
+        LocalRuntime::default(),
+        IntentArchive::new(restored.clone()),
+    );
+    assert_eq!(restored.load().unwrap(), healthy);
+    assert_eq!(
+        restored_engine.check_current(&healthy).unwrap().disposition,
+        CheckDisposition::Ready
+    );
+    // Removing this behavior would break the separately recorded promise. It
+    // must be rechecked, rather than silently retired through the old receipt.
+    assert!(restored_engine
+        .prepare_scoped_withdrawal(&restored, &[layer], "withdraw")
+        .is_err());
+    assert_eq!(restored.load().unwrap(), healthy);
+    assert_eq!(
+        healthy
+            .decisions
+            .decisions
+            .iter()
+            .find(|d| d.id == "independent")
+            .unwrap()
+            .status,
+        DecisionStatus::Active
+    );
+    add(&restored, "continued", "Continued independent work");
+    assert_eq!(store.load().unwrap(), healthy);
 }

@@ -5,14 +5,14 @@ mod json;
 pub mod scope;
 mod upgrade;
 use crate::product_contract::*;
-use crate::product_runtime::{merged_data, LocalRuntime};
+use crate::product_runtime::{merged_data, LocalRuntime, DRIVER_VERSION};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Component, Path};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 pub(crate) use upgrade::LegacyUpgrade;
 pub use upgrade::{UpgradeProgress, UpgradeSummary};
 
@@ -234,8 +234,56 @@ pub struct ProductStore {
     root: Arc<files::Directory>,
     name: std::ffi::OsString,
     upgrade_requires_reopen: Arc<std::sync::atomic::AtomicBool>,
+    validation_cache: Arc<Mutex<ValidationCache>>,
+}
+#[derive(PartialEq, Eq)]
+struct ValidationIdentity {
+    runtime: RuntimeCapabilities,
+    driver: &'static str,
+    compiler: u32,
+    limits: RuntimeLimits,
+}
+struct ValidatedSnapshot {
+    pointer: Pointer,
+    bytes: Vec<u8>,
+    identity: ValidationIdentity,
+}
+#[derive(Default)]
+struct ValidationCache {
+    verified: Option<ValidatedSnapshot>,
+    #[cfg(test)]
+    hits: usize,
+    #[cfg(test)]
+    validations: usize,
 }
 impl ProductStore {
+    fn validation_cache_guard(&self) -> MutexGuard<'_, ValidationCache> {
+        match self.validation_cache.lock() {
+            Ok(cache) => cache,
+            Err(poisoned) => {
+                // A poisoned cache never grants reuse. Keep verifying cold on
+                // this handle; opening the store again creates a clean cache.
+                let mut cache = poisoned.into_inner();
+                cache.verified = None;
+                cache
+            }
+        }
+    }
+    fn clear_validation_cache(&self) {
+        self.validation_cache_guard().verified = None;
+    }
+    #[cfg(test)]
+    pub(crate) fn validation_cache_stats(&self) -> (usize, usize) {
+        let cache = self.validation_cache_guard();
+        (cache.hits, cache.validations)
+    }
+    #[cfg(test)]
+    pub(crate) fn poison_validation_cache_for_test(&self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _cache = self.validation_cache.lock().unwrap();
+            panic!("synthetic validation-cache poison");
+        }));
+    }
     fn location(path: &Path) -> Result<(files::Directory, std::ffi::OsString)> {
         if !path.is_absolute()
             || path
@@ -342,6 +390,7 @@ impl ProductStore {
             root: Arc::new(root),
             name,
             upgrade_requires_reopen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            validation_cache: Arc::new(Mutex::new(ValidationCache::default())),
         };
         let _lock = store.root.lock()?;
         store.require_unactivated()?;
@@ -432,6 +481,7 @@ impl ProductStore {
             root: Arc::new(root),
             name,
             upgrade_requires_reopen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            validation_cache: Arc::new(Mutex::new(ValidationCache::default())),
         })
     }
     fn pinned(&self) -> Result<()> {
@@ -443,6 +493,13 @@ impl ProductStore {
         Ok(())
     }
     pub fn load(&self) -> Result<ProjectSnapshot> {
+        let result = self.load_current();
+        if result.is_err() {
+            self.clear_validation_cache();
+        }
+        result
+    }
+    fn load_current(&self) -> Result<ProjectSnapshot> {
         if self
             .upgrade_requires_reopen
             .load(std::sync::atomic::Ordering::Acquire)
@@ -470,22 +527,59 @@ impl ProductStore {
                 "snapshot checksum mismatch; use a verified checkpoint".into(),
             ));
         }
-        snapshot.validate()?;
         if snapshot.revision != pointer.revision || snapshot.data.project_id != pointer.project_id {
             return Err(StoreError::Corrupt(
                 "pointer does not match snapshot".into(),
             ));
         }
-        // Reopening verifies usable current state, rather than trusting a stored
-        // flag or recomputing any historical event under the active program.
-        LocalRuntime::default().start(
-            snapshot.program()?,
-            &snapshot.data,
-            &snapshot.session,
-            snapshot.clock_day,
-            0,
-            RuntimeLimits::default(),
-        )?;
+        self.pinned()?;
+        let runtime = LocalRuntime::default();
+        let identity = ValidationIdentity {
+            runtime: runtime.capabilities(),
+            driver: DRIVER_VERSION,
+            compiler: scope::COMPILER_VERSION,
+            limits: RuntimeLimits::default(),
+        };
+        let reused = {
+            let mut cache = self.validation_cache_guard();
+            let reused = cache.verified.as_ref().is_some_and(|checked| {
+                checked.pointer == pointer && checked.bytes == bytes && checked.identity == identity
+            });
+            if reused {
+                #[cfg(test)]
+                {
+                    cache.hits += 1;
+                }
+            } else {
+                cache.verified = None;
+                #[cfg(test)]
+                {
+                    cache.validations += 1;
+                }
+            }
+            reused
+        };
+        if !reused {
+            // Only these pure checks are reusable. The complete object was
+            // freshly read, strictly parsed and hashed above on every load.
+            // Referenced intention objects are still independently read and
+            // verified by archive/backup admission; they are not cached here.
+            snapshot.validate()?;
+            runtime.start(
+                snapshot.program()?,
+                &snapshot.data,
+                &snapshot.session,
+                snapshot.clock_day,
+                0,
+                identity.limits.clone(),
+            )?;
+            self.pinned()?;
+            self.validation_cache_guard().verified = Some(ValidatedSnapshot {
+                pointer,
+                bytes,
+                identity,
+            });
+        }
         Ok(snapshot)
     }
     fn save(
@@ -494,6 +588,7 @@ impl ProductStore {
         replace_current: bool,
         #[cfg(test)] fault: Option<FaultPoint>,
     ) -> Result<()> {
+        self.clear_validation_cache();
         self.pinned()?;
         if !replace_current {
             self.require_unactivated()?;

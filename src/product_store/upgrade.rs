@@ -399,6 +399,7 @@ impl ProductStore {
             root: Arc::new(root),
             name,
             upgrade_requires_reopen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            validation_cache: Arc::new(Mutex::new(ValidationCache::default())),
         };
         let _lock = store.root.lock()?;
         let marker = canonical_bytes(&(

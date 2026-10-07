@@ -22,6 +22,16 @@ pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
             return Err(error("duplicate scoped adoption revision link"));
         }
     }
+    // Decision IDs are never reused by the host. Their first required plan
+    // binds activation even after a later supersession or explicit withdrawal.
+    let mut first_required = BTreeMap::new();
+    for adoption in &snapshot.adoptions {
+        for id in &adoption.plan.required_decisions {
+            first_required
+                .entry(id.clone())
+                .or_insert(adoption.revision);
+        }
+    }
     // Retained-basis reconstruction consults earlier compositions before the
     // semantic composition pass below. Reject broken references first so no
     // corrupted import/restart can turn those proof lookups into indexing panics.
@@ -266,6 +276,21 @@ pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
         {
             return Err(error("scoped plan link mismatch"));
         }
+        let mut expected_decisions = BTreeSet::new();
+        for id in &linked.plan.required_decisions {
+            if first_required.get(id) != Some(&linked.revision) {
+                continue;
+            }
+            let decision = snapshot
+                .decisions
+                .decisions
+                .iter()
+                .find(|d| &d.id == id)
+                .ok_or_else(|| error("newly activated scoped decision missing"))?;
+            if decision.scope == linked.plan.scope {
+                expected_decisions.insert(id.clone());
+            }
+        }
         let mut decision_ids = BTreeSet::new();
         for id in &matching[0].decisions {
             let decision = snapshot
@@ -274,7 +299,8 @@ pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
                 .iter()
                 .find(|d| &d.id == id)
                 .ok_or_else(|| error("scoped receipt decision missing"))?;
-            if !decision_ids.insert(id)
+            if !decision_ids.insert(id.clone())
+                || !linked.plan.required_decisions.contains(id)
                 || decision.scope != linked.plan.scope
                 || !matches!(&decision.outcome,DecisionOutcome::Accept{artifact} if artifact==&target.artifact.program_digest)
             {
@@ -282,6 +308,11 @@ pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
                     "scoped decision does not bind this exact frozen outcome",
                 ));
             }
+        }
+        if decision_ids != expected_decisions {
+            return Err(error(
+                "scoped receipt differs from the exact newly activated intention set",
+            ));
         }
         let layer = state
             .layers
