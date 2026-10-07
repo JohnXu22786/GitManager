@@ -36,6 +36,31 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libx11-dev libxcb1-dev
 
+      # Prepare the synthetic fixture's interpreter, separately from the real
+      # provider probe deadline. These timings do not establish a failure cause.
+      - name: Prepare macOS synthetic Python runtime
+        if: runner.os == 'macOS'
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixture_root="$(mktemp -d "$RUNNER_TEMP/provider-python.XXXXXX")"
+          trap 'rm -rf "$fixture_root"' EXIT
+          mkdir "$fixture_root/work"
+          ls -l /usr/bin/python3
+          /usr/bin/file /usr/bin/python3
+          for phase in cold warm; do
+            mkdir "$fixture_root/$phase-home"
+            printf 'Synthetic Python runtime readiness: %s launch\n' "$phase"
+            (
+              cd "$fixture_root/work"
+              /usr/bin/time -p /usr/bin/env -i \
+                HOME="$fixture_root/$phase-home" PATH="$fixture_root:/usr/bin:/bin" \
+                LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+                /usr/bin/python3 -c 'import json, os, pathlib, subprocess, sys, time; print(json.dumps({"executable": sys.executable, "resolved_executable": str(pathlib.Path(sys.executable).resolve(strict=True)), "version": sys.version, "environment_keys": sorted(os.environ)}, sort_keys=True))'
+            )
+          done
+
       - name: Configure Git identity for tests
         run: |
           git config --global user.name "GitManager CI"
