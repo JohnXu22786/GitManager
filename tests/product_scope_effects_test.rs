@@ -13,6 +13,250 @@ use product_contract::*;
 use product_runtime::LocalRuntime;
 use product_store::{scope::*, ProductStore};
 
+#[test]
+fn history_projection_reuse_preserves_exact_inputs_and_execution_limits() {
+    use product_runtime::ProjectionValidation;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    let dir = tempdir();
+    let source = program(false);
+    let store = ProductStore::create(dir.path().join("tool"), &source, 20000).unwrap();
+    let record = add(&store, "row", "Projection row");
+    let data = store.load().unwrap().data;
+    let row = RecordRef {
+        entity: record.entity.clone(),
+        record: record.id.clone(),
+    };
+    let expression = field("row", "production");
+    let runtime = LocalRuntime::default();
+    let mut checks = ProjectionValidation::default();
+    macro_rules! evaluate {
+        ($checks:expr, $data:expr, $day:expr, $limits:expr) => {
+            runtime.evaluate_record_projection_with(
+                $checks,
+                $limits,
+                &source,
+                $data,
+                &row,
+                "row",
+                &expression,
+                &Type::Integer,
+                $day,
+            )
+        };
+    }
+    let original = runtime
+        .evaluate_record_projection(
+            &source,
+            &data,
+            &row,
+            "row",
+            &expression,
+            &Type::Integer,
+            20000,
+        )
+        .unwrap();
+    assert_eq!(
+        evaluate!(&mut checks, &data, 20000, RuntimeLimits::default()).unwrap(),
+        original
+    );
+    let checked = checks.counts();
+    assert_eq!(checked, (1, 1));
+    assert_eq!(
+        evaluate!(&mut checks, &data, 20000, RuntimeLimits::default()).unwrap(),
+        original
+    );
+    assert_eq!(checks.counts(), checked);
+    let mut changed = data.clone();
+    changed.records[0]
+        .values
+        .insert("production".into(), DataValue::Integer { value: 9 });
+    assert_eq!(
+        evaluate!(&mut checks, &changed, 20000, RuntimeLimits::default()).unwrap(),
+        DataValue::Integer { value: 9 }
+    );
+    assert_eq!(checks.counts(), checked);
+    changed.records[0]
+        .values
+        .insert("production".into(), text("wrong type"));
+    assert!(evaluate!(&mut checks, &changed, 20000, RuntimeLimits::default()).is_err());
+    assert!(runtime
+        .evaluate_record_projection_with(
+            &mut checks,
+            RuntimeLimits::default(),
+            &source,
+            &data,
+            &row,
+            "row",
+            &expression,
+            &Type::Text,
+            20000
+        )
+        .is_err());
+    assert!(runtime
+        .evaluate_record_projection_with(
+            &mut checks,
+            RuntimeLimits::default(),
+            &source,
+            &data,
+            &row,
+            "wrong_subject",
+            &expression,
+            &Type::Integer,
+            20000
+        )
+        .is_err());
+    for day in [20000, 20001] {
+        assert_eq!(
+            runtime
+                .evaluate_record_projection_with(
+                    &mut checks,
+                    RuntimeLimits::default(),
+                    &source,
+                    &data,
+                    &row,
+                    "row",
+                    &Expr::Today,
+                    &Type::Date,
+                    day
+                )
+                .unwrap(),
+            DataValue::Date { days: day }
+        );
+    }
+    assert!(evaluate!(&mut checks, &data, i32::MAX, RuntimeLimits::default()).is_err());
+    let mut wrong_source = source.clone();
+    wrong_source.artifact.program_digest =
+        canonical_digest(IdentityDomain::Program, &"forged").unwrap();
+    assert!(runtime
+        .evaluate_record_projection_with(
+            &mut checks,
+            RuntimeLimits::default(),
+            &wrong_source,
+            &data,
+            &row,
+            "row",
+            &expression,
+            &Type::Integer,
+            20000
+        )
+        .is_err());
+    let other_source = source.clone().at_path("other-program.json").unwrap();
+    let before = checks.counts();
+    assert_eq!(
+        runtime
+            .evaluate_record_projection_with(
+                &mut checks,
+                RuntimeLimits::default(),
+                &other_source,
+                &data,
+                &row,
+                "row",
+                &expression,
+                &Type::Integer,
+                20000
+            )
+            .unwrap(),
+        original
+    );
+    assert_eq!(checks.counts(), (before.0 + 1, before.1 + 1));
+    let low_fuel = RuntimeLimits {
+        fuel: 1,
+        ..RuntimeLimits::default()
+    };
+    let before = checks.counts();
+    assert!(matches!(
+        evaluate!(&mut checks, &data, 20000, low_fuel),
+        Err(AdapterError::BudgetExhausted(_))
+    ));
+    assert_eq!(checks.counts().1, before.1 + 1);
+    let cancelled = Arc::new(AtomicBool::new(true));
+    let cancelling = LocalRuntime::with_cancellation(cancelled.clone());
+    assert!(matches!(
+        cancelling.evaluate_record_projection_with(
+            &mut checks,
+            RuntimeLimits::default(),
+            &source,
+            &data,
+            &row,
+            "row",
+            &expression,
+            &Type::Integer,
+            20000
+        ),
+        Err(AdapterError::Cancelled)
+    ));
+    cancelled.store(false, Ordering::Relaxed);
+    assert_eq!(
+        cancelling
+            .evaluate_record_projection_with(
+                &mut checks,
+                RuntimeLimits::default(),
+                &source,
+                &data,
+                &row,
+                "row",
+                &expression,
+                &Type::Integer,
+                20000,
+            )
+            .unwrap(),
+        original
+    );
+    let mut historical = record.values.clone();
+    historical.insert("production".into(), DataValue::Integer { value: 7 });
+    let expected = runtime
+        .evaluate_historical_record_projection(
+            &source,
+            &data,
+            &row,
+            &historical,
+            true,
+            "row",
+            &expression,
+            &Type::Integer,
+            20000,
+        )
+        .unwrap();
+    assert_eq!(
+        runtime
+            .evaluate_historical_record_projection_with(
+                &mut checks,
+                RuntimeLimits::default(),
+                &source,
+                &data,
+                &row,
+                &historical,
+                true,
+                "row",
+                &expression,
+                &Type::Integer,
+                20000
+            )
+            .unwrap(),
+        expected
+    );
+    historical.insert("production".into(), text("invalid historical value"));
+    assert!(runtime
+        .evaluate_historical_record_projection_with(
+            &mut checks,
+            RuntimeLimits::default(),
+            &source,
+            &data,
+            &row,
+            &historical,
+            true,
+            "row",
+            &expression,
+            &Type::Integer,
+            20000
+        )
+        .is_err());
+    assert_eq!(store.load().unwrap().data, data);
+}
+
 fn production(store: &ProductStore, row: &Record) -> i64 {
     let s = store.load().unwrap();
     let runtime = LocalRuntime::default();

@@ -1,4 +1,5 @@
 use super::*;
+use crate::product_runtime::ProjectionValidation;
 use compiler::*;
 
 pub(super) fn row_ref(row: &Record) -> RecordRef {
@@ -22,7 +23,26 @@ pub(super) fn completed(
     lifecycle: &LifecycleBinding,
     day: i32,
 ) -> Result<bool> {
-    let value = LocalRuntime::default().evaluate_record_projection(
+    completed_with(
+        &mut ProjectionValidation::default(),
+        program,
+        data,
+        row,
+        lifecycle,
+        day,
+    )
+}
+fn completed_with<'a>(
+    checks: &mut ProjectionValidation<'a>,
+    program: &'a CapturedProgram,
+    data: &DataSnapshot,
+    row: &RecordRef,
+    lifecycle: &LifecycleBinding,
+    day: i32,
+) -> Result<bool> {
+    let value = LocalRuntime::default().evaluate_record_projection_with(
+        checks,
+        RuntimeLimits::default(),
         program,
         data,
         row,
@@ -37,15 +57,18 @@ pub(super) fn completed(
         Err(error("completion predicate is not Boolean"))
     }
 }
-fn completed_historical(
-    program: &CapturedProgram,
+fn completed_historical<'a>(
+    checks: &mut ProjectionValidation<'a>,
+    program: &'a CapturedProgram,
     data: &DataSnapshot,
     row: &RecordRef,
     lifecycle: &LifecycleBinding,
     day: i32,
     change: &RecordChange,
 ) -> Result<bool> {
-    let value = LocalRuntime::default().evaluate_historical_record_projection(
+    let value = LocalRuntime::default().evaluate_historical_record_projection_with(
+        checks,
+        RuntimeLimits::default(),
         program,
         data,
         row,
@@ -264,6 +287,9 @@ pub(super) fn verify_history_frames(
     layers: &[Digest],
     frames: &[ReplayFrame],
 ) -> Result<()> {
+    // Captures are immutable for this call. Data, event rows and expression
+    // values are still checked/evaluated afresh at every use below.
+    let mut checks = ProjectionValidation::default();
     for id in layers {
         let layer = snapshot
             .scope
@@ -387,6 +413,7 @@ pub(super) fn verify_history_frames(
                     let producer = program(snapshot, &source.output)?;
                     if (change.archived
                         || completed_historical(
+                            &mut checks,
                             producer,
                             &snapshot.data,
                             &reference,
@@ -454,6 +481,7 @@ pub(super) fn verify_history_frames(
                         let mut projection_values = change.after.clone();
                         if !(archive && change.archived)
                             && !completed_historical(
+                                &mut checks,
                                 producer,
                                 &snapshot.data,
                                 &reference,
@@ -508,7 +536,9 @@ pub(super) fn verify_history_frames(
                                 let expression =
                                     slot(&mut producer_app, &patch.request.destination)?.clone();
                                 let observed = LocalRuntime::default()
-                                    .evaluate_historical_record_projection(
+                                    .evaluate_historical_record_projection_with(
+                                        &mut checks,
+                                        RuntimeLimits::default(),
                                         producer,
                                         &snapshot.data,
                                         &reference,
@@ -547,7 +577,8 @@ pub(super) fn verify_history_frames(
                 let is_sealed = value_bool(&expected, &sealed)?;
                 if is_sealed
                     && !row.archived
-                    && !completed(
+                    && !completed_with(
+                        &mut checks,
                         snapshot.program()?,
                         &snapshot.data,
                         &reference,
@@ -559,7 +590,8 @@ pub(super) fn verify_history_frames(
                 }
                 if !is_sealed
                     && (row.archived
-                        || completed(
+                        || completed_with(
+                            &mut checks,
                             snapshot.program()?,
                             &snapshot.data,
                             &reference,

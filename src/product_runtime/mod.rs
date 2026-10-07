@@ -55,6 +55,46 @@ pub fn has_protected_fields(program: &CapturedProgram) -> bool {
 pub const RUNTIME_VERSION: &str = "local-interpreter/3";
 pub const DRIVER_VERSION: &str = "semantic-input/3";
 type Result<T> = std::result::Result<T, AdapterError>;
+
+/// Successful immutable checks retained only by one history-verification call.
+/// Borrowing captures prevents mutation or pointer reuse during this lifetime.
+/// No data frame, row, day, meter, cancellation state or evaluated value is kept.
+#[derive(Default)]
+pub(crate) struct ProjectionValidation<'a> {
+    sources: Vec<&'a CapturedProgram>,
+    types: std::collections::BTreeSet<Vec<u8>>,
+    bytes: usize,
+    #[cfg(test)]
+    source_checks: usize,
+    #[cfg(test)]
+    type_checks: usize,
+}
+impl<'a> ProjectionValidation<'a> {
+    fn source(&mut self, program: &'a CapturedProgram) -> Result<Option<usize>> {
+        if let Some(index) = self
+            .sources
+            .iter()
+            .position(|prior| std::ptr::eq(*prior, program) || *prior == program)
+        {
+            return Ok(Some(index));
+        }
+        #[cfg(test)]
+        {
+            self.source_checks += 1;
+        }
+        program.validate()?;
+        if self.sources.len() == MAX_ITEMS {
+            return Ok(None);
+        }
+        self.sources.push(program);
+        Ok(Some(self.sources.len() - 1))
+    }
+    #[cfg(test)]
+    pub(crate) fn counts(&self) -> (usize, usize) {
+        (self.source_checks, self.type_checks)
+    }
+}
+
 fn invalid(message: &str) -> AdapterError {
     AdapterError::Invalid(ContractError(message.into()))
 }
@@ -218,9 +258,35 @@ impl LocalRuntime {
         expected: &Type,
         day: i32,
     ) -> Result<DataValue> {
-        program.validate()?;
+        self.evaluate_record_projection_with(
+            &mut ProjectionValidation::default(),
+            RuntimeLimits::default(),
+            program,
+            data,
+            row,
+            binding,
+            expression,
+            expected,
+            day,
+        )
+    }
+    pub(crate) fn evaluate_record_projection_with<'a>(
+        &self,
+        checks: &mut ProjectionValidation<'a>,
+        limits: RuntimeLimits,
+        program: &'a CapturedProgram,
+        data: &DataSnapshot,
+        row: &RecordRef,
+        binding: &str,
+        expression: &Expr,
+        expected: &Type,
+        day: i32,
+    ) -> Result<DataValue> {
+        let source = checks.source(program)?;
         data.validate()?;
-        self.evaluate_projection_inner(program, data, row, binding, expression, expected, day)
+        self.evaluate_projection_inner(
+            program, data, row, binding, expression, expected, day, limits, checks, source,
+        )
     }
     /// Evaluate an independently proven own-row historical expression. Validate
     /// the coherent current data and every producer-row value first; global
@@ -237,7 +303,35 @@ impl LocalRuntime {
         expected: &Type,
         day: i32,
     ) -> Result<DataValue> {
-        program.validate()?;
+        self.evaluate_historical_record_projection_with(
+            &mut ProjectionValidation::default(),
+            RuntimeLimits::default(),
+            program,
+            data,
+            row,
+            values,
+            archived,
+            binding,
+            expression,
+            expected,
+            day,
+        )
+    }
+    pub(crate) fn evaluate_historical_record_projection_with<'a>(
+        &self,
+        checks: &mut ProjectionValidation<'a>,
+        limits: RuntimeLimits,
+        program: &'a CapturedProgram,
+        data: &DataSnapshot,
+        row: &RecordRef,
+        values: &Values,
+        archived: bool,
+        binding: &str,
+        expression: &Expr,
+        expected: &Type,
+        day: i32,
+    ) -> Result<DataValue> {
+        let source = checks.source(program)?;
         data.validate()?;
         if values.len() > MAX_ITEMS {
             return Err(invalid("historical projection row exceeds bounds"));
@@ -284,6 +378,9 @@ impl LocalRuntime {
             expression,
             expected,
             day,
+            limits,
+            checks,
+            source,
         )
     }
     fn evaluate_projection_inner(
@@ -295,8 +392,12 @@ impl LocalRuntime {
         expression: &Expr,
         expected: &Type,
         day: i32,
+        limits: RuntimeLimits,
+        checks: &mut ProjectionValidation<'_>,
+        source: Option<usize>,
     ) -> Result<DataValue> {
         validate_day(day)?;
+        limits.validate()?;
         if data.project_id != program.binding.project_id || !valid_id(binding) {
             return Err(invalid("projection project or binding mismatch"));
         }
@@ -305,28 +406,39 @@ impl LocalRuntime {
             record: row.record.clone(),
         };
         eval::record(data, &value)?;
-        let mut app = program.program.clone();
-        let mut id = "gm_scope_projection".to_owned();
-        while app.actions.iter().any(|a| a.id == id) {
-            id.push('_');
+        let key = source
+            .map(|source| {
+                canonical_bytes(&(source, &row.entity, binding, expression, expected, &limits))
+            })
+            .transpose()?;
+        let cached = key.as_ref().is_some_and(|key| checks.types.contains(key));
+        if !cached {
+            #[cfg(test)]
+            {
+                checks.type_checks += 1;
+            }
+            let mut app = program.program.clone();
+            let mut id = "gm_scope_projection".to_owned();
+            while app.actions.iter().any(|a| a.id == id) {
+                id.push('_');
+            }
+            app.actions.push(ActionDefinition {
+                id,
+                label: "Host projection type check".into(),
+                parameters: BTreeMap::from([(binding.to_owned(), Type::reference(&row.entity))]),
+                guards: vec![],
+                ensures: vec![],
+                steps: vec![Statement::Assert {
+                    condition: Expr::Equal {
+                        left: Box::new(expression.clone()),
+                        right: Box::new(expression.clone()),
+                    },
+                    message: "Projection type check".into(),
+                }],
+            });
+            app.validate()?;
         }
-        app.actions.push(ActionDefinition {
-            id,
-            label: "Host projection type check".into(),
-            parameters: BTreeMap::from([(binding.to_owned(), Type::reference(&row.entity))]),
-            guards: vec![],
-            ensures: vec![],
-            steps: vec![Statement::Assert {
-                condition: Expr::Equal {
-                    left: Box::new(expression.clone()),
-                    right: Box::new(expression.clone()),
-                },
-                message: "Projection type check".into(),
-            }],
-        });
-        app.validate()?;
         let session = SessionState::initial(&program.program)?;
-        let limits = RuntimeLimits::default();
         let mut meter = Meter::new(limits.clone(), limits.fuel, self.cancelled.clone());
         let env = Env::from([(binding.to_owned(), (Type::reference(&row.entity), value))]);
         let mut evaluator = Eval {
@@ -341,6 +453,16 @@ impl LocalRuntime {
         }
         let result = evaluator.eval(expression, &env)?;
         validate_value(&result, expected, 0)?;
+        if !cached {
+            if let Some(key) = key {
+                // Saturation only disables reuse. It never changes which valid
+                // projection can execute or relaxes the original AST budgets.
+                if checks.types.len() < MAX_ITEMS && key.len() <= MAX_WIRE_BYTES - checks.bytes {
+                    checks.bytes += key.len();
+                    checks.types.insert(key);
+                }
+            }
+        }
         Ok(result)
     }
     pub fn compatibility_at(
