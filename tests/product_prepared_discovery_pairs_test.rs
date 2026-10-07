@@ -737,3 +737,230 @@ fn legacy_single_rehearsal_preserves_reversed_recorded_decision_order() {
         .recover_new(&dir.path().join("recovered"))
         .unwrap();
 }
+
+#[test]
+fn legacy_single_rehearsal_can_resupply_an_already_retained_correspondence() {
+    let dir = tempdir();
+    let path = dir.path().join("tool");
+    let store = managed_store(&path);
+    let current = store.load().unwrap();
+    let manifest = &current.scope.compositions[&current.active_revision];
+    let original = &current.programs[0];
+    let mapped =
+        product_runtime::merged_data(current.program().unwrap(), &manifest.basis.data).unwrap();
+    let (context, _) = ScopedExecutionContext::committed(&current)
+        .unwrap()
+        .project_seed(
+            original,
+            &manifest.basis.data,
+            current.program().unwrap(),
+            &mapped,
+            manifest.basis.day,
+        )
+        .unwrap();
+    let proofs = context.correspondence_proofs();
+    assert!(!proofs.is_empty());
+    let save = store
+        .prepare_switch(current.program().unwrap(), "save-correspondence")
+        .unwrap();
+    store
+        .adopt_correspondence_verified(
+            current.revision,
+            &save,
+            current.program().unwrap(),
+            &current.decisions,
+            &proofs,
+            |_, _, _, _| Ok(()),
+        )
+        .unwrap();
+    let current = store.load().unwrap();
+    assert_eq!(current.scope.correspondences.len(), proofs.len());
+    let mut raw = serde_json::to_value(program(true).program).unwrap();
+    raw["observables"][0]["value"] = serde_json::to_value(int(1)).unwrap();
+    let prospective = prepare(&store, &capture(raw), "prospective");
+    let engine = DecisionEngine::new(LocalRuntime::default(), IntentArchive::new(store.clone()));
+    let scenario = ScenarioSpec {
+        version: 1,
+        id: "legacy-existing-proof".into(),
+        label: "Retain a pending choice with existing proof context".into(),
+        seed: current.data.clone(),
+        session: current.session.clone(),
+        clock_day: current.clock_day,
+        random_seed: 0,
+        inputs: vec![
+            invoke("export", &[]),
+            SemanticInput::Observe {
+                point: "result".into(),
+            },
+        ],
+        validity: vec![],
+    };
+    let scenes = vec![
+        engine
+            .accept_prepared_current_scene(&store, &prospective, &scenario, Disclosure::Synthetic)
+            .unwrap(),
+        engine
+            .accept_scoped_scene(&store, &prospective, &scenario, Disclosure::Synthetic)
+            .unwrap(),
+    ];
+    let object = serde_json::json!({"version":1,"content":{"kind":"scenes","scenes":scenes}});
+    let witness = store
+        .stage_extension(&canonical_bytes(&object).unwrap())
+        .unwrap();
+    let mut next = current.decisions.clone();
+    next.revision += 1;
+    let mut scope = choice(DecisionOutcome::Deferred).scope;
+    scope.operations = ["export".into()].into_iter().collect();
+    next.decisions.push(ScopedDecision {
+        id: "legacy-pending".into(),
+        revision: 1,
+        request: "Retain this existing context".into(),
+        rationale: None,
+        scope,
+        outcome: DecisionOutcome::Deferred,
+        status: DecisionStatus::Pending,
+        obligations: vec![],
+        scenarios: scenes
+            .iter()
+            .map(|scene| scene.scenario().identity().unwrap())
+            .collect(),
+        witness,
+        supersedes: vec![],
+    });
+    let adoption = store
+        .prepare_switch(current.program().unwrap(), "record-with-existing-proof")
+        .unwrap();
+    let retained = store
+        .adopt_rehearsal_verified(
+            current.revision,
+            &adoption,
+            current.program().unwrap(),
+            &next,
+            &prospective,
+            &["legacy-pending".into()],
+            &proofs,
+            |_, _, _, _| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(
+        retained.scope.correspondences,
+        current.scope.correspondences
+    );
+    assert_eq!(ProductStore::open(&path).unwrap().load().unwrap(), retained);
+    let bytes = product_backup::VerifiedBackup::capture(&store)
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+    product_backup::VerifiedBackup::from_bytes(&bytes)
+        .unwrap()
+        .recover_new(&dir.path().join("recovered"))
+        .unwrap();
+}
+
+#[test]
+fn pair_receipt_tag_mutations_and_half_pair_cannot_downgrade_to_legacy() {
+    let dir = tempdir();
+    let store = managed_store(&dir.path().join("tool"));
+    let current = store.load().unwrap();
+    let ordinary = store
+        .prepare_switch(current.program().unwrap(), "ordinary-before-pair")
+        .unwrap();
+    let current = store
+        .adopt(
+            current.revision,
+            &ordinary,
+            current.program().unwrap(),
+            &current.decisions,
+        )
+        .unwrap();
+    let a = prepare(&store, &design(1, fixture_producer(), false), "a");
+    let b = prepare(&store, &design(2, fixture_producer(), false), "b");
+    let engine = DecisionEngine::new(LocalRuntime::default(), IntentArchive::new(store.clone()));
+    let scenes = engine
+        .accept_paired_scoped_scenes(
+            &store,
+            &a,
+            &b,
+            &scene(&current, a.target()),
+            Disclosure::Synthetic,
+        )
+        .unwrap();
+    let change = engine
+        .prepare_paired_rehearsed_choice(
+            &store,
+            a,
+            b,
+            choice(DecisionOutcome::Deferred),
+            scenes.to_vec(),
+            &[],
+            "record",
+        )
+        .unwrap();
+    let healthy = engine.adopt(&store, &change).unwrap();
+    let archive = IntentArchive::new(store.clone());
+    let bundle = archive.export_for(&healthy).unwrap();
+    let tag = canonical_digest(IdentityDomain::Evidence, &"managed-evolution-pair/1").unwrap();
+    let evidence = &healthy.adoptions.last().unwrap().plan.evidence;
+    assert!(evidence.len() >= 3);
+    assert_eq!(evidence[evidence.len() - 2], tag);
+    for mutation in 0..5 {
+        let mut corrupt = healthy.clone();
+        let evidence = &mut corrupt.adoptions.last_mut().unwrap().plan.evidence;
+        let end = evidence.len();
+        match mutation {
+            0 => {
+                evidence.remove(end - 2);
+            }
+            1 => {
+                evidence.swap(end - 2, end - 1);
+            }
+            2 => {
+                evidence.push(tag.clone());
+            }
+            3 => {
+                evidence[end - 1] =
+                    canonical_digest(IdentityDomain::Evidence, &"other inventory").unwrap();
+            }
+            _ => {
+                evidence.remove(end - 1);
+            }
+        }
+        assert!(corrupt.validate().is_err(), "mutation {mutation}");
+    }
+    let mut half = healthy.clone();
+    let missing = half.scope.rehearsals.keys().next().unwrap().clone();
+    half.scope.rehearsals.remove(&missing);
+    half.programs
+        .retain(|source| canonical_digest(IdentityDomain::Source, source).unwrap() != missing);
+    assert!(half.validate().is_err());
+    // Even deleting the tag cannot make the original two-prospective scene
+    // package into an authentic current-plus-one legacy recording.
+    let evidence = &mut half.adoptions.last_mut().unwrap().plan.evidence;
+    evidence.truncate(evidence.len() - 2);
+    let mut rebound = serde_json::to_value(&bundle).unwrap();
+    rebound["snapshot"] =
+        serde_json::to_value(canonical_digest(IdentityDomain::Data, &half).unwrap()).unwrap();
+    let rebound: IntentionBundle = serde_json::from_value(rebound).unwrap();
+    assert!(validate_bundle(&half, &rebound).is_err());
+    // A tagged ordinary receipt with no paired proof inventory is rejected.
+    let mut collision = current.clone();
+    collision
+        .adoptions
+        .last_mut()
+        .unwrap()
+        .plan
+        .evidence
+        .push(healthy.adoptions.last().unwrap().plan.evidence[0].clone());
+    collision
+        .adoptions
+        .last_mut()
+        .unwrap()
+        .plan
+        .evidence
+        .extend([
+            tag,
+            canonical_digest(IdentityDomain::Evidence, &"not a pair").unwrap(),
+        ]);
+    assert!(collision.validate().is_err());
+    assert_eq!(store.load().unwrap(), healthy);
+}

@@ -6,6 +6,7 @@ mod history;
 mod rehearsal;
 mod replay;
 pub(super) use correspondence::install as retain_correspondences;
+pub(crate) use rehearsal::pair_recording_evidence;
 pub(super) use rehearsal::{rehearsals_request, retain_rehearsals};
 pub(crate) use replay::ProvenanceColumns;
 pub use replay::ScopedExecutionContext;

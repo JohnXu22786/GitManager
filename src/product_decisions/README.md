@@ -158,3 +158,11 @@ prepared target supplies later discovery correspondence. Later acceptance or
 resolution requires a newly prepared selected design against then-current work
 and the exact pending decision IDs. Old preparations remain stale after daily
 work, while immutable experienced history stays available.
+
+Paired recording receipts append a fixed domain-separated tag and the exact
+pair-request digest to `AdoptionPlan.evidence`. Its first mapping entry and raw
+run digests stay in place. Snapshot validation requires exactly this trailing
+binding for two proofs sharing one recording birth; immutable scene-package
+validation independently refuses to downgrade a damaged prospective pair into
+a legacy current-plus-one scene package. Legacy single-target ID ordering and
+resupplied already-retained correspondences keep their established semantics.

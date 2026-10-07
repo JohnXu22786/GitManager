@@ -998,6 +998,15 @@ impl ProductStore {
                 ))
             };
         }
+        if rehearsal.is_some_and(|(proofs, _)| proofs.len() == 2)
+            && correspondences
+                .keys()
+                .any(|id| current.scope.correspondences.contains_key(id))
+        {
+            return Err(StoreError::Invalid(
+                "paired recording must name only newly recorded correspondence proofs".into(),
+            ));
+        }
         if expected_revision != current.revision
             || prepared.expected_revision != current.revision
             || prepared.target != revision(target)?

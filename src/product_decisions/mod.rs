@@ -1468,7 +1468,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         mappings.retain(|m| !m.mappings.is_empty() || !m.scenarios.is_empty());
         let compatibility =
             LocalRuntime::default().compatibility_at(target, &current.data, current.clock_day)?;
-        let plan = AdoptionPlan {
+        let mut plan = AdoptionPlan {
             version: CONTRACT_VERSION,
             id: id.into(),
             project_id: current.data.project_id.clone(),
@@ -1510,6 +1510,13 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             .collect::<std::result::Result<_, _>>()?,
             retire_decisions: retire,
         };
+        if let Some((proofs, ids)) = self.pending_rehearsal.borrow().as_ref() {
+            if let Some(evidence) =
+                crate::product_store::scope::pair_recording_evidence(proofs, ids)?
+            {
+                plan.evidence.extend(evidence);
+            }
+        }
         validate_withdrawal_delta(current, &next, &plan)?;
         self.verify_destination_packages(store, current, &next, &plan)?;
         let prepared = store.prepare_adoption(plan, target)?;

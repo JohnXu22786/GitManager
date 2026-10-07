@@ -18,14 +18,7 @@ fn decision_births(snapshot: &ProjectSnapshot) -> Result<BTreeMap<u64, DecisionB
     let mut graph_identity = graph.identity()?;
     let mut births = BTreeMap::new();
     for adoption in snapshot.adoptions.iter().rev() {
-        if !snapshot
-            .scope
-            .adoptions
-            .iter()
-            .any(|receipt| receipt.revision == adoption.revision)
-        {
-            rehearsal::verify_recording_request(snapshot, adoption, &graph)?;
-        }
+        rehearsal::verify_recording_request(snapshot, adoption, &graph)?;
         let required: BTreeSet<_> = graph
             .decisions
             .iter()

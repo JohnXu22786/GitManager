@@ -75,6 +75,48 @@ pub(in crate::product_store) fn rehearsals_request(
         _ => Err(error("unsupported rehearsal proof inventory")),
     }
 }
+fn pair_tag() -> Result<Digest> {
+    Ok(canonical_digest(
+        IdentityDomain::Evidence,
+        &"managed-evolution-pair/1",
+    )?)
+}
+/// A bounded trailing receipt pair; the established first mapping slot and all
+/// raw execution evidence remain intact. This is not a generic metadata channel.
+pub(crate) fn pair_recording_evidence(
+    prepared: &[PreparedScopedChange],
+    decisions: &[Id],
+) -> Result<Option<[Digest; 2]>> {
+    if prepared.len() != 2 {
+        return Ok(None);
+    }
+    if decisions.len() != 1 {
+        return Err(error("paired rehearsal records one exact pending choice"));
+    }
+    Ok(Some([
+        pair_tag()?,
+        rehearsals_request(prepared, decisions)?,
+    ]))
+}
+fn recorded_pair_binding(plan: &AdoptionPlan) -> Result<Option<&Digest>> {
+    let tag = pair_tag()?;
+    let positions: Vec<_> = plan
+        .evidence
+        .iter()
+        .enumerate()
+        .filter(|(_, digest)| **digest == tag)
+        .map(|(index, _)| index)
+        .collect();
+    match positions.as_slice() {
+        [] => Ok(None),
+        [index] if *index > 0 && index.checked_add(2) == Some(plan.evidence.len()) => {
+            Ok(plan.evidence.last())
+        }
+        _ => Err(error(
+            "paired recording tag is duplicated, misplaced or incomplete",
+        )),
+    }
+}
 pub(in crate::product_store) fn retain_rehearsals(
     current: &mut ProjectSnapshot,
     prepared: &[PreparedScopedChange],
@@ -83,8 +125,11 @@ pub(in crate::product_store) fn retain_rehearsals(
     plan: &AdoptionPlan,
 ) -> Result<()> {
     ScopedExecutionContext::rehearsals(current, prepared)?;
-    if prepared.len() == 2 && decisions.len() != 1 {
-        return Err(error("paired rehearsal records one exact pending choice"));
+    let pair = pair_recording_evidence(prepared, decisions)?;
+    if recorded_pair_binding(plan)? != pair.as_ref().map(|evidence| &evidence[1]) {
+        return Err(error(
+            "paired recording is missing its exact tagged proof inventory",
+        ));
     }
     if current
         .scope
@@ -179,81 +224,80 @@ pub(super) fn verify_recording_request(
         .values()
         .filter(|proof| proof.recorded_by == receipt.plan.id)
         .collect();
-    let target = program(snapshot, &receipt.active)?;
-    let mut request = if proofs.is_empty() {
-        canonical_digest(IdentityDomain::Adoption, &(&receipt.plan, target, graph))?
-    } else {
-        if proofs.len() > 2
-            || (proofs.len() == 2
-                && proofs
-                    .iter()
-                    .any(|proof| proof.manifest.transition != ScopeTransition::Evolution))
-        {
-            return Err(error("recording has an unsupported rehearsal inventory"));
-        }
-        let first = proofs[0];
-        if proofs.iter().any(|proof| {
+    let binding = recorded_pair_binding(&receipt.plan)?;
+    if binding.is_none() && proofs.len() < 2 {
+        // Existing single-target records did not retain the order of recorded
+        // IDs or resupplied already-retained correspondence inventories. Keep
+        // their established graph/source/scene/receipt validation unchanged.
+        // Independently verified scene packages still distinguish a real
+        // current-plus-one recording from a damaged prospective pair.
+        return Ok(());
+    }
+    if proofs.len() != 2
+        || binding.is_none()
+        || proofs
+            .iter()
+            .any(|proof| proof.manifest.transition != ScopeTransition::Evolution)
+    {
+        return Err(error(
+            "paired recording is missing a tag or one of its exact proofs",
+        ));
+    }
+    let first = proofs[0];
+    if first.witnesses.len() != 1
+        || proofs.iter().any(|proof| {
             proof.manifest.basis != first.manifest.basis
                 || proof.witnesses != first.witnesses
                 || proof.recorded_revision != first.recorded_revision
-        }) {
-            return Err(error(
-                "paired rehearsal proofs differ in basis or exact recording birth",
-            ));
-        }
-        if proofs.len() == 1 && first.witnesses.len() > 1 {
-            // The established public single-target API accepted an ordered ID
-            // slice but retained only its set. Its original order cannot be
-            // reconstructed. Preserve that legacy validation boundary: exact
-            // graph births/source/scene/receipt checks still apply below.
-            // New paired recordings require exactly one pending decision.
-            return Ok(());
-        }
-        if proofs.len() == 2 && first.witnesses.len() != 1 {
-            return Err(error("paired rehearsal must bind one exact pending choice"));
-        }
-        let decisions: Vec<_> = graph
-            .decisions
-            .iter()
-            .filter(|decision| first.witnesses.contains_key(&decision.id))
-            .map(|decision| decision.id.clone())
-            .collect();
-        let mut requests = vec![];
-        for proof in proofs {
-            requests.push(canonical_digest(
-                IdentityDomain::Adoption,
-                &(
-                    "managed-rehearsal/1",
-                    &proof.manifest.basis.snapshot,
-                    &proof.manifest,
-                    program(snapshot, &proof.manifest.business)?,
-                    program(snapshot, &proof.manifest.output)?,
-                    &proof.seed,
-                    &proof.compatibility,
-                    &decisions,
-                ),
-            )?);
-        }
-        let proof_request = if requests.len() == 1 {
-            requests.remove(0)
-        } else {
-            requests.sort();
-            canonical_digest(
-                IdentityDomain::Adoption,
-                &("managed-evolution-pair/1", requests),
-            )?
-        };
-        canonical_digest(
+        })
+    {
+        return Err(error(
+            "paired rehearsal proofs differ in basis or exact recording birth",
+        ));
+    }
+    let decisions: Vec<_> = graph
+        .decisions
+        .iter()
+        .filter(|decision| first.witnesses.contains_key(&decision.id))
+        .map(|decision| decision.id.clone())
+        .collect();
+    let mut requests = vec![];
+    for proof in proofs {
+        requests.push(canonical_digest(
             IdentityDomain::Adoption,
             &(
-                "record-managed-rehearsal/1",
-                &receipt.plan,
-                target,
-                graph,
-                proof_request,
+                "managed-rehearsal/1",
+                &proof.manifest.basis.snapshot,
+                &proof.manifest,
+                program(snapshot, &proof.manifest.business)?,
+                program(snapshot, &proof.manifest.output)?,
+                &proof.seed,
+                &proof.compatibility,
+                &decisions,
             ),
-        )?
-    };
+        )?);
+    }
+    requests.sort();
+    let proof_request = canonical_digest(
+        IdentityDomain::Adoption,
+        &("managed-evolution-pair/1", requests),
+    )?;
+    if binding != Some(&proof_request) {
+        return Err(error(
+            "paired recording proof inventory differs from its tagged evidence",
+        ));
+    }
+    let target = program(snapshot, &receipt.active)?;
+    let mut request = canonical_digest(
+        IdentityDomain::Adoption,
+        &(
+            "record-managed-rehearsal/1",
+            &receipt.plan,
+            target,
+            graph,
+            proof_request,
+        ),
+    )?;
     let correspondences: BTreeMap<_, _> = snapshot
         .scope
         .correspondences
