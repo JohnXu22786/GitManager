@@ -14,7 +14,7 @@ use crate::product_provider::{
 };
 use crate::product_runtime::{LocalRuntime, ProductRun};
 use crate::product_store::{ProductStore, ProjectSnapshot};
-use crate::ui::product_runtime_view::{ProductRuntimeView, WidgetTrace};
+use crate::ui::product_runtime_view::{take_shortcuts, ProductRuntimeView, WidgetTrace};
 use journal::{Association, Basis, Interrupted, JournalFile, ProviderAssociation};
 use std::{
     path::{Path, PathBuf},
@@ -86,7 +86,7 @@ impl Gate {
         self.state
             .compare_exchange(0, 3, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
-            || self.state.load(Ordering::Acquire) == 1
+            || matches!(self.state.load(Ordering::Acquire), 1 | 3)
     }
     fn check(&self) -> Result<(), String> {
         if self.cancelled.load(Ordering::Acquire) {
@@ -130,6 +130,10 @@ enum Action {
         input: SemanticInput,
     },
     Reconcile,
+    AbandonCreation,
+    Tick {
+        today: i32,
+    },
     Close,
     #[cfg(test)]
     DialogCancelled,
@@ -142,6 +146,7 @@ struct Command {
 struct Pending {
     key: Key,
     gate: Gate,
+    renderer: bool,
 }
 #[derive(Clone)]
 enum Page {
@@ -174,6 +179,7 @@ struct Update {
     mutation_blocked: bool,
     generation_blocked: bool,
     pending: bool,
+    abandon_creation: bool,
 }
 #[derive(Clone)]
 struct Completion {
@@ -209,6 +215,10 @@ pub struct ProductStudio {
     generation_blocked: bool,
     unresolved: bool,
     closing: bool,
+    abandon_creation: bool,
+    clock_attempt: Option<(Basis, i32)>,
+    #[cfg(test)]
+    clock: Arc<std::sync::atomic::AtomicI32>,
 }
 impl Default for ProductStudio {
     fn default() -> Self {
@@ -222,6 +232,8 @@ impl ProductStudio {
     fn construct(config: Config) -> Self {
         let (send, commands) = mpsc::sync_channel(1);
         let (complete, receive) = mpsc::sync_channel(1);
+        #[cfg(test)]
+        let clock = config.hooks.today.clone();
         std::thread::spawn(move || worker::run(config, commands, complete));
         let mut studio = Self {
             send,
@@ -241,6 +253,10 @@ impl ProductStudio {
             generation_blocked: true,
             unresolved: false,
             closing: false,
+            abandon_creation: false,
+            clock_attempt: None,
+            #[cfg(test)]
+            clock,
         };
         studio.issue(Action::Boot);
         studio
@@ -265,8 +281,13 @@ impl ProductStudio {
             basis: self.basis(),
         };
         let gate = Gate::default();
+        // Initialization must finish even if the user immediately changes panels.
+        if matches!(action, Action::Boot) {
+            let _ = gate.commit();
+        }
+        let renderer = matches!(action, Action::Preview { .. } | Action::Daily { .. });
         match self.send.try_send(Command { key: key.clone(), gate: gate.clone(), action }) {
-            Ok(()) => self.pending = Some(Pending { key, gate }),
+            Ok(()) => self.pending = Some(Pending { key, gate, renderer }),
             Err(_) => self.notice = "The tool worker is unavailable. Saved work was kept; reopen the app to reconcile unfinished work".into(),
         }
     }
@@ -277,6 +298,7 @@ impl ProductStudio {
             if self.pending.as_ref().map(|p| &p.key) != Some(&completion.key) {
                 continue;
             }
+            let renderer_request = self.pending.as_ref().is_some_and(|p| p.renderer);
             self.pending = None;
             let fresh =
                 completion.key.session == self.session && completion.key.epoch == self.epoch;
@@ -285,6 +307,7 @@ impl ProductStudio {
             self.mutation_blocked = update.mutation_blocked;
             self.generation_blocked = update.generation_blocked;
             self.unresolved = update.pending;
+            self.abandon_creation = update.abandon_creation;
             self.destination = update.destination;
             if fresh && !self.closing {
                 if let Some(page) = update.page {
@@ -297,7 +320,9 @@ impl ProductStudio {
                 if let Some(need) = update.need {
                     self.need = need;
                 }
-                self.renderer.acknowledge(completion.acknowledged);
+                if renderer_request {
+                    self.renderer.acknowledge(completion.acknowledged);
+                }
                 self.notice = update.notice;
             } else {
                 self.notice = match completion.committed {
@@ -313,6 +338,28 @@ impl ProductStudio {
                 self.closing = false;
                 self.issue(Action::Close);
             }
+        }
+        // Clock changes are ordinary receipt-bound store operations, not a
+        // different rendering clock. Retry failures only on explicit request.
+        if !self.is_busy() && !self.mutation_blocked && !self.closing {
+            if let Page::Daily { basis, .. } = &self.page {
+                let today = self.today();
+                let attempt = (basis.clone(), today);
+                if basis.day < today && self.clock_attempt.as_ref() != Some(&attempt) {
+                    self.clock_attempt = Some(attempt);
+                    self.issue(Action::Tick { today });
+                }
+            }
+        }
+    }
+    fn today(&self) -> i32 {
+        #[cfg(test)]
+        {
+            self.clock.load(Ordering::Acquire)
+        }
+        #[cfg(not(test))]
+        {
+            day()
         }
     }
     fn cancel(&mut self) -> bool {
@@ -333,6 +380,17 @@ impl ProductStudio {
     }
     pub fn show(&mut self, ui: &mut egui::Ui) -> WidgetTrace {
         let mut trace = WidgetTrace::default();
+        let active_model = match &self.page {
+            Page::Draft { model, .. } | Page::Daily { model, .. } => Some(model),
+            _ => None,
+        };
+        let shortcuts = take_shortcuts(
+            ui,
+            active_model.and_then(|m| m.program.views.iter().find(|v| v.id == m.observation.view)),
+            !self.is_busy() && !self.mutation_blocked,
+            &mut trace,
+        );
+        let today = self.today();
         let busy = self.is_busy();
         if busy {
             ui.ctx().request_repaint_after(Duration::from_millis(30));
@@ -346,7 +404,14 @@ impl ProductStudio {
         let mut close = false;
         if busy {
             trace.label(ui, "Working… You can continue using the other app panels.");
-            if trace.button(ui, "studio.cancel", "Cancel", true) {
+            if trace.button(
+                ui,
+                "studio.cancel",
+                "Cancel",
+                self.pending
+                    .as_ref()
+                    .is_some_and(|p| p.gate.state.load(Ordering::Acquire) == 0),
+            ) {
                 self.cancel();
             }
         }
@@ -359,6 +424,17 @@ impl ProductStudio {
                 !busy,
             ) {
                 action = Some(Action::Reconcile);
+            }
+            if self.abandon_creation {
+                trace.label(ui, "If the original folder has no committed tool, you can set this attempt aside. Its files are kept. An existing or unreadable CURRENT is never discarded.");
+                if trace.button(
+                    ui,
+                    "studio.abandon",
+                    "Set aside this uncommitted save",
+                    !busy,
+                ) {
+                    action = Some(Action::AbandonCreation);
+                }
             }
         }
         match &self.page {
@@ -503,7 +579,14 @@ impl ProductStudio {
                 }
                 close = trace.button(ui, "studio.back", "Back without keeping", true);
                 ui.separator();
-                let output = self.renderer.show(ui, model, "draft", !busy, false, &[]);
+                let output = self.renderer.show(
+                    ui,
+                    model,
+                    "draft",
+                    !busy && action.is_none() && !close,
+                    false,
+                    &shortcuts,
+                );
                 trace.append(output.trace);
                 if action.is_none() {
                     if let Some(input) = output.input {
@@ -523,18 +606,33 @@ impl ProductStudio {
                 trace.label(ui, "Output files cannot be saved in this initial version. Generated output can be inspected below.");
                 close = trace.button(ui, "studio.close", "Close tool", true);
                 let mut model = model.clone();
-                model.read_only |= self.mutation_blocked;
+                model.read_only |= self.mutation_blocked || basis.day != today;
+                if basis.day != today {
+                    trace.label(ui, "The saved tool date differs from today. Current-day work is paused until its date is safely updated; the saved data is kept.");
+                    if basis.day < today
+                        && trace.button(
+                            ui,
+                            "studio.today",
+                            "Update to today",
+                            !busy && !self.mutation_blocked,
+                        )
+                    {
+                        action = Some(Action::Tick { today });
+                    }
+                }
                 let output = self.renderer.show(
                     ui,
                     &model,
                     "daily",
-                    !busy && !self.mutation_blocked,
+                    !busy && !self.mutation_blocked && action.is_none() && !close,
                     false,
-                    &[],
+                    &shortcuts,
                 );
                 trace.append(output.trace);
-                if let Some(input) = output.input {
-                    action = Some(Action::Daily { input });
+                if action.is_none() {
+                    if let Some(input) = output.input {
+                        action = Some(Action::Daily { input });
+                    }
                 }
             }
         }
@@ -561,13 +659,31 @@ pub struct TestPause {
     pub release: AtomicBool,
 }
 #[cfg(test)]
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct TestHooks {
     pub before_commit: Option<Arc<TestPause>>,
+    pub before_preview: Option<Arc<TestPause>>,
+    pub folder_choice: Option<PathBuf>,
     pub after_commit: Option<Arc<TestPause>>,
     pub lose_ack: Arc<AtomicBool>,
     pub stopped: Arc<AtomicBool>,
     pub duplicate_completion: bool,
+    pub today: Arc<std::sync::atomic::AtomicI32>,
+}
+#[cfg(test)]
+impl Default for TestHooks {
+    fn default() -> Self {
+        Self {
+            before_commit: None,
+            before_preview: None,
+            folder_choice: None,
+            after_commit: None,
+            lose_ack: Arc::new(AtomicBool::new(false)),
+            stopped: Arc::new(AtomicBool::new(false)),
+            duplicate_completion: false,
+            today: Arc::new(std::sync::atomic::AtomicI32::new(20000)),
+        }
+    }
 }
 #[cfg(test)]
 impl ProductStudio {
@@ -618,6 +734,12 @@ impl ProductStudio {
     }
     pub fn test_close(&mut self) {
         self.close();
+    }
+    pub fn test_abandon(&mut self) {
+        self.issue(Action::AbandonCreation);
+    }
+    pub fn test_generation_blocked(&self) -> bool {
+        self.generation_blocked
     }
     pub fn test_reconcile(&mut self) {
         self.issue(Action::Reconcile);
@@ -699,5 +821,20 @@ pub fn test_stage_provider(
         wire_source: wire.source_digest,
         issued: true,
     });
+    journal.write(value).unwrap();
+}
+
+#[cfg(test)]
+pub fn test_stage_unstarted_creation(root: &Path, path: &Path, capture: &CapturedProgram) {
+    let tool = Association {
+        path: path.into(),
+        identity: ToolIdentity {
+            project_id: capture.binding.project_id.clone(),
+            first_program: canonical_digest(IdentityDomain::Source, capture).unwrap(),
+        },
+    };
+    let mut journal = JournalFile::open(root).unwrap();
+    let mut value = journal.value.clone();
+    value.pending = Some(Interrupted::Create { tool });
     journal.write(value).unwrap();
 }

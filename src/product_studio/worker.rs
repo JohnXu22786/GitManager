@@ -121,6 +121,10 @@ impl Worker {
                 || self.generation_blocked
                 || durable_pending,
             pending: pending && self.ready.is_none(),
+            abandon_creation: self
+                .journal
+                .as_ref()
+                .is_some_and(|j| matches!(j.value.pending, Some(Interrupted::Create { .. }))),
         }
     }
     fn journal(&mut self, edit: impl FnOnce(&mut journal::Journal)) -> Result<(), String> {
@@ -164,6 +168,16 @@ impl Worker {
             }
         }
         Ok(())
+    }
+    fn today(&self) -> i32 {
+        #[cfg(test)]
+        {
+            self.config.hooks.today.load(Ordering::Acquire)
+        }
+        #[cfg(not(test))]
+        {
+            day()
+        }
     }
     fn transport(&self, provider: ProviderKind) -> Result<ProviderTransport, String> {
         #[cfg(test)]
@@ -349,7 +363,7 @@ impl Worker {
             runtime.validate(&capture).map_err(error)?;
             captures.push(capture);
         }
-        let run = empty_run(&captures[0], day(), &runtime)?;
+        let run = empty_run(&captures[0], self.today(), &runtime)?;
         gate.check()?;
         let draft = Draft {
             request: ready.request,
@@ -377,6 +391,15 @@ impl Worker {
     }
     fn preview(&mut self, input: SemanticInput, key: &Key, gate: &Gate) -> Result<(), String> {
         self.check_draft(key)?;
+        #[cfg(test)]
+        if let Some(pause) = &self.config.hooks.before_preview {
+            pause.reached.store(true, Ordering::Release);
+            while !pause.release.load(Ordering::Acquire) && !gate.cancelled.load(Ordering::Acquire)
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        gate.check()?;
         let draft = self.draft.as_mut().unwrap();
         let runtime = LocalRuntime::with_cancellation(gate.cancelled.clone());
         let mut run = runtime
@@ -395,7 +418,9 @@ impl Worker {
             .map_err(error)?;
         // Compute the complete view before replacing the old copied run.
         runtime.view_model(&run).map_err(error)?;
-        gate.check()?;
+        if !gate.finish() {
+            return Err("Preview cancelled; the previous draft was kept".into());
+        }
         draft.run = run;
         draft.revision = draft
             .revision
@@ -416,7 +441,9 @@ impl Worker {
             draft.run.clock_day(),
             &LocalRuntime::with_cancellation(gate.cancelled.clone()),
         )?;
-        gate.check()?;
+        if !gate.finish() {
+            return Err("Preview cancelled; the previous draft was kept".into());
+        }
         draft.run = run;
         draft.selected = candidate;
         draft.revision = draft
@@ -518,7 +545,7 @@ impl Worker {
             self.journal(|j| j.pending = None)?;
             return Err(e);
         }
-        let result = ProductStore::create(&path, &capture, day());
+        let result = ProductStore::create(&path, &capture, self.today());
         #[cfg(test)]
         let result = if self.config.hooks.lose_ack.swap(false, Ordering::AcqRel) && result.is_ok() {
             Err(crate::product_store::StoreError::Invalid(
@@ -554,6 +581,11 @@ impl Worker {
             .as_ref()
             .ok_or("Open a saved tool before entering work")?;
         let basis = Basis::capture(&current.snapshot)?;
+        if !matches!(input, SemanticInput::AdvanceClock { .. }) && basis.day != self.today() {
+            return Err(
+                "The tool date changed; update it to today before entering current-day work".into(),
+            );
+        }
         if key.basis.as_ref() != Some(&basis) {
             return Err(
                 "The displayed source, data, or session changed; reopen the current tool".into(),
@@ -743,6 +775,47 @@ impl Worker {
             }
         }
     }
+    fn abandon_creation(&mut self, gate: &Gate) -> Result<(), String> {
+        let Some(Interrupted::Create { tool }) =
+            self.journal.as_ref().and_then(|j| j.value.pending.clone())
+        else {
+            return Err("There is no unfinished initial save to set aside".into());
+        };
+        // Keep every original byte. With the host lock held, no old host worker
+        // can still be creating this tool. Existing folders share the store's
+        // no-follow lock while checking that activation never occurred.
+        let folder = match std::fs::symlink_metadata(&tool.path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(error(e)),
+            Ok(_) => Some(crate::product_locations::Folder::open(&tool.path).map_err(error)?),
+        };
+        let _lock = match &folder {
+            Some(folder) => Some(folder.lock().map_err(error)?),
+            None => None,
+        };
+        let parent = crate::product_locations::Folder::open(
+            tool.path
+                .parent()
+                .ok_or("The unfinished folder has no parent")?,
+        )
+        .map_err(error)?;
+        match std::fs::symlink_metadata(tool.path.join("CURRENT")) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(format!("The original activation status is unreadable; it was kept: {e}")),
+            Ok(_) => return Err("The original folder contains an activation pointer. Check the saved result; it cannot be discarded as uncommitted".into()),
+        }
+        parent.check().map_err(error)?;
+        if let Some(folder) = &folder {
+            folder.check().map_err(error)?;
+        }
+        gate.commit()?;
+        self.journal(|j| {
+            j.pending = None;
+            j.abandoned_creation = Some(tool.clone());
+        })?;
+        self.notice = format!("The uncommitted save was set aside. Its original location and any partial files were kept at {}. You can explicitly save the draft again or start a new request", tool.path.display());
+        Ok(())
+    }
     fn close(&mut self) -> Result<(), String> {
         if self.ready.is_some() {
             self.journal(|j| {
@@ -757,6 +830,16 @@ impl Worker {
         self.page = Page::Home;
         self.chosen = None;
         Ok(())
+    }
+    fn pick_folder(&self, _title: &str) -> Option<PathBuf> {
+        #[cfg(test)]
+        {
+            self.config.hooks.folder_choice.clone()
+        }
+        #[cfg(not(test))]
+        {
+            rfd::FileDialog::new().set_title(_title).pick_folder()
+        }
     }
     fn before_commit(&self, _gate: &Gate) {
         #[cfg(test)]
@@ -794,10 +877,7 @@ impl Worker {
             Action::Save => self.save(key, gate),
             Action::Daily { input } => self.daily(input.clone(), key, gate),
             Action::Open { path, expected } => self.open(path.clone(), expected.clone()),
-            Action::OpenDialog => match rfd::FileDialog::new()
-                .set_title("Open a saved generated-tool folder")
-                .pick_folder()
-            {
+            Action::OpenDialog => match self.pick_folder("Open a saved generated-tool folder") {
                 Some(path) => {
                     gate.check()?;
                     self.open(path, None)
@@ -807,22 +887,34 @@ impl Worker {
                     Ok(())
                 }
             },
-            Action::ChooseDestination => match rfd::FileDialog::new()
-                .set_title("Choose where to keep this tool's data")
-                .pick_folder()
-            {
-                Some(path) => {
-                    gate.check()?;
-                    ToolLocations::chosen(&path).map_err(error)?;
-                    self.chosen = Some(path);
-                    Ok(())
+            Action::ChooseDestination => {
+                match self.pick_folder("Choose where to keep this tool's data") {
+                    Some(path) => {
+                        gate.check()?;
+                        ToolLocations::chosen(&path).map_err(error)?;
+                        self.chosen = Some(path);
+                        Ok(())
+                    }
+                    None => {
+                        self.notice = "Folder selection cancelled; nothing was saved and no other destination was selected".into();
+                        Ok(())
+                    }
                 }
-                None => {
-                    self.notice = "Folder selection cancelled; nothing was saved and no other destination was selected".into();
-                    Ok(())
-                }
-            },
+            }
             Action::Reconcile => self.reconcile(true, gate),
+            Action::AbandonCreation => self.abandon_creation(gate),
+            Action::Tick { today } => {
+                if *today != self.today() {
+                    return Err("The device date changed again; refresh the current view".into());
+                }
+                let basis = key.basis.as_ref().ok_or("No current tool clock")?;
+                let days = u32::try_from(i64::from(*today) - i64::from(basis.day))
+                    .map_err(|_| "A saved clock cannot be moved backwards automatically")?;
+                if days == 0 {
+                    return Ok(());
+                }
+                self.daily(SemanticInput::AdvanceClock { days }, key, gate)
+            }
             Action::Close => self.close(),
             #[cfg(test)]
             Action::DialogCancelled => {
@@ -878,7 +970,15 @@ pub(super) fn run(
         }
         let mut result = host.handle(&command);
         if !command.gate.finish() && host.committed.is_none() {
-            if !matches!(command.action, Action::Daily { .. } | Action::Reconcile) {
+            if !matches!(
+                command.action,
+                Action::Daily { .. }
+                    | Action::Tick { .. }
+                    | Action::Reconcile
+                    | Action::Save
+                    | Action::Preview { .. }
+                    | Action::Select { .. }
+            ) {
                 if let Err(e) = host.close() {
                     host.notice = e;
                 }

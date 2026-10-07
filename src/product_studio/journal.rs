@@ -74,6 +74,7 @@ pub(super) struct Journal {
     pub last: Option<Association>,
     pub pending: Option<Interrupted>,
     pub provider: Option<ProviderAssociation>,
+    pub abandoned_creation: Option<Association>,
 }
 impl Default for Journal {
     fn default() -> Self {
@@ -84,6 +85,7 @@ impl Default for Journal {
             last: None,
             pending: None,
             provider: None,
+            abandoned_creation: None,
         }
     }
 }
@@ -101,6 +103,9 @@ impl Journal {
             }
             Ok(())
         };
+        if let Some(tool) = &self.abandoned_creation {
+            check(tool)?;
+        }
         if let Some(tool) = &self.last {
             check(tool)?;
         }

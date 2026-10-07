@@ -360,3 +360,94 @@ fn restart_never_autoreplays_an_uncommitted_input_but_explicit_retry_uses_same_i
     settle(&mut s);
     assert_eq!(s.test_runtime().unwrap().retained_records.len(), 1);
 }
+
+#[test]
+fn initialization_cannot_be_cancelled_into_an_unusable_session() {
+    let (_temp, root) = root();
+    let mut s = ProductStudio::testing(root, None, TestHooks::default());
+    assert!(!s.test_cancel());
+    settle(&mut s);
+    assert!(!s.test_generation_blocked());
+    assert_eq!(s.test_page(), "home");
+}
+#[test]
+fn rollover_is_persisted_before_today_dependent_work_and_survives_restart() {
+    use serde_json::json;
+    let (_temp, root) = root();
+    let path = root.join("dated-tool");
+    let mut source = organizer();
+    source["entities"][0]["fields"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"id":"entered","label":"Entered","value_type":{"kind":"date"}}));
+    source["actions"][0]["steps"][0]["values"]["entered"] = json!({"kind":"today"});
+    ProductStore::create(&path, &capture(source), 20000).unwrap();
+    let hooks = TestHooks::default();
+    let clock = hooks.today.clone();
+    let stopped = hooks.stopped.clone();
+    let mut s = ProductStudio::testing(root.clone(), None, hooks);
+    settle(&mut s);
+    open(&mut s, &path);
+    clock.store(20003, Ordering::Release);
+    settle(&mut s);
+    s.test_daily(add("Later work"));
+    settle(&mut s);
+    let snapshot = ProductStore::open(&path).unwrap().load().unwrap();
+    assert_eq!(snapshot.clock_day, 20003);
+    assert_eq!(
+        snapshot.data.records[0].values["entered"],
+        DataValue::Date { days: 20003 }
+    );
+    stop(s, &stopped);
+    let hooks = TestHooks::default();
+    hooks.today.store(20004, Ordering::Release);
+    let mut s = ProductStudio::testing(root, None, hooks);
+    settle(&mut s);
+    assert_eq!(
+        ProductStore::open(path).unwrap().load().unwrap().clock_day,
+        20004
+    );
+    assert_eq!(s.test_runtime().unwrap().retained_records.len(), 1);
+}
+#[test]
+fn unactivated_creation_can_be_explicitly_set_aside_without_deleting_partial_files() {
+    for partial in [false, true] {
+        let (_temp, root) = root();
+        let path = root.join("unactivated");
+        if partial {
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join("orphan"), b"preserve exact partial bytes").unwrap();
+        }
+        product_studio::test_stage_unstarted_creation(&root, &path, &capture(organizer()));
+        let mut s = ProductStudio::testing(root, None, TestHooks::default());
+        settle(&mut s);
+        assert!(s.test_generation_blocked());
+        s.test_abandon();
+        settle(&mut s);
+        assert!(!s.test_generation_blocked(), "{}", s.test_notice());
+        if partial {
+            assert_eq!(
+                fs::read(path.join("orphan")).unwrap(),
+                b"preserve exact partial bytes"
+            );
+        } else {
+            assert!(!path.exists());
+        }
+    }
+}
+#[test]
+fn corrupt_activation_cannot_be_abandoned_as_an_uncommitted_creation() {
+    let (_temp, root) = root();
+    let path = saved(&root);
+    fs::write(path.join("CURRENT"), b"corrupt activation").unwrap();
+    product_studio::test_stage_unstarted_creation(&root, &path, &capture(organizer()));
+    let mut s = ProductStudio::testing(root, None, TestHooks::default());
+    settle(&mut s);
+    s.test_abandon();
+    settle(&mut s);
+    assert!(s.test_generation_blocked());
+    assert_eq!(
+        fs::read(path.join("CURRENT")).unwrap(),
+        b"corrupt activation"
+    );
+}
