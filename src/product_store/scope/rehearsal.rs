@@ -197,6 +197,10 @@ pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
                 working.session = manifest.basis.session.clone();
                 working.clock_day = manifest.basis.day;
                 working.revision = manifest.basis.revision;
+                // Reconstruct the adopted layer inventory at this frozen basis.
+                working.scope.layers.retain(|id, _| {
+                    previous.is_some_and(|predecessor| predecessor.layers.contains(id))
+                });
                 request_valid(&working, &layer.request)?;
                 let before = compiler::business_program(&working)?;
                 if compiler::derive_patches(&before, &candidate.program, &layer.request)?

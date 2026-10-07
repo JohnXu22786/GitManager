@@ -2839,6 +2839,139 @@ fn first_scope_can_be_rehearsed_and_retained_before_any_live_layer_exists() {
 }
 
 #[test]
+fn unaccepted_rehearsal_does_not_restrict_a_later_first_lifecycle() {
+    for outcome in [DecisionOutcome::Deferred, DecisionOutcome::NeitherFits] {
+        let dir = tempdir();
+        let path = dir.path().join("tool");
+        let store = ProductStore::create(&path, &program(false), 20000).unwrap();
+        let job = add(&store, "job", "Waiting work");
+        action(&store, "wait", "wait", &job);
+        tick(&store, "days", 20003);
+        let before = store.load().unwrap();
+        let proposal = store
+            .prepare_scoped_change(
+                &program(true),
+                &request(&before, ScopePopulation::All),
+                "unaccepted-proposal",
+            )
+            .unwrap();
+        let engine =
+            DecisionEngine::new(LocalRuntime::default(), IntentArchive::new(store.clone()));
+        let scene = selected_scene(&proposal, &job);
+        let baseline = engine
+            .accept_prepared_current_scene(&store, &proposal, &scene, Disclosure::Synthetic)
+            .unwrap();
+        let prospective = engine
+            .accept_scoped_scene(&store, &proposal, &scene, Disclosure::Synthetic)
+            .unwrap();
+        let pending = Choice {
+            id: "pending-first".into(),
+            request: "Keep this experience without adopting its lifecycle".into(),
+            rationale: None,
+            scope: proposal.scope().clone(),
+            outcome,
+            obligations: vec![],
+            binding: IntentionBinding::ObservedOutcome,
+        };
+        let change = engine
+            .prepare_rehearsed_choice(
+                &store,
+                proposal,
+                pending,
+                vec![baseline, prospective],
+                &[],
+                "record-proposal",
+            )
+            .unwrap();
+        let retained = engine.adopt(&store, &change).unwrap();
+        assert!(retained.scope.layers.is_empty());
+        assert_eq!(retained.data, before.data);
+        let mut fresh_request = request(&retained, ScopePopulation::All);
+        let original = fresh_request.lifecycles[0].completed.clone();
+        fresh_request.lifecycles[0].completed = Expr::And {
+            values: vec![original, boolean(true)],
+        };
+        let fresh = store
+            .prepare_scoped_change(&program(true), &fresh_request, "accept-fresh")
+            .unwrap();
+        let scene = selected_scene(&fresh, &job);
+        let accepted = engine
+            .accept_scoped_scene(&store, &fresh, &scene, Disclosure::Synthetic)
+            .unwrap();
+        let choice = Choice {
+            id: "accepted-first".into(),
+            request: "Adopt this freshly experienced lifecycle".into(),
+            rationale: None,
+            scope: fresh.scope().clone(),
+            outcome: DecisionOutcome::Accept {
+                artifact: fresh.target().artifact.program_digest.clone(),
+            },
+            obligations: vec![],
+            binding: IntentionBinding::ObservedOutcome,
+        };
+        let change = engine
+            .prepare_scoped_choice(&store, fresh, choice, vec![accepted], "accept-fresh")
+            .unwrap();
+        let adopted = engine.adopt(&store, &change).unwrap();
+        assert_eq!(adopted.scope.layers.len(), 1);
+        assert_eq!(adopted.scope.rehearsals, retained.scope.rehearsals);
+        assert_eq!(adopted.data.events, retained.data.events);
+        assert_eq!(
+            adopted.decisions.decisions[0].status,
+            DecisionStatus::Pending
+        );
+        assert_eq!(
+            adopted
+                .scope
+                .layers
+                .values()
+                .next()
+                .unwrap()
+                .request
+                .lifecycles,
+            fresh_request.lifecycles
+        );
+        let completed = action(&store, "complete-live", "complete", &job);
+        assert_eq!(
+            row(&completed, &job).values["production"],
+            DataValue::Integer { value: 0 }
+        );
+        let live_redefinition = store
+            .prepare_scoped_change(
+                &program(false),
+                &request(&completed, ScopePopulation::All),
+                "redefine-live",
+            )
+            .err()
+            .expect("an adopted lifecycle still protects completed history");
+        assert!(live_redefinition
+            .to_string()
+            .contains("completion meaning differs"));
+        let reopened = ProductStore::open(&path).unwrap();
+        assert_eq!(reopened.load().unwrap(), completed);
+        let recovered = product_backup::VerifiedBackup::capture(&reopened)
+            .unwrap()
+            .recover_new(&dir.path().join("recovered"))
+            .unwrap();
+        assert_eq!(recovered.load().unwrap(), completed);
+        let engine = DecisionEngine::new(
+            LocalRuntime::default(),
+            IntentArchive::new(recovered.clone()),
+        );
+        assert_eq!(
+            engine.check_current(&completed).unwrap().disposition,
+            CheckDisposition::Ready
+        );
+        add(&recovered, "continued", "Later legitimate work");
+        assert_eq!(
+            row(&recovered.load().unwrap(), &job).values["production"],
+            DataValue::Integer { value: 0 }
+        );
+        assert_eq!(store.load().unwrap(), completed);
+    }
+}
+
+#[test]
 fn fresh_scoped_discovery_retains_creation_identity_without_pending_history() {
     use product_discovery::{discover, DiscoveryPolicy, VerifiedRetainedHistory};
     use std::sync::{atomic::AtomicBool, Arc};
