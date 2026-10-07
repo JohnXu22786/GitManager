@@ -559,6 +559,20 @@ impl Worker {
             self.journal(|j| j.pending = None)?;
             return Err(e);
         }
+        #[cfg(test)]
+        let result = if self
+            .config
+            .hooks
+            .fail_creation
+            .swap(false, Ordering::AcqRel)
+        {
+            Err(crate::product_store::StoreError::Invalid(
+                "injected creation failure before activation".into(),
+            ))
+        } else {
+            ProductStore::create(&path, &capture, self.today())
+        };
+        #[cfg(not(test))]
         let result = ProductStore::create(&path, &capture, self.today());
         #[cfg(test)]
         let result = if self.config.hooks.lose_ack.swap(false, Ordering::AcqRel) && result.is_ok() {
@@ -833,6 +847,7 @@ impl Worker {
         if has_receipt(&opened.snapshot, &operation, &input)? {
             return self.reconcile(false, gate);
         }
+        self.before_abandon(gate);
         gate.commit()?;
         self.retain_unsaved(tool, operation, input, &opened.snapshot, "You explicitly set aside this input after verifying that the current saved tool has no matching commit".into())?;
         self.notice = "The uncommitted input was set aside and kept for reference. You can continue using your saved work".into();
@@ -871,6 +886,7 @@ impl Worker {
         if let Some(folder) = &folder {
             folder.check().map_err(error)?;
         }
+        self.before_abandon(gate);
         gate.commit()?;
         self.journal(|j| {
             j.pending = None;
@@ -902,6 +918,16 @@ impl Worker {
         #[cfg(not(test))]
         {
             rfd::FileDialog::new().set_title(_title).pick_folder()
+        }
+    }
+    fn before_abandon(&self, _gate: &Gate) {
+        #[cfg(test)]
+        if let Some(pause) = &self.config.hooks.before_abandon {
+            pause.reached.store(true, Ordering::Release);
+            while !pause.release.load(Ordering::Acquire) && !_gate.cancelled.load(Ordering::Acquire)
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
     }
     fn before_commit(&self, _gate: &Gate) {
@@ -1046,15 +1072,15 @@ pub(super) fn run(
         }
         let mut result = host.handle(&command);
         if !command.gate.finish() && host.committed.is_none() {
-            if !matches!(
+            // Only unfinished generation/opening is cleared on cancellation.
+            // Cancelling an edit, save, or recovery operation preserves its
+            // previously visible tool/draft and unresolved associations.
+            if matches!(
                 command.action,
-                Action::Daily { .. }
-                    | Action::Tick { .. }
-                    | Action::Reconcile
-                    | Action::Save
-                    | Action::Preview { .. }
-                    | Action::Select { .. }
-                    | Action::ChooseDestination
+                Action::Prepare { .. }
+                    | Action::Consent { .. }
+                    | Action::Open { .. }
+                    | Action::OpenDialog
             ) {
                 if let Err(e) = host.close() {
                     host.notice = e;

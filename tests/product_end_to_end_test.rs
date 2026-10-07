@@ -140,6 +140,11 @@ fn controls_generate_preview_save_and_reopen_two_distinct_fixture_shapes() {
         let root = fs::canonicalize(temp.path()).unwrap();
         let transport = transport(&root, program, "good");
         let hooks = TestHooks::default();
+        // The actual create commits, then its acknowledgement is lost. The
+        // host must find the same tool instead of allocating a second path.
+        hooks
+            .lose_ack
+            .store(true, std::sync::atomic::Ordering::Release);
         let stopped = hooks.stopped.clone();
         let mut studio = ProductStudio::testing(root.clone(), Some(transport), hooks);
         let mut h = EguiHarness::new(egui::vec2(1000.0, 1200.0));
@@ -505,4 +510,78 @@ fn host_cancel_keeps_draft_and_destination_then_deliberate_folder_save_works() {
     settle(&mut h, &mut s);
     assert_eq!(s.test_location().unwrap().parent(), Some(chosen.as_path()));
     assert_eq!(s.test_page(), "daily");
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelling_unactivated_save_recovery_preserves_draft_destination_and_pending_identity() {
+    use std::sync::{atomic::Ordering, Arc};
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let pause = Arc::new(product_studio::TestPause::default());
+    let hooks = TestHooks {
+        before_abandon: Some(pause.clone()),
+        fail_creation: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        ..TestHooks::default()
+    };
+    let (mut s, mut h) = generated(&root, hooks);
+    let source = s.test_runtime().unwrap().program.clone();
+    let destination = s.test_destination().unwrap().to_path_buf();
+    click(&mut h, &mut s, "studio.keep");
+    settle(&mut h, &mut s);
+    assert_eq!(s.test_page(), "draft");
+    assert!(s.test_generation_blocked());
+    let before: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("studio/session.json")).unwrap()).unwrap();
+    click(&mut h, &mut s, "studio.abandon");
+    wait_flag(&pause.reached);
+    click(&mut h, &mut s, "studio.cancel");
+    settle(&mut h, &mut s);
+    assert_eq!(s.test_page(), "draft");
+    assert_eq!(s.test_runtime().unwrap().program, source);
+    assert_eq!(s.test_destination(), Some(destination.as_path()));
+    let after: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("studio/session.json")).unwrap()).unwrap();
+    assert_eq!(after["pending"], before["pending"]);
+    pause.release.store(true, Ordering::Release);
+    click(&mut h, &mut s, "studio.abandon");
+    settle(&mut h, &mut s);
+    click(&mut h, &mut s, "studio.keep");
+    settle(&mut h, &mut s);
+    assert_eq!(s.test_page(), "daily");
+}
+#[cfg(unix)]
+#[test]
+fn failed_recent_registration_does_not_recreate_an_already_saved_tool() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let hooks = TestHooks::default();
+    let stopped = hooks.stopped.clone();
+    let (mut s, mut h) = generated(&root, hooks);
+    fs::write(root.join("recent-tools.json"), b"damaged recent list kept").unwrap();
+    click(&mut h, &mut s, "studio.keep");
+    settle(&mut h, &mut s);
+    assert_eq!(s.test_page(), "daily");
+    assert!(s.test_notice().contains("registration"));
+    let path = s.test_location().unwrap().to_path_buf();
+    assert_eq!(
+        fs::read(root.join("recent-tools.json")).unwrap(),
+        b"damaged recent list kept"
+    );
+    assert_eq!(
+        fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("tool-"))
+            .count(),
+        1
+    );
+    drop(s);
+    wait_flag(&stopped);
+    let mut restarted = ProductStudio::testing(root, None, TestHooks::default());
+    settle(&mut h, &mut restarted);
+    assert_eq!(restarted.test_location(), Some(path.as_path()));
+    restarted.test_daily(fixture::add("Saved despite registration failure"));
+    settle(&mut h, &mut restarted);
+    assert_eq!(restarted.test_runtime().unwrap().retained_records.len(), 1);
 }

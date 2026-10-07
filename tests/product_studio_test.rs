@@ -210,36 +210,61 @@ fn lost_daily_ack_is_reconciled_once_and_double_click_does_not_duplicate() {
 
 #[test]
 fn stale_external_source_data_and_session_reject_the_original_operation() {
-    let (_temp, root) = root();
-    let path = saved(&root);
-    let mut studio = ProductStudio::testing(root, None, TestHooks::default());
-    settle(&mut studio);
-    open(&mut studio, &path);
-    ProductStore::open(&path)
-        .unwrap()
-        .apply(
-            0,
-            "external",
-            &SemanticInput::Navigate {
-                view: "new_person".into(),
-            },
-            RuntimeLimits::default(),
-        )
-        .unwrap();
-    studio.test_daily(add("Stale"));
-    settle(&mut studio);
-    assert!(ProductStore::open(&path)
-        .unwrap()
-        .load()
-        .unwrap()
-        .data
-        .records
-        .is_empty());
-    assert!(
-        studio.test_notice().contains("changed"),
-        "{}",
-        studio.test_notice()
-    );
+    for change in ["source", "data", "session"] {
+        let (_temp, root) = root();
+        let path = saved(&root);
+        let mut studio = ProductStudio::testing(root, None, TestHooks::default());
+        settle(&mut studio);
+        open(&mut studio, &path);
+        let store = ProductStore::open(&path).unwrap();
+        match change {
+            "source" => {
+                let mut source = organizer();
+                source["label"] = serde_json::json!("Externally changed source");
+                let source = capture(source);
+                let plan = store.prepare_switch(&source, "external-source").unwrap();
+                let snapshot = store.load().unwrap();
+                store
+                    .adopt(snapshot.revision, &plan, &source, &snapshot.decisions)
+                    .unwrap();
+            }
+            "data" => {
+                store
+                    .apply(
+                        0,
+                        "external-data",
+                        &add("External fact"),
+                        RuntimeLimits::default(),
+                    )
+                    .unwrap();
+            }
+            _ => {
+                store
+                    .apply(
+                        0,
+                        "external-session",
+                        &SemanticInput::Navigate {
+                            view: "new_person".into(),
+                        },
+                        RuntimeLimits::default(),
+                    )
+                    .unwrap();
+            }
+        }
+        let before = store.load().unwrap();
+        studio.test_daily(add("Stale"));
+        settle(&mut studio);
+        assert_eq!(
+            store.load().unwrap(),
+            before,
+            "stale {change} must not write"
+        );
+        assert!(
+            studio.test_notice().contains("changed"),
+            "{}",
+            studio.test_notice()
+        );
+    }
 }
 
 #[test]
@@ -528,4 +553,36 @@ fn stale_uncommitted_input_can_be_explicitly_set_aside_while_preserving_current_
         journal["last_unsaved"]["input"],
         serde_json::to_value(input).unwrap()
     );
+}
+
+#[test]
+fn cancelled_unsaved_input_recovery_preserves_the_pending_association() {
+    let (_temp, root) = root();
+    let path = saved(&root);
+    product_studio::test_stage_daily(&root, &path, add("Pending entry"), false);
+    let pending: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("studio/session.json")).unwrap()).unwrap();
+    let pause = Arc::new(TestPause::default());
+    let hooks = TestHooks {
+        before_abandon: Some(pause.clone()),
+        ..TestHooks::default()
+    };
+    let mut s = ProductStudio::testing(root.clone(), None, hooks);
+    settle(&mut s);
+    s.test_abandon_daily();
+    until(|| pause.reached.load(Ordering::Acquire));
+    assert!(s.test_cancel());
+    settle(&mut s);
+    assert_eq!(s.test_page(), "daily");
+    assert!(s.test_generation_blocked());
+    let after: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("studio/session.json")).unwrap()).unwrap();
+    assert_eq!(after["pending"], pending["pending"]);
+    assert!(ProductStore::open(path)
+        .unwrap()
+        .load()
+        .unwrap()
+        .data
+        .records
+        .is_empty());
 }
