@@ -41,6 +41,9 @@ jobs:
           git config --global user.name "GitManager CI"
           git config --global user.email "gitmanager-ci@users.noreply.invalid"
 
+      - name: Check production application
+        run: cargo check --locked --bin git_manager
+
       - name: Run tests
         run: cargo test --all-targets
 

@@ -597,6 +597,8 @@ pub enum Tab {
 pub struct App {
     pub tool_studio: crate::tool_studio::ToolStudio,
     pub tools_mode: bool,
+    pub product_studio: crate::product_studio::ProductStudio,
+    pub generated_tools_mode: bool,
     pub git: GitRepo,
     pub current_tab: Tab,
     pub repo_path: String,
@@ -707,6 +709,8 @@ impl App {
         Self {
             tool_studio: crate::tool_studio::ToolStudio::new(),
             tools_mode: true,
+            product_studio: crate::product_studio::ProductStudio::new(),
+            generated_tools_mode: true,
             git: GitRepo::new(),
             current_tab: Tab::Worktrees,
             repo_path: String::new(),
@@ -1022,6 +1026,7 @@ impl App {
 
     pub fn open_repo(&mut self, path: &str) {
         self.tools_mode = false;
+        self.generated_tools_mode = false;
         self.open_repo_path(Path::new(path));
     }
 
@@ -3474,6 +3479,8 @@ impl eframe::App for App {
                 _ => {}
             }
         }
+        self.product_studio.poll();
+        if self.product_studio.is_busy() { ctx.request_repaint_after(std::time::Duration::from_millis(30)); }
         self.process_pending_ops(ctx);
         self.process_task_verification(ctx);
         self.process_task_integrated_verification(ctx);
@@ -3501,9 +3508,11 @@ impl eframe::App for App {
         // --- Top Bar ---
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
-                if ui.button("我的工具").clicked() { self.tools_mode = true; }
+                if ui.button("生成工具").clicked() { self.generated_tools_mode = true; }
+                if ui.button("我的工具（订单）").clicked() { self.generated_tools_mode = false; self.tools_mode = true; }
                 if crate::ui::ellipsis_button(ui, "☷ Tasks").clicked() {
                     self.tools_mode = false;
+                    self.generated_tools_mode = false;
                     self.current_tab = Tab::Tasks;
                 }
                 if crate::ui::add_enabled_ellipsis(ui, !self.is_busy(), "📂").clicked() {
@@ -3744,6 +3753,10 @@ impl eframe::App for App {
 
         // --- Central Panel ---
         egui::CentralPanel::default().show(ctx, |ui| {
+            if self.generated_tools_mode {
+                egui::ScrollArea::vertical().show(ui, |ui| { self.product_studio.show(ui); });
+                return;
+            }
             if self.tools_mode {
                 let tasks = self.task_registry.entries().iter().map(|t| (t.id.clone(), t.title.clone())).collect::<Vec<_>>();
                 self.tool_studio.show(ui, &tasks, &|id| {
