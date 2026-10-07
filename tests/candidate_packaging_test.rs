@@ -362,4 +362,30 @@ fn ci_candidate_steps_are_main_push_only_and_read_only() {
         upload.contains("name: git_manager-${{ github.sha }}-x86_64-unknown-linux-gnu-unsigned")
     );
     assert!(upload.contains("if-no-files-found: error"));
+    let readiness_index = steps
+        .iter()
+        .position(|step| step.starts_with("name: Prepare macOS synthetic Python runtime\n"))
+        .expect("missing macOS synthetic runtime readiness");
+    assert!(readiness_index < test_index);
+    let readiness = steps[readiness_index];
+    assert!(readiness.contains("        if: runner.os == 'macOS'\n"));
+    assert!(readiness.contains("        timeout-minutes: 1\n"));
+    assert!(readiness.contains("        shell: bash\n"));
+    assert!(readiness.contains("set -euo pipefail"));
+    assert!(readiness.contains("mktemp -d \"$RUNNER_TEMP/provider-python.XXXXXX\""));
+    assert!(readiness.contains("for phase in cold warm; do"));
+    assert!(readiness.contains("mkdir \"$fixture_root/$phase-home\""));
+    assert!(readiness.contains("/usr/bin/time -p /usr/bin/env -i"));
+    assert!(readiness
+        .contains("HOME=\"$fixture_root/$phase-home\" PATH=\"$fixture_root:/usr/bin:/bin\""));
+    assert!(readiness.contains("LANG=C.UTF-8 LC_ALL=C.UTF-8"));
+    assert!(
+        readiness.contains("/usr/bin/python3 -c 'import json, os, pathlib, subprocess, sys, time;")
+    );
+    assert!(readiness.contains("\"executable\": sys.executable"));
+    assert!(readiness.contains("pathlib.Path(sys.executable).resolve(strict=True)"));
+    assert!(readiness.contains("\"version\": sys.version"));
+    assert!(!readiness.contains("xcrun"));
+    assert!(!readiness.contains("cargo test"));
+    assert!(!readiness.contains("--version"));
 }
