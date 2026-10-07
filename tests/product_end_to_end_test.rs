@@ -472,3 +472,37 @@ fn returned_keyboard_bindings_run_in_both_draft_and_saved_tool() {
         assert_eq!(s.test_runtime().unwrap().artifacts[0].rows.len(), 1);
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn host_cancel_keeps_draft_and_destination_then_deliberate_folder_save_works() {
+    use std::sync::{atomic::Ordering, Arc};
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let chosen = root.join("chosen-data-folder");
+    fs::create_dir(&chosen).unwrap();
+    let pause = Arc::new(product_studio::TestPause::default());
+    let hooks = TestHooks {
+        before_destination: Some(pause.clone()),
+        folder_choice: Some(chosen.clone()),
+        ..TestHooks::default()
+    };
+    let (mut s, mut h) = generated(&root, hooks);
+    let source = s.test_runtime().unwrap().program.clone();
+    let original = s.test_destination().unwrap().to_path_buf();
+    click(&mut h, &mut s, "studio.destination");
+    wait_flag(&pause.reached);
+    click(&mut h, &mut s, "studio.cancel");
+    settle(&mut h, &mut s);
+    assert_eq!(s.test_page(), "draft");
+    assert_eq!(s.test_runtime().unwrap().program, source);
+    assert_eq!(s.test_destination(), Some(original.as_path()));
+    pause.release.store(true, Ordering::Release);
+    click(&mut h, &mut s, "studio.destination");
+    settle(&mut h, &mut s);
+    assert_eq!(s.test_destination(), Some(chosen.as_path()));
+    click(&mut h, &mut s, "studio.keep");
+    settle(&mut h, &mut s);
+    assert_eq!(s.test_location().unwrap().parent(), Some(chosen.as_path()));
+    assert_eq!(s.test_page(), "daily");
+}

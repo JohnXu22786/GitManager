@@ -67,6 +67,15 @@ pub(super) enum Interrupted {
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(super) struct UnsavedInput {
+    pub tool: Association,
+    pub operation: Id,
+    pub input: SemanticInput,
+    pub summary: String,
+    pub explanation: String,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct Journal {
     magic: String,
     version: u32,
@@ -75,6 +84,7 @@ pub(super) struct Journal {
     pub pending: Option<Interrupted>,
     pub provider: Option<ProviderAssociation>,
     pub abandoned_creation: Option<Association>,
+    pub last_unsaved: Option<UnsavedInput>,
 }
 impl Default for Journal {
     fn default() -> Self {
@@ -86,6 +96,7 @@ impl Default for Journal {
             pending: None,
             provider: None,
             abandoned_creation: None,
+            last_unsaved: None,
         }
     }
 }
@@ -103,6 +114,16 @@ impl Journal {
             }
             Ok(())
         };
+        if let Some(unsaved) = &self.last_unsaved {
+            check(&unsaved.tool)?;
+            if !valid_id(&unsaved.operation)
+                || unsaved.summary.len() > MAX_TEXT_BYTES
+                || unsaved.explanation.len() > MAX_TEXT_BYTES
+            {
+                return Err("Invalid retained unsaved input".into());
+            }
+            validate_input_shape(&unsaved.input).map_err(error)?;
+        }
         if let Some(tool) = &self.abandoned_creation {
             check(tool)?;
         }

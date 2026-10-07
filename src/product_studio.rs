@@ -17,7 +17,7 @@ use crate::product_provider::{
 use crate::product_runtime::{LocalRuntime, ProductRun};
 use crate::product_store::{ProductStore, ProjectSnapshot};
 use crate::ui::product_runtime_view::{take_shortcuts, ProductRuntimeView, WidgetTrace};
-use journal::{Association, Basis, Interrupted, JournalFile, ProviderAssociation};
+use journal::{Association, Basis, Interrupted, JournalFile, ProviderAssociation, UnsavedInput};
 use std::{
     path::{Path, PathBuf},
     sync::{
@@ -133,6 +133,7 @@ enum Action {
     },
     Reconcile,
     AbandonCreation,
+    AbandonDaily,
     Tick {
         today: i32,
     },
@@ -182,6 +183,8 @@ struct Update {
     generation_blocked: bool,
     pending: bool,
     abandon_creation: bool,
+    abandon_daily: bool,
+    unsaved: Option<String>,
 }
 #[derive(Clone)]
 struct Completion {
@@ -218,6 +221,8 @@ pub struct ProductStudio {
     unresolved: bool,
     closing: bool,
     abandon_creation: bool,
+    abandon_daily: bool,
+    unsaved: Option<String>,
     clock_attempt: Option<(Basis, i32)>,
     #[cfg(test)]
     clock: Arc<std::sync::atomic::AtomicI32>,
@@ -256,6 +261,8 @@ impl ProductStudio {
             unresolved: false,
             closing: false,
             abandon_creation: false,
+            abandon_daily: false,
+            unsaved: None,
             clock_attempt: None,
             #[cfg(test)]
             clock,
@@ -310,6 +317,8 @@ impl ProductStudio {
             self.generation_blocked = update.generation_blocked;
             self.unresolved = update.pending;
             self.abandon_creation = update.abandon_creation;
+            self.abandon_daily = update.abandon_daily;
+            self.unsaved = update.unsaved;
             self.destination = update.destination;
             if fresh && !self.closing {
                 if let Some(page) = update.page {
@@ -402,6 +411,11 @@ impl ProductStudio {
         if !self.notice.is_empty() {
             trace.label(ui, self.notice.clone());
         }
+        if let Some(unsaved) = &self.unsaved {
+            ui.collapsing("Last unsaved entry (kept for reference)", |ui| {
+                trace.label(ui, unsaved.clone());
+            });
+        }
         let mut action = None;
         let mut close = false;
         if busy {
@@ -426,6 +440,17 @@ impl ProductStudio {
                 !busy,
             ) {
                 action = Some(Action::Reconcile);
+            }
+            if self.abandon_daily {
+                trace.label(ui, "You may set aside an input only after its current saved tool is verified to have no matching commit. The original input stays available for reference.");
+                if trace.button(
+                    ui,
+                    "studio.abandon-input",
+                    "Set aside this unsaved input",
+                    !busy,
+                ) {
+                    action = Some(Action::AbandonDaily);
+                }
             }
             if self.abandon_creation {
                 trace.label(ui, "If the original folder has no committed tool, you can set this attempt aside. Its files are kept. An existing or unreadable CURRENT is never discarded.");
@@ -665,6 +690,7 @@ pub struct TestPause {
 pub struct TestHooks {
     pub before_commit: Option<Arc<TestPause>>,
     pub before_preview: Option<Arc<TestPause>>,
+    pub before_destination: Option<Arc<TestPause>>,
     pub folder_choice: Option<PathBuf>,
     pub after_commit: Option<Arc<TestPause>>,
     pub lose_ack: Arc<AtomicBool>,
@@ -678,6 +704,7 @@ impl Default for TestHooks {
         Self {
             before_commit: None,
             before_preview: None,
+            before_destination: None,
             folder_choice: None,
             after_commit: None,
             lose_ack: Arc::new(AtomicBool::new(false)),
@@ -736,6 +763,12 @@ impl ProductStudio {
     }
     pub fn test_close(&mut self) {
         self.close();
+    }
+    pub fn test_abandon_daily(&mut self) {
+        self.issue(Action::AbandonDaily);
+    }
+    pub fn test_destination(&self) -> Option<&Path> {
+        self.destination.as_deref()
     }
     pub fn test_abandon(&mut self) {
         self.issue(Action::AbandonCreation);

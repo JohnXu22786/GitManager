@@ -451,3 +451,81 @@ fn corrupt_activation_cannot_be_abandoned_as_an_uncommitted_creation() {
         b"corrupt activation"
     );
 }
+
+#[test]
+fn conclusively_failed_recovery_keeps_input_without_permanently_blocking_work() {
+    let (_temp, root) = root();
+    let path = root.join("unique-tool");
+    let mut source = organizer();
+    source["entities"][0]["unique"] = serde_json::json!([["name"]]);
+    let store = ProductStore::create(&path, &capture(source), 20000).unwrap();
+    store
+        .apply(0, "first", &add("Ada"), RuntimeLimits::default())
+        .unwrap();
+    let duplicate = add("Ada");
+    product_studio::test_stage_daily(&root, &path, duplicate.clone(), false);
+    let mut s = ProductStudio::testing(root.clone(), None, TestHooks::default());
+    settle(&mut s);
+    s.test_reconcile();
+    settle(&mut s);
+    assert!(!s.test_generation_blocked(), "{}", s.test_notice());
+    assert!(s.test_notice().contains("did not commit"));
+    let journal: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("studio/session.json")).unwrap()).unwrap();
+    assert!(journal["pending"].is_null());
+    assert_eq!(
+        journal["last_unsaved"]["input"],
+        serde_json::to_value(&duplicate).unwrap()
+    );
+    s.test_daily(add("Noor"));
+    settle(&mut s);
+    assert_eq!(
+        ProductStore::open(path)
+            .unwrap()
+            .load()
+            .unwrap()
+            .data
+            .records
+            .len(),
+        2
+    );
+}
+#[test]
+fn stale_uncommitted_input_can_be_explicitly_set_aside_while_preserving_current_work() {
+    let (_temp, root) = root();
+    let path = saved(&root);
+    let input = add("Uncommitted older input");
+    product_studio::test_stage_daily(&root, &path, input.clone(), false);
+    ProductStore::open(&path)
+        .unwrap()
+        .apply(
+            0,
+            "external-new-work",
+            &add("Later real work"),
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    let mut s = ProductStudio::testing(root.clone(), None, TestHooks::default());
+    settle(&mut s);
+    s.test_reconcile();
+    settle(&mut s);
+    assert!(s.test_generation_blocked());
+    s.test_abandon_daily();
+    settle(&mut s);
+    assert!(!s.test_generation_blocked());
+    s.test_daily(add("Continued"));
+    settle(&mut s);
+    let snapshot = ProductStore::open(path).unwrap().load().unwrap();
+    assert_eq!(snapshot.data.records.len(), 2);
+    assert!(snapshot
+        .data
+        .records
+        .iter()
+        .all(|r| r.values["name"] != string("Uncommitted older input")));
+    let journal: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("studio/session.json")).unwrap()).unwrap();
+    assert_eq!(
+        journal["last_unsaved"]["input"],
+        serde_json::to_value(input).unwrap()
+    );
+}

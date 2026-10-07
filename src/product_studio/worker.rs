@@ -125,6 +125,20 @@ impl Worker {
                 .journal
                 .as_ref()
                 .is_some_and(|j| matches!(j.value.pending, Some(Interrupted::Create { .. }))),
+            abandon_daily: self
+                .journal
+                .as_ref()
+                .is_some_and(|j| matches!(j.value.pending, Some(Interrupted::Daily { .. }))),
+            unsaved: self
+                .journal
+                .as_ref()
+                .and_then(|j| j.value.last_unsaved.as_ref())
+                .map(|u| {
+                    format!(
+                        "{}\n{}\nThis entry was not saved or automatically resubmitted.",
+                        u.summary, u.explanation
+                    )
+                }),
         }
     }
     fn journal(&mut self, edit: impl FnOnce(&mut journal::Journal)) -> Result<(), String> {
@@ -751,10 +765,19 @@ impl Worker {
                     );
                     opened = open_verified(&tool.path, Some(&tool.identity)).map_err(error)?;
                     if !has_receipt(&opened.snapshot, &operation, &input)? {
-                        return Err(format!(
-                            "The exact retry did not commit: {:?}",
-                            result.err()
-                        ));
+                        let failed = result.is_err();
+                        let explanation =
+                            format!("The exact retry did not commit: {:?}", result.err());
+                        if failed && Basis::capture(&opened.snapshot)? == basis {
+                            self.retain_unsaved(
+                                tool.clone(),
+                                operation,
+                                input,
+                                &opened.snapshot,
+                                explanation.clone(),
+                            )?;
+                        }
+                        return Err(explanation);
                     }
                 }
                 self.committed = Some(tool.path.clone());
@@ -774,6 +797,46 @@ impl Worker {
                 Ok(())
             }
         }
+    }
+    fn retain_unsaved(
+        &mut self,
+        tool: Association,
+        operation: Id,
+        input: SemanticInput,
+        snapshot: &ProjectSnapshot,
+        explanation: String,
+    ) -> Result<(), String> {
+        let summary = describe_input(&input, snapshot);
+        let unsaved = UnsavedInput {
+            tool,
+            operation,
+            input,
+            summary,
+            explanation: explanation.chars().take(MAX_TEXT_BYTES / 4).collect(),
+        };
+        self.journal(|j| {
+            j.pending = None;
+            j.last_unsaved = Some(unsaved);
+        })
+    }
+    fn abandon_daily(&mut self, gate: &Gate) -> Result<(), String> {
+        let Some(Interrupted::Daily {
+            tool,
+            operation,
+            input,
+            ..
+        }) = self.journal.as_ref().and_then(|j| j.value.pending.clone())
+        else {
+            return Err("There is no unfinished daily input to set aside".into());
+        };
+        let opened = open_verified(&tool.path, Some(&tool.identity)).map_err(error)?;
+        if has_receipt(&opened.snapshot, &operation, &input)? {
+            return self.reconcile(false, gate);
+        }
+        gate.commit()?;
+        self.retain_unsaved(tool, operation, input, &opened.snapshot, "You explicitly set aside this input after verifying that the current saved tool has no matching commit".into())?;
+        self.notice = "The uncommitted input was set aside and kept for reference. You can continue using your saved work".into();
+        Ok(())
     }
     fn abandon_creation(&mut self, gate: &Gate) -> Result<(), String> {
         let Some(Interrupted::Create { tool }) =
@@ -888,10 +951,22 @@ impl Worker {
                 }
             },
             Action::ChooseDestination => {
+                #[cfg(test)]
+                if let Some(pause) = &self.config.hooks.before_destination {
+                    pause.reached.store(true, Ordering::Release);
+                    while !pause.release.load(Ordering::Acquire)
+                        && !gate.cancelled.load(Ordering::Acquire)
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                gate.check()?;
                 match self.pick_folder("Choose where to keep this tool's data") {
                     Some(path) => {
-                        gate.check()?;
                         ToolLocations::chosen(&path).map_err(error)?;
+                        if !gate.finish() {
+                            return Err("Folder selection cancelled; the draft and previous destination were kept".into());
+                        }
                         self.chosen = Some(path);
                         Ok(())
                     }
@@ -903,6 +978,7 @@ impl Worker {
             }
             Action::Reconcile => self.reconcile(true, gate),
             Action::AbandonCreation => self.abandon_creation(gate),
+            Action::AbandonDaily => self.abandon_daily(gate),
             Action::Tick { today } => {
                 if *today != self.today() {
                     return Err("The device date changed again; refresh the current view".into());
@@ -978,6 +1054,7 @@ pub(super) fn run(
                     | Action::Save
                     | Action::Preview { .. }
                     | Action::Select { .. }
+                    | Action::ChooseDestination
             ) {
                 if let Err(e) = host.close() {
                     host.notice = e;
@@ -1103,4 +1180,74 @@ fn find_endpoint(name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn describe_input(input: &SemanticInput, snapshot: &ProjectSnapshot) -> String {
+    use crate::ui::product_runtime_view::value_text;
+    let program = snapshot.program().ok().map(|c| &c.program);
+    let view_label = |id: &str| {
+        program
+            .and_then(|p| p.views.iter().find(|v| v.id == id))
+            .map(|v| v.label.as_str())
+            .unwrap_or(id)
+            .to_string()
+    };
+    let summary = match input {
+        SemanticInput::Submit { view, arguments } => {
+            let fields = program
+                .and_then(|p| p.views.iter().find(|v| &v.id == view))
+                .and_then(|v| match &v.kind {
+                    ViewKind::Form { fields, .. } => Some(fields),
+                    _ => None,
+                });
+            let values = arguments
+                .iter()
+                .map(|(id, value)| {
+                    format!(
+                        "{}: {}",
+                        fields
+                            .and_then(|f| f.iter().find(|f| &f.parameter == id))
+                            .map(|f| f.label.as_str())
+                            .unwrap_or(id),
+                        value_text(value)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            format!("{}: {values}", view_label(view))
+        }
+        SemanticInput::Invoke { action, arguments } => format!(
+            "{}: {}",
+            program
+                .and_then(|p| p.actions.iter().find(|a| &a.id == action))
+                .map(|a| a.label.as_str())
+                .unwrap_or(action),
+            arguments
+                .iter()
+                .map(|(name, value)| format!("{name}: {}", value_text(value)))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ),
+        SemanticInput::Control {
+            view,
+            control,
+            value,
+        } => format!("{} / {control}: {}", view_label(view), value_text(value)),
+        SemanticInput::Activate { view, binding, row } => format!(
+            "{} / {}{}",
+            view_label(view),
+            program
+                .and_then(|p| p.views.iter().find(|v| &v.id == view))
+                .and_then(|v| v.actions.iter().find(|a| &a.id == binding))
+                .map(|a| a.label.as_str())
+                .unwrap_or(binding),
+            row.as_ref()
+                .map(|r| format!(" ({})", r.record))
+                .unwrap_or_default()
+        ),
+        SemanticInput::Navigate { view } => format!("Open {}", view_label(view)),
+        SemanticInput::AdvanceClock { days } => format!("Advance the saved date by {days} days"),
+        SemanticInput::Observe { point } => format!("Observe {point}"),
+    };
+    summary.chars().take(MAX_TEXT_BYTES / 4).collect()
 }
