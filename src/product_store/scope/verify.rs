@@ -7,11 +7,20 @@ pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
         || state.layers.len() > MAX_LAYERS
         || state.compositions.len() > MAX_ITEMS
         || state.initializations.len() != state.layers.len()
-        || state.adoptions.len() > MAX_ITEMS
+        || state.adoptions.len() != state.compositions.len()
         || state.rehearsals.len() > MAX_ITEMS
         || state.correspondences.len() > MAX_ITEMS
     {
         return Err(error("invalid scope-state version or inventory"));
+    }
+    // Every composition below must have exactly one receipt. Equal inventory
+    // sizes also exclude unmatched receipts that could shadow a consumer's
+    // revision lookup without ever entering that composition validation pass.
+    let mut receipt_revisions = BTreeSet::new();
+    for receipt in &state.adoptions {
+        if !receipt_revisions.insert(receipt.revision) {
+            return Err(error("duplicate scoped adoption revision link"));
+        }
     }
     // Retained-basis reconstruction consults earlier compositions before the
     // semantic composition pass below. Reject broken references first so no

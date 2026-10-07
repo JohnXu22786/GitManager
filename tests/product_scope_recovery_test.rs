@@ -323,3 +323,68 @@ fn corrupted_earlier_composition_references_fail_before_recovery_activation() {
     assert_eq!(store.load().unwrap(), healthy);
     add(&store, "later", "Still usable after rejected recovery");
 }
+
+#[test]
+fn unmatched_and_ambiguous_scope_receipts_cannot_enter_recovery() {
+    let dir = tempdir();
+    let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
+    let before = store.load().unwrap();
+    let prepared = store
+        .prepare_scoped_change(
+            &program(true),
+            &request(&before, ScopePopulation::FutureWork),
+            "scope",
+        )
+        .unwrap();
+    let layer = prepared.layer_id().unwrap().unwrap();
+    store.adopt_scoped(before.revision, &prepared).unwrap();
+    add(&store, "later", "Later legitimate work");
+    let withdrawal = store
+        .prepare_scoped_withdrawal(&[layer], "withdraw")
+        .unwrap();
+    let healthy = store
+        .adopt_scoped(store.load().unwrap().revision, &withdrawal)
+        .unwrap();
+    assert_eq!(healthy.scope.adoptions.len(), 2);
+    let unknown = canonical_digest(IdentityDomain::Adoption, &"unknown-composition").unwrap();
+    let mut extra = healthy.clone();
+    let mut forged = extra.scope.adoptions[0].clone();
+    forged.composition = unknown.clone();
+    forged.decisions = vec!["unrelated-intention".into()];
+    // It shadows the real receipt in a revision-only consumer unless the
+    // authoritative inventory rejects every unmatched entry first.
+    extra.scope.adoptions.insert(0, forged);
+    let mut replaced = healthy.clone();
+    replaced.scope.adoptions[0].composition = unknown;
+    let mut duplicate_revision = healthy.clone();
+    duplicate_revision.scope.adoptions[1].revision = duplicate_revision.scope.adoptions[0].revision;
+    let mut duplicate_composition = healthy.clone();
+    duplicate_composition.scope.adoptions[1] = duplicate_composition.scope.adoptions[0].clone();
+    for (index, corrupted) in [extra, replaced, duplicate_revision, duplicate_composition]
+        .iter()
+        .enumerate()
+    {
+        assert!(corrupted.validate().is_err());
+        let destination = dir.path().join(format!("rejected-{index}"));
+        let activated = std::cell::Cell::new(false);
+        assert!(
+            ProductStore::create_recovered_with(&destination, corrupted, |_| {
+                activated.set(true);
+                Ok(())
+            })
+            .is_err()
+        );
+        assert!(!activated.get());
+        assert!(!destination.exists());
+        assert_eq!(store.load().unwrap(), healthy);
+    }
+    let restored =
+        ProductStore::create_recovered(dir.path().join("valid-recovery"), &healthy).unwrap();
+    assert_eq!(restored.load().unwrap(), healthy);
+    add(
+        &restored,
+        "continued",
+        "Continued after valid receipt recovery",
+    );
+    assert_eq!(store.load().unwrap(), healthy);
+}

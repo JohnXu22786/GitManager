@@ -270,6 +270,17 @@ fn ci_candidate_steps_are_main_push_only_and_read_only() {
         .iter()
         .position(|step| step.starts_with("name: Run tests\n"))
         .unwrap();
+    assert!(steps[test_index].contains("        id: full_suite\n"));
+    assert!(!workflow.contains("continue-on-error:"));
+    let diagnostic_index = steps
+        .iter()
+        .position(|step| step.starts_with("name: Diagnose macOS bridge fixture in isolation\n"))
+        .expect("missing failure-only macOS diagnostic");
+    assert!(diagnostic_index > test_index);
+    let diagnostic = steps[diagnostic_index];
+    assert!(diagnostic.contains("        if: ${{ failure() && runner.os == 'macOS' && steps.full_suite.outcome == 'failure' }}\n"));
+    assert!(diagnostic.contains("        timeout-minutes: 5\n"));
+    assert!(diagnostic.contains("        run: cargo test --test product_discovery_test bridge_rejects_correlated_and_domain_mismatches_and_cancels_running_fixture -- --exact --nocapture --test-threads=1\n"));
     let mut candidate_steps = Vec::new();
     for name in [
         "Build Linux candidate",
@@ -281,6 +292,7 @@ fn ci_candidate_steps_are_main_push_only_and_read_only() {
             .position(|step| step.starts_with(&format!("name: {name}\n")))
             .expect("missing candidate step");
         assert!(index > test_index);
+        assert!(index > diagnostic_index);
         assert!(steps[index].contains("        if: ${{ success() && runner.os == 'Linux' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}\n"));
         candidate_steps.push((index, steps[index]));
     }
