@@ -2146,6 +2146,14 @@ fn all_nonbinary_managed_rehearsals_survive_restart_recovery_without_activation(
 
 #[test]
 fn future_rehearsals_preserve_selected_promises_without_activating_cohorts() {
+    fn timing(outcome: &DecisionOutcome, phase: &str, started: &std::time::Instant) {
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
+            "scope_future_timing outcome={outcome:?} phase={phase} elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+    }
     fn future_scene(source: &CapturedProgram, seed: &DataSnapshot) -> ScenarioSpec {
         let mut scene = ScenarioSpec {
             version: 1,
@@ -2207,6 +2215,7 @@ fn future_rehearsals_preserve_selected_promises_without_activating_cohorts() {
         DecisionOutcome::NeitherFits,
         DecisionOutcome::Deferred,
     ] {
+        let started = std::time::Instant::now();
         let dir = tempdir();
         let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
         let selected = add(&store, "selected", "Selected waiting work");
@@ -2368,6 +2377,7 @@ fn future_rehearsals_preserve_selected_promises_without_activating_cohorts() {
         assert_eq!(saved.decisions.decisions[1].scope, pending_scope);
         assert_eq!(saved.decisions.decisions[1].status, DecisionStatus::Pending);
         assert_eq!(engine.adopt(&store, &change).unwrap(), saved);
+        timing(&outcome, "retained", &started);
         let reopened = ProductStore::open(dir.path().join("tool")).unwrap();
         let backup = product_backup::VerifiedBackup::capture(&reopened).unwrap();
         let recovered = product_backup::VerifiedBackup::from_bytes(&backup.to_bytes().unwrap())
@@ -2375,6 +2385,7 @@ fn future_rehearsals_preserve_selected_promises_without_activating_cohorts() {
             .recover_new(&dir.path().join("recovered"))
             .unwrap();
         assert_eq!(recovered.load().unwrap(), saved);
+        timing(&outcome, "recovered", &started);
         let engine = DecisionEngine::new(
             LocalRuntime::default(),
             IntentArchive::new(recovered.clone()),
@@ -2470,6 +2481,7 @@ fn future_rehearsals_preserve_selected_promises_without_activating_cohorts() {
             engine.check_current(&adopted).unwrap().disposition,
             CheckDisposition::Ready
         );
+        timing(&outcome, "resolved", &started);
         let future = add(&recovered, "real-future", "Real future work");
         let actual = action(&recovered, "calculate-future", "calculate", &future);
         assert_eq!(
@@ -2519,6 +2531,7 @@ fn future_rehearsals_preserve_selected_promises_without_activating_cohorts() {
             engine.check_current(&later_adoption).unwrap().disposition,
             CheckDisposition::Ready
         );
+        timing(&outcome, "third-layer", &started);
         // A durable successor scene can use this exact derived input after
         // later real work; it keeps a separately bound original operation frame.
         let current = recovered.load().unwrap();
@@ -2576,6 +2589,7 @@ fn future_rehearsals_preserve_selected_promises_without_activating_cohorts() {
                 .disposition,
             CheckDisposition::Ready
         );
+        timing(&outcome, "final-recovery", &started);
     }
 }
 
