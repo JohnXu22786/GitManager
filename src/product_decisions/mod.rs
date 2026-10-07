@@ -1400,7 +1400,10 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             self.with_rehearsal(change.rehearsal.clone(), || {
                 self.with_correspondences(change.correspondences.clone(), || {
                     let verify =
-                        |current, target, next, plan| {
+                        |current: &ProjectSnapshot,
+                         target: &CapturedProgram,
+                         next: &DecisionGraph,
+                         plan: &AdoptionPlan| {
                             if canonical_digest(IdentityDomain::Data, current)?
                                 != change.expected_snapshot
                                 || self.runtime.capabilities().version != change.runtime
