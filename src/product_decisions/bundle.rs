@@ -1,6 +1,6 @@
 //! Portable immutable objects. Backup validation is not execution authority;
 //! restored intentions are always rerun before later behavior adoption.
-use super::archive::{decode, Content, Object};
+use super::archive::{decode, validate_rehearsal_scenes, Content, Object};
 use super::*;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -77,6 +77,11 @@ pub fn validate_bundle(snapshot: &ProjectSnapshot, bundle: &IntentionBundle) -> 
                 }
                 for s in &scenes {
                     s.validate()?;
+                    ScopedExecutionContext::committed(snapshot)?.verify_seed(
+                        &s.program,
+                        &s.scenario.seed,
+                        s.scenario.clock_day,
+                    )?;
                     if !sources.iter().any(|p: &CapturedProgram| {
                         p.artifact.program_digest == s.program.artifact.program_digest
                     }) {
@@ -86,6 +91,7 @@ pub fn validate_bundle(snapshot: &ProjectSnapshot, bundle: &IntentionBundle) -> 
                         return Err(invalid("accepted scene belongs to another project"));
                     }
                 }
+                validate_rehearsal_scenes(snapshot, &object.digest, &scenes)?;
                 accepted.extend(scenes.clone());
                 let ids = scenes
                     .iter()
@@ -238,4 +244,22 @@ impl IntentArchive {
         self.export_for(snapshot)?;
         Ok(())
     }
+}
+
+/// Explicit format-upgrade rebinding of the outer snapshot link only. Exact
+/// scene/mapping object bytes and their content identities never change.
+pub fn upgrade_bundle_binding(
+    original: &Digest,
+    snapshot: &ProjectSnapshot,
+    bundle: &IntentionBundle,
+) -> Result<IntentionBundle> {
+    if bundle.snapshot != *original || !snapshot.scope.layers.is_empty() {
+        return Err(invalid(
+            "legacy intention bundle does not bind the original unscoped snapshot",
+        ));
+    }
+    let mut upgraded = bundle.clone();
+    upgraded.snapshot = canonical_digest(IdentityDomain::Data, snapshot)?;
+    validate_bundle(snapshot, &upgraded)?;
+    Ok(upgraded)
 }

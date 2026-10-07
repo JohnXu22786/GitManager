@@ -832,8 +832,8 @@ fn legacy_observation_shape_is_preserved_and_old_execution_versions_are_stale() 
             "current",
         )
         .unwrap();
-    assert_eq!(run.binding.runtime_version, "local-interpreter/2");
-    assert_eq!(run.binding.driver_version, "semantic-input/2");
+    assert_eq!(run.binding.runtime_version, "local-interpreter/3");
+    assert_eq!(run.binding.driver_version, "semantic-input/3");
     let mut old = run.clone();
     old.binding.runtime_version = "local-interpreter/1".into();
     assert!(!old.is_current(&run.binding));

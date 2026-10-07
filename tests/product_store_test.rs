@@ -245,15 +245,15 @@ fn corrupted_immutable_object_and_duplicate_pointer_keys_are_rejected() {
     let pointer = fs::read(path.join("CURRENT")).unwrap();
     let p: serde_json::Value = serde_json::from_slice(&pointer).unwrap();
     let object = path.join(format!("object-{}.json", p["object"].as_str().unwrap()));
-    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&object).unwrap()).unwrap();
+    let original_object = fs::read(&object).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&original_object).unwrap();
     value["clock_day"] = json!(20001);
     fs::write(&object, serde_json::to_vec(&value).unwrap()).unwrap();
     assert!(matches!(store.load(), Err(StoreError::Corrupt(_))));
-    let pointer = String::from_utf8(pointer).unwrap().replacen(
-        "\"version\":1",
-        "\"version\":1,\"version\":1",
-        1,
-    );
+    fs::write(&object, original_object).unwrap();
+    let original_pointer = String::from_utf8(pointer).unwrap();
+    let pointer = original_pointer.replacen("\"version\":2", "\"version\":2,\"version\":2", 1);
+    assert_ne!(pointer, original_pointer);
     fs::write(path.join("CURRENT"), pointer).unwrap();
     assert!(store.load().is_err());
 }

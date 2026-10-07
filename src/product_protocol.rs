@@ -67,12 +67,34 @@ pub enum WorkspaceAction {
     },
     Back,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryOrigin {
+    CapturedAtAdoption,
+    ObservedAtCompletion,
+    ObservedAtArchive,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreservedResult {
+    pub record: RecordRef,
+    pub label: String,
+    pub value: DataValue,
+    pub day: i32,
+    pub origin: HistoryOrigin,
+    pub program: Digest,
+    pub event: Option<Id>,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PreservedHistory {
+    pub results: Vec<PreservedResult>,
+    pub events: Vec<BusinessEvent>,
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeView {
     pub program: AppDefinition,
     pub observation: ViewObservation,
     pub artifacts: Vec<LocalArtifact>,
     pub retained_records: Vec<Record>,
+    pub history: PreservedHistory,
     pub read_only: bool,
     pub issues: Vec<String>,
 }

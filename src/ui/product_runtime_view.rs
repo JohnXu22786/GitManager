@@ -511,6 +511,26 @@ impl ProductRuntimeView {
                 if allow_export && trace.button(ui,&format!("{prefix}.output.{index}.save"),"Save output…",interactive && self.queued_inputs.is_empty() && self.dirty_controls.is_empty() && artifact.validate().is_ok()) { output.export=Some(artifact.digest.clone()); }
                 if !allow_export { trace.label(ui,"Preview output stays in this comparison"); }
             }
+            if !model.history.results.is_empty() {
+                egui::CollapsingHeader::new("Preserved completed results").default_open(true).show(ui,|ui| {
+                    for result in &model.history.results {
+                        let origin=match result.origin {
+                            crate::product_protocol::HistoryOrigin::CapturedAtAdoption=>"Captured when this change was adopted; the earlier completion value was not reconstructed",
+                            crate::product_protocol::HistoryOrigin::ObservedAtCompletion=>"Recorded by the actual completion action",
+                            crate::product_protocol::HistoryOrigin::ObservedAtArchive=>"Recorded by the actual archive action",
+                        };
+                        trace.label(ui,format!("{} / {} · {}: {}",result.record.entity,result.record.record,result.label,value_text(&result.value)));
+                        trace.label(ui,format!("{origin} · {}",date(result.day).map(|d|d.to_string()).unwrap_or_else(||"Invalid date".into())));
+                        trace.label(ui,format!("Source {}{}",result.program.as_str(),result.event.as_ref().map(|id|format!(" · Event {id}")).unwrap_or_default()));
+                    }
+                });
+            }
+            if !model.history.events.is_empty() {
+                ui.collapsing("Recorded business events",|ui|for event in &model.history.events {
+                    trace.label(ui,format!("{} · {} · {}",event.id,event.action,date(event.day).map(|d|d.to_string()).unwrap_or_else(||"Invalid date".into())));
+                    for change in &event.changes {trace.label(ui,format!("{} / {}{}",change.entity,change.record,if change.archived {" (archived)"}else{""}));for (key,value) in &change.after {if !key.starts_with(crate::product_runtime::PROTECTED_FIELD_PREFIX){trace.label(ui,format!("{key}: {}",value_text(value)));}}}
+                });
+            }
             if !model.retained_records.is_empty() {
                 ui.collapsing("All retained data", |ui| for record in &model.retained_records { trace.label(ui,format!("{} / {}{}",record.entity,record.id,if record.archived {" (archived)"} else {""})); for (field,value) in &record.values { trace.label(ui,format!("{field}: {}",value_text(value))); } });
             }

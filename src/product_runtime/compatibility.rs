@@ -2,9 +2,9 @@ use super::*;
 
 /// Add schema definitions, never remove or reinterpret a recorded field. Active
 /// uniqueness/constraints may change; actual event values are never recomputed.
-pub(super) fn merge(program: &CapturedProgram, current: &DataSnapshot) -> Result<DataSnapshot> {
+pub(super) fn merge(program: &AppDefinition, current: &DataSnapshot) -> Result<DataSnapshot> {
     let mut next = current.clone();
-    for entity in &program.program.entities {
+    for entity in &program.entities {
         if let Some(stored) = next.schema.iter_mut().find(|e| e.id == entity.id) {
             for field in &entity.fields {
                 if let Some(old) = stored.fields.iter().find(|f| f.id == field.id) {
@@ -75,7 +75,7 @@ pub(super) fn check(
             report.issues.push(format!("Entity {} remains inspectable but the target has no workflow for its current records",stored.id));
         }
     }
-    if let Ok(data) = merge(program, current) {
+    if let Ok(data) = merge(&program.program, current) {
         let state = State {
             data,
             session: SessionState::initial(&program.program)?,
@@ -108,7 +108,7 @@ pub(super) fn check(
                 report.state = CompatibilityState::Incompatible;
             }
         }
-    } else if let Err(error) = merge(program, current) {
+    } else if let Err(error) = merge(&program.program, current) {
         report.issues.push(format!(
             "Current schema/data cannot be represented safely: {error:?}"
         ));

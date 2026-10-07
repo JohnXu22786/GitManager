@@ -2,25 +2,34 @@
 //! activation pointer. Legacy order projects are never read or rewritten here.
 mod files;
 mod json;
+pub mod scope;
+mod upgrade;
 use crate::product_contract::*;
-use crate::product_runtime::{merged_data, LocalRuntime};
+use crate::product_runtime::{merged_data, LocalRuntime, DRIVER_VERSION};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Component, Path};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
+pub(crate) use upgrade::LegacyUpgrade;
+pub use upgrade::{UpgradeProgress, UpgradeSummary};
 
 const MAGIC: &str = "gitmanager.generated-project";
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 const MAX_STORE_BYTES: usize = 16 * 1024 * 1024;
+/// Local envelopes retain multiple full captures and execution receipts. Each
+/// individual source/provider document still has its separate 1 MiB cap.
+pub(crate) const MAX_INTENTION_OBJECT_BYTES: usize = MAX_STORE_BYTES;
 type Result<T> = std::result::Result<T, StoreError>;
 #[derive(Debug)]
 pub enum StoreError {
     Io(io::Error),
     Invalid(String),
     UnsupportedFormat(u32),
+    UpgradeRequired,
+    RestartRequired,
     Conflict(String),
     Incompatible(CompatibilityReport),
     Runtime(AdapterError),
@@ -60,6 +69,8 @@ pub enum FaultPoint {
     AfterObject,
     BeforePointer,
     AfterPointer,
+    AfterUpgradeObject,
+    AfterUpgradeJournal,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +103,7 @@ pub struct ProjectSnapshot {
     pub adoptions: Vec<AdoptionReceipt>,
     pub operations: BTreeMap<Id, OperationReceipt>,
     pub artifacts: Vec<LocalArtifact>,
+    pub scope: scope::ScopeState,
 }
 fn revision(program: &CapturedProgram) -> std::result::Result<Digest, ContractError> {
     canonical_digest(IdentityDomain::Source, program)
@@ -190,6 +202,7 @@ impl ProjectSnapshot {
         if self.artifacts.iter().map(|a| a.bytes.len()).sum::<usize>() > MAX_OUTPUT_BYTES {
             return Err(StoreError::Invalid("retained output byte limit".into()));
         }
+        scope::verify_snapshot(self)?;
         Ok(())
     }
 }
@@ -204,7 +217,7 @@ struct Pointer {
 }
 /// Prepared locally against exact current identities. This is a rehearsal, not
 /// authorization: the host must obtain the user's choice before calling adopt.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedAdoption {
     plan: AdoptionPlan,
     expected_revision: u64,
@@ -220,8 +233,57 @@ pub struct ProductStore {
     parent: Arc<files::Directory>,
     root: Arc<files::Directory>,
     name: std::ffi::OsString,
+    upgrade_requires_reopen: Arc<std::sync::atomic::AtomicBool>,
+    validation_cache: Arc<Mutex<ValidationCache>>,
+}
+#[derive(PartialEq, Eq)]
+struct ValidationIdentity {
+    runtime: RuntimeCapabilities,
+    driver: &'static str,
+    compiler: u32,
+    limits: RuntimeLimits,
+}
+struct ValidatedSnapshot {
+    pointer: Pointer,
+    bytes: Vec<u8>,
+    identity: ValidationIdentity,
+}
+#[derive(Default)]
+struct ValidationCache {
+    verified: Option<ValidatedSnapshot>,
+    #[cfg(test)]
+    hits: usize,
+    #[cfg(test)]
+    validations: usize,
 }
 impl ProductStore {
+    fn validation_cache_guard(&self) -> MutexGuard<'_, ValidationCache> {
+        match self.validation_cache.lock() {
+            Ok(cache) => cache,
+            Err(poisoned) => {
+                // A poisoned cache never grants reuse. Keep verifying cold on
+                // this handle; opening the store again creates a clean cache.
+                let mut cache = poisoned.into_inner();
+                cache.verified = None;
+                cache
+            }
+        }
+    }
+    fn clear_validation_cache(&self) {
+        self.validation_cache_guard().verified = None;
+    }
+    #[cfg(test)]
+    pub(crate) fn validation_cache_stats(&self) -> (usize, usize) {
+        let cache = self.validation_cache_guard();
+        (cache.hits, cache.validations)
+    }
+    #[cfg(test)]
+    pub(crate) fn poison_validation_cache_for_test(&self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _cache = self.validation_cache.lock().unwrap();
+            panic!("synthetic validation-cache poison");
+        }));
+    }
     fn location(path: &Path) -> Result<(files::Directory, std::ffi::OsString)> {
         if !path.is_absolute()
             || path
@@ -268,6 +330,7 @@ impl ProductStore {
             adoptions: vec![],
             operations: BTreeMap::new(),
             artifacts: vec![],
+            scope: scope::ScopeState::default(),
         };
         // Ordinary creation and recovery share the same fresh-only activation.
         Self::create_recovered(path, &snapshot)
@@ -326,6 +389,8 @@ impl ProductStore {
             parent: Arc::new(parent),
             root: Arc::new(root),
             name,
+            upgrade_requires_reopen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            validation_cache: Arc::new(Mutex::new(ValidationCache::default())),
         };
         let _lock = store.root.lock()?;
         store.require_unactivated()?;
@@ -380,7 +445,7 @@ impl ProductStore {
         self.pinned()?;
         let bytes = self.root.read(
             &format!("extension-{}.json", digest.as_str()),
-            MAX_WIRE_BYTES,
+            MAX_INTENTION_OBJECT_BYTES,
         )?;
         if Self::extension_digest(&bytes)? != *digest {
             return Err(StoreError::Corrupt(
@@ -392,7 +457,7 @@ impl ProductStore {
     }
 
     fn extension_digest(bytes: &[u8]) -> Result<Digest> {
-        if bytes.len() > MAX_WIRE_BYTES {
+        if bytes.len() > MAX_INTENTION_OBJECT_BYTES {
             return Err(StoreError::Invalid(
                 "intention object exceeds the byte limit".into(),
             ));
@@ -415,6 +480,8 @@ impl ProductStore {
             parent: Arc::new(parent),
             root: Arc::new(root),
             name,
+            upgrade_requires_reopen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            validation_cache: Arc::new(Mutex::new(ValidationCache::default())),
         })
     }
     fn pinned(&self) -> Result<()> {
@@ -426,10 +493,26 @@ impl ProductStore {
         Ok(())
     }
     pub fn load(&self) -> Result<ProjectSnapshot> {
+        let result = self.load_current();
+        if result.is_err() {
+            self.clear_validation_cache();
+        }
+        result
+    }
+    fn load_current(&self) -> Result<ProjectSnapshot> {
+        if self
+            .upgrade_requires_reopen
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(StoreError::RestartRequired);
+        }
         self.pinned()?;
         let pointer: Pointer = json::parse(&self.root.read("CURRENT", 16 * 1024)?)?;
         if pointer.magic != MAGIC {
             return Err(StoreError::Corrupt("not a generated-tool project".into()));
+        }
+        if pointer.version == 1 {
+            return Err(StoreError::UpgradeRequired);
         }
         if pointer.version != FORMAT {
             return Err(StoreError::UnsupportedFormat(pointer.version));
@@ -444,22 +527,59 @@ impl ProductStore {
                 "snapshot checksum mismatch; use a verified checkpoint".into(),
             ));
         }
-        snapshot.validate()?;
         if snapshot.revision != pointer.revision || snapshot.data.project_id != pointer.project_id {
             return Err(StoreError::Corrupt(
                 "pointer does not match snapshot".into(),
             ));
         }
-        // Reopening verifies usable current state, rather than trusting a stored
-        // flag or recomputing any historical event under the active program.
-        LocalRuntime::default().start(
-            snapshot.program()?,
-            &snapshot.data,
-            &snapshot.session,
-            snapshot.clock_day,
-            0,
-            RuntimeLimits::default(),
-        )?;
+        self.pinned()?;
+        let runtime = LocalRuntime::default();
+        let identity = ValidationIdentity {
+            runtime: runtime.capabilities(),
+            driver: DRIVER_VERSION,
+            compiler: scope::COMPILER_VERSION,
+            limits: RuntimeLimits::default(),
+        };
+        let reused = {
+            let mut cache = self.validation_cache_guard();
+            let reused = cache.verified.as_ref().is_some_and(|checked| {
+                checked.pointer == pointer && checked.bytes == bytes && checked.identity == identity
+            });
+            if reused {
+                #[cfg(test)]
+                {
+                    cache.hits += 1;
+                }
+            } else {
+                cache.verified = None;
+                #[cfg(test)]
+                {
+                    cache.validations += 1;
+                }
+            }
+            reused
+        };
+        if !reused {
+            // Only these pure checks are reusable. The complete object was
+            // freshly read, strictly parsed and hashed above on every load.
+            // Referenced intention objects are still independently read and
+            // verified by archive/backup admission; they are not cached here.
+            snapshot.validate()?;
+            runtime.start(
+                snapshot.program()?,
+                &snapshot.data,
+                &snapshot.session,
+                snapshot.clock_day,
+                0,
+                identity.limits.clone(),
+            )?;
+            self.pinned()?;
+            self.validation_cache_guard().verified = Some(ValidatedSnapshot {
+                pointer,
+                bytes,
+                identity,
+            });
+        }
         Ok(snapshot)
     }
     fn save(
@@ -468,6 +588,7 @@ impl ProductStore {
         replace_current: bool,
         #[cfg(test)] fault: Option<FaultPoint>,
     ) -> Result<()> {
+        self.clear_validation_cache();
         self.pinned()?;
         if !replace_current {
             self.require_unactivated()?;
@@ -573,6 +694,7 @@ impl ProductStore {
                 "project changed; reload before applying this input".into(),
             ));
         }
+        let before = snapshot.clone();
         let runtime = LocalRuntime::default();
         let mut run = runtime.resume(
             snapshot.program()?,
@@ -600,6 +722,7 @@ impl ProductStore {
                 revision: snapshot.revision,
             },
         );
+        scope::verify_transition(&before, &snapshot)?;
         self.save(
             &snapshot,
             true,
@@ -743,12 +866,104 @@ impl ProductStore {
     where
         F: FnOnce(&ProjectSnapshot, &CapturedProgram, &DecisionGraph, &AdoptionPlan) -> Result<()>,
     {
+        self.adopt_verified_inner(
+            expected_revision,
+            prepared,
+            target,
+            decisions,
+            None,
+            &BTreeMap::new(),
+            verify,
+        )
+    }
+    pub(crate) fn adopt_correspondence_verified<F>(
+        &self,
+        expected_revision: u64,
+        prepared: &PreparedAdoption,
+        target: &CapturedProgram,
+        decisions: &DecisionGraph,
+        correspondences: &BTreeMap<Digest, scope::ScopeCorrespondence>,
+        verify: F,
+    ) -> Result<ProjectSnapshot>
+    where
+        F: FnOnce(&ProjectSnapshot, &CapturedProgram, &DecisionGraph, &AdoptionPlan) -> Result<()>,
+    {
+        self.adopt_verified_inner(
+            expected_revision,
+            prepared,
+            target,
+            decisions,
+            None,
+            correspondences,
+            verify,
+        )
+    }
+    /// Retain replay authority for an experienced prospective implementation,
+    /// while the ordinary decision commit keeps the exact current executable.
+    pub fn adopt_rehearsal_verified<F>(
+        &self,
+        expected_revision: u64,
+        prepared: &PreparedAdoption,
+        target: &CapturedProgram,
+        decisions: &DecisionGraph,
+        rehearsal: &scope::PreparedScopedChange,
+        recorded_decisions: &[Id],
+        correspondences: &BTreeMap<Digest, scope::ScopeCorrespondence>,
+        verify: F,
+    ) -> Result<ProjectSnapshot>
+    where
+        F: FnOnce(&ProjectSnapshot, &CapturedProgram, &DecisionGraph, &AdoptionPlan) -> Result<()>,
+    {
+        self.adopt_verified_inner(
+            expected_revision,
+            prepared,
+            target,
+            decisions,
+            Some((rehearsal, recorded_decisions)),
+            correspondences,
+            verify,
+        )
+    }
+    fn adopt_verified_inner<F>(
+        &self,
+        expected_revision: u64,
+        prepared: &PreparedAdoption,
+        target: &CapturedProgram,
+        decisions: &DecisionGraph,
+        rehearsal: Option<(&scope::PreparedScopedChange, &[Id])>,
+        correspondences: &BTreeMap<Digest, scope::ScopeCorrespondence>,
+        verify: F,
+    ) -> Result<ProjectSnapshot>
+    where
+        F: FnOnce(&ProjectSnapshot, &CapturedProgram, &DecisionGraph, &AdoptionPlan) -> Result<()>,
+    {
         let _lock = self.root.lock()?;
         let mut current = self.load()?;
-        let request = canonical_digest(
-            IdentityDomain::Adoption,
-            &(&prepared.plan, target, decisions),
-        )?;
+        let request = if let Some((proof, ids)) = rehearsal {
+            canonical_digest(
+                IdentityDomain::Adoption,
+                &(
+                    "record-managed-rehearsal/1",
+                    &prepared.plan,
+                    target,
+                    decisions,
+                    scope::rehearsal_request(proof, ids)?,
+                ),
+            )?
+        } else {
+            canonical_digest(
+                IdentityDomain::Adoption,
+                &(&prepared.plan, target, decisions),
+            )?
+        };
+        let request = if correspondences.is_empty() {
+            request
+        } else {
+            canonical_digest(
+                IdentityDomain::Adoption,
+                &("scope-correspondence/1", &request, correspondences),
+            )?
+        };
         if let Some(receipt) = current.operations.get(&prepared.plan.id) {
             return if receipt.request == request {
                 Ok(current)
@@ -766,9 +981,19 @@ impl ProductStore {
                 "project changed after adoption rehearsal".into(),
             ));
         }
+        if !current.scope.layers.is_empty() && revision(target)? != current.active_revision {
+            return Err(StoreError::Invalid(
+                "Managed history requires a verified scoped or managed-evolution preparation"
+                    .into(),
+            ));
+        }
+        scope::reject_unmanaged_target(&current, target)?;
         self.check_plan(&current, &prepared.plan, target)?;
         decisions.validate()?;
         verify(&current, target, decisions, &prepared.plan)?;
+        if let Some((proof, ids)) = rehearsal {
+            scope::retain_rehearsal(&mut current, proof, decisions, ids, &prepared.plan)?;
+        }
         let previous = current.active_revision.clone();
         let target_revision = revision(target)?;
         if !current
@@ -806,6 +1031,8 @@ impl ProductStore {
                 revision: current.revision,
             },
         );
+        let revision = current.revision;
+        scope::retain_correspondences(&mut current, correspondences, &prepared.plan.id, revision)?;
         LocalRuntime::default().start(
             target,
             &current.data,

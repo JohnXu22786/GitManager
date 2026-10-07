@@ -130,6 +130,32 @@ impl VerifiedBackup {
                 "backup intake byte limit",
             ));
         }
+        let header: serde_json::Value = serde_json::from_slice(bytes)?;
+        if header
+            .get("payload")
+            .and_then(|p| p.get("snapshot"))
+            .and_then(|s| s.get("version"))
+            .and_then(|v| v.as_u64())
+            .is_some_and(|version| version != 1 && version != 2)
+        {
+            return Err(OperationIssue::new(
+                IssueKind::Unsupported,
+                "unsupported generated-project snapshot version",
+            ));
+        }
+        if header
+            .get("payload")
+            .and_then(|p| p.get("snapshot"))
+            .and_then(|s| s.get("version"))
+            .and_then(|v| v.as_u64())
+            == Some(1)
+        {
+            LegacyBackup::from_bytes(bytes)?;
+            return Err(OperationIssue::new(
+                IssueKind::UpgradeRequired,
+                "legacy backup requires explicit fresh-destination upgrade",
+            ));
+        }
         let backup = Self {
             envelope: serde_json::from_slice(bytes)?,
         };
@@ -434,5 +460,202 @@ pub fn doctor(path: &Path, expected: &ToolIdentity, shelf: &CheckpointShelf) -> 
                 },
             }
         }
+    }
+}
+
+/// The controller presents this gate on launch/open before enabling daily edits.
+pub enum OpenGate {
+    Ready(OpenedTool),
+    UpgradeRequired(crate::product_store::UpgradeSummary),
+}
+pub fn inspect_open(path: &Path, expected: Option<&ToolIdentity>) -> Result<OpenGate> {
+    let store = ProductStore::open(path)?;
+    let summary = store.inspect_upgrade()?;
+    verify_upgrade_identity(&summary, expected)?;
+    if summary.restart_required {
+        Ok(OpenGate::UpgradeRequired(summary))
+    } else {
+        Ok(OpenGate::Ready(open_verified(path, expected)?))
+    }
+}
+fn verify_upgrade_identity(
+    summary: &crate::product_store::UpgradeSummary,
+    expected: Option<&ToolIdentity>,
+) -> Result<()> {
+    if expected.is_some_and(|identity| {
+        identity.project_id != summary.project_id || identity.first_program != summary.first_program
+    }) {
+        return Err(OperationIssue::new(
+            IssueKind::Collision,
+            "upgrade folder belongs to another tool",
+        ));
+    }
+    Ok(())
+}
+/// Explicit, offline upgrade with visible progress supplied by the controller.
+/// Completion requires restart/reopen. No saved backup is deleted.
+pub fn upgrade_open_verified<F>(
+    path: &Path,
+    expected: Option<&ToolIdentity>,
+    progress: F,
+) -> Result<crate::product_store::UpgradeSummary>
+where
+    F: FnMut(crate::product_store::UpgradeProgress),
+{
+    let store = ProductStore::open(path)?;
+    verify_upgrade_identity(&store.inspect_upgrade()?, expected)?;
+    let archive = IntentArchive::new(store.clone());
+    let result = store.upgrade_generated_project_verified(progress, |target| {
+        let identity =
+            ToolIdentity::from_snapshot(target).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        if expected.is_some_and(|expected| *expected != identity) {
+            return Err(StoreError::Conflict("upgrade identity changed".into()));
+        }
+        archive
+            .export_for(target)
+            .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        Ok(())
+    })?;
+    verify_upgrade_identity(&result, expected)?;
+    Ok(result)
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyPayload {
+    snapshot: serde_json::Value,
+    intentions: IntentionBundle,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyEnvelope {
+    magic: String,
+    version: u32,
+    digest: Digest,
+    payload: LegacyPayload,
+}
+/// Verified read-only intake. Upgrade/recovery always chooses a fresh folder;
+/// the original backup is never rewritten or used as an ordinary writable store.
+pub struct LegacyBackup {
+    original: Vec<u8>,
+    upgrade: crate::product_store::LegacyUpgrade,
+    intentions: IntentionBundle,
+}
+pub enum BackupIntake {
+    Current(VerifiedBackup),
+    UpgradeRequired(LegacyBackup),
+}
+pub fn inspect_backup(bytes: &[u8]) -> Result<BackupIntake> {
+    if bytes.len() > MAX_BACKUP_BYTES {
+        return Err(OperationIssue::new(IssueKind::Limit, "backup intake limit"));
+    }
+    let header: serde_json::Value = serde_json::from_slice(bytes)?;
+    if header
+        .get("payload")
+        .and_then(|p| p.get("snapshot"))
+        .and_then(|s| s.get("version"))
+        .and_then(|v| v.as_u64())
+        == Some(1)
+    {
+        Ok(BackupIntake::UpgradeRequired(LegacyBackup::from_bytes(
+            bytes,
+        )?))
+    } else {
+        Ok(BackupIntake::Current(VerifiedBackup::from_bytes(bytes)?))
+    }
+}
+impl LegacyBackup {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > MAX_BACKUP_BYTES {
+            return Err(OperationIssue::new(
+                IssueKind::Limit,
+                "legacy backup intake limit",
+            ));
+        }
+        let envelope: LegacyEnvelope = serde_json::from_slice(bytes)?;
+        if envelope.magic != MAGIC || envelope.version != 1 {
+            return Err(OperationIssue::new(
+                IssueKind::Unsupported,
+                "legacy backup format",
+            ));
+        }
+        if canonical_bytes(&envelope)? != bytes
+            || canonical_digest(IdentityDomain::Evidence, &envelope.payload)? != envelope.digest
+        {
+            return Err(OperationIssue::new(
+                IssueKind::Corrupt,
+                "legacy backup checksum/canonical content mismatch",
+            ));
+        }
+        let upgrade = crate::product_store::LegacyUpgrade::decode(&canonical_bytes(
+            &envelope.payload.snapshot,
+        )?)?;
+        let intentions = crate::product_decisions::upgrade_bundle_binding(
+            &upgrade.original_digest,
+            &upgrade.snapshot,
+            &envelope.payload.intentions,
+        )
+        .map_err(|e| OperationIssue::new(IssueKind::Corrupt, e))?;
+        Ok(Self {
+            original: bytes.to_vec(),
+            upgrade,
+            intentions,
+        })
+    }
+    pub fn original_bytes(&self) -> &[u8] {
+        &self.original
+    }
+    /// On success, restart, open_verified the chosen path, then register that
+    /// new instance. A failed pre-pointer attempt leaves only staged immutable
+    /// files; the original backup and any existing tool remain untouched.
+    pub fn upgrade_recover_new<P>(
+        &self,
+        path: &Path,
+        progress: P,
+    ) -> Result<crate::product_store::UpgradeSummary>
+    where
+        P: FnMut(crate::product_store::UpgradeProgress),
+    {
+        self.recover_inner(
+            path,
+            progress,
+            #[cfg(test)]
+            None,
+        )
+    }
+    #[cfg(test)]
+    pub fn upgrade_recover_with_fault<P>(
+        &self,
+        path: &Path,
+        progress: P,
+        fault: crate::product_store::FaultPoint,
+    ) -> Result<crate::product_store::UpgradeSummary>
+    where
+        P: FnMut(crate::product_store::UpgradeProgress),
+    {
+        self.recover_inner(path, progress, Some(fault))
+    }
+    fn recover_inner<P>(
+        &self,
+        path: &Path,
+        progress: P,
+        #[cfg(test)] fault: Option<crate::product_store::FaultPoint>,
+    ) -> Result<crate::product_store::UpgradeSummary>
+    where
+        P: FnMut(crate::product_store::UpgradeProgress),
+    {
+        let verified = Self::from_bytes(&self.original)?;
+        Ok(ProductStore::recover_upgraded_with(
+            path,
+            &verified.upgrade,
+            |store, snapshot| {
+                IntentArchive::new(store.clone())
+                    .restore_for(snapshot, &verified.intentions)
+                    .map_err(|e| StoreError::Corrupt(e.to_string()))
+            },
+            progress,
+            #[cfg(test)]
+            fault,
+        )?)
     }
 }

@@ -26,6 +26,9 @@ pub struct IntentArchive {
     store: ProductStore,
 }
 impl IntentArchive {
+    pub(super) fn snapshot(&self) -> Result<ProjectSnapshot> {
+        Ok(self.store.load()?)
+    }
     pub fn new(store: ProductStore) -> Self {
         Self { store }
     }
@@ -60,7 +63,7 @@ impl IntentArchive {
             content,
         };
         let bytes = canonical_bytes(&object)?;
-        if bytes.len() > MAX_WIRE_BYTES {
+        if bytes.len() > crate::product_store::MAX_INTENTION_OBJECT_BYTES {
             return Err(invalid("intention object exceeds archive byte limit"));
         }
         let digest = canonical_digest(IdentityDomain::Evidence, &object)?;
@@ -84,6 +87,7 @@ impl IntentArchive {
         for s in &scenes {
             s.validate()?;
         }
+        validate_rehearsal_scenes(&self.store.load()?, digest, &scenes)?;
         Ok(scenes)
     }
     pub(super) fn load_mappings(
@@ -104,8 +108,74 @@ impl IntentArchive {
         Ok(mappings)
     }
 }
+/// Link already validated, immutable scenes to the exact prospective proof
+/// recorded with their decision. The store verifies those decision births;
+/// the archive supplies the independently checksummed scene bytes.
+pub(super) fn validate_rehearsal_scenes(
+    snapshot: &ProjectSnapshot,
+    witness: &Digest,
+    scenes: &[AcceptedScene],
+) -> Result<()> {
+    let proofs: Vec<_> = snapshot
+        .scope
+        .rehearsals
+        .values()
+        .filter(|proof| proof.witnesses.values().any(|digest| digest == witness))
+        .collect();
+    if proofs.is_empty() {
+        return Ok(());
+    }
+    let sources: BTreeMap<_, _> = snapshot
+        .programs
+        .iter()
+        .map(|source| Ok((canonical_digest(IdentityDomain::Source, source)?, source)))
+        .collect::<Result<_>>()?;
+    let identities = scenes
+        .iter()
+        .map(|scene| scene.scenario.identity())
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for proof in proofs {
+        let baseline = sources
+            .get(&proof.manifest.basis.active)
+            .ok_or_else(|| invalid("rehearsal baseline capture is missing"))?;
+        let prospective = sources
+            .get(&proof.manifest.output)
+            .ok_or_else(|| invalid("rehearsal prospective capture is missing"))?;
+        if !scenes.iter().any(|scene| &scene.program == *baseline)
+            || !scenes.iter().any(|scene| &scene.program == *prospective)
+            || scenes
+                .iter()
+                .any(|scene| &scene.program != *baseline && &scene.program != *prospective)
+        {
+            return Err(invalid(
+                "rehearsal witness differs from its exact experienced source pair",
+            ));
+        }
+        for (id, digest) in &proof.witnesses {
+            if digest != witness {
+                continue;
+            }
+            let decision = snapshot
+                .decisions
+                .decisions
+                .iter()
+                .find(|decision| &decision.id == id)
+                .ok_or_else(|| invalid("rehearsal decision is missing"))?;
+            if decision.witness != *witness || decision.scenarios != identities {
+                return Err(invalid(
+                    "rehearsal scene identities differ from their recorded decision",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
 pub(super) fn decode(bytes: &[u8], digest: &Digest) -> Result<Content> {
-    let value = bounded_input::parse_json_bytes(bytes).map_err(|e| invalid(&e.to_string()))?;
+    let value = bounded_input::parse_json_bytes_with_limit(
+        bytes,
+        crate::product_store::MAX_INTENTION_OBJECT_BYTES,
+    )
+    .map_err(|e| invalid(&e.to_string()))?;
     let object: Object = serde_json::from_value(value).map_err(|e| invalid(&e.to_string()))?;
     if bytes != canonical_bytes(&object)?
         || object.version != 1

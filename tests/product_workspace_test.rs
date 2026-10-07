@@ -50,6 +50,7 @@ fn runtime() -> RuntimeView {
     let program =
         AppDefinition::parse(&serde_json::to_vec(&fixture::organizer()).unwrap()).unwrap();
     RuntimeView {
+        history: PreservedHistory::default(),
         program,
         observation: ViewObservation {
             view: "people".into(),

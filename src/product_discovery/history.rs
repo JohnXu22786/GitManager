@@ -4,7 +4,13 @@ use crate::product_decisions::{
     CheckDisposition, CheckReport, DecisionEngine, IntentArchive, IntentionBinding,
     VerifiedDiscoveryScene,
 };
+use crate::product_runtime::ReplayAdmission;
+use crate::product_store::scope::{
+    PreparedScopedChange, ProvenanceColumns, ScopedExecutionContext,
+};
 use crate::product_store::{ProductStore, ProjectSnapshot};
+
+type ProjectionRegistry = Arc<std::sync::RwLock<BTreeMap<Digest, ScopedExecutionContext>>>;
 
 /// Loaded only through V07's independently replayed projection. No provider or
 /// deserialized public flags can construct this authority. The saved package
@@ -17,9 +23,12 @@ pub struct VerifiedRetainedHistory {
     bindings: BTreeMap<Id, IntentionBinding>,
     projection_replays: usize,
     mapped_scenes: Vec<VerifiedDiscoveryScene>,
+    replay_context: ScopedExecutionContext,
+    projected_contexts: ProjectionRegistry,
     /// Host-proposed mappings are validated and exercised by V07, never trusted
     /// as evidence. Each proposal is bound to one exact captured target.
     target_mappings: BTreeMap<Digest, Vec<SemanticMapping>>,
+    prepared_targets: BTreeMap<Digest, PreparedScopedChange>,
 }
 impl std::fmt::Debug for VerifiedRetainedHistory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -32,6 +41,87 @@ impl std::fmt::Debug for VerifiedRetainedHistory {
 fn unavailable(error: impl std::fmt::Display) -> AdapterError {
     AdapterError::Unsupported(format!("Retained intention history is unverified: {error}"))
 }
+/// Only the exact host-regenerated source may identify compiler-added columns.
+/// An ordinary source gets no exemption for names resembling system metadata.
+pub(super) fn comparison_columns(
+    policy: &DiscoveryPolicy,
+    source: &CapturedProgram,
+) -> Result<ProvenanceColumns, AdapterError> {
+    source.validate()?;
+    if let Some(history) = &policy.retained_history {
+        let id = canonical_digest(IdentityDomain::Source, source)?;
+        if let Some(prepared) = history.prepared_targets.get(&id) {
+            return ScopedExecutionContext::prepared(&history.current, prepared)
+                .and_then(|context| context.provenance_columns(source))
+                .map_err(unavailable);
+        }
+        return history
+            .replay_context
+            .provenance_columns(source)
+            .map_err(unavailable);
+    }
+    if crate::product_runtime::has_protected_fields(source) {
+        return Err(unavailable(
+            "comparison source has no verified compiler manifest",
+        ));
+    }
+    Ok(ProvenanceColumns::default())
+}
+
+/// A temporary material-comparison projection, never a RunEvidence or a saved
+/// artifact. The original runs and their complete byte receipts stay intact.
+pub(super) fn comparison_observations(
+    policy: &DiscoveryPolicy,
+    source: &CapturedProgram,
+    run: &RunEvidence,
+) -> Result<Vec<Observation>, AdapterError> {
+    if run.binding.source != source.binding || run.binding.artifact != source.artifact {
+        return Err(unavailable(
+            "comparison projection source differs from execution",
+        ));
+    }
+    let columns = comparison_columns(policy, source)?;
+    let mut observations = run.observations.clone();
+    for observation in &mut observations {
+        if let Some(schema) = &mut observation.view_schema {
+            schema
+                .columns
+                .retain(|column, _| !columns.view(&observation.view.view, column));
+        }
+        for row in &mut observation.view.rows {
+            row.cells
+                .retain(|column, _| !columns.view(&observation.view.view, column));
+        }
+        for artifact in &mut observation.outputs {
+            artifact.validate()?;
+            if artifact
+                .columns
+                .iter()
+                .any(|column| columns.output(&artifact.output, &column.id))
+            {
+                let fields = artifact
+                    .columns
+                    .iter()
+                    .filter(|column| !columns.output(&artifact.output, &column.id))
+                    .cloned()
+                    .collect();
+                let rows = artifact
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        row.iter()
+                            .filter(|(column, _)| !columns.output(&artifact.output, column))
+                            .map(|(column, value)| (column.clone(), value.clone()))
+                            .collect()
+                    })
+                    .collect();
+                *artifact =
+                    LocalArtifact::from_rows(&artifact.output, artifact.format, fields, rows)?;
+            }
+        }
+    }
+    Ok(observations)
+}
 impl VerifiedRetainedHistory {
     pub fn load(store: &ProductStore) -> Result<Self, AdapterError> {
         let current = store.load().map_err(unavailable)?;
@@ -40,6 +130,9 @@ impl VerifiedRetainedHistory {
         let context = Self::projection(&engine, &current)?;
         let bindings = Self::bindings(&engine, &current)?;
         let mapped_scenes = engine.discovery_scenes(&current).map_err(unavailable)?;
+        let replay_context = engine
+            .retained_replay_context(&current)
+            .map_err(unavailable)?;
         let projection_replays = current
             .decisions
             .decisions
@@ -68,7 +161,10 @@ impl VerifiedRetainedHistory {
             bindings,
             projection_replays,
             mapped_scenes,
+            replay_context,
+            projected_contexts: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             target_mappings: BTreeMap::new(),
+            prepared_targets: BTreeMap::new(),
         })
     }
     /// A rename suggestion is not a passing check. Discovery independently
@@ -87,6 +183,137 @@ impl VerifiedRetainedHistory {
         self.target_mappings
             .insert(canonical_digest(IdentityDomain::Source, target)?, mappings);
         Ok(())
+    }
+    pub fn map_prepared_target(
+        &mut self,
+        prepared: PreparedScopedChange,
+        mappings: Vec<SemanticMapping>,
+    ) -> Result<(), AdapterError> {
+        if self.store.load().map_err(unavailable)? != self.current {
+            return Err(unavailable("prepared-target basis changed"));
+        }
+        ScopedExecutionContext::prepared(&self.current, &prepared)
+            .map_err(unavailable)?
+            .admit_target(prepared.target())
+            .map_err(unavailable)?;
+        self.map_target(prepared.target(), mappings)?;
+        self.prepared_targets.insert(
+            canonical_digest(IdentityDomain::Source, prepared.target())?,
+            prepared,
+        );
+        Ok(())
+    }
+    pub(super) fn replay_admission(&self) -> Result<Arc<dyn ReplayAdmission>, AdapterError> {
+        let mut contexts = vec![self.replay_context.clone()];
+        for prepared in self.prepared_targets.values() {
+            contexts.push(
+                ScopedExecutionContext::prepared(&self.current, prepared)
+                    .map_err(unavailable)?
+                    .with_correspondences(&self.replay_context.correspondence_proofs())
+                    .map_err(unavailable)?,
+            );
+            for scene in &self.mapped_scenes {
+                // Populate the same bounded registry used by projection and
+                // replay. A returned projected scene must not lose the proof
+                // independently regenerated from its retained original input.
+                let _ = self.project_comparison_scene(
+                    self.current.program().map_err(unavailable)?,
+                    prepared.target(),
+                    scene.mapped(),
+                );
+            }
+        }
+        Ok(Arc::new(HistoryAdmission {
+            contexts,
+            projected_contexts: self.projected_contexts.clone(),
+        }))
+    }
+    /// Host-authenticated preparation only: both compared executables receive
+    /// this same actual scenario. Unknown correspondence remains unavailable.
+    pub(super) fn project_comparison_scene(
+        &self,
+        before: &CapturedProgram,
+        target: &CapturedProgram,
+        scene: &ScenarioSpec,
+    ) -> Result<ScenarioSpec, AdapterError> {
+        let (scene, context) = self.projected_scene_context(before, target, scene)?;
+        if let Some(context) = context {
+            let key = scene.identity()?;
+            let mut registry = self
+                .projected_contexts
+                .write()
+                .map_err(|_| unavailable("projected scene admission lock is poisoned"))?;
+            if let Some(existing) = registry.get(&key) {
+                if existing.correspondence_proofs() != context.correspondence_proofs() {
+                    return Err(unavailable(
+                        "projected scene has ambiguous admission context",
+                    ));
+                }
+            } else {
+                if registry.len() >= MAX_ITEMS {
+                    return Err(unavailable("projected scene admission exceeds bounds"));
+                }
+                registry.insert(key, context);
+            }
+        }
+        Ok(scene)
+    }
+    fn projected_scene_context(
+        &self,
+        before: &CapturedProgram,
+        target: &CapturedProgram,
+        scene: &ScenarioSpec,
+    ) -> Result<(ScenarioSpec, Option<ScopedExecutionContext>), AdapterError> {
+        let target_id = canonical_digest(IdentityDomain::Source, target)?;
+        let Some(prepared) = self.prepared_targets.get(&target_id) else {
+            return Ok((scene.clone(), None));
+        };
+        if before != self.current.program().map_err(unavailable)? || prepared.target() != target {
+            return Err(unavailable(
+                "scene projection does not name the exact current/prepared pair",
+            ));
+        }
+        {
+            let registry = self
+                .projected_contexts
+                .read()
+                .map_err(|_| unavailable("projected scene admission lock is poisoned"))?;
+            let mut matched: Option<&ScopedExecutionContext> = None;
+            for context in registry.values().filter(|context| {
+                context.has_scenario_correspondence(scene) && context.admit_target(target).is_ok()
+            }) {
+                context
+                    .verify_seed(before, &scene.seed, scene.clock_day)
+                    .map_err(unavailable)?;
+                context
+                    .verify_seed(target, &scene.seed, scene.clock_day)
+                    .map_err(unavailable)?;
+                if matched.is_some_and(|prior| {
+                    prior.correspondence_proofs() != context.correspondence_proofs()
+                }) {
+                    return Err(unavailable(
+                        "projected scene has ambiguous regenerated authority",
+                    ));
+                }
+                matched = Some(context);
+            }
+            if let Some(context) = matched {
+                return Ok((scene.clone(), Some(context.clone())));
+            }
+        }
+        let context = ScopedExecutionContext::prepared(&self.current, prepared)
+            .map_err(unavailable)?
+            .with_correspondences(&self.replay_context.correspondence_proofs())
+            .map_err(unavailable)?;
+        let mut mapped = scene.clone();
+        mapped.seed = crate::product_runtime::merged_data(target, &scene.seed)?;
+        let (context, actual) = context
+            .project_scenario(before, scene, target, &mapped)
+            .map_err(unavailable)?;
+        context
+            .verify_seed(before, &actual.seed, actual.clock_day)
+            .map_err(unavailable)?;
+        Ok((actual, Some(context)))
     }
     fn projection(
         engine: &DecisionEngine<LocalRuntime>,
@@ -220,17 +447,29 @@ impl VerifiedRetainedHistory {
             LocalRuntime::with_cancellation(cancelled),
             IntentArchive::new(self.store.clone()),
         );
-        let mut checked = engine
-            .check_discovery_candidate(
+        let target_id = canonical_digest(IdentityDomain::Source, target)?;
+        let mappings = self
+            .target_mappings
+            .get(&target_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let mut checked = if let Some(prepared) = self.prepared_targets.get(&target_id) {
+            engine.check_prepared_discovery_candidate(
                 &self.current,
                 target,
-                self.target_mappings
-                    .get(&canonical_digest(IdentityDomain::Source, target)?)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]),
+                prepared,
+                mappings,
                 policy.search.runtime.clone(),
             )
-            .map_err(unavailable)?;
+        } else {
+            engine.check_discovery_candidate(
+                &self.current,
+                target,
+                mappings,
+                policy.search.runtime.clone(),
+            )
+        }
+        .map_err(unavailable)?;
         // These are the actual mapped target executions returned by V07.
         // Workflow validity is a pure post-execution predicate, so evaluate it
         // here without fabricating another run or weakening the saved binding.
@@ -315,9 +554,21 @@ impl VerifiedRetainedHistory {
                 &(scene_equivalence_key(scene)?, &scene.validity),
             )?)
         };
+        let source = request
+            .sources
+            .first()
+            .ok_or_else(|| unavailable("current source missing"))?;
+        let target = request
+            .sources
+            .get(1)
+            .ok_or_else(|| unavailable("candidate source missing"))?;
+        let projected: Vec<_> = contexts
+            .iter()
+            .map(|context| self.project_comparison_scene(source, target, context.mapped()))
+            .collect::<Result<_, _>>()?;
         let mut scenes = BTreeMap::new();
-        for context in &contexts {
-            scenes.insert(key(context.mapped())?, context.mapped());
+        for scene in &projected {
+            scenes.insert(key(scene)?, scene);
         }
         let exact: Vec<_> = scenes
             .values()
@@ -343,17 +594,18 @@ impl VerifiedRetainedHistory {
         let digest = key(selected)?;
         let sides: Vec<_> = contexts
             .into_iter()
-            .filter(|c| key(c.mapped()).ok().as_ref() == Some(&digest))
+            .zip(projected.iter())
+            .filter(|(_, scene)| key(scene).ok().as_ref() == Some(&digest))
             .collect();
         if sides.len() != 2
-            || sides[0].original().binding.artifact == sides[1].original().binding.artifact
+            || sides[0].0.original().binding.artifact == sides[1].0.original().binding.artifact
         {
             return Err(unavailable(
                 "nonbinary history needs both real source-qualified outcomes",
             ));
         }
         let mut outcomes = vec![];
-        for (index, side) in sides.iter().enumerate() {
+        for (index, (side, projected)) in sides.iter().enumerate() {
             let original = replay_accepted_outcome(
                 request,
                 policy,
@@ -369,13 +621,46 @@ impl VerifiedRetainedHistory {
                 },
                 runs,
             )?;
-            // This actual current-source replay supplies trace correspondence;
-            // its values never replace the original accepted side's values.
-            runs.push(side.replay().clone());
+            // Receipt initialization changes the actual compared seed, never
+            // the historical accepted outcome. Re-execute correspondence on
+            // that actual input instead of relabeling an earlier run binding.
+            let correspondence = if *projected != side.mapped() {
+                let run = budget.replay(
+                    runtime,
+                    source,
+                    projected,
+                    &request.decisions,
+                    policy.search.runtime.clone(),
+                    if index == 0 {
+                        "retained-projected-first"
+                    } else {
+                        "retained-projected-second"
+                    },
+                )?;
+                if run.state != EvidenceState::Observed {
+                    return Err(unavailable(
+                        "initialized historical correspondence did not execute",
+                    ));
+                }
+                run
+            } else {
+                side.replay().clone()
+            };
+            runs.push(correspondence.clone());
+            let original_source = request
+                .sources
+                .iter()
+                .find(|source| {
+                    source.binding == original.binding.source
+                        && source.artifact == original.binding.artifact
+                })
+                .ok_or_else(|| unavailable("retained comparison source is unavailable"))?;
+            let comparison = comparison_observations(policy, original_source, &original)?;
             outcomes.push(RetainedRun {
                 original,
+                comparison,
                 compared_input: selected.input_identity()?,
-                correspondence: side.replay().clone(),
+                correspondence,
                 mappings: side.mappings().to_vec(),
             });
         }
@@ -390,6 +675,7 @@ impl VerifiedRetainedHistory {
 /// historical RunEvidence, output receipt or immutable identity is rewritten.
 pub(super) struct RetainedRun {
     pub original: RunEvidence,
+    pub comparison: Vec<Observation>,
     pub correspondence: RunEvidence,
     compared_input: Digest,
     pub mappings: Vec<SemanticMapping>,
@@ -398,6 +684,7 @@ impl RetainedRun {
     pub fn direct(run: RunEvidence) -> Self {
         Self {
             original: run.clone(),
+            comparison: run.observations.clone(),
             compared_input: run.binding.input_digest.clone(),
             correspondence: run,
             mappings: vec![],
@@ -495,4 +782,110 @@ pub(super) fn append_check(
     report.checks.extend(checked.checks);
     report.runs.extend(checked.runs);
     disposition
+}
+
+struct HistoryAdmission {
+    contexts: Vec<ScopedExecutionContext>,
+    projected_contexts: ProjectionRegistry,
+}
+impl ReplayAdmission for HistoryAdmission {
+    fn replay_operation_ids(
+        &self,
+        source: &CapturedProgram,
+        scenario: &ScenarioSpec,
+    ) -> Result<Vec<Id>, AdapterError> {
+        let projected = self
+            .projected_contexts
+            .read()
+            .map_err(|_| unavailable("projected scene admission lock is poisoned"))?;
+        let mut result = None;
+        let explicit = self
+            .contexts
+            .iter()
+            .chain(projected.values())
+            .any(|context| {
+                context.has_scenario_correspondence(scenario)
+                    && context
+                        .validate_seed(source, &scenario.seed, scenario.clock_day)
+                        .is_ok()
+            });
+        for context in self.contexts.iter().chain(projected.values()) {
+            if explicit && !context.has_scenario_correspondence(scenario) {
+                continue;
+            }
+            if context
+                .validate_seed(source, &scenario.seed, scenario.clock_day)
+                .is_err()
+            {
+                continue;
+            }
+            let ids = context.replay_operation_ids(source, scenario)?;
+            if result.as_ref().is_some_and(|prior| prior != &ids) {
+                return Err(unavailable(
+                    "ambiguous historical replay operation identity",
+                ));
+            }
+            result = Some(ids);
+        }
+        if let Some(ids) = result {
+            return Ok(ids);
+        }
+        if crate::product_runtime::has_protected_fields(source) {
+            return Err(unavailable(
+                "scoped replay operation identity is unverified",
+            ));
+        }
+        Ok(scenario.replay_operation_ids()?)
+    }
+
+    fn validate_seed(
+        &self,
+        source: &CapturedProgram,
+        data: &DataSnapshot,
+        day: i32,
+    ) -> Result<(), AdapterError> {
+        if !crate::product_runtime::has_protected_fields(source) {
+            return Ok(());
+        }
+        // Several independently verified contexts can contain the same
+        // baseline source. Admission is the exact source-and-data pair, not
+        // the first source match (a newer preparation may initialize a seed).
+        let projected = self
+            .projected_contexts
+            .read()
+            .map_err(|_| unavailable("projected scene admission lock is poisoned"))?;
+        self.contexts
+            .iter()
+            .chain(projected.values())
+            .filter(|context| context.contains_managed_source(source))
+            .find_map(|context| context.validate_seed(source, data, day).ok())
+            .ok_or_else(|| {
+                unavailable("scoped source and data have no matching verified host context")
+            })
+    }
+    fn validate_state(
+        &self,
+        source: &CapturedProgram,
+        data: &DataSnapshot,
+        day: i32,
+    ) -> Result<(), AdapterError> {
+        if !crate::product_runtime::has_protected_fields(source) {
+            return Ok(());
+        }
+        // Several independently verified contexts can contain the same
+        // baseline source. Admission is the exact source-and-data pair, not
+        // the first source match (a newer preparation may initialize a seed).
+        let projected = self
+            .projected_contexts
+            .read()
+            .map_err(|_| unavailable("projected scene admission lock is poisoned"))?;
+        self.contexts
+            .iter()
+            .chain(projected.values())
+            .filter(|context| context.contains_managed_source(source))
+            .find_map(|context| context.validate_state(source, data, day).ok())
+            .ok_or_else(|| {
+                unavailable("scoped source and data have no matching verified host context")
+            })
+    }
 }
