@@ -514,6 +514,7 @@ fn retained_new_action_pair_reopens_for_fresh_discovery_without_repeated_questio
                 Disclosure::Synthetic,
             )
             .unwrap();
+        let original_primary_binding = scenes[0].evidence().binding.source.clone();
         let change = engine
             .prepare_paired_rehearsed_choice(
                 &store,
@@ -540,6 +541,23 @@ fn retained_new_action_pair_reopens_for_fresh_discovery_without_repeated_questio
             vec![],
         )
         .unwrap();
+        // Same executable bytes do not make an arbitrary fresh source capture
+        // a historical producer or an independently prepared primary target.
+        let mut missing = policy.clone();
+        missing.retained_history = Some(VerifiedRetainedHistory::load(&reopened).unwrap());
+        missing
+            .retained_history
+            .as_mut()
+            .unwrap()
+            .map_prepared_result(checked.clone())
+            .unwrap();
+        let denied = discover(
+            &request,
+            &result,
+            &missing,
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(denied.is_err() || denied.unwrap().questions.is_empty());
         policy
             .retained_history
             .as_mut()
@@ -548,6 +566,17 @@ fn retained_new_action_pair_reopens_for_fresh_discovery_without_repeated_questio
             .unwrap();
         let report =
             discover(&request, &result, &policy, Arc::new(AtomicBool::new(false))).unwrap();
+        assert_ne!(request.sources[1].binding, original_primary_binding);
+        assert!(report
+            .runs
+            .iter()
+            .any(|run| run.binding.source == original_primary_binding
+                && run.state == EvidenceState::Observed));
+        assert!(report
+            .runs
+            .iter()
+            .any(|run| run.binding.source == request.sources[1].binding
+                && run.state == EvidenceState::Observed));
         assert!(report.questions.is_empty(), "{:?}", report.questions);
         assert!(report.unverified.is_empty(), "{:?}", report.unverified);
         assert!(
