@@ -134,3 +134,27 @@ intentions with the production runtime.
 The deterministic tests use explicitly fixture-origin programs/provider responses.
 They verify these components and persistence, not live AI generation, a fresh
 human user's success, arbitrary framework execution or market value.
+
+## Two prospective managed evolutions
+
+For a new action absent from current, `accept_paired_scoped_scenes` executes two
+independently prepared managed evolutions on the same exact frozen business
+seed, day, session and semantic inputs. Each runtime start performs its own
+checked additive schema projection. `prepare_paired_rehearsed_choice` retains
+EitherAcceptable, BothNeeded, NeitherFits or Deferred as one pending scene
+package. Both exact authored/compiled proofs share its recording receipt and
+birth. The existing one-prepared-versus-current rehearsal remains available.
+
+This bounded pair route accepts Evolution preparations only. It does not combine
+fresh-layer cohort initializations, substitute current for a prospective design,
+or activate either candidate. Live behavior, records, schema, session, artifacts
+and adopted layers stay unchanged. Open and backup admission verify both proofs,
+the exact experienced source/input pair, recording inventory and decision birth.
+A missing or replaced proof cannot reuse the original operation receipt.
+
+Pending new-action scenes that current cannot perform retain their actual
+prospective replay sources; they are not labeled current observations. A fresh
+prepared target supplies later discovery correspondence. Later acceptance or
+resolution requires a newly prepared selected design against then-current work
+and the exact pending decision IDs. Old preparations remain stale after daily
+work, while immutable experienced history stays available.

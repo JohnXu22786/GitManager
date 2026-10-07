@@ -1,6 +1,7 @@
 //! Source-bound hypotheses become questions only after independent execution.
 //! This module cannot adopt programs or mutate a daily-work store.
 mod history;
+mod prepared;
 mod provider;
 mod source;
 use crate::product_contract::*;
@@ -9,6 +10,7 @@ use crate::product_runtime::LocalRuntime;
 use crate::product_scenarios::*;
 use history::RetainedRun;
 pub use history::VerifiedRetainedHistory;
+pub use prepared::PreparedDiscoveryCandidate;
 pub use provider::*;
 pub use source::{analyze_delta, SourceDelta};
 use std::{
@@ -103,6 +105,8 @@ pub struct ChoiceQuestion {
 }
 #[derive(Clone, Debug)]
 pub struct DiscoveryReport {
+    /// Exact original development results and their checked host lowering links.
+    pub lowerings: Vec<PreparedDiscoveryCandidate>,
     pub coverage: Vec<String>,
     pub delta: SourceDelta,
     pub questions: Vec<ChoiceQuestion>,
@@ -625,8 +629,15 @@ pub fn discover(
     if before.program.id != candidate.program.id {
         return Err(invalid("source revision changes the application identity"));
     }
+    let lowerings = policy
+        .retained_history
+        .as_ref()
+        .map(|history| history.result_lowerings(request, result))
+        .transpose()?
+        .unwrap_or_default();
     let delta = analyze_delta(before, candidate)?;
     let mut report = DiscoveryReport {
+        lowerings,
         coverage: vec!["Finite source-guided hypotheses and executed scenarios; untested behavior is not proven equivalent".into()],
         delta,
         questions: vec![],
@@ -935,7 +946,13 @@ pub fn discover(
     }
     let mut candidates = BTreeMap::new();
     for c in &result.response.candidates {
-        let captured = if let Some(source) = request
+        let captured = if let Some(lowering) = report
+            .lowerings
+            .iter()
+            .find(|link| link.candidate_id() == c.id)
+        {
+            lowering.target().clone()
+        } else if let Some(source) = request
             .sources
             .iter()
             .find(|source| source.source_bytes == c.source_json.as_bytes())

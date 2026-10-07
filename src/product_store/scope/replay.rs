@@ -340,6 +340,80 @@ impl ScopedExecutionContext {
         context.adoption_target = snapshot.active_revision.clone();
         Ok(context)
     }
+    /// Two prospective managed evolutions over one exact live basis. Only
+    /// independently regenerated manifests/captures are inserted; no cohort
+    /// metadata, schema or authority from arbitrary contexts is combined.
+    pub fn rehearsed_pair(
+        snapshot: &ProjectSnapshot,
+        first: &PreparedScopedChange,
+        second: &PreparedScopedChange,
+    ) -> Result<Self> {
+        for prepared in [first, second] {
+            rehearsal::eligible(prepared)?;
+            if prepared.manifest.transition != ScopeTransition::Evolution {
+                return Err(compiler::error(
+                    "paired rehearsal supports managed evolutions only",
+                ));
+            }
+        }
+        if first.manifest.output == second.manifest.output
+            || first.target.artifact == second.target.artifact
+        {
+            return Err(compiler::error(
+                "paired rehearsal needs two distinct prospective executables",
+            ));
+        }
+        let mut context = Self::rehearsed(snapshot, first)?;
+        // Validate the second separately against the unchanged live snapshot.
+        Self::rehearsed(snapshot, second)?;
+        if first.manifest.basis != second.manifest.basis
+            || first.manifest.layers != second.manifest.layers
+            || first.manifest.active != second.manifest.active
+        {
+            return Err(compiler::error(
+                "paired evolutions do not preserve the same frozen layer basis",
+            ));
+        }
+        retain(&mut context.snapshot, second.candidate())?;
+        retain(&mut context.snapshot, second.target())?;
+        context
+            .snapshot
+            .scope
+            .compositions
+            .insert(second.manifest.output.clone(), second.manifest.clone());
+        context
+            .projected_seeds
+            .insert(second.initialized.identity()?);
+        // Every correspondence is regenerated in the combined, bounded source
+        // registry. Equal IDs with unequal proofs are an error, never last-win.
+        let mut proofs = first.correspondences.clone();
+        for (id, proof) in &second.correspondences {
+            if proofs.get(id).is_some_and(|prior| prior != proof) {
+                return Err(compiler::error("paired correspondence identity collision"));
+            }
+            proofs.insert(id.clone(), proof.clone());
+        }
+        context = context.with_correspondences(&proofs)?;
+        for prepared in [first, second] {
+            context.verify_seed(prepared.target(), &snapshot.data, snapshot.clock_day)?;
+            if merged_data(prepared.target(), &snapshot.data)? != prepared.initialized {
+                return Err(compiler::error("paired evolution seed is not an additive projection of the frozen business input"));
+            }
+        }
+        Ok(context)
+    }
+    pub(crate) fn rehearsals(
+        snapshot: &ProjectSnapshot,
+        prepared: &[PreparedScopedChange],
+    ) -> Result<Self> {
+        match prepared {
+            [single] => Self::rehearsed(snapshot, single),
+            [first, second] => Self::rehearsed_pair(snapshot, first, second),
+            _ => Err(compiler::error(
+                "rehearsal must name one prepared target or two managed evolutions",
+            )),
+        }
+    }
     pub(crate) fn provenance_columns(&self, source: &CapturedProgram) -> Result<ProvenanceColumns> {
         source.validate()?;
         let id = revision(source)?;

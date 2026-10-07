@@ -49,7 +49,55 @@ pub(in crate::product_store) fn rehearsal_request(
         ),
     )?)
 }
-pub(in crate::product_store) fn retain_rehearsal(
+pub(in crate::product_store) fn rehearsals_request(
+    prepared: &[PreparedScopedChange],
+    decisions: &[Id],
+) -> Result<Digest> {
+    match prepared {
+        [single] => rehearsal_request(single, decisions),
+        [first, second]
+            if first.manifest.transition == ScopeTransition::Evolution
+                && second.manifest.transition == ScopeTransition::Evolution =>
+        {
+            let mut proofs = vec![
+                rehearsal_request(first, decisions)?,
+                rehearsal_request(second, decisions)?,
+            ];
+            proofs.sort();
+            if proofs[0] == proofs[1] {
+                return Err(error("paired rehearsal proofs must be distinct"));
+            }
+            Ok(canonical_digest(
+                IdentityDomain::Adoption,
+                &("managed-evolution-pair/1", proofs),
+            )?)
+        }
+        _ => Err(error("unsupported rehearsal proof inventory")),
+    }
+}
+pub(in crate::product_store) fn retain_rehearsals(
+    current: &mut ProjectSnapshot,
+    prepared: &[PreparedScopedChange],
+    next: &DecisionGraph,
+    decisions: &[Id],
+    plan: &AdoptionPlan,
+) -> Result<()> {
+    ScopedExecutionContext::rehearsals(current, prepared)?;
+    if current
+        .scope
+        .rehearsals
+        .len()
+        .saturating_add(prepared.len())
+        > MAX_ITEMS
+    {
+        return Err(error("rehearsal inventory exceeds bounds"));
+    }
+    for proof in prepared {
+        retain_rehearsal(current, proof, next, decisions, plan)?;
+    }
+    Ok(())
+}
+fn retain_rehearsal(
     current: &mut ProjectSnapshot,
     prepared: &PreparedScopedChange,
     next: &DecisionGraph,
@@ -57,7 +105,6 @@ pub(in crate::product_store) fn retain_rehearsal(
     plan: &AdoptionPlan,
 ) -> Result<()> {
     eligible(prepared)?;
-    ScopedExecutionContext::prepared(current, prepared)?;
     if plan.target != current.program()?.artifact
         || plan.current_source != current.program()?.binding
         || current.scope.rehearsals.len() >= MAX_ITEMS
@@ -113,6 +160,109 @@ pub(in crate::product_store) fn retain_rehearsal(
         .scope
         .rehearsals
         .insert(prepared.manifest.output.clone(), proof);
+    Ok(())
+}
+/// Reconstruct the immutable recording request from its historical graph and
+/// exact proof inventory. Missing/replaced proofs cannot borrow an earlier
+/// operation receipt even when their own local content hashes are recomputed.
+pub(super) fn verify_recording_request(
+    snapshot: &ProjectSnapshot,
+    receipt: &AdoptionReceipt,
+    graph: &DecisionGraph,
+) -> Result<()> {
+    let proofs: Vec<_> = snapshot
+        .scope
+        .rehearsals
+        .values()
+        .filter(|proof| proof.recorded_by == receipt.plan.id)
+        .collect();
+    let target = program(snapshot, &receipt.active)?;
+    let mut request = if proofs.is_empty() {
+        canonical_digest(IdentityDomain::Adoption, &(&receipt.plan, target, graph))?
+    } else {
+        if proofs.len() > 2
+            || (proofs.len() == 2
+                && proofs
+                    .iter()
+                    .any(|proof| proof.manifest.transition != ScopeTransition::Evolution))
+        {
+            return Err(error("recording has an unsupported rehearsal inventory"));
+        }
+        let first = proofs[0];
+        if proofs.iter().any(|proof| {
+            proof.manifest.basis != first.manifest.basis
+                || proof.witnesses != first.witnesses
+                || proof.recorded_revision != first.recorded_revision
+        }) {
+            return Err(error(
+                "paired rehearsal proofs differ in basis or exact recording birth",
+            ));
+        }
+        let decisions: Vec<_> = graph
+            .decisions
+            .iter()
+            .filter(|decision| first.witnesses.contains_key(&decision.id))
+            .map(|decision| decision.id.clone())
+            .collect();
+        let mut requests = vec![];
+        for proof in proofs {
+            requests.push(canonical_digest(
+                IdentityDomain::Adoption,
+                &(
+                    "managed-rehearsal/1",
+                    &proof.manifest.basis.snapshot,
+                    &proof.manifest,
+                    program(snapshot, &proof.manifest.business)?,
+                    program(snapshot, &proof.manifest.output)?,
+                    &proof.seed,
+                    &proof.compatibility,
+                    &decisions,
+                ),
+            )?);
+        }
+        let proof_request = if requests.len() == 1 {
+            requests.remove(0)
+        } else {
+            requests.sort();
+            canonical_digest(
+                IdentityDomain::Adoption,
+                &("managed-evolution-pair/1", requests),
+            )?
+        };
+        canonical_digest(
+            IdentityDomain::Adoption,
+            &(
+                "record-managed-rehearsal/1",
+                &receipt.plan,
+                target,
+                graph,
+                proof_request,
+            ),
+        )?
+    };
+    let correspondences: BTreeMap<_, _> = snapshot
+        .scope
+        .correspondences
+        .iter()
+        .filter(|(_, proof)| proof.operation == receipt.plan.id)
+        .map(|(id, receipt)| (id.clone(), receipt.proof.clone()))
+        .collect();
+    if !correspondences.is_empty() {
+        request = canonical_digest(
+            IdentityDomain::Adoption,
+            &("scope-correspondence/1", &request, correspondences),
+        )?;
+    }
+    if snapshot
+        .operations
+        .get(&receipt.plan.id)
+        .map(|operation| &operation.request)
+        != Some(&request)
+    {
+        return Err(error(
+            "rehearsal or decision recording differs from its exact operation receipt",
+        ));
+    }
     Ok(())
 }
 pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {

@@ -914,12 +914,37 @@ impl ProductStore {
     where
         F: FnOnce(&ProjectSnapshot, &CapturedProgram, &DecisionGraph, &AdoptionPlan) -> Result<()>,
     {
+        self.adopt_rehearsals_verified(
+            expected_revision,
+            prepared,
+            target,
+            decisions,
+            std::slice::from_ref(rehearsal),
+            recorded_decisions,
+            correspondences,
+            verify,
+        )
+    }
+    pub(crate) fn adopt_rehearsals_verified<F>(
+        &self,
+        expected_revision: u64,
+        prepared: &PreparedAdoption,
+        target: &CapturedProgram,
+        decisions: &DecisionGraph,
+        rehearsals: &[scope::PreparedScopedChange],
+        recorded_decisions: &[Id],
+        correspondences: &BTreeMap<Digest, scope::ScopeCorrespondence>,
+        verify: F,
+    ) -> Result<ProjectSnapshot>
+    where
+        F: FnOnce(&ProjectSnapshot, &CapturedProgram, &DecisionGraph, &AdoptionPlan) -> Result<()>,
+    {
         self.adopt_verified_inner(
             expected_revision,
             prepared,
             target,
             decisions,
-            Some((rehearsal, recorded_decisions)),
+            Some((rehearsals, recorded_decisions)),
             correspondences,
             verify,
         )
@@ -930,7 +955,7 @@ impl ProductStore {
         prepared: &PreparedAdoption,
         target: &CapturedProgram,
         decisions: &DecisionGraph,
-        rehearsal: Option<(&scope::PreparedScopedChange, &[Id])>,
+        rehearsal: Option<(&[scope::PreparedScopedChange], &[Id])>,
         correspondences: &BTreeMap<Digest, scope::ScopeCorrespondence>,
         verify: F,
     ) -> Result<ProjectSnapshot>
@@ -947,7 +972,7 @@ impl ProductStore {
                     &prepared.plan,
                     target,
                     decisions,
-                    scope::rehearsal_request(proof, ids)?,
+                    scope::rehearsals_request(proof, ids)?,
                 ),
             )?
         } else {
@@ -992,7 +1017,7 @@ impl ProductStore {
         decisions.validate()?;
         verify(&current, target, decisions, &prepared.plan)?;
         if let Some((proof, ids)) = rehearsal {
-            scope::retain_rehearsal(&mut current, proof, decisions, ids, &prepared.plan)?;
+            scope::retain_rehearsals(&mut current, proof, decisions, ids, &prepared.plan)?;
         }
         let previous = current.active_revision.clone();
         let target_revision = revision(target)?;
