@@ -15,6 +15,12 @@ jobs:
   test:
     name: Cargo test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # Optimize the complete test workload while retaining its runtime checks.
+    # The independently selected release profile is unaffected.
+    env:
+      CARGO_PROFILE_TEST_OPT_LEVEL: "1"
+      CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: "true"
+      CARGO_PROFILE_TEST_OVERFLOW_CHECKS: "true"
     strategy:
       fail-fast: false
       matrix:
@@ -69,8 +75,51 @@ jobs:
       - name: Check production application
         run: cargo check --locked --bin git_manager
 
+      - name: Compile Linux scope test harness
+        if: ${{ success() && runner.os == 'Linux' && github.event_name == 'push' && github.ref == 'refs/heads/feat/enforced-adoption-scope' }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git diff --exit-code HEAD
+          test "$(rustc --version --verbose | sed -n 's/^host: //p')" = x86_64-unknown-linux-gnu
+          cargo test --locked --no-run --test product_scope_runtime_view_test --message-format=json-render-diagnostics > "$RUNNER_TEMP/scope-test-build.jsonl"
+          git diff --exit-code HEAD
+
+      - name: Package Linux scope test harness
+        if: ${{ success() && runner.os == 'Linux' && github.event_name == 'push' && github.ref == 'refs/heads/feat/enforced-adoption-scope' }}
+        run: |
+          python3 scripts/package_scope_test.py \
+            --repo-root "$GITHUB_WORKSPACE" \
+            --build-json "$RUNNER_TEMP/scope-test-build.jsonl" \
+            --source-sha "$GITHUB_SHA" \
+            --output-dir "$RUNNER_TEMP/scope-test-artifacts"
+
+      - name: Upload Linux scope test harness
+        if: ${{ success() && runner.os == 'Linux' && github.event_name == 'push' && github.ref == 'refs/heads/feat/enforced-adoption-scope' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: scope-tests-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}-product_scope_runtime_view_test-x86_64-unknown-linux-gnu
+          path: ${{ runner.temp }}/scope-test-artifacts/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
       - name: Run tests
+        id: full_suite
+        if: ${{ !cancelled() }}
         run: cargo test --all-targets
+
+      # Isolated success can reveal concurrency or cold-start sensitivity; it
+      # does not establish causality or override the original suite failure.
+      - name: Diagnose macOS bridge fixture in isolation
+        if: ${{ failure() && runner.os == 'macOS' && steps.full_suite.outcome == 'failure' }}
+        timeout-minutes: 5
+        run: cargo test --test product_provider_test bridge_rejects_correlated_and_domain_mismatches_and_cancels_running_fixture -- --exact --nocapture --test-threads=1
+
+      - name: Diagnose macOS consented discovery fixture in isolation
+        if: ${{ failure() && runner.os == 'macOS' && steps.full_suite.outcome == 'failure' }}
+        timeout-minutes: 5
+        run: cargo test --test product_provider_test consented_fake_cli_bridge_preserves_origin_and_rejects_mismatches -- --exact --nocapture --test-threads=1
 
       - name: Build Linux candidate
         if: ${{ success() && runner.os == 'Linux' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}

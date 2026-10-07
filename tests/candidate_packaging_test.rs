@@ -262,6 +262,14 @@ fn ci_candidate_steps_are_main_push_only_and_read_only() {
     assert!(!workflow.contains("contents: write"));
     assert!(!workflow.contains("action-gh-release"));
     assert!(workflow.contains("run: cargo test --all-targets"));
+    assert!(workflow.contains("    env:\n      CARGO_PROFILE_TEST_OPT_LEVEL: \"1\"\n      CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: \"true\"\n      CARGO_PROFILE_TEST_OVERFLOW_CHECKS: \"true\"\n"));
+    for key in [
+        "CARGO_PROFILE_TEST_OPT_LEVEL",
+        "CARGO_PROFILE_TEST_DEBUG_ASSERTIONS",
+        "CARGO_PROFILE_TEST_OVERFLOW_CHECKS",
+    ] {
+        assert_eq!(workflow.matches(key).count(), 1);
+    }
     for os in ["ubuntu-latest", "windows-latest", "macos-latest"] {
         assert!(workflow.contains(&format!("          - {os}")));
     }
@@ -270,6 +278,57 @@ fn ci_candidate_steps_are_main_push_only_and_read_only() {
         .iter()
         .position(|step| step.starts_with("name: Run tests\n"))
         .unwrap();
+    assert!(steps[test_index].contains("        id: full_suite\n"));
+    assert!(steps[test_index].contains("        if: ${{ !cancelled() }}\n"));
+    assert!(!workflow.contains("continue-on-error:"));
+    let mut harness_steps = Vec::new();
+    for name in [
+        "Compile Linux scope test harness",
+        "Package Linux scope test harness",
+        "Upload Linux scope test harness",
+    ] {
+        let index = steps
+            .iter()
+            .position(|step| step.starts_with(&format!("name: {name}\n")))
+            .unwrap();
+        assert!(index < test_index);
+        assert!(steps[index].contains("        if: ${{ success() && runner.os == 'Linux' && github.event_name == 'push' && github.ref == 'refs/heads/feat/enforced-adoption-scope' }}\n"));
+        harness_steps.push((index, steps[index]));
+    }
+    assert!(harness_steps.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    assert!(harness_steps[0].1.contains("cargo test --locked --no-run --test product_scope_runtime_view_test --message-format=json-render-diagnostics"));
+    assert!(!harness_steps[0].1.contains("--release"));
+    assert!(!harness_steps[0].1.contains("--features"));
+    assert!(harness_steps[1]
+        .1
+        .contains("python3 scripts/package_scope_test.py"));
+    assert!(harness_steps[1].1.contains("--source-sha \"$GITHUB_SHA\""));
+    assert!(harness_steps[2]
+        .1
+        .contains("uses: actions/upload-artifact@v4"));
+    assert!(harness_steps[2].1.contains("scope-tests-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}-product_scope_runtime_view_test-x86_64-unknown-linux-gnu"));
+    assert!(harness_steps[2].1.contains("retention-days: 1\n"));
+    assert!(harness_steps[2].1.contains("if-no-files-found: error\n"));
+    let diagnostic_index = steps
+        .iter()
+        .position(|step| step.starts_with("name: Diagnose macOS bridge fixture in isolation\n"))
+        .expect("missing failure-only macOS diagnostic");
+    assert!(diagnostic_index > test_index);
+    let diagnostic = steps[diagnostic_index];
+    assert!(diagnostic.contains("        if: ${{ failure() && runner.os == 'macOS' && steps.full_suite.outcome == 'failure' }}\n"));
+    assert!(diagnostic.contains("        timeout-minutes: 5\n"));
+    assert!(diagnostic.contains("        run: cargo test --test product_provider_test bridge_rejects_correlated_and_domain_mismatches_and_cancels_running_fixture -- --exact --nocapture --test-threads=1\n"));
+    let consented_index = steps
+        .iter()
+        .position(|step| {
+            step.starts_with("name: Diagnose macOS consented discovery fixture in isolation\n")
+        })
+        .expect("missing failure-only consented discovery diagnostic");
+    assert!(consented_index > diagnostic_index);
+    let consented = steps[consented_index];
+    assert!(consented.contains("        if: ${{ failure() && runner.os == 'macOS' && steps.full_suite.outcome == 'failure' }}\n"));
+    assert!(consented.contains("        timeout-minutes: 5\n"));
+    assert!(consented.contains("        run: cargo test --test product_provider_test consented_fake_cli_bridge_preserves_origin_and_rejects_mismatches -- --exact --nocapture --test-threads=1\n"));
     let mut candidate_steps = Vec::new();
     for name in [
         "Build Linux candidate",
@@ -281,6 +340,7 @@ fn ci_candidate_steps_are_main_push_only_and_read_only() {
             .position(|step| step.starts_with(&format!("name: {name}\n")))
             .expect("missing candidate step");
         assert!(index > test_index);
+        assert!(index > diagnostic_index);
         assert!(steps[index].contains("        if: ${{ success() && runner.os == 'Linux' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}\n"));
         candidate_steps.push((index, steps[index]));
     }

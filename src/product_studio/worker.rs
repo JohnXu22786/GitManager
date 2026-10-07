@@ -173,7 +173,7 @@ impl Worker {
         if let Err(e) = self.reconcile(false, &Gate::default()) {
             self.notice = e;
         }
-        if self.opened.is_none() {
+        if self.opened.is_none() && !matches!(self.page, Page::Upgrade { .. }) {
             let last = self.journal.as_ref().and_then(|j| j.value.last.clone());
             if let Some(last) = last {
                 if let Err(e) = self.open(last.path, Some(last.identity)) {
@@ -470,12 +470,29 @@ impl Worker {
         Ok(())
     }
     fn open(&mut self, path: PathBuf, expected: Option<ToolIdentity>) -> Result<(), String> {
-        let opened = open_verified(&path, expected.as_ref()).map_err(error)?;
+        let opened = match inspect_open(&path, expected.as_ref()).map_err(error)? {
+            OpenGate::UpgradeRequired(summary) => {
+                let tool = Association {
+                    path,
+                    identity: ToolIdentity {
+                        project_id: summary.project_id.clone(),
+                        first_program: summary.first_program.clone(),
+                    },
+                };
+                self.journal(|j| j.last = Some(tool.clone()))?;
+                self.opened = None;
+                self.draft = None;
+                self.ready = None;
+                self.page = Page::Upgrade { tool, summary };
+                return Ok(());
+            }
+            OpenGate::Ready(opened) => opened,
+        };
         let association = Association {
             path,
             identity: ToolIdentity::from_snapshot(&opened.snapshot).map_err(error)?,
         };
-        let page = daily_page(&association, &opened.snapshot)?;
+        let page = daily_page(&association, &opened.store, &opened.snapshot)?;
         self.opened = Some(OpenTool {
             association: association.clone(),
             store: opened.store,
@@ -487,6 +504,87 @@ impl Worker {
         self.journal(|j| j.last = Some(association.clone()))?;
         self.post_save(&association);
         Ok(())
+    }
+    fn upgrade(
+        &mut self,
+        tool: &Association,
+        summary: &UpgradeSummary,
+        gate: &Gate,
+    ) -> Result<(), String> {
+        if !matches!(&self.page, Page::Upgrade { tool: shown, summary: shown_summary } if shown == tool && shown_summary == summary)
+        {
+            return Err("The displayed upgrade request changed; open the saved tool again".into());
+        }
+        if self
+            .journal
+            .as_ref()
+            .and_then(|j| j.value.pending.as_ref())
+            .is_some_and(|pending| {
+                let (Interrupted::Create { tool: pending_tool }
+                | Interrupted::Daily {
+                    tool: pending_tool, ..
+                }) = pending;
+                pending_tool != tool
+            })
+        {
+            return Err(
+                "Resolve the unfinished save for the other tool before upgrading this one".into(),
+            );
+        }
+        self.before_commit(gate);
+        gate.check()?;
+        match inspect_open(&tool.path, Some(&tool.identity)).map_err(error)? {
+            OpenGate::UpgradeRequired(current) if current == *summary => (),
+            OpenGate::Ready(_) => {
+                self.notice = "This tool is already upgraded; reopening its verified current work".into();
+                return self.open(tool.path.clone(), Some(tool.identity.clone()));
+            }
+            _ => return Err("Saved work changed since the upgrade was shown. Open it again to review the current upgrade".into()),
+        }
+        gate.commit()?;
+        // No ordinary daily handle survives migration. The verified helper
+        // drops its RestartRequired handle; only a fresh open may render/edit.
+        self.opened = None;
+        let result = upgrade_open_verified(&tool.path, Some(&tool.identity), |stage| {
+            gate.upgrade_stage.store(
+                match stage {
+                    UpgradeProgress::Validating => 1,
+                    UpgradeProgress::Staged => 2,
+                    UpgradeProgress::Verified => 3,
+                    UpgradeProgress::Activating => 4,
+                    UpgradeProgress::RestartRequired => 5,
+                },
+                Ordering::Release,
+            );
+        });
+        #[cfg(test)]
+        let result = if result.is_ok() && self.config.hooks.lose_ack.swap(false, Ordering::AcqRel) {
+            Err(crate::product_locations::OperationIssue {
+                kind: crate::product_locations::IssueKind::Unavailable,
+                message: "injected lost upgrade acknowledgement".into(),
+                next_step: "reconcile this exact path".into(),
+                detail: String::new(),
+            })
+        } else {
+            result
+        };
+        // A failed acknowledgement is not evidence of an uncommitted upgrade.
+        // Reconcile the same path/identity, never create or overwrite a copy.
+        match inspect_open(&tool.path, Some(&tool.identity)).map_err(error)? {
+            OpenGate::Ready(_) => {
+                self.committed = Some(tool.path.clone());
+                self.after_commit();
+                self.notice = "Local format upgrade verified. The tool was restarted and reopened with its saved work; original snapshots and backups were kept".into();
+                self.open(tool.path.clone(), Some(tool.identity.clone()))?;
+                if self.journal.as_ref().is_some_and(|j| j.value.pending.is_some()) {
+                    if let Err(e) = self.reconcile(false, gate) {
+                        self.notice.push_str(&format!(" The earlier input remains recorded for recovery: {e}"));
+                    }
+                }
+                Ok(())
+            }
+            OpenGate::UpgradeRequired(_) => Err(format!("The upgrade did not activate. Original saved work is kept; review and retry the upgrade. {:?}", result.err())),
+        }
     }
     fn post_save(&mut self, tool: &Association) {
         let result = (|| -> Result<(), String> {
@@ -592,7 +690,7 @@ impl Worker {
                 self.committed = Some(path.clone());
                 self.after_commit();
                 self.opened = Some(OpenTool { association: association.clone(), store: opened.store, snapshot: opened.snapshot });
-                self.page = daily_page(&association, &self.opened.as_ref().unwrap().snapshot)?;
+                self.page = daily_page(&association, &self.opened.as_ref().unwrap().store, &self.opened.as_ref().unwrap().snapshot)?;
                 self.draft = None;
                 self.journal(|j| { j.pending = None; j.last = Some(association.clone()); })?;
                 self.notice = "Tool saved. You can now enter real work; the isolated draft records were not saved".into();
@@ -668,7 +766,11 @@ impl Worker {
                 store: checked.store,
                 snapshot: checked.snapshot,
             });
-            self.page = daily_page(&association, &self.opened.as_ref().unwrap().snapshot)?;
+            self.page = daily_page(
+                &association,
+                &self.opened.as_ref().unwrap().store,
+                &self.opened.as_ref().unwrap().snapshot,
+            )?;
             self.journal(|j| {
                 j.pending = None;
                 j.last = Some(association.clone());
@@ -731,6 +833,16 @@ impl Worker {
     }
     fn reconcile(&mut self, retry: bool, gate: &Gate) -> Result<(), String> {
         let pending = self.journal.as_ref().and_then(|j| j.value.pending.clone());
+        if let Some(Interrupted::Create { tool } | Interrupted::Daily { tool, .. }) = &pending {
+            if matches!(
+                inspect_open(&tool.path, Some(&tool.identity)).map_err(error)?,
+                OpenGate::UpgradeRequired(_)
+            ) {
+                // Launch inspects only. Neither an interrupted save nor a
+                // previous upgrade request grants permission to migrate now.
+                return self.open(tool.path.clone(), Some(tool.identity.clone()));
+            }
+        }
         match pending {
             None => self.reconcile_provider(),
             Some(Interrupted::Create { tool }) => {
@@ -746,7 +858,11 @@ impl Worker {
                     store: opened.store,
                     snapshot: opened.snapshot,
                 });
-                self.page = daily_page(&tool, &self.opened.as_ref().unwrap().snapshot)?;
+                self.page = daily_page(
+                    &tool,
+                    &self.opened.as_ref().unwrap().store,
+                    &self.opened.as_ref().unwrap().snapshot,
+                )?;
                 self.journal(|j| {
                     j.pending = None;
                     j.last = Some(tool.clone());
@@ -800,7 +916,11 @@ impl Worker {
                     store: opened.store,
                     snapshot: opened.snapshot,
                 });
-                self.page = daily_page(&tool, &self.opened.as_ref().unwrap().snapshot)?;
+                self.page = daily_page(
+                    &tool,
+                    &self.opened.as_ref().unwrap().store,
+                    &self.opened.as_ref().unwrap().snapshot,
+                )?;
                 self.journal(|j| {
                     j.pending = None;
                     j.last = Some(tool.clone());
@@ -966,6 +1086,7 @@ impl Worker {
             Action::Save => self.save(key, gate),
             Action::Daily { input } => self.daily(input.clone(), key, gate),
             Action::Open { path, expected } => self.open(path.clone(), expected.clone()),
+            Action::Upgrade { tool, summary } => self.upgrade(tool, summary, gate),
             Action::OpenDialog => match self.pick_folder("Open a saved generated-tool folder") {
                 Some(path) => {
                     gate.check()?;
@@ -1139,23 +1260,23 @@ fn empty_run(
         )
         .map_err(error)
 }
-fn daily_page(tool: &Association, snapshot: &ProjectSnapshot) -> Result<Page, String> {
-    let runtime = LocalRuntime::default();
-    let run = runtime
-        .resume(
-            snapshot.program().map_err(error)?,
-            &snapshot.data,
-            &snapshot.session,
-            snapshot.clock_day,
-            0,
-            RuntimeLimits::default(),
-            &snapshot.artifacts,
-        )
-        .map_err(error)?;
+fn daily_page(
+    tool: &Association,
+    store: &ProductStore,
+    snapshot: &ProjectSnapshot,
+) -> Result<Page, String> {
+    let model = store.runtime_view().map_err(error)?;
+    // runtime_view performs its own verified load. Do not pair a newer view
+    // with an older request basis if another process saves during rendering.
+    if store.load().map_err(error)? != *snapshot {
+        return Err(
+            "The saved tool changed while opening its view; reopen the current work".into(),
+        );
+    }
     Ok(Page::Daily {
         tool: tool.clone(),
         basis: Basis::capture(snapshot)?,
-        model: runtime.view_model(&run).map_err(error)?,
+        model,
     })
 }
 fn has_receipt(

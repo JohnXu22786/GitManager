@@ -4,7 +4,9 @@
 mod journal;
 #[path = "product_studio/worker.rs"]
 mod worker;
-use crate::product_backup::{open_verified, CheckpointShelf};
+use crate::product_backup::{
+    inspect_open, open_verified, upgrade_open_verified, CheckpointShelf, OpenGate,
+};
 use crate::product_contract::*;
 use crate::product_discovery::{
     encode_request, prepare_development, PreparedDevelopment, ProviderOptions,
@@ -15,7 +17,7 @@ use crate::product_provider::{
     CapabilityProfile, ConsentReceipt, DataDisclosure, JobState, ProviderKind, ProviderTransport,
 };
 use crate::product_runtime::{LocalRuntime, ProductRun};
-use crate::product_store::{ProductStore, ProjectSnapshot};
+use crate::product_store::{ProductStore, ProjectSnapshot, UpgradeProgress, UpgradeSummary};
 use crate::ui::product_runtime_view::{take_shortcuts, ProductRuntimeView, WidgetTrace};
 use journal::{Association, Basis, Interrupted, JournalFile, ProviderAssociation, UnsavedInput};
 use std::{
@@ -56,12 +58,14 @@ fn day() -> i32 {
 struct Gate {
     state: Arc<AtomicU8>,
     cancelled: Arc<AtomicBool>,
+    upgrade_stage: Arc<AtomicU8>,
 }
 impl Default for Gate {
     fn default() -> Self {
         Self {
             state: Arc::new(AtomicU8::new(0)),
             cancelled: Arc::new(AtomicBool::new(false)),
+            upgrade_stage: Arc::new(AtomicU8::new(0)),
         }
     }
 }
@@ -128,6 +132,10 @@ enum Action {
         expected: Option<ToolIdentity>,
     },
     OpenDialog,
+    Upgrade {
+        tool: Association,
+        summary: UpgradeSummary,
+    },
     Daily {
         input: SemanticInput,
     },
@@ -154,6 +162,10 @@ struct Pending {
 #[derive(Clone)]
 enum Page {
     Home,
+    Upgrade {
+        tool: Association,
+        summary: UpgradeSummary,
+    },
     Consent {
         disclosure: DataDisclosure,
         need: String,
@@ -420,6 +432,24 @@ impl ProductStudio {
         let mut close = false;
         if busy {
             trace.label(ui, "Working… You can continue using the other app panels.");
+            match self
+                .pending
+                .as_ref()
+                .map(|p| p.gate.upgrade_stage.load(Ordering::Acquire))
+            {
+                Some(1) => trace.label(ui, "Upgrade: validating the original saved tool…"),
+                Some(2) => trace.label(ui, "Upgrade: staged locally; original data is kept…"),
+                Some(3) => trace.label(ui, "Upgrade: saved records and history verified…"),
+                Some(4) => trace.label(
+                    ui,
+                    "Upgrade: activating the verified format; do not close the app…",
+                ),
+                Some(5) => trace.label(
+                    ui,
+                    "Upgrade verified. Restarting the tool with a fresh open session…",
+                ),
+                _ => (),
+            }
             if trace.button(
                 ui,
                 "studio.cancel",
@@ -465,6 +495,34 @@ impl ProductStudio {
             }
         }
         match &self.page {
+            Page::Upgrade { tool, summary } => {
+                trace.label(ui, "This saved generated tool needs a local format upgrade before you can continue working.");
+                trace.label(
+                    ui,
+                    format!(
+                        "Format {} → {} · {} records · {} events · {} outputs",
+                        summary.from_version,
+                        summary.to_version,
+                        summary.records,
+                        summary.events,
+                        summary.artifacts
+                    ),
+                );
+                trace.label(ui, "Original snapshots and backups are kept. This runs offline, verifies saved work, then restarts the tool in a fresh session. Nothing is sent to an AI service.");
+                trace.label(ui, format!("Saved locally: {}", tool.path.display()));
+                if trace.button(
+                    ui,
+                    "studio.upgrade",
+                    "Upgrade, restart tool and reopen",
+                    !busy,
+                ) {
+                    action = Some(Action::Upgrade {
+                        tool: tool.clone(),
+                        summary: summary.clone(),
+                    });
+                }
+                close = trace.button(ui, "studio.back", "Back without upgrading", true);
+            }
             Page::Home => {
                 trace.label(ui, "What would you like this tool to help you do?");
                 trace.control(
@@ -730,6 +788,7 @@ impl ProductStudio {
     pub fn test_page(&self) -> &'static str {
         match self.page {
             Page::Home => "home",
+            Page::Upgrade { .. } => "upgrade",
             Page::Consent { .. } => "consent",
             Page::Draft { .. } => "draft",
             Page::Daily { .. } => "daily",
@@ -761,6 +820,14 @@ impl ProductStudio {
     }
     pub fn test_daily(&mut self, input: SemanticInput) {
         self.issue(Action::Daily { input });
+    }
+    pub fn test_upgrade(&mut self) {
+        if let Page::Upgrade { tool, summary } = &self.page {
+            self.issue(Action::Upgrade {
+                tool: tool.clone(),
+                summary: summary.clone(),
+            });
+        }
     }
     pub fn test_cancel(&mut self) -> bool {
         self.cancel()

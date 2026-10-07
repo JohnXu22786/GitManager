@@ -3,12 +3,63 @@
 #[path = "../src/product_provider/mod.rs"]
 mod product_provider;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "fixtures/product_discovery/mod.rs"]
+mod discovery_fixture;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "fixtures/product_runtime/mod.rs"]
+mod fixture;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "../src/product_contract.rs"]
+mod product_contract;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "../src/product_decisions/mod.rs"]
+mod product_decisions;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "../src/product_discovery/mod.rs"]
+mod product_discovery;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "../src/product_protocol.rs"]
+mod product_protocol;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "../src/product_runtime/mod.rs"]
+mod product_runtime;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "../src/product_scenarios/mod.rs"]
+mod product_scenarios;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "../src/product_store/mod.rs"]
+mod product_store;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use discovery_fixture::input;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use product_contract::{
+    canonical_digest, AdapterError, DevelopmentProvider, DevelopmentRequest, DevelopmentResult,
+    IdentityDomain, Producer,
+};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use product_discovery::{
+    discover, prepare_development, DiscoveryPolicy, DiscoveryReport, ProviderOptions,
+};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::sync::{atomic::AtomicBool, Arc};
+
 use product_provider::*;
 use serde_json::{json, Value};
 use std::{
     fs, thread,
     time::{Duration, Instant},
 };
+
+// Run unrelated macOS CLI fixture cases one at a time. Each case keeps its
+// own concurrent jobs, child processes and original deadlines.
+#[cfg(target_os = "macos")]
+fn cli_fixture_guard() -> std::sync::MutexGuard<'static, ()> {
+    static CASES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    CASES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn request(id: &str, kind: ProviderKind) -> ProviderRequest {
     ProviderRequest {
@@ -139,6 +190,8 @@ fn malformed_request_never_becomes_a_job() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn fixtures_preserve_unicode_and_argv_without_creating_proof() {
+    #[cfg(target_os = "macos")]
+    let _cli_fixture = cli_fixture_guard();
     for kind in [ProviderKind::Codex, ProviderKind::Claude] {
         let f = Fixture::new(kind, "good");
         let r = f.run("good");
@@ -177,6 +230,8 @@ fn fixtures_preserve_unicode_and_argv_without_creating_proof() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn readiness_distinguishes_missing_unsupported_auth_and_failed_probes() {
+    #[cfg(target_os = "macos")]
+    let _cli_fixture = cli_fixture_guard();
     for (mode, expected) in [
         ("auth_required", Readiness::AuthRequired),
         ("failed_probe", Readiness::ProbeFailed),
@@ -201,6 +256,8 @@ fn readiness_distinguishes_missing_unsupported_auth_and_failed_probes() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn consent_and_capability_changes_are_rejected_before_invocation() {
+    #[cfg(target_os = "macos")]
+    let _cli_fixture = cli_fixture_guard();
     for change in ["missing", "expired", "provider", "schema", "executable"] {
         let f = Fixture::new(ProviderKind::Codex, "good");
         let mut p = f.prepare("consent");
@@ -228,6 +285,8 @@ fn consent_and_capability_changes_are_rejected_before_invocation() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn duplicate_requests_and_stale_source_cannot_reuse_results() {
+    #[cfg(target_os = "macos")]
+    let _cli_fixture = cli_fixture_guard();
     let f = Fixture::new(ProviderKind::Codex, "good");
     let r = f.run("once");
     assert!(f
@@ -251,6 +310,8 @@ fn duplicate_requests_and_stale_source_cannot_reuse_results() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn malformed_out_of_order_duplicate_and_partial_codex_results_fail_closed() {
+    #[cfg(target_os = "macos")]
+    let _cli_fixture = cli_fixture_guard();
     for mode in [
         "wrong_digest",
         "wrong_provider",
@@ -280,6 +341,8 @@ fn malformed_out_of_order_duplicate_and_partial_codex_results_fail_closed() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn claude_requires_structured_output_success_and_its_own_session() {
+    #[cfg(target_os = "macos")]
+    let _cli_fixture = cli_fixture_guard();
     for mode in [
         "text_only",
         "wrong_session",
@@ -296,6 +359,8 @@ fn claude_requires_structured_output_success_and_its_own_session() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn nonzero_quota_and_network_are_not_success() {
+    #[cfg(target_os = "macos")]
+    let _cli_fixture = cli_fixture_guard();
     for (mode, expected) in [
         ("nonzero", JobState::ProviderError),
         ("quota", JobState::Quota),
@@ -310,6 +375,8 @@ fn nonzero_quota_and_network_are_not_success() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn stdout_stderr_and_result_files_are_bounded() {
+    #[cfg(target_os = "macos")]
+    let _cli_fixture = cli_fixture_guard();
     for mode in ["stdout_overflow", "stderr_overflow", "oversize_file"] {
         let f = Fixture::new(ProviderKind::Codex, mode);
         let receipt = f.run("bound");
@@ -325,6 +392,8 @@ fn stdout_stderr_and_result_files_are_bounded() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn symlinks_and_parent_escape_are_not_read_or_overwritten() {
+    #[cfg(target_os = "macos")]
+    let _cli_fixture = cli_fixture_guard();
     use std::os::unix::fs::symlink;
     let f = Fixture::new(ProviderKind::Codex, "symlink_output");
     let r = f.run("link");
@@ -346,6 +415,8 @@ fn symlinks_and_parent_escape_are_not_read_or_overwritten() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn timeout_cancellation_and_drop_stop_inherited_child_processes() {
+    #[cfg(target_os = "macos")]
+    let _cli_fixture = cli_fixture_guard();
     for mode in ["slow", "child", "blocked_stdin"] {
         let f = Fixture::new(ProviderKind::Codex, mode);
         let mut r = request("timeout", ProviderKind::Codex);
@@ -380,6 +451,8 @@ fn timeout_cancellation_and_drop_stop_inherited_child_processes() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn successful_parent_cannot_leave_delayed_children_or_partial_publication() {
+    #[cfg(target_os = "macos")]
+    let _cli_fixture = cli_fixture_guard();
     let f = Fixture::new(ProviderKind::Codex, "orphan_child");
     let r = f.run("parent");
     assert_eq!(r.state, JobState::TransportValidated);
@@ -411,6 +484,8 @@ fn successful_parent_cannot_leave_delayed_children_or_partial_publication() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn active_reconciliation_and_cancellation_races_do_not_invent_completion() {
+    #[cfg(target_os = "macos")]
+    let _cli_fixture = cli_fixture_guard();
     let f = Fixture::new(ProviderKind::Codex, "slow");
     let p = f.prepare("active");
     let a = approval(&p);
@@ -436,6 +511,8 @@ fn active_reconciliation_and_cancellation_races_do_not_invent_completion() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn real_endpoint_never_infers_data_only_from_help_or_authentication() {
+    #[cfg(target_os = "macos")]
+    let _cli_fixture = cli_fixture_guard();
     let f = Fixture::new(ProviderKind::Codex, "good");
     // Still a synthetic executable: production factory exercises the ordinary
     // probe policy without any model call or generation authority.
@@ -465,6 +542,8 @@ fn real_endpoint_never_infers_data_only_from_help_or_authentication() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn trusted_harness_discloses_limits_of_unchanged_probe_fingerprints() {
+    #[cfg(target_os = "macos")]
+    let _cli_fixture = cli_fixture_guard();
     for kind in [ProviderKind::Codex, ProviderKind::Claude] {
         let f = Fixture::new(kind, "good");
         // The production policy still runs only the synthetic fixture's probes.
@@ -514,6 +593,8 @@ fn trusted_harness_discloses_limits_of_unchanged_probe_fingerprints() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn corrupted_receipts_and_unfinished_publication_do_not_panic_or_pass() {
+    #[cfg(target_os = "macos")]
+    let _cli_fixture = cli_fixture_guard();
     let f = Fixture::new(ProviderKind::Claude, "good");
     let p = f.prepare("corrupt");
     let a = approval(&p);
@@ -548,6 +629,8 @@ fn corrupted_receipts_and_unfinished_publication_do_not_panic_or_pass() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn enveloping_preserves_root_local_schema_references_and_rejects_anchors() {
+    #[cfg(target_os = "macos")]
+    let _cli_fixture = cli_fixture_guard();
     let f = Fixture::new(ProviderKind::Codex, "good");
     let mut r = request("refs", ProviderKind::Codex);
     r.schema=br##"{"type":"object","$defs":{"Text":{"type":"string"}},"properties":{"text":{"$ref":"#/$defs/Text"}}}"##.to_vec();
@@ -573,6 +656,8 @@ fn enveloping_preserves_root_local_schema_references_and_rejects_anchors() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn schema_literals_and_properties_named_like_keywords_are_not_rewritten() {
+    #[cfg(target_os = "macos")]
+    let _cli_fixture = cli_fixture_guard();
     let f = Fixture::new(ProviderKind::Codex, "good");
     let mut r = request("literal", ProviderKind::Codex);
     r.schema=br##"{"type":"object","const":{"$ref":"#"},"properties":{"$ref":{"type":"string"}},"examples":[{"$id":"literal data"}],"default":{"$anchor":"literal"}}"##.to_vec();
@@ -600,6 +685,8 @@ fn schema_literals_and_properties_named_like_keywords_are_not_rewritten() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn consent_expiring_during_probes_never_launches_a_provider() {
+    #[cfg(target_os = "macos")]
+    let _cli_fixture = cli_fixture_guard();
     let f = Fixture::new(ProviderKind::Codex, "slow_probe");
     let p = f.prepare("expires");
     let mut a = approval(&p);
@@ -611,6 +698,8 @@ fn consent_expiring_during_probes_never_launches_a_provider() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_correlated_response_cannot_hide_incomplete_stdin_delivery() {
+    #[cfg(target_os = "macos")]
+    let _cli_fixture = cli_fixture_guard();
     let f = Fixture::new(ProviderKind::Codex, "early_exit");
     let mut request = request("early", ProviderKind::Codex);
     request.prompt = vec![b'x'; MAX_PROMPT_BYTES];
@@ -623,6 +712,8 @@ fn a_correlated_response_cannot_hide_incomplete_stdin_delivery() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn identical_binary_on_another_route_needs_new_disclosure() {
+    #[cfg(target_os = "macos")]
+    let _cli_fixture = cli_fixture_guard();
     let f = Fixture::new(ProviderKind::Codex, "good");
     let p = f.prepare("route");
     let a = approval(&p);
@@ -665,6 +756,8 @@ fn rejects_recursive_schema_keywords_but_preserves_literal_instances() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn readiness_rejects_fifo_without_waiting_for_a_writer() {
+    #[cfg(target_os = "macos")]
+    let _cli_fixture = cli_fixture_guard();
     use std::{
         ffi::CString,
         os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
@@ -708,4 +801,127 @@ fn readiness_rejects_fifo_without_waiting_for_a_writer() {
     worker.join().unwrap();
     assert!(response.is_ok(), "probe waited for a FIFO writer");
     assert_eq!(response.unwrap().readiness, Readiness::ProbeFailed);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn bridge_rejects_correlated_and_domain_mismatches_and_cancels_running_fixture() {
+    #[cfg(target_os = "macos")]
+    let _cli_fixture = cli_fixture_guard();
+    use product_provider::{unix_ms, ConsentReceipt, ProviderKind, ProviderTransport};
+    use std::{
+        cell::Cell,
+        fs,
+        os::unix::fs::PermissionsExt,
+        time::{Duration, Instant},
+    };
+    for mode in ["wrong_digest", "wrong_source", "domain_wrong", "slow"] {
+        let (request, mut result) = input();
+        if mode == "domain_wrong" {
+            result.response.request_digest =
+                canonical_digest(IdentityDomain::Request, &"other request").unwrap();
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let bin = root.join("fake.py");
+        {
+            let _guard = product_provider::fixture_executable_write_guard();
+            let script = include_str!("fixtures/provider_transport/fake_cli.py").replace(
+                "{'passed': True, 'text': wire['prompt'], 'command': 'untrusted-do-not-execute'}",
+                "cfg['response']",
+            );
+            fs::write(&bin, script).unwrap();
+            fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(
+                bin.with_extension("json"),
+                serde_json::to_vec(&json!({"mode":mode,"response":result.response})).unwrap(),
+            )
+            .unwrap();
+        }
+        let home = root.join("home");
+        fs::create_dir(&home).unwrap();
+        let transport =
+            ProviderTransport::new_fixture(root.join("jobs"), ProviderKind::Codex, bin, home)
+                .unwrap();
+        let prepared =
+            prepare_development(transport, &request, ProviderOptions::default()).unwrap();
+        let consent = ConsentReceipt {
+            disclosure_digest: prepared.disclosure().digest(),
+            approval_reference: "fixture-only".into(),
+            expires_at_unix_ms: unix_ms() + 60_000,
+        };
+        let bridge = prepared.authorize(consent);
+        let checks = Cell::new(0);
+        let started = Instant::now();
+        let actual = bridge.develop(&request, &|| {
+            checks.set(checks.get() + 1);
+            mode == "slow" && checks.get() > 5
+        });
+        assert!(actual.is_err(), "{mode}");
+        if mode == "slow" {
+            assert!(matches!(actual, Err(AdapterError::Cancelled)));
+            assert!(started.elapsed() < Duration::from_secs(5));
+        }
+        assert!(
+            bridge.develop(&request, &|| false).is_err(),
+            "consumed jobs are never silently resent"
+        );
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn run(r: &DevelopmentRequest, out: &DevelopmentResult, p: DiscoveryPolicy) -> DiscoveryReport {
+    discover(r, out, &p, Arc::new(AtomicBool::new(false))).unwrap()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn consented_fake_cli_bridge_preserves_origin_and_rejects_mismatches() {
+    #[cfg(target_os = "macos")]
+    let _cli_fixture = cli_fixture_guard();
+    use product_provider::{unix_ms, ConsentReceipt, ProviderKind, ProviderTransport};
+    use std::{fs, os::unix::fs::PermissionsExt};
+    let (r, out) = input();
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let bin = root.join("fixture.py");
+    {
+        let _guard = product_provider::fixture_executable_write_guard();
+        let script = include_str!("fixtures/provider_transport/fake_cli.py").replace(
+            "{'passed': True, 'text': wire['prompt'], 'command': 'untrusted-do-not-execute'}",
+            "cfg['response']",
+        );
+        fs::write(&bin, script).unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(
+            bin.with_extension("json"),
+            serde_json::to_vec(&json!({"response":out.response})).unwrap(),
+        )
+        .unwrap();
+    }
+    let home = root.join("home");
+    fs::create_dir(&home).unwrap();
+    let transport =
+        ProviderTransport::new_fixture(root.join("jobs"), ProviderKind::Codex, bin, home).unwrap();
+    let prepared = prepare_development(transport, &r, ProviderOptions::default()).unwrap();
+    let consent = ConsentReceipt {
+        disclosure_digest: prepared.disclosure().digest(),
+        approval_reference: "synthetic fixture only".into(),
+        expires_at_unix_ms: unix_ms() + 60_000,
+    };
+    let bridge = prepared.authorize(consent);
+    let mut wrong = r.clone();
+    wrong.request.push('!');
+    assert!(bridge.develop(&wrong, &|| false).is_err());
+    assert!(matches!(
+        bridge.develop(&r, &|| true),
+        Err(AdapterError::Cancelled)
+    ));
+    let result = bridge.develop(&r, &|| false).unwrap();
+    assert!(matches!(result.producer, Producer::Fixture { .. }));
+    result.validate_for(&r).unwrap();
+    assert_eq!(
+        run(&r, &result, DiscoveryPolicy::default()).questions.len(),
+        1
+    );
 }

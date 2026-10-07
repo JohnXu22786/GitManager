@@ -823,6 +823,37 @@ impl<'a> Validator<'a> {
             }
         })
     }
+    fn assignment(
+        &mut self,
+        value: &Expr,
+        env: &Environment,
+        expected: &Type,
+        depth: usize,
+    ) -> Result<()> {
+        // Storage supplies the expected optional type to each conditional
+        // branch. A sealed value may be Null while the live branch computes T.
+        // This does not widen If expressions outside an optional assignment.
+        if let (
+            Type::Optional { .. },
+            Expr::If {
+                condition,
+                then_value,
+                else_value,
+            },
+        ) = (expected, value)
+        {
+            self.node(depth)?;
+            self.expect(condition, env, &Type::Boolean, depth + 1, true)?;
+            self.assignment(then_value, env, expected, depth + 1)?;
+            return self.assignment(else_value, env, expected, depth + 1);
+        }
+        let actual = self.expr(value, env, depth, true)?;
+        require(
+            &actual == expected
+                || matches!(expected, Type::Optional { item } if item.as_ref() == &actual),
+            format!("assignment type mismatch: expected {expected:?}, found {actual:?}"),
+        )
+    }
     fn assignments(
         &mut self,
         entity: &str,
@@ -834,7 +865,10 @@ impl<'a> Validator<'a> {
         bounded(values.len())?;
         for (field, value) in values {
             let typ = &self.field(entity, field)?.value_type;
-            self.expect(value, env, typ, depth, true)?;
+            // Optional storage accepts a computed non-null inner value as well
+            // as an explicitly optional expression, without splitting an atomic
+            // multi-field Create or Update into separate mutations.
+            self.assignment(value, env, typ, depth)?;
         }
         if create {
             for field in &self.entity(entity)?.fields {
@@ -3833,6 +3867,16 @@ pub trait RuntimeAdapter {
         run: &Self::Run,
         point: &str,
     ) -> std::result::Result<Observation, AdapterError>;
+    /// Inspect already-produced immutable output receipts without evaluating
+    /// expressions, observing views, or charging execution fuel.
+    fn emitted_artifacts<'a>(
+        &self,
+        _run: &'a Self::Run,
+    ) -> std::result::Result<&'a [LocalArtifact], AdapterError> {
+        Err(AdapterError::Unsupported(
+            "Adapter cannot inspect emitted artifact provenance".into(),
+        ))
+    }
     fn data<'a>(&self, run: &'a Self::Run) -> &'a DataSnapshot;
     fn session<'a>(&self, run: &'a Self::Run) -> &'a SessionState;
     fn compatibility(

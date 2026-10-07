@@ -16,9 +16,85 @@ use std::sync::{
 };
 use std::time::Instant;
 
-pub const RUNTIME_VERSION: &str = "local-interpreter/2";
-pub const DRIVER_VERSION: &str = "semantic-input/2";
+pub const PROTECTED_FIELD_PREFIX: &str = "gm_scope_";
+/// Host admission is separate from executable semantics. The interpreter still
+/// executes one ordinary program; this hook validates retained scope provenance.
+pub trait ReplayAdmission: Send + Sync {
+    /// Keep synthetic record allocation tied to the authenticated original
+    /// business input when host-only metadata is added to a replay seed.
+    fn replay_operation_ids(
+        &self,
+        _program: &CapturedProgram,
+        scenario: &ScenarioSpec,
+    ) -> Result<Vec<Id>> {
+        Ok(scenario.replay_operation_ids()?)
+    }
+
+    fn validate_seed(
+        &self,
+        program: &CapturedProgram,
+        data: &DataSnapshot,
+        day: i32,
+    ) -> Result<()> {
+        self.validate_state(program, data, day)
+    }
+    fn validate_state(
+        &self,
+        program: &CapturedProgram,
+        data: &DataSnapshot,
+        day: i32,
+    ) -> Result<()>;
+}
+pub fn has_protected_fields(program: &CapturedProgram) -> bool {
+    program.program.entities.iter().any(|e| {
+        e.fields
+            .iter()
+            .any(|f| f.id.starts_with(PROTECTED_FIELD_PREFIX))
+    })
+}
+pub const RUNTIME_VERSION: &str = "local-interpreter/3";
+pub const DRIVER_VERSION: &str = "semantic-input/3";
 type Result<T> = std::result::Result<T, AdapterError>;
+
+/// Successful immutable checks retained only by one history-verification call.
+/// Borrowing captures prevents mutation or pointer reuse during this lifetime.
+/// No data frame, row, day, meter, cancellation state or evaluated value is kept.
+#[derive(Default)]
+pub(crate) struct ProjectionValidation<'a> {
+    sources: Vec<&'a CapturedProgram>,
+    types: std::collections::BTreeSet<Vec<u8>>,
+    bytes: usize,
+    #[cfg(test)]
+    source_checks: usize,
+    #[cfg(test)]
+    type_checks: usize,
+}
+impl<'a> ProjectionValidation<'a> {
+    fn source(&mut self, program: &'a CapturedProgram) -> Result<Option<usize>> {
+        if let Some(index) = self
+            .sources
+            .iter()
+            .position(|prior| std::ptr::eq(*prior, program) || *prior == program)
+        {
+            return Ok(Some(index));
+        }
+        #[cfg(test)]
+        {
+            self.source_checks += 1;
+        }
+        program.validate()?;
+        if self.sources.len() == MAX_ITEMS {
+            return Ok(None);
+        }
+        self.sources.push(program);
+        Ok(Some(self.sources.len() - 1))
+    }
+    #[cfg(test)]
+    pub(crate) fn counts(&self) -> (usize, usize) {
+        (self.source_checks, self.type_checks)
+    }
+}
+
 fn invalid(message: &str) -> AdapterError {
     AdapterError::Invalid(ContractError(message.into()))
 }
@@ -45,6 +121,7 @@ fn diagnostic(error: &AdapterError) -> String {
 #[derive(Clone, Default)]
 pub struct LocalRuntime {
     cancelled: Arc<AtomicBool>,
+    admission: Option<Arc<dyn ReplayAdmission>>,
 }
 #[derive(Clone)]
 struct State {
@@ -159,7 +236,234 @@ impl Meter {
 }
 impl LocalRuntime {
     pub fn with_cancellation(cancelled: Arc<AtomicBool>) -> Self {
-        Self { cancelled }
+        Self {
+            cancelled,
+            admission: None,
+        }
+    }
+    pub fn with_admission(mut self, admission: Arc<dyn ReplayAdmission>) -> Self {
+        self.admission = Some(admission);
+        self
+    }
+    /// Host-only bounded evaluation for metadata initialization. This uses the
+    /// production evaluator, validates the expression in a typed action, and
+    /// never creates a transaction or modifies a business record.
+    pub(crate) fn evaluate_record_projection(
+        &self,
+        program: &CapturedProgram,
+        data: &DataSnapshot,
+        row: &RecordRef,
+        binding: &str,
+        expression: &Expr,
+        expected: &Type,
+        day: i32,
+    ) -> Result<DataValue> {
+        self.evaluate_record_projection_with(
+            &mut ProjectionValidation::default(),
+            RuntimeLimits::default(),
+            program,
+            data,
+            row,
+            binding,
+            expression,
+            expected,
+            day,
+        )
+    }
+    pub(crate) fn evaluate_record_projection_with<'a>(
+        &self,
+        checks: &mut ProjectionValidation<'a>,
+        limits: RuntimeLimits,
+        program: &'a CapturedProgram,
+        data: &DataSnapshot,
+        row: &RecordRef,
+        binding: &str,
+        expression: &Expr,
+        expected: &Type,
+        day: i32,
+    ) -> Result<DataValue> {
+        let source = checks.source(program)?;
+        data.validate()?;
+        self.evaluate_projection_inner(
+            program, data, row, binding, expression, expected, day, limits, checks, source,
+        )
+    }
+    /// Evaluate an independently proven own-row historical expression. Validate
+    /// the coherent current data and every producer-row value first; global
+    /// constraints must not be applied to a mixture of historical/current rows.
+    pub(crate) fn evaluate_historical_record_projection(
+        &self,
+        program: &CapturedProgram,
+        data: &DataSnapshot,
+        row: &RecordRef,
+        values: &Values,
+        archived: bool,
+        binding: &str,
+        expression: &Expr,
+        expected: &Type,
+        day: i32,
+    ) -> Result<DataValue> {
+        self.evaluate_historical_record_projection_with(
+            &mut ProjectionValidation::default(),
+            RuntimeLimits::default(),
+            program,
+            data,
+            row,
+            values,
+            archived,
+            binding,
+            expression,
+            expected,
+            day,
+        )
+    }
+    pub(crate) fn evaluate_historical_record_projection_with<'a>(
+        &self,
+        checks: &mut ProjectionValidation<'a>,
+        limits: RuntimeLimits,
+        program: &'a CapturedProgram,
+        data: &DataSnapshot,
+        row: &RecordRef,
+        values: &Values,
+        archived: bool,
+        binding: &str,
+        expression: &Expr,
+        expected: &Type,
+        day: i32,
+    ) -> Result<DataValue> {
+        let source = checks.source(program)?;
+        data.validate()?;
+        if values.len() > MAX_ITEMS {
+            return Err(invalid("historical projection row exceeds bounds"));
+        }
+        let storage = data
+            .schema
+            .iter()
+            .find(|e| e.id == row.entity)
+            .ok_or_else(|| invalid("historical projection storage entity missing"))?;
+        for (id, value) in values {
+            let field = storage
+                .fields
+                .iter()
+                .find(|f| &f.id == id)
+                .ok_or_else(|| invalid("historical projection field missing"))?;
+            validate_value(value, &field.value_type, 0)?;
+        }
+        let producer = program
+            .program
+            .entities
+            .iter()
+            .find(|e| e.id == row.entity)
+            .ok_or_else(|| invalid("historical producer entity missing"))?;
+        for field in &producer.fields {
+            validate_value(
+                values.get(&field.id).unwrap_or(&DataValue::Null),
+                &field.value_type,
+                0,
+            )?;
+        }
+        let mut historical = data.clone();
+        let record = historical
+            .records
+            .iter_mut()
+            .find(|r| r.entity == row.entity && r.id == row.record)
+            .ok_or_else(|| invalid("historical projection record missing"))?;
+        record.values = values.clone();
+        record.archived = archived;
+        self.evaluate_projection_inner(
+            program,
+            &historical,
+            row,
+            binding,
+            expression,
+            expected,
+            day,
+            limits,
+            checks,
+            source,
+        )
+    }
+    fn evaluate_projection_inner(
+        &self,
+        program: &CapturedProgram,
+        data: &DataSnapshot,
+        row: &RecordRef,
+        binding: &str,
+        expression: &Expr,
+        expected: &Type,
+        day: i32,
+        limits: RuntimeLimits,
+        checks: &mut ProjectionValidation<'_>,
+        source: Option<usize>,
+    ) -> Result<DataValue> {
+        validate_day(day)?;
+        limits.validate()?;
+        if data.project_id != program.binding.project_id || !valid_id(binding) {
+            return Err(invalid("projection project or binding mismatch"));
+        }
+        let value = DataValue::Reference {
+            entity: row.entity.clone(),
+            record: row.record.clone(),
+        };
+        eval::record(data, &value)?;
+        let key = source
+            .map(|source| {
+                canonical_bytes(&(source, &row.entity, binding, expression, expected, &limits))
+            })
+            .transpose()?;
+        let cached = key.as_ref().is_some_and(|key| checks.types.contains(key));
+        if !cached {
+            #[cfg(test)]
+            {
+                checks.type_checks += 1;
+            }
+            let mut app = program.program.clone();
+            let mut id = "gm_scope_projection".to_owned();
+            while app.actions.iter().any(|a| a.id == id) {
+                id.push('_');
+            }
+            app.actions.push(ActionDefinition {
+                id,
+                label: "Host projection type check".into(),
+                parameters: BTreeMap::from([(binding.to_owned(), Type::reference(&row.entity))]),
+                guards: vec![],
+                ensures: vec![],
+                steps: vec![Statement::Assert {
+                    condition: Expr::Equal {
+                        left: Box::new(expression.clone()),
+                        right: Box::new(expression.clone()),
+                    },
+                    message: "Projection type check".into(),
+                }],
+            });
+            app.validate()?;
+        }
+        let session = SessionState::initial(&program.program)?;
+        let mut meter = Meter::new(limits.clone(), limits.fuel, self.cancelled.clone());
+        let env = Env::from([(binding.to_owned(), (Type::reference(&row.entity), value))]);
+        let mut evaluator = Eval {
+            app: &program.program,
+            data,
+            session: &session,
+            day,
+            meter: &mut meter,
+        };
+        if evaluator.typ(expression, &env)? != *expected {
+            return Err(invalid("projection result type mismatch"));
+        }
+        let result = evaluator.eval(expression, &env)?;
+        validate_value(&result, expected, 0)?;
+        if !cached {
+            if let Some(key) = key {
+                // Saturation only disables reuse. It never changes which valid
+                // projection can execute or relaxes the original AST budgets.
+                if checks.types.len() < MAX_ITEMS && key.len() <= MAX_WIRE_BYTES - checks.bytes {
+                    checks.bytes += key.len();
+                    checks.types.insert(key);
+                }
+            }
+        }
+        Ok(result)
     }
     pub fn compatibility_at(
         &self,
@@ -211,6 +515,10 @@ impl LocalRuntime {
             observation: observation.view,
             artifacts: observation.outputs,
             retained_records: run.state.data.records.clone(),
+            history: crate::product_protocol::PreservedHistory {
+                results: vec![],
+                events: run.state.data.events.clone(),
+            },
             read_only: false,
             issues: vec![],
         })
@@ -225,6 +533,32 @@ impl LocalRuntime {
         limits: RuntimeLimits,
         id: &str,
     ) -> Result<RunEvidence> {
+        self.replay_admitted(
+            program,
+            scenario,
+            decisions,
+            limits,
+            id,
+            self.admission.as_deref(),
+        )
+    }
+    pub fn replay_admitted(
+        &self,
+        program: &CapturedProgram,
+        scenario: &ScenarioSpec,
+        decisions: &DecisionGraph,
+        limits: RuntimeLimits,
+        id: &str,
+        admission: Option<&dyn ReplayAdmission>,
+    ) -> Result<RunEvidence> {
+        if has_protected_fields(program) && admission.is_none() {
+            return Err(AdapterError::Unsupported(
+                "Protected scope history needs a verified host admission context".into(),
+            ));
+        }
+        if let Some(admission) = admission {
+            admission.validate_seed(program, &scenario.seed, scenario.clock_day)?;
+        }
         if !valid_id(id) {
             return Err(invalid("invalid run ID"));
         }
@@ -254,9 +588,19 @@ impl LocalRuntime {
         let mut uncovered = Vec::new();
         // The shared replay driver excludes observation instrumentation from
         // mutation identity. Live apply/store IDs are supplied by their caller.
-        let operations = scenario.replay_operation_ids()?;
+        let operations = if let Some(admission) = admission {
+            admission.replay_operation_ids(program, scenario)?
+        } else {
+            scenario.replay_operation_ids()?
+        };
         for (input, operation) in scenario.inputs.iter().zip(operations) {
-            if let Err(error) = self.apply(&mut run, input, &operation) {
+            let applied = self.apply(&mut run, input, &operation).and_then(|step| {
+                if let Some(admission) = admission {
+                    admission.validate_state(program, self.data(&run), run.clock_day())?;
+                }
+                Ok(step)
+            });
+            if let Err(error) = applied {
                 state = if matches!(
                     error,
                     AdapterError::Cancelled | AdapterError::BudgetExhausted(_)
@@ -483,6 +827,9 @@ impl RuntimeAdapter for LocalRuntime {
         run.fuel.set(meter.fuel);
         result
     }
+    fn emitted_artifacts<'a>(&self, run: &'a ProductRun) -> Result<&'a [LocalArtifact]> {
+        Ok(run.artifacts())
+    }
     fn data<'a>(&self, run: &'a ProductRun) -> &'a DataSnapshot {
         &run.state.data
     }
@@ -533,6 +880,12 @@ fn check_references(value: &DataValue, data: &DataSnapshot) -> Result<()> {
 }
 pub(crate) fn merged_data(
     program: &CapturedProgram,
+    current: &DataSnapshot,
+) -> Result<DataSnapshot> {
+    merged_definition_data(&program.program, current)
+}
+pub(crate) fn merged_definition_data(
+    program: &AppDefinition,
     current: &DataSnapshot,
 ) -> Result<DataSnapshot> {
     compatibility::merge(program, current)

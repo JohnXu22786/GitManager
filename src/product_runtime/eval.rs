@@ -101,7 +101,7 @@ impl Eval<'_> {
     }
 
     /// Static result types are needed even when map/filter receives no values.
-    fn typ(&mut self, expr: &Expr, env: &Env) -> Result<Type> {
+    pub(super) fn typ(&mut self, expr: &Expr, env: &Env) -> Result<Type> {
         self.meter.tick(1)?;
         Ok(match expr {
             Expr::Literal { value_type, .. } => value_type.clone(),

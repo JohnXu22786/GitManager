@@ -119,8 +119,9 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                     )?,
                     None => mapping.scenario(&scene.scenario, &target.program)?,
                 };
-                let (replay, target_contexts) = execute(
-                    &self.runtime,
+                let (replay, target_contexts, mapped) = self.execute_mapped_scene(
+                    &scene.program,
+                    &scene.scenario,
                     target,
                     &mapped,
                     &current.decisions,
@@ -164,6 +165,32 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
     /// source-qualified mappings used by adoption, then independently verify
     /// concrete outcomes AND extra predicates before offering this executable.
     /// This creates no adoption authority and writes no archive objects.
+    pub fn check_prepared_discovery_candidate(
+        &mut self,
+        current: &ProjectSnapshot,
+        target: &CapturedProgram,
+        prepared: &PreparedScopedChange,
+        mappings: &[SemanticMapping],
+        limits: RuntimeLimits,
+    ) -> Result<CheckReport> {
+        self.clear_admission_cache();
+        if prepared.target() != target {
+            return Err(invalid(
+                "prepared discovery target differs from the exact captured candidate",
+            ));
+        }
+        ScopedExecutionContext::prepared(current, prepared)?;
+        let previous = self.pending_scope.replace(Some(prepared.clone()));
+        let previous_correspondences = self
+            .pending_correspondences
+            .replace(prepared.correspondences.clone());
+        let result = self.check_discovery_candidate(current, target, mappings, limits);
+        self.pending_scope.replace(previous);
+        self.pending_correspondences
+            .replace(previous_correspondences);
+        self.clear_admission_cache();
+        result
+    }
     pub fn check_discovery_candidate(
         &mut self,
         current: &ProjectSnapshot,
@@ -285,8 +312,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             binding_index.push(serde_json::json!({"decision":decision.id,"binding":binding}));
             for scene in scenes {
                 relevant_scenes.push(scene.clone());
-                let (run, _) = execute(
-                    &self.runtime,
+                let (run, _) = self.execute_scene(
                     &scene.program,
                     &scene.scenario,
                     &current.decisions,
@@ -346,6 +372,24 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 });
             }
         }
+        if let Some(editable) = current.editable_scope_context()? {
+            let editing = request.operation != DevelopmentOperation::Discover;
+            if editing && !request.sources.iter().any(|p| p == &editable.editable) {
+                request.sources.push(editable.editable.clone());
+            }
+            // Discover's extra sources must remain accepted-scene artifacts.
+            // It receives the slot index, while modification/reconciliation
+            // also carries the honest ordinary capture as an actual source.
+            let index = serde_json::json!({
+                "compiled_source": editable.compiled_source,
+                "editable_source": if editing { Some(canonical_digest(IdentityDomain::Source, &editable.editable)?) } else { None },
+                "slots": editable.slots,
+            });
+            request.request.push_str(&format!(
+                "\nHost-verified editing guide: slots use pre-instrumentation logical coordinates bound to compiled_source, not compiled JSON pointers. Edit ordinary rules; never author protected metadata. Map every retained slot to the exact new ordinary source, including inactive history slots. The host must prepare and recheck the complete result. {}",
+                String::from_utf8(canonical_bytes(&index)?).map_err(|_| invalid("scope editing index encoding failed"))?
+            ));
+        }
         // Discover preserves its primary pair; other transports bind the last source.
         if request.operation != DevelopmentOperation::Discover {
             request.sources.retain(|p| {
@@ -385,8 +429,9 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                     &current.program()?.program,
                     &replacement.replacement,
                 )?;
-                let (actual, _) = execute(
-                    &self.runtime,
+                let (actual, _, mapped) = self.execute_mapped_scene(
+                    &original.program,
+                    &original.scenario,
                     current.program()?,
                     &mapped,
                     &current.decisions,

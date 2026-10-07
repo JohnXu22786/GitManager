@@ -1,0 +1,1530 @@
+#[path = "fixtures/product_scope/mod.rs"]
+mod fixture;
+#[path = "../src/product_contract.rs"]
+mod product_contract;
+#[path = "../src/product_protocol.rs"]
+mod product_protocol;
+#[path = "../src/product_runtime/mod.rs"]
+mod product_runtime;
+#[path = "../src/product_store/mod.rs"]
+mod product_store;
+use fixture::*;
+use product_contract::*;
+use product_runtime::LocalRuntime;
+use product_store::{scope::*, ProductStore};
+
+#[test]
+fn history_projection_reuse_preserves_exact_inputs_and_execution_limits() {
+    use product_runtime::ProjectionValidation;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    let dir = tempdir();
+    let source = program(false);
+    let store = ProductStore::create(dir.path().join("tool"), &source, 20000).unwrap();
+    let record = add(&store, "row", "Projection row");
+    let data = store.load().unwrap().data;
+    let row = RecordRef {
+        entity: record.entity.clone(),
+        record: record.id.clone(),
+    };
+    let expression = field("row", "production");
+    let runtime = LocalRuntime::default();
+    let mut checks = ProjectionValidation::default();
+    macro_rules! evaluate {
+        ($checks:expr, $data:expr, $day:expr, $limits:expr) => {
+            runtime.evaluate_record_projection_with(
+                $checks,
+                $limits,
+                &source,
+                $data,
+                &row,
+                "row",
+                &expression,
+                &Type::Integer,
+                $day,
+            )
+        };
+    }
+    let original = runtime
+        .evaluate_record_projection(
+            &source,
+            &data,
+            &row,
+            "row",
+            &expression,
+            &Type::Integer,
+            20000,
+        )
+        .unwrap();
+    assert_eq!(
+        evaluate!(&mut checks, &data, 20000, RuntimeLimits::default()).unwrap(),
+        original
+    );
+    let checked = checks.counts();
+    assert_eq!(checked, (1, 1));
+    assert_eq!(
+        evaluate!(&mut checks, &data, 20000, RuntimeLimits::default()).unwrap(),
+        original
+    );
+    assert_eq!(checks.counts(), checked);
+    let mut changed = data.clone();
+    changed.records[0]
+        .values
+        .insert("production".into(), DataValue::Integer { value: 9 });
+    assert_eq!(
+        evaluate!(&mut checks, &changed, 20000, RuntimeLimits::default()).unwrap(),
+        DataValue::Integer { value: 9 }
+    );
+    assert_eq!(checks.counts(), checked);
+    changed.records[0]
+        .values
+        .insert("production".into(), text("wrong type"));
+    assert!(evaluate!(&mut checks, &changed, 20000, RuntimeLimits::default()).is_err());
+    assert!(runtime
+        .evaluate_record_projection_with(
+            &mut checks,
+            RuntimeLimits::default(),
+            &source,
+            &data,
+            &row,
+            "row",
+            &expression,
+            &Type::Text,
+            20000
+        )
+        .is_err());
+    assert!(runtime
+        .evaluate_record_projection_with(
+            &mut checks,
+            RuntimeLimits::default(),
+            &source,
+            &data,
+            &row,
+            "wrong_subject",
+            &expression,
+            &Type::Integer,
+            20000
+        )
+        .is_err());
+    for day in [20000, 20001] {
+        assert_eq!(
+            runtime
+                .evaluate_record_projection_with(
+                    &mut checks,
+                    RuntimeLimits::default(),
+                    &source,
+                    &data,
+                    &row,
+                    "row",
+                    &Expr::Today,
+                    &Type::Date,
+                    day
+                )
+                .unwrap(),
+            DataValue::Date { days: day }
+        );
+    }
+    assert!(evaluate!(&mut checks, &data, i32::MAX, RuntimeLimits::default()).is_err());
+    let mut wrong_source = source.clone();
+    wrong_source.artifact.program_digest =
+        canonical_digest(IdentityDomain::Program, &"forged").unwrap();
+    assert!(runtime
+        .evaluate_record_projection_with(
+            &mut checks,
+            RuntimeLimits::default(),
+            &wrong_source,
+            &data,
+            &row,
+            "row",
+            &expression,
+            &Type::Integer,
+            20000
+        )
+        .is_err());
+    let other_source = source.clone().at_path("other-program.json").unwrap();
+    let before = checks.counts();
+    assert_eq!(
+        runtime
+            .evaluate_record_projection_with(
+                &mut checks,
+                RuntimeLimits::default(),
+                &other_source,
+                &data,
+                &row,
+                "row",
+                &expression,
+                &Type::Integer,
+                20000
+            )
+            .unwrap(),
+        original
+    );
+    assert_eq!(checks.counts(), (before.0 + 1, before.1 + 1));
+    let low_fuel = RuntimeLimits {
+        fuel: 1,
+        ..RuntimeLimits::default()
+    };
+    let before = checks.counts();
+    assert!(matches!(
+        evaluate!(&mut checks, &data, 20000, low_fuel),
+        Err(AdapterError::BudgetExhausted(_))
+    ));
+    assert_eq!(checks.counts().1, before.1 + 1);
+    let cancelled = Arc::new(AtomicBool::new(true));
+    let cancelling = LocalRuntime::with_cancellation(cancelled.clone());
+    assert!(matches!(
+        cancelling.evaluate_record_projection_with(
+            &mut checks,
+            RuntimeLimits::default(),
+            &source,
+            &data,
+            &row,
+            "row",
+            &expression,
+            &Type::Integer,
+            20000
+        ),
+        Err(AdapterError::Cancelled)
+    ));
+    cancelled.store(false, Ordering::Relaxed);
+    assert_eq!(
+        cancelling
+            .evaluate_record_projection_with(
+                &mut checks,
+                RuntimeLimits::default(),
+                &source,
+                &data,
+                &row,
+                "row",
+                &expression,
+                &Type::Integer,
+                20000,
+            )
+            .unwrap(),
+        original
+    );
+    let mut historical = record.values.clone();
+    historical.insert("production".into(), DataValue::Integer { value: 7 });
+    let expected = runtime
+        .evaluate_historical_record_projection(
+            &source,
+            &data,
+            &row,
+            &historical,
+            true,
+            "row",
+            &expression,
+            &Type::Integer,
+            20000,
+        )
+        .unwrap();
+    assert_eq!(
+        runtime
+            .evaluate_historical_record_projection_with(
+                &mut checks,
+                RuntimeLimits::default(),
+                &source,
+                &data,
+                &row,
+                &historical,
+                true,
+                "row",
+                &expression,
+                &Type::Integer,
+                20000
+            )
+            .unwrap(),
+        expected
+    );
+    historical.insert("production".into(), text("invalid historical value"));
+    assert!(runtime
+        .evaluate_historical_record_projection_with(
+            &mut checks,
+            RuntimeLimits::default(),
+            &source,
+            &data,
+            &row,
+            &historical,
+            true,
+            "row",
+            &expression,
+            &Type::Integer,
+            20000
+        )
+        .is_err());
+    assert_eq!(store.load().unwrap().data, data);
+}
+
+fn production(store: &ProductStore, row: &Record) -> i64 {
+    let s = store.load().unwrap();
+    let runtime = LocalRuntime::default();
+    let run = runtime
+        .start(
+            s.program().unwrap(),
+            &s.data,
+            &s.session,
+            s.clock_day,
+            0,
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    let view = runtime.observe(&run, "result").unwrap().view;
+    let actual = view
+        .rows
+        .iter()
+        .find(|r| r.record.record == row.id)
+        .unwrap();
+    if let DataValue::Integer { value } = actual.cells["production"] {
+        value
+    } else {
+        panic!("wrong type")
+    }
+}
+#[test]
+fn future_cohort_survives_waiting_edits_completion_and_mixed_export() {
+    let dir = tempdir();
+    let path = dir.path().join("tool");
+    let store = ProductStore::create(&path, &program(false), 20000).unwrap();
+    let old = add(&store, "old", "Existing");
+    let completed = add(&store, "completed", "Completed");
+    let archived = add(&store, "archived", "Archived");
+    tick(&store, "before", 20002);
+    action(&store, "finish-old", "complete", &completed);
+    action(&store, "archive-old", "archive", &archived);
+    let before = store.load().unwrap();
+    let prepared = store
+        .prepare_scoped_change(
+            &program(true),
+            &request(&before, ScopePopulation::FutureWork),
+            "scope",
+        )
+        .unwrap();
+    assert_eq!(store.load().unwrap(), before);
+    let after = store.adopt_scoped(before.revision, &prepared).unwrap();
+    assert_eq!(after.data.events, before.data.events);
+    for historical in [&completed, &archived] {
+        let actual = row(&after, historical);
+        let prior = row(&before, historical);
+        assert_eq!(actual.revision, prior.revision);
+        assert_eq!(actual.archived, prior.archived);
+        for (k, v) in &prior.values {
+            assert_eq!(actual.values.get(k), Some(v));
+        }
+    }
+    let new = add(&store, "new", "Future");
+    action(&store, "wait-new", "wait", &new);
+    action(&store, "wait-old", "wait", &old);
+    tick(&store, "three-days", 20005);
+    action(&store, "calculate-new", "calculate", &new);
+    assert_eq!(production(&store, &new), 0);
+    assert_eq!(production(&store, &old), 5);
+    assert_eq!(production(&store, &completed), 2);
+    assert_eq!(production(&store, &archived), 2);
+    let current = store.load().unwrap();
+    assert_eq!(
+        row(&current, &new).values["promised"],
+        DataValue::Date { days: 20020 }
+    );
+    assert_eq!(
+        row(&current, &new).values["waiting"],
+        DataValue::Boolean { value: true }
+    );
+    action(&store, "resume-new", "resume", &new);
+    tick(&store, "production-days", 20007);
+    action(&store, "complete-new", "complete", &new);
+    tick(&store, "later-clock", 20010);
+    assert_eq!(production(&store, &new), 2);
+    let exported = apply(&store, "export-all", invoke("export", &[]));
+    let output = exported.artifacts.last().unwrap();
+    assert_eq!(output.rows.len(), 4);
+    assert!(String::from_utf8(output.bytes.clone())
+        .unwrap()
+        .contains("Future,2"));
+    assert_eq!(ProductStore::open(&path).unwrap().load().unwrap(), exported);
+    assert_eq!(production(&store, &new), 2);
+}
+#[test]
+fn selected_unfinished_population_is_frozen_and_preparation_goes_stale() {
+    let dir = tempdir();
+    let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
+    let selected = add(&store, "selected", "Selected");
+    let other = add(&store, "other", "Other");
+    let before = store.load().unwrap();
+    let refs = vec![RecordRef {
+        entity: selected.entity.clone(),
+        record: selected.id.clone(),
+    }];
+    let request = request(
+        &before,
+        ScopePopulation::SelectedUnfinished { records: refs },
+    );
+    let stale = store
+        .prepare_scoped_change(&program(true), &request, "stale")
+        .unwrap();
+    action(&store, "edit", "wait", &selected);
+    assert!(store.adopt_scoped(before.revision, &stale).is_err());
+    let before = store.load().unwrap();
+    let prepared = store
+        .prepare_scoped_change(&program(true), &request, "chosen")
+        .unwrap();
+    store.adopt_scoped(before.revision, &prepared).unwrap();
+    let future = add(&store, "future", "Not selected");
+    action(&store, "wait-other", "wait", &other);
+    action(&store, "wait-future", "wait", &future);
+    tick(&store, "wait-three", 20003);
+    assert_eq!(production(&store, &selected), 0);
+    assert_eq!(production(&store, &other), 3);
+    assert_eq!(production(&store, &future), 3);
+    action(&store, "finish", "complete", &selected);
+    tick(&store, "later", 20005);
+    assert_eq!(production(&store, &selected), 0);
+}
+#[test]
+fn partial_structural_changes_and_raw_metadata_spoofing_are_rejected() {
+    let dir = tempdir();
+    let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
+    add(&store, "old", "Old");
+    let before = store.load().unwrap();
+    let req = request(&before, ScopePopulation::FutureWork);
+    let mut candidate = serde_json::to_value(program(true).program).unwrap();
+    candidate["actions"][6]["steps"][0]["items"]["limit"] = serde_json::json!(1);
+    assert!(store
+        .prepare_scoped_change(&capture(candidate), &req, "bad-loop")
+        .is_err());
+    let prepared = store
+        .prepare_scoped_change(&program(true), &req, "valid")
+        .unwrap();
+    store.adopt_scoped(before.revision, &prepared).unwrap();
+    let current = store.load().unwrap();
+    let switch = store.prepare_switch(&program(false), "bypass");
+    assert!(
+        switch.is_err()
+            || store
+                .adopt(
+                    current.revision,
+                    &switch.unwrap(),
+                    &program(false),
+                    &current.decisions
+                )
+                .is_err()
+    );
+    let mut forged = current.clone();
+    let key = forged.data.records[0]
+        .values
+        .keys()
+        .find(|k| k.starts_with("gm_scope_") && k.ends_with("member"))
+        .unwrap()
+        .clone();
+    forged.data.records[0]
+        .values
+        .insert(key, DataValue::Boolean { value: true });
+    assert!(forged.validate().is_err());
+    assert_eq!(store.load().unwrap(), current);
+}
+
+#[test]
+fn optional_assignment_widening_preserves_types_nulls_and_atomic_constraints() {
+    let mut raw = serde_json::to_value(program(false).program).unwrap();
+    raw["entities"][0]["fields"].as_array_mut().unwrap().push(serde_json::json!({"id":"optional_days","label":"Optional days","value_type":{"kind":"optional","item":{"kind":"integer"}}}));
+    raw["actions"][0]["steps"][0]["values"]["optional_days"] =
+        serde_json::to_value(int(4)).unwrap();
+    raw["actions"][3]["steps"][0]["values"]["optional_days"] =
+        serde_json::to_value(elapsed("row", false)).unwrap();
+    let p = capture(raw.clone());
+    let dir = tempdir();
+    let store = ProductStore::create(dir.path().join("widened"), &p, 20000).unwrap();
+    let r = add(&store, "add", "Optional assignment");
+    assert_eq!(r.values["optional_days"], DataValue::Integer { value: 4 });
+    tick(&store, "advance", 20003);
+    let next = action(&store, "update", "calculate", &r);
+    assert_eq!(
+        row(&next, &r).values["optional_days"],
+        DataValue::Integer { value: 3 }
+    );
+    let mut missing = raw.clone();
+    missing["actions"][0]["steps"][0]["values"]
+        .as_object_mut()
+        .unwrap()
+        .remove("optional_days");
+    let missing_store =
+        ProductStore::create(dir.path().join("missing"), &capture(missing), 20000).unwrap();
+    let absent = add(&missing_store, "missing", "Missing optional");
+    assert!(!absent.values.contains_key("optional_days"));
+    let mut nullable = raw.clone();
+    nullable["actions"][0]["steps"][0]["values"]["optional_days"] = serde_json::json!({"kind":"literal","value_type":{"kind":"optional","item":{"kind":"integer"}},"value":{"kind":"null"}});
+    let null_store =
+        ProductStore::create(dir.path().join("null"), &capture(nullable.clone()), 20000).unwrap();
+    assert_eq!(
+        add(&null_store, "null", "Null optional").values["optional_days"],
+        DataValue::Null
+    );
+    nullable["entities"][0]["constraints"] = serde_json::json!([{"kind":"not","value":{"kind":"equal","left":field("record","optional_days"),"right":{"kind":"literal","value_type":{"kind":"optional","item":{"kind":"integer"}},"value":{"kind":"null"}}}}]);
+    let constrained =
+        ProductStore::create(dir.path().join("constraints"), &capture(nullable), 20000).unwrap();
+    let before = constrained.load().unwrap();
+    assert!(constrained
+        .apply(
+            0,
+            "invalid",
+            &invoke(
+                "add",
+                &[
+                    ("name", text("Invalid")),
+                    ("promised", DataValue::Date { days: 20020 })
+                ]
+            ),
+            RuntimeLimits::default()
+        )
+        .is_err());
+    assert_eq!(constrained.load().unwrap(), before);
+    for kind in ["text", "boolean"] {
+        let mut bad = raw.clone();
+        bad["actions"][3]["steps"][0]["values"]["optional_days"] = if kind == "text" {
+            serde_json::to_value(lit(text("Wrong"), Type::Text)).unwrap()
+        } else {
+            serde_json::to_value(boolean(true)).unwrap()
+        };
+        assert!(AppDefinition::parse(&serde_json::to_vec(&bad).unwrap()).is_err());
+    }
+    raw["entities"][0]["fields"]
+        .as_array_mut()
+        .unwrap()
+        .last_mut()
+        .unwrap()["value_type"] =
+        serde_json::json!({"kind":"optional","item":{"kind":"optional","item":{"kind":"integer"}}});
+    assert!(AppDefinition::parse(&serde_json::to_vec(&raw).unwrap()).is_err());
+}
+
+#[path = "fixtures/product_runtime/mod.rs"]
+mod contacts;
+#[test]
+fn scoped_optional_updates_preserve_sealed_nulls_and_atomic_fields() {
+    fn source(pause: bool) -> serde_json::Value {
+        let mut raw = serde_json::to_value(program(pause).program).unwrap();
+        let fields = raw["entities"][0]["fields"].as_array_mut().unwrap();
+        fields.iter_mut().find(|f| f["id"] == "production").unwrap()["value_type"] =
+            serde_json::json!({"kind":"optional","item":{"kind":"integer"}});
+        for name in ["pair_a", "pair_b"] {
+            fields
+                .push(serde_json::json!({"id":name,"label":name,"value_type":{"kind":"integer"}}));
+        }
+        raw["entities"][0]["constraints"] = serde_json::json!([{
+            "kind":"equal","left":field("record","pair_a"),"right":field("record","pair_b")
+        }]);
+        raw["actions"][0]["steps"][0]["values"]["production"] = serde_json::json!({
+            "kind":"literal","value_type":{"kind":"optional","item":{"kind":"integer"}},"value":{"kind":"null"}
+        });
+        for name in ["pair_a", "pair_b"] {
+            raw["actions"][0]["steps"][0]["values"][name] = serde_json::to_value(int(0)).unwrap();
+            raw["actions"][3]["steps"][0]["values"][name] =
+                serde_json::to_value(elapsed("row", false)).unwrap();
+        }
+        raw["actions"].as_array_mut().unwrap().extend([
+            serde_json::json!({"id":"mark_done","label":"Keep the recorded result","parameters":{"row":{"kind":"reference","entity":"job"}},"guards":[],"steps":[{"kind":"update","record":var("row"),"values":{"done":boolean(true)}}],"ensures":[]}),
+            serde_json::json!({"id":"invalid_pair","label":"Invalid simultaneous update","parameters":{"row":{"kind":"reference","entity":"job"}},"guards":[],"steps":[{"kind":"update","record":var("row"),"values":{"pair_a":int(4),"pair_b":int(5)}}],"ensures":[]}),
+        ]);
+        raw
+    }
+    let raw = source(false);
+    let dir = tempdir();
+    let path = dir.path().join("optional-scope");
+    let store = ProductStore::create(&path, &capture(raw.clone()), 20000).unwrap();
+    let null = add(&store, "null", "Completed without a value");
+    action(&store, "seal-null", "mark_done", &null);
+    let value = add(&store, "value", "Completed with a value");
+    let live = add(&store, "live", "Selected unfinished");
+    let other = add(&store, "other", "Other unfinished");
+    action(&store, "wait", "wait", &live);
+    tick(&store, "two-days", 20002);
+    action(&store, "record-value", "calculate", &value);
+    action(&store, "seal-value", "mark_done", &value);
+    let before = store.load().unwrap();
+    let prepared = store
+        .prepare_scoped_change(
+            &capture(source(true)),
+            &request(
+                &before,
+                ScopePopulation::SelectedUnfinished {
+                    records: vec![RecordRef {
+                        entity: live.entity.clone(),
+                        record: live.id.clone(),
+                    }],
+                },
+            ),
+            "optional-scope",
+        )
+        .unwrap();
+    store.adopt_scoped(before.revision, &prepared).unwrap();
+    tick(&store, "three-days", 20003);
+    for (record, expected) in [
+        (&live, DataValue::Integer { value: 0 }),
+        (&other, DataValue::Integer { value: 3 }),
+        (&null, DataValue::Null),
+        (&value, DataValue::Integer { value: 2 }),
+    ] {
+        let before = store.load().unwrap();
+        let after = action(
+            &store,
+            &format!("calculate-{}", record.id),
+            "calculate",
+            record,
+        );
+        let actual = row(&after, record);
+        assert_eq!(actual.values["production"], expected);
+        assert_eq!(actual.values["pair_a"], DataValue::Integer { value: 3 });
+        assert_eq!(actual.values["pair_b"], DataValue::Integer { value: 3 });
+        assert_eq!(after.data.events.len(), before.data.events.len() + 1);
+    }
+    let before = store.load().unwrap();
+    assert!(store
+        .apply(
+            before.revision,
+            "invalid-pair",
+            &invoke("invalid_pair", &[("row", reference(&live))]),
+            RuntimeLimits::default()
+        )
+        .is_err());
+    assert_eq!(store.load().unwrap(), before);
+    assert_eq!(ProductStore::open(&path).unwrap().load().unwrap(), before);
+
+    let optional_null = raw["actions"][0]["steps"][0]["values"]["production"].clone();
+    let mixed = serde_json::json!({"kind":"if","condition":boolean(true),"then_value":optional_null,"else_value":int(7)});
+    // The same optional storage rule applies to both Create and Update, including
+    // nested assignment branches; it does not alter generic expression typing.
+    let mut assignment = raw.clone();
+    for action in [0, 3] {
+        assignment["actions"][action]["steps"][0]["values"]["production"] = serde_json::json!({"kind":"if","condition":boolean(false),"then_value":mixed,"else_value":int(9)});
+    }
+    let branch_store = ProductStore::create(
+        dir.path().join("branches"),
+        &capture(assignment.clone()),
+        20000,
+    )
+    .unwrap();
+    let r = add(&branch_store, "branch-create", "Optional branches");
+    assert_eq!(r.values["production"], DataValue::Integer { value: 9 });
+    assert_eq!(
+        row(&action(&branch_store, "branch-update", "calculate", &r), &r).values["production"],
+        DataValue::Integer { value: 9 }
+    );
+    for action in [0, 3] {
+        let mut bad = assignment.clone();
+        bad["actions"][action]["steps"][0]["values"]["production"]["then_value"]["else_value"] =
+            serde_json::to_value(lit(text("Wrong inner type"), Type::Text)).unwrap();
+        assert!(AppDefinition::parse(&serde_json::to_vec(&bad).unwrap()).is_err());
+        let mut bad_condition = assignment.clone();
+        bad_condition["actions"][action]["steps"][0]["values"]["production"]["condition"] =
+            serde_json::to_value(int(1)).unwrap();
+        assert!(AppDefinition::parse(&serde_json::to_vec(&bad_condition).unwrap()).is_err());
+    }
+    let mut generic = raw;
+    generic["views"][0]["kind"]["columns"][1]["value"] = mixed;
+    assert!(AppDefinition::parse(&serde_json::to_vec(&generic).unwrap()).is_err());
+}
+
+#[test]
+fn export_only_result_changes_do_not_modify_shared_selection_or_delete() {
+    let mut source = contacts::organizer();
+    source["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"delete_selected","label":"Archive selected","parameters":{},"guards":[],"steps":[{"kind":"for_each","items":{"kind":"state","state":"selected"},"binding":"person","steps":[{"kind":"archive","record":contacts::var("person")}]}],"ensures":[]}));
+    let original = contacts::capture(source.clone());
+    let dir = tempdir();
+    let store = ProductStore::create(dir.path().join("contacts"), &original, 20000).unwrap();
+    apply(&store, "ada", contacts::add("Ada"));
+    apply(&store, "bea", contacts::add("Bea"));
+    apply(
+        &store,
+        "collect",
+        contacts::invoke("collect", Values::new()),
+    );
+    let original_selection = store.load().unwrap().session.values["selected"].clone();
+    let mut candidate = source.clone();
+    let filtered = serde_json::json!({"kind":"filter","items":{"kind":"state","state":"selected"},"binding":"person","predicate":{"kind":"equal","left":contacts::field(contacts::var("person"),"name"),"right":contacts::text("Ada")}});
+    candidate["actions"][2]["steps"][0]["items"] = filtered.clone();
+    candidate["observables"][0]["value"]["items"] = filtered;
+    let candidate = contacts::capture(candidate);
+    let current = store.load().unwrap();
+    let request = ScopeRequest {
+        population: ScopePopulation::All,
+        operations: ["export_people".into()].into_iter().collect(),
+        excluded_records: vec![],
+        lifecycles: vec![],
+        patches: vec![
+            EffectPatchRequest {
+                destination: EffectDestination::EmitItems {
+                    action: "export_people".into(),
+                    path: vec![0],
+                },
+                entity: "person".into(),
+                subject: "person".into(),
+                value_type: Type::list(Type::reference("person")),
+            },
+            EffectPatchRequest {
+                destination: EffectDestination::Observable {
+                    observable: "selected_count".into(),
+                },
+                entity: "person".into(),
+                subject: "person".into(),
+                value_type: Type::Integer,
+            },
+        ],
+    };
+    let prepared = store
+        .prepare_scoped_change(&candidate, &request, "export-preference")
+        .unwrap();
+    store.adopt_scoped(current.revision, &prepared).unwrap();
+    // Program adoption resets session by the established store contract. Restore
+    // the actual selection through the real collection action before comparison.
+    apply(
+        &store,
+        "reselect",
+        contacts::invoke("collect", Values::new()),
+    );
+    let selected = store.load().unwrap();
+    assert_eq!(selected.session.values["selected"], original_selection);
+    let runtime = LocalRuntime::default();
+    let run = runtime
+        .start(
+            selected.program().unwrap(),
+            &selected.data,
+            &selected.session,
+            selected.clock_day,
+            0,
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        runtime.observe(&run, "preview").unwrap().values["selected_count"],
+        DataValue::Integer { value: 1 }
+    );
+    let exported = apply(
+        &store,
+        "export",
+        contacts::invoke("export_people", Values::new()),
+    );
+    assert_eq!(exported.artifacts.last().unwrap().rows.len(), 1);
+    assert_eq!(exported.session.values["selected"], original_selection);
+    let deleted = apply(
+        &store,
+        "delete",
+        contacts::invoke("delete_selected", Values::new()),
+    );
+    assert_eq!(
+        deleted.data.records.iter().filter(|r| r.archived).count(),
+        2
+    );
+    let mut unsafe_candidate = source;
+    unsafe_candidate["actions"][1]["steps"][0]["items"]["limit"] = serde_json::json!(1);
+    assert!(store
+        .prepare_scoped_change(
+            &contacts::capture(unsafe_candidate),
+            &request,
+            "shared-state-change"
+        )
+        .is_err());
+}
+
+#[test]
+fn missing_birth_and_damaged_completed_values_fail_without_live_fallback() {
+    let dir = tempdir();
+    let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
+    let before = store.load().unwrap();
+    let prepared = store
+        .prepare_scoped_change(
+            &program(true),
+            &request(&before, ScopePopulation::FutureWork),
+            "scope",
+        )
+        .unwrap();
+    store.adopt_scoped(before.revision, &prepared).unwrap();
+    let row = add(&store, "later", "Later");
+    action(&store, "wait", "wait", &row);
+    tick(&store, "time", 20003);
+    let complete = action(&store, "complete", "complete", &row);
+    let mut missing = complete.clone();
+    missing.data.events.retain(|e| e.operation_id != "later");
+    assert!(missing.validate().is_err());
+    let mut corrupt = complete.clone();
+    let saved = corrupt.data.records[0]
+        .values
+        .keys()
+        .find(|key| key.starts_with("gm_scope_") && key.contains("_value_"))
+        .unwrap()
+        .clone();
+    corrupt.data.records[0]
+        .values
+        .insert(saved, DataValue::Null);
+    assert!(corrupt.validate().is_err());
+    let mut wrong_producer = complete.clone();
+    wrong_producer.data.records[0].created_program =
+        wrong_producer.programs[0].artifact.program_digest.clone();
+    assert!(wrong_producer.validate().is_err());
+    let mut forged = complete.clone();
+    forged
+        .scope
+        .compositions
+        .values_mut()
+        .next()
+        .unwrap()
+        .active
+        .clear();
+    assert!(forged.validate().is_err());
+    assert_eq!(store.load().unwrap(), complete);
+}
+#[test]
+fn failed_mixed_transaction_rolls_back_fields_seals_outputs_and_stamps() {
+    fn source(pause: bool) -> CapturedProgram {
+        let mut raw = serde_json::to_value(program(pause).program).unwrap();
+        let query = serde_json::json!({"kind":"query","entity":"job","binding":"item","predicate":boolean(true),"sort":[],"limit":1000,"include_archived":false});
+        let emit = raw["actions"][6]["steps"][0].clone();
+        raw["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"batch_fail","label":"Atomic failed batch","parameters":{},"guards":[],"steps":[{"kind":"for_each","items":query,"binding":"item","steps":[{"kind":"update","record":var("item"),"values":{"production":elapsed("item",pause),"done":boolean(true)}}]},emit,{"kind":"assert","condition":boolean(false),"message":"Stop the entire transaction"}],"ensures":[]}));
+        capture(raw)
+    }
+    let dir = tempdir();
+    let store = ProductStore::create(dir.path().join("tool"), &source(false), 20000).unwrap();
+    add(&store, "old", "Old");
+    let before = store.load().unwrap();
+    let mut req = request(&before, ScopePopulation::FutureWork);
+    req.operations.insert("batch_fail".into());
+    req.patches.push(EffectPatchRequest {
+        destination: EffectDestination::Update {
+            action: "batch_fail".into(),
+            path: vec![0, 0],
+            field: "production".into(),
+        },
+        entity: "job".into(),
+        subject: "item".into(),
+        value_type: Type::Integer,
+    });
+    req.patches.push(EffectPatchRequest {
+        destination: EffectDestination::EmitColumn {
+            action: "batch_fail".into(),
+            path: vec![1],
+            column: "production".into(),
+        },
+        entity: "job".into(),
+        subject: "row".into(),
+        value_type: Type::Integer,
+    });
+    let prepared = store
+        .prepare_scoped_change(&source(true), &req, "scope")
+        .unwrap();
+    store.adopt_scoped(before.revision, &prepared).unwrap();
+    let later = add(&store, "new", "New");
+    action(&store, "wait", "wait", &later);
+    tick(&store, "days", 20003);
+    let before = store.load().unwrap();
+    assert!(store
+        .apply(
+            before.revision,
+            "batch-failure",
+            &invoke("batch_fail", &[]),
+            RuntimeLimits::default()
+        )
+        .is_err());
+    assert_eq!(store.load().unwrap(), before);
+}
+
+#[test]
+fn independent_operation_layer_does_not_corrupt_completion_or_withdrawal() {
+    fn with_indicator(pause: bool, visible: bool) -> CapturedProgram {
+        let mut raw = serde_json::to_value(program(pause).program).unwrap();
+        raw["observables"] = serde_json::json!([{"id":"show_summary","label":"Show summary","value":boolean(visible)}]);
+        capture(raw)
+    }
+    let dir = tempdir();
+    let store = ProductStore::create(
+        dir.path().join("tool"),
+        &with_indicator(false, false),
+        20000,
+    )
+    .unwrap();
+    let before = store.load().unwrap();
+    let first = store
+        .prepare_scoped_change(
+            &with_indicator(true, false),
+            &request(&before, ScopePopulation::FutureWork),
+            "timing",
+        )
+        .unwrap();
+    let timing = first.layer_id().unwrap().unwrap();
+    store.adopt_scoped(before.revision, &first).unwrap();
+    let independent = ScopeRequest {
+        population: ScopePopulation::All,
+        operations: ["export".into()].into_iter().collect(),
+        excluded_records: vec![],
+        lifecycles: vec![],
+        patches: vec![EffectPatchRequest {
+            destination: EffectDestination::Observable {
+                observable: "show_summary".into(),
+            },
+            entity: "job".into(),
+            subject: "row".into(),
+            value_type: Type::Boolean,
+        }],
+    };
+    let before = store.load().unwrap();
+    let second = store
+        .prepare_scoped_change(&with_indicator(true, true), &independent, "summary")
+        .unwrap();
+    store.adopt_scoped(before.revision, &second).unwrap();
+    let job = add(&store, "later", "Later");
+    action(&store, "wait", "wait", &job);
+    tick(&store, "days", 20003);
+    let completed = action(&store, "finish", "complete", &job);
+    assert_eq!(
+        row(&completed, &job).values["production"],
+        DataValue::Integer { value: 0 }
+    );
+    let withdrawal = store
+        .prepare_scoped_withdrawal(&[timing], "withdraw-timing")
+        .unwrap();
+    let preserved = store.adopt_scoped(completed.revision, &withdrawal).unwrap();
+    let runtime = LocalRuntime::default();
+    let run = runtime
+        .start(
+            preserved.program().unwrap(),
+            &preserved.data,
+            &preserved.session,
+            preserved.clock_day,
+            0,
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        runtime.observe(&run, "independent").unwrap().values["show_summary"],
+        DataValue::Boolean { value: true }
+    );
+}
+#[test]
+fn foreign_subject_dependency_is_rejected_before_any_adoption() {
+    fn coupled(pause: bool) -> CapturedProgram {
+        let mut raw = serde_json::to_value(program(pause).program).unwrap();
+        raw["entities"][0]["fields"].as_array_mut().unwrap().push(serde_json::json!({"id":"copied","label":"Copied result","value_type":{"kind":"integer"}}));
+        raw["actions"][0]["steps"][0]["values"]["copied"] = serde_json::to_value(int(0)).unwrap();
+        raw["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"copy_result","label":"Copy to another job","parameters":{"source":{"kind":"reference","entity":"job"},"target":{"kind":"reference","entity":"job"}},"guards":[],"steps":[{"kind":"update","record":var("target"),"values":{"copied":field("source","production")}}],"ensures":[]}));
+        capture(raw)
+    }
+    let dir = tempdir();
+    let store = ProductStore::create(dir.path().join("tool"), &coupled(false), 20000).unwrap();
+    let row = add(&store, "first", "Selected");
+    add(&store, "second", "Unselected");
+    let before = store.load().unwrap();
+    let req = request(
+        &before,
+        ScopePopulation::SelectedUnfinished {
+            records: vec![RecordRef {
+                entity: row.entity,
+                record: row.id,
+            }],
+        },
+    );
+    assert!(store
+        .prepare_scoped_change(&coupled(true), &req, "unsafe-copy")
+        .is_err());
+    assert_eq!(store.load().unwrap(), before);
+}
+#[test]
+fn completion_export_order_is_verified_before_activation() {
+    fn combined(pause: bool, late_write: bool) -> CapturedProgram {
+        let mut raw = serde_json::to_value(program(pause).program).unwrap();
+        let complete = raw["actions"][4]["steps"][0].clone();
+        let mut emit = raw["actions"][6]["steps"][0].clone();
+        fn rename(v: &mut serde_json::Value) {
+            match v {
+                serde_json::Value::Object(m) => {
+                    if m.get("kind").and_then(|v| v.as_str()) == Some("variable")
+                        && m.get("name").and_then(|v| v.as_str()) == Some("row")
+                    {
+                        m.insert("name".into(), serde_json::json!("output_row"));
+                    }
+                    for v in m.values_mut() {
+                        rename(v)
+                    }
+                }
+                serde_json::Value::Array(a) => {
+                    for v in a {
+                        rename(v)
+                    }
+                }
+                _ => {}
+            }
+        }
+        emit["binding"] = serde_json::json!("output_row");
+        rename(&mut emit);
+        let mut steps = vec![complete, emit];
+        if late_write {
+            steps.push(serde_json::json!({"kind":"update","record":var("row"),"values":{"waited":int(99)}}));
+        }
+        raw["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"complete_export","label":"Complete and export","parameters":{"row":{"kind":"reference","entity":"job"}},"guards":[],"steps":steps,"ensures":[]}));
+        capture(raw)
+    }
+    for unsafe_order in [false, true] {
+        let dir = tempdir();
+        let store = ProductStore::create(
+            dir.path().join("tool"),
+            &combined(false, unsafe_order),
+            20000,
+        )
+        .unwrap();
+        let before = store.load().unwrap();
+        let mut req = request(&before, ScopePopulation::FutureWork);
+        req.operations.insert("complete_export".into());
+        req.patches.push(EffectPatchRequest {
+            destination: EffectDestination::Update {
+                action: "complete_export".into(),
+                path: vec![0],
+                field: "production".into(),
+            },
+            entity: "job".into(),
+            subject: "row".into(),
+            value_type: Type::Integer,
+        });
+        req.patches.push(EffectPatchRequest {
+            destination: EffectDestination::EmitColumn {
+                action: "complete_export".into(),
+                path: vec![1],
+                column: "production".into(),
+            },
+            entity: "job".into(),
+            subject: "output_row".into(),
+            value_type: Type::Integer,
+        });
+        let prepared = store.prepare_scoped_change(&combined(true, unsafe_order), &req, "scope");
+        if unsafe_order {
+            assert!(prepared.is_err());
+            assert_eq!(store.load().unwrap(), before);
+        } else {
+            let prepared = prepared.unwrap();
+            store.adopt_scoped(before.revision, &prepared).unwrap();
+            let job = add(&store, "later", "Later");
+            action(&store, "wait", "wait", &job);
+            tick(&store, "days", 20003);
+            let completed = action(&store, "complete-export", "complete_export", &job);
+            assert_eq!(
+                completed.artifacts.last().unwrap().rows[0]["production"],
+                DataValue::Integer { value: 0 }
+            );
+            assert!(
+                String::from_utf8(completed.artifacts.last().unwrap().bytes.clone())
+                    .unwrap()
+                    .contains("ObservedAtCompletion")
+            );
+        }
+    }
+}
+#[test]
+fn unpatched_shared_export_cannot_be_labelled_as_preserved_history() {
+    fn shared(pause: bool) -> CapturedProgram {
+        let mut raw = serde_json::to_value(program(pause).program).unwrap();
+        let mut other = serde_json::to_value(program(false).program.actions[6].clone()).unwrap();
+        other["id"] = serde_json::json!("export_other");
+        raw["actions"].as_array_mut().unwrap().push(other);
+        capture(raw)
+    }
+    let dir = tempdir();
+    let store = ProductStore::create(dir.path().join("tool"), &shared(false), 20000).unwrap();
+    let before = store.load().unwrap();
+    assert!(store
+        .prepare_scoped_change(
+            &shared(true),
+            &request(&before, ScopePopulation::FutureWork),
+            "unsafe-shared-output"
+        )
+        .is_err());
+    assert_eq!(store.load().unwrap(), before);
+}
+
+#[test]
+fn durable_aliases_cannot_carry_scoped_values_into_foreign_rows() {
+    fn aliases(pause: bool) -> CapturedProgram {
+        let mut raw = serde_json::to_value(program(pause).program).unwrap();
+        for field in ["cached", "copied"] {
+            raw["entities"][0]["fields"].as_array_mut().unwrap().push(
+                serde_json::json!({"id":field,"label":field,"value_type":{"kind":"integer"}}),
+            );
+            raw["actions"][0]["steps"][0]["values"][field] = serde_json::to_value(int(0)).unwrap();
+        }
+        raw["actions"].as_array_mut().unwrap().extend([
+            serde_json::json!({"id":"cache_result","label":"Cache locally","parameters":{"row":{"kind":"reference","entity":"job"}},"guards":[],"steps":[{"kind":"update","record":var("row"),"values":{"cached":field("row","production")}}],"ensures":[]}),
+            serde_json::json!({"id":"copy_cached","label":"Copy cached result","parameters":{"source":{"kind":"reference","entity":"job"},"target":{"kind":"reference","entity":"job"}},"guards":[],"steps":[{"kind":"update","record":var("target"),"values":{"copied":field("source","cached")}}],"ensures":[]})]);
+        capture(raw)
+    }
+    let dir = tempdir();
+    let store = ProductStore::create(dir.path().join("tool"), &aliases(false), 20000).unwrap();
+    let selected = add(&store, "selected", "Selected");
+    add(&store, "other", "Other");
+    let before = store.load().unwrap();
+    let req = request(
+        &before,
+        ScopePopulation::SelectedUnfinished {
+            records: vec![RecordRef {
+                entity: selected.entity,
+                record: selected.id,
+            }],
+        },
+    );
+    assert!(store
+        .prepare_scoped_change(&aliases(true), &req, "unsafe-alias")
+        .is_err());
+    assert_eq!(store.load().unwrap(), before);
+}
+fn completed_scope_snapshot() -> product_store::ProjectSnapshot {
+    let dir = tempdir();
+    let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
+    let before = store.load().unwrap();
+    let prepared = store
+        .prepare_scoped_change(
+            &program(true),
+            &request(&before, ScopePopulation::FutureWork),
+            "scope",
+        )
+        .unwrap();
+    store.adopt_scoped(before.revision, &prepared).unwrap();
+    let row = add(&store, "born", "Later");
+    action(&store, "waiting", "wait", &row);
+    tick(&store, "days", 20003);
+    action(&store, "complete", "complete", &row)
+}
+#[test]
+fn terminal_work_cannot_erase_its_required_completion_seal() {
+    let mut snapshot = completed_scope_snapshot();
+    let event = snapshot
+        .data
+        .events
+        .iter_mut()
+        .find(|e| e.operation_id == "complete")
+        .unwrap();
+    let change = &mut event.changes[0];
+    let prior = change.before.as_ref().unwrap();
+    change.after.retain(|key, _| !key.starts_with("gm_scope_"));
+    change.after.extend(
+        prior
+            .iter()
+            .filter(|(key, _)| key.starts_with("gm_scope_"))
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    snapshot.data.records[0].values = change.after.clone();
+    assert!(snapshot.validate().is_err());
+}
+#[test]
+fn completion_cannot_claim_an_archive_event_that_never_happened() {
+    let mut snapshot = completed_scope_snapshot();
+    assert!(!snapshot.data.records[0].archived);
+    let origin = snapshot.data.records[0]
+        .values
+        .keys()
+        .find(|key| key.starts_with("gm_scope_") && key.ends_with("_origin"))
+        .unwrap()
+        .clone();
+    let forged = DataValue::Text {
+        value: "ObservedAtArchive".into(),
+    };
+    snapshot.data.records[0]
+        .values
+        .insert(origin.clone(), forged.clone());
+    snapshot
+        .data
+        .events
+        .iter_mut()
+        .find(|e| e.operation_id == "complete")
+        .unwrap()
+        .changes[0]
+        .after
+        .insert(origin, forged);
+    assert!(snapshot.validate().is_err());
+}
+
+#[test]
+fn every_writer_of_a_completed_durable_result_requires_protection() {
+    fn with_reset(pause: bool) -> CapturedProgram {
+        let mut raw = serde_json::to_value(program(pause).program).unwrap();
+        raw["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"reset","label":"Reset derived result","parameters":{"row":{"kind":"reference","entity":"job"}},"guards":[],"steps":[{"kind":"update","record":var("row"),"values":{"production":int(99)}}],"ensures":[]}));
+        capture(raw)
+    }
+    let dir = tempdir();
+    let store = ProductStore::create(dir.path().join("tool"), &with_reset(false), 20000).unwrap();
+    let before = store.load().unwrap();
+    let mut req = request(&before, ScopePopulation::FutureWork);
+    assert!(store
+        .prepare_scoped_change(&with_reset(true), &req, "uncovered")
+        .is_err());
+    req.operations.insert("reset".into());
+    req.patches.push(EffectPatchRequest {
+        destination: EffectDestination::Update {
+            action: "reset".into(),
+            path: vec![0],
+            field: "production".into(),
+        },
+        entity: "job".into(),
+        subject: "row".into(),
+        value_type: Type::Integer,
+    });
+    let prepared = store
+        .prepare_scoped_change(&with_reset(true), &req, "protected")
+        .unwrap();
+    store.adopt_scoped(before.revision, &prepared).unwrap();
+    let job = add(&store, "job", "Completed work");
+    action(&store, "wait", "wait", &job);
+    tick(&store, "days", 20003);
+    let completed = action(&store, "complete", "complete", &job);
+    let reset = action(&store, "reset", "reset", &job);
+    assert_eq!(
+        row(&reset, &job).values["production"],
+        row(&completed, &job).values["production"]
+    );
+    let mut corrupted = reset;
+    corrupted.data.records[0]
+        .values
+        .insert("production".into(), DataValue::Integer { value: 99 });
+    corrupted.data.events.last_mut().unwrap().changes[0]
+        .after
+        .insert("production".into(), DataValue::Integer { value: 99 });
+    assert!(corrupted.validate().is_err());
+}
+
+#[test]
+fn scoped_values_cannot_route_unscoped_bindings_targets_or_output_membership() {
+    fn routed(pause: bool, route: &str) -> CapturedProgram {
+        let mut raw = serde_json::to_value(program(pause).program).unwrap();
+        raw["entities"][0]["fields"].as_array_mut().unwrap().push(serde_json::json!({"id":"copied","label":"Copied result","value_type":{"kind":"integer"}}));
+        raw["actions"][0]["steps"][0]["values"]["copied"] = serde_json::to_value(int(0)).unwrap();
+        let positive = Expr::Less {
+            left: Box::new(int(0)),
+            right: Box::new(field("source", "production")),
+        };
+        let extra = match route {
+            "binding" => {
+                serde_json::json!({"id":"copy_result","label":"Copy result","parameters":{"target":{"kind":"reference","entity":"job"},"value":{"kind":"integer"}},"guards":[],"steps":[{"kind":"update","record":var("target"),"values":{"copied":var("value")}}],"ensures":[]})
+            }
+            "target" => {
+                serde_json::json!({"id":"copy_result","label":"Route write","parameters":{"source":{"kind":"reference","entity":"job"},"target":{"kind":"reference","entity":"job"}},"guards":[],"steps":[{"kind":"update","record":{"kind":"if","condition":positive,"then_value":var("target"),"else_value":var("source")},"values":{"copied":int(99)}}],"ensures":[]})
+            }
+            "output" => {
+                raw["outputs"].as_array_mut().unwrap().push(serde_json::json!({"id":"audit","label":"Audit","format":"csv","columns":[{"id":"name","label":"Name","value_type":{"kind":"text"}}]}));
+                let empty = lit(
+                    DataValue::List {
+                        item_type: Type::reference("job"),
+                        items: vec![],
+                    },
+                    Type::list(Type::reference("job")),
+                );
+                serde_json::json!({"id":"copy_result","label":"Route output","parameters":{"source":{"kind":"reference","entity":"job"}},"guards":[],"steps":[{"kind":"emit","output":"audit","items":{"kind":"if","condition":positive,"then_value":raw["views"][0]["kind"]["rows"].clone(),"else_value":empty},"binding":"audit_row","columns":{"name":field("audit_row","name")}}],"ensures":[]})
+            }
+            _ => unreachable!(),
+        };
+        raw["actions"].as_array_mut().unwrap().push(extra);
+        if route == "binding" {
+            raw["views"][0]["actions"] = serde_json::json!([{"id":"copy_result","label":"Copy derived result","placement":"row","action":"copy_result","arguments":{"target":var("row"),"value":field("row","production")},"enabled":boolean(true)}]);
+        }
+        capture(raw)
+    }
+    for route in ["binding", "target", "output"] {
+        let dir = tempdir();
+        let store =
+            ProductStore::create(dir.path().join("tool"), &routed(false, route), 20000).unwrap();
+        let selected = add(&store, "selected", "Selected");
+        add(&store, "excluded", "Excluded");
+        let before = store.load().unwrap();
+        let req = request(
+            &before,
+            ScopePopulation::SelectedUnfinished {
+                records: vec![RecordRef {
+                    entity: selected.entity,
+                    record: selected.id,
+                }],
+            },
+        );
+        assert!(
+            store
+                .prepare_scoped_change(&routed(true, route), &req, "unsafe-route")
+                .is_err(),
+            "{route}"
+        );
+        assert_eq!(store.load().unwrap(), before);
+    }
+}
+
+#[test]
+fn completion_capture_rejects_writes_across_an_emitting_loop_back_edge() {
+    fn loop_emit(pause: bool) -> CapturedProgram {
+        let mut raw = serde_json::to_value(program(pause).program).unwrap();
+        let query = raw["actions"][6]["steps"][0]["items"].clone();
+        let mut emit = raw["actions"][6]["steps"][0].clone();
+        emit["binding"] = serde_json::json!("out");
+        emit["columns"] = serde_json::json!({"name":field("out","name"),"production":elapsed("out",pause),"promised":field("out","promised"),"reminder":field("out","waiting")});
+        raw["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"loop_emit","label":"Complete and emit per iteration","parameters":{"target":{"kind":"reference","entity":"job"}},"guards":[],"steps":[{"kind":"for_each","items":query,"binding":"each","steps":[{"kind":"update","record":var("target"),"values":{"done":boolean(true),"waited":{"kind":"add","left":field("target","waited"),"right":int(1)}}},emit]}],"ensures":[]}));
+        capture(raw)
+    }
+    let dir = tempdir();
+    let store = ProductStore::create(dir.path().join("tool"), &loop_emit(false), 20000).unwrap();
+    add(&store, "first", "First");
+    add(&store, "second", "Second");
+    let before = store.load().unwrap();
+    let mut req = request(&before, ScopePopulation::FutureWork);
+    req.operations.insert("loop_emit".into());
+    req.patches.push(EffectPatchRequest {
+        destination: EffectDestination::EmitColumn {
+            action: "loop_emit".into(),
+            path: vec![0, 1],
+            column: "production".into(),
+        },
+        entity: "job".into(),
+        subject: "out".into(),
+        value_type: Type::Integer,
+    });
+    assert!(store
+        .prepare_scoped_change(&loop_emit(true), &req, "unsafe-loop")
+        .is_err());
+    assert_eq!(store.load().unwrap(), before);
+}
+
+#[test]
+fn preserved_projections_reject_parameters_in_prior_and_mapped_expressions() {
+    fn parameterized(pause: bool, depends: bool) -> CapturedProgram {
+        let mut raw = serde_json::to_value(program(pause).program).unwrap();
+        for action in raw["actions"].as_array_mut().unwrap() {
+            action["parameters"]["delta"] = serde_json::json!({"kind":"integer"});
+        }
+        if depends {
+            raw["actions"][6]["steps"][0]["columns"]["production"] =
+                serde_json::json!({"kind":"add","left":elapsed("row",pause),"right":var("delta")});
+        }
+        capture(raw)
+    }
+    let dir = tempdir();
+    let store =
+        ProductStore::create(dir.path().join("prior"), &parameterized(false, true), 20000).unwrap();
+    let before = store.load().unwrap();
+    assert!(store
+        .prepare_scoped_change(
+            &parameterized(true, false),
+            &request(&before, ScopePopulation::FutureWork),
+            "prior-parameter"
+        )
+        .is_err());
+    assert_eq!(store.load().unwrap(), before);
+    let store = ProductStore::create(dir.path().join("mapped"), &program(false), 20000).unwrap();
+    let before = store.load().unwrap();
+    let scoped = store
+        .prepare_scoped_change(
+            &program(true),
+            &request(&before, ScopePopulation::FutureWork),
+            "scope",
+        )
+        .unwrap();
+    let layer = scoped.layer_id().unwrap().unwrap();
+    let current = store.adopt_scoped(before.revision, &scoped).unwrap();
+    let candidate = parameterized(true, true);
+    let target = canonical_digest(IdentityDomain::Source, &candidate).unwrap();
+    let mappings: Vec<_> = current.scope.layers[&layer]
+        .patches
+        .iter()
+        .enumerate()
+        .map(|(patch, p)| ScopeSlotMapping {
+            layer: layer.clone(),
+            patch,
+            from_source: current.active_revision.clone(),
+            from: p.request.destination.clone(),
+            to_source: target.clone(),
+            to: p.request.destination.clone(),
+            subject: p.request.subject.clone(),
+        })
+        .collect();
+    assert!(store
+        .prepare_managed_evolution(&candidate, &mappings, "mapped-parameter")
+        .is_err());
+    assert_eq!(store.load().unwrap(), current);
+}
+
+#[test]
+fn historical_row_verification_allows_valid_unique_value_reuse() {
+    fn unique(pause: bool) -> CapturedProgram {
+        let mut raw = serde_json::to_value(program(pause).program).unwrap();
+        raw["entities"][0]["unique"] = serde_json::json!([["name"]]);
+        raw["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"rename","label":"Correct work name","parameters":{"row":{"kind":"reference","entity":"job"},"name":{"kind":"text"}},"guards":[],"steps":[{"kind":"update","record":var("row"),"values":{"name":var("name")}}],"ensures":[]}));
+        capture(raw)
+    }
+    let dir = tempdir();
+    let path = dir.path().join("tool");
+    let store = ProductStore::create(&path, &unique(false), 20000).unwrap();
+    let before = store.load().unwrap();
+    let prepared = store
+        .prepare_scoped_change(
+            &unique(true),
+            &request(&before, ScopePopulation::FutureWork),
+            "scope",
+        )
+        .unwrap();
+    store.adopt_scoped(before.revision, &prepared).unwrap();
+    let first = add(&store, "first", "first");
+    action(&store, "wait", "wait", &first);
+    tick(&store, "days", 20003);
+    action(&store, "complete", "complete", &first);
+    let exported = apply(&store, "original-export", invoke("export", &[]));
+    apply(
+        &store,
+        "rename",
+        invoke(
+            "rename",
+            &[("row", reference(&first)), ("name", text("second"))],
+        ),
+    );
+    let reused = add(&store, "reused", "first");
+    let current = store.load().unwrap();
+    assert_eq!(row(&current, &first).values["name"], text("second"));
+    assert_eq!(row(&current, &reused).values["name"], text("first"));
+    assert_eq!(current.artifacts, exported.artifacts);
+    assert_eq!(
+        row(&current, &first).values["production"],
+        DataValue::Integer { value: 0 }
+    );
+    let reopened = ProductStore::open(&path).unwrap();
+    let latest = apply(&reopened, "continued-export", invoke("export", &[]));
+    assert_eq!(latest.artifacts.last().unwrap().rows.len(), 2);
+    assert_eq!(
+        latest.artifacts.last().unwrap().rows[0]["production"],
+        DataValue::Integer { value: 0 }
+    );
+    let before = reopened.load().unwrap();
+    assert!(reopened
+        .apply(
+            before.revision,
+            "invalid-duplicate",
+            &invoke(
+                "rename",
+                &[("row", reference(&reused)), ("name", text("second"))]
+            ),
+            RuntimeLimits::default()
+        )
+        .is_err());
+    assert_eq!(reopened.load().unwrap(), before);
+}
+
+#[test]
+fn incompatible_lifecycle_cannot_reopen_an_earlier_sealed_result() {
+    let dir = tempdir();
+    let path = dir.path().join("tool");
+    let store = ProductStore::create(&path, &program(false), 20000).unwrap();
+    let job = add(&store, "job", "Waiting completed work");
+    action(&store, "wait", "wait", &job);
+    tick(&store, "days", 20003);
+    let before = store.load().unwrap();
+    let first = store
+        .prepare_scoped_change(
+            &program(true),
+            &request(&before, ScopePopulation::All),
+            "first",
+        )
+        .unwrap();
+    store.adopt_scoped(before.revision, &first).unwrap();
+    action(&store, "complete", "complete", &job);
+    let sealed = apply(&store, "saved-export", invoke("export", &[]));
+    assert_eq!(
+        sealed.artifacts.last().unwrap().rows[0]["production"],
+        DataValue::Integer { value: 0 }
+    );
+    let mut raw = serde_json::to_value(program(true).program).unwrap();
+    for pointer in [
+        "/actions/3/steps/0/values/production",
+        "/actions/4/steps/0/values/production",
+        "/actions/6/steps/0/columns/production",
+        "/views/0/kind/columns/1/value",
+    ] {
+        let value = raw.pointer(pointer).unwrap().clone();
+        *raw.pointer_mut(pointer).unwrap() =
+            serde_json::json!({"kind":"add","left":value,"right":int(9)});
+    }
+    for population in [
+        ScopePopulation::All,
+        ScopePopulation::SelectedUnfinished {
+            records: vec![RecordRef {
+                entity: job.entity.clone(),
+                record: job.id.clone(),
+            }],
+        },
+    ] {
+        let mut later = request(&sealed, population);
+        later.lifecycles[0].completed = Expr::And {
+            values: vec![
+                field("record", "done"),
+                Expr::Not {
+                    value: Box::new(field("record", "waiting")),
+                },
+            ],
+        };
+        assert!(store
+            .prepare_scoped_change(&capture(raw.clone()), &later, "must-not-reopen")
+            .is_err());
+        assert_eq!(store.load().unwrap(), sealed);
+    }
+    let reopened = ProductStore::open(&path).unwrap();
+    let later = add(&reopened, "later", "Continued legitimate work");
+    action(&reopened, "later-calculate", "calculate", &later);
+    let result = apply(&reopened, "later-export", invoke("export", &[]));
+    assert_eq!(
+        result.artifacts.last().unwrap().rows[0]["production"],
+        DataValue::Integer { value: 0 }
+    );
+    assert_eq!(row(&result, &job).values, row(&sealed, &job).values);
+}
+
+#[test]
+fn managed_evolution_rejects_unstartable_initial_session_before_commit() {
+    let dir = tempdir();
+    let path = dir.path().join("tool");
+    let store = ProductStore::create(&path, &program(false), 20000).unwrap();
+    let existing = add(&store, "existing", "Existing selectable work");
+    let before = store.load().unwrap();
+    let first = store
+        .prepare_scoped_change(
+            &program(true),
+            &request(&before, ScopePopulation::FutureWork),
+            "first",
+        )
+        .unwrap();
+    let current = store.adopt_scoped(before.revision, &first).unwrap();
+    let pointer = std::fs::read(path.join("CURRENT")).unwrap();
+    let candidate = |record: &str| {
+        let mut raw = serde_json::to_value(program(true).program).unwrap();
+        raw["state"].as_array_mut().unwrap().push(serde_json::json!({"id":"focused_job","label":"Focused job","value_type":{"kind":"reference","entity":"job"},"initial":{"kind":"reference","entity":"job","record":record}}));
+        capture(raw)
+    };
+    let mappings = |source: &CapturedProgram| {
+        let target = canonical_digest(IdentityDomain::Source, source).unwrap();
+        current
+            .editable_scope_context()
+            .unwrap()
+            .unwrap()
+            .slots
+            .iter()
+            .map(|slot| ScopeSlotMapping {
+                layer: slot.layer.clone(),
+                patch: slot.patch,
+                from_source: current.active_revision.clone(),
+                from: slot.destination.clone(),
+                to_source: target.clone(),
+                to: slot.destination.clone(),
+                subject: slot.subject.clone(),
+            })
+            .collect::<Vec<_>>()
+    };
+    let invalid = candidate("missing-record");
+    assert!(store
+        .prepare_managed_evolution(&invalid, &mappings(&invalid), "invalid-session")
+        .is_err());
+    assert_eq!(std::fs::read(path.join("CURRENT")).unwrap(), pointer);
+    assert_eq!(ProductStore::open(&path).unwrap().load().unwrap(), current);
+    let valid = candidate(&existing.id);
+    let prepared = store
+        .prepare_managed_evolution(&valid, &mappings(&valid), "valid-session")
+        .unwrap();
+    let adopted = store.adopt_scoped(current.revision, &prepared).unwrap();
+    assert_eq!(adopted.data.records, current.data.records);
+    assert_eq!(adopted.data.events, current.data.events);
+    assert_eq!(adopted.session.values["focused_job"], reference(&existing));
+    let reopened = ProductStore::open(&path).unwrap();
+    assert_eq!(reopened.load().unwrap(), adopted);
+    action(&reopened, "continue", "calculate", &existing);
+}

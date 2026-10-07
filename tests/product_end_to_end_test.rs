@@ -585,3 +585,68 @@ fn failed_recent_registration_does_not_recreate_an_already_saved_tool() {
     settle(&mut h, &mut restarted);
     assert_eq!(restarted.test_runtime().unwrap().retained_records.len(), 1);
 }
+
+#[test]
+fn format_upgrade_controls_require_explicit_confirmation_and_reopen_fresh_daily_view() {
+    use product_contract::*;
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let path = root.join("old-generated");
+    let store =
+        product_store::ProductStore::create(&path, &fixture::capture(fixture::organizer()), 20000)
+            .unwrap();
+    let snapshot = store
+        .apply(
+            0,
+            "earlier",
+            &fixture::add("Earlier fictional work"),
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    let mut wire = serde_json::to_value(&snapshot).unwrap();
+    wire.as_object_mut().unwrap().remove("scope");
+    wire["version"] = serde_json::json!(1);
+    let digest = canonical_digest(IdentityDomain::Data, &wire).unwrap();
+    fs::write(
+        path.join(format!("object-{}.json", digest.as_str())),
+        canonical_bytes(&wire).unwrap(),
+    )
+    .unwrap();
+    let pointer = canonical_bytes(&serde_json::json!({"magic":"gitmanager.generated-project","version":1,"project_id":snapshot.data.project_id,"revision":snapshot.revision,"object":digest})).unwrap();
+    fs::write(path.join("CURRENT"), &pointer).unwrap();
+    let hooks = TestHooks {
+        folder_choice: Some(path.clone()),
+        ..TestHooks::default()
+    };
+    let mut studio = ProductStudio::testing(root, None, hooks);
+    let mut h = EguiHarness::new(egui::vec2(1000.0, 1200.0));
+    settle(&mut h, &mut studio);
+    click(&mut h, &mut studio, "studio.open");
+    settle(&mut h, &mut studio);
+    assert_eq!(studio.test_page(), "upgrade");
+    let trace = frame(&mut h, &mut studio);
+    assert!(trace
+        .text
+        .iter()
+        .any(|s| s.contains("Original snapshots and backups are kept")));
+    click(&mut h, &mut studio, "studio.back");
+    settle(&mut h, &mut studio);
+    assert_eq!(fs::read(path.join("CURRENT")).unwrap(), pointer);
+    click(&mut h, &mut studio, "studio.open");
+    settle(&mut h, &mut studio);
+    click(&mut h, &mut studio, "studio.upgrade");
+    settle(&mut h, &mut studio);
+    assert_eq!(studio.test_page(), "daily", "{}", studio.test_notice());
+    assert_eq!(
+        studio.test_runtime().unwrap().retained_records,
+        snapshot.data.records
+    );
+    assert_eq!(
+        product_store::ProductStore::open(path)
+            .unwrap()
+            .load()
+            .unwrap()
+            .version,
+        2
+    );
+}

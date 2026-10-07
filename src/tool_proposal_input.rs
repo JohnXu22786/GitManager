@@ -23,6 +23,9 @@ pub const MAX_NESTING_DEPTH: usize = 64;
 #[derive(Debug)]
 pub enum InputError {
     InputTooLarge,
+    InputExceedsLimit {
+        max_bytes: usize,
+    },
     NestingTooDeep,
     DuplicateObjectMember,
     /// Malformed JSON, invalid UTF-8, trailing input, or numbers outside
@@ -36,6 +39,9 @@ impl fmt::Display for InputError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InputTooLarge => write!(formatter, "JSON input exceeds {MAX_INPUT_BYTES} bytes"),
+            Self::InputExceedsLimit { max_bytes } => {
+                write!(formatter, "JSON input exceeds {max_bytes} bytes")
+            }
             Self::NestingTooDeep => {
                 write!(
                     formatter,
@@ -70,7 +76,18 @@ pub fn parse_json_bytes(bytes: &[u8]) -> Result<Value, InputError> {
     if bytes.len() > MAX_INPUT_BYTES {
         return Err(InputError::InputTooLarge);
     }
+    parse_json_bytes_with_limit(bytes, MAX_INPUT_BYTES)
+}
 
+/// Parse a local envelope under an explicit caller-owned byte cap. This does
+/// not alter the 1 MiB proposal/source intake API or its reader limit.
+pub(crate) fn parse_json_bytes_with_limit(
+    bytes: &[u8],
+    max_bytes: usize,
+) -> Result<Value, InputError> {
+    if bytes.len() > max_bytes {
+        return Err(InputError::InputExceedsLimit { max_bytes });
+    }
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let mut violation = None;
     let result = ValueSeed {

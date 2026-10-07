@@ -27,10 +27,17 @@ pub struct EvolutionDraft {
     resolved: Vec<ResolvedNeed>,
     runtime: String,
     mappings: Vec<ImplementationMapping>,
+    scoped: Option<PreparedScopedChange>,
 }
 impl EvolutionDraft {
     pub fn candidate(&self) -> &CapturedProgram {
         &self.candidate
+    }
+    pub fn authored_candidate(&self) -> &CapturedProgram {
+        self.scoped
+            .as_ref()
+            .map(PreparedScopedChange::candidate)
+            .unwrap_or(&self.candidate)
     }
     pub fn suggestion(&self) -> &EvolutionSuggestion {
         &self.suggestion
@@ -89,6 +96,29 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             return Err(AdapterError::Cancelled.into());
         }
         let result = provider.develop(&request.request, cancelled)?;
+        self.evolution_result(result, request, id, None, cancelled)
+    }
+    /// Verify an already returned provider result against the exact opaque host
+    /// preparation. The ordinary capture keeps its genuine producer; resolved
+    /// scenes and adoption bind to the separately captured compiled executable.
+    pub fn develop_prepared_evolution(
+        &self,
+        result: DevelopmentResult,
+        request: &ReconciliationRequest,
+        id: &str,
+        prepared: PreparedScopedChange,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<EvolutionDraft> {
+        self.evolution_result(result, request, id, Some(prepared), cancelled)
+    }
+    fn evolution_result(
+        &self,
+        result: DevelopmentResult,
+        request: &ReconciliationRequest,
+        id: &str,
+        scoped: Option<PreparedScopedChange>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<EvolutionDraft> {
         if cancelled() {
             return Err(AdapterError::Cancelled.into());
         }
@@ -130,6 +160,29 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             None,
         )?;
         self.runtime.validate(&candidate)?;
+        let candidate = if let Some(prepared) = &scoped {
+            let current = self.archive.snapshot()?;
+            if canonical_digest(IdentityDomain::Data, &current)? != request.current
+                || prepared.candidate() != &candidate
+            {
+                return Err(invalid("managed reconciliation preparation is stale or names a different authored candidate"));
+            }
+            ScopedExecutionContext::prepared(&current, prepared)?;
+            prepared.target().clone()
+        } else {
+            candidate
+        };
+        self.with_scoped(scoped.clone(), || {
+            self.resolve_evolution(request, candidate, suggestion, scoped)
+        })
+    }
+    fn resolve_evolution(
+        &self,
+        request: &ReconciliationRequest,
+        candidate: CapturedProgram,
+        suggestion: EvolutionSuggestion,
+        scoped: Option<PreparedScopedChange>,
+    ) -> Result<EvolutionDraft> {
         if let Some(current) = request.sources.last() {
             let mut executable = candidate.program.clone();
             // A new application identifier alone is not a new executable design.
@@ -220,8 +273,9 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 &candidate.program,
                 &decoded.replacement,
             )?;
-            accept_scene(
-                &self.runtime,
+            self.capture_mapped_scene(
+                &original.program,
+                &original.scenario,
                 &candidate,
                 &decoded.replacement,
                 original.disclosure,
@@ -258,8 +312,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             let mut obligations = vec![];
             let mut exercised = BTreeSet::new();
             for original in self.archive.load(&decision.witness)? {
-                let (prior, contexts) = execute(
-                    &self.runtime,
+                let (prior, contexts) = self.execute_scene(
                     &original.program,
                     &original.scenario,
                     &request.decisions,
@@ -299,8 +352,9 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 } else {
                     mapping.scenario(&original.scenario, &candidate.program)?
                 };
-                let (mut checked, target_contexts) = capture_scene(
-                    &self.runtime,
+                let (mut checked, target_contexts) = self.capture_mapped_scene(
+                    &original.program,
+                    &original.scenario,
                     &candidate,
                     &replacement,
                     original.disclosure,
@@ -308,8 +362,12 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 )?;
                 checked.bind_outcome = original.bind_outcome;
                 if (decision.obligations.is_empty() || original.bind_outcome)
-                    && same_outcome(original.observations(), checked.observations(), &mapping)?
-                        != Some(true)
+                    && self.compare_outcome(
+                        &original,
+                        &candidate,
+                        checked.observations(),
+                        &mapping,
+                    )? != Some(true)
                 {
                     return Err(DecisionError::Unverified(
                         "New design does not reproduce both accepted outcomes".into(),
@@ -381,6 +439,10 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 "New design fails an unrelated active intention".into(),
             ));
         }
+        let mut scoped = scoped;
+        if let Some(prepared) = &mut scoped {
+            prepared.correspondences = self.pending_correspondences.borrow().clone();
+        }
         Ok(EvolutionDraft {
             request: request.clone(),
             candidate,
@@ -388,9 +450,29 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             resolved,
             runtime: self.runtime.capabilities().version,
             mappings,
+            scoped,
         })
     }
     pub fn prepare_evolution(
+        &self,
+        store: &ProductStore,
+        draft: &EvolutionDraft,
+        id: &str,
+    ) -> Result<VerifiedChange> {
+        if draft
+            .scoped
+            .as_ref()
+            .is_some_and(|prepared| prepared.operation_id() != id)
+        {
+            return Err(invalid(
+                "managed evolution adoption operation differs from its preparation",
+            ));
+        }
+        self.with_scoped(draft.scoped.clone(), || {
+            self.prepare_evolution_inner(store, draft, id)
+        })
+    }
+    fn prepare_evolution_inner(
         &self,
         store: &ProductStore,
         draft: &EvolutionDraft,
