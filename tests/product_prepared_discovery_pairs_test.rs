@@ -65,6 +65,15 @@ fn authored_result_resolves_to_host_lowered_execution_without_rewriting_provenan
         report.log,
         report.unverified
     );
+    assert!(report
+        .coverage
+        .iter()
+        .any(|coverage| coverage.contains("No current-side experience is claimed")));
+    assert!(!report
+        .runs
+        .iter()
+        .any(|run| run.binding.artifact == request.sources[0].artifact
+            && run.state == EvidenceState::Observed));
     assert_eq!(report.lowerings.len(), 1);
     assert_eq!(report.lowerings[0].result(), &result);
     assert_eq!(report.lowerings[0].authored(), &authored);
@@ -580,4 +589,151 @@ fn prepared_lowering_does_not_turn_an_independent_requirement_violation_into_a_p
         .unverified
         .iter()
         .any(|message| message.contains("violated")));
+}
+
+#[test]
+fn unexpected_baseline_guard_failure_and_exhaustion_remain_unverified() {
+    let dir = tempdir();
+    let store = managed_store(&dir.path().join("tool"));
+    let mut blocked = serde_json::to_value(design(2, fixture_producer(), false).program).unwrap();
+    blocked["actions"][7]["guards"] = serde_json::json!([boolean(false)]);
+    let blocked = capture(blocked);
+    let prepared = prepare(&store, &blocked, "existing-guard");
+    store
+        .adopt_scoped(store.load().unwrap().revision, &prepared)
+        .unwrap();
+    let primary = prepare(&store, &design(1, fixture_producer(), false), "primary");
+    let alternative = design(3, fixture_producer(), false);
+    let (request, result, mut policy) = discovery(&store, &primary, &alternative);
+    let proof = PreparedDiscoveryCandidate::from_result(
+        &store.load().unwrap(),
+        &request,
+        &result,
+        "alternative",
+        prepare(&store, &alternative, "alternative"),
+        vec![],
+    )
+    .unwrap();
+    policy
+        .retained_history
+        .as_mut()
+        .unwrap()
+        .map_prepared_result(proof)
+        .unwrap();
+    let report = discover(&request, &result, &policy, Arc::new(AtomicBool::new(false))).unwrap();
+    assert!(report.questions.is_empty());
+    assert!(!report.unverified.is_empty());
+    assert!(report
+        .runs
+        .iter()
+        .any(|run| run.binding.artifact == request.sources[0].artifact
+            && run.state == EvidenceState::Failed));
+    policy.search.runtime.fuel = 1;
+    let exhausted = discover(&request, &result, &policy, Arc::new(AtomicBool::new(false))).unwrap();
+    assert!(exhausted.questions.is_empty());
+    assert!(!exhausted.unverified.is_empty());
+    let cancelled = discover(&request, &result, &policy, Arc::new(AtomicBool::new(true)));
+    assert!(cancelled.is_err() || cancelled.unwrap().questions.is_empty());
+}
+
+#[test]
+fn legacy_single_rehearsal_preserves_reversed_recorded_decision_order() {
+    let dir = tempdir();
+    let path = dir.path().join("tool");
+    let store = managed_store(&path);
+    let current = store.load().unwrap();
+    let mut raw = serde_json::to_value(program(true).program).unwrap();
+    raw["observables"][0]["value"] = serde_json::to_value(int(1)).unwrap();
+    let prospective = prepare(&store, &capture(raw), "prospective");
+    let engine = DecisionEngine::new(LocalRuntime::default(), IntentArchive::new(store.clone()));
+    let scenario = ScenarioSpec {
+        version: 1,
+        id: "legacy-many".into(),
+        label: "One current and one prospective outcome".into(),
+        seed: current.data.clone(),
+        session: current.session.clone(),
+        clock_day: current.clock_day,
+        random_seed: 0,
+        inputs: vec![
+            invoke("export", &[]),
+            SemanticInput::Observe {
+                point: "result".into(),
+            },
+        ],
+        validity: vec![],
+    };
+    let scenes = vec![
+        engine
+            .accept_prepared_current_scene(&store, &prospective, &scenario, Disclosure::Synthetic)
+            .unwrap(),
+        engine
+            .accept_scoped_scene(&store, &prospective, &scenario, Disclosure::Synthetic)
+            .unwrap(),
+    ];
+    let object = serde_json::json!({"version":1,"content":{"kind":"scenes","scenes":scenes}});
+    let witness = store
+        .stage_extension(&canonical_bytes(&object).unwrap())
+        .unwrap();
+    let mut next = current.decisions.clone();
+    next.revision += 1;
+    for id in ["a", "b"] {
+        let mut scope = choice(DecisionOutcome::Deferred).scope;
+        scope.operations = ["export".into()].into_iter().collect();
+        next.decisions.push(ScopedDecision {
+            id: id.into(),
+            revision: 1,
+            request: "Keep this unresolved historical choice".into(),
+            rationale: None,
+            scope,
+            outcome: DecisionOutcome::Deferred,
+            status: DecisionStatus::Pending,
+            obligations: vec![],
+            scenarios: scenes
+                .iter()
+                .map(|scene| scene.scenario().identity().unwrap())
+                .collect(),
+            witness: witness.clone(),
+            supersedes: vec![],
+        });
+    }
+    let adoption = store
+        .prepare_switch(current.program().unwrap(), "record-reversed")
+        .unwrap();
+    let reversed = vec!["b".into(), "a".into()];
+    let retained = store
+        .adopt_rehearsal_verified(
+            current.revision,
+            &adoption,
+            current.program().unwrap(),
+            &next,
+            &prospective,
+            &reversed,
+            &Default::default(),
+            |_, _, _, _| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(ProductStore::open(&path).unwrap().load().unwrap(), retained);
+    assert_eq!(
+        store
+            .adopt_rehearsal_verified(
+                current.revision,
+                &adoption,
+                current.program().unwrap(),
+                &next,
+                &prospective,
+                &reversed,
+                &Default::default(),
+                |_, _, _, _| Ok(())
+            )
+            .unwrap(),
+        retained
+    );
+    let bytes = product_backup::VerifiedBackup::capture(&store)
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+    product_backup::VerifiedBackup::from_bytes(&bytes)
+        .unwrap()
+        .recover_new(&dir.path().join("recovered"))
+        .unwrap();
 }

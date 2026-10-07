@@ -207,6 +207,56 @@ fn checked_scene(
     checked
 }
 
+/// Identify only a type-level absence of an independently required new
+/// action and its added session state. The projected value is used solely to
+/// classify the validation error; it is never executed or called current proof.
+fn required_feature_absence(
+    before: &CapturedProgram,
+    candidate: &CapturedProgram,
+    scene: &ScenarioSpec,
+    policy: &DiscoveryPolicy,
+) -> Option<AdapterError> {
+    let error = scene.validate(&before.program).err()?;
+    scene.validate(&candidate.program).ok()?;
+    let missing: BTreeSet<_> = policy
+        .required_actions
+        .iter()
+        .filter(|id| {
+            !before
+                .program
+                .actions
+                .iter()
+                .any(|action| &action.id == *id)
+                && candidate
+                    .program
+                    .actions
+                    .iter()
+                    .any(|action| &action.id == *id)
+        })
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    let mut projected = scene.clone();
+    let mut removed = false;
+    projected.inputs.retain(|input| {
+        let absent =
+            matches!(input, SemanticInput::Invoke { action, .. } if missing.contains(action));
+        removed |= absent;
+        !absent
+    });
+    if !removed {
+        return None;
+    }
+    projected
+        .session
+        .values
+        .retain(|id, _| before.program.state.iter().any(|state| &state.id == id));
+    // Reject any other invalid view, input, argument, field or session value.
+    projected.validate(&before.program).ok()?;
+    Some(AdapterError::Invalid(error))
+}
+
 struct ReplayBudget {
     remaining: Cell<usize>,
     cancelled: Arc<AtomicBool>,
@@ -1165,12 +1215,20 @@ pub fn discover(
                     material_unknowns.insert((before.binding.identity()?, candidate.binding.identity()?, scene_equivalence_key(&scene)?), format!("Captured source executions differ in material channels without executable property terms: {}", channels.join(", ")));
                 }
             }
-            for result in [baseline_run, candidate_run] {
+            let expected_absence = if new_feature && current_ran {
+                required_feature_absence(before, candidate, &scene, policy)
+            } else {
+                None
+            };
+            for (side, result) in [baseline_run, candidate_run].into_iter().enumerate() {
                 match result {
                     Ok(run) => report.runs.push(run),
-                    Err(e) => report
+                    Err(error) if side == 0 && expected_absence.as_ref() == Some(&error) => {
+                        report.coverage.push("Current cannot execute this independently required new action/state; compare the two verified prospective implementations. No current-side experience is claimed".into());
+                    }
+                    Err(error) => report
                         .unverified
-                        .push(format!("Captured-source replay unavailable: {e:?}")),
+                        .push(format!("Captured-source replay unavailable: {error:?}")),
                 }
             }
             if unchanged {

@@ -83,6 +83,9 @@ pub(in crate::product_store) fn retain_rehearsals(
     plan: &AdoptionPlan,
 ) -> Result<()> {
     ScopedExecutionContext::rehearsals(current, prepared)?;
+    if prepared.len() == 2 && decisions.len() != 1 {
+        return Err(error("paired rehearsal records one exact pending choice"));
+    }
     if current
         .scope
         .rehearsals
@@ -197,6 +200,17 @@ pub(super) fn verify_recording_request(
             return Err(error(
                 "paired rehearsal proofs differ in basis or exact recording birth",
             ));
+        }
+        if proofs.len() == 1 && first.witnesses.len() > 1 {
+            // The established public single-target API accepted an ordered ID
+            // slice but retained only its set. Its original order cannot be
+            // reconstructed. Preserve that legacy validation boundary: exact
+            // graph births/source/scene/receipt checks still apply below.
+            // New paired recordings require exactly one pending decision.
+            return Ok(());
+        }
+        if proofs.len() == 2 && first.witnesses.len() != 1 {
+            return Err(error("paired rehearsal must bind one exact pending choice"));
         }
         let decisions: Vec<_> = graph
             .decisions
