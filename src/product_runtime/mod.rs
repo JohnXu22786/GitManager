@@ -705,6 +705,9 @@ impl RuntimeAdapter for LocalRuntime {
         run.fuel.set(meter.fuel);
         result
     }
+    fn emitted_artifacts<'a>(&self, run: &'a ProductRun) -> Result<&'a [LocalArtifact]> {
+        Ok(run.artifacts())
+    }
     fn data<'a>(&self, run: &'a ProductRun) -> &'a DataSnapshot {
         &run.state.data
     }

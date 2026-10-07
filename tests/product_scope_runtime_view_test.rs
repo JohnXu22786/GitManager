@@ -2921,3 +2921,92 @@ fn prepared_discovery_restores_correspondence_state_on_the_same_engine() {
     );
     assert_eq!(store.load().unwrap(), current);
 }
+
+#[test]
+fn scoped_output_provenance_does_not_evaluate_intermediate_observables() {
+    fn deferred_observation(pause: bool) -> CapturedProgram {
+        let mut raw = serde_json::to_value(program(pause).program).unwrap();
+        raw["state"].as_array_mut().unwrap().push(serde_json::json!({"id":"scratch","label":"Intermediate export state","value_type":{"kind":"integer"},"initial":{"kind":"integer","value":0}}));
+        raw["observables"].as_array_mut().unwrap().push(serde_json::json!({"id":"safe_final","label":"Final state","value":{"kind":"add","left":{"kind":"state","state":"scratch"},"right":int(1)}}));
+        raw["actions"][6]["steps"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"kind":"set_state","state":"scratch","value":int(i64::MAX)}));
+        raw["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"reset_observation","label":"Finish export state","parameters":{},"guards":[],"steps":[{"kind":"set_state","state":"scratch","value":int(0)}],"ensures":[]}));
+        capture(raw)
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let store =
+        ProductStore::create(dir.path().join("tool"), &deferred_observation(false), 20000).unwrap();
+    let job = add(&store, "job", "Waiting export");
+    action(&store, "wait", "wait", &job);
+    tick(&store, "days", 20003);
+    let current = store.load().unwrap();
+    let prepared = store
+        .prepare_scoped_change(
+            &deferred_observation(true),
+            &request(&current, ScopePopulation::All),
+            "scope",
+        )
+        .unwrap();
+    let mut scene = selected_scene(&prepared, &job);
+    scene
+        .inputs
+        .insert(scene.inputs.len() - 1, invoke("reset_observation", &[]));
+    let context = ScopedExecutionContext::prepared(&current, &prepared).unwrap();
+    let direct = LocalRuntime::default()
+        .replay_admitted(
+            prepared.target(),
+            &scene,
+            &current.decisions,
+            RuntimeLimits::default(),
+            "direct",
+            Some(&context),
+        )
+        .unwrap();
+    assert_eq!(direct.state, EvidenceState::Observed);
+    assert_eq!(direct.observations.len(), 1);
+    assert_eq!(
+        direct.observations[0].values["safe_final"],
+        DataValue::Integer { value: 1 }
+    );
+    let engine = DecisionEngine::new(LocalRuntime::default(), IntentArchive::new(store.clone()));
+    let accepted = engine
+        .accept_scoped_scene(&store, &prepared, &scene, Disclosure::Synthetic)
+        .unwrap();
+    assert_eq!(accepted.observations(), direct.observations);
+    assert_eq!(accepted.evidence().trace, direct.trace);
+    let choice = Choice {
+        id: "timing".into(),
+        request: "Keep the actually experienced scoped export and final observation".into(),
+        rationale: None,
+        scope: prepared.scope().clone(),
+        outcome: DecisionOutcome::Accept {
+            artifact: prepared.target().artifact.program_digest.clone(),
+        },
+        obligations: vec![],
+        binding: IntentionBinding::ObservedOutcome,
+    };
+    let change = engine
+        .prepare_scoped_choice(&store, prepared, choice, vec![accepted], "scope")
+        .unwrap();
+    let adopted = engine.adopt(&store, &change).unwrap();
+    assert_eq!(
+        engine.check_current(&adopted).unwrap().disposition,
+        CheckDisposition::Ready
+    );
+    apply(&store, "live-export", invoke("export", &[]));
+    let continued = apply(&store, "live-reset", invoke("reset_observation", &[]));
+    assert_eq!(
+        continued.session.values["scratch"],
+        DataValue::Integer { value: 0 }
+    );
+    assert_eq!(
+        continued.artifacts.last().unwrap().rows[0]["production"],
+        DataValue::Integer { value: 0 }
+    );
+    ProductStore::open(dir.path().join("tool"))
+        .unwrap()
+        .runtime_view()
+        .unwrap();
+}

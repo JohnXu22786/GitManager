@@ -113,7 +113,9 @@ validity changes need new correspondence rather than a silent namespace change.
 Concrete comparison excludes only compiler-added view/output provenance columns
 identified by independently regenerated manifests. All business cells, output
 row order/count, column types and predicates stay binding. Full raw observations,
-bytes and visible provenance remain retained.
+bytes and visible provenance remain retained. Intention replay reads emitted
+provenance from immutable output receipts; it does not insert additional view
+or observable evaluations between the explicit workflow observations.
 
 The initialized seed of a managed evolution remains authenticated
 through its exact retained basis and source after later edits and restart.

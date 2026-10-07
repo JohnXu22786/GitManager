@@ -318,12 +318,17 @@ pub(super) fn execute_admitted<R: RuntimeAdapter>(
                 && !event.outputs.is_empty()
                 && crate::product_runtime::has_protected_fields(program)
             {
-                let observed = runtime.observe(&run, "scope-output-correspondence")?;
-                for output in observed
-                    .outputs
-                    .iter()
-                    .filter(|o| event.outputs.contains(&o.digest))
-                {
+                let artifacts = runtime.emitted_artifacts(&run)?;
+                for digest in &event.outputs {
+                    let output = artifacts
+                        .iter()
+                        .find(|output| &output.digest == digest)
+                        .ok_or_else(|| {
+                            DecisionError::Unverified(
+                                "Emitted scoped output receipt is unavailable".into(),
+                            )
+                        })?;
+                    output.validate()?;
                     for row in &output.rows {
                         for (field, value) in row {
                             if field.starts_with(crate::product_runtime::PROTECTED_FIELD_PREFIX)

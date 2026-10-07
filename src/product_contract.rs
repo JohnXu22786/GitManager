@@ -3841,6 +3841,16 @@ pub trait RuntimeAdapter {
         run: &Self::Run,
         point: &str,
     ) -> std::result::Result<Observation, AdapterError>;
+    /// Inspect already-produced immutable output receipts without evaluating
+    /// expressions, observing views, or charging execution fuel.
+    fn emitted_artifacts<'a>(
+        &self,
+        _run: &'a Self::Run,
+    ) -> std::result::Result<&'a [LocalArtifact], AdapterError> {
+        Err(AdapterError::Unsupported(
+            "Adapter cannot inspect emitted artifact provenance".into(),
+        ))
+    }
     fn data<'a>(&self, run: &'a Self::Run) -> &'a DataSnapshot;
     fn session<'a>(&self, run: &'a Self::Run) -> &'a SessionState;
     fn compatibility(
