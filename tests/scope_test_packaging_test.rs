@@ -15,6 +15,11 @@ class PackageTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+        self.profile_environment = {'CARGO_PROFILE_TEST_OPT_LEVEL':'1',
+            'CARGO_PROFILE_TEST_DEBUG_ASSERTIONS':'true', 'CARGO_PROFILE_TEST_OVERFLOW_CHECKS':'true'}
+        environment = mock.patch.dict(os.environ, self.profile_environment)
+        environment.start()
+        self.addCleanup(environment.stop)
         self.root = pathlib.Path(self.temp.name) / 'checkout'
         self.root.mkdir()
         (self.root / 'target/debug/deps').mkdir(parents=True)
@@ -25,7 +30,7 @@ class PackageTests(unittest.TestCase):
         self.log = self.root.parent / 'build.jsonl'
         self.artifact = {'reason':'compiler-artifact', 'manifest_path':str(self.root / 'Cargo.toml'),
             'target':{'kind':['test'], 'name':p.TARGET_NAME, 'src_path':str(self.root / 'tests' / (p.TARGET_NAME + '.rs'))},
-            'profile':{'test':True, 'opt_level':'0', 'debug_assertions':True, 'debuginfo':2},
+            'profile':{'test':True, 'opt_level':'1', 'debug_assertions':True, 'overflow_checks':True, 'debuginfo':2},
             'features':[], 'executable':str(self.binary)}
         self.write_log()
         self.args = argparse.Namespace(repo_root=self.root, build_json=self.log,
@@ -54,6 +59,21 @@ class PackageTests(unittest.TestCase):
             return p.package(self.args)
     def test_selection(self):
         self.assertEqual(p.select_artifact(self.log, self.root)['executable'], str(self.binary))
+        for field, values in [('opt_level',['0','2','3',None]), ('debug_assertions',[False,None]), ('overflow_checks',[False,None]), ('test',[False,None])]:
+            for value in values:
+                saved = self.artifact['profile'].copy()
+                if value is None: del self.artifact['profile'][field]
+                else: self.artifact['profile'][field] = value
+                self.write_log()
+                with self.assertRaises(ValueError): p.select_artifact(self.log, self.root)
+                self.artifact['profile'] = saved
+        self.write_log()
+        for key in self.profile_environment:
+            for value in ['0',None]:
+                with mock.patch.dict(os.environ):
+                    if value is None: del os.environ[key]
+                    else: os.environ[key] = value
+                    with self.assertRaises(ValueError): p.select_artifact(self.log, self.root)
         for field, value in [('manifest_path',str(self.root.parent/'Cargo.toml')), ('profile',{'test':True,'opt_level':'3','debug_assertions':False}), ('executable',str(self.root.parent/'foreign'))]:
             saved = self.artifact[field]
             self.artifact[field] = value
@@ -89,6 +109,7 @@ class PackageTests(unittest.TestCase):
             metadata = json.loads(metadata_copy)
             self.assertEqual(metadata['source'], self.identity)
             self.assertEqual(metadata['profile'], self.artifact['profile'])
+            self.assertEqual(metadata['profile_environment'], self.profile_environment)
             self.assertEqual(metadata['distribution'], 'unsigned-ci-test-harness')
             self.assertTrue(metadata['direct_list']['success'])
             self.assertEqual(set(metadata['archive_members']), set(names))

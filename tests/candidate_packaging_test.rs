@@ -262,6 +262,14 @@ fn ci_candidate_steps_are_main_push_only_and_read_only() {
     assert!(!workflow.contains("contents: write"));
     assert!(!workflow.contains("action-gh-release"));
     assert!(workflow.contains("run: cargo test --all-targets"));
+    assert!(workflow.contains("    env:\n      CARGO_PROFILE_TEST_OPT_LEVEL: \"1\"\n      CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: \"true\"\n      CARGO_PROFILE_TEST_OVERFLOW_CHECKS: \"true\"\n"));
+    for key in [
+        "CARGO_PROFILE_TEST_OPT_LEVEL",
+        "CARGO_PROFILE_TEST_DEBUG_ASSERTIONS",
+        "CARGO_PROFILE_TEST_OVERFLOW_CHECKS",
+    ] {
+        assert_eq!(workflow.matches(key).count(), 1);
+    }
     for os in ["ubuntu-latest", "windows-latest", "macos-latest"] {
         assert!(workflow.contains(&format!("          - {os}")));
     }

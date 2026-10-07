@@ -20,6 +20,9 @@ REPOSITORY = "JohnXu22786/GitManager"
 BRANCH = "refs/heads/feat/enforced-adoption-scope"
 CARGO_COMMAND = ["cargo", "test", "--locked", "--no-run", "--test", TARGET_NAME,
                  "--message-format=json-render-diagnostics"]
+TEST_PROFILE_ENV = {"CARGO_PROFILE_TEST_OPT_LEVEL": "1",
+                    "CARGO_PROFILE_TEST_DEBUG_ASSERTIONS": "true",
+                    "CARGO_PROFILE_TEST_OVERFLOW_CHECKS": "true"}
 
 
 def command(argv, **kwargs):
@@ -71,7 +74,15 @@ def source_identity(root, expected):
     }
 
 
+def profile_environment():
+    selected = {name: os.environ.get(name) for name in TEST_PROFILE_ENV}
+    if selected != TEST_PROFILE_ENV:
+        raise ValueError("test profile environment differs from the complete CI test workload")
+    return selected
+
+
 def select_artifact(build_json, root):
+    profile_environment()
     regular(build_json)
     if build_json.stat().st_size > 64 * 1024 * 1024:
         raise ValueError("Cargo message inventory is too large")
@@ -90,10 +101,11 @@ def select_artifact(build_json, root):
     artifact = selected[0]
     target, profile = artifact["target"], artifact.get("profile", {})
     if (target.get("kind") != ["test"] or profile.get("test") is not True
-            or profile.get("opt_level") != "0" or profile.get("debug_assertions") is not True
+            or profile.get("opt_level") != "1" or profile.get("debug_assertions") is not True
+            or profile.get("overflow_checks") is not True
             or artifact.get("manifest_path") != str(root / "Cargo.toml")
             or target.get("src_path") != str(root / "tests" / (TARGET_NAME + ".rs"))):
-        raise ValueError("compiler artifact differs from the exact default-profile integration target")
+        raise ValueError("compiler artifact differs from the exact optimized test-profile integration target")
     executable = artifact.get("executable")
     if not isinstance(executable, str):
         raise ValueError("compiler artifact has no executable")
@@ -188,6 +200,7 @@ def package(args):
                     "target": HOST, "test_target": TARGET_NAME, "cargo_command": CARGO_COMMAND,
                     "toolchain": {"rustc_verbose": rustc, "cargo": cargo},
                     "profile": artifact["profile"], "features": artifact.get("features", []),
+                    "profile_environment": profile_environment(),
                     "original_executable": {"path": original.relative_to(root).as_posix(),
                         "sha256": original_digest, "size_bytes": before.st_size,
                         "mode": stat.S_IMODE(before.st_mode)},
