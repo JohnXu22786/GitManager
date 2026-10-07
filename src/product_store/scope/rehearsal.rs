@@ -238,6 +238,7 @@ pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
                 "rehearsal compatibility does not independently regenerate",
             ));
         }
+        validate_initial_runtime(target, &seed, manifest.basis.day)?;
         let receipt = snapshot
             .adoptions
             .iter()

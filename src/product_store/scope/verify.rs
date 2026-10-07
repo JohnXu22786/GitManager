@@ -314,6 +314,7 @@ pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
         {
             return Err(error("initialized-data compatibility receipt mismatch"));
         }
+        validate_initial_runtime(target, &data, manifest.basis.day)?;
     }
     rehearsal::validate(snapshot)?;
     correspondence::validate(snapshot)?;

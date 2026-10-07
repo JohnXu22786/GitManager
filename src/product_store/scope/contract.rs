@@ -216,6 +216,20 @@ pub struct ScopeScenarioCorrespondence {
     pub original: ScenarioSpec,
     pub projected: ScenarioSpec,
 }
+impl ScopeScenarioCorrespondence {
+    /// Structural input reductions keep the exact authenticated starting
+    /// frame. Inputs and labels have their own new evidence identities.
+    pub(super) fn matches_frame(&self, scenario: &ScenarioSpec) -> bool {
+        let original = &self.projected;
+        original.version == scenario.version
+            && original.id == scenario.id
+            && original.seed == scenario.seed
+            && original.session == scenario.session
+            && original.clock_day == scenario.clock_day
+            && original.random_seed == scenario.random_seed
+            && original.validity == scenario.validity
+    }
+}
 impl ScopeCorrespondence {
     pub fn identity(&self) -> Result<Digest> {
         Ok(canonical_digest(IdentityDomain::Scenario, self)?)

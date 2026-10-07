@@ -2721,6 +2721,88 @@ fn fresh_scoped_discovery_retains_creation_identity_without_pending_history() {
         assert_eq!(row["production"], DataValue::Integer { value });
         assert_ne!(run.binding.scenario_digest, scene.identity().unwrap());
     }
+    // Structural reduction may remove an unrelated observation without
+    // changing the authenticated operation frame or future reference IDs.
+    let mut reducing = scene.clone();
+    reducing.inputs.insert(
+        1,
+        SemanticInput::Observe {
+            point: "unrelated".into(),
+        },
+    );
+    let mut mapped = reducing.clone();
+    mapped.seed = product_runtime::merged_data(prepared.target(), &reducing.seed).unwrap();
+    let (context, projected) = ScopedExecutionContext::prepared(&current, &prepared)
+        .unwrap()
+        .project_scenario(
+            current.program().unwrap(),
+            &reducing,
+            prepared.target(),
+            &mapped,
+        )
+        .unwrap();
+    let comparison = product_scenarios::ComparisonEngine::new(Arc::new(AtomicBool::new(false)))
+        .with_admission(Arc::new(context));
+    let target = product_scenarios::ObservationTarget::OutputColumn {
+        point: "result".into(),
+        output: "sheet".into(),
+        column: "production".into(),
+    };
+    let mut reduced = projected.clone();
+    reduced.inputs.remove(1);
+    let checked = comparison
+        .compare(
+            current.program().unwrap(),
+            prepared.target(),
+            &reduced,
+            &current.decisions,
+            target.clone(),
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        checked.state,
+        EvidenceState::Observed,
+        "{:?}",
+        checked.diagnostics
+    );
+    let minimized = comparison
+        .minimize(
+            current.program().unwrap(),
+            prepared.target(),
+            &projected,
+            &current.decisions,
+            target.clone(),
+            product_scenarios::SearchBudget::default(),
+        )
+        .unwrap();
+    let witness = minimized.witness.unwrap();
+    assert!(!witness
+        .witness()
+        .scenario
+        .inputs
+        .iter()
+        .any(|input| matches!(input,SemanticInput::Observe{point} if point=="unrelated")));
+    assert!(witness
+        .reduction_audit()
+        .iter()
+        .any(|audit| audit.trial.outcome == ReductionOutcome::DifferencePreserved));
+    let mut tampered = reduced;
+    tampered.clock_day += 1;
+    let refused = comparison
+        .compare(
+            current.program().unwrap(),
+            prepared.target(),
+            &tampered,
+            &current.decisions,
+            target,
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    assert!(matches!(
+        refused.state,
+        EvidenceState::Unsupported | EvidenceState::Inconclusive
+    ));
     assert_eq!(store.load().unwrap(), current);
 }
 

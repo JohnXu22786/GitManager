@@ -106,7 +106,9 @@ Historical replay captures are labelled CapturedForHistoricalReplay rather
 than presented as a real adoption receipt. Bounded typed proofs and original
 source/seed/scenario bindings survive restart and backup. Projected scenarios
 keep the original deterministic operation namespace, with distinct actual
-scenario/source evidence; live adoption freshness is unchanged.
+scenario/source evidence; live adoption freshness is unchanged. Structural
+input reductions retain that verified starting frame. Seed, session, clock or
+validity changes need new correspondence rather than a silent namespace change.
 
 Concrete comparison excludes only compiler-added view/output provenance columns
 identified by independently regenerated manifests. All business cells, output
@@ -129,7 +131,9 @@ Initialization adds only allocated host fields. It does not increment business
 generation, alter existing record revisions or invent business events. Actual
 creation and completion transactions record their own metadata changes. Open,
 daily saves, adoption and recovery verify sources, receipts, record identity,
-membership, monotone seals and saved-value provenance.
+membership, monotone seals and saved-value provenance. Preparations and atomic
+activation also validate the exact initial runtime session, including references;
+compatible data alone cannot authorize an unusable tool.
 
 Use ProductStore::runtime_view for daily presentation. Its preserved result/event
 inspector survives changes to ordinary application views. Exports carry result

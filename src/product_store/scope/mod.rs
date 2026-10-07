@@ -140,6 +140,17 @@ fn request_valid(snapshot: &ProjectSnapshot, request: &ScopeRequest) -> Result<(
     }
     Ok(())
 }
+fn validate_initial_runtime(target: &CapturedProgram, data: &DataSnapshot, day: i32) -> Result<()> {
+    LocalRuntime::default().start(
+        target,
+        data,
+        &SessionState::initial(&target.program)?,
+        day,
+        0,
+        RuntimeLimits::default(),
+    )?;
+    Ok(())
+}
 fn prepare(
     snapshot: &ProjectSnapshot,
     candidate: &CapturedProgram,
@@ -200,14 +211,7 @@ fn prepare(
     if compatibility.state != CompatibilityState::Compatible {
         return Err(StoreError::Incompatible(compatibility));
     }
-    LocalRuntime::default().start(
-        &target,
-        &initialized,
-        &SessionState::initial(&target.program)?,
-        snapshot.clock_day,
-        0,
-        RuntimeLimits::default(),
-    )?;
+    validate_initial_runtime(&target, &initialized, snapshot.clock_day)?;
     let plan = make_plan(snapshot, &target, layer.scope(), id)?;
     Ok(PreparedScopedChange {
         correspondences: BTreeMap::new(),
@@ -263,6 +267,7 @@ fn prepare_withdrawal(
     if compatibility.state != CompatibilityState::Compatible {
         return Err(StoreError::Incompatible(compatibility));
     }
+    validate_initial_runtime(&target, &initialized, snapshot.clock_day)?;
     let scope = DecisionScope {
         operations: layers
             .iter()
@@ -333,6 +338,7 @@ fn prepare_evolution(
     if compatibility.state != CompatibilityState::Compatible {
         return Err(StoreError::Incompatible(compatibility));
     }
+    validate_initial_runtime(&target, &initialized, snapshot.clock_day)?;
     let scope = DecisionScope {
         operations: target
             .program
@@ -653,6 +659,14 @@ impl ProductStore {
             &prepared.correspondences,
             &adoption.plan.id,
             revision,
+        )?;
+        LocalRuntime::default().start(
+            &prepared.target,
+            &current.data,
+            &current.session,
+            current.clock_day,
+            0,
+            RuntimeLimits::default(),
         )?;
         self.save(
             &current,

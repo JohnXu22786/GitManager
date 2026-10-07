@@ -165,7 +165,7 @@ impl ScopedExecutionContext {
             c.proof
                 .scenario
                 .as_ref()
-                .is_some_and(|pair| pair.projected == *scenario)
+                .is_some_and(|pair| pair.matches_frame(scenario))
         })
     }
     fn operation_seed<'a>(
@@ -174,17 +174,23 @@ impl ScopedExecutionContext {
         scenario: &'a ScenarioSpec,
     ) -> Result<&'a DataSnapshot> {
         source.validate()?;
-        Ok(self
-            .correspondences
-            .values()
-            .find(|c| {
-                c.proof
-                    .scenario
-                    .as_ref()
-                    .is_some_and(|pair| pair.projected == *scenario)
-            })
-            .map(|c| &c.operation_seed)
-            .unwrap_or(&scenario.seed))
+        if let Some(checked) = self.correspondences.values().find(|c| {
+            c.proof
+                .scenario
+                .as_ref()
+                .is_some_and(|pair| pair.matches_frame(scenario))
+        }) {
+            return Ok(&checked.operation_seed);
+        }
+        if self.correspondences.values().any(|c| {
+            c.proof
+                .scenario
+                .as_ref()
+                .is_some_and(|pair| pair.projected.id == scenario.id)
+        }) {
+            return Err(compiler::error("projected scenario changed its authenticated input frame; operation identity is unverified"));
+        }
+        Ok(&scenario.seed)
     }
     pub(crate) fn project_scenario(
         &self,

@@ -1100,3 +1100,62 @@ fn incompatible_lifecycle_cannot_reopen_an_earlier_sealed_result() {
     );
     assert_eq!(row(&result, &job).values, row(&sealed, &job).values);
 }
+
+#[test]
+fn managed_evolution_rejects_unstartable_initial_session_before_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tool");
+    let store = ProductStore::create(&path, &program(false), 20000).unwrap();
+    let existing = add(&store, "existing", "Existing selectable work");
+    let before = store.load().unwrap();
+    let first = store
+        .prepare_scoped_change(
+            &program(true),
+            &request(&before, ScopePopulation::FutureWork),
+            "first",
+        )
+        .unwrap();
+    let current = store.adopt_scoped(before.revision, &first).unwrap();
+    let pointer = std::fs::read(path.join("CURRENT")).unwrap();
+    let candidate = |record: &str| {
+        let mut raw = serde_json::to_value(program(true).program).unwrap();
+        raw["state"].as_array_mut().unwrap().push(serde_json::json!({"id":"focused_job","label":"Focused job","value_type":{"kind":"reference","entity":"job"},"initial":{"kind":"reference","entity":"job","record":record}}));
+        capture(raw)
+    };
+    let mappings = |source: &CapturedProgram| {
+        let target = canonical_digest(IdentityDomain::Source, source).unwrap();
+        current
+            .editable_scope_context()
+            .unwrap()
+            .unwrap()
+            .slots
+            .iter()
+            .map(|slot| ScopeSlotMapping {
+                layer: slot.layer.clone(),
+                patch: slot.patch,
+                from_source: current.active_revision.clone(),
+                from: slot.destination.clone(),
+                to_source: target.clone(),
+                to: slot.destination.clone(),
+                subject: slot.subject.clone(),
+            })
+            .collect::<Vec<_>>()
+    };
+    let invalid = candidate("missing-record");
+    assert!(store
+        .prepare_managed_evolution(&invalid, &mappings(&invalid), "invalid-session")
+        .is_err());
+    assert_eq!(std::fs::read(path.join("CURRENT")).unwrap(), pointer);
+    assert_eq!(ProductStore::open(&path).unwrap().load().unwrap(), current);
+    let valid = candidate(&existing.id);
+    let prepared = store
+        .prepare_managed_evolution(&valid, &mappings(&valid), "valid-session")
+        .unwrap();
+    let adopted = store.adopt_scoped(current.revision, &prepared).unwrap();
+    assert_eq!(adopted.data.records, current.data.records);
+    assert_eq!(adopted.data.events, current.data.events);
+    assert_eq!(adopted.session.values["focused_job"], reference(&existing));
+    let reopened = ProductStore::open(&path).unwrap();
+    assert_eq!(reopened.load().unwrap(), adopted);
+    action(&reopened, "continue", "calculate", &existing);
+}
