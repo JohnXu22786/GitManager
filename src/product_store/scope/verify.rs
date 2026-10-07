@@ -182,6 +182,12 @@ pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
         {
             return Err(error("ambiguous active layer inventory"));
         }
+        let expected_previous = state.compositions.get(&manifest.basis.active);
+        if manifest.previous.as_ref() != expected_previous.map(|_| &manifest.basis.active) {
+            return Err(error(
+                "composition predecessor differs from its exact adopted basis",
+            ));
+        }
         if let Some(previous) = &manifest.previous {
             let prior = state
                 .compositions
@@ -237,6 +243,11 @@ pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
                     .values()
                     .find(|l| l.operation == manifest.operation)
                     .ok_or_else(|| error("adoption layer missing"))?;
+                if manifest.business != new.candidate || manifest.basis != new.basis {
+                    return Err(error(
+                        "adoption composition differs from its exact layer candidate or basis",
+                    ));
+                }
                 let mut expected = prior.map(|p| p.layers.clone()).unwrap_or_default();
                 expected.push(new.identity()?);
                 let mut active = prior.map(|p| p.active.clone()).unwrap_or_default();

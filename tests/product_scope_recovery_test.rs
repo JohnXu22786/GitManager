@@ -388,3 +388,218 @@ fn unmatched_and_ambiguous_scope_receipts_cannot_enter_recovery() {
     );
     assert_eq!(store.load().unwrap(), healthy);
 }
+
+#[test]
+fn rehashed_compositions_require_exact_predecessor_business_and_basis() {
+    use product_runtime::LocalRuntime;
+    use product_store::ProjectSnapshot;
+    fn reseal(snapshot: &mut ProjectSnapshot, mut manifest: CompositionManifest) {
+        let old = manifest.output.clone();
+        let target = compile_test_manifest(snapshot, &manifest).unwrap();
+        let output = canonical_digest(IdentityDomain::Source, &target).unwrap();
+        manifest.output = output.clone();
+        snapshot.data = product_runtime::merged_data(&target, &snapshot.data).unwrap();
+        let runtime = LocalRuntime::default();
+        let compatibility = runtime
+            .compatibility_at(&target, &manifest.basis.data, manifest.basis.day)
+            .unwrap();
+        let initialized = runtime
+            .compatibility_at(&target, &snapshot.data, manifest.basis.day)
+            .unwrap();
+        let adoption = snapshot
+            .adoptions
+            .iter_mut()
+            .find(|a| a.plan.id == manifest.operation)
+            .unwrap();
+        adoption.active = output.clone();
+        adoption.plan.target = target.artifact.clone();
+        adoption.plan.compatibility = compatibility;
+        let receipt = snapshot
+            .scope
+            .adoptions
+            .iter_mut()
+            .find(|r| r.revision == adoption.revision)
+            .unwrap();
+        receipt.plan = adoption.plan.identity().unwrap();
+        receipt.composition = canonical_digest(IdentityDomain::Adoption, &manifest).unwrap();
+        receipt.initialized_compatibility = initialized;
+        snapshot
+            .programs
+            .retain(|p| canonical_digest(IdentityDomain::Source, p).unwrap() != old);
+        snapshot.programs.push(target);
+        snapshot.scope.compositions.remove(&old);
+        snapshot.scope.compositions.insert(output.clone(), manifest);
+        snapshot.active_revision = output;
+    }
+    fn reminder(snapshot: &ProjectSnapshot, record: &Record) -> DataValue {
+        let runtime = LocalRuntime::default();
+        let run = runtime
+            .start(
+                snapshot.program().unwrap(),
+                &snapshot.data,
+                &snapshot.session,
+                snapshot.clock_day,
+                0,
+                RuntimeLimits::default(),
+            )
+            .unwrap();
+        runtime
+            .observe(&run, "result")
+            .unwrap()
+            .view
+            .rows
+            .iter()
+            .find(|r| r.record.record == record.id)
+            .unwrap()
+            .cells["reminder"]
+            .clone()
+    }
+    let dir = tempdir();
+    let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
+    let job = add(&store, "job", "Waiting work");
+    action(&store, "wait", "wait", &job);
+    let before = store.load().unwrap();
+    let prepared = store
+        .prepare_scoped_change(
+            &program(true),
+            &request(&before, ScopePopulation::All),
+            "first",
+        )
+        .unwrap();
+    let first_layer = prepared.layer_id().unwrap().unwrap();
+    let first = store.adopt_scoped(before.revision, &prepared).unwrap();
+    let mut raw = serde_json::to_value(program(true).program).unwrap();
+    raw["actions"][6]["steps"][0]["columns"]["reminder"] =
+        serde_json::to_value(boolean(false)).unwrap();
+    raw["views"][0]["kind"]["columns"][3]["value"] = serde_json::to_value(boolean(false)).unwrap();
+    let second_candidate = capture(raw.clone());
+    let second_scope = ScopeRequest {
+        population: ScopePopulation::All,
+        operations: ["export".into()].into_iter().collect(),
+        excluded_records: vec![],
+        lifecycles: vec![LifecycleBinding {
+            entity: "job".into(),
+            completed: field("record", "done"),
+            source: first.active_revision.clone(),
+        }],
+        patches: vec![
+            EffectPatchRequest {
+                destination: EffectDestination::EmitColumn {
+                    action: "export".into(),
+                    path: vec![0],
+                    column: "reminder".into(),
+                },
+                entity: "job".into(),
+                subject: "row".into(),
+                value_type: Type::Boolean,
+            },
+            EffectPatchRequest {
+                destination: EffectDestination::ViewColumn {
+                    view: "work".into(),
+                    column: "reminder".into(),
+                },
+                entity: "job".into(),
+                subject: "row".into(),
+                value_type: Type::Boolean,
+            },
+        ],
+    };
+    let prepared = store
+        .prepare_scoped_change(&second_candidate, &second_scope, "second")
+        .unwrap();
+    let second = store.adopt_scoped(first.revision, &prepared).unwrap();
+    let withdrawal = store
+        .prepare_scoped_withdrawal(&[first_layer], "withdraw-first")
+        .unwrap();
+    let healthy = store.adopt_scoped(second.revision, &withdrawal).unwrap();
+    assert_eq!(
+        reminder(&healthy, &job),
+        DataValue::Boolean { value: false }
+    );
+
+    let mut older_predecessor = healthy.clone();
+    let mut manifest =
+        older_predecessor.scope.compositions[&older_predecessor.active_revision].clone();
+    let prior = &first.scope.compositions[&first.active_revision];
+    manifest.previous = Some(first.active_revision.clone());
+    manifest.business = prior.business.clone();
+    manifest.layers = prior.layers.clone();
+    manifest.active.clear();
+    manifest.rewrites = prior.rewrites.clone();
+    reseal(&mut older_predecessor, manifest);
+    // The forged bytes really remove the independent reminder rule, despite
+    // retaining existing business rows/events and recomputing every hash.
+    assert_eq!(older_predecessor.data.records, healthy.data.records);
+    assert_eq!(older_predecessor.data.events, healthy.data.events);
+    assert_eq!(
+        reminder(&older_predecessor, &job),
+        DataValue::Boolean { value: true }
+    );
+
+    let mut other_business = second.clone();
+    raw["actions"][0]["steps"][0]["values"]["promised"] =
+        serde_json::to_value(lit(DataValue::Date { days: 20050 }, Type::Date)).unwrap();
+    let unrelated = capture(raw);
+    let mut manifest = other_business.scope.compositions[&other_business.active_revision].clone();
+    manifest.business = canonical_digest(IdentityDomain::Source, &unrelated).unwrap();
+    other_business.programs.push(unrelated);
+    reseal(&mut other_business, manifest);
+    let runtime = LocalRuntime::default();
+    let mut run = runtime
+        .start(
+            other_business.program().unwrap(),
+            &other_business.data,
+            &other_business.session,
+            20000,
+            0,
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    runtime
+        .apply(
+            &mut run,
+            &invoke(
+                "add",
+                &[
+                    ("name", text("Forged later work")),
+                    ("promised", DataValue::Date { days: 20020 }),
+                ],
+            ),
+            "forged-input",
+        )
+        .unwrap();
+    assert_eq!(
+        runtime
+            .observe(&run, "result")
+            .unwrap()
+            .view
+            .rows
+            .iter()
+            .find(|row| row.cells["name"] == text("Forged later work"))
+            .unwrap()
+            .cells["promised"],
+        DataValue::Date { days: 20050 }
+    );
+
+    let mut other_basis = second.clone();
+    let mut manifest = other_basis.scope.compositions[&other_basis.active_revision].clone();
+    manifest.basis.snapshot =
+        canonical_digest(IdentityDomain::Data, &"another frozen basis").unwrap();
+    reseal(&mut other_basis, manifest);
+    for (index, corrupted) in [older_predecessor, other_business, other_basis]
+        .iter()
+        .enumerate()
+    {
+        assert!(corrupted.validate().is_err());
+        let destination = dir.path().join(format!("forged-manifest-{index}"));
+        assert!(ProductStore::create_recovered_with(&destination, corrupted, |_| Ok(())).is_err());
+        assert!(!destination.exists());
+        assert_eq!(store.load().unwrap(), healthy);
+    }
+    let recovered = ProductStore::create_recovered(dir.path().join("valid"), &healthy).unwrap();
+    add(&recovered, "continued", "Valid continued work");
+    assert_eq!(
+        reminder(&recovered.load().unwrap(), &job),
+        DataValue::Boolean { value: false }
+    );
+}

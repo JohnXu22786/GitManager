@@ -280,7 +280,7 @@ fn ci_candidate_steps_are_main_push_only_and_read_only() {
     let diagnostic = steps[diagnostic_index];
     assert!(diagnostic.contains("        if: ${{ failure() && runner.os == 'macOS' && steps.full_suite.outcome == 'failure' }}\n"));
     assert!(diagnostic.contains("        timeout-minutes: 5\n"));
-    assert!(diagnostic.contains("        run: cargo test --test product_discovery_test bridge_rejects_correlated_and_domain_mismatches_and_cancels_running_fixture -- --exact --nocapture --test-threads=1\n"));
+    assert!(diagnostic.contains("        run: cargo test --test product_provider_test bridge_rejects_correlated_and_domain_mismatches_and_cancels_running_fixture -- --exact --nocapture --test-threads=1\n"));
     let mut candidate_steps = Vec::new();
     for name in [
         "Build Linux candidate",

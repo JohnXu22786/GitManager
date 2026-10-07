@@ -15,6 +15,16 @@ use crate::product_runtime::{DRIVER_VERSION, RUNTIME_VERSION};
 pub use contract::*;
 use std::collections::BTreeSet;
 
+/// Test-only corruption fixtures can rebuild bytes without gaining an opaque
+/// preparation or bypassing snapshot admission. Absent from production builds.
+#[cfg(test)]
+pub(crate) fn compile_test_manifest(
+    snapshot: &ProjectSnapshot,
+    manifest: &CompositionManifest,
+) -> Result<CapturedProgram> {
+    compiler::compile(snapshot, manifest)
+}
+
 fn program<'a>(snapshot: &'a ProjectSnapshot, id: &Digest) -> Result<&'a CapturedProgram> {
     snapshot
         .programs

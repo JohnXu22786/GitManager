@@ -3,6 +3,25 @@
 #[path = "../src/product_provider/mod.rs"]
 mod product_provider;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "fixtures/product_discovery/mod.rs"]
+mod discovery_fixture;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "../src/product_discovery/provider.rs"]
+mod discovery_provider;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "fixtures/product_runtime/mod.rs"]
+mod fixture;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "../src/product_contract.rs"]
+mod product_contract;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use discovery_fixture::input;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use discovery_provider::{prepare_development, ProviderOptions};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use product_contract::{canonical_digest, AdapterError, DevelopmentProvider, IdentityDomain};
+
 use product_provider::*;
 use serde_json::{json, Value};
 use std::{
@@ -708,4 +727,68 @@ fn readiness_rejects_fifo_without_waiting_for_a_writer() {
     worker.join().unwrap();
     assert!(response.is_ok(), "probe waited for a FIFO writer");
     assert_eq!(response.unwrap().readiness, Readiness::ProbeFailed);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn bridge_rejects_correlated_and_domain_mismatches_and_cancels_running_fixture() {
+    use product_provider::{unix_ms, ConsentReceipt, ProviderKind, ProviderTransport};
+    use std::{
+        cell::Cell,
+        fs,
+        os::unix::fs::PermissionsExt,
+        time::{Duration, Instant},
+    };
+    for mode in ["wrong_digest", "wrong_source", "domain_wrong", "slow"] {
+        let (request, mut result) = input();
+        if mode == "domain_wrong" {
+            result.response.request_digest =
+                canonical_digest(IdentityDomain::Request, &"other request").unwrap();
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let bin = root.join("fake.py");
+        {
+            let _guard = product_provider::fixture_executable_write_guard();
+            let script = include_str!("fixtures/provider_transport/fake_cli.py").replace(
+                "{'passed': True, 'text': wire['prompt'], 'command': 'untrusted-do-not-execute'}",
+                "cfg['response']",
+            );
+            fs::write(&bin, script).unwrap();
+            fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(
+                bin.with_extension("json"),
+                serde_json::to_vec(&json!({"mode":mode,"response":result.response})).unwrap(),
+            )
+            .unwrap();
+        }
+        let home = root.join("home");
+        fs::create_dir(&home).unwrap();
+        let transport =
+            ProviderTransport::new_fixture(root.join("jobs"), ProviderKind::Codex, bin, home)
+                .unwrap();
+        let prepared =
+            prepare_development(transport, &request, ProviderOptions::default()).unwrap();
+        let consent = ConsentReceipt {
+            disclosure_digest: prepared.disclosure().digest(),
+            approval_reference: "fixture-only".into(),
+            expires_at_unix_ms: unix_ms() + 60_000,
+        };
+        let bridge = prepared.authorize(consent);
+        let checks = Cell::new(0);
+        let started = Instant::now();
+        let actual = bridge.develop(&request, &|| {
+            checks.set(checks.get() + 1);
+            mode == "slow" && checks.get() > 5
+        });
+        assert!(actual.is_err(), "{mode}");
+        if mode == "slow" {
+            assert!(matches!(actual, Err(AdapterError::Cancelled)));
+            assert!(started.elapsed() < Duration::from_secs(5));
+        }
+        assert!(
+            bridge.develop(&request, &|| false).is_err(),
+            "consumed jobs are never silently resent"
+        );
+    }
 }
