@@ -8,6 +8,18 @@ use std::path::{Component, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 static TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
+pub(crate) struct WriteLock {
+    file: File,
+}
+impl Drop for WriteLock {
+    fn drop(&mut self) {
+        // Unix duplicates share the lock, so closing only this descriptor can
+        // leave it held past the transaction. Release it before File closes.
+        // Drop cannot return errors; closing the file remains the fallback.
+        let _ = self.file.unlock();
+    }
+}
+
 pub(super) struct Directory {
     pub file: File,
     path: PathBuf,
@@ -177,11 +189,11 @@ impl Directory {
             ))
         }
     }
-    pub fn lock(&self) -> io::Result<File> {
+    pub fn lock(&self) -> io::Result<WriteLock> {
         let file = self.open_file(OsStr::new(".write.lock"), true, true)?;
         file.try_lock()
             .map_err(|e| io::Error::new(io::ErrorKind::WouldBlock, e))?;
-        Ok(file)
+        Ok(WriteLock { file })
     }
     pub fn publish(&self, name: &str, bytes: &[u8], replace: bool) -> io::Result<()> {
         valid_name(OsStr::new(name))?;
@@ -475,5 +487,102 @@ mod windows {
             return Err(io::Error::last_os_error());
         }
         Ok(())
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
+mod tests {
+    use super::*;
+
+    struct TestDirectory(PathBuf);
+    impl TestDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "gitmanager-store-lock-{}-{}-{}",
+                module_path!().replace("::", "-"),
+                std::process::id(),
+                TEMP_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(fs::canonicalize(path).unwrap())
+        }
+        fn open(&self) -> Directory {
+            Directory::open(&self.0).unwrap()
+        }
+    }
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    fn assert_busy<T>(result: io::Result<T>) {
+        let error = result.err().expect("a live owner must exclude other writers");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(matches!(
+            error
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<fs::TryLockError>()),
+            Some(fs::TryLockError::WouldBlock)
+        ));
+    }
+
+    #[test]
+    fn lock_excludes_other_owners_until_scope_exit() {
+        let temp = TestDirectory::new();
+        let directory = temp.open();
+        let other = temp.open();
+        {
+            let _owner = directory.lock().unwrap();
+            assert_busy(other.lock());
+            assert_busy(other.lock());
+        }
+        let owner = other.lock().unwrap();
+        assert_busy(directory.lock());
+        drop(owner);
+        directory.lock().unwrap();
+    }
+
+    #[test]
+    fn lock_releases_after_failed_scope() {
+        let temp = TestDirectory::new();
+        let directory = temp.open();
+        let other = temp.open();
+        let result = (|| -> io::Result<()> {
+            let _owner = directory.lock()?;
+            directory.publish("../invalid", b"not committed", false)?;
+            Ok(())
+        })();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        {
+            let _owner = other.lock().unwrap();
+            assert_busy(directory.lock());
+        }
+        let result = std::panic::catch_unwind(|| {
+            let _owner = directory.lock().unwrap();
+            panic!("transaction interrupted");
+        });
+        assert!(result.is_err());
+        other.lock().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_lock_releases_while_duplicate_survives() {
+        let temp = TestDirectory::new();
+        let directory = temp.open();
+        let other = temp.open();
+        let owner = directory.lock().unwrap();
+        let duplicate = owner.file.try_clone().unwrap();
+        assert_busy(other.lock());
+        drop(owner);
+        let next_owner = other
+            .lock()
+            .expect("the transaction owner has released its lock");
+        assert_busy(directory.lock());
+        drop(duplicate);
+        assert_busy(directory.lock());
+        drop(next_owner);
+        directory.lock().unwrap();
     }
 }
