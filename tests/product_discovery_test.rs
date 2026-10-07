@@ -379,56 +379,6 @@ fn domain_transport_projection_binds_exact_source_and_cancellation() {
     );
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[test]
-fn consented_fake_cli_bridge_preserves_origin_and_rejects_mismatches() {
-    use product_provider::{unix_ms, ConsentReceipt, ProviderKind, ProviderTransport};
-    use std::{fs, os::unix::fs::PermissionsExt};
-    let (r, out) = input();
-    let temp = tempfile::tempdir().unwrap();
-    let root = fs::canonicalize(temp.path()).unwrap();
-    let bin = root.join("fixture.py");
-    {
-        let _guard = product_provider::fixture_executable_write_guard();
-        let script = include_str!("fixtures/provider_transport/fake_cli.py").replace(
-            "{'passed': True, 'text': wire['prompt'], 'command': 'untrusted-do-not-execute'}",
-            "cfg['response']",
-        );
-        fs::write(&bin, script).unwrap();
-        fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
-        fs::write(
-            bin.with_extension("json"),
-            serde_json::to_vec(&json!({"response":out.response})).unwrap(),
-        )
-        .unwrap();
-    }
-    let home = root.join("home");
-    fs::create_dir(&home).unwrap();
-    let transport =
-        ProviderTransport::new_fixture(root.join("jobs"), ProviderKind::Codex, bin, home).unwrap();
-    let prepared = prepare_development(transport, &r, ProviderOptions::default()).unwrap();
-    let consent = ConsentReceipt {
-        disclosure_digest: prepared.disclosure().digest(),
-        approval_reference: "synthetic fixture only".into(),
-        expires_at_unix_ms: unix_ms() + 60_000,
-    };
-    let bridge = prepared.authorize(consent);
-    let mut wrong = r.clone();
-    wrong.request.push('!');
-    assert!(bridge.develop(&wrong, &|| false).is_err());
-    assert!(matches!(
-        bridge.develop(&r, &|| true),
-        Err(AdapterError::Cancelled)
-    ));
-    let result = bridge.develop(&r, &|| false).unwrap();
-    assert!(matches!(result.producer, Producer::Fixture { .. }));
-    result.validate_for(&r).unwrap();
-    assert_eq!(
-        run(&r, &result, DiscoveryPolicy::default()).questions.len(),
-        1
-    );
-}
-
 #[test]
 fn equivalent_refactor_and_failed_explicit_checks_are_quiet() {
     let (mut r, mut out) = input();

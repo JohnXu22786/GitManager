@@ -5,6 +5,15 @@ AppDefinition. Daily work, rehearsals, comparisons and intention replay use the
 production interpreter. The genuine input captures remain retained. The
 deterministic composition has honest ExternalAuthor provenance.
 
+Snapshot admission checks the complete ordered adoption history against exact
+retained source captures, operation revisions, scoped receipts, prior decision
+graph digests and the current source. Decision births are reconstructed from
+those graph checkpoints, including later supersession or withdrawal; editable
+required-ID arrays alone do not establish when a promise was accepted. These
+checks establish internal consistency of app-managed local history. They do not
+cryptographically attest user approval against someone who replaces the entire
+store, all retained evidence and all hashes.
+
 ## Supported scope
 
 - Future work is a durable cohort. Actual creation transactions stamp membership;

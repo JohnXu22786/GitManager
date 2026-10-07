@@ -536,6 +536,71 @@ fn rehashed_compositions_require_exact_predecessor_business_and_basis() {
         DataValue::Boolean { value: true }
     );
 
+    let mut joint_predecessor = older_predecessor.clone();
+    let mut manifest =
+        joint_predecessor.scope.compositions[&joint_predecessor.active_revision].clone();
+    manifest.basis.active = first.active_revision.clone();
+    let linked = joint_predecessor.adoptions.last_mut().unwrap();
+    linked.previous = first.active_revision.clone();
+    linked.plan.current_source = first.program().unwrap().binding.clone();
+    reseal(&mut joint_predecessor, manifest);
+    assert_eq!(joint_predecessor.data.records, healthy.data.records);
+    assert_eq!(joint_predecessor.data.events, healthy.data.events);
+    assert_eq!(
+        reminder(&joint_predecessor, &job),
+        DataValue::Boolean { value: true }
+    );
+
+    let mut rolled_back_tail = healthy.clone();
+    rolled_back_tail.active_revision = first.active_revision.clone();
+    assert_eq!(
+        reminder(&rolled_back_tail, &job),
+        DataValue::Boolean { value: true }
+    );
+
+    // A self-consistent ordinary plan cannot switch among managed captures
+    // without the scoped transition that preserves every independent layer.
+    let mut unreceipted_switch = healthy.clone();
+    let mut linked = unreceipted_switch.adoptions.last().unwrap().clone();
+    linked.revision += 1;
+    linked.previous = healthy.active_revision.clone();
+    linked.active = first.active_revision.clone();
+    linked.plan.id = "unreceipted-switch".into();
+    linked.plan.current_source = healthy.program().unwrap().binding.clone();
+    linked.plan.target = first.program().unwrap().artifact.clone();
+    linked.plan.expected_data = healthy.data.identity().unwrap();
+    linked.plan.expected_generation = healthy.data.generation;
+    linked.plan.expected_session = healthy.session.identity().unwrap();
+    linked.plan.expected_decisions = healthy.decisions.identity().unwrap();
+    linked.plan.compatibility = LocalRuntime::default()
+        .compatibility_at(first.program().unwrap(), &healthy.data, healthy.clock_day)
+        .unwrap();
+    unreceipted_switch.operations.insert(
+        linked.plan.id.clone(),
+        product_store::OperationReceipt {
+            operation: linked.plan.id.clone(),
+            request: linked.plan.identity().unwrap(),
+            revision: linked.revision,
+        },
+    );
+    unreceipted_switch.revision = linked.revision;
+    unreceipted_switch.active_revision = linked.active.clone();
+    unreceipted_switch.adoptions.push(linked);
+    assert_eq!(
+        reminder(&unreceipted_switch, &job),
+        DataValue::Boolean { value: true }
+    );
+
+    let mut wrong_plan_target = healthy.clone();
+    let basis = &wrong_plan_target.scope.compositions[&wrong_plan_target.active_revision].basis;
+    let compatibility = LocalRuntime::default()
+        .compatibility_at(first.program().unwrap(), &basis.data, basis.day)
+        .unwrap();
+    let linked = wrong_plan_target.adoptions.last_mut().unwrap();
+    linked.plan.target = first.program().unwrap().artifact.clone();
+    linked.plan.compatibility = compatibility;
+    wrong_plan_target.scope.adoptions.last_mut().unwrap().plan = linked.plan.identity().unwrap();
+
     let mut other_business = second.clone();
     raw["actions"][0]["steps"][0]["values"]["promised"] =
         serde_json::to_value(lit(DataValue::Date { days: 20050 }, Type::Date)).unwrap();
@@ -586,9 +651,17 @@ fn rehashed_compositions_require_exact_predecessor_business_and_basis() {
     manifest.basis.snapshot =
         canonical_digest(IdentityDomain::Data, &"another frozen basis").unwrap();
     reseal(&mut other_basis, manifest);
-    for (index, corrupted) in [older_predecessor, other_business, other_basis]
-        .iter()
-        .enumerate()
+    for (index, corrupted) in [
+        older_predecessor,
+        joint_predecessor,
+        rolled_back_tail,
+        unreceipted_switch,
+        wrong_plan_target,
+        other_business,
+        other_basis,
+    ]
+    .iter()
+    .enumerate()
     {
         assert!(corrupted.validate().is_err());
         let destination = dir.path().join(format!("forged-manifest-{index}"));

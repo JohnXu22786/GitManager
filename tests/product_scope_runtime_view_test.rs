@@ -3632,7 +3632,34 @@ fn scoped_receipts_cannot_claim_later_independent_intentions() {
         .push("independent".into());
     let mut loses_original = healthy.clone();
     loses_original.scope.adoptions[0].decisions.clear();
-    for (index, corrupted) in [claims_later, loses_original].iter().enumerate() {
+    let mut rewrites_activation = claims_later.clone();
+    let later_plan = rewrites_activation.adoptions.last().unwrap().plan.clone();
+    let earlier = &mut rewrites_activation.adoptions[0].plan;
+    earlier.required_decisions.push("independent".into());
+    earlier.checks.extend(
+        later_plan
+            .checks
+            .iter()
+            .filter(|check| check.decision == "independent")
+            .cloned(),
+    );
+    earlier.evidence.extend(later_plan.evidence);
+    rewrites_activation.scope.adoptions[0].plan = earlier.identity().unwrap();
+    // The later plan's exact prior graph still records only the original
+    // promise, even when the older required-ID list and receipt are resealed.
+    assert_eq!(
+        rewrites_activation
+            .adoptions
+            .last()
+            .unwrap()
+            .plan
+            .expected_decisions,
+        current.decisions.identity().unwrap()
+    );
+    for (index, corrupted) in [claims_later, loses_original, rewrites_activation]
+        .iter()
+        .enumerate()
+    {
         assert!(corrupted.validate().is_err());
         let destination = dir.path().join(format!("forged-{index}"));
         let activated = std::cell::Cell::new(false);

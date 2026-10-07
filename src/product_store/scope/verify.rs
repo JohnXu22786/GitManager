@@ -1,6 +1,235 @@
 use super::*;
 use compiler::error;
 
+struct AdoptionHistory<'a> {
+    links: BTreeMap<Digest, (&'a AdoptionReceipt, &'a ScopedAdoptionReceipt)>,
+}
+
+/// Recover only the host's existing graph transitions. Exact prior graph
+/// digests anchor births independently of editable required-ID arrays. The
+/// temporary reverse walk never changes retained terminal history.
+fn decision_births(snapshot: &ProjectSnapshot) -> Result<BTreeMap<u64, BTreeSet<Id>>> {
+    let mut graph = snapshot.decisions.clone();
+    let mut graph_identity = graph.identity()?;
+    let mut births = BTreeMap::new();
+    for adoption in snapshot.adoptions.iter().rev() {
+        let required: BTreeSet<_> = graph
+            .decisions
+            .iter()
+            .filter(|decision| decision.status == DecisionStatus::Active)
+            .map(|decision| decision.id.clone())
+            .collect();
+        if required != adoption.plan.required_decisions.iter().cloned().collect() {
+            return Err(error(
+                "adoption requirements differ from its exact committed graph",
+            ));
+        }
+        let mut added = BTreeSet::new();
+        if graph_identity != adoption.plan.expected_decisions {
+            graph.revision = graph
+                .revision
+                .checked_sub(1)
+                .ok_or_else(|| error("decision graph revision has no predecessor"))?;
+            for id in &adoption.plan.retire_decisions {
+                let decision = graph
+                    .decisions
+                    .iter_mut()
+                    .find(|decision| &decision.id == id)
+                    .ok_or_else(|| error("retired decision missing from retained graph"))?;
+                match &decision.status {
+                    DecisionStatus::Withdrawn {
+                        adoption: operation,
+                    } if operation == &adoption.plan.id => {}
+                    DecisionStatus::Superseded { .. } => {}
+                    _ => return Err(error("retirement differs from its graph transition")),
+                }
+                decision.status = if matches!(
+                    decision.outcome,
+                    DecisionOutcome::Accept { .. } | DecisionOutcome::KeepCurrent
+                ) {
+                    DecisionStatus::Active
+                } else {
+                    DecisionStatus::Pending
+                };
+                decision.revision = decision
+                    .revision
+                    .checked_sub(1)
+                    .ok_or_else(|| error("retired decision has no prior revision"))?;
+            }
+            // Each appended ID is removed once across this bounded walk.
+            // Validate reciprocity after matching the prior graph: a successor
+            // is temporarily present while undoing its retirement edge.
+            while canonical_digest(IdentityDomain::Decision, &graph)?
+                != adoption.plan.expected_decisions
+            {
+                let decision = graph
+                    .decisions
+                    .pop()
+                    .ok_or_else(|| error("retained prior decision graph does not regenerate"))?;
+                if decision.revision != 1
+                    || adoption.plan.retire_decisions.contains(&decision.id)
+                    || !matches!(
+                        decision.status,
+                        DecisionStatus::Active | DecisionStatus::Pending
+                    )
+                {
+                    return Err(error("decision birth rewrites earlier terminal history"));
+                }
+                if decision.status == DecisionStatus::Active {
+                    added.insert(decision.id);
+                }
+            }
+            graph.validate()?;
+            graph_identity = adoption.plan.expected_decisions.clone();
+        } else if !adoption.plan.retire_decisions.is_empty() {
+            return Err(error("unchanged graph cannot claim a retirement"));
+        }
+        births.insert(adoption.revision, added);
+    }
+    if graph.revision != 0 || !graph.decisions.is_empty() {
+        return Err(error("decision graph lacks its original empty checkpoint"));
+    }
+    Ok(births)
+}
+
+/// One bounded map connects plans, exact captures, operation revisions,
+/// scoped receipts, decision births and the live tail. Local digests do not
+/// attest approval against wholesale replacement of the store and its evidence.
+fn adoption_history(snapshot: &ProjectSnapshot) -> Result<AdoptionHistory<'_>> {
+    let state = &snapshot.scope;
+    let mut history = AdoptionHistory {
+        links: BTreeMap::new(),
+    };
+    if state.layers.is_empty() && state.rehearsals.is_empty() && state.correspondences.is_empty() {
+        return Ok(history);
+    }
+    let sources: BTreeMap<_, _> = snapshot
+        .programs
+        .iter()
+        .map(|source| Ok((revision(source)?, source)))
+        .collect::<Result<_>>()?;
+    let mut manifests = BTreeMap::new();
+    for (output, manifest) in &state.compositions {
+        if manifests
+            .insert(
+                canonical_digest(IdentityDomain::Adoption, manifest)?,
+                output,
+            )
+            .is_some()
+        {
+            return Err(error("ambiguous composition identity"));
+        }
+    }
+    let mut receipts = BTreeMap::new();
+    for receipt in &state.adoptions {
+        if receipts.insert(receipt.revision, receipt).is_some() {
+            return Err(error("duplicate scoped adoption revision link"));
+        }
+    }
+    let births = decision_births(snapshot)?;
+    let mut active = revision(
+        snapshot
+            .programs
+            .first()
+            .ok_or_else(|| error("initial source missing"))?,
+    )?;
+    let mut operations = BTreeSet::new();
+    for linked in &snapshot.adoptions {
+        let previous = sources
+            .get(&active)
+            .ok_or_else(|| error("prior active capture missing"))?;
+        let target = sources
+            .get(&linked.active)
+            .ok_or_else(|| error("adopted capture missing"))?;
+        if linked.previous != active
+            || linked.plan.current_source != previous.binding
+            || linked.plan.target != target.artifact
+            || !operations.insert(&linked.plan.id)
+            || snapshot
+                .operations
+                .get(&linked.plan.id)
+                .map(|operation| operation.revision)
+                != Some(linked.revision)
+        {
+            return Err(error(
+                "adoption is inconsistent with its ordered source and operation history",
+            ));
+        }
+        if let Some(receipt) = receipts.get(&linked.revision) {
+            let output = manifests
+                .get(&receipt.composition)
+                .ok_or_else(|| error("scoped receipt has no composition"))?;
+            let manifest = &state.compositions[*output];
+            if linked.active != **output
+                || linked.plan.identity()? != receipt.plan
+                || linked.plan.id != manifest.operation
+                || manifest.basis.active != active
+                || linked.plan.expected_data != manifest.basis.data.identity()?
+                || linked.plan.expected_generation != manifest.basis.data.generation
+                || linked.plan.expected_session != manifest.basis.session.identity()?
+                || linked.plan.expected_decisions != manifest.basis.decisions
+                || manifest.basis.revision.checked_add(1) != Some(linked.revision)
+                || history
+                    .links
+                    .insert((*output).clone(), (linked, *receipt))
+                    .is_some()
+            {
+                return Err(error(
+                    "scoped plan differs from its exact history checkpoint",
+                ));
+            }
+            let expected: BTreeSet<_> = snapshot
+                .decisions
+                .decisions
+                .iter()
+                .filter(|decision| {
+                    births[&linked.revision].contains(&decision.id)
+                        && decision.scope == linked.plan.scope
+                })
+                .map(|decision| decision.id.clone())
+                .collect();
+            let mut actual = BTreeSet::new();
+            for id in &receipt.decisions {
+                let decision = snapshot
+                    .decisions
+                    .decisions
+                    .iter()
+                    .find(|decision| &decision.id == id)
+                    .ok_or_else(|| error("scoped receipt decision missing"))?;
+                if !actual.insert(id.clone())
+                    || !matches!(&decision.outcome, DecisionOutcome::Accept { artifact } if artifact == &target.artifact.program_digest)
+                {
+                    return Err(error(
+                        "scoped decision differs from its exact accepted artifact",
+                    ));
+                }
+            }
+            if actual != expected {
+                return Err(error(
+                    "scoped receipt differs from the exact newly activated intention set",
+                ));
+            }
+        } else if linked.active != active
+            && (state.compositions.contains_key(&active)
+                || state.compositions.contains_key(&linked.active))
+        {
+            return Err(error(
+                "managed source change has no scoped adoption receipt",
+            ));
+        }
+        active = linked.active.clone();
+    }
+    if active != snapshot.active_revision
+        || history.links.len() != state.compositions.len()
+        || history.links.len() != receipts.len()
+    {
+        return Err(error(
+            "active source or scoped inventory differs from the ordered history tail",
+        ));
+    }
+    Ok(history)
+}
+
 pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
     let state = &snapshot.scope;
     if state.version != COMPILER_VERSION
@@ -13,25 +242,7 @@ pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
     {
         return Err(error("invalid scope-state version or inventory"));
     }
-    // Every composition below must have exactly one receipt. Equal inventory
-    // sizes also exclude unmatched receipts that could shadow a consumer's
-    // revision lookup without ever entering that composition validation pass.
-    let mut receipt_revisions = BTreeSet::new();
-    for receipt in &state.adoptions {
-        if !receipt_revisions.insert(receipt.revision) {
-            return Err(error("duplicate scoped adoption revision link"));
-        }
-    }
-    // Decision IDs are never reused by the host. Their first required plan
-    // binds activation even after a later supersession or explicit withdrawal.
-    let mut first_required = BTreeMap::new();
-    for adoption in &snapshot.adoptions {
-        for id in &adoption.plan.required_decisions {
-            first_required
-                .entry(id.clone())
-                .or_insert(adoption.revision);
-        }
-    }
+    let history = adoption_history(snapshot)?;
     // Retained-basis reconstruction consults earlier compositions before the
     // semantic composition pass below. Reject broken references first so no
     // corrupted import/restart can turn those proof lookups into indexing panics.
@@ -263,66 +474,19 @@ pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
                 "compiled source differs from independently regenerated envelope",
             ));
         }
-        let manifest_identity = canonical_digest(IdentityDomain::Adoption, manifest)?;
-        let matching: Vec<_> = state
-            .adoptions
-            .iter()
-            .filter(|a| a.composition == manifest_identity)
-            .collect();
-        if matching.len() != 1 {
-            return Err(error("composition needs exactly one atomic receipt"));
-        }
-        let linked = snapshot
-            .adoptions
-            .iter()
-            .find(|a| a.revision == matching[0].revision)
-            .ok_or_else(|| error("scoped receipt lacks adoption"))?;
-        if linked.active != *output
-            || linked.plan.identity()? != matching[0].plan
-            || linked.previous != manifest.basis.active
-            || linked.plan.expected_data != manifest.basis.data.identity()?
-            || linked.plan.expected_session != manifest.basis.session.identity()?
-            || linked.plan.expected_decisions != manifest.basis.decisions
-            || linked.revision != manifest.basis.revision + 1
+        let (linked, matching) = history
+            .links
+            .get(output)
+            .copied()
+            .ok_or_else(|| error("composition lacks its validated history link"))?;
+        if LocalRuntime::default().compatibility_at(
+            target,
+            &manifest.basis.data,
+            manifest.basis.day,
+        )? != linked.plan.compatibility
         {
-            return Err(error("scoped plan link mismatch"));
-        }
-        let mut expected_decisions = BTreeSet::new();
-        for id in &linked.plan.required_decisions {
-            if first_required.get(id) != Some(&linked.revision) {
-                continue;
-            }
-            let decision = snapshot
-                .decisions
-                .decisions
-                .iter()
-                .find(|d| &d.id == id)
-                .ok_or_else(|| error("newly activated scoped decision missing"))?;
-            if decision.scope == linked.plan.scope {
-                expected_decisions.insert(id.clone());
-            }
-        }
-        let mut decision_ids = BTreeSet::new();
-        for id in &matching[0].decisions {
-            let decision = snapshot
-                .decisions
-                .decisions
-                .iter()
-                .find(|d| &d.id == id)
-                .ok_or_else(|| error("scoped receipt decision missing"))?;
-            if !decision_ids.insert(id.clone())
-                || !linked.plan.required_decisions.contains(id)
-                || decision.scope != linked.plan.scope
-                || !matches!(&decision.outcome,DecisionOutcome::Accept{artifact} if artifact==&target.artifact.program_digest)
-            {
-                return Err(error(
-                    "scoped decision does not bind this exact frozen outcome",
-                ));
-            }
-        }
-        if decision_ids != expected_decisions {
             return Err(error(
-                "scoped receipt differs from the exact newly activated intention set",
+                "adoption compatibility differs from its frozen input",
             ));
         }
         let layer = state
@@ -334,14 +498,14 @@ pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
                 return Err(error("layer receipt attached to the wrong transition"));
             }
             let (data, initialization) = history::initialize(snapshot, layer, target)?;
-            if matching[0].initialization
+            if matching.initialization
                 != Some(canonical_digest(IdentityDomain::Adoption, &initialization)?)
             {
                 return Err(error("initialization receipt link mismatch"));
             }
             data
         } else {
-            if matching[0].initialization.is_some() {
+            if matching.initialization.is_some() {
                 return Err(error("withdrawal must not initialize metadata"));
             }
             let previous = manifest
@@ -361,7 +525,7 @@ pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
         };
         let report = LocalRuntime::default().compatibility_at(target, &data, manifest.basis.day)?;
         if report.state != CompatibilityState::Compatible
-            || report != matching[0].initialized_compatibility
+            || report != matching.initialized_compatibility
         {
             return Err(error("initialized-data compatibility receipt mismatch"));
         }

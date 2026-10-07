@@ -281,6 +281,17 @@ fn ci_candidate_steps_are_main_push_only_and_read_only() {
     assert!(diagnostic.contains("        if: ${{ failure() && runner.os == 'macOS' && steps.full_suite.outcome == 'failure' }}\n"));
     assert!(diagnostic.contains("        timeout-minutes: 5\n"));
     assert!(diagnostic.contains("        run: cargo test --test product_provider_test bridge_rejects_correlated_and_domain_mismatches_and_cancels_running_fixture -- --exact --nocapture --test-threads=1\n"));
+    let consented_index = steps
+        .iter()
+        .position(|step| {
+            step.starts_with("name: Diagnose macOS consented discovery fixture in isolation\n")
+        })
+        .expect("missing failure-only consented discovery diagnostic");
+    assert!(consented_index > diagnostic_index);
+    let consented = steps[consented_index];
+    assert!(consented.contains("        if: ${{ failure() && runner.os == 'macOS' && steps.full_suite.outcome == 'failure' }}\n"));
+    assert!(consented.contains("        timeout-minutes: 5\n"));
+    assert!(consented.contains("        run: cargo test --test product_provider_test consented_fake_cli_bridge_preserves_origin_and_rejects_mismatches -- --exact --nocapture --test-threads=1\n"));
     let mut candidate_steps = Vec::new();
     for name in [
         "Build Linux candidate",

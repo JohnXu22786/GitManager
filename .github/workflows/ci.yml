@@ -52,6 +52,11 @@ jobs:
         timeout-minutes: 5
         run: cargo test --test product_provider_test bridge_rejects_correlated_and_domain_mismatches_and_cancels_running_fixture -- --exact --nocapture --test-threads=1
 
+      - name: Diagnose macOS consented discovery fixture in isolation
+        if: ${{ failure() && runner.os == 'macOS' && steps.full_suite.outcome == 'failure' }}
+        timeout-minutes: 5
+        run: cargo test --test product_provider_test consented_fake_cli_bridge_preserves_origin_and_rejects_mismatches -- --exact --nocapture --test-threads=1
+
       - name: Build Linux candidate
         if: ${{ success() && runner.os == 'Linux' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         env:

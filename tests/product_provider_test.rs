@@ -7,20 +7,42 @@ mod product_provider;
 #[path = "fixtures/product_discovery/mod.rs"]
 mod discovery_fixture;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-#[path = "../src/product_discovery/provider.rs"]
-mod discovery_provider;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[path = "fixtures/product_runtime/mod.rs"]
 mod fixture;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[path = "../src/product_contract.rs"]
 mod product_contract;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "../src/product_decisions/mod.rs"]
+mod product_decisions;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "../src/product_discovery/mod.rs"]
+mod product_discovery;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "../src/product_protocol.rs"]
+mod product_protocol;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "../src/product_runtime/mod.rs"]
+mod product_runtime;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "../src/product_scenarios/mod.rs"]
+mod product_scenarios;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "../src/product_store/mod.rs"]
+mod product_store;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use discovery_fixture::input;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use discovery_provider::{prepare_development, ProviderOptions};
+use product_contract::{
+    canonical_digest, AdapterError, DevelopmentProvider, DevelopmentRequest, DevelopmentResult,
+    IdentityDomain, Producer,
+};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use product_contract::{canonical_digest, AdapterError, DevelopmentProvider, IdentityDomain};
+use product_discovery::{
+    discover, prepare_development, DiscoveryPolicy, DiscoveryReport, ProviderOptions,
+};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::sync::{atomic::AtomicBool, Arc};
 
 use product_provider::*;
 use serde_json::{json, Value};
@@ -791,4 +813,59 @@ fn bridge_rejects_correlated_and_domain_mismatches_and_cancels_running_fixture()
             "consumed jobs are never silently resent"
         );
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn run(r: &DevelopmentRequest, out: &DevelopmentResult, p: DiscoveryPolicy) -> DiscoveryReport {
+    discover(r, out, &p, Arc::new(AtomicBool::new(false))).unwrap()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn consented_fake_cli_bridge_preserves_origin_and_rejects_mismatches() {
+    use product_provider::{unix_ms, ConsentReceipt, ProviderKind, ProviderTransport};
+    use std::{fs, os::unix::fs::PermissionsExt};
+    let (r, out) = input();
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let bin = root.join("fixture.py");
+    {
+        let _guard = product_provider::fixture_executable_write_guard();
+        let script = include_str!("fixtures/provider_transport/fake_cli.py").replace(
+            "{'passed': True, 'text': wire['prompt'], 'command': 'untrusted-do-not-execute'}",
+            "cfg['response']",
+        );
+        fs::write(&bin, script).unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(
+            bin.with_extension("json"),
+            serde_json::to_vec(&json!({"response":out.response})).unwrap(),
+        )
+        .unwrap();
+    }
+    let home = root.join("home");
+    fs::create_dir(&home).unwrap();
+    let transport =
+        ProviderTransport::new_fixture(root.join("jobs"), ProviderKind::Codex, bin, home).unwrap();
+    let prepared = prepare_development(transport, &r, ProviderOptions::default()).unwrap();
+    let consent = ConsentReceipt {
+        disclosure_digest: prepared.disclosure().digest(),
+        approval_reference: "synthetic fixture only".into(),
+        expires_at_unix_ms: unix_ms() + 60_000,
+    };
+    let bridge = prepared.authorize(consent);
+    let mut wrong = r.clone();
+    wrong.request.push('!');
+    assert!(bridge.develop(&wrong, &|| false).is_err());
+    assert!(matches!(
+        bridge.develop(&r, &|| true),
+        Err(AdapterError::Cancelled)
+    ));
+    let result = bridge.develop(&r, &|| false).unwrap();
+    assert!(matches!(result.producer, Producer::Fixture { .. }));
+    result.validate_for(&r).unwrap();
+    assert_eq!(
+        run(&r, &result, DiscoveryPolicy::default()).questions.len(),
+        1
+    );
 }
