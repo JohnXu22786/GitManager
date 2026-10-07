@@ -478,7 +478,9 @@ impl ScopedExecutionContext {
             next = manifest.previous.clone();
         }
         for manifest in lineage.into_iter().rev() {
-            if initialized.identity()? != manifest.basis.data.identity()? {
+            if initialized.identity()? != manifest.basis.data.identity()?
+                || (manifest.transition == ScopeTransition::Adoption && day != manifest.basis.day)
+            {
                 continue;
             }
             let target = program(&self.snapshot, &manifest.output)?;
@@ -608,15 +610,7 @@ impl ScopedExecutionContext {
         projected.clock_day = day;
         // Live receipt validation is unchanged. A historical replay may use
         // only a separately authenticated, independently derived input frame.
-        let live = if manifest
-            .layers
-            .iter()
-            .any(|id| data.generation < projected.scope.layers[id].basis.data.generation)
-        {
-            Err(compiler::error("scene precedes the frozen cohort and needs explicit source-qualified correspondence"))
-        } else {
-            history::verify_history_layers(&projected, &manifest.layers)
-        };
+        let live = history::verify_history_layers(&projected, &manifest.layers);
         if live.is_ok() {
             return live;
         }

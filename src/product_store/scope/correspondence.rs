@@ -66,6 +66,7 @@ pub(super) fn derive(
                             .contains_key(&compiler::key(id, &r.entity, "sealed"))
                 });
         if data.generation >= layer.basis.data.generation
+            && day >= layer.basis.day
             && data.events.starts_with(&layer.basis.data.events)
             && initialized
         {

@@ -277,6 +277,14 @@ pub(super) fn verify_history_frames(
             .find(|r| &r.layer == id)
             .ok_or_else(|| error("initialization receipt missing"))?;
         let frame = frames.iter().find(|frame| &frame.layer == id);
+        if frame.is_none()
+            && (snapshot.data.generation < layer.basis.data.generation
+                || snapshot.clock_day < layer.basis.day)
+        {
+            return Err(error(
+                "input predates the live capture and needs an authenticated historical frame",
+            ));
+        }
         let basis_data = frame.map(|f| &f.before).unwrap_or(&layer.basis.data);
         let additions = frame.map(|f| &f.additions).unwrap_or(&receipt.additions);
         if !snapshot.data.events.starts_with(&basis_data.events) {

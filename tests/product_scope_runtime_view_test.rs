@@ -3010,3 +3010,159 @@ fn scoped_output_provenance_does_not_evaluate_intermediate_observables() {
         .runtime_view()
         .unwrap();
 }
+
+#[test]
+fn clock_only_scope_adoption_preserves_original_day_completed_scene() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tool");
+    let store = ProductStore::create(&path, &program(false), 20000).unwrap();
+    let job = add(&store, "job", "Completed before the clock changed");
+    let original = action(&store, "complete", "complete", &job);
+    let scene = ScenarioSpec {
+        version: 1,
+        id: "original-day".into(),
+        label: "Actually experienced completed result on its original day".into(),
+        seed: original.data.clone(),
+        session: original.session.clone(),
+        clock_day: original.clock_day,
+        random_seed: 42,
+        inputs: vec![
+            invoke("export", &[]),
+            SemanticInput::Observe {
+                point: "result".into(),
+            },
+        ],
+        validity: vec![],
+    };
+    let engine = DecisionEngine::new(LocalRuntime::default(), IntentArchive::new(store.clone()));
+    let accepted = engine
+        .accept_current_scene(&original, &scene, Disclosure::Synthetic)
+        .unwrap();
+    assert_eq!(
+        accepted.observations()[0].outputs[0].rows[0]["production"],
+        DataValue::Integer { value: 0 }
+    );
+    let choice = Choice {
+        id: "original-completed-promise".into(),
+        request: "Keep the whole completed result experienced on the original day".into(),
+        rationale: None,
+        scope: DecisionScope {
+            operations: ["export".into()].into_iter().collect(),
+            population: Population::All,
+            conditions: Values::new(),
+            excluded_records: vec![],
+            unknowns: vec![],
+        },
+        outcome: DecisionOutcome::KeepCurrent,
+        obligations: vec![],
+        binding: IntentionBinding::ObservedOutcome,
+    };
+    let change = engine
+        .prepare_choice(
+            &store,
+            original.program().unwrap(),
+            choice,
+            vec![accepted],
+            "keep-original-day",
+        )
+        .unwrap();
+    engine.adopt(&store, &change).unwrap();
+    let current = tick(&store, "later-clock", 20003);
+    assert_eq!(current.data, original.data);
+    let prepared = store
+        .prepare_scoped_change(
+            &program(true),
+            &request(&current, ScopePopulation::FutureWork),
+            "future-rule",
+        )
+        .unwrap();
+    let context = ScopedExecutionContext::prepared(&current, &prepared).unwrap();
+    // The live initialization captured a different day, so it cannot stand in
+    // for the earlier scene even though every business byte is unchanged.
+    assert!(context
+        .verify_seed(prepared.target(), prepared.seed(), scene.clock_day)
+        .is_err());
+    let mut mapped = scene.clone();
+    mapped.seed = product_runtime::merged_data(prepared.target(), &scene.seed).unwrap();
+    let (historical, projected) = context
+        .project_scenario(
+            original.program().unwrap(),
+            &scene,
+            prepared.target(),
+            &mapped,
+        )
+        .unwrap();
+    assert_eq!(projected.clock_day, scene.clock_day);
+    assert_eq!(projected.seed.events, scene.seed.events);
+    assert_eq!(projected.seed.generation, scene.seed.generation);
+    for (key, value) in &scene.seed.records[0].values {
+        assert_eq!(projected.seed.records[0].values.get(key), Some(value));
+    }
+    let saved = &projected.seed.records[0].values;
+    assert!(saved.iter().any(|(key, value)| key.starts_with("gm_scope_")
+        && *value == text("CapturedForHistoricalReplay")));
+    assert!(saved
+        .iter()
+        .any(|(key, value)| key.starts_with("gm_scope_")
+            && *value == DataValue::Date { days: 20000 }));
+    let replay = LocalRuntime::default()
+        .replay_admitted(
+            prepared.target(),
+            &projected,
+            &current.decisions,
+            RuntimeLimits::default(),
+            "original-day",
+            Some(&historical),
+        )
+        .unwrap();
+    assert_eq!(replay.state, EvidenceState::Observed);
+    assert_eq!(
+        replay.observations[0].outputs[0].rows[0]["production"],
+        DataValue::Integer { value: 0 }
+    );
+    assert_eq!(
+        replay.observations[0].view.rows[0].cells["production"],
+        DataValue::Integer { value: 0 }
+    );
+    assert_eq!(store.load().unwrap(), current);
+
+    let change = engine
+        .prepare_managed_change(&store, prepared, &[], "future-rule")
+        .unwrap();
+    let adopted = engine.adopt(&store, &change).unwrap();
+    assert!(!adopted.scope.correspondences.is_empty());
+    assert_eq!(
+        row(&adopted, &job).values["production"],
+        DataValue::Integer { value: 0 }
+    );
+    let mut predating = adopted.clone();
+    predating.clock_day = 20000;
+    assert!(predating.validate().is_err());
+    let reopened = ProductStore::open(&path).unwrap();
+    let backup = product_backup::VerifiedBackup::capture(&reopened).unwrap();
+    let recovered = backup.recover_new(dir.path().join("recovered")).unwrap();
+    let engine = DecisionEngine::new(
+        LocalRuntime::default(),
+        IntentArchive::new(recovered.clone()),
+    );
+    assert_eq!(
+        engine
+            .check_current(&recovered.load().unwrap())
+            .unwrap()
+            .disposition,
+        CheckDisposition::Ready
+    );
+    // Daily work keeps the separate actual adoption-day capture, while the
+    // durable old scene continues to reproduce its earlier-day result.
+    tick(&recovered, "continue-clock", 20006);
+    let continued = apply(&recovered, "continued-export", invoke("export", &[]));
+    assert_eq!(
+        continued.artifacts.last().unwrap().rows[0]["production"],
+        DataValue::Integer { value: 3 }
+    );
+    assert_eq!(
+        engine.check_current(&continued).unwrap().disposition,
+        CheckDisposition::Ready
+    );
+    ProductStore::open(dir.path().join("recovered")).unwrap();
+}
