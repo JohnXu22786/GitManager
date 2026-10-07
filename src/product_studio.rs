@@ -1,6 +1,8 @@
 //! Reachable initial generated-tool host. Later change/scope flows are not yet
 //! exposed here. One worker owns every blocking operation, including job Drop.
+#[path = "product_studio/journal.rs"]
 mod journal;
+#[path = "product_studio/worker.rs"]
 mod worker;
 use crate::product_backup::{open_verified, CheckpointShelf};
 use crate::product_contract::*;
