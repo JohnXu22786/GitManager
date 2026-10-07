@@ -5863,15 +5863,11 @@ mod tests {
         use std::sync::{Arc, Mutex};
         let progress = Arc::new(Mutex::new(String::new()));
 
-        {
-            let p = progress.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                *p.lock().unwrap() = "Receiving objects: 45%".to_string();
-            });
-        }
-
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        let p = progress.clone();
+        let worker = std::thread::spawn(move || {
+            *p.lock().unwrap() = "Receiving objects: 45%".to_string();
+        });
+        worker.join().unwrap();
         let current = progress.lock().unwrap().clone();
         assert_eq!(current, "Receiving objects: 45%");
     }
