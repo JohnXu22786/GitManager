@@ -1624,6 +1624,10 @@ fn new_scope_offers_only_affected_entities_after_an_earlier_managed_layer() {
         app["outputs"].as_array_mut().unwrap().push(output);
         let mut view = second["views"][0].clone();
         substitute(&mut view);
+        for binding in view["actions"].as_array_mut().unwrap() {
+            binding["action"] =
+                serde_json::json!(format!("supply_{}", binding["action"].as_str().unwrap()));
+        }
         app["views"].as_array_mut().unwrap().push(view);
         capture(app)
     }
@@ -1672,16 +1676,18 @@ fn new_scope_offers_only_affected_entities_after_an_earlier_managed_layer() {
     settle(&mut studio);
     change(&mut studio, &path);
     // A copied completion demonstrates the new entity's actual finished state.
-    studio.test_trial(invoke("supply_complete", &[("row", reference(&supply))]));
-    settle(&mut studio);
-    studio.test_lifecycle_outcome(
-        RecordRef {
-            entity: supply.entity.clone(),
-            record: supply.id.clone(),
-        },
-        "done",
+    let mut h = egui_harness::EguiHarness::new(egui::vec2(1600.0, 2400.0));
+    click(&mut h, &mut studio, "current.navigate.supplies");
+    click(
+        &mut h,
+        &mut studio,
+        &format!("current.row.supply.{}.complete", supply.id),
     );
-    settle(&mut studio);
+    click(
+        &mut h,
+        &mut studio,
+        &format!("studio.finished.supply.{}.done", supply.id),
+    );
     let eligible = studio.test_scope_records();
     assert!(!eligible.iter().any(|r| r.record == old.id));
     assert_eq!(
