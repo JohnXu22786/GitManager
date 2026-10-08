@@ -338,8 +338,21 @@ impl ProductStudio {
             _ => None,
         }
     }
+    fn inputs_pending(&self) -> bool {
+        self.renderer.pending_edits() || self.alternative_renderer.pending_edits()
+    }
+    fn action_waits_for_inputs(&self, action: &Action) -> bool {
+        matches!(
+            action,
+            Action::Decide { .. } | Action::Modify { .. } | Action::ResumeChoice { .. }
+        ) && self.inputs_pending()
+    }
     fn issue(&mut self, action: Action) {
         if self.pending.is_some() {
+            return;
+        }
+        if self.action_waits_for_inputs(&action) {
+            self.notice = "Finish or correct the inputs before continuing.".into();
             return;
         }
         let key = Key {
@@ -470,6 +483,7 @@ impl ProductStudio {
         );
         let today = self.today();
         let busy = self.is_busy();
+        let inputs_pending = self.inputs_pending();
         if busy {
             ui.ctx().request_repaint_after(Duration::from_millis(30));
         }
@@ -920,7 +934,7 @@ impl ProductStudio {
                         } else {
                             "Accept the alternative"
                         },
-                        !busy && view.can_accept,
+                        !busy && !inputs_pending && view.can_accept,
                     ) {
                         action = Some(Action::Decide {
                             outcome: DecisionOutcome::Accept {
@@ -952,6 +966,7 @@ impl ProductStudio {
                             key,
                             label,
                             !busy
+                                && !inputs_pending
                                 && if outcome == DecisionOutcome::KeepCurrent {
                                     view.can_keep_current
                                 } else {
@@ -960,6 +975,9 @@ impl ProductStudio {
                         ) {
                             action = Some(Action::Decide { outcome });
                         }
+                    }
+                    if inputs_pending {
+                        trace.label(ui, "Finish or correct the copied inputs below before recording a choice.");
                     }
                     if view.same_alternative {
                         trace.label(ui,"Both sides use the same rules. A new pair will not be recorded. Returning to saved work leaves any earlier choices unchanged.");
@@ -1075,6 +1093,7 @@ impl ProductStudio {
                     "studio.modify",
                     "Review this change request",
                     !busy
+                        && !inputs_pending
                         && !self.generation_blocked
                         && !self.need.trim().is_empty()
                         && basis.day == today,
@@ -1101,12 +1120,15 @@ impl ProductStudio {
                         ui,
                         &format!("studio.resume.{}", choice.id),
                         "Try this saved choice on current work",
-                        !busy && !self.mutation_blocked,
+                        !busy && !inputs_pending && !self.mutation_blocked,
                     ) {
                         action = Some(Action::ResumeChoice {
                             decision: choice.id.clone(),
                         });
                     }
+                }
+                if inputs_pending {
+                    trace.label(ui, "Finish or correct the work inputs below before requesting a change or revisiting a choice.");
                 }
                 let mut model = model.clone();
                 model.read_only |= self.mutation_blocked || basis.day != today;
@@ -1142,7 +1164,13 @@ impl ProductStudio {
         if close {
             self.close();
         } else if let Some(action) = action {
+            // Editing stays available while a task is busy. A control can also
+            // enqueue a new value later in this frame, after a choice button.
+            let waiting_for_inputs = self.action_waits_for_inputs(&action);
             self.issue(action);
+            if waiting_for_inputs {
+                ui.ctx().request_repaint();
+            }
         }
         trace
     }

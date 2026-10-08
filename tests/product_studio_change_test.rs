@@ -3206,3 +3206,248 @@ fn scoped_navigation_and_clock_do_not_establish_business_experience() {
         DecisionStatus::Pending
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn queued_inputs_finish_before_choices_and_context_changes() {
+    use std::sync::{atomic::Ordering, Arc};
+    for (pane, choice) in [
+        ("current", "studio.accept"),
+        ("alternative", "studio.defer"),
+    ] {
+        let dir = tempdir();
+        let root = dir.path();
+        let path = root.join("tool");
+        let original = other_shape::capture(other_shape::filtered());
+        let mut changed = other_shape::filtered();
+        changed["views"][0]["kind"]["columns"].as_array_mut().unwrap().push(serde_json::json!({"id":"area","label":"Area","value":other_shape::field(other_shape::var("row"),"area")}));
+        let candidate = other_shape::capture(changed);
+        let store = ProductStore::create(&path, &original, 20000).unwrap();
+        for (operation, name) in [("first", "adam"), ("second", "abby")] {
+            store
+                .apply(
+                    store.load().unwrap().revision,
+                    operation,
+                    &other_shape::add(name),
+                    RuntimeLimits::default(),
+                )
+                .unwrap();
+        }
+        let before = store.load().unwrap();
+        let pause = Arc::new(product_studio::TestPause::default());
+        pause.release.store(true, Ordering::Release);
+        let mut studio = ProductStudio::testing(
+            root.into(),
+            Some(transport(root, &candidate)),
+            TestHooks {
+                before_preview: Some(pause.clone()),
+                before_commit: Some(pause.clone()),
+                ..TestHooks::default()
+            },
+        );
+        settle(&mut studio);
+        change(&mut studio, &path);
+        let mut h = egui_harness::EguiHarness::new(egui::vec2(1600.0, 2400.0));
+        click(&mut h, &mut studio, "current.action.export_button");
+        let choices = [
+            "studio.accept",
+            "studio.keep-current",
+            "studio.either",
+            "studio.both",
+            "studio.neither",
+            "studio.defer",
+        ];
+        let ready = frame(&mut h, &mut studio);
+        for key in choices {
+            assert!(ready.controls[key].enabled, "{key}: {}", studio.test_notice());
+        }
+        let point = ready.controls[choice].rect.center();
+
+        click(&mut h, &mut studio, &format!("{pane}.control.search_input"));
+        pause.reached.store(false, Ordering::Release);
+        pause.release.store(false, Ordering::Release);
+        h.text("a");
+        frame(&mut h, &mut studio);
+        let start = Instant::now();
+        while !pause.reached.load(Ordering::Acquire) {
+            studio.poll();
+            assert!(start.elapsed() < Duration::from_secs(120));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        h.text("b");
+        let queued = frame(&mut h, &mut studio);
+        assert!(studio.is_busy());
+        assert!(queued.controls[&format!("{pane}.control.search_input")].enabled);
+        pause.release.store(true, Ordering::Release);
+        // Poll without drawing: the first input is acknowledged, but the newer
+        // visible control value has not yet drained from its renderer queue.
+        settle(&mut studio);
+        assert_eq!(
+            studio.test_current_trial().unwrap().observation.controls["search_input"],
+            other_shape::string("a")
+        );
+        if pane == "alternative" {
+            studio.test_decide_exact(DecisionOutcome::Deferred);
+            assert!(!studio.is_busy(), "The final host gate must refuse queued inputs");
+            assert!(studio.test_notice().contains("inputs"));
+        } else {
+            h.press_at(point);
+            h.release_at(point);
+        }
+        let attempted = frame(&mut h, &mut studio);
+        if pane == "current" {
+            assert!(attempted.controls[choice].rect.contains(point));
+        }
+        for key in choices {
+            assert!(
+                !attempted.controls[key].enabled,
+                "{pane} has a newer copied input; {key} must wait"
+            );
+        }
+        assert_eq!(store.load().unwrap(), before);
+        settle(&mut studio);
+        assert_eq!(studio.test_page(), "change");
+        for model in [
+            studio.test_current_trial().unwrap(),
+            studio.test_alternative().unwrap(),
+        ] {
+            assert_eq!(
+                model.observation.controls["search_input"],
+                other_shape::string("ab")
+            );
+            assert_eq!(model.observation.rows.len(), 1);
+        }
+        let ready = frame(&mut h, &mut studio);
+        for key in choices {
+            assert!(ready.controls[key].enabled, "{key}: {}", studio.test_notice());
+        }
+        click(&mut h, &mut studio, choice);
+        assert_eq!(studio.test_page(), "daily", "{}", studio.test_notice());
+        let saved = store.load().unwrap();
+        assert_eq!(saved.data, before.data);
+        assert_eq!(saved.session, before.session);
+        assert_eq!(saved.clock_day, before.clock_day);
+        let decision = saved.decisions.decisions.last().unwrap();
+        if choice == "studio.accept" {
+            assert!(matches!(decision.outcome, DecisionOutcome::Accept { .. }));
+        } else {
+            assert_eq!(decision.outcome, DecisionOutcome::Deferred);
+            assert_eq!(decision.status, DecisionStatus::Pending);
+            assert_eq!(saved.active_revision, before.active_revision);
+        }
+        let inherited = product_decisions::DecisionEngine::new(
+            product_runtime::LocalRuntime::default(),
+            product_decisions::IntentArchive::new(store.clone()),
+        )
+        .development_request(
+            &saved,
+            "after-queued-input",
+            DevelopmentOperation::Modify,
+            "Keep the example I actually finished trying",
+            DevelopmentContext {
+                view: Some(saved.session.view.clone()),
+                selected: vec![],
+                recent_inputs: vec![],
+                data_digest: Some(saved.data.identity().unwrap()),
+                session_digest: Some(saved.session.identity().unwrap()),
+            },
+        )
+        .unwrap();
+        let accepted: Vec<_> = inherited
+            .accepted_scenes
+            .iter()
+            .filter(|scene| scene.decision == decision.id)
+            .collect();
+        assert!(!accepted.is_empty());
+        for scene in accepted {
+            let example = inherited
+                .examples
+                .iter()
+                .find(|example| example.scenario.identity().unwrap() == scene.scenario)
+                .unwrap();
+            assert_eq!(
+                example.scenario.inputs.last(),
+                Some(&SemanticInput::Control {
+                    view: "people".into(),
+                    control: "search_input".into(),
+                    value: other_shape::string("ab"),
+                }),
+                "The durable source-bound example must retain the latest queued input"
+            );
+        }
+
+        // The same event ordering must preserve real work before changing to a
+        // Modify disclosure or reopening a saved choice on its latest basis.
+        click(&mut h, &mut studio, "studio.change-need");
+        h.text(" Keep my latest work context");
+        frame(&mut h, &mut studio);
+        let context_key = if choice == "studio.accept" {
+            "studio.modify".to_string()
+        } else {
+            format!("studio.resume.{}", decision.id)
+        };
+        let ready = frame(&mut h, &mut studio);
+        assert!(ready.controls["studio.modify"].enabled);
+        assert!(ready.controls[&context_key].enabled);
+        click(&mut h, &mut studio, "daily.control.search_input");
+        pause.reached.store(false, Ordering::Release);
+        pause.release.store(false, Ordering::Release);
+        h.text("a");
+        frame(&mut h, &mut studio);
+        let start = Instant::now();
+        while !pause.reached.load(Ordering::Acquire) {
+            studio.poll();
+            assert!(start.elapsed() < Duration::from_secs(120));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        h.text("b");
+        frame(&mut h, &mut studio);
+        pause.release.store(true, Ordering::Release);
+        settle(&mut studio);
+        assert_eq!(
+            studio.test_runtime().unwrap().observation.controls["search_input"],
+            other_shape::string("a")
+        );
+        let pending = frame(&mut h, &mut studio);
+        assert!(!pending.controls["studio.modify"].enabled);
+        assert!(!pending.controls[&context_key].enabled);
+        settle(&mut studio);
+        assert_eq!(
+            studio.test_runtime().unwrap().observation.controls["search_input"],
+            other_shape::string("ab")
+        );
+        let latest = store.load().unwrap();
+        assert_eq!(latest.data, saved.data);
+        assert_eq!(latest.decisions, saved.decisions);
+        click(&mut h, &mut studio, &context_key);
+        if choice == "studio.accept" {
+            assert_eq!(studio.test_page(), "consent", "{}", studio.test_notice());
+            let request = studio.test_prepared_request().unwrap();
+            assert_eq!(
+                request.context.session_digest,
+                Some(latest.session.identity().unwrap())
+            );
+            assert_eq!(request.sources.last(), Some(latest.program().unwrap()));
+            assert_eq!(
+                request.context.recent_inputs.last(),
+                Some(&SemanticInput::Control {
+                    view: "people".into(),
+                    control: "search_input".into(),
+                    value: other_shape::string("ab"),
+                })
+            );
+        } else {
+            assert_eq!(studio.test_page(), "change", "{}", studio.test_notice());
+            for model in [
+                studio.test_current_trial().unwrap(),
+                studio.test_alternative().unwrap(),
+            ] {
+                assert_eq!(
+                    model.observation.controls["search_input"],
+                    other_shape::string("ab")
+                );
+            }
+        }
+        assert_eq!(store.load().unwrap(), latest);
+    }
+}
