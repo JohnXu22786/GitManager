@@ -2,7 +2,6 @@
 use super::*;
 use crate::product_locations::Folder;
 use serde::{Deserialize, Serialize};
-use std::fs::File;
 const JOURNAL_LIMIT: usize = 256 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -181,7 +180,7 @@ impl Journal {
 pub(super) struct JournalFile {
     folder: Folder,
     // One generated-tool host writer per profile. Release happens on the worker.
-    _lock: File,
+    _lock: crate::product_locations::WriteLock,
     pub value: Journal,
 }
 impl JournalFile {

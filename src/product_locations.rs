@@ -15,6 +15,7 @@ use std::path::{Component, Path, PathBuf};
 // Directory or file handle is part of the public helper contract.
 #[path = "product_store/files.rs"]
 mod files;
+pub(crate) use files::WriteLock;
 
 pub(crate) const MAX_LOCAL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_RECENT_BYTES: usize = 1024 * 1024;
@@ -267,7 +268,7 @@ impl Folder {
         self.directory.publish(name, bytes, replace)?;
         self.check()
     }
-    pub(crate) fn lock(&self) -> Result<fs::File> {
+    pub(crate) fn lock(&self) -> Result<WriteLock> {
         self.check()?;
         Ok(self.directory.lock()?)
     }
