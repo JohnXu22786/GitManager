@@ -329,6 +329,10 @@ pub struct ProductRuntimeView {
     focused_row: Option<RecordRef>,
 }
 impl ProductRuntimeView {
+    /// Local renderer focus is context, never a saved semantic input.
+    pub(crate) fn focused_record(&self) -> Option<&RecordRef> {
+        self.focused_row.as_ref()
+    }
     /// Called only for the exact controller-owned request acknowledgement.
     pub(crate) fn acknowledge(&mut self, successful: bool) {
         let pending = self.pending_control.take();

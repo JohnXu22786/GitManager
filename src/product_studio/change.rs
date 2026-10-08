@@ -627,7 +627,7 @@ impl ChangeDraft {
         if !self.structural && missing.is_empty() {
             let runtime = LocalRuntime::default();
             for row in &self.snapshot.data.records {
-                if row.archived {
+                if row.archived || !self.analysis.entities.contains(&row.entity) {
                     continue;
                 }
                 let Some(lifecycle) = self.lifecycles.iter().find(|l| l.entity == row.entity)

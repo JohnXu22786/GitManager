@@ -233,6 +233,7 @@ impl Worker {
         key: &Key,
         gate: &Gate,
         modify: bool,
+        focused: Option<RecordRef>,
     ) -> Result<(), String> {
         self.no_pending()?;
         if self.generation_blocked
@@ -269,6 +270,21 @@ impl Worker {
                 );
             }
             let mut selected = model.observation.selected.clone();
+            if let Some(focused) = focused {
+                if !model.observation.rows.iter().any(|r| r.record == focused)
+                    || !current
+                        .snapshot
+                        .data
+                        .records
+                        .iter()
+                        .any(|r| r.entity == focused.entity && r.id == focused.record)
+                {
+                    return Err("The focused record is no longer in this saved view. Focus current work before requesting the change".into());
+                }
+                if !selected.contains(&focused) {
+                    selected.push(focused);
+                }
+            }
             if let Some(focused) = &current.snapshot.session.focused_record {
                 if !selected.contains(focused) {
                     selected.push(focused.clone());
@@ -1456,12 +1472,21 @@ impl Worker {
                 need,
                 provider,
                 profile,
-            } => self.prepare(need.clone(), *provider, *profile, key, gate, false),
+            } => self.prepare(need.clone(), *provider, *profile, key, gate, false, None),
             Action::Modify {
                 need,
                 provider,
                 profile,
-            } => self.prepare(need.clone(), *provider, *profile, key, gate, true),
+                focused,
+            } => self.prepare(
+                need.clone(),
+                *provider,
+                *profile,
+                key,
+                gate,
+                true,
+                focused.clone(),
+            ),
             Action::Trial { input } => {
                 #[cfg(test)]
                 if let Some(pause) = &self.config.hooks.before_preview {

@@ -131,6 +131,7 @@ enum Action {
         need: String,
         provider: ProviderKind,
         profile: CapabilityProfile,
+        focused: Option<RecordRef>,
     },
     Trial {
         input: SemanticInput,
@@ -1041,6 +1042,7 @@ impl ProductStudio {
                         need: self.need.clone(),
                         provider: self.provider,
                         profile: self.profile,
+                        focused: self.renderer.focused_record().cloned(),
                     });
                 }
                 for choice in choices
@@ -1175,6 +1177,7 @@ impl ProductStudio {
             need: need.into(),
             provider: self.provider,
             profile: self.profile,
+            focused: self.renderer.focused_record().cloned(),
         });
     }
     pub fn test_consent(&mut self) {
@@ -1234,6 +1237,19 @@ impl ProductStudio {
     }
     pub fn test_can_accept(&self) -> bool {
         matches!(&self.page,Page::Change(v) if v.can_accept)
+    }
+    pub fn test_scope_records(&self) -> Vec<RecordRef> {
+        if let Page::Change(view) = &self.page {
+            view.scope_rows
+                .iter()
+                .map(|r| RecordRef {
+                    entity: r.entity.clone(),
+                    record: r.id.clone(),
+                })
+                .collect()
+        } else {
+            vec![]
+        }
     }
     pub fn test_current_trial(&self) -> Option<&RuntimeView> {
         if let Page::Change(v) = &self.page {

@@ -1327,3 +1327,116 @@ fn restart_verifies_exact_change_receipt_and_refuses_a_conflicting_plan() {
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn new_scope_offers_only_affected_entities_after_an_earlier_managed_layer() {
+    fn dual(a: bool, b: bool) -> CapturedProgram {
+        let mut app = serde_json::to_value(&program(a).program).unwrap();
+        let second = serde_json::to_value(&program(b).program).unwrap();
+        fn substitute(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::String(s) => {
+                    if s == "job" {
+                        *s = "supply".into()
+                    } else if s == "sheet" {
+                        *s = "supply_sheet".into()
+                    } else if s == "work" {
+                        *s = "supplies".into()
+                    }
+                }
+                serde_json::Value::Array(a) => {
+                    for v in a {
+                        substitute(v)
+                    }
+                }
+                serde_json::Value::Object(o) => {
+                    for v in o.values_mut() {
+                        substitute(v)
+                    }
+                }
+                _ => (),
+            }
+        }
+        let mut entity = second["entities"][0].clone();
+        substitute(&mut entity);
+        app["entities"].as_array_mut().unwrap().push(entity);
+        for action in second["actions"].as_array().unwrap() {
+            let mut action = action.clone();
+            substitute(&mut action);
+            action["id"] = serde_json::json!(format!("supply_{}", action["id"].as_str().unwrap()));
+            app["actions"].as_array_mut().unwrap().push(action);
+        }
+        let mut output = second["outputs"][0].clone();
+        substitute(&mut output);
+        app["outputs"].as_array_mut().unwrap().push(output);
+        let mut view = second["views"][0].clone();
+        substitute(&mut view);
+        app["views"].as_array_mut().unwrap().push(view);
+        capture(app)
+    }
+    let dir = tempdir();
+    let root = dir.path();
+    let path = root.join("tool");
+    let store = ProductStore::create(&path, &dual(false, false), 20000).unwrap();
+    let old = add(&store, "old-work", "Earlier collection");
+    apply(
+        &store,
+        "new-supply",
+        invoke(
+            "supply_add",
+            &[
+                ("name", text("New collection")),
+                ("promised", DataValue::Date { days: 20020 }),
+            ],
+        ),
+    );
+    let supply = store
+        .load()
+        .unwrap()
+        .data
+        .records
+        .iter()
+        .find(|r| r.entity == "supply")
+        .unwrap()
+        .clone();
+    let current = store.load().unwrap();
+    let req = product_studio::test_scope_request(
+        &current,
+        &dual(true, false),
+        ScopePopulation::All,
+        vec![lifecycle(&current)],
+    )
+    .unwrap();
+    let first = store
+        .prepare_scoped_change(&dual(true, false), &req, "first")
+        .unwrap();
+    store.adopt_scoped(current.revision, &first).unwrap();
+    let mut studio = ProductStudio::testing(
+        root.into(),
+        Some(transport(root, &dual(true, true))),
+        TestHooks::default(),
+    );
+    settle(&mut studio);
+    change(&mut studio, &path);
+    // A copied completion demonstrates the new entity's actual finished state.
+    studio.test_trial(invoke("supply_complete", &[("row", reference(&supply))]));
+    settle(&mut studio);
+    studio.test_lifecycle_outcome(
+        RecordRef {
+            entity: supply.entity.clone(),
+            record: supply.id.clone(),
+        },
+        "done",
+    );
+    settle(&mut studio);
+    let eligible = studio.test_scope_records();
+    assert!(!eligible.iter().any(|r| r.record == old.id));
+    assert_eq!(
+        eligible,
+        vec![RecordRef {
+            entity: supply.entity,
+            record: supply.id
+        }]
+    );
+}

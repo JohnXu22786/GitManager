@@ -689,6 +689,19 @@ fn controls_modify_play_and_record_each_real_nonbinary_choice() {
         settle(&mut h, &mut studio);
         studio.test_open(path);
         settle(&mut h, &mut studio);
+        let focused = product_contract::RecordRef {
+            entity: before.data.records[0].entity.clone(),
+            record: before.data.records[0].id.clone(),
+        };
+        click(
+            &mut h,
+            &mut studio,
+            &format!("daily.focus.{}.{}", focused.entity, focused.record),
+        );
+        assert!(
+            store.load().unwrap().session.focused_record.is_none(),
+            "focus is renderer-local, not a saved input"
+        );
         fill(
             &mut h,
             &mut studio,
@@ -698,6 +711,15 @@ fn controls_modify_play_and_record_each_real_nonbinary_choice() {
         click(&mut h, &mut studio, "studio.modify");
         settle(&mut h, &mut studio);
         assert_eq!(studio.test_page(), "consent", "{}", studio.test_notice());
+        assert!(
+            studio
+                .test_prepared_request()
+                .unwrap()
+                .context
+                .selected
+                .contains(&focused),
+            "actual local focus must accompany this Modify request"
+        );
         assert!(frame(&mut h, &mut studio)
             .text
             .iter()
