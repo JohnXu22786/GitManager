@@ -44,6 +44,57 @@ use std::{
     time::{Duration, Instant},
 };
 
+// The shared backend corpus intentionally has no UI bindings. Host examples
+// expose the same business behavior through the production generated renderer.
+fn program(pause: bool) -> CapturedProgram {
+    let mut value = serde_json::to_value(fixture::program(pause).program).unwrap();
+    let actions = value["actions"].as_array().unwrap().clone();
+    for action in actions.iter().filter(|a| a["id"] != "add") {
+        let row = !action["parameters"].as_object().unwrap().is_empty();
+        value["views"][0]["actions"].as_array_mut().unwrap().push(serde_json::json!({
+            "id":action["id"],"label":action["label"],"action":action["id"],
+            "placement":if row {"row"} else {"toolbar"},
+            "arguments":if row {serde_json::json!({"row":var("row")})} else {serde_json::json!({})},
+            "enabled":boolean(true)
+        }));
+    }
+    value["views"].as_array_mut().unwrap().push(serde_json::json!({
+        "id":"new_work","label":"New work","kind":{"kind":"form","action":"add",
+        "fields":[{"parameter":"name","label":"Name"},{"parameter":"promised","label":"Customer commitment"}],
+        "defaults":{"promised":{"kind":"date","days":20010}}},"actions":[],"keys":[]
+    }));
+    capture(value)
+}
+
+#[cfg(unix)]
+fn frame(
+    h: &mut egui_harness::EguiHarness,
+    s: &mut ProductStudio,
+) -> product_runtime_view::WidgetTrace {
+    s.poll();
+    h.frame(|ctx| {
+        egui::CentralPanel::default()
+            .show(ctx, |ui| s.show(ui))
+            .inner
+    })
+}
+
+#[cfg(unix)]
+fn click(h: &mut egui_harness::EguiHarness, s: &mut ProductStudio, key: &str) {
+    let trace = frame(h, s);
+    let control = trace
+        .controls
+        .get(key)
+        .unwrap_or_else(|| panic!("missing {key}: {:?}", trace.text));
+    assert!(control.enabled, "disabled {key}: {:?}", trace.text);
+    let point = control.rect.center();
+    h.press_at(point);
+    frame(h, s);
+    h.release_at(point);
+    frame(h, s);
+    settle(s);
+}
+
 fn settle(studio: &mut ProductStudio) {
     let start = Instant::now();
     loop {
@@ -1648,7 +1699,7 @@ fn managed_editing_guide_names_the_actual_supplied_capture_and_measures_envelope
         let dir = tempdir();
         let path = dir.path().join("tool");
         let (before, candidate) = if row_layer {
-            (program(false), program(true))
+            (fixture::program(false), fixture::program(true))
         } else {
             let original = other_shape::capture(other_shape::organizer());
             let mut changed = other_shape::organizer();
@@ -1934,4 +1985,204 @@ fn provider_request_read_bounds_keep_strict_json_and_refuse_modified_or_oversize
         tool_proposal_input::parse_json_bytes(&vec![b' '; 1024 * 1024 + 1]).is_err(),
         "the external/source parser bound stays at 1MiB"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn navigation_only_structural_comparison_keeps_pending_choices_unavailable() {
+    let dir = tempdir();
+    let root = dir.path();
+    let path = root.join("tool");
+    let original = other_shape::capture(other_shape::organizer());
+    let mut changed = other_shape::organizer();
+    changed["views"][0]["kind"]["columns"].as_array_mut().unwrap().push(serde_json::json!({"id":"area","label":"Area","value":other_shape::field(other_shape::var("row"),"area")}));
+    let candidate = other_shape::capture(changed);
+    let store = ProductStore::create(&path, &original, 20000).unwrap();
+    store
+        .apply(
+            0,
+            "first",
+            &other_shape::add("Ada"),
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    let before = store.load().unwrap();
+    let mut studio = ProductStudio::testing(
+        root.into(),
+        Some(transport(root, &candidate)),
+        TestHooks::default(),
+    );
+    settle(&mut studio);
+    change(&mut studio, &path);
+    let mut h = egui_harness::EguiHarness::new(egui::vec2(1400.0, 1800.0));
+    click(&mut h, &mut studio, "current.navigate.new_person");
+    let trace = frame(&mut h, &mut studio);
+    for key in [
+        "studio.either",
+        "studio.both",
+        "studio.neither",
+        "studio.defer",
+    ] {
+        assert!(
+            !trace.controls[key].enabled,
+            "Navigation alone has no business task scope: {key}"
+        );
+    }
+    assert_eq!(store.load().unwrap(), before);
+    click(&mut h, &mut studio, "current.field.name");
+    h.text("Copied person");
+    frame(&mut h, &mut studio);
+    click(&mut h, &mut studio, "current.field.area");
+    h.text("north");
+    frame(&mut h, &mut studio);
+    click(&mut h, &mut studio, "current.submit");
+    click(&mut h, &mut studio, "studio.defer");
+    let saved = store.load().unwrap();
+    assert_eq!(saved.data, before.data);
+    assert_eq!(saved.active_revision, before.active_revision);
+    assert_eq!(
+        saved.decisions.decisions.last().unwrap().outcome,
+        DecisionOutcome::Deferred
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn change_commit_rechecks_real_day_after_preparation_and_clears_only_its_pending_marker() {
+    let dir = tempdir();
+    let root = dir.path();
+    let path = root.join("tool");
+    let original = other_shape::capture(other_shape::organizer());
+    let mut changed = other_shape::organizer();
+    changed["actions"][2]["steps"][0]["items"] = other_shape::query("person");
+    let candidate = other_shape::capture(changed);
+    let store = ProductStore::create(&path, &original, 20000).unwrap();
+    store
+        .apply(
+            0,
+            "first",
+            &other_shape::add("Ada"),
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    let before = store.load().unwrap();
+    let pause = std::sync::Arc::new(product_studio::TestPause::default());
+    let hooks = TestHooks {
+        before_commit: Some(pause.clone()),
+        ..TestHooks::default()
+    };
+    let clock = hooks.today.clone();
+    let stopped = hooks.stopped.clone();
+    let mut studio = ProductStudio::testing(root.into(), Some(transport(root, &candidate)), hooks);
+    settle(&mut studio);
+    change(&mut studio, &path);
+    studio.test_trial(other_shape::invoke("export_people", Default::default()));
+    settle(&mut studio);
+    let original_journal: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("studio/session.json")).unwrap()).unwrap();
+    let need = original_journal["need"].as_str().unwrap().to_owned();
+    studio.test_decide(DecisionOutcome::Deferred);
+    let start = Instant::now();
+    while !pause.reached.load(std::sync::atomic::Ordering::Acquire) {
+        studio.poll();
+        assert!(start.elapsed() < Duration::from_secs(120));
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    clock.store(20001, std::sync::atomic::Ordering::Release);
+    pause
+        .release
+        .store(true, std::sync::atomic::Ordering::Release);
+    settle(&mut studio);
+    assert_eq!(studio.test_page(), "change", "{}", studio.test_notice());
+    assert!(studio.test_notice().contains("date changed"));
+    assert_eq!(store.load().unwrap(), before);
+    let journal: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("studio/session.json")).unwrap()).unwrap();
+    assert!(journal["pending"].is_null());
+    assert_eq!(journal["need"], original_journal["need"]);
+    drop(studio);
+    let start = Instant::now();
+    while !stopped.load(std::sync::atomic::Ordering::Acquire) {
+        assert!(start.elapsed() < Duration::from_secs(30));
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let hooks = TestHooks::default();
+    hooks
+        .today
+        .store(20001, std::sync::atomic::Ordering::Release);
+    let mut reopened = ProductStudio::testing(root.into(), None, hooks);
+    settle(&mut reopened);
+    assert_eq!(reopened.test_page(), "daily", "{}", reopened.test_notice());
+    assert_eq!(reopened.test_need(), need);
+    let saved = store.load().unwrap();
+    assert_eq!(saved.decisions, before.decisions);
+    assert_eq!(saved.data.records, before.data.records);
+    assert_eq!(saved.clock_day, 20001);
+}
+
+#[cfg(unix)]
+#[test]
+fn copied_day_control_plays_waiting_boundary_without_mutating_live_work() {
+    let dir = tempdir();
+    let root = dir.path();
+    let path = root.join("tool");
+    let store = ProductStore::create(&path, &program(false), 20000).unwrap();
+    let row = add(&store, "first", "Waiting work");
+    action(&store, "waiting", "wait", &row);
+    let before = store.load().unwrap();
+    let mut studio = ProductStudio::testing(
+        root.into(),
+        Some(transport(root, &program(true))),
+        TestHooks::default(),
+    );
+    settle(&mut studio);
+    change(&mut studio, &path);
+    let mut h = egui_harness::EguiHarness::new(egui::vec2(1600.0, 2400.0));
+    click(
+        &mut h,
+        &mut studio,
+        &format!("current.row.job.{}.complete", row.id),
+    );
+    click(
+        &mut h,
+        &mut studio,
+        &format!("studio.finished.job.{}.done", row.id),
+    );
+    for _ in 0..3 {
+        click(&mut h, &mut studio, "studio.trial.next-day");
+    }
+    assert!(frame(&mut h, &mut studio)
+        .text
+        .iter()
+        .any(|text| text.contains("Copied date: 2024-10-07")));
+    click(
+        &mut h,
+        &mut studio,
+        &format!("current.row.job.{}.calculate", row.id),
+    );
+    click(&mut h, &mut studio, "current.action.export");
+    let current = studio.test_current_trial().unwrap();
+    let alternative = studio.test_alternative().unwrap();
+    let old = current
+        .retained_records
+        .iter()
+        .find(|r| r.id == row.id)
+        .unwrap();
+    let new = alternative
+        .retained_records
+        .iter()
+        .find(|r| r.id == row.id)
+        .unwrap();
+    assert_eq!(old.values["production"], DataValue::Integer { value: 3 });
+    assert_eq!(new.values["production"], DataValue::Integer { value: 0 });
+    assert_eq!(old.values["promised"], new.values["promised"]);
+    assert_ne!(current.artifacts[0].bytes, alternative.artifacts[0].bytes);
+    assert_eq!(
+        store.load().unwrap(),
+        before,
+        "Copied clock, data, and session must stay isolated"
+    );
+    click(&mut h, &mut studio, "studio.return");
+    assert_eq!(studio.test_page(), "daily");
+    assert_eq!(store.load().unwrap(), before);
 }

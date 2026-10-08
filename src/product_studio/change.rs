@@ -19,6 +19,7 @@ pub(super) struct LifecycleOption {
 pub(super) struct ChangeView {
     pub basis: Basis,
     pub current: RuntimeView,
+    pub trial_day: i32,
     pub target_artifact: Digest,
     pub alternative: Option<RuntimeView>,
     pub population: ScopePopulation,
@@ -62,6 +63,7 @@ pub(super) struct ChangeDraft {
     scope_operations: BTreeSet<Id>,
     scenario: ScenarioSpec,
     current: RuntimeView,
+    trial_day: i32,
     alternative: Option<RuntimeView>,
     scenes: Option<(AcceptedScene, AcceptedScene)>,
 }
@@ -147,7 +149,7 @@ fn replay_view(
     program: &CapturedProgram,
     scenario: &ScenarioSpec,
     admission: &ScopedExecutionContext,
-) -> Result<RuntimeView, String> {
+) -> Result<(RuntimeView, i32), String> {
     admission
         .validate_seed(program, &scenario.seed, scenario.clock_day)
         .map_err(error)?;
@@ -172,7 +174,7 @@ fn replay_view(
     }
     // This is the raw isolated execution. Saved facts are separately shown in
     // the daily ProductStore::runtime_view, never invented in a trial view.
-    runtime.view_model(&run).map_err(error)
+    Ok((runtime.view_model(&run).map_err(error)?, run.clock_day()))
 }
 impl ChangeDraft {
     pub fn new(
@@ -198,7 +200,7 @@ impl ChangeDraft {
             inputs: vec![],
             validity: vec![],
         };
-        let current = replay_view(
+        let (current, trial_day) = replay_view(
             &runtime,
             snapshot.program().map_err(error)?,
             &scenario,
@@ -226,6 +228,7 @@ impl ChangeDraft {
             scope_operations: BTreeSet::new(),
             scenario,
             current,
+            trial_day,
             alternative: None,
             scenes: None,
         })
@@ -341,17 +344,21 @@ impl ChangeDraft {
         }
         .map_err(error)?;
         let runtime = LocalRuntime::with_cancellation(gate.cancelled.clone());
-        let current = replay_view(
+        let (current, trial_day) = replay_view(
             &runtime,
             self.snapshot.program().map_err(error)?,
             &scenario,
             &admission,
         )?;
-        let alternative = replay_view(&runtime, target, &scenario, &admission)?;
+        let (alternative, alternative_day) = replay_view(&runtime, target, &scenario, &admission)?;
+        if trial_day != alternative_day {
+            return Err("The copied versions did not keep the same simulated date. Start a fresh comparison".into());
+        }
         gate.check()?;
         self.prepared = prepared;
         self.scenario = scenario;
         self.current = current;
+        self.trial_day = trial_day;
         self.alternative = Some(alternative);
         self.scenes = None;
         Ok(())
@@ -490,7 +497,7 @@ impl ChangeDraft {
         let runtime = LocalRuntime::with_cancellation(gate.cancelled.clone());
         if !self.missing().is_empty() {
             let admission = ScopedExecutionContext::committed(&self.snapshot).map_err(error)?;
-            let current = replay_view(
+            let (current, trial_day) = replay_view(
                 &runtime,
                 self.snapshot.program().map_err(error)?,
                 &scenario,
@@ -499,6 +506,7 @@ impl ChangeDraft {
             gate.check()?;
             self.scenario = scenario;
             self.current = current;
+            self.trial_day = trial_day;
             return Ok(());
         }
         if !self.structural && self.analysis.operations.is_empty() {
@@ -509,7 +517,7 @@ impl ChangeDraft {
                 .collect();
             if operations.is_empty() {
                 let admission = ScopedExecutionContext::committed(&self.snapshot).map_err(error)?;
-                let current = replay_view(
+                let (current, trial_day) = replay_view(
                     &runtime,
                     self.snapshot.program().map_err(error)?,
                     &scenario,
@@ -518,6 +526,7 @@ impl ChangeDraft {
                 gate.check()?;
                 self.scenario = scenario;
                 self.current = current;
+                self.trial_day = trial_day;
                 return Ok(());
             }
             if self.scope_operations != operations || self.alternative.is_none() {
@@ -568,16 +577,21 @@ impl ChangeDraft {
             )
         }
         .map_err(error)?;
-        let current = replay_view(
+        let (current, trial_day) = replay_view(
             &runtime,
             self.snapshot.program().map_err(error)?,
             current_scene.scenario(),
             &admission,
         )?;
-        let alternative = replay_view(&runtime, target, alternative_scene.scenario(), &admission)?;
+        let (alternative, alternative_day) =
+            replay_view(&runtime, target, alternative_scene.scenario(), &admission)?;
+        if trial_day != alternative_day {
+            return Err("The copied versions did not keep the same simulated date. Start a fresh comparison".into());
+        }
         gate.check()?;
         self.scenario = scenario;
         self.current = current;
+        self.trial_day = trial_day;
         self.alternative = Some(alternative);
         self.scenes = Some((current_scene, alternative_scene));
         Ok(())
@@ -735,6 +749,7 @@ impl ChangeDraft {
         Ok(ChangeView {
             basis: Basis::capture(&self.snapshot)?,
             current: self.current.clone(),
+            trial_day: self.trial_day,
             target_artifact: self
                 .prepared
                 .as_ref()
@@ -749,14 +764,15 @@ impl ChangeDraft {
             lifecycle_options: options,
             can_accept: (wording_update && self.alternative.is_some()) || experienced_scope,
             can_keep_current: experienced_scope && !wording_update,
-            can_retain: self.scenes.is_some() && !same_alternative && !wording_update,
+            can_retain: self.scenes.is_some()
+                && !required.is_empty()
+                && !same_alternative
+                && !wording_update,
             same_alternative,
             readiness_notes: vec![],
             whole_design: self.structural,
             wording_update,
-            needs_task: !self.structural
-                && self.analysis.operations.is_empty()
-                && self.scope_operations.is_empty(),
+            needs_task: !wording_update && required.is_empty(),
             partial_scope: !self.structural
                 && !self.analysis.patches.iter().any(|p| {
                     matches!(
@@ -866,7 +882,7 @@ impl ChangeDraft {
             DecisionOutcome::Accept { .. } | DecisionOutcome::KeepCurrent
         ) && !view.can_retain
         {
-            return Err("These are not two distinct tool versions. Return to saved work without recording a new pair; earlier choices are kept".into());
+            return Err("Try an actual business task with two distinct tool versions before recording a new pair. Returning to saved work keeps earlier choices".into());
         }
         let engine = engine(store, gate);
         if outcome == DecisionOutcome::KeepCurrent && self.prepared.is_some() {

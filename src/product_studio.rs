@@ -766,6 +766,20 @@ impl ProductStudio {
                 trace.label(ui, format!("Requested change: {}", view.need));
                 trace.label(ui, view.origin.clone());
                 trace.label(ui, "Copied work only. Both sides use the same starting records, date and input sequence. Trial entries never become saved business work.");
+                trace.label(ui, format!(
+                    "Copied date: {}. Advancing this date changes only the copies, never saved work or its date.",
+                    crate::ui::product_runtime_view::value_text(&DataValue::Date { days: view.trial_day })
+                ));
+                if trace.button(
+                    ui,
+                    "studio.trial.next-day",
+                    "Try one day later on the copies",
+                    !busy,
+                ) {
+                    action = Some(Action::Trial {
+                        input: SemanticInput::AdvanceClock { days: 1 },
+                    });
+                }
                 if !view.lifecycle_note.is_empty() {
                     trace.label(ui, view.lifecycle_note.clone());
                 }
@@ -801,7 +815,7 @@ impl ProductStudio {
                     }
                 } else {
                     if view.needs_task {
-                        trace.label(ui,"Try the task this result belongs to below. Its actual action will define the rule's task scope, then both versions will be independently replayed.");
+                        trace.label(ui,"Try an actual task below before recording a choice. A copied view alone does not define which work the choice applies to; both versions will be independently replayed.");
                     }
                     if view.whole_design {
                         trace.label(ui, "This changes the tool's design as a whole. Existing protected results and intentions are independently checked; partial rule scopes are unavailable for this design.");

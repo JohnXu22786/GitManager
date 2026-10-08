@@ -1241,6 +1241,7 @@ impl Worker {
             .as_ref()
             .ok_or("No experienced change is available")?;
         let basis = Basis::capture(&draft.snapshot)?;
+        let expected_day = basis.day;
         if key.basis.as_ref() != Some(&basis) || self.today() != basis.day {
             return Err("This comparison is stale. Rehearse on current saved work".into());
         }
@@ -1257,6 +1258,10 @@ impl Worker {
             })
         })?;
         self.before_commit(gate);
+        if self.today() != expected_day {
+            self.journal(|j| j.pending = None)?;
+            return Err("The date changed before saving. Return to saved work and rehearse a fresh comparison; no choice was committed".into());
+        }
         if let Err(e) = gate.commit() {
             self.journal(|j| j.pending = None)?;
             return Err(e);
