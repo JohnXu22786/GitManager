@@ -3399,6 +3399,9 @@ pub enum DevelopmentOperation {
 pub enum Disclosure {
     Synthetic,
     ExplicitlySelectedSanitized,
+    /// Exact selected business records. This declares origin, not sanitization
+    /// or authorization to send them to a development provider.
+    ExplicitlySelected,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

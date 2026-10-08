@@ -1,5 +1,9 @@
-//! Reachable initial generated-tool host. Later change/scope flows are not yet
-//! exposed here. One worker owns every blocking operation, including job Drop.
+//! Generated-tool host. One worker owns blocking generation, copied changes,
+//! verification, adoption and job cleanup; egui only renders bounded models.
+#[path = "product_studio/change.rs"]
+mod change;
+#[path = "product_studio/change_adapter.rs"]
+mod change_adapter;
 #[path = "product_studio/journal.rs"]
 mod journal;
 #[path = "product_studio/worker.rs"]
@@ -8,17 +12,21 @@ use crate::product_backup::{
     inspect_open, open_verified, upgrade_open_verified, CheckpointShelf, OpenGate,
 };
 use crate::product_contract::*;
+use crate::product_decisions::{DecisionEngine, IntentArchive};
 use crate::product_discovery::{
     encode_request, prepare_development, PreparedDevelopment, ProviderOptions,
 };
 use crate::product_locations::{RecentEntry, RecentTools, ToolIdentity, ToolLocations};
 use crate::product_protocol::RuntimeView;
+use crate::product_provider::JobReceipt;
 use crate::product_provider::{
     CapabilityProfile, ConsentReceipt, DataDisclosure, JobState, ProviderKind, ProviderTransport,
 };
 use crate::product_runtime::{LocalRuntime, ProductRun};
+use crate::product_store::scope::{LifecycleBinding, ScopePopulation};
 use crate::product_store::{ProductStore, ProjectSnapshot, UpgradeProgress, UpgradeSummary};
 use crate::ui::product_runtime_view::{take_shortcuts, ProductRuntimeView, WidgetTrace};
+use change::{ChangeDraft, ChangeView};
 use journal::{Association, Basis, Interrupted, JournalFile, ProviderAssociation, UnsavedInput};
 use std::{
     path::{Path, PathBuf},
@@ -119,6 +127,31 @@ enum Action {
     Consent {
         disclosure: String,
     },
+    Modify {
+        need: String,
+        provider: ProviderKind,
+        profile: CapabilityProfile,
+    },
+    Trial {
+        input: SemanticInput,
+    },
+    Scope {
+        population: ScopePopulation,
+    },
+    Finished {
+        record: RecordRef,
+        field: Id,
+    },
+    NoFinished {
+        entity: Id,
+    },
+    Decide {
+        outcome: DecisionOutcome,
+    },
+    ResumeChoice {
+        decision: Id,
+    },
+    ReturnDaily,
     Select {
         candidate: usize,
     },
@@ -169,7 +202,10 @@ enum Page {
     Consent {
         disclosure: DataDisclosure,
         need: String,
+        request: DevelopmentRequest,
+        basis: Option<Basis>,
     },
+    Change(ChangeView),
     Draft {
         basis: Basis,
         labels: Vec<String>,
@@ -182,6 +218,7 @@ enum Page {
         tool: Association,
         basis: Basis,
         model: RuntimeView,
+        choices: Vec<ScopedDecision>,
     },
 }
 #[derive(Clone)]
@@ -222,6 +259,8 @@ pub struct ProductStudio {
     epoch: u64,
     page: Page,
     renderer: ProductRuntimeView,
+    alternative_renderer: ProductRuntimeView,
+    scope_selection: Vec<RecordRef>,
     need: String,
     provider: ProviderKind,
     profile: CapabilityProfile,
@@ -262,6 +301,8 @@ impl ProductStudio {
             epoch: 0,
             page: Page::Home,
             renderer: ProductRuntimeView::default(),
+            alternative_renderer: ProductRuntimeView::default(),
+            scope_selection: vec![],
             need: String::new(),
             provider: ProviderKind::Codex,
             profile: CapabilityProfile::DataOnly,
@@ -288,6 +329,8 @@ impl ProductStudio {
     fn basis(&self) -> Option<Basis> {
         match &self.page {
             Page::Daily { basis, .. } | Page::Draft { basis, .. } => Some(basis.clone()),
+            Page::Change(view) => Some(view.basis.clone()),
+            Page::Consent { basis, .. } => basis.clone(),
             _ => None,
         }
     }
@@ -306,7 +349,10 @@ impl ProductStudio {
         if matches!(action, Action::Boot) {
             let _ = gate.commit();
         }
-        let renderer = matches!(action, Action::Preview { .. } | Action::Daily { .. });
+        let renderer = matches!(
+            action,
+            Action::Preview { .. } | Action::Daily { .. } | Action::Trial { .. }
+        );
         match self.send.try_send(Command { key: key.clone(), gate: gate.clone(), action }) {
             Ok(()) => self.pending = Some(Pending { key, gate, renderer }),
             Err(_) => self.notice = "The tool worker is unavailable. Saved work was kept; reopen the app to reconcile unfinished work".into(),
@@ -338,6 +384,8 @@ impl ProductStudio {
                     self.page = page;
                     if reset {
                         self.renderer = ProductRuntimeView::default();
+                        self.alternative_renderer = ProductRuntimeView::default();
+                        self.scope_selection.clear();
                     }
                 }
                 if let Some(need) = update.need {
@@ -345,6 +393,8 @@ impl ProductStudio {
                 }
                 if renderer_request {
                     self.renderer.acknowledge(completion.acknowledged);
+                    self.alternative_renderer
+                        .acknowledge(completion.acknowledged);
                 }
                 self.notice = update.notice;
             } else {
@@ -405,6 +455,7 @@ impl ProductStudio {
         let mut trace = WidgetTrace::default();
         let active_model = match &self.page {
             Page::Draft { model, .. } | Page::Daily { model, .. } => Some(model),
+            Page::Change(view) => Some(&view.current),
             _ => None,
         };
         let shortcuts = take_shortcuts(
@@ -419,7 +470,7 @@ impl ProductStudio {
             ui.ctx().request_repaint_after(Duration::from_millis(30));
         }
         trace.label(ui, "Your generated tools");
-        trace.label(ui, "Create a local tool from your own need. Saved tools work offline. Changes to a saved tool are not available in this initial version.");
+        trace.label(ui, "Create a local tool from your own need. Saved tools work offline; try changes on copies before keeping them.");
         if !self.notice.is_empty() {
             trace.label(ui, self.notice.clone());
         }
@@ -585,13 +636,41 @@ impl ProductStudio {
                     }
                 }
             }
-            Page::Consent { disclosure, need } => {
+            Page::Consent {
+                disclosure,
+                need,
+                request,
+                ..
+            } => {
                 trace.label(
                     ui,
                     format!("Send this request to {}?", disclosure.recipient),
                 );
                 trace.label(ui, format!("Your exact need: {need}"));
-                trace.label(ui, "This initial request includes the need above and the public application-language instructions/schema. It contains no saved tool sources, business records, earlier conversations, or accepted scenes.");
+                if request.operation == DevelopmentOperation::Generate {
+                    trace.label(ui, "This initial request includes the need above and the public application-language instructions/schema. It contains no saved tool sources, business records, earlier conversations, or accepted scenes.");
+                } else {
+                    trace.label(ui, format!("This request includes {} exact tool sources, the current view and selection, {} recent acknowledged inputs, {} retained intentions, and {} complete inherited examples with their business records and observed results. These copies may contain private information; they are not automatically sanitized.", request.sources.len(), request.context.recent_inputs.len(), request.decisions.decisions.len(), request.examples.len()));
+                    ui.collapsing("Review the complete inherited examples", |ui| {
+                        for example in &request.examples {
+                            trace.label(
+                                ui,
+                                format!("{} · {:?}", example.scenario.label, example.disclosure),
+                            );
+                            for record in &example.scenario.seed.records {
+                                for (field, value) in &record.values {
+                                    trace.label(
+                                        ui,
+                                        format!(
+                                            "{field}: {}",
+                                            crate::ui::product_runtime_view::value_text(value)
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                    });
+                }
                 trace.label(ui, disclosure.purpose.clone());
                 for category in &disclosure.data_categories {
                     trace.label(ui, category.clone());
@@ -615,7 +694,18 @@ impl ProductStudio {
                         disclosure: disclosure.digest(),
                     });
                 }
-                close = trace.button(ui, "studio.back", "Back without sending", true);
+                if request.operation == DevelopmentOperation::Modify {
+                    if trace.button(
+                        ui,
+                        "studio.return",
+                        "Back to saved work without sending",
+                        !busy,
+                    ) {
+                        action = Some(Action::ReturnDaily);
+                    }
+                } else {
+                    close = trace.button(ui, "studio.back", "Back without sending", true);
+                }
             }
             Page::Draft {
                 labels,
@@ -679,7 +769,227 @@ impl ProductStudio {
                     }
                 }
             }
-            Page::Daily { tool, basis, model } => {
+            Page::Change(view) => {
+                trace.label(ui, format!("Requested change: {}", view.need));
+                trace.label(ui, view.origin.clone());
+                trace.label(ui, "Copied work only. Both sides use the same starting records, date and input sequence. Trial entries never become saved business work.");
+                if !view.lifecycle_note.is_empty() {
+                    trace.label(ui, view.lifecycle_note.clone());
+                }
+                if !view.missing.is_empty() {
+                    trace.label(ui, "When should this work count as finished, so future rule changes leave its recorded result alone? Try the existing completion action below, then choose the recorded outcome that defines finished work.");
+                    for option in &view.lifecycle_options {
+                        if trace.button(
+                            ui,
+                            &format!(
+                                "studio.finished.{}.{}.{}",
+                                option.record.entity, option.record.record, option.field
+                            ),
+                            &option.label,
+                            !busy,
+                        ) {
+                            action = Some(Action::Finished {
+                                record: option.record.clone(),
+                                field: option.field.clone(),
+                            });
+                        }
+                    }
+                    for (entity, label) in &view.missing {
+                        if trace.button(
+                            ui,
+                            &format!("studio.no-finished.{entity}"),
+                            &format!("{label} has no finished state"),
+                            !busy,
+                        ) {
+                            action = Some(Action::NoFinished {
+                                entity: entity.clone(),
+                            });
+                        }
+                    }
+                } else {
+                    if view.whole_design {
+                        trace.label(ui, "This changes the tool's design as a whole. Existing protected results and intentions are independently checked; partial rule scopes are unavailable for this design.");
+                    } else {
+                        trace.label(ui, "Choose where the rule applies. Already completed results and past events remain preserved, including with All work.");
+                        for (key, label, population) in [
+                            (
+                                "studio.scope.future",
+                                "Future work",
+                                ScopePopulation::FutureWork,
+                            ),
+                            ("studio.scope.all", "All work", ScopePopulation::All),
+                        ] {
+                            if trace.button(ui, key, label, !busy && view.population != population)
+                            {
+                                action = Some(Action::Scope { population });
+                            }
+                        }
+                        ui.collapsing("Choose these unfinished items", |ui| {
+                            for row in &view.current.retained_records {
+                                if row.archived {
+                                    continue;
+                                }
+                                let reference = RecordRef {
+                                    entity: row.entity.clone(),
+                                    record: row.id.clone(),
+                                };
+                                let label = row
+                                    .values
+                                    .values()
+                                    .find_map(|v| {
+                                        if let DataValue::Text { value } = v {
+                                            Some(value.clone())
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .unwrap_or_else(|| row.entity.clone());
+                                let mut selected = self.scope_selection.contains(&reference);
+                                let response = ui
+                                    .add_enabled(!busy, egui::Checkbox::new(&mut selected, label));
+                                if response.changed() {
+                                    if selected {
+                                        self.scope_selection.push(reference.clone());
+                                    } else {
+                                        self.scope_selection.retain(|r| r != &reference);
+                                    }
+                                }
+                                trace.control(
+                                    &format!("studio.select.{}.{}", row.entity, row.id),
+                                    response,
+                                );
+                            }
+                            if trace.button(
+                                ui,
+                                "studio.scope.selected",
+                                "Apply to these unfinished items",
+                                !busy && !self.scope_selection.is_empty(),
+                            ) {
+                                action = Some(Action::Scope {
+                                    population: ScopePopulation::SelectedUnfinished {
+                                        records: self.scope_selection.clone(),
+                                    },
+                                });
+                            }
+                        });
+                    }
+                    trace.label(
+                        ui,
+                        format!(
+                            "Current scope: {}",
+                            match &view.population {
+                                ScopePopulation::All => "All work".into(),
+                                ScopePopulation::FutureWork =>
+                                    "Future work begun after acceptance".into(),
+                                ScopePopulation::SelectedUnfinished { records } =>
+                                    format!("{} frozen selected unfinished items", records.len()),
+                            }
+                        ),
+                    );
+                    trace.label(
+                        ui,
+                        format!(
+                            "Try the affected tasks before accepting: {}",
+                            view.operations.join(", ")
+                        ),
+                    );
+                    if trace.button(
+                        ui,
+                        "studio.accept",
+                        "Accept the alternative",
+                        !busy && view.can_accept,
+                    ) {
+                        action = Some(Action::Decide {
+                            outcome: DecisionOutcome::Accept {
+                                artifact: view.basis.source.clone(),
+                            },
+                        });
+                    }
+                    for (key, label, outcome) in [
+                        (
+                            "studio.keep-current",
+                            "Keep current",
+                            DecisionOutcome::KeepCurrent,
+                        ),
+                        (
+                            "studio.either",
+                            "Either is acceptable",
+                            DecisionOutcome::EitherAcceptable,
+                        ),
+                        ("studio.both", "I need both", DecisionOutcome::BothNeeded),
+                        (
+                            "studio.neither",
+                            "Neither fits",
+                            DecisionOutcome::NeitherFits,
+                        ),
+                        ("studio.defer", "Decide later", DecisionOutcome::Deferred),
+                    ] {
+                        if trace.button(ui, key, label, !busy && view.experienced) {
+                            action = Some(Action::Decide { outcome });
+                        }
+                    }
+                    trace.label(ui,"The four unresolved choices retain both actual experiences without changing your live tool. You can reopen them after continuing work.");
+                }
+                if trace.button(ui, "studio.return", "Return to saved work", !busy) {
+                    action = Some(Action::ReturnDaily);
+                }
+                ui.separator();
+                if let Some(alternative) = &view.alternative {
+                    ui.columns(2, |columns| {
+                        trace.label(&mut columns[0], "Current");
+                        let output = self.renderer.show(
+                            &mut columns[0],
+                            &view.current,
+                            "current",
+                            !busy && action.is_none(),
+                            false,
+                            &shortcuts,
+                        );
+                        trace.append(output.trace);
+                        if let Some(input) = output.input {
+                            if action.is_none() {
+                                action = Some(Action::Trial { input });
+                            }
+                        }
+                        trace.label(&mut columns[1], "Alternative");
+                        let output = self.alternative_renderer.show(
+                            &mut columns[1],
+                            alternative,
+                            "alternative",
+                            !busy && action.is_none(),
+                            false,
+                            &[],
+                        );
+                        trace.append(output.trace);
+                        if let Some(input) = output.input {
+                            if action.is_none() {
+                                action = Some(Action::Trial { input });
+                            }
+                        }
+                    });
+                } else {
+                    let output = self.renderer.show(
+                        ui,
+                        &view.current,
+                        "current",
+                        !busy && action.is_none(),
+                        false,
+                        &shortcuts,
+                    );
+                    trace.append(output.trace);
+                    if let Some(input) = output.input {
+                        if action.is_none() {
+                            action = Some(Action::Trial { input });
+                        }
+                    }
+                }
+            }
+            Page::Daily {
+                tool,
+                basis,
+                model,
+                choices,
+            } => {
                 trace.label(
                     ui,
                     format!(
@@ -690,6 +1000,69 @@ impl ProductStudio {
                 trace.label(ui, format!("Saved locally: {}", tool.path.display()));
                 trace.label(ui, "Output files cannot be saved in this initial version. Generated output can be inspected below.");
                 close = trace.button(ui, "studio.close", "Close tool", true);
+                ui.add_enabled_ui(!busy, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.provider, ProviderKind::Codex, "Codex");
+                        ui.selectable_value(&mut self.provider, ProviderKind::Claude, "Claude");
+                    });
+                    ui.radio_value(
+                        &mut self.profile,
+                        CapabilityProfile::DataOnly,
+                        "Data-only (requires verified availability)",
+                    );
+                    ui.radio_value(
+                        &mut self.profile,
+                        CapabilityProfile::TrustedHarness,
+                        "Trusted Harness (review broader access before sending)",
+                    );
+                });
+                trace.label(ui, "What should work differently here?");
+                trace.control(
+                    "studio.change-need",
+                    ui.add_enabled(
+                        !busy,
+                        egui::TextEdit::multiline(&mut self.need)
+                            .desired_rows(2)
+                            .char_limit(MAX_TEXT_BYTES),
+                    ),
+                );
+                if trace.button(
+                    ui,
+                    "studio.modify",
+                    "Review this change request",
+                    !busy
+                        && !self.generation_blocked
+                        && !self.need.trim().is_empty()
+                        && basis.day == today,
+                ) {
+                    action = Some(Action::Modify {
+                        need: self.need.clone(),
+                        provider: self.provider,
+                        profile: self.profile,
+                    });
+                }
+                for choice in choices
+                    .iter()
+                    .filter(|d| d.status == DecisionStatus::Pending)
+                {
+                    trace.label(
+                        ui,
+                        format!(
+                            "Saved unresolved choice: {} · {:?}",
+                            choice.request, choice.outcome
+                        ),
+                    );
+                    if trace.button(
+                        ui,
+                        &format!("studio.resume.{}", choice.id),
+                        "Try this saved choice on current work",
+                        !busy && !self.mutation_blocked,
+                    ) {
+                        action = Some(Action::ResumeChoice {
+                            decision: choice.id.clone(),
+                        });
+                    }
+                }
                 let mut model = model.clone();
                 model.read_only |= self.mutation_blocked || basis.day != today;
                 if basis.day != today {
@@ -792,6 +1165,58 @@ impl ProductStudio {
             Page::Consent { .. } => "consent",
             Page::Draft { .. } => "draft",
             Page::Daily { .. } => "daily",
+            Page::Change(_) => "change",
+        }
+    }
+    pub fn test_modify(&mut self, need: &str) {
+        self.issue(Action::Modify {
+            need: need.into(),
+            provider: self.provider,
+            profile: self.profile,
+        });
+    }
+    pub fn test_consent(&mut self) {
+        if let Page::Consent { disclosure, .. } = &self.page {
+            self.issue(Action::Consent {
+                disclosure: disclosure.digest(),
+            });
+        }
+    }
+    pub fn test_prepared_request(&self) -> Option<&DevelopmentRequest> {
+        if let Page::Consent { request, .. } = &self.page {
+            Some(request)
+        } else {
+            None
+        }
+    }
+    pub fn test_lifecycle_outcome(&mut self, record: RecordRef, field: &str) {
+        self.issue(Action::Finished {
+            record,
+            field: field.into(),
+        });
+    }
+    pub fn test_scope(&mut self, population: ScopePopulation) {
+        self.issue(Action::Scope { population });
+    }
+    pub fn test_trial(&mut self, input: SemanticInput) {
+        self.issue(Action::Trial { input });
+    }
+    pub fn test_decide(&mut self, outcome: DecisionOutcome) {
+        self.issue(Action::Decide { outcome });
+    }
+    pub fn test_resume_choice(&mut self, decision: &str) {
+        self.issue(Action::ResumeChoice {
+            decision: decision.into(),
+        });
+    }
+    pub fn test_can_accept(&self) -> bool {
+        matches!(&self.page,Page::Change(v) if v.can_accept)
+    }
+    pub fn test_alternative(&self) -> Option<&RuntimeView> {
+        if let Page::Change(v) = &self.page {
+            v.alternative.as_ref()
+        } else {
+            None
         }
     }
     pub fn test_notice(&self) -> &str {
@@ -926,6 +1351,7 @@ pub fn test_stage_provider(
         wire_request: wire.digest().unwrap(),
         wire_source: wire.source_digest,
         issued: true,
+        modify: None,
     });
     journal.write(value).unwrap();
 }
@@ -943,4 +1369,20 @@ pub fn test_stage_unstarted_creation(root: &Path, path: &Path, capture: &Capture
     let mut value = journal.value.clone();
     value.pending = Some(Interrupted::Create { tool });
     journal.write(value).unwrap();
+}
+
+#[cfg(test)]
+pub fn test_scope_request(
+    snapshot: &ProjectSnapshot,
+    candidate: &CapturedProgram,
+    population: ScopePopulation,
+    lifecycles: Vec<LifecycleBinding>,
+) -> Result<crate::product_store::scope::ScopeRequest, String> {
+    change_adapter::request(
+        snapshot,
+        candidate,
+        population,
+        lifecycles,
+        std::collections::BTreeSet::new(),
+    )
 }
