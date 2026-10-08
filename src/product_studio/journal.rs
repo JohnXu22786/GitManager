@@ -2,7 +2,6 @@
 use super::*;
 use crate::product_locations::Folder;
 use serde::{Deserialize, Serialize};
-use std::fs::File;
 // Complete inherited Modify context must fit the existing strict 1 MiB local
 // JSON intake. Old journals retain the same format, digests and read path.
 const JOURNAL_LIMIT: usize = MAX_WIRE_BYTES;
@@ -219,7 +218,7 @@ impl Journal {
 pub(super) struct JournalFile {
     folder: Folder,
     // One generated-tool host writer per profile. Release happens on the worker.
-    _lock: File,
+    _lock: crate::product_locations::WriteLock,
     pub value: Journal,
 }
 impl JournalFile {
