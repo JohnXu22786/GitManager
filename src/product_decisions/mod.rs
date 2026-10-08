@@ -114,7 +114,7 @@ impl CheckReport {
 /// Kept opaque: only this host can prepare it, and commit repeats the checks.
 pub struct VerifiedChange {
     scoped: Option<PreparedScopedChange>,
-    rehearsal: Option<(PreparedScopedChange, Vec<Id>)>,
+    rehearsal: Option<(Vec<PreparedScopedChange>, Vec<Id>)>,
     correspondences: BTreeMap<Digest, ScopeCorrespondence>,
     prepared: PreparedAdoption,
     revision: u64,
@@ -140,7 +140,7 @@ impl VerifiedChange {
 struct AdmissionKey {
     current: ProjectSnapshot,
     prepared: Option<PreparedScopedChange>,
-    rehearsal: Option<(PreparedScopedChange, Vec<Id>)>,
+    rehearsal: Option<(Vec<PreparedScopedChange>, Vec<Id>)>,
     correspondences: BTreeMap<Digest, ScopeCorrespondence>,
     runtime: RuntimeCapabilities,
     driver: &'static str,
@@ -154,7 +154,7 @@ pub struct DecisionEngine<R: RuntimeAdapter> {
     archive: IntentArchive,
     limits: RuntimeLimits,
     pending_scope: RefCell<Option<PreparedScopedChange>>,
-    pending_rehearsal: RefCell<Option<(PreparedScopedChange, Vec<Id>)>>,
+    pending_rehearsal: RefCell<Option<(Vec<PreparedScopedChange>, Vec<Id>)>>,
     pending_correspondences: RefCell<BTreeMap<Digest, ScopeCorrespondence>>,
     // One immutable admission result; every lookup still freshly loads and
     // verifies CURRENT and its complete on-disk snapshot before comparing keys.
@@ -241,7 +241,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             }
             ScopedExecutionContext::prepared(&key.current, prepared)?
         } else if let Some((prepared, _)) = &key.rehearsal {
-            ScopedExecutionContext::rehearsed(&key.current, prepared)?
+            ScopedExecutionContext::rehearsals(&key.current, prepared)?
         } else {
             ScopedExecutionContext::committed(&key.current)?
         };
@@ -438,13 +438,20 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
     }
     fn with_rehearsal<T>(
         &self,
-        rehearsal: Option<(PreparedScopedChange, Vec<Id>)>,
+        rehearsal: Option<(Vec<PreparedScopedChange>, Vec<Id>)>,
         f: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
-        let proofs = rehearsal
-            .as_ref()
-            .map(|(p, _)| p.correspondences.clone())
-            .unwrap_or_else(|| self.pending_correspondences.borrow().clone());
+        let mut proofs = self.pending_correspondences.borrow().clone();
+        if let Some((prepared, _)) = &rehearsal {
+            for p in prepared {
+                for (id, proof) in &p.correspondences {
+                    if proofs.get(id).is_some_and(|prior| prior != proof) {
+                        return Err(invalid("conflicting rehearsal correspondence"));
+                    }
+                    proofs.insert(id.clone(), proof.clone());
+                }
+            }
+        }
         let old = self.pending_rehearsal.replace(rehearsal);
         let result = self.with_correspondences(proofs, f);
         self.pending_rehearsal.replace(old);
@@ -484,7 +491,80 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             return Err(invalid("retained nonbinary rehearsal needs both exact experienced source-qualified alternatives"));
         }
         let recorded = vec![choice.id.clone()];
-        self.with_rehearsal(Some((prepared, recorded)), || {
+        self.with_rehearsal(Some((vec![prepared], recorded)), || {
+            self.prepare_choice_resolving(store, current.program()?, choice, scenes, resolves, id)
+        })
+    }
+    /// Experience two prospective managed designs without installing either.
+    /// The shared scene uses one authenticated current business seed. Runtime
+    /// start independently performs each target's checked additive schema merge.
+    pub fn accept_paired_scoped_scenes(
+        &self,
+        store: &ProductStore,
+        first: &PreparedScopedChange,
+        second: &PreparedScopedChange,
+        scenario: &ScenarioSpec,
+        disclosure: Disclosure,
+    ) -> Result<[AcceptedScene; 2]> {
+        let current = store.load()?;
+        let context = ScopedExecutionContext::rehearsed_pair(&current, first, second)?;
+        if scenario.seed != current.data || scenario.clock_day != current.clock_day {
+            return Err(invalid(
+                "paired experience needs the exact frozen business seed and day",
+            ));
+        }
+        for target in [first.target(), second.target()] {
+            scenario.validate(&target.program)?;
+            context.verify_seed(target, &scenario.seed, scenario.clock_day)?;
+        }
+        self.with_rehearsal(Some((vec![first.clone(), second.clone()], vec![])), || {
+            Ok([
+                self.capture_admitted_scene(
+                    first.target(),
+                    scenario,
+                    disclosure,
+                    self.limits.clone(),
+                )?
+                .0,
+                self.capture_admitted_scene(
+                    second.target(),
+                    scenario,
+                    disclosure,
+                    self.limits.clone(),
+                )?
+                .0,
+            ])
+        })
+    }
+    pub fn prepare_paired_rehearsed_choice(
+        &self,
+        store: &ProductStore,
+        first: PreparedScopedChange,
+        second: PreparedScopedChange,
+        choice: Choice,
+        scenes: Vec<AcceptedScene>,
+        resolves: &[Id],
+        id: &str,
+    ) -> Result<VerifiedChange> {
+        let current = store.load()?;
+        ScopedExecutionContext::rehearsed_pair(&current, &first, &second)?;
+        if !matches!(
+            choice.outcome,
+            DecisionOutcome::EitherAcceptable
+                | DecisionOutcome::BothNeeded
+                | DecisionOutcome::NeitherFits
+                | DecisionOutcome::Deferred
+        ) || scenes.len() != 2
+            || scenes[0].program != *first.target()
+            || scenes[1].program != *second.target()
+            || scenes[0].scenario != scenes[1].scenario
+            || scenes[0].scenario.seed != current.data
+            || scenes[0].scenario.clock_day != current.clock_day
+        {
+            return Err(invalid("paired nonbinary choice needs both exact prospective outcomes on the same frozen input"));
+        }
+        let recorded = vec![choice.id.clone()];
+        self.with_rehearsal(Some((vec![first, second], recorded)), || {
             self.prepare_choice_resolving(store, current.program()?, choice, scenes, resolves, id)
         })
     }
@@ -1388,7 +1468,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         mappings.retain(|m| !m.mappings.is_empty() || !m.scenarios.is_empty());
         let compatibility =
             LocalRuntime::default().compatibility_at(target, &current.data, current.clock_day)?;
-        let plan = AdoptionPlan {
+        let mut plan = AdoptionPlan {
             version: CONTRACT_VERSION,
             id: id.into(),
             project_id: current.data.project_id.clone(),
@@ -1430,6 +1510,13 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             .collect::<std::result::Result<_, _>>()?,
             retire_decisions: retire,
         };
+        if let Some((proofs, ids)) = self.pending_rehearsal.borrow().as_ref() {
+            if let Some(evidence) =
+                crate::product_store::scope::pair_recording_evidence(proofs, ids)?
+            {
+                plan.evidence.extend(evidence);
+            }
+        }
         validate_withdrawal_delta(current, &next, &plan)?;
         self.verify_destination_packages(store, current, &next, &plan)?;
         let prepared = store.prepare_adoption(plan, target)?;
@@ -1518,7 +1605,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                             verify,
                         )?
                     } else if let Some((proof, ids)) = &change.rehearsal {
-                        store.adopt_rehearsal_verified(
+                        store.adopt_rehearsals_verified(
                             change.revision,
                             &change.prepared,
                             &change.target,

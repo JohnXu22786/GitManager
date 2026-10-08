@@ -1,6 +1,7 @@
 //! Source-bound hypotheses become questions only after independent execution.
 //! This module cannot adopt programs or mutate a daily-work store.
 mod history;
+mod prepared;
 mod provider;
 mod source;
 use crate::product_contract::*;
@@ -9,6 +10,7 @@ use crate::product_runtime::LocalRuntime;
 use crate::product_scenarios::*;
 use history::RetainedRun;
 pub use history::VerifiedRetainedHistory;
+pub use prepared::PreparedDiscoveryCandidate;
 pub use provider::*;
 pub use source::{analyze_delta, SourceDelta};
 use std::{
@@ -103,6 +105,8 @@ pub struct ChoiceQuestion {
 }
 #[derive(Clone, Debug)]
 pub struct DiscoveryReport {
+    /// Exact original development results and their checked host lowering links.
+    pub lowerings: Vec<PreparedDiscoveryCandidate>,
     pub coverage: Vec<String>,
     pub delta: SourceDelta,
     pub questions: Vec<ChoiceQuestion>,
@@ -201,6 +205,105 @@ fn checked_scene(
         }
     }
     checked
+}
+
+/// Identify only a type-level absence of an independently required new
+/// action and its added session state. The projected value is used solely to
+/// classify the validation error; it is never executed or called current proof.
+fn required_feature_absence(
+    before: &CapturedProgram,
+    candidate: &CapturedProgram,
+    scene: &ScenarioSpec,
+    policy: &DiscoveryPolicy,
+) -> Option<AdapterError> {
+    let error = scene.validate(&before.program).err()?;
+    scene.validate(&candidate.program).ok()?;
+    let missing: BTreeSet<_> = policy
+        .required_actions
+        .iter()
+        .filter(|id| {
+            !before
+                .program
+                .actions
+                .iter()
+                .any(|action| &action.id == *id)
+                && candidate
+                    .program
+                    .actions
+                    .iter()
+                    .any(|action| &action.id == *id)
+        })
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    let mut projected = scene.clone();
+    let mut removed = false;
+    projected.inputs.retain(|input| {
+        let absent =
+            matches!(input, SemanticInput::Invoke { action, .. } if missing.contains(action));
+        removed |= absent;
+        !absent
+    });
+    if !removed {
+        return None;
+    }
+    projected
+        .session
+        .values
+        .retain(|id, _| before.program.state.iter().any(|state| &state.id == id));
+    // Reject any other invalid view, input, argument, field or session value.
+    projected.validate(&before.program).ok()?;
+    Some(AdapterError::Invalid(error))
+}
+
+/// Declared output channels can be absent in a real new-feature scene. This
+/// applies only to two complete, exact prospective runs with an actual matching
+/// observation and no artifact of that output on either side. Missing points,
+/// missing columns in an emitted artifact and failed/partial runs stay unknown.
+fn completed_output_absence(
+    comparison: &ComparisonReport,
+    before: &CapturedProgram,
+    after: &CapturedProgram,
+    scene: &ScenarioSpec,
+    target: &ObservationTarget,
+) -> bool {
+    let (point, output) = match target {
+        ObservationTarget::OutputCount { point, output }
+        | ObservationTarget::OutputColumn { point, output, .. } => (point, output),
+        _ => return false,
+    };
+    if comparison.state != EvidenceState::Inconclusive
+        || comparison.witness.is_some()
+        || comparison.runs.len() != 2
+    {
+        return false;
+    }
+    comparison
+        .runs
+        .iter()
+        .zip([(before, "before-run"), (after, "after-run")])
+        .all(|(run, (source, id))| {
+            run.id == id
+                && run.state == EvidenceState::Observed
+                && run.errors.is_empty()
+                && run.uncovered.is_empty()
+                && run.validate().is_ok()
+                && run.binding.source == source.binding
+                && run.binding.artifact == source.artifact
+                && scene.identity().ok().as_ref() == Some(&run.binding.scenario_digest)
+                && scene.input_identity().ok().as_ref() == Some(&run.binding.input_digest)
+                && run
+                    .observations
+                    .iter()
+                    .find(|observation| &observation.point == point)
+                    .is_some_and(|observation| {
+                        !observation
+                            .outputs
+                            .iter()
+                            .any(|artifact| &artifact.output == output)
+                    })
+        })
 }
 
 struct ReplayBudget {
@@ -625,8 +728,15 @@ pub fn discover(
     if before.program.id != candidate.program.id {
         return Err(invalid("source revision changes the application identity"));
     }
+    let lowerings = policy
+        .retained_history
+        .as_ref()
+        .map(|history| history.result_lowerings(request, result))
+        .transpose()?
+        .unwrap_or_default();
     let delta = analyze_delta(before, candidate)?;
     let mut report = DiscoveryReport {
+        lowerings,
         coverage: vec!["Finite source-guided hypotheses and executed scenarios; untested behavior is not proven equivalent".into()],
         delta,
         questions: vec![],
@@ -935,7 +1045,13 @@ pub fn discover(
     }
     let mut candidates = BTreeMap::new();
     for c in &result.response.candidates {
-        let captured = if let Some(source) = request
+        let captured = if let Some(lowering) = report
+            .lowerings
+            .iter()
+            .find(|link| link.candidate_id() == c.id)
+        {
+            lowering.target().clone()
+        } else if let Some(source) = request
             .sources
             .iter()
             .find(|source| source.source_bytes == c.source_json.as_bytes())
@@ -1148,12 +1264,20 @@ pub fn discover(
                     material_unknowns.insert((before.binding.identity()?, candidate.binding.identity()?, scene_equivalence_key(&scene)?), format!("Captured source executions differ in material channels without executable property terms: {}", channels.join(", ")));
                 }
             }
-            for result in [baseline_run, candidate_run] {
+            let expected_absence = if new_feature && current_ran {
+                required_feature_absence(before, candidate, &scene, policy)
+            } else {
+                None
+            };
+            for (side, result) in [baseline_run, candidate_run].into_iter().enumerate() {
                 match result {
                     Ok(run) => report.runs.push(run),
-                    Err(e) => report
+                    Err(error) if side == 0 && expected_absence.as_ref() == Some(&error) => {
+                        report.coverage.push("Current cannot execute this independently required new action/state; compare the two verified prospective implementations. No current-side experience is claimed".into());
+                    }
+                    Err(error) => report
                         .unverified
-                        .push(format!("Captured-source replay unavailable: {e:?}")),
+                        .push(format!("Captured-source replay unavailable: {error:?}")),
                 }
             }
             if unchanged {
@@ -1420,7 +1544,7 @@ pub fn discover(
                             candidate,
                             &scene,
                             &request.decisions,
-                            target,
+                            target.clone(),
                             hypothesis_search.clone(),
                         )?;
                         if !channels_checked {
@@ -1465,6 +1589,24 @@ pub fn discover(
                                     material_unknowns.insert((alternative.binding.identity()?, candidate.binding.identity()?, scene_equivalence_key(&scene)?), format!("Alternative {id} executions differ in material channels without executable property terms: {}", channels.join(", ")));
                                 }
                             }
+                        }
+                        if *new_feature
+                            && completed_output_absence(
+                                &comparison,
+                                alternative,
+                                candidate,
+                                &scene,
+                                &target,
+                            )
+                        {
+                            let output = match &target {
+                                ObservationTarget::OutputCount { output, .. }
+                                | ObservationTarget::OutputColumn { output, .. } => output,
+                                _ => unreachable!("checked output target"),
+                            };
+                            report.coverage.push(format!("Output {output} was absent on both completed prospective runs at {}; no output-value comparison or witness is claimed", target.point()));
+                            report.runs.extend(comparison.runs);
+                            continue;
                         }
                         entry.state = comparison.state;
                         if !matches!(

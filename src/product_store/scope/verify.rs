@@ -18,6 +18,7 @@ fn decision_births(snapshot: &ProjectSnapshot) -> Result<BTreeMap<u64, DecisionB
     let mut graph_identity = graph.identity()?;
     let mut births = BTreeMap::new();
     for adoption in snapshot.adoptions.iter().rev() {
+        rehearsal::verify_recording_request(snapshot, adoption, &graph)?;
         let required: BTreeSet<_> = graph
             .decisions
             .iter()
@@ -226,17 +227,37 @@ fn adoption_history(snapshot: &ProjectSnapshot) -> Result<AdoptionHistory<'_>> {
         }
         active = linked.active.clone();
     }
-    let mut rehearsal_operations = BTreeSet::new();
+    let mut rehearsal_operations: BTreeMap<&Id, Vec<&ManagedRehearsal>> = BTreeMap::new();
     for proof in state.rehearsals.values() {
+        rehearsal_operations
+            .entry(&proof.recorded_by)
+            .or_default()
+            .push(proof);
         let witnesses = proof.witnesses.keys().cloned().collect();
-        if !rehearsal_operations.insert(&proof.recorded_by)
-            || births
-                .get(&proof.recorded_revision)
-                .map(|born| &born.pending)
-                != Some(&witnesses)
+        if births
+            .get(&proof.recorded_revision)
+            .map(|born| &born.pending)
+            != Some(&witnesses)
         {
             return Err(error(
                 "rehearsal witnesses differ from their exact recording decision births",
+            ));
+        }
+    }
+    for proofs in rehearsal_operations.values() {
+        if proofs.len() > 2
+            || (proofs.len() == 2
+                && proofs.iter().any(|proof| {
+                    proof.manifest.transition != ScopeTransition::Evolution
+                        || proof.manifest.basis != proofs[0].manifest.basis
+                        || proof.manifest.layers != proofs[0].manifest.layers
+                        || proof.manifest.active != proofs[0].manifest.active
+                        || proof.witnesses != proofs[0].witnesses
+                        || proof.recorded_revision != proofs[0].recorded_revision
+                }))
+        {
+            return Err(error(
+                "paired rehearsal has ambiguous recording or preservation authority",
             ));
         }
     }
