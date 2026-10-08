@@ -267,7 +267,7 @@ impl Folder {
         self.directory.publish(name, bytes, replace)?;
         self.check()
     }
-    fn lock(&self) -> Result<fs::File> {
+    pub(crate) fn lock(&self) -> Result<fs::File> {
         self.check()?;
         Ok(self.directory.lock()?)
     }
