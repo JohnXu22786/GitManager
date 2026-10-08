@@ -42,8 +42,10 @@ impl VerifiedDiscoveryScene {
 }
 impl<R: RuntimeAdapter> DecisionEngine<R> {
     /// Project applicable pending history onto the current executable through
-    /// its retained source-qualified mappings. No archive decoding escapes this
-    /// boundary and no pending preference becomes an active obligation.
+    /// its retained source-qualified mappings. Exact prospective-pair scenes
+    /// whose new operations are absent from current keep their original replay
+    /// source until a fresh target can execute them. No archive decoding escapes
+    /// this boundary and no pending preference becomes an active obligation.
     pub fn discovery_scenes(
         &self,
         current: &ProjectSnapshot,
@@ -80,6 +82,41 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                         ))
                     }
                     ScopeMatch::Applies => {}
+                }
+                // A retained two-prospective design may introduce an action
+                // absent from live current. Preserve its actual replay source;
+                // it is not an observation of current or an equivalence claim.
+                // The archive has already checked this exact scene package
+                // against both immutable proofs and their shared recording.
+                let paired: Vec<_> = current
+                    .scope
+                    .rehearsals
+                    .values()
+                    .filter(|proof| proof.witnesses.get(&decision.id) == Some(&decision.witness))
+                    .collect();
+                if paired.len() == 2
+                    && paired[0].recorded_by == paired[1].recorded_by
+                    && paired[0].manifest.basis == paired[1].manifest.basis
+                    && scene.scenario.validate(&target.program).is_err()
+                {
+                    let operations = contexts
+                        .iter()
+                        .filter(|context| {
+                            scope_match(&decision.scope, context).state == ScopeMatch::Applies
+                        })
+                        .map(|context| context.operation.clone())
+                        .collect();
+                    result.push(VerifiedDiscoveryScene {
+                        decision: decision.id.clone(),
+                        package: decision.witness.clone(),
+                        original: original.clone(),
+                        scenario: scene.scenario.clone(),
+                        mapped: scene.scenario,
+                        replay: original,
+                        mappings: vec![],
+                        operations,
+                    });
+                    continue;
                 }
                 let candidates: Vec<_> = mappings
                     .iter()

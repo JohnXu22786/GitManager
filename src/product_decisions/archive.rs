@@ -134,24 +134,61 @@ pub(super) fn validate_rehearsal_scenes(
         .iter()
         .map(|scene| scene.scenario.identity())
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut recordings: BTreeMap<&Id, Vec<_>> = BTreeMap::new();
     for proof in proofs {
-        let baseline = sources
-            .get(&proof.manifest.basis.active)
-            .ok_or_else(|| invalid("rehearsal baseline capture is missing"))?;
-        let prospective = sources
-            .get(&proof.manifest.output)
-            .ok_or_else(|| invalid("rehearsal prospective capture is missing"))?;
-        if !scenes.iter().any(|scene| &scene.program == *baseline)
-            || !scenes.iter().any(|scene| &scene.program == *prospective)
+        recordings
+            .entry(&proof.recorded_by)
+            .or_default()
+            .push(proof);
+    }
+    for proofs in recordings.values() {
+        let first = proofs[0];
+        let expected: Vec<_> = match proofs.as_slice() {
+            [single] => vec![&single.manifest.basis.active, &single.manifest.output],
+            [a, b]
+                if a.manifest.basis == b.manifest.basis
+                    && a.witnesses == b.witnesses
+                    && a.recorded_revision == b.recorded_revision =>
+            {
+                vec![&a.manifest.output, &b.manifest.output]
+            }
+            _ => {
+                return Err(invalid(
+                    "rehearsal package has an ambiguous recording inventory",
+                ))
+            }
+        };
+        let expected: Vec<_> = expected
+            .into_iter()
+            .map(|id| {
+                sources
+                    .get(id)
+                    .copied()
+                    .ok_or_else(|| invalid("rehearsal experienced capture is missing"))
+            })
+            .collect::<Result<_>>()?;
+        if expected
+            .iter()
+            .any(|source| !scenes.iter().any(|scene| &scene.program == *source))
             || scenes
                 .iter()
-                .any(|scene| &scene.program != *baseline && &scene.program != *prospective)
+                .any(|scene| !expected.contains(&&scene.program))
         {
             return Err(invalid(
                 "rehearsal witness differs from its exact experienced source pair",
             ));
         }
-        for (id, digest) in &proof.witnesses {
+        if proofs.len() == 2
+            && (scenes.len() != 2
+                || scenes[0].scenario != scenes[1].scenario
+                || scenes[0].scenario.seed != first.manifest.basis.data
+                || scenes[0].scenario.clock_day != first.manifest.basis.day)
+        {
+            return Err(invalid(
+                "paired rehearsal witness changed its shared frozen business input",
+            ));
+        }
+        for (id, digest) in &first.witnesses {
             if digest != witness {
                 continue;
             }

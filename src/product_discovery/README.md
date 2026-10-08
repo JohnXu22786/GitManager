@@ -243,3 +243,21 @@ refuses absent discriminators whenever host resolution is ambiguous. Absent
 legacy fields remain omitted. Proposed retirement only names listed needs with
 known Active or Pending status; proposal validation does not activate pending
 predicates, retire decisions, or authorize adoption.
+
+## Checked authored alternatives for managed tools
+
+`PreparedDiscoveryCandidate::from_result` binds the exact discovery request,
+actual development result, selected candidate ID and freshly regenerated scoped
+preparation. The returned candidate bytes are captured with the result's own
+producer and project, and must equal `prepared.candidate()`. Register the opaque
+link with `VerifiedRetainedHistory::map_prepared_result` before discovery.
+
+Discovery executes the independently generated `prepared.target()` for these
+alternatives. `DiscoveryReport::lowerings` retains the actual result and both
+captures, so callers can show the explicit authored-to-host-compiled link.
+Source locations continue to identify the original request source bytes; they
+are never rewritten into pointers into compiled output. Registration is bound to
+the complete result and request, not only a candidate label. Freshness, retained
+intentions, independent feature requirements and ordinary search/minimization
+checks still apply. This local consistency boundary adds no cryptographic
+provider or user-approval authority.
