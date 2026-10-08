@@ -80,6 +80,18 @@ pub(crate) fn read(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
     }
     Ok(bytes)
 }
+/// Only the saved typed request uses this larger, derived local envelope cap.
+/// Duplicate members, nesting, trailing input and the typed byte bounds remain
+/// independently enforced before a subprocess or retained result can be used.
+pub(crate) fn request(path: &Path) -> Result<ProviderRequest, String> {
+    let bytes = read(path, MAX_SERIALIZED_REQUEST_BYTES)?;
+    let value = input::parse_json_bytes_with_limit(&bytes, MAX_SERIALIZED_REQUEST_BYTES)
+        .map_err(|e| e.to_string())?;
+    let request: ProviderRequest = serde_json::from_value(value).map_err(|e| e.to_string())?;
+    request.validate()?;
+    Ok(request)
+}
+
 pub(crate) fn json<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
     let bytes = read(path, MAX_RESULT_BYTES)?;
     let value = input::parse_json_bytes(&bytes).map_err(|e| e.to_string())?;

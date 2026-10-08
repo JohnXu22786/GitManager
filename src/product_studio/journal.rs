@@ -3,7 +3,9 @@ use super::*;
 use crate::product_locations::Folder;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-const JOURNAL_LIMIT: usize = 256 * 1024;
+// Complete inherited Modify context must fit the existing strict 1 MiB local
+// JSON intake. Old journals retain the same format, digests and read path.
+const JOURNAL_LIMIT: usize = MAX_WIRE_BYTES;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

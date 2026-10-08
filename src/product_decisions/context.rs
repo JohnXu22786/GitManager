@@ -374,15 +374,25 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         }
         if let Some(editable) = current.editable_scope_context()? {
             let editing = request.operation != DevelopmentOperation::Discover;
-            if editing && !request.sources.iter().any(|p| p == &editable.editable) {
-                request.sources.push(editable.editable.clone());
+            // A whole-population composition can already be ordinary source.
+            // Keep the artifact-deduplicated current capture and its real local
+            // producer; the editing guide must name that supplied capture.
+            let editable_source = if editable.editable.program == current.program()?.program
+                && editable.editable.source_bytes == current.program()?.source_bytes
+            {
+                current.program()?
+            } else {
+                &editable.editable
+            };
+            if editing && !request.sources.iter().any(|p| p == editable_source) {
+                request.sources.push(editable_source.clone());
             }
             // Discover's extra sources must remain accepted-scene artifacts.
             // It receives the slot index, while modification/reconciliation
             // also carries the honest ordinary capture as an actual source.
             let index = serde_json::json!({
                 "compiled_source": editable.compiled_source,
-                "editable_source": if editing { Some(canonical_digest(IdentityDomain::Source, &editable.editable)?) } else { None },
+                "editable_source": if editing { Some(canonical_digest(IdentityDomain::Source, editable_source)?) } else { None },
                 "slots": editable.slots,
             });
             request.request.push_str(&format!(

@@ -273,7 +273,7 @@ impl ProviderTransport {
         {
             return Err("exact current disclosure has not been authorized".into());
         }
-        let request: ProviderRequest = storage::json(&directory.join("request.json"))?;
+        let request = storage::request(&directory.join("request.json"))?;
         if request.digest()? != receipt.request_digest
             || request.provider != self.endpoint.kind
             || receipt.provenance
@@ -289,7 +289,7 @@ impl ProviderTransport {
             return Err("provider environment changed".into());
         }
         let (expected_stdin, expected_schema) = adapter::wire(&request, &receipt.disclosure.nonce)?;
-        let stdin = storage::read(&directory.join("stdin.json"), MAX_RESULT_BYTES)?;
+        let stdin = storage::read(&directory.join("stdin.json"), MAX_STDIN_BYTES)?;
         let schema = storage::read(&directory.join("schema.json"), MAX_RESULT_BYTES)?;
         if stdin != expected_stdin
             || schema != expected_schema
@@ -504,7 +504,7 @@ impl ProviderTransport {
         {
             return Err("completion lacks matching terminal provenance".into());
         }
-        let request: ProviderRequest = storage::json(&directory.join("request.json"))?;
+        let request = storage::request(&directory.join("request.json"))?;
         if request.digest()? != expected_request {
             return Err("saved request was modified".into());
         }

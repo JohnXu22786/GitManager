@@ -23,7 +23,9 @@ use crate::product_provider::{
     CapabilityProfile, ConsentReceipt, DataDisclosure, JobState, ProviderKind, ProviderTransport,
 };
 use crate::product_runtime::{LocalRuntime, ProductRun};
-use crate::product_store::scope::{LifecycleBinding, ScopePopulation};
+#[cfg(test)]
+use crate::product_store::scope::LifecycleBinding;
+use crate::product_store::scope::ScopePopulation;
 use crate::product_store::{ProductStore, ProjectSnapshot, UpgradeProgress, UpgradeSummary};
 use crate::ui::product_runtime_view::{take_shortcuts, ProductRuntimeView, WidgetTrace};
 use change::{ChangeDraft, ChangeView};

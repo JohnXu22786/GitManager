@@ -894,7 +894,24 @@ fn managed_modify_inherits_exact_intent_and_benign_edit_adds_no_question() {
         .iter()
         .all(|e| e.disclosure == Disclosure::ExplicitlySelected));
     let editable = first.editable_scope_context().unwrap().unwrap();
-    assert!(request.sources.contains(&editable.editable));
+    let line = request
+        .request
+        .lines()
+        .find(|s| s.starts_with("Host-verified editing guide:"))
+        .unwrap();
+    let guide: serde_json::Value = serde_json::from_str(&line[line.find('{').unwrap()..]).unwrap();
+    let supplied = request
+        .sources
+        .iter()
+        .find(|source| {
+            serde_json::to_value(canonical_digest(IdentityDomain::Source, *source).unwrap())
+                .unwrap()
+                == guide["editable_source"]
+        })
+        .unwrap();
+    assert_eq!(supplied.program, editable.editable.program);
+    assert_eq!(supplied.source_bytes, editable.editable.source_bytes);
+    assert_eq!(supplied, first.program().unwrap());
     assert_eq!(request.decisions, first.decisions);
     studio.test_consent();
     settle(&mut studio);
@@ -1438,5 +1455,299 @@ fn new_scope_offers_only_affected_entities_after_an_earlier_managed_layer() {
             entity: supply.entity,
             record: supply.id
         }]
+    );
+}
+
+#[test]
+fn managed_editing_guide_names_the_actual_supplied_capture_and_measures_envelopes() {
+    for row_layer in [false, true] {
+        let dir = tempdir();
+        let path = dir.path().join("tool");
+        let (before, candidate) = if row_layer {
+            (program(false), program(true))
+        } else {
+            let original = other_shape::capture(other_shape::organizer());
+            let mut changed = other_shape::organizer();
+            changed["actions"][2]["steps"][0]["items"] = other_shape::query("person");
+            (original, other_shape::capture(changed))
+        };
+        let store = ProductStore::create(&path, &before, 20000).unwrap();
+        let basis = store.load().unwrap();
+        let req = product_studio::test_scope_request(
+            &basis,
+            &candidate,
+            ScopePopulation::All,
+            if row_layer {
+                vec![lifecycle(&basis)]
+            } else {
+                vec![]
+            },
+        )
+        .unwrap();
+        let prepared = store
+            .prepare_scoped_change(&candidate, &req, "layer")
+            .unwrap();
+        store.adopt_scoped(basis.revision, &prepared).unwrap();
+        let current = store.load().unwrap();
+        let editable = current.editable_scope_context().unwrap().unwrap();
+        let request = product_decisions::DecisionEngine::new(
+            product_runtime::LocalRuntime::default(),
+            product_decisions::IntentArchive::new(store.clone()),
+        )
+        .development_request(
+            &current,
+            "measure",
+            DevelopmentOperation::Modify,
+            "Change the title",
+            DevelopmentContext {
+                view: Some(current.session.view.clone()),
+                selected: vec![],
+                recent_inputs: vec![],
+                data_digest: Some(current.data.identity().unwrap()),
+                session_digest: Some(current.session.identity().unwrap()),
+            },
+        )
+        .unwrap();
+        let line = request
+            .request
+            .lines()
+            .find(|s| s.starts_with("Host-verified editing guide:"))
+            .unwrap();
+        let guide: serde_json::Value =
+            serde_json::from_str(&line[line.find('{').unwrap()..]).unwrap();
+        let actual = request.sources.iter().find(|s| {
+            serde_json::to_value(canonical_digest(IdentityDomain::Source, *s).unwrap()).unwrap()
+                == guide["editable_source"]
+        });
+        assert!(
+            actual.is_some(),
+            "editable guide points outside actual sources"
+        );
+        let actual = actual.unwrap();
+        assert_eq!(actual.program, editable.editable.program);
+        assert_eq!(actual.source_bytes, editable.editable.source_bytes);
+        assert_eq!(request.sources.last(), Some(current.program().unwrap()));
+        if row_layer {
+            assert_eq!(actual, &editable.editable);
+        } else {
+            assert_eq!(actual, current.program().unwrap());
+        }
+        eprintln!("MEASURE row_layer={row_layer} request_bytes={} current_capture_bytes={} editable_capture_bytes={} current_source_bytes={} source_count={} schema_bytes={}",canonical_bytes(&request).unwrap().len(),canonical_bytes(current.program().unwrap()).unwrap().len(),canonical_bytes(&editable.editable).unwrap().len(),current.program().unwrap().source_bytes.len(),request.sources.len(),APP_SCHEMA.len());
+    }
+}
+
+#[cfg(unix)]
+fn bounded_transport(
+    root: &Path,
+    kind: product_provider::ProviderKind,
+) -> product_provider::ProviderTransport {
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = product_provider::fixture_executable_write_guard();
+    let executable = root.join("bounded-fixture.py");
+    fs::write(
+        &executable,
+        include_str!("fixtures/provider_transport/fake_cli.py").replace(
+            "{'passed': True, 'text': wire['prompt'], 'command': 'untrusted-do-not-execute'}",
+            "{'received': len(wire['prompt'])}",
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        executable.with_extension("json"),
+        serde_json::to_vec(&serde_json::json!({"provider":kind,"mode":"good"})).unwrap(),
+    )
+    .unwrap();
+    let home = root.join("fixture-home");
+    fs::create_dir(&home).unwrap();
+    product_provider::ProviderTransport::new_fixture(root.join("jobs"), kind, executable, home)
+        .unwrap()
+}
+#[cfg(unix)]
+fn bounded_request(
+    id: &str,
+    kind: product_provider::ProviderKind,
+    prompt: Vec<u8>,
+) -> product_provider::ProviderRequest {
+    product_provider::ProviderRequest {
+        request_id: id.into(),
+        provider: kind,
+        source_digest: product_provider::digest(b"synthetic bounded input"),
+        prompt,
+        schema: br#"{"type":"object","additionalProperties":true}"#.to_vec(),
+        purpose: "Synthetic request-boundary regression".into(),
+        data_categories: vec!["Synthetic bytes only".into()],
+        profile: product_provider::CapabilityProfile::DataOnly,
+        limits: product_provider::JobLimits::default(),
+    }
+}
+#[cfg(unix)]
+fn bounded_consent(prepared: &product_provider::PreparedJob) -> product_provider::ConsentReceipt {
+    product_provider::ConsentReceipt {
+        disclosure_digest: prepared.disclosure.digest(),
+        approval_reference: "synthetic-fixture-only".into(),
+        expires_at_unix_ms: product_provider::unix_ms() + 120_000,
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn provider_request_bound_roundtrips_near_limit_and_legacy_bytes_without_digest_changes() {
+    use product_provider::*;
+    for kind in [ProviderKind::Codex, ProviderKind::Claude] {
+        let dir = tempdir();
+        let root = dir.path();
+        let transport = bounded_transport(root, kind);
+        for (name, prompt) in [
+            ("legacy", b"Exact old UTF-8 request".to_vec()),
+            ("near-limit", vec![0; 1024 * 1024]),
+            ("serialized-limit", vec![127; 1024 * 1024]),
+        ] {
+            let mut request = bounded_request(name, kind, prompt);
+            if name != "legacy" {
+                request.schema.resize(MAX_SCHEMA_BYTES, b' ');
+                request.purpose = "\0".repeat(1024);
+                request.data_categories = vec!["\0".repeat(256); 32];
+            }
+            assert!(request.validate().is_ok());
+            let expected = request.digest().unwrap();
+            let prepared = transport.prepare(request.clone()).unwrap();
+            let job_dir = root.join("jobs").join(name);
+            let stored = fs::read(job_dir.join("request.json")).unwrap();
+            assert!(stored.len() <= MAX_SERIALIZED_REQUEST_BYTES);
+            let decoded: ProviderRequest = serde_json::from_slice(&stored).unwrap();
+            assert_eq!(decoded, request);
+            assert_eq!(decoded.digest().unwrap(), expected);
+            assert_eq!(prepared.disclosure.request_digest, expected);
+            assert_eq!(prepared.disclosure.prompt_digest, digest(&request.prompt));
+            let stdin = fs::read(job_dir.join("stdin.json")).unwrap();
+            assert!(stdin.len() <= MAX_STDIN_BYTES);
+            let wire: serde_json::Value = serde_json::from_slice(&stdin).unwrap();
+            assert_eq!(wire["prompt"].as_str().unwrap().as_bytes(), request.prompt);
+            assert_eq!(prepared.disclosure.stdin_digest, digest(&stdin));
+            if name == "near-limit" {
+                assert!(stdin.len() > 6 * MAX_PROMPT_BYTES);
+            }
+            if name == "serialized-limit" {
+                assert!(stored.len() > MAX_SERIALIZED_REQUEST_BYTES - 64 * 1024);
+            }
+            if name != "legacy" {
+                assert!(stored.len() > MAX_RESULT_BYTES);
+            }
+            let consent = bounded_consent(&prepared);
+            let mut job = transport.submit(prepared, &consent).unwrap();
+            let start = Instant::now();
+            let receipt = loop {
+                if let Some(r) = job.poll().unwrap() {
+                    break r;
+                }
+                assert!(start.elapsed() < Duration::from_secs(30));
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            assert_eq!(
+                receipt.state,
+                JobState::TransportValidated,
+                "{}",
+                receipt.detail
+            );
+            let actual = transport
+                .ingest(name, &expected, &request.source_digest)
+                .unwrap()
+                .unwrap();
+            let result: serde_json::Value = serde_json::from_slice(&actual.final_bytes).unwrap();
+            assert_eq!(result["received"], request.prompt.len());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn provider_request_read_bounds_keep_strict_json_and_refuse_modified_or_oversized_inputs() {
+    use product_provider::*;
+    let dir = tempdir();
+    let root = dir.path();
+    let transport = bounded_transport(root, ProviderKind::Codex);
+    let oversized = bounded_request(
+        "over-prompt",
+        ProviderKind::Codex,
+        vec![b'x'; MAX_PROMPT_BYTES + 1],
+    );
+    assert!(transport.prepare(oversized).is_err());
+    assert!(!root.join("jobs/over-prompt").exists());
+    for mode in [
+        "oversized-request",
+        "duplicate-key",
+        "deep-json",
+        "trailing-json",
+        "oversized-stdin",
+        "changed-stdin",
+    ] {
+        let request = bounded_request(
+            mode,
+            ProviderKind::Codex,
+            b"Exact small legacy input".to_vec(),
+        );
+        let prepared = transport.prepare(request).unwrap();
+        let consent = bounded_consent(&prepared);
+        let job_dir = root.join("jobs").join(mode);
+        let expected = match mode {
+            "oversized-request" => {
+                fs::write(
+                    job_dir.join("request.json"),
+                    vec![b' '; MAX_SERIALIZED_REQUEST_BYTES + 1],
+                )
+                .unwrap();
+                "byte limit"
+            }
+            "duplicate-key" => {
+                let mut bytes = fs::read(job_dir.join("request.json")).unwrap();
+                bytes.pop();
+                bytes.extend_from_slice(br#", "request_id":"duplicate"}"#);
+                fs::write(job_dir.join("request.json"), bytes).unwrap();
+                "duplicate"
+            }
+            "deep-json" => {
+                let mut value: serde_json::Value =
+                    serde_json::from_slice(&fs::read(job_dir.join("request.json")).unwrap())
+                        .unwrap();
+                let mut nested = serde_json::json!("value");
+                for _ in 0..66 {
+                    nested = serde_json::json!([nested]);
+                }
+                value["data_categories"] = nested;
+                fs::write(
+                    job_dir.join("request.json"),
+                    serde_json::to_vec(&value).unwrap(),
+                )
+                .unwrap();
+                "nesting"
+            }
+            "trailing-json" => {
+                let mut bytes = fs::read(job_dir.join("request.json")).unwrap();
+                bytes.extend_from_slice(b" true");
+                fs::write(job_dir.join("request.json"), bytes).unwrap();
+                "trailing"
+            }
+            "oversized-stdin" => {
+                fs::write(job_dir.join("stdin.json"), vec![b' '; MAX_STDIN_BYTES + 1]).unwrap();
+                "byte limit"
+            }
+            _ => {
+                let mut bytes = fs::read(job_dir.join("stdin.json")).unwrap();
+                bytes.push(b' ');
+                fs::write(job_dir.join("stdin.json"), bytes).unwrap();
+                "changed"
+            }
+        };
+        let error = transport
+            .submit(prepared, &consent)
+            .err()
+            .expect("corrupt input must be refused");
+        assert!(error.to_lowercase().contains(expected), "{mode}: {error}");
+        assert!(!job_dir.join("fixture-invocation.json").exists());
+    }
+    assert!(
+        tool_proposal_input::parse_json_bytes(&vec![b' '; 1024 * 1024 + 1]).is_err(),
+        "the external/source parser bound stays at 1MiB"
     );
 }
