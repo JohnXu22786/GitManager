@@ -19,6 +19,17 @@ mod tool_proposal_input;
 mod tool_proposals;
 mod tool_workspace_protocol;
 mod tool_studio;
+mod product_contract;
+mod product_protocol;
+mod product_provider;
+mod product_runtime;
+mod product_store;
+mod product_scenarios;
+mod product_decisions;
+mod product_discovery;
+mod product_locations;
+mod product_backup;
+mod product_studio;
 
 use eframe::egui;
 use std::path::{Path, PathBuf};

@@ -268,7 +268,7 @@ impl Folder {
         self.directory.publish(name, bytes, replace)?;
         self.check()
     }
-    fn lock(&self) -> Result<WriteLock> {
+    pub(crate) fn lock(&self) -> Result<WriteLock> {
         self.check()?;
         Ok(self.directory.lock()?)
     }
