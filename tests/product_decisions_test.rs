@@ -440,6 +440,18 @@ fn unknown_active_scope_and_tampered_scene_never_authorize_adoption() {
         .scope
         .conditions
         .insert("area".into(), string("north"));
+    // The actual emitted participant supplies Ada's authored area. This was
+    // unknown before direct emission receipts; it is now independently known.
+    engine
+        .prepare_choice(&store, &p, chosen.clone(), vec![scene(&p)], "known")
+        .unwrap();
+    assert_eq!(store.load().unwrap(), before);
+    // An absent business boundary remains unknown even when record identity
+    // and another condition are authenticated. Never infer its value.
+    chosen
+        .scope
+        .conditions
+        .insert("delivery_region".into(), string("north"));
     assert!(engine
         .prepare_choice(&store, &p, chosen, vec![scene(&p)], "unknown")
         .is_err());
