@@ -404,6 +404,8 @@ impl Worker {
         let raw = provider.raw_response();
         if ready.basis.is_none() {
             self.page = Page::Home;
+        } else if let Some(opened) = &self.opened {
+            self.page = daily_page(&opened.association, &opened.store, &opened.snapshot)?;
         }
         // Dropping the provider/job and any cancellation join stays on this worker.
         drop(provider);

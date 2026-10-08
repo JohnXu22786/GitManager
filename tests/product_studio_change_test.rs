@@ -421,7 +421,7 @@ fn every_pending_choice_keeps_live_state_and_resolves_fresh_after_work_and_reope
         assert!(!reopened.test_can_accept());
         assert_eq!(store.load().unwrap().data.records.len(), 2);
         let backup = product_backup::VerifiedBackup::capture(&store).unwrap();
-        let recovered = backup.recover_new(root.join("recovery")).unwrap();
+        let recovered = backup.recover_new(&root.join("recovery")).unwrap();
         assert_eq!(
             recovered.load().unwrap().decisions,
             store.load().unwrap().decisions
@@ -701,4 +701,274 @@ fn distinct_collection_shape_runs_real_current_and_alternative_exports() {
         store.load().unwrap().artifacts.last().unwrap().rows.len(),
         1
     );
+}
+
+#[test]
+fn legacy_provider_wire_identity_stays_stable_without_real_example_origins() {
+    let request = DevelopmentRequest {
+        version: 1,
+        id: "legacy-prepared".into(),
+        project_id: "legacy-tool".into(),
+        operation: DevelopmentOperation::Generate,
+        request: "Keep the original need".into(),
+        sources: vec![],
+        context: DevelopmentContext {
+            view: None,
+            selected: vec![],
+            recent_inputs: vec![],
+            data_digest: None,
+            session_digest: None,
+        },
+        examples: vec![],
+        accepted_scenes: vec![],
+        decisions: DecisionGraph {
+            version: 1,
+            revision: 0,
+            decisions: vec![],
+        },
+        unknowns: vec![],
+        required_capabilities: Default::default(),
+    };
+    let wire =
+        product_discovery::encode_request(&request, &product_discovery::ProviderOptions::default())
+            .unwrap();
+    assert_eq!(wire.data_categories,vec!["Selected executable sources and their provenance","User request, selected context and active scoped decisions/unknowns","Explicitly selected synthetic or sanitized scenario examples and accepted observations"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_modify_inherits_exact_intent_and_benign_edit_adds_no_question() {
+    let dir = tempdir();
+    let root = dir.path();
+    let path = root.join("tool");
+    let original = other_shape::capture(other_shape::organizer());
+    let mut changed = other_shape::organizer();
+    changed["actions"][2]["steps"][0]["items"] = other_shape::query("person");
+    let candidate = other_shape::capture(changed.clone());
+    let store = ProductStore::create(&path, &original, 20000).unwrap();
+    store
+        .apply(
+            0,
+            "add-first",
+            &other_shape::add("Ada"),
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    let mut studio = ProductStudio::testing(
+        root.into(),
+        Some(transport(root, &candidate)),
+        TestHooks::default(),
+    );
+    settle(&mut studio);
+    change(&mut studio, &path);
+    studio.test_trial(other_shape::invoke("export_people", Default::default()));
+    settle(&mut studio);
+    studio.test_decide(DecisionOutcome::Accept {
+        artifact: candidate.artifact.program_digest,
+    });
+    settle(&mut studio);
+    assert_eq!(studio.test_page(), "daily", "{}", studio.test_notice());
+    let first = store.load().unwrap();
+    assert_eq!(first.decisions.decisions.len(), 1);
+    changed["label"] = serde_json::json!("My club organizer");
+    {
+        let _guard = product_provider::fixture_executable_write_guard();
+        fs::write(
+            root.join("change-fixture.json"),
+            serde_json::to_vec(&serde_json::json!({"program":changed,"mode":"good"})).unwrap(),
+        )
+        .unwrap();
+    }
+    studio.test_modify("Use my own title");
+    settle(&mut studio);
+    let request = studio.test_prepared_request().unwrap();
+    assert_eq!(request.operation, DevelopmentOperation::Modify);
+    assert_eq!(request.sources.last(), Some(first.program().unwrap()));
+    assert!(!request.accepted_scenes.is_empty());
+    assert!(request
+        .examples
+        .iter()
+        .all(|e| e.disclosure == Disclosure::ExplicitlySelected));
+    let editable = first.editable_scope_context().unwrap().unwrap();
+    assert!(request.sources.contains(&editable.editable));
+    assert_eq!(request.decisions, first.decisions);
+    studio.test_consent();
+    settle(&mut studio);
+    assert_eq!(studio.test_page(), "change", "{}", studio.test_notice());
+    assert!(
+        studio.test_can_accept(),
+        "benign wording update should not need another business answer: {}",
+        studio.test_notice()
+    );
+    studio.test_decide(DecisionOutcome::Accept {
+        artifact: first.program().unwrap().artifact.program_digest.clone(),
+    });
+    settle(&mut studio);
+    assert_eq!(studio.test_page(), "daily", "{}", studio.test_notice());
+    let next = store.load().unwrap();
+    assert_eq!(next.decisions, first.decisions);
+    assert_eq!(next.data, first.data);
+    assert_eq!(next.program().unwrap().program.label, "My club organizer");
+}
+
+#[cfg(unix)]
+#[test]
+fn ordinary_structural_design_uses_checked_whole_design_and_preserves_data() {
+    let dir = tempdir();
+    let root = dir.path();
+    let path = root.join("tool");
+    let original = other_shape::capture(other_shape::organizer());
+    let mut changed = other_shape::organizer();
+    changed["views"][0]["kind"]["columns"].as_array_mut().unwrap().push(serde_json::json!({"id":"area","label":"Area","value":other_shape::field(other_shape::var("row"),"area")}));
+    let candidate = other_shape::capture(changed);
+    let store = ProductStore::create(&path, &original, 20000).unwrap();
+    store
+        .apply(
+            0,
+            "add-first",
+            &other_shape::add("Ada"),
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    let before = store.load().unwrap();
+    let mut studio = ProductStudio::testing(
+        root.into(),
+        Some(transport(root, &candidate)),
+        TestHooks::default(),
+    );
+    settle(&mut studio);
+    change(&mut studio, &path);
+    studio.test_trial(other_shape::invoke("export_people", Default::default()));
+    settle(&mut studio);
+    studio.test_decide(DecisionOutcome::Accept {
+        artifact: candidate.artifact.program_digest,
+    });
+    settle(&mut studio);
+    assert_eq!(studio.test_page(), "daily", "{}", studio.test_notice());
+    let saved = store.load().unwrap();
+    assert_eq!(saved.data, before.data);
+    assert!(saved.scope.layers.is_empty());
+    assert_eq!(
+        saved.program().unwrap().program.views[0].kind,
+        candidate.program.views[0].kind
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn choice_commit_gate_close_and_lost_ack_record_once_and_reopen_safely() {
+    for after in [false, true] {
+        let dir = tempdir();
+        let root = dir.path();
+        let path = root.join("tool");
+        let original = other_shape::capture(other_shape::organizer());
+        let mut changed = other_shape::organizer();
+        changed["actions"][2]["steps"][0]["items"] = other_shape::query("person");
+        let candidate = other_shape::capture(changed);
+        let store = ProductStore::create(&path, &original, 20000).unwrap();
+        store
+            .apply(
+                0,
+                "add-first",
+                &other_shape::add("Ada"),
+                RuntimeLimits::default(),
+            )
+            .unwrap();
+        let before = store.load().unwrap();
+        let pause = std::sync::Arc::new(product_studio::TestPause::default());
+        let mut hooks = TestHooks {
+            duplicate_completion: true,
+            ..TestHooks::default()
+        };
+        if after {
+            hooks.after_commit = Some(pause.clone());
+            hooks
+                .lose_ack
+                .store(true, std::sync::atomic::Ordering::Release);
+        } else {
+            hooks.before_commit = Some(pause.clone());
+        }
+        let stopped = hooks.stopped.clone();
+        let mut studio =
+            ProductStudio::testing(root.into(), Some(transport(root, &candidate)), hooks);
+        settle(&mut studio);
+        change(&mut studio, &path);
+        studio.test_trial(other_shape::invoke("export_people", Default::default()));
+        settle(&mut studio);
+        studio.test_decide(DecisionOutcome::Deferred);
+        let start = Instant::now();
+        while !pause.reached.load(std::sync::atomic::Ordering::Acquire) {
+            studio.poll();
+            assert!(
+                start.elapsed() < Duration::from_secs(120),
+                "{}",
+                studio.test_notice()
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(studio.test_cancel(), !after);
+        studio.test_close();
+        pause
+            .release
+            .store(true, std::sync::atomic::Ordering::Release);
+        settle(&mut studio);
+        assert_eq!(studio.test_page(), "home");
+        let saved = store.load().unwrap();
+        assert_eq!(saved.data, before.data);
+        assert_eq!(saved.active_revision, before.active_revision);
+        assert_eq!(saved.decisions.decisions.len(), usize::from(after));
+        drop(studio);
+        let start = Instant::now();
+        while !stopped.load(std::sync::atomic::Ordering::Acquire) {
+            assert!(start.elapsed() < Duration::from_secs(30));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let mut restarted = ProductStudio::testing(root.into(), None, TestHooks::default());
+        settle(&mut restarted);
+        assert_eq!(restarted.test_page(), "daily");
+        assert_eq!(store.load().unwrap(), saved);
+    }
+}
+
+#[test]
+fn wrong_project_and_altered_retained_lifecycle_do_not_create_scoped_authority() {
+    let dir = tempdir();
+    let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
+    let current = store.load().unwrap();
+    let foreign = CapturedProgram::capture(
+        &program(true).source_bytes,
+        "other-project",
+        Producer::Fixture {
+            name: "foreign".into(),
+        },
+        None,
+    )
+    .unwrap();
+    assert!(product_studio::test_scope_request(
+        &current,
+        &foreign,
+        ScopePopulation::All,
+        vec![lifecycle(&current)]
+    )
+    .is_err());
+    let prepared = store
+        .prepare_scoped_change(
+            &program(true),
+            &request(&current, ScopePopulation::All),
+            "original-layer",
+        )
+        .unwrap();
+    store.adopt_scoped(current.revision, &prepared).unwrap();
+    let managed = store.load().unwrap();
+    let mut redefined = lifecycle(&managed);
+    redefined.completed = boolean(false);
+    assert!(product_studio::test_scope_request(
+        &managed,
+        &program(false),
+        ScopePopulation::All,
+        vec![redefined]
+    )
+    .unwrap_err()
+    .contains("meaning"));
+    assert_eq!(store.load().unwrap(), managed);
 }

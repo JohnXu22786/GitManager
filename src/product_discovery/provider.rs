@@ -71,8 +71,15 @@ pub fn encode_request(
             ));
         }
     }
-    if request.examples.is_empty() {
-        data_categories.push("No selected scenario examples".into());
+    if !request
+        .examples
+        .iter()
+        .any(|example| example.disclosure == Disclosure::ExplicitlySelected)
+    {
+        // Preserve the exact wire identity of already prepared legacy jobs.
+        // These origins existed before real business copies were supported.
+        data_categories.truncate(2);
+        data_categories.push("Explicitly selected synthetic or sanitized scenario examples and accepted observations".into());
     }
     let wire = ProviderRequest {
         request_id: request.id.clone(),
