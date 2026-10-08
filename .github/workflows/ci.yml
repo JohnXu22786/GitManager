@@ -72,6 +72,9 @@ jobs:
           git config --global user.name "GitManager CI"
           git config --global user.email "gitmanager-ci@users.noreply.invalid"
 
+      - name: Check production application
+        run: cargo check --locked --bin git_manager
+
       - name: Compile Linux scope test harness
         if: ${{ success() && runner.os == 'Linux' && github.event_name == 'push' && github.ref == 'refs/heads/feat/enforced-adoption-scope' }}
         run: |
