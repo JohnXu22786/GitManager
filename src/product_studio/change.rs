@@ -179,6 +179,33 @@ fn replay_view(
     Ok((runtime.view_model(&run).map_err(error)?, run.clock_day()))
 }
 
+fn prepared_replay(
+    snapshot: &ProjectSnapshot,
+    prepared: &PreparedScopedChange,
+    original: &ScenarioSpec,
+) -> Result<(PreparedScopedChange, ScopedExecutionContext, ScenarioSpec), String> {
+    // Rebuild only the copied input's correspondences. Committed historical
+    // correspondences are independently reconstructed from the snapshot.
+    let mut bound = prepared.clone();
+    bound.correspondences.clear();
+    let context = ScopedExecutionContext::prepared(snapshot, &bound).map_err(error)?;
+    let mut mapped = original.clone();
+    mapped.seed =
+        crate::product_runtime::merged_data(prepared.target(), &original.seed).map_err(error)?;
+    let (context, actual) = context
+        .project_scenario(
+            snapshot.program().map_err(error)?,
+            original,
+            prepared.target(),
+            &mapped,
+        )
+        .map_err(error)?;
+    // These are regenerated input correspondences, not host-authored claims.
+    // Checked scene capture and final adoption reconstruct them independently.
+    bound.correspondences = context.correspondence_proofs();
+    Ok((bound, context, actual))
+}
+
 impl ChangeDraft {
     pub fn new(
         snapshot: ProjectSnapshot,
