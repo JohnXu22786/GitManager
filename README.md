@@ -93,6 +93,14 @@ sudo apt-get install libgtk-3-dev libwebkit2gtk-4.1-dev libx11-dev libxcb1-dev
 
 Runtime library availability can vary by distribution and version.
 
+For display compatibility troubleshooting, select a rendering backend for one process:
+
+```sh
+GIT_MANAGER_RENDERER=glow ./git_manager
+```
+
+The only accepted values are exactly `glow` and `wgpu`. Leaving the variable unset preserves the application's existing default. Invalid values stop startup with an error; the application does not automatically retry another backend or save this choice. Rendering compatibility still needs to be checked on the actual desktop.
+
 ### Windows
 
 Extract the `windows-x86_64` ZIP archive and run `git_manager.exe` from the extracted files.

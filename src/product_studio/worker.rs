@@ -506,7 +506,7 @@ impl Worker {
             // Retain the actual returned alternative even if its shape needs a
             // business clarification or a supported design route.
             let result = change.prepare(&current.store, gate);
-            self.page = Page::Change(change.view()?);
+            self.page = Page::Change(change.checked_view(&current.store, gate)?);
             self.change = Some(change);
             self.notice =
                 "Try the actual change on copied work. Nothing in your saved tool changed".into();
@@ -1215,7 +1215,7 @@ impl Worker {
         }
         let mut next = draft.clone();
         action(&mut next, store)?;
-        let page = Page::Change(next.view()?);
+        let page = Page::Change(next.checked_view(store, gate)?);
         if !gate.finish() {
             return Err("Trial cancelled; the previous copied experience was kept".into());
         }
@@ -1396,12 +1396,13 @@ impl Worker {
                 .collect();
         }
         let result = draft.prepare(&opened.store, gate);
+        let page = Page::Change(draft.checked_view(&opened.store, gate)?);
         if !gate.finish() {
             return Err(
                 "Opening the retained choice was cancelled; saved work is unchanged".into(),
             );
         }
-        self.page = Page::Change(draft.view()?);
+        self.page = page;
         self.change = Some(draft);
         self.notice="This is a fresh comparison on your current saved work. The earlier experiences remain unchanged in history; try the alternatives again before resolving".into();
         result

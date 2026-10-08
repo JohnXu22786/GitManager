@@ -889,10 +889,19 @@ impl ProductStudio {
                             view.operations.join(", ")
                         ),
                     );
+                    if !view.unavailable_tasks.is_empty() {
+                        trace.label(ui, format!(
+                            "These required tasks cannot be tried through controls on both sides: {}. This comparison cannot verify the full chosen scope. Return to saved work to keep the existing tool and any earlier choice; a revised design with usable controls is needed before acceptance.",
+                            view.unavailable_tasks.join(", ")
+                        ));
+                    }
+                    for note in &view.readiness_notes {
+                        trace.label(ui, note.clone());
+                    }
                     if trace.button(
                         ui,
                         "studio.accept",
-                        if view.equivalent {
+                        if view.wording_update {
                             "Apply checked wording update"
                         } else {
                             "Accept the alternative"
@@ -928,12 +937,21 @@ impl ProductStudio {
                             ui,
                             key,
                             label,
-                            !busy && view.experienced && !view.equivalent,
+                            !busy
+                                && if outcome == DecisionOutcome::KeepCurrent {
+                                    view.can_keep_current
+                                } else {
+                                    view.can_retain
+                                },
                         ) {
                             action = Some(Action::Decide { outcome });
                         }
                     }
-                    trace.label(ui,"The four unresolved choices retain both actual experiences without changing your live tool. You can reopen them after continuing work.");
+                    if view.same_alternative {
+                        trace.label(ui,"Both sides now use the same tool version. A new pair will not be recorded. Returning to saved work leaves any earlier choices unchanged.");
+                    } else {
+                        trace.label(ui,"The four unresolved choices retain both actual experiences without changing your live tool. You can reopen them after continuing work.");
+                    }
                 }
                 if trace.button(ui, "studio.return", "Return to saved work", !busy) {
                     action = Some(Action::ReturnDaily);
@@ -956,7 +974,14 @@ impl ProductStudio {
                                 action = Some(Action::Trial { input });
                             }
                         }
-                        trace.label(&mut columns[1], "Alternative");
+                        trace.label(
+                            &mut columns[1],
+                            if view.same_alternative {
+                                "Same current version"
+                            } else {
+                                "Alternative"
+                            },
+                        );
                         let output = self.alternative_renderer.show(
                             &mut columns[1],
                             alternative,

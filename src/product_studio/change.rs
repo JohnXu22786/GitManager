@@ -25,13 +25,17 @@ pub(super) struct ChangeView {
     pub missing: Vec<(Id, String)>,
     pub lifecycle_options: Vec<LifecycleOption>,
     pub can_accept: bool,
-    pub experienced: bool,
+    pub can_keep_current: bool,
+    pub can_retain: bool,
+    pub same_alternative: bool,
+    pub readiness_notes: Vec<String>,
     pub whole_design: bool,
-    pub equivalent: bool,
+    pub wording_update: bool,
     pub needs_task: bool,
     pub partial_scope: bool,
     pub scope_rows: Vec<Record>,
     pub operations: Vec<String>,
+    pub unavailable_tasks: Vec<String>,
     pub need: String,
     pub origin: String,
     pub lifecycle_note: String,
@@ -108,6 +112,35 @@ fn operation(program: &AppDefinition, input: &SemanticInput) -> Option<Id> {
             }),
         _ => None,
     }
+}
+fn exposed_operations(program: &AppDefinition) -> BTreeSet<Id> {
+    let mut operations = BTreeSet::new();
+    for view in &program.views {
+        operations.extend(view.actions.iter().map(|binding| binding.action.clone()));
+        match &view.kind {
+            ViewKind::Form { action, .. } => {
+                operations.insert(action.clone());
+            }
+            ViewKind::List {
+                controls,
+                selection,
+                ..
+            } => {
+                operations.extend(
+                    controls
+                        .iter()
+                        .filter_map(|control| control.on_change.clone()),
+                );
+                operations.extend(
+                    selection
+                        .iter()
+                        .filter_map(|selection| selection.on_change.clone()),
+                );
+            }
+            ViewKind::Detail { .. } => {}
+        }
+    }
+    operations
 }
 fn replay_view(
     runtime: &LocalRuntime,
@@ -659,6 +692,46 @@ impl ChangeDraft {
             Producer::LiveAgent {provider,invocation_id,..}=>format!("Actual returned source from {provider}, request {invocation_id}. The scoped executable is a separate host-compiled source."),
             _=>"Exact retained authored source; this is a fresh rehearsal of the saved choice.".into(),
         };
+        // Revisiting a pending choice is an explicit resolution, even when a
+        // separate adoption has since made its alternative match current work.
+        let wording_update = self.equivalent && self.resolves.is_empty();
+        // The language permits internal actions without generated controls. Do
+        // not ask a person to complete an impossible acceptance checklist. This
+        // detects absent routes, not a claim that dynamic guards will succeed;
+        // the actual checked rehearsal remains required for every scoped task.
+        let unavailable_tasks = self
+            .alternative
+            .as_ref()
+            .filter(|_| !wording_update)
+            .map(|alternative| {
+                let current = exposed_operations(&self.current.program);
+                let prospective = exposed_operations(&alternative.program);
+                required
+                    .iter()
+                    .filter(|task| !current.contains(*task) || !prospective.contains(*task))
+                    .map(|task| {
+                        self.candidate
+                            .program
+                            .actions
+                            .iter()
+                            .find(|action| &action.id == task)
+                            .map(|action| action.label.clone())
+                            .unwrap_or_else(|| "A required task".into())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let experienced_scope = self.scenes.is_some()
+            && !required.is_empty()
+            && required.is_subset(&experienced)
+            && unavailable_tasks.is_empty();
+        let target = self
+            .prepared
+            .as_ref()
+            .map(|p| p.target())
+            .unwrap_or(&self.candidate);
+        let same_alternative = self.alternative.is_some()
+            && target.artifact == self.snapshot.program().map_err(error)?.artifact;
         Ok(ChangeView {
             basis: Basis::capture(&self.snapshot)?,
             current: self.current.clone(),
@@ -674,13 +747,13 @@ impl ChangeDraft {
             population: self.population.clone(),
             missing,
             lifecycle_options: options,
-            can_accept: (self.equivalent && self.alternative.is_some())
-                || (self.scenes.is_some()
-                    && !required.is_empty()
-                    && required.is_subset(&experienced)),
-            experienced: self.scenes.is_some(),
+            can_accept: (wording_update && self.alternative.is_some()) || experienced_scope,
+            can_keep_current: experienced_scope && !wording_update,
+            can_retain: self.scenes.is_some() && !same_alternative && !wording_update,
+            same_alternative,
+            readiness_notes: vec![],
             whole_design: self.structural,
-            equivalent: self.equivalent,
+            wording_update,
             needs_task: !self.structural
                 && self.analysis.operations.is_empty()
                 && self.scope_operations.is_empty(),
@@ -693,10 +766,38 @@ impl ChangeDraft {
                 }),
             scope_rows,
             operations,
+            unavailable_tasks,
             need: self.need.clone(),
             origin,
             lifecycle_note: self.lifecycle_note.clone(),
         })
+    }
+    /// Active promises must pass the same preparation used at the actual click.
+    /// This runs only on the worker, after copied tasks have been experienced.
+    /// Staged proof objects are not adoption receipts; the final commit still
+    /// performs its own fresh preparation and source/data/day fencing.
+    pub fn checked_view(&self, store: &ProductStore, gate: &Gate) -> Result<ChangeView, String> {
+        let mut view = self.view()?;
+        for (outcome, ready, note) in [
+            (DecisionOutcome::Accept { artifact: view.target_artifact.clone() }, &mut view.can_accept,
+             "This copied example has not verified the full chosen scope for accepting the change. Try the affected work or return to saved work."),
+            (DecisionOutcome::KeepCurrent, &mut view.can_keep_current,
+             "This copied example has not verified the full chosen scope for recording Keep current. Returning to saved work leaves the existing tool and earlier choices unchanged."),
+        ] {
+            if *ready {
+                if let Err(error) = self.decision(store, outcome, &id("readiness"), gate) {
+                    *ready = false;
+                    view.readiness_notes.push(note.into());
+                    #[cfg(test)]
+                    eprintln!("Checked choice preparation: {error}");
+                    #[cfg(not(test))]
+                    let _ = error;
+                }
+            }
+        }
+        gate.check()?;
+        self.check(store)?;
+        Ok(view)
     }
     pub fn decision(
         &self,
@@ -756,6 +857,17 @@ impl ChangeDraft {
             .scenes
             .clone()
             .ok_or("Try the actual copied alternatives before recording a choice")?;
+        let view = self.view()?;
+        if outcome == DecisionOutcome::KeepCurrent && !view.can_keep_current {
+            return Err("Try every affected task through the available controls before recording Keep current. Returning to saved work leaves earlier choices unchanged".into());
+        }
+        if !matches!(
+            outcome,
+            DecisionOutcome::Accept { .. } | DecisionOutcome::KeepCurrent
+        ) && !view.can_retain
+        {
+            return Err("These are not two distinct tool versions. Return to saved work without recording a new pair; earlier choices are kept".into());
+        }
         let engine = engine(store, gate);
         if outcome == DecisionOutcome::KeepCurrent && self.prepared.is_some() {
             // Keep the original evidence intact. A current-only retained promise

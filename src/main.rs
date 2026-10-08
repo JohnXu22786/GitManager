@@ -250,9 +250,23 @@ fn native_file_dialog() -> Option<String> {
         .map(|p| p.to_string_lossy().to_string())
 }
 
+fn renderer_for_process(value: Option<&std::ffi::OsStr>) -> std::io::Result<eframe::Renderer> {
+    match value {
+        None => Ok(eframe::Renderer::default()),
+        Some(value) if value == std::ffi::OsStr::new("glow") => Ok(eframe::Renderer::Glow),
+        Some(value) if value == std::ffi::OsStr::new("wgpu") => Ok(eframe::Renderer::Wgpu),
+        Some(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "GIT_MANAGER_RENDERER must be exactly glow or wgpu, or be unset",
+        )),
+    }
+}
+
 fn main() -> eframe::Result<()> {
     let app_title = format!("Git Manager v{}", version_info::VERSION);
     let options = eframe::NativeOptions {
+        renderer: renderer_for_process(std::env::var_os("GIT_MANAGER_RENDERER").as_deref())
+            .map_err(|error| eframe::Error::AppCreation(Box::new(error)))?,
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([800.0, 550.0])
             .with_min_inner_size([600.0, 400.0])
@@ -275,6 +289,51 @@ fn main() -> eframe::Result<()> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn renderer_selection_preserves_default_without_an_override() {
+        assert_eq!(
+            renderer_for_process(None).unwrap(),
+            eframe::NativeOptions::default().renderer
+        );
+    }
+
+    #[test]
+    fn renderer_selection_accepts_only_exact_supported_names() {
+        for (name, expected) in [
+            ("glow", eframe::Renderer::Glow),
+            ("wgpu", eframe::Renderer::Wgpu),
+        ] {
+            assert_eq!(
+                renderer_for_process(Some(std::ffi::OsStr::new(name))).unwrap(),
+                expected
+            );
+        }
+        for invalid in [
+            "",
+            "Glow",
+            "WGPU",
+            " glow",
+            "wgpu\n",
+            "glow --help",
+            "/tmp/glow",
+            "$(glow)",
+        ] {
+            let error = renderer_for_process(Some(std::ffi::OsStr::new(invalid))).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(
+                error.to_string(),
+                "GIT_MANAGER_RENDERER must be exactly glow or wgpu, or be unset"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renderer_selection_rejects_non_unicode_without_fallback() {
+        use std::os::unix::ffi::OsStrExt;
+        assert!(renderer_for_process(Some(std::ffi::OsStr::from_bytes(b"glow\xff"))).is_err());
+    }
 
     #[test]
     fn system_font_candidates_include_platform_fallbacks() {

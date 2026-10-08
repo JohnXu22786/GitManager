@@ -28,6 +28,8 @@ mod tool_proposal_input;
 mod ui {
     pub(crate) use super::product_runtime_view;
 }
+#[path = "support/egui_harness.rs"]
+mod egui_harness;
 #[path = "fixtures/product_runtime/mod.rs"]
 mod other_shape;
 #[path = "../src/product_studio.rs"]
@@ -930,6 +932,188 @@ fn managed_modify_inherits_exact_intent_and_benign_edit_adds_no_question() {
     assert_eq!(next.decisions, first.decisions);
     assert_eq!(next.data, first.data);
     assert_eq!(next.program().unwrap().program.label, "My club organizer");
+}
+
+#[cfg(unix)]
+#[test]
+fn revisited_equivalent_pending_choice_requires_fresh_rehearsal() {
+    for (expose_collect, choice) in [
+        (false, "studio.return"),
+        (true, "studio.accept"),
+        (true, "studio.keep-current"),
+    ] {
+        let dir = tempdir();
+        let root = dir.path();
+        let path = root.join("tool");
+        let mut initial = other_shape::organizer();
+        if expose_collect {
+            let mut collect_button = initial["views"][0]["actions"][0].clone();
+            collect_button["id"] = serde_json::json!("collect_button");
+            collect_button["label"] = serde_json::json!("Collect current results");
+            collect_button["action"] = serde_json::json!("collect");
+            initial["views"][0]["actions"]
+                .as_array_mut()
+                .unwrap()
+                .push(collect_button);
+        }
+        let original = other_shape::capture(initial.clone());
+        let mut changed = initial;
+        changed["actions"][2]["steps"][0]["items"] = other_shape::query("person");
+        let candidate = other_shape::capture(changed);
+        let store = ProductStore::create(&path, &original, 20000).unwrap();
+        store
+            .apply(
+                0,
+                "first",
+                &other_shape::add("Ada"),
+                RuntimeLimits::default(),
+            )
+            .unwrap();
+        let mut studio = ProductStudio::testing(
+            root.into(),
+            Some(transport(root, &candidate)),
+            TestHooks::default(),
+        );
+        settle(&mut studio);
+        change(&mut studio, &path);
+        studio.test_trial(other_shape::invoke("export_people", Default::default()));
+        settle(&mut studio);
+        studio.test_decide(DecisionOutcome::Deferred);
+        settle(&mut studio);
+        let pending = store.load().unwrap().decisions.decisions[0].id.clone();
+
+        // A separate, genuinely requested change can settle the same behavior while
+        // this older choice remains pending. It does not resolve that choice for us.
+        change(&mut studio, &path);
+        studio.test_trial(other_shape::invoke("export_people", Default::default()));
+        settle(&mut studio);
+        studio.test_decide(DecisionOutcome::Accept {
+            artifact: candidate.artifact.program_digest.clone(),
+        });
+        settle(&mut studio);
+        assert_eq!(studio.test_page(), "daily", "{}", studio.test_notice());
+        studio.test_daily(other_shape::add("Later real work"));
+        settle(&mut studio);
+        let before = store.load().unwrap();
+        assert_eq!(
+            before.decisions.decisions[0].status,
+            DecisionStatus::Pending
+        );
+        studio.test_resume_choice(&pending);
+        settle(&mut studio);
+        assert_eq!(studio.test_page(), "change", "{}", studio.test_notice());
+        assert!(
+            !studio.test_can_accept(),
+            "Resolving an older choice still needs a fresh experience"
+        );
+        let mut harness = egui_harness::EguiHarness::new(egui::vec2(1400.0, 1800.0));
+        let render = |h: &mut egui_harness::EguiHarness, s: &mut ProductStudio| {
+            h.frame(|ctx| {
+                egui::CentralPanel::default()
+                    .show(ctx, |ui| s.show(ui))
+                    .inner
+            })
+        };
+        let fresh = render(&mut harness, &mut studio);
+        assert!(!fresh.controls["studio.accept"].enabled);
+        if !expose_collect {
+            assert!(
+                fresh.text.iter().any(|text| text
+                    .contains("cannot be tried through controls on both sides")
+                    && text.contains("Collect current results")),
+                "The missing business task must be explained: {:?}",
+                fresh.text
+            );
+        }
+        studio.test_decide(DecisionOutcome::Accept {
+            artifact: candidate.artifact.program_digest,
+        });
+        settle(&mut studio);
+        assert_eq!(studio.test_page(), "change");
+        assert!(studio
+            .test_notice()
+            .contains("Try the actual copied alternatives"));
+        assert_eq!(store.load().unwrap(), before);
+
+        studio.test_trial(other_shape::invoke("export_people", Default::default()));
+        settle(&mut studio);
+        if expose_collect {
+            // This is now a whole-design managed resolution. Its declared scope also
+            // includes the reachable intake and collect actions, not only export.
+            assert!(!studio.test_can_accept());
+            studio.test_trial(other_shape::add("Only in the copied rehearsal"));
+            settle(&mut studio);
+            studio.test_trial(other_shape::invoke("collect", Default::default()));
+            settle(&mut studio);
+            studio.test_trial(other_shape::invoke("export_people", Default::default()));
+            settle(&mut studio);
+        }
+        let experienced = render(&mut harness, &mut studio);
+        assert_eq!(
+            experienced.controls["studio.accept"].enabled,
+            expose_collect
+        );
+        assert_eq!(
+            experienced.controls["studio.keep-current"].enabled,
+            expose_collect
+        );
+        for key in [
+            "studio.either",
+            "studio.both",
+            "studio.neither",
+            "studio.defer",
+        ] {
+            assert!(
+                !experienced.controls[key].enabled,
+                "An identical artifact is not a new pair: {key}"
+            );
+        }
+        assert!(experienced
+            .text
+            .iter()
+            .any(|text| text.contains("Both sides now use the same tool version")));
+        for outcome in [
+            DecisionOutcome::EitherAcceptable,
+            DecisionOutcome::BothNeeded,
+            DecisionOutcome::NeitherFits,
+            DecisionOutcome::Deferred,
+        ] {
+            studio.test_decide(outcome);
+            settle(&mut studio);
+            assert_eq!(studio.test_page(), "change");
+            assert_eq!(store.load().unwrap(), before);
+        }
+        // Re-render after the refused direct submissions, then use a real control.
+        let experienced = render(&mut harness, &mut studio);
+        let point = experienced.controls[choice].rect.center();
+        harness.press_at(point);
+        render(&mut harness, &mut studio);
+        harness.release_at(point);
+        render(&mut harness, &mut studio);
+        settle(&mut studio);
+        assert_eq!(studio.test_page(), "daily", "{}", studio.test_notice());
+        let resolved = store.load().unwrap();
+        assert_eq!(resolved.data, before.data);
+        assert_eq!(resolved.data.records.len(), 2);
+        if expose_collect {
+            assert!(matches!(
+                resolved.decisions.decisions[0].status,
+                DecisionStatus::Superseded { .. }
+            ));
+            let recorded = &resolved.decisions.decisions.last().unwrap().outcome;
+            if choice == "studio.accept" {
+                assert!(matches!(recorded, DecisionOutcome::Accept { .. }));
+            } else {
+                assert_eq!(recorded, &DecisionOutcome::KeepCurrent);
+                assert_eq!(resolved.active_revision, before.active_revision);
+            }
+        } else {
+            assert_eq!(
+                resolved, before,
+                "Leaving this unsupported comparison must preserve the original pending choice"
+            );
+        }
+    }
 }
 
 #[cfg(unix)]
