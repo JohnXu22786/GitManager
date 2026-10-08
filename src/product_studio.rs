@@ -203,6 +203,7 @@ enum Page {
         disclosure: DataDisclosure,
         need: String,
         request: DevelopmentRequest,
+        review: String,
         basis: Option<Basis>,
     },
     Change(ChangeView),
@@ -640,6 +641,7 @@ impl ProductStudio {
                 disclosure,
                 need,
                 request,
+                review,
                 ..
             } => {
                 trace.label(
@@ -651,24 +653,12 @@ impl ProductStudio {
                     trace.label(ui, "This initial request includes the need above and the public application-language instructions/schema. It contains no saved tool sources, business records, earlier conversations, or accepted scenes.");
                 } else {
                     trace.label(ui, format!("This request includes {} exact tool sources, the current view and selection, {} recent acknowledged inputs, {} retained intentions, and {} complete inherited examples with their business records and observed results. These copies may contain private information; they are not automatically sanitized.", request.sources.len(), request.context.recent_inputs.len(), request.decisions.decisions.len(), request.examples.len()));
-                    ui.collapsing("Review the complete inherited examples", |ui| {
-                        for example in &request.examples {
-                            trace.label(
-                                ui,
-                                format!("{} · {:?}", example.scenario.label, example.disclosure),
-                            );
-                            for record in &example.scenario.seed.records {
-                                for (field, value) in &record.values {
-                                    trace.label(
-                                        ui,
-                                        format!(
-                                            "{field}: {}",
-                                            crate::ui::product_runtime_view::value_text(value)
-                                        ),
-                                    );
-                                }
-                            }
-                        }
+                    ui.collapsing("Review every value sent in this exact request", |ui| {
+                        trace.label(ui,"This read-only payload includes the exact request, sources, selected records, recent inputs, full inherited scenarios and accepted observations. You do not need to edit it.");
+                        egui::ScrollArea::vertical().max_height(360.0).show(ui,|ui| {
+                            let mut text=review.as_str();
+                            trace.control("studio.disclosure-payload",ui.add(egui::TextEdit::multiline(&mut text).interactive(false).desired_width(f32::INFINITY)));
+                        });
                     });
                 }
                 trace.label(ui, disclosure.purpose.clone());
@@ -807,6 +797,9 @@ impl ProductStudio {
                         }
                     }
                 } else {
+                    if view.needs_task {
+                        trace.label(ui,"Try the task this result belongs to below. Its actual action will define the rule's task scope, then both versions will be independently replayed.");
+                    }
                     if view.whole_design {
                         trace.label(ui, "This changes the tool's design as a whole. Existing protected results and intentions are independently checked; partial rule scopes are unavailable for this design.");
                     } else {
@@ -905,7 +898,7 @@ impl ProductStudio {
                     ) {
                         action = Some(Action::Decide {
                             outcome: DecisionOutcome::Accept {
-                                artifact: view.basis.source.clone(),
+                                artifact: view.target_artifact.clone(),
                             },
                         });
                     }
@@ -1191,6 +1184,13 @@ impl ProductStudio {
             });
         }
     }
+    pub fn test_disclosure_payload(&self) -> Option<&str> {
+        if let Page::Consent { review, .. } = &self.page {
+            Some(review)
+        } else {
+            None
+        }
+    }
     pub fn test_prepared_request(&self) -> Option<&DevelopmentRequest> {
         if let Page::Consent { request, .. } = &self.page {
             Some(request)
@@ -1211,6 +1211,20 @@ impl ProductStudio {
         self.issue(Action::Trial { input });
     }
     pub fn test_decide(&mut self, outcome: DecisionOutcome) {
+        let outcome = if matches!(outcome, DecisionOutcome::Accept { .. }) {
+            if let Page::Change(view) = &self.page {
+                DecisionOutcome::Accept {
+                    artifact: view.target_artifact.clone(),
+                }
+            } else {
+                outcome
+            }
+        } else {
+            outcome
+        };
+        self.issue(Action::Decide { outcome });
+    }
+    pub fn test_decide_exact(&mut self, outcome: DecisionOutcome) {
         self.issue(Action::Decide { outcome });
     }
     pub fn test_resume_choice(&mut self, decision: &str) {
@@ -1401,4 +1415,21 @@ pub fn test_scope_request(
         lifecycles,
         std::collections::BTreeSet::new(),
     )
+}
+
+#[cfg(test)]
+pub fn test_stage_change(root: &Path, path: &Path, before: &ProjectSnapshot, plan: AdoptionPlan) {
+    let tool = Association {
+        path: path.into(),
+        identity: ToolIdentity::from_snapshot(before).unwrap(),
+    };
+    let mut journal = JournalFile::open(root).unwrap();
+    let mut value = journal.value.clone();
+    value.last = Some(tool.clone());
+    value.pending = Some(Interrupted::Change {
+        tool,
+        basis: Basis::capture(before).unwrap(),
+        plan,
+    });
+    journal.write(value).unwrap();
 }

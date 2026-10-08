@@ -19,6 +19,7 @@ pub(super) struct LifecycleOption {
 pub(super) struct ChangeView {
     pub basis: Basis,
     pub current: RuntimeView,
+    pub target_artifact: Digest,
     pub alternative: Option<RuntimeView>,
     pub population: ScopePopulation,
     pub missing: Vec<(Id, String)>,
@@ -27,6 +28,7 @@ pub(super) struct ChangeView {
     pub experienced: bool,
     pub whole_design: bool,
     pub equivalent: bool,
+    pub needs_task: bool,
     pub partial_scope: bool,
     pub scope_rows: Vec<Record>,
     pub operations: Vec<String>,
@@ -53,6 +55,7 @@ pub(super) struct ChangeDraft {
     equivalent: bool,
     lifecycle_evidence: String,
     analysis: change_adapter::Analysis,
+    scope_operations: BTreeSet<Id>,
     scenario: ScenarioSpec,
     current: RuntimeView,
     alternative: Option<RuntimeView>,
@@ -187,6 +190,7 @@ impl ChangeDraft {
             equivalent,
             lifecycle_evidence: String::new(),
             analysis,
+            scope_operations: BTreeSet::new(),
             scenario,
             current,
             alternative: None,
@@ -218,7 +222,11 @@ impl ChangeDraft {
     pub fn prepare(&mut self, store: &ProductStore, gate: &Gate) -> Result<(), String> {
         gate.check()?;
         self.check(store)?;
-        if !self.missing().is_empty() {
+        if !self.missing().is_empty()
+            || (!self.structural
+                && self.analysis.operations.is_empty()
+                && self.scope_operations.is_empty())
+        {
             return Ok(());
         }
         let prepared = if self.structural {
@@ -249,7 +257,7 @@ impl ChangeDraft {
                 &self.candidate,
                 self.population.clone(),
                 self.lifecycles.clone(),
-                BTreeSet::new(),
+                self.scope_operations.clone(),
             )?;
             Some(
                 store
@@ -446,14 +454,9 @@ impl ChangeDraft {
         }
         let mut scenario = self.scenario.clone();
         scenario.inputs.push(input);
-        let admission = if let Some(p) = &self.prepared {
-            ScopedExecutionContext::prepared(&self.snapshot, p)
-        } else {
-            ScopedExecutionContext::committed(&self.snapshot)
-        }
-        .map_err(error)?;
         let runtime = LocalRuntime::with_cancellation(gate.cancelled.clone());
         if !self.missing().is_empty() {
+            let admission = ScopedExecutionContext::committed(&self.snapshot).map_err(error)?;
             let current = replay_view(
                 &runtime,
                 self.snapshot.program().map_err(error)?,
@@ -465,9 +468,43 @@ impl ChangeDraft {
             self.current = current;
             return Ok(());
         }
+        if !self.structural && self.analysis.operations.is_empty() {
+            let operations: BTreeSet<_> = scenario
+                .inputs
+                .iter()
+                .filter_map(|input| operation(&self.candidate.program, input))
+                .collect();
+            if operations.is_empty() {
+                let admission = ScopedExecutionContext::committed(&self.snapshot).map_err(error)?;
+                let current = replay_view(
+                    &runtime,
+                    self.snapshot.program().map_err(error)?,
+                    &scenario,
+                    &admission,
+                )?;
+                gate.check()?;
+                self.scenario = scenario;
+                self.current = current;
+                return Ok(());
+            }
+            if self.scope_operations != operations || self.alternative.is_none() {
+                let inputs = scenario.inputs.clone();
+                self.scope_operations = operations;
+                self.operation = id("change");
+                self.prepare(store, gate)?;
+                scenario = self.scenario.clone();
+                scenario.inputs = inputs;
+            }
+        }
         if self.alternative.is_none() {
             return Err("Prepare a compatible comparison before trying this change".into());
         }
+        let admission = if let Some(p) = &self.prepared {
+            ScopedExecutionContext::prepared(&self.snapshot, p)
+        } else {
+            ScopedExecutionContext::committed(&self.snapshot)
+        }
+        .map_err(error)?;
         let target = self
             .prepared
             .as_ref()
@@ -625,6 +662,14 @@ impl ChangeDraft {
         Ok(ChangeView {
             basis: Basis::capture(&self.snapshot)?,
             current: self.current.clone(),
+            target_artifact: self
+                .prepared
+                .as_ref()
+                .map(|p| p.target())
+                .unwrap_or(&self.candidate)
+                .artifact
+                .program_digest
+                .clone(),
             alternative: self.alternative.clone(),
             population: self.population.clone(),
             missing,
@@ -636,6 +681,9 @@ impl ChangeDraft {
             experienced: self.scenes.is_some(),
             whole_design: self.structural,
             equivalent: self.equivalent,
+            needs_task: !self.structural
+                && self.analysis.operations.is_empty()
+                && self.scope_operations.is_empty(),
             partial_scope: !self.structural
                 && !self.analysis.patches.iter().any(|p| {
                     matches!(
@@ -682,6 +730,16 @@ impl ChangeDraft {
                 return Err("The experienced source is not the actual provider result".into());
             }
         }
+        if let DecisionOutcome::Accept { artifact } = &outcome {
+            let target = self
+                .prepared
+                .as_ref()
+                .map(|p| p.target())
+                .unwrap_or(&self.candidate);
+            if artifact != &target.artifact.program_digest {
+                return Err("The accepted artifact is not the exact displayed alternative. Rehearse the current comparison".into());
+            }
+        }
         if self.equivalent
             && matches!(outcome, DecisionOutcome::Accept { .. })
             && self.resolves.is_empty()
@@ -694,19 +752,39 @@ impl ChangeDraft {
             }
             .map_err(error);
         }
-        let (current, alternative) = self
+        let (mut current, alternative) = self
             .scenes
             .clone()
             .ok_or("Try the actual copied alternatives before recording a choice")?;
         let engine = engine(store, gate);
-        let accepting = matches!(outcome, DecisionOutcome::Accept { .. });
-        let outcome = if accepting {
-            DecisionOutcome::Accept {
-                artifact: alternative.program().artifact.program_digest.clone(),
+        if outcome == DecisionOutcome::KeepCurrent && self.prepared.is_some() {
+            // Keep the original evidence intact. A current-only retained promise
+            // gets its own fresh replay on the exact committed starting frame.
+            let mut original = current.scenario().clone();
+            original.seed = self.snapshot.data.clone();
+            let replay = engine
+                .accept_current_scene(&self.snapshot, &original, Disclosure::ExplicitlySelected)
+                .map_err(error)?;
+            let same = current.observations().len() == replay.observations().len()
+                && current
+                    .observations()
+                    .iter()
+                    .zip(replay.observations())
+                    .all(|(a, b)| {
+                        a.point == b.point
+                            && a.session_digest == b.session_digest
+                            && a.values == b.values
+                            && a.value_types == b.value_types
+                            && a.view == b.view
+                            && a.view_schema == b.view_schema
+                            && a.outputs == b.outputs
+                    });
+            if !same {
+                return Err("The committed-current replay differs from the current result you experienced. Start a fresh comparison before keeping it".into());
             }
-        } else {
-            outcome
-        };
+            current = replay;
+        }
+        let accepting = matches!(outcome, DecisionOutcome::Accept { .. });
         let scope = if let Some(p) = &self.prepared {
             p.scope().clone()
         } else {

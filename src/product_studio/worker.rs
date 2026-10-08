@@ -262,9 +262,21 @@ impl Worker {
         let request = if modify {
             let current = self.opened.as_ref().unwrap();
             let model = current.store.runtime_view().map_err(error)?;
+            if current.store.load().map_err(error)? != current.snapshot {
+                return Err(
+                    "Saved work changed while its context was captured. Reopen it before sending"
+                        .into(),
+                );
+            }
+            let mut selected = model.observation.selected.clone();
+            if let Some(focused) = &current.snapshot.session.focused_record {
+                if !selected.contains(focused) {
+                    selected.push(focused.clone());
+                }
+            }
             let context = DevelopmentContext {
                 view: Some(current.snapshot.session.view.clone()),
-                selected: model.observation.selected.clone(),
+                selected,
                 recent_inputs: self.recent_inputs.clone(),
                 data_digest: Some(current.snapshot.data.identity().map_err(error)?),
                 session_digest: Some(current.snapshot.session.identity().map_err(error)?),
@@ -354,6 +366,7 @@ impl Worker {
                 .map(|j| j.value.need.clone())
                 .unwrap_or_else(|| request.request.clone()),
             request: request.clone(),
+            review: String::from_utf8(wire.prompt.clone()).map_err(error)?,
             basis: modify_binding.as_ref().map(|(_, basis)| basis.clone()),
         };
         #[cfg(test)]
@@ -1289,24 +1302,70 @@ impl Worker {
             .values()
             .filter(|p| p.witnesses.get(decision) == Some(&choice.witness))
             .collect();
-        if matches.len() != 1 {
-            return Err("This saved choice needs a fresh development request to reconstruct its exact alternative; no current result was substituted".into());
-        }
-        let proof = matches[0];
-        let candidate_id = proof
-            .layer
-            .as_ref()
-            .map(|l| &l.candidate)
-            .unwrap_or(&proof.manifest.business);
-        let candidate = snapshot
-            .programs
-            .iter()
-            .find(|p| {
-                canonical_digest(IdentityDomain::Source, *p).ok().as_ref() == Some(candidate_id)
-            })
-            .ok_or("The exact retained authored source is missing")?
-            .clone();
-        let request = proof.layer.as_ref().map(|l| l.request.clone());
+        let (candidate, request) = if matches.len() == 1 {
+            let proof = matches[0];
+            let candidate_id = proof
+                .layer
+                .as_ref()
+                .map(|l| &l.candidate)
+                .unwrap_or(&proof.manifest.business);
+            let candidate = snapshot
+                .programs
+                .iter()
+                .find(|p| {
+                    canonical_digest(IdentityDomain::Source, *p).ok().as_ref() == Some(candidate_id)
+                })
+                .ok_or("The exact retained authored source is missing")?
+                .clone();
+            (candidate, proof.layer.as_ref().map(|l| l.request.clone()))
+        } else if matches.is_empty() {
+            // Public inheritance independently verifies each retained scene and
+            // supplies its real source. Do not decode private archive objects.
+            let engine = DecisionEngine::new(
+                LocalRuntime::with_cancellation(gate.cancelled.clone()),
+                IntentArchive::new(opened.store.clone()),
+            );
+            let inherited = engine
+                .development_request(
+                    &snapshot,
+                    &id("revisit"),
+                    DevelopmentOperation::Modify,
+                    &choice.request,
+                    DevelopmentContext {
+                        view: Some(snapshot.session.view.clone()),
+                        selected: vec![],
+                        recent_inputs: vec![],
+                        data_digest: Some(snapshot.data.identity().map_err(error)?),
+                        session_digest: Some(snapshot.session.identity().map_err(error)?),
+                    },
+                )
+                .map_err(error)?;
+            let mut alternatives = vec![];
+            for accepted in inherited.accepted_scenes.iter().filter(|s| {
+                s.decision == decision
+                    && s.source != snapshot.program().expect("verified source").artifact
+            }) {
+                let source = inherited
+                    .sources
+                    .iter()
+                    .find(|s| s.artifact == accepted.source)
+                    .ok_or("The archived choice source is missing")?;
+                if !alternatives.contains(source) {
+                    alternatives.push(source.clone());
+                }
+            }
+            if alternatives.len() != 1
+                || crate::product_runtime::has_protected_fields(&alternatives[0])
+            {
+                return Err("This saved choice has no unambiguous current-versus-one ordinary alternative. A fresh design request is needed; no source was substituted".into());
+            }
+            (alternatives.remove(0), None)
+        } else {
+            return Err(
+                "The saved choice has ambiguous rehearsal proofs; no alternative was selected"
+                    .into(),
+            );
+        };
         let mut draft = ChangeDraft::new(snapshot, candidate, choice.request)?;
         draft.resolves = vec![decision.into()];
         if let Some(request) = request {

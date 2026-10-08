@@ -252,11 +252,14 @@ fn scoped_host_choices_preserve_mixed_completed_work_and_rehearse_after_scope_ch
         let selected = add(&store, "selected", "Selected");
         let other = add(&store, "other", "Other");
         let completed = add(&store, "completed", "Completed");
+        let archived = add(&store, "archived", "Archived");
+        action(&store, "archive-original", "archive", &archived);
         action(&store, "wait-first", "wait", &selected);
         action(&store, "wait-other", "wait", &other);
         action(&store, "complete-original", "complete", &completed);
         let before = store.load().unwrap();
         let hooks = TestHooks::default();
+        let today = hooks.today.clone();
         hooks
             .lose_ack
             .store(true, std::sync::atomic::Ordering::Release);
@@ -346,9 +349,110 @@ fn scoped_host_choices_preserve_mixed_completed_work_and_rehearse_after_scope_ch
             .results
             .iter()
             .any(|r| r.record.record == completed.id));
-        studio.test_daily(invoke("calculate", &[("row", reference(&other))]));
+        today.store(20003, std::sync::atomic::Ordering::Release);
+        settle(&mut studio);
+        for live in [&selected, &other] {
+            studio.test_daily(invoke("calculate", &[("row", reference(live))]));
+            settle(&mut studio);
+        }
+        let calculated = store.load().unwrap();
+        let selected_days = if matches!(population, ScopePopulation::FutureWork) {
+            3
+        } else {
+            0
+        };
+        let other_days = if population == ScopePopulation::All {
+            0
+        } else {
+            3
+        };
+        assert_eq!(
+            fixture::row(&calculated, &selected).values["production"],
+            DataValue::Integer {
+                value: selected_days
+            }
+        );
+        assert_eq!(
+            fixture::row(&calculated, &other).values["production"],
+            DataValue::Integer { value: other_days }
+        );
+        studio.test_daily(invoke("complete", &[("row", reference(&selected))]));
+        settle(&mut studio);
+        studio.test_daily(invoke(
+            "add",
+            &[
+                ("name", text("Later saved work")),
+                ("promised", DataValue::Date { days: 20020 }),
+            ],
+        ));
+        settle(&mut studio);
+        let later = store
+            .load()
+            .unwrap()
+            .data
+            .records
+            .into_iter()
+            .find(|r| r.values.get("name") == Some(&text("Later saved work")))
+            .unwrap();
+        studio.test_daily(invoke("wait", &[("row", reference(&later))]));
+        settle(&mut studio);
+        today.store(20006, std::sync::atomic::Ordering::Release);
+        settle(&mut studio);
+        studio.test_daily(invoke("calculate", &[("row", reference(&later))]));
+        settle(&mut studio);
+        studio.test_daily(invoke("export", &[]));
+        settle(&mut studio);
+        let final_work = store.load().unwrap();
+        let later_days = if matches!(population, ScopePopulation::SelectedUnfinished { .. }) {
+            3
+        } else {
+            0
+        };
+        assert_eq!(
+            fixture::row(&final_work, &later).values["production"],
+            DataValue::Integer { value: later_days }
+        );
+        assert_eq!(
+            fixture::row(&final_work, &selected).values["production"],
+            DataValue::Integer {
+                value: selected_days
+            }
+        );
+        assert_eq!(
+            fixture::row(&final_work, &completed).values["production"],
+            DataValue::Integer { value: 0 }
+        );
+        assert!(fixture::row(&final_work, &archived).archived);
+        let output = final_work.artifacts.last().unwrap();
+        for (name, expected) in [
+            ("Selected", selected_days),
+            (
+                "Other",
+                if population == ScopePopulation::All {
+                    0
+                } else {
+                    6
+                },
+            ),
+            ("Completed", 0),
+            ("Archived", 0),
+            ("Later saved work", later_days),
+        ] {
+            let record = output
+                .rows
+                .iter()
+                .find(|r| r.get("name") == Some(&text(name)))
+                .unwrap();
+            assert_eq!(record["production"], DataValue::Integer { value: expected });
+        }
+        assert_eq!(final_work.data.records.len(), 5);
+        assert!(final_work.data.events.len() > before.data.events.len());
+        studio.test_close();
+        settle(&mut studio);
+        studio.test_open(path.clone());
         settle(&mut studio);
         assert_eq!(studio.test_page(), "daily");
+        assert_eq!(store.load().unwrap(), final_work);
     }
 }
 
@@ -971,4 +1075,255 @@ fn wrong_project_and_altered_retained_lifecycle_do_not_create_scoped_authority()
     .unwrap_err()
     .contains("meaning"));
     assert_eq!(store.load().unwrap(), managed);
+}
+
+#[cfg(unix)]
+#[test]
+fn projection_only_change_learns_scope_from_actual_copied_task() {
+    let dir = tempdir();
+    let root = dir.path();
+    let path = root.join("tool");
+    let original = other_shape::capture(other_shape::organizer());
+    let mut changed = other_shape::organizer();
+    changed["observables"][0]["value"] =
+        serde_json::json!({"kind":"count","items":other_shape::query("person")});
+    let candidate = other_shape::capture(changed);
+    let store = ProductStore::create(&path, &original, 20000).unwrap();
+    store
+        .apply(
+            0,
+            "add-first",
+            &other_shape::add("Ada"),
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    let mut studio = ProductStudio::testing(
+        root.into(),
+        Some(transport(root, &candidate)),
+        TestHooks::default(),
+    );
+    settle(&mut studio);
+    change(&mut studio, &path);
+    studio.test_trial(other_shape::invoke("export_people", Default::default()));
+    settle(&mut studio);
+    assert!(studio.test_can_accept(), "{}", studio.test_notice());
+    assert!(studio.test_alternative().is_some());
+    studio.test_decide(DecisionOutcome::Accept {
+        artifact: candidate.artifact.program_digest,
+    });
+    settle(&mut studio);
+    assert_eq!(studio.test_page(), "daily", "{}", studio.test_notice());
+    assert_eq!(store.load().unwrap().scope.layers.len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn ordinary_structural_pending_choice_reopens_and_resolves_exactly() {
+    let dir = tempdir();
+    let root = dir.path();
+    let path = root.join("tool");
+    let original = other_shape::capture(other_shape::organizer());
+    let mut changed = other_shape::organizer();
+    changed["views"][0]["kind"]["columns"].as_array_mut().unwrap().push(serde_json::json!({"id":"area","label":"Area","value":other_shape::field(other_shape::var("row"),"area")}));
+    let candidate = other_shape::capture(changed);
+    let store = ProductStore::create(&path, &original, 20000).unwrap();
+    store
+        .apply(
+            0,
+            "add-first",
+            &other_shape::add("Ada"),
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    let mut studio = ProductStudio::testing(
+        root.into(),
+        Some(transport(root, &candidate)),
+        TestHooks::default(),
+    );
+    settle(&mut studio);
+    change(&mut studio, &path);
+    studio.test_trial(other_shape::invoke("export_people", Default::default()));
+    settle(&mut studio);
+    studio.test_decide(DecisionOutcome::BothNeeded);
+    settle(&mut studio);
+    let pending = store.load().unwrap().decisions.decisions[0].id.clone();
+    assert!(store.load().unwrap().scope.rehearsals.is_empty());
+    studio.test_daily(other_shape::add("Later work"));
+    settle(&mut studio);
+    studio.test_resume_choice(&pending);
+    settle(&mut studio);
+    assert_eq!(studio.test_page(), "change", "{}", studio.test_notice());
+    studio.test_trial(other_shape::invoke("export_people", Default::default()));
+    settle(&mut studio);
+    studio.test_decide(DecisionOutcome::Accept {
+        artifact: candidate.artifact.program_digest,
+    });
+    settle(&mut studio);
+    assert_eq!(studio.test_page(), "daily", "{}", studio.test_notice());
+    let saved = store.load().unwrap();
+    assert_eq!(saved.data.records.len(), 2);
+    assert!(matches!(
+        saved.decisions.decisions[0].status,
+        DecisionStatus::Superseded { .. }
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn keep_managed_current_replays_committed_seed_and_preserves_the_experienced_result() {
+    let dir = tempdir();
+    let root = dir.path();
+    let path = root.join("tool");
+    let store = ProductStore::create(&path, &program(false), 20000).unwrap();
+    let row = add(&store, "item", "Existing work");
+    let before = store.load().unwrap();
+    let prepared = store
+        .prepare_scoped_change(
+            &program(true),
+            &request(&before, ScopePopulation::All),
+            "first-layer",
+        )
+        .unwrap();
+    store.adopt_scoped(before.revision, &prepared).unwrap();
+    let current = store.load().unwrap();
+    let mut studio = ProductStudio::testing(
+        root.into(),
+        Some(transport(root, &program(false))),
+        TestHooks::default(),
+    );
+    settle(&mut studio);
+    change(&mut studio, &path);
+    for task in ["calculate", "complete", "export"] {
+        studio.test_trial(if task == "export" {
+            invoke(task, &[])
+        } else {
+            invoke(task, &[("row", reference(&row))])
+        });
+        settle(&mut studio);
+    }
+    studio.test_decide(DecisionOutcome::KeepCurrent);
+    settle(&mut studio);
+    assert_eq!(studio.test_page(), "daily", "{}", studio.test_notice());
+    let saved = store.load().unwrap();
+    assert_eq!(saved.active_revision, current.active_revision);
+    assert_eq!(saved.data, current.data);
+    assert_eq!(saved.scope.layers.len(), current.scope.layers.len());
+    assert_eq!(
+        saved.decisions.decisions[0].outcome,
+        DecisionOutcome::KeepCurrent
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn inherited_private_trial_inputs_are_in_the_exact_prepared_disclosure() {
+    let dir = tempdir();
+    let root = dir.path();
+    let path = root.join("tool");
+    let original = other_shape::capture(other_shape::organizer());
+    let mut changed = other_shape::organizer();
+    changed["actions"][2]["steps"][0]["items"] = other_shape::query("person");
+    let candidate = other_shape::capture(changed);
+    let store = ProductStore::create(&path, &original, 20000).unwrap();
+    let mut studio = ProductStudio::testing(
+        root.into(),
+        Some(transport(root, &candidate)),
+        TestHooks::default(),
+    );
+    settle(&mut studio);
+    change(&mut studio, &path);
+    studio.test_trial(other_shape::add("Private copied name from an input"));
+    settle(&mut studio);
+    studio.test_trial(other_shape::invoke("export_people", Default::default()));
+    settle(&mut studio);
+    studio.test_decide(DecisionOutcome::Deferred);
+    settle(&mut studio);
+    assert_eq!(studio.test_page(), "daily", "{}", studio.test_notice());
+    studio.test_modify("Review the retained actual examples");
+    settle(&mut studio);
+    assert_eq!(studio.test_page(), "consent", "{}", studio.test_notice());
+    let request = studio.test_prepared_request().unwrap();
+    assert!(request
+        .examples
+        .iter()
+        .all(|e| e.scenario.seed.records.is_empty()));
+    let payload = studio.test_disclosure_payload().unwrap();
+    assert!(payload.contains("Private copied name from an input"));
+    let wire: serde_json::Value = serde_json::from_str(payload).unwrap();
+    assert_eq!(wire["request"], serde_json::to_value(request).unwrap());
+    assert!(store.load().unwrap().data.records.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn host_refuses_acceptance_for_a_different_artifact() {
+    let dir = tempdir();
+    let root = dir.path();
+    let path = root.join("tool");
+    let original = other_shape::capture(other_shape::organizer());
+    let mut changed = other_shape::organizer();
+    changed["actions"][2]["steps"][0]["items"] = other_shape::query("person");
+    let candidate = other_shape::capture(changed);
+    let store = ProductStore::create(&path, &original, 20000).unwrap();
+    let mut studio = ProductStudio::testing(
+        root.into(),
+        Some(transport(root, &candidate)),
+        TestHooks::default(),
+    );
+    settle(&mut studio);
+    change(&mut studio, &path);
+    studio.test_trial(other_shape::invoke("export_people", Default::default()));
+    settle(&mut studio);
+    let before = store.load().unwrap();
+    studio.test_decide_exact(DecisionOutcome::Accept {
+        artifact: original.artifact.program_digest,
+    });
+    settle(&mut studio);
+    assert!(studio.test_notice().contains("artifact"));
+    assert_eq!(store.load().unwrap(), before);
+}
+
+#[test]
+fn restart_verifies_exact_change_receipt_and_refuses_a_conflicting_plan() {
+    for forged in [false, true] {
+        let dir = tempdir();
+        let root = dir.path();
+        let path = root.join("tool");
+        let store = ProductStore::create(&path, &program(false), 20000).unwrap();
+        let before = store.load().unwrap();
+        let prepared = store
+            .prepare_scoped_change(
+                &program(true),
+                &request(&before, ScopePopulation::All),
+                "saved-change",
+            )
+            .unwrap();
+        let mut plan = store.scoped_plan(&prepared).unwrap().plan().clone();
+        store.adopt_scoped(before.revision, &prepared).unwrap();
+        let saved = store.load().unwrap();
+        if forged {
+            plan.required_decisions.push("another-promise".into());
+        }
+        product_studio::test_stage_change(root, &path, &before, plan);
+        let mut studio = ProductStudio::testing(root.into(), None, TestHooks::default());
+        settle(&mut studio);
+        assert_eq!(studio.test_page(), "daily", "{}", studio.test_notice());
+        assert_eq!(store.load().unwrap(), saved);
+        studio.test_reconcile();
+        settle(&mut studio);
+        if forged {
+            assert!(studio.test_notice().contains("different saved plan"));
+            studio.test_daily(invoke(
+                "add",
+                &[
+                    ("name", text("Blocked duplicate")),
+                    ("promised", DataValue::Date { days: 20010 }),
+                ],
+            ));
+            settle(&mut studio);
+            assert_eq!(store.load().unwrap(), saved);
+        } else {
+            assert_eq!(store.load().unwrap().scope.adoptions.len(), 1);
+        }
+    }
 }
