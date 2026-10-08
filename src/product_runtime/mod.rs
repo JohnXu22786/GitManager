@@ -510,6 +510,13 @@ impl LocalRuntime {
         run.state.outputs = artifacts.to_vec();
         Ok(run)
     }
+    #[cfg(test)]
+    pub(crate) fn test_fresh_output_participants<'a>(
+        &self,
+        run: &'a ProductRun,
+    ) -> &'a [EmittedRecordParticipants] {
+        &run.state.output_participants
+    }
     pub fn view_model(&self, run: &ProductRun) -> Result<RuntimeView> {
         let observation = self.observe(run, "view")?;
         Ok(RuntimeView {
@@ -789,6 +796,9 @@ impl RuntimeAdapter for LocalRuntime {
         })();
         run.fuel.set(meter.fuel);
         let output_start = run.state.outputs.len();
+        // Restored artifacts have no freshly executed sidecars. Their count
+        // must never index the independent vector of this run's receipts.
+        let participant_start = run.state.output_participants.len();
         let (outcome, diagnostic) = match &result {
             Ok(()) => (StepOutcome::Applied, None),
             Err(e) => (
@@ -820,7 +830,7 @@ impl RuntimeAdapter for LocalRuntime {
             outcome,
             diagnostic,
         };
-        for receipt in &mut run.state.output_participants[output_start..] {
+        for receipt in &mut run.state.output_participants[participant_start..] {
             receipt.bind_step(
                 &request,
                 &step.before_data,
@@ -847,7 +857,12 @@ impl RuntimeAdapter for LocalRuntime {
         &self,
         run: &'a ProductRun,
     ) -> Result<Option<&'a [EmittedRecordParticipants]>> {
-        Ok(Some(&run.state.output_participants))
+        // Resume preserves historical bytes without inventing execution
+        // receipts for them. A fresh suffix is not a complete inventory.
+        Ok(
+            (run.state.output_participants.len() == run.state.outputs.len())
+                .then_some(run.state.output_participants.as_slice()),
+        )
     }
     fn data<'a>(&self, run: &'a ProductRun) -> &'a DataSnapshot {
         &run.state.data

@@ -1037,8 +1037,14 @@ impl Worker {
                     // Opaque replay/adoption authority does not survive restart.
                     // A verified absence permits fresh work, never blind resend.
                     self.journal(|j| j.pending = None)?;
+                    self.notice.clear();
                     self.open(tool.path.clone(), Some(tool.identity))?;
-                    self.notice="The interrupted change has no saved receipt. Your current work is kept; reopen the choice or request it again for a fresh rehearsal before accepting".into();
+                    let outcome = "The interrupted change has no saved receipt. Your current work is kept; reopen the choice or request it again for a fresh rehearsal before accepting";
+                    self.notice = if self.notice.is_empty() {
+                        outcome.into()
+                    } else {
+                        format!("{outcome} {}", self.notice)
+                    };
                     Ok(())
                 } else {
                     self.notice="A change was interrupted before acknowledgement. Check its exact receipt before making another change; nothing is automatically adopted".into();

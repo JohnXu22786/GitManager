@@ -2899,3 +2899,174 @@ fn opened_checkpoint_rechecks_concurrent_work_and_subsequent_object_corruption()
     fs::write(&object, bytes).unwrap();
     assert_eq!(opened.checkpoint(&shelf).unwrap().digest, receipt.digest);
 }
+
+#[cfg(unix)]
+#[test]
+fn uncommitted_change_recovery_keeps_backup_warning_and_current_work() {
+    let dir = tempdir();
+    let root = dir.path();
+    let path = root.join("tool");
+    let store = ProductStore::create(&path, &program(false), 20000).unwrap();
+    add(&store, "existing", "Existing work");
+    let before = store.load().unwrap();
+    let prepared = store
+        .prepare_scoped_change(
+            &program(true),
+            &request(&before, ScopePopulation::All),
+            "unsaved-change",
+        )
+        .unwrap();
+    let plan = store.scoped_plan(&prepared).unwrap().plan().clone();
+    product_studio::test_stage_change(root, &path, &before, plan);
+    fs::write(root.join("checkpoints"), b"blocked backup folder").unwrap();
+    let mut studio = ProductStudio::testing(root.into(), None, TestHooks::default());
+    settle(&mut studio);
+    let mut h = egui_harness::EguiHarness::new(egui::vec2(1400.0, 1800.0));
+    click(&mut h, &mut studio, "studio.reconcile");
+    assert_eq!(studio.test_page(), "daily", "{}", studio.test_notice());
+    assert!(
+        studio.test_notice().contains("backup"),
+        "{}",
+        studio.test_notice()
+    );
+    assert!(
+        studio.test_notice().contains("no saved receipt"),
+        "{}",
+        studio.test_notice()
+    );
+    assert_eq!(store.load().unwrap(), before);
+    let journal: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("studio/session.json")).unwrap()).unwrap();
+    assert!(journal["pending"].is_null());
+    studio.test_daily(invoke(
+        "add",
+        &[
+            ("name", text("Later work")),
+            ("promised", DataValue::Date { days: 20010 }),
+        ],
+    ));
+    settle(&mut studio);
+    let after = store.load().unwrap();
+    assert_eq!(after.data.records.len(), before.data.records.len() + 1);
+    assert_eq!(after.active_revision, before.active_revision);
+    assert_eq!(after.decisions, before.decisions);
+    assert_eq!(after.scope.adoptions, before.scope.adoptions);
+    studio.test_reconcile();
+    settle(&mut studio);
+    assert_eq!(store.load().unwrap(), after);
+}
+
+#[test]
+fn resumed_outputs_keep_history_without_fabricating_participant_authority() {
+    let (program, data, _) = participant_fixture();
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let runtime = product_runtime::LocalRuntime::with_cancellation(cancelled.clone());
+    let mut run = runtime
+        .start(
+            &program,
+            &data,
+            &SessionState::initial(&program.program).unwrap(),
+            20000,
+            0,
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    runtime
+        .apply(&mut run, &invoke("pair", &[]), "original-export")
+        .unwrap();
+    for round in 0..2 {
+        let retained = runtime.emitted_artifacts(&run).unwrap().to_vec();
+        let mut resumed = runtime
+            .resume(
+                &program,
+                runtime.data(&run),
+                runtime.session(&run),
+                20000,
+                0,
+                RuntimeLimits::default(),
+                &retained,
+            )
+            .unwrap();
+        assert!(runtime
+            .emitted_record_participants(&resumed)
+            .unwrap()
+            .is_none());
+        runtime
+            .apply(
+                &mut resumed,
+                &SemanticInput::Observe {
+                    point: "restored".into(),
+                },
+                &format!("observe-{round}"),
+            )
+            .unwrap();
+        assert_eq!(runtime.emitted_artifacts(&resumed).unwrap(), retained);
+        let operation = format!("new-export-{round}");
+        let step = runtime
+            .apply(&mut resumed, &invoke("pair", &[]), &operation)
+            .unwrap();
+        let outputs = runtime.emitted_artifacts(&resumed).unwrap().to_vec();
+        assert_eq!(outputs.len(), retained.len() + 2);
+        assert_eq!(&outputs[..retained.len()], retained);
+        assert!(
+            outputs.iter().all(|output| output == &outputs[0]),
+            "Restored and new outputs intentionally have identical bytes and digests"
+        );
+        assert!(
+            runtime
+                .emitted_record_participants(&resumed)
+                .unwrap()
+                .is_none(),
+            "The fresh suffix must not masquerade as complete historical receipts"
+        );
+        let fresh = runtime.test_fresh_output_participants(&resumed).to_vec();
+        assert_eq!(fresh.len(), 2);
+        for (local, receipt) in fresh.iter().enumerate() {
+            let ordinal = retained.len() + local;
+            receipt
+                .validate_for(
+                    &program,
+                    &operation,
+                    ordinal,
+                    &outputs[ordinal],
+                    &step,
+                    20000,
+                )
+                .unwrap();
+            assert!(receipt.validate_for(&program, &operation, local, &outputs[local], &step, 20000).is_err(), "A fresh receipt cannot claim an identical historical output at its sidecar-vector position");
+        }
+        let before_data = runtime.data(&resumed).clone();
+        let before_session = runtime.session(&resumed).clone();
+        assert_eq!(
+            runtime
+                .apply(&mut resumed, &invoke("pair", &[]), &operation)
+                .unwrap(),
+            step
+        );
+        assert!(runtime
+            .apply(
+                &mut resumed,
+                &invoke("rejected_pair", &[]),
+                &format!("failed-{round}")
+            )
+            .is_err());
+        cancelled.store(true, std::sync::atomic::Ordering::Release);
+        assert!(runtime
+            .apply(
+                &mut resumed,
+                &invoke("pair", &[]),
+                &format!("cancelled-{round}")
+            )
+            .is_err());
+        cancelled.store(false, std::sync::atomic::Ordering::Release);
+        assert_eq!(runtime.data(&resumed), &before_data);
+        assert_eq!(runtime.session(&resumed), &before_session);
+        assert_eq!(runtime.emitted_artifacts(&resumed).unwrap(), outputs);
+        assert_eq!(runtime.test_fresh_output_participants(&resumed), fresh);
+        assert!(runtime
+            .emitted_record_participants(&resumed)
+            .unwrap()
+            .is_none());
+        run = resumed;
+    }
+}
