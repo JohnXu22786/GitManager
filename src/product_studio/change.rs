@@ -782,8 +782,11 @@ impl ChangeDraft {
             .as_ref()
             .map(|p| p.target())
             .unwrap_or(&self.candidate);
+        // Compare the effective executables, including their scoped rules.
+        // Raw source identities remain distinct when only wording differs.
         let same_alternative = self.alternative.is_some()
-            && target.artifact == self.snapshot.program().map_err(error)?.artifact;
+            && target.artifact.semantic_digest
+                == self.snapshot.program().map_err(error)?.artifact.semantic_digest;
         Ok(ChangeView {
             basis: Basis::capture(&self.snapshot)?,
             current: self.current.clone(),

@@ -988,10 +988,12 @@ fn managed_modify_inherits_exact_intent_and_benign_edit_adds_no_question() {
 #[cfg(unix)]
 #[test]
 fn revisited_equivalent_pending_choice_requires_fresh_rehearsal() {
-    for (expose_collect, choice) in [
-        (false, "studio.return"),
-        (true, "studio.accept"),
-        (true, "studio.keep-current"),
+    for (expose_collect, choice, rename_after_adoption) in [
+        (true, "studio.accept", true),
+        (true, "studio.keep-current", true),
+        (false, "studio.return", false),
+        (true, "studio.accept", false),
+        (true, "studio.keep-current", false),
     ] {
         let dir = tempdir();
         let root = dir.path();
@@ -1043,6 +1045,35 @@ fn revisited_equivalent_pending_choice_requires_fresh_rehearsal() {
         });
         settle(&mut studio);
         assert_eq!(studio.test_page(), "daily", "{}", studio.test_notice());
+        if rename_after_adoption {
+            let before_rename = store.load().unwrap();
+            let mut titled = serde_json::to_value(&candidate.program).unwrap();
+            titled["label"] = serde_json::json!("My current organizer title");
+            {
+                let _guard = product_provider::fixture_executable_write_guard();
+                fs::write(
+                    root.join("change-fixture.json"),
+                    serde_json::to_vec(&serde_json::json!({"program":titled,"mode":"good"}))
+                        .unwrap(),
+                )
+                .unwrap();
+            }
+            studio.test_modify("Use my current organizer title");
+            settle(&mut studio);
+            studio.test_consent();
+            settle(&mut studio);
+            let mut title_controls =
+                egui_harness::EguiHarness::new(egui::vec2(1400.0, 1800.0));
+            click(&mut title_controls, &mut studio, "studio.accept");
+            assert_eq!(studio.test_page(), "daily", "{}", studio.test_notice());
+            let renamed = store.load().unwrap();
+            assert_eq!(renamed.data, before_rename.data);
+            assert_eq!(renamed.decisions, before_rename.decisions);
+            assert_eq!(
+                renamed.program().unwrap().program.label,
+                "My current organizer title"
+            );
+        }
         studio.test_daily(other_shape::add("Later real work"));
         settle(&mut studio);
         let before = store.load().unwrap();
@@ -1116,13 +1147,13 @@ fn revisited_equivalent_pending_choice_requires_fresh_rehearsal() {
         ] {
             assert!(
                 !experienced.controls[key].enabled,
-                "An identical artifact is not a new pair: {key}"
+                "Equivalent rules are not a new pair: {key}"
             );
         }
         assert!(experienced
             .text
             .iter()
-            .any(|text| text.contains("Both sides now use the same tool version")));
+            .any(|text| text.contains("Both sides use the same rules")));
         for outcome in [
             DecisionOutcome::EitherAcceptable,
             DecisionOutcome::BothNeeded,
@@ -1154,9 +1185,19 @@ fn revisited_equivalent_pending_choice_requires_fresh_rehearsal() {
             let recorded = &resolved.decisions.decisions.last().unwrap().outcome;
             if choice == "studio.accept" {
                 assert!(matches!(recorded, DecisionOutcome::Accept { .. }));
+                assert_eq!(
+                    resolved.program().unwrap().program.label,
+                    candidate.program.label
+                );
             } else {
                 assert_eq!(recorded, &DecisionOutcome::KeepCurrent);
                 assert_eq!(resolved.active_revision, before.active_revision);
+                if rename_after_adoption {
+                    assert_eq!(
+                        resolved.program().unwrap().program.label,
+                        "My current organizer title"
+                    );
+                }
             }
         } else {
             assert_eq!(

@@ -962,7 +962,7 @@ impl ProductStudio {
                         }
                     }
                     if view.same_alternative {
-                        trace.label(ui,"Both sides now use the same tool version. A new pair will not be recorded. Returning to saved work leaves any earlier choices unchanged.");
+                        trace.label(ui,"Both sides use the same rules. A new pair will not be recorded. Returning to saved work leaves any earlier choices unchanged.");
                     } else {
                         trace.label(ui,"The four unresolved choices retain both actual experiences without changing your live tool. You can reopen them after continuing work.");
                     }
@@ -991,7 +991,7 @@ impl ProductStudio {
                         trace.label(
                             &mut columns[1],
                             if view.same_alternative {
-                                "Same current version"
+                                "Same rules"
                             } else {
                                 "Alternative"
                             },
