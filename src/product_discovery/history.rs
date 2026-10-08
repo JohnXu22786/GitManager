@@ -29,6 +29,7 @@ pub struct VerifiedRetainedHistory {
     /// as evidence. Each proposal is bound to one exact captured target.
     target_mappings: BTreeMap<Digest, Vec<SemanticMapping>>,
     prepared_targets: BTreeMap<Digest, PreparedScopedChange>,
+    prepared_results: Vec<PreparedDiscoveryCandidate>,
 }
 impl std::fmt::Debug for VerifiedRetainedHistory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -165,6 +166,7 @@ impl VerifiedRetainedHistory {
             projected_contexts: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             target_mappings: BTreeMap::new(),
             prepared_targets: BTreeMap::new(),
+            prepared_results: vec![],
         })
     }
     /// A rename suggestion is not a passing check. Discovery independently
@@ -202,6 +204,50 @@ impl VerifiedRetainedHistory {
             prepared,
         );
         Ok(())
+    }
+    /// Register only a complete checked response-to-executable link, never a
+    /// candidate label or provider-authored claim of host compilation.
+    pub fn map_prepared_result(
+        &mut self,
+        candidate: PreparedDiscoveryCandidate,
+    ) -> Result<(), AdapterError> {
+        if self.store.load().map_err(unavailable)? != self.current {
+            return Err(unavailable("prepared result basis changed"));
+        }
+        candidate.verify(&self.current, candidate.request(), candidate.result())?;
+        if self.prepared_results.len() >= 8
+            || self
+                .prepared_results
+                .iter()
+                .any(|prior| prior.candidate_id() == candidate.candidate_id())
+        {
+            return Err(invalid(
+                "prepared result registration is duplicate or exceeds response bounds",
+            ));
+        }
+        self.map_prepared_target(
+            candidate.preparation().clone(),
+            candidate.mappings().to_vec(),
+        )?;
+        self.prepared_results.push(candidate);
+        Ok(())
+    }
+    pub(super) fn result_lowerings(
+        &self,
+        request: &DevelopmentRequest,
+        result: &DevelopmentResult,
+    ) -> Result<Vec<PreparedDiscoveryCandidate>, AdapterError> {
+        if !self.prepared_results.is_empty()
+            && self.store.load().map_err(unavailable)? != self.current
+        {
+            return Err(AdapterError::Stale(
+                "prepared discovery basis changed".into(),
+            ));
+        }
+        for candidate in &self.prepared_results {
+            candidate.verify(&self.current, request, result)?;
+        }
+        Ok(self.prepared_results.clone())
     }
     pub(super) fn replay_admission(&self) -> Result<Arc<dyn ReplayAdmission>, AdapterError> {
         let mut contexts = vec![self.replay_context.clone()];
@@ -305,6 +351,19 @@ impl VerifiedRetainedHistory {
             .map_err(unavailable)?
             .with_correspondences(&self.replay_context.correspondence_proofs())
             .map_err(unavailable)?;
+        // A new action may be absent from current. Authenticate its common
+        // input independently of current's ability to execute that action;
+        // discovery still requires the independent feature gate before A/B.
+        if context
+            .verify_seed(before, &scene.seed, scene.clock_day)
+            .is_ok()
+            && context
+                .verify_seed(target, &scene.seed, scene.clock_day)
+                .is_ok()
+        {
+            scene.validate(&target.program)?;
+            return Ok((scene.clone(), Some(context)));
+        }
         let mut mapped = scene.clone();
         mapped.seed = crate::product_runtime::merged_data(target, &scene.seed)?;
         let (context, actual) = context
@@ -409,10 +468,31 @@ impl VerifiedRetainedHistory {
                 .iter()
                 .find(|p| p.artifact == accepted.source)
                 .ok_or_else(|| unavailable("historical source is missing"))?;
-            if !request.examples.contains(original) || !request.sources.contains(source) {
-                return Err(unavailable(
-                    "exact historical source or typed input is missing",
-                ));
+            if !request.examples.contains(original) {
+                return Err(unavailable("exact historical typed input is missing"));
+            }
+            if !request.sources.contains(source) {
+                // The transport contract deduplicates artifacts. A freshly
+                // regenerated host capture may execute identical bytes under
+                // a different preparation/producer identity. Verify that exact
+                // link locally; retain and replay the original capture below.
+                let represented = request.sources.iter().any(|captured| {
+                    captured.artifact == source.artifact
+                        && captured.source_bytes == source.source_bytes
+                        && self.replay_context.contains_managed_source(source)
+                        && canonical_digest(IdentityDomain::Source, captured)
+                            .ok()
+                            .and_then(|id| self.prepared_targets.get(&id))
+                            .is_some_and(|prepared| {
+                                prepared.target() == captured
+                                    && ScopedExecutionContext::prepared(&self.current, prepared)
+                                        .and_then(|context| context.admit_target(captured))
+                                        .is_ok()
+                            })
+                });
+                if !represented {
+                    return Err(unavailable("exact historical capture or independently prepared byte correspondence is missing"));
+                }
             }
         }
         Ok(())
@@ -606,21 +686,36 @@ impl VerifiedRetainedHistory {
         }
         let mut outcomes = vec![];
         for (index, (side, projected)) in sides.iter().enumerate() {
-            let original = replay_accepted_outcome(
-                request,
-                policy,
+            let original_source = self
+                .current
+                .programs
+                .iter()
+                .chain(self.context.sources.iter())
+                .find(|source| {
+                    source.binding == side.original().binding.source
+                        && source.artifact == side.original().binding.artifact
+                })
+                .ok_or_else(|| unavailable("exact retained comparison capture is unavailable"))?;
+            let original = budget.replay(
                 runtime,
-                budget,
-                decision,
-                side.scenario(),
-                &side.original().binding.artifact,
+                original_source,
+                &checked_scene(side.scenario(), true, &[original_source], policy),
+                &request.decisions,
+                policy.search.runtime.clone(),
                 if index == 0 {
                     "retained-package-first"
                 } else {
                     "retained-package-second"
                 },
-                runs,
             )?;
+            if original.state != EvidenceState::Observed
+                || original.observations != side.original().observations
+            {
+                return Err(unavailable(
+                    "exact historical capture did not reproduce its accepted observations",
+                ));
+            }
+            runs.push(original.clone());
             // Receipt initialization changes the actual compared seed, never
             // the historical accepted outcome. Re-execute correspondence on
             // that actual input instead of relabeling an earlier run binding.
@@ -647,14 +742,6 @@ impl VerifiedRetainedHistory {
                 side.replay().clone()
             };
             runs.push(correspondence.clone());
-            let original_source = request
-                .sources
-                .iter()
-                .find(|source| {
-                    source.binding == original.binding.source
-                        && source.artifact == original.binding.artifact
-                })
-                .ok_or_else(|| unavailable("retained comparison source is unavailable"))?;
             let comparison = comparison_observations(policy, original_source, &original)?;
             outcomes.push(RetainedRun {
                 original,
