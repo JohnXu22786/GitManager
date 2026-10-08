@@ -625,13 +625,26 @@ impl Worker {
         };
         let association = Association {
             path,
-            identity: ToolIdentity::from_snapshot(&opened.snapshot).map_err(error)?,
+            identity: opened.summary.identity.clone(),
         };
+        self.install_opened(association, opened)
+    }
+    fn install_opened(
+        &mut self,
+        association: Association,
+        mut opened: crate::product_backup::OpenedTool,
+    ) -> Result<(), String> {
+        // open_verified checked snapshot, intention objects and identity
+        // together. Do not discard that result and open it all again.
+        // daily_page still fences its fresh rendered view to this exact basis.
+        if association.identity != opened.summary.identity {
+            return Err("The verified tool belongs to another saved identity".into());
+        }
         let page = daily_page(&association, &opened.store, &opened.snapshot)?;
         self.opened = Some(OpenTool {
             association: association.clone(),
-            store: opened.store,
-            snapshot: opened.snapshot,
+            store: opened.store.clone(),
+            snapshot: opened.snapshot.clone(),
         });
         self.draft = None;
         self.change = None;
@@ -639,7 +652,7 @@ impl Worker {
         self.ready = None;
         self.page = page;
         self.journal(|j| j.last = Some(association.clone()))?;
-        self.post_save(&association);
+        self.post_save_opened(&association, Some(&mut opened));
         Ok(())
     }
     fn upgrade(
@@ -727,6 +740,13 @@ impl Worker {
         }
     }
     fn post_save(&mut self, tool: &Association) {
+        self.post_save_opened(tool, None);
+    }
+    fn post_save_opened(
+        &mut self,
+        tool: &Association,
+        opened: Option<&mut crate::product_backup::OpenedTool>,
+    ) {
         let result = (|| -> Result<(), String> {
             let locations = self
                 .locations
@@ -735,10 +755,13 @@ impl Worker {
             let recent = RecentTools::open(locations.path()).map_err(error)?;
             let instance = recent.remember(&tool.path, unix_ms()).map_err(error)?;
             let store = &self.opened.as_ref().ok_or("Saved tool is not open")?.store;
-            CheckpointShelf::for_tool(locations, &tool.identity, &instance)
-                .map_err(error)?
-                .capture(store)
-                .map_err(error)?;
+            let shelf =
+                CheckpointShelf::for_tool(locations, &tool.identity, &instance).map_err(error)?;
+            match opened {
+                Some(opened) => opened.checkpoint(&shelf),
+                None => shelf.capture(store),
+            }
+            .map_err(error)?;
             Ok(())
         })();
         if let Err(e) = result {
@@ -1006,9 +1029,9 @@ impl Worker {
                         j.pending = None;
                         j.last = Some(tool.clone());
                     })?;
-                    self.open(tool.path.clone(), Some(tool.identity))?;
                     self.notice =
                         "The exact saved choice was verified. It was not adopted twice".into();
+                    self.install_opened(tool.clone(), opened)?;
                     Ok(())
                 } else if retry {
                     // Opaque replay/adoption authority does not survive restart.
@@ -1287,8 +1310,8 @@ impl Worker {
                 j.pending = None;
                 j.last = Some(tool.clone());
             })?;
-            self.open(tool.path, Some(tool.identity))?;
             self.notice="Your choice was saved. Continue ordinary work; pending choices did not activate their alternatives".into();
+            self.install_opened(tool, checked)?;
             Ok(())
         } else {
             self.journal(|j| j.pending = None)?;

@@ -61,6 +61,8 @@ pub(super) struct ChangeDraft {
     lifecycle_evidence: String,
     analysis: change_adapter::Analysis,
     scope_operations: BTreeSet<Id>,
+    // Keep copied record allocation anchored to the committed business frame.
+    // Prepared metadata belongs only to independently projected replay scenes.
     scenario: ScenarioSpec,
     current: RuntimeView,
     trial_day: i32,
@@ -176,6 +178,7 @@ fn replay_view(
     // the daily ProductStore::runtime_view, never invented in a trial view.
     Ok((runtime.view_model(&run).map_err(error)?, run.clock_day()))
 }
+
 impl ChangeDraft {
     pub fn new(
         snapshot: ProjectSnapshot,
@@ -265,7 +268,7 @@ impl ChangeDraft {
         {
             return Ok(());
         }
-        let prepared = if self.structural {
+        let mut prepared = if self.structural {
             if self.population != ScopePopulation::All {
                 return Err("This changes the tool's design. A partial rule scope cannot describe this design change".into());
             }
@@ -332,25 +335,29 @@ impl ChangeDraft {
         let mut scenario = self.scenario.clone();
         scenario.inputs.clear();
         scenario.id = id("trial");
-        scenario.seed = prepared
-            .as_ref()
-            .map(|p| p.seed())
-            .unwrap_or(&self.snapshot.data)
-            .clone();
-        let admission = if let Some(p) = &prepared {
-            ScopedExecutionContext::prepared(&self.snapshot, p)
+        scenario.seed = self.snapshot.data.clone();
+        let (admission, replay) = if let Some(p) = &prepared {
+            let (bound, context, actual) = prepared_replay(&self.snapshot, p, &scenario)?;
+            prepared = Some(bound);
+            (context, actual)
         } else {
-            ScopedExecutionContext::committed(&self.snapshot)
-        }
-        .map_err(error)?;
+            (
+                ScopedExecutionContext::committed(&self.snapshot).map_err(error)?,
+                scenario.clone(),
+            )
+        };
+        let target = prepared
+            .as_ref()
+            .map(|p| p.target())
+            .unwrap_or(&self.candidate);
         let runtime = LocalRuntime::with_cancellation(gate.cancelled.clone());
         let (current, trial_day) = replay_view(
             &runtime,
             self.snapshot.program().map_err(error)?,
-            &scenario,
+            &replay,
             &admission,
         )?;
-        let (alternative, alternative_day) = replay_view(&runtime, target, &scenario, &admission)?;
+        let (alternative, alternative_day) = replay_view(&runtime, target, &replay, &admission)?;
         if trial_day != alternative_day {
             return Err("The copied versions did not keep the same simulated date. Start a fresh comparison".into());
         }
@@ -541,31 +548,34 @@ impl ChangeDraft {
         if self.alternative.is_none() {
             return Err("Prepare a compatible comparison before trying this change".into());
         }
-        let admission = if let Some(p) = &self.prepared {
-            ScopedExecutionContext::prepared(&self.snapshot, p)
-        } else {
-            ScopedExecutionContext::committed(&self.snapshot)
-        }
-        .map_err(error)?;
-        let target = self
-            .prepared
-            .as_ref()
-            .map(|p| p.target())
-            .unwrap_or(&self.candidate);
         // Observation is explicitly part of the exact independently replayed
         // scene; keep the editable trace without accumulating hidden observes.
         let mut proof = scenario.clone();
         proof.inputs.push(SemanticInput::Observe {
             point: "result".into(),
         });
+        let (prepared, admission, proof) = if let Some(p) = &self.prepared {
+            let (bound, context, actual) = prepared_replay(&self.snapshot, p, &proof)?;
+            (Some(bound), context, actual)
+        } else {
+            (
+                None,
+                ScopedExecutionContext::committed(&self.snapshot).map_err(error)?,
+                proof,
+            )
+        };
+        let target = prepared
+            .as_ref()
+            .map(|p| p.target())
+            .unwrap_or(&self.candidate);
         let engine = engine(store, gate);
-        let current_scene = if let Some(p) = &self.prepared {
+        let current_scene = if let Some(p) = &prepared {
             engine.accept_prepared_current_scene(store, p, &proof, Disclosure::ExplicitlySelected)
         } else {
             engine.accept_current_scene(&self.snapshot, &proof, Disclosure::ExplicitlySelected)
         }
         .map_err(error)?;
-        let alternative_scene = if let Some(p) = &self.prepared {
+        let alternative_scene = if let Some(p) = &prepared {
             engine.accept_scoped_scene(store, p, &proof, Disclosure::ExplicitlySelected)
         } else {
             accept_scene(
@@ -589,6 +599,7 @@ impl ChangeDraft {
             return Err("The copied versions did not keep the same simulated date. Start a fresh comparison".into());
         }
         gate.check()?;
+        self.prepared = prepared;
         self.scenario = scenario;
         self.current = current;
         self.trial_day = trial_day;

@@ -81,6 +81,8 @@ pub(super) fn check(
             session: SessionState::initial(&program.program)?,
             day: day.unwrap_or(0),
             outputs: vec![],
+            output_participants: vec![],
+            output_participant_count: 0,
         };
         let limits = RuntimeLimits {
             fuel: 10_000_000,

@@ -2192,3 +2192,710 @@ fn copied_day_control_plays_waiting_boundary_without_mutating_live_work() {
     assert_eq!(studio.test_page(), "daily");
     assert_eq!(store.load().unwrap(), before);
 }
+
+#[cfg(unix)]
+fn create_copied_work(
+    h: &mut egui_harness::EguiHarness,
+    studio: &mut ProductStudio,
+    name: &str,
+) -> Record {
+    click(h, studio, "current.navigate.new_work");
+    click(h, studio, "current.field.name");
+    h.text(name);
+    frame(h, studio);
+    click(h, studio, "current.submit");
+    let row = studio
+        .test_current_trial()
+        .unwrap()
+        .retained_records
+        .iter()
+        .find(|row| row.values.get("name") == Some(&text(name)))
+        .unwrap_or_else(|| panic!("Copied creation failed: {}", studio.test_notice()))
+        .clone();
+    click(h, studio, "current.navigate.work");
+    row
+}
+
+#[cfg(unix)]
+#[test]
+fn projection_reprepare_preserves_created_record_identity_and_retained_pair() {
+    let dir = tempdir();
+    let root = dir.path();
+    let path = root.join("tool");
+    let original = program(false);
+    let mut changed = serde_json::to_value(&original.program).unwrap();
+    changed["views"][0]["kind"]["columns"][1]["value"] = serde_json::to_value(int(99)).unwrap();
+    let candidate = capture(changed);
+    let store = ProductStore::create(&path, &original, 20000).unwrap();
+    let done = add(&store, "existing", "Completed history");
+    action(&store, "finish-existing", "complete", &done);
+    let before = store.load().unwrap();
+    let mut studio = ProductStudio::testing(
+        root.into(),
+        Some(transport(root, &candidate)),
+        TestHooks::default(),
+    );
+    settle(&mut studio);
+    change(&mut studio, &path);
+    let mut h = egui_harness::EguiHarness::new(egui::vec2(1600.0, 2400.0));
+    click(
+        &mut h,
+        &mut studio,
+        &format!("studio.finished.job.{}.done", done.id),
+    );
+    let copied = create_copied_work(&mut h, &mut studio, "Copied new work");
+    click(
+        &mut h,
+        &mut studio,
+        &format!("current.row.job.{}.wait", copied.id),
+    );
+    for view in [
+        studio.test_current_trial().unwrap(),
+        studio.test_alternative().unwrap(),
+    ] {
+        let row = view
+            .retained_records
+            .iter()
+            .find(|row| row.id == copied.id)
+            .unwrap_or_else(|| panic!("Copied identity changed: {}", studio.test_notice()));
+        assert_eq!(
+            row.values["waiting"],
+            DataValue::Boolean { value: true },
+            "{}",
+            studio.test_notice()
+        );
+    }
+    assert_eq!(store.load().unwrap(), before);
+    click(&mut h, &mut studio, "studio.defer");
+    assert_eq!(studio.test_page(), "daily", "{}", studio.test_notice());
+    let saved = store.load().unwrap();
+    assert_eq!(saved.active_revision, before.active_revision);
+    assert_eq!(saved.data, before.data);
+    assert_eq!(saved.session, before.session);
+    assert_eq!(
+        saved.decisions.decisions[0].outcome,
+        DecisionOutcome::Deferred
+    );
+    assert_eq!(saved.decisions.decisions[0].status, DecisionStatus::Pending);
+}
+
+#[cfg(unix)]
+#[test]
+fn future_work_keep_current_preserves_replayed_created_record_identity() {
+    let dir = tempdir();
+    let root = dir.path();
+    let path = root.join("tool");
+    let store = ProductStore::create(&path, &program(false), 20000).unwrap();
+    let done = add(&store, "existing", "Completed history");
+    action(&store, "finish-existing", "complete", &done);
+    let before = store.load().unwrap();
+    let mut studio = ProductStudio::testing(
+        root.into(),
+        Some(transport(root, &program(true))),
+        TestHooks::default(),
+    );
+    settle(&mut studio);
+    change(&mut studio, &path);
+    let mut h = egui_harness::EguiHarness::new(egui::vec2(1600.0, 2400.0));
+    click(
+        &mut h,
+        &mut studio,
+        &format!("studio.finished.job.{}.done", done.id),
+    );
+    click(&mut h, &mut studio, "studio.scope.future");
+    let copied = create_copied_work(&mut h, &mut studio, "Future copied work");
+    click(
+        &mut h,
+        &mut studio,
+        &format!("current.row.job.{}.wait", copied.id),
+    );
+    click(&mut h, &mut studio, "studio.trial.next-day");
+    for task in ["calculate", "complete"] {
+        click(
+            &mut h,
+            &mut studio,
+            &format!("current.row.job.{}.{task}", copied.id),
+        );
+    }
+    click(&mut h, &mut studio, "current.action.export");
+    for (view, expected) in [
+        (studio.test_current_trial().unwrap(), 1),
+        (studio.test_alternative().unwrap(), 0),
+    ] {
+        let row = view
+            .retained_records
+            .iter()
+            .find(|row| row.id == copied.id)
+            .unwrap();
+        assert_eq!(
+            row.values["production"],
+            DataValue::Integer { value: expected }
+        );
+    }
+    assert_eq!(store.load().unwrap(), before);
+    click(&mut h, &mut studio, "studio.keep-current");
+    assert_eq!(studio.test_page(), "daily", "{}", studio.test_notice());
+    let saved = store.load().unwrap();
+    assert_eq!(saved.active_revision, before.active_revision);
+    assert_eq!(saved.data, before.data);
+    assert_eq!(saved.session, before.session);
+    assert_eq!(
+        saved.decisions.decisions[0].outcome,
+        DecisionOutcome::KeepCurrent
+    );
+    assert_eq!(saved.decisions.decisions[0].status, DecisionStatus::Active);
+}
+
+fn participant_fixture() -> (CapturedProgram, DataSnapshot, Vec<Record>) {
+    let dir = tempdir();
+    let store = ProductStore::create(&dir.path().join("tool"), &program(false), 20000).unwrap();
+    add(&store, "one", "Same visible result");
+    add(&store, "two", "Same visible result");
+    let data = store.load().unwrap().data;
+    let rows = data.records.clone();
+    let mut app = serde_json::to_value(&program(false).program).unwrap();
+    let references = |values: Vec<DataValue>| {
+        lit(
+            DataValue::List {
+                item_type: Type::reference("job"),
+                items: values,
+            },
+            Type::list(Type::reference("job")),
+        )
+    };
+    let first = participant_emit(references(vec![reference(&rows[0])]));
+    let second = participant_emit(references(vec![reference(&rows[1])]));
+    let missing = DataValue::Reference {
+        entity: "job".into(),
+        record: "absent-row".into(),
+    };
+    let cases = [
+        ("pair", vec![first.clone(), second], vec![]),
+        ("rejected_pair", vec![first], vec![boolean(false)]),
+        (
+            "untracked",
+            vec![participant_emit(lit(
+                DataValue::List {
+                    item_type: Type::Integer,
+                    items: vec![DataValue::Integer { value: 1 }],
+                },
+                Type::list(Type::Integer),
+            ))],
+            vec![],
+        ),
+        (
+            "missing_item",
+            vec![participant_emit(references(vec![missing.clone()]))],
+            vec![],
+        ),
+        (
+            "mixed_items",
+            vec![participant_emit(references(vec![
+                reference(&rows[0]),
+                missing,
+            ]))],
+            vec![],
+        ),
+        (
+            "empty_items",
+            vec![participant_emit(references(vec![]))],
+            vec![],
+        ),
+    ];
+    for (id, steps, ensures) in cases {
+        app["actions"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id":id,"label":id,"parameters":{},"guards":[],"steps":steps,"ensures":ensures
+            }));
+    }
+    (capture(app), data, rows)
+}
+fn participant_emit(items: Expr) -> serde_json::Value {
+    serde_json::json!({"kind":"emit","output":"sheet","items":items,"binding":"item","columns":{
+        "name":lit(text("Identical"),Type::Text),"production":int(0),
+        "promised":lit(DataValue::Date {days:20000},Type::Date),"reminder":boolean(false)
+    }})
+}
+
+#[test]
+fn emission_participants_bind_actual_rows_not_duplicate_bytes_or_other_events() {
+    let (program, data, rows) = participant_fixture();
+    let runtime = product_runtime::LocalRuntime::default();
+    let mut run = runtime
+        .start(
+            &program,
+            &data,
+            &SessionState::initial(&program.program).unwrap(),
+            20000,
+            0,
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    let first_step = runtime
+        .apply(&mut run, &invoke("pair", &[]), "first-event")
+        .unwrap();
+    let outputs = runtime.emitted_artifacts(&run).unwrap();
+    assert_eq!(
+        outputs[0], outputs[1],
+        "The raw outputs really have identical bytes and digests"
+    );
+    let receipts = runtime.emitted_record_participants(&run).unwrap().unwrap();
+    assert_eq!(receipts.len(), 2);
+    for (ordinal, row) in rows.iter().enumerate() {
+        receipts[ordinal]
+            .validate_for(
+                &program,
+                "first-event",
+                ordinal,
+                &outputs[ordinal],
+                &first_step,
+                20000,
+            )
+            .unwrap();
+        let participants = receipts[ordinal].records().unwrap();
+        assert_eq!(participants.len(), 1);
+        assert_eq!(
+            participants[0].record(),
+            &RecordRef {
+                entity: row.entity.clone(),
+                record: row.id.clone()
+            }
+        );
+        assert_eq!(participants[0].created_program(), &row.created_program);
+        assert!(receipts[ordinal]
+            .validate_for(
+                &program,
+                "second-event",
+                ordinal,
+                &outputs[ordinal],
+                &first_step,
+                20000
+            )
+            .is_err());
+        assert!(receipts[ordinal]
+            .validate_for(
+                &program,
+                "first-event",
+                ordinal,
+                &outputs[ordinal],
+                &first_step,
+                20001
+            )
+            .is_err());
+        let mut other_frame = first_step.clone();
+        other_frame.before_data = data.identity().unwrap();
+        other_frame.before_session =
+            canonical_digest(IdentityDomain::Session, &"other copied session").unwrap();
+        assert!(receipts[ordinal]
+            .validate_for(
+                &program,
+                "first-event",
+                ordinal,
+                &outputs[ordinal],
+                &other_frame,
+                20000
+            )
+            .is_err());
+        assert!(receipts[ordinal]
+            .validate_for(
+                &program,
+                "first-event",
+                1 - ordinal,
+                &outputs[ordinal],
+                &first_step,
+                20000
+            )
+            .is_err());
+    }
+    let before = receipts.to_vec();
+    runtime
+        .apply(&mut run, &invoke("pair", &[]), "first-event")
+        .unwrap();
+    assert_eq!(
+        runtime.emitted_record_participants(&run).unwrap().unwrap(),
+        before
+    );
+    assert_eq!(runtime.emitted_artifacts(&run).unwrap().len(), 2);
+    let second_step = runtime
+        .apply(&mut run, &invoke("pair", &[]), "second-event")
+        .unwrap();
+    let receipts = runtime.emitted_record_participants(&run).unwrap().unwrap();
+    assert_eq!(receipts.len(), 4);
+    receipts[2]
+        .validate_for(
+            &program,
+            "second-event",
+            2,
+            &runtime.emitted_artifacts(&run).unwrap()[2],
+            &second_step,
+            20000,
+        )
+        .unwrap();
+    assert!(receipts[0]
+        .validate_for(
+            &program,
+            "second-event",
+            2,
+            &runtime.emitted_artifacts(&run).unwrap()[2],
+            &second_step,
+            20000
+        )
+        .is_err());
+}
+
+#[test]
+fn emission_participants_preserve_rollback_cancellation_and_unknown_collections() {
+    let (program, data, _) = participant_fixture();
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let runtime = product_runtime::LocalRuntime::with_cancellation(cancelled.clone());
+    let mut run = runtime
+        .start(
+            &program,
+            &data,
+            &SessionState::initial(&program.program).unwrap(),
+            20000,
+            0,
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    runtime
+        .apply(&mut run, &invoke("pair", &[]), "first-event")
+        .unwrap();
+    let outputs = runtime.emitted_artifacts(&run).unwrap().to_vec();
+    let receipts = runtime
+        .emitted_record_participants(&run)
+        .unwrap()
+        .unwrap()
+        .to_vec();
+    let saved_data = runtime.data(&run).clone();
+    assert!(runtime
+        .apply(&mut run, &invoke("rejected_pair", &[]), "rejected-event")
+        .is_err());
+    assert_eq!(runtime.emitted_artifacts(&run).unwrap(), outputs);
+    assert_eq!(
+        runtime.emitted_record_participants(&run).unwrap().unwrap(),
+        receipts
+    );
+    assert_eq!(runtime.data(&run), &saved_data);
+    cancelled.store(true, std::sync::atomic::Ordering::Release);
+    assert!(runtime
+        .apply(&mut run, &invoke("pair", &[]), "cancelled-event")
+        .is_err());
+    assert_eq!(
+        runtime.emitted_record_participants(&run).unwrap().unwrap(),
+        receipts
+    );
+    cancelled.store(false, std::sync::atomic::Ordering::Release);
+    for action in ["missing_item", "mixed_items"] {
+        assert!(runtime
+            .apply(&mut run, &invoke(action, &[]), action)
+            .is_err());
+        assert_eq!(runtime.emitted_artifacts(&run).unwrap(), outputs);
+        assert_eq!(
+            runtime.emitted_record_participants(&run).unwrap().unwrap(),
+            receipts
+        );
+        assert_eq!(runtime.data(&run), &saved_data);
+    }
+    for (action, expected_rows) in [("untracked", 1), ("empty_items", 0)] {
+        runtime
+            .apply(&mut run, &invoke(action, &[]), action)
+            .unwrap();
+        assert_eq!(
+            runtime
+                .emitted_artifacts(&run)
+                .unwrap()
+                .last()
+                .unwrap()
+                .rows
+                .len(),
+            expected_rows
+        );
+        assert!(
+            runtime
+                .emitted_record_participants(&run)
+                .unwrap()
+                .unwrap()
+                .last()
+                .unwrap()
+                .records()
+                .is_none(),
+            "{action} must not acquire inferred or partial provenance"
+        );
+    }
+}
+
+#[test]
+fn emission_participant_budget_refuses_whole_emission_without_changing_output() {
+    let (source, mut data, rows) = participant_fixture();
+    let birth = data.events[0].clone();
+    data.records.clear();
+    data.events.clear();
+    for index in 0..64 {
+        let mut row = rows[0].clone();
+        row.id = format!("seed-{index}");
+        let mut event = birth.clone();
+        event.id = format!("event-{index}");
+        event.operation_id = format!("birth-{index}");
+        event.sequence = index + 1;
+        event.changes[0].record = row.id.clone();
+        data.records.push(row);
+        data.events.push(event);
+    }
+    data.generation = 64;
+    data.validate().unwrap();
+    let mut app = serde_json::to_value(&source.program).unwrap();
+    let query = serde_json::from_value(serde_json::json!({"kind":"query","entity":"job","binding":"q","predicate":boolean(true),"sort":[],"limit":1000,"include_archived":true})).unwrap();
+    app["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"bulk","label":"Bulk copied output","parameters":{},"guards":[],"ensures":[],"steps":[
+        {"kind":"for_each","items":lit(DataValue::List { item_type:Type::Integer,items:(0..200).map(|value|DataValue::Integer{value}).collect() },Type::list(Type::Integer)),"binding":"iteration","steps":[participant_emit(query)]}
+    ]}));
+    let program = capture(app);
+    let runtime = product_runtime::LocalRuntime::default();
+    let mut run = runtime
+        .start(
+            &program,
+            &data,
+            &SessionState::initial(&program.program).unwrap(),
+            20000,
+            0,
+            RuntimeLimits {
+                fuel: 10_000_000,
+                elapsed_millis: 60_000,
+                ..RuntimeLimits::default()
+            },
+        )
+        .unwrap();
+    runtime
+        .apply(&mut run, &invoke("bulk", &[]), "bulk-event")
+        .unwrap();
+    let outputs = runtime.emitted_artifacts(&run).unwrap();
+    assert_eq!(outputs.len(), 200);
+    assert!(outputs
+        .iter()
+        .all(|output| output == &outputs[0] && output.rows.len() == 64));
+    let receipts = runtime.emitted_record_participants(&run).unwrap().unwrap();
+    assert_eq!(receipts.len(), outputs.len());
+    let known = MAX_COLLECTION / 64;
+    assert!(receipts[..known]
+        .iter()
+        .all(|receipt| receipt.records().is_some_and(|records| records.len() == 64)));
+    assert!(
+        receipts[known..]
+            .iter()
+            .all(|receipt| receipt.records().is_none()),
+        "An over-bound emission is wholly unavailable, never a truncated subset"
+    );
+}
+
+#[test]
+fn sealed_backup_bytes_and_checkpoint_readback_remain_exact() {
+    use product_backup::{CheckpointShelf, VerifiedBackup};
+    use product_locations::{ToolIdentity, ToolLocations};
+    let dir = tempdir();
+    let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
+    let before = store.load().unwrap();
+    let backup = VerifiedBackup::capture(&store).unwrap();
+    let bytes = backup.to_bytes().unwrap();
+    let identity = ToolIdentity::from_snapshot(&before).unwrap();
+    assert_eq!(backup.summary().unwrap().identity, identity);
+    assert_eq!(backup.clone().to_bytes().unwrap(), bytes);
+    let locations = ToolLocations::create_default_at(&dir.path().join("host")).unwrap();
+    let instance = canonical_digest(IdentityDomain::Evidence, &"checkpoint instance").unwrap();
+    let shelf = CheckpointShelf::for_tool(&locations, &identity, &instance).unwrap();
+    let mut opened =
+        product_backup::open_verified(&dir.path().join("tool"), Some(&identity)).unwrap();
+    let first = opened.checkpoint(&shelf).unwrap();
+    let repeated = shelf.capture(&store).unwrap();
+    assert_eq!(first.path, repeated.path);
+    assert_eq!(fs::read(&first.path).unwrap(), bytes);
+    assert_eq!(
+        VerifiedBackup::from_bytes(&bytes).unwrap().snapshot(),
+        &before
+    );
+    let changed = [bytes.clone(), b" ".to_vec()].concat();
+    fs::write(&first.path, &changed).unwrap();
+    assert!(shelf.capture(&store).is_err());
+    assert_eq!(
+        fs::read(&first.path).unwrap(),
+        changed,
+        "A collision must not overwrite a changed checkpoint"
+    );
+    assert!(VerifiedBackup::from_bytes(&changed).is_err());
+    let mut wrong: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    wrong["payload"]["snapshot"]["session"]["view"] = "unknown-view".into();
+    wrong["payload"]["intentions"]["snapshot"] = serde_json::to_value(
+        canonical_digest(IdentityDomain::Data, &wrong["payload"]["snapshot"]).unwrap(),
+    )
+    .unwrap();
+    wrong["digest"] = serde_json::to_value(
+        canonical_digest(IdentityDomain::Evidence, &wrong["payload"]).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        VerifiedBackup::from_bytes(&canonical_bytes(&wrong).unwrap()).is_err(),
+        "Recomputed checksums do not authorize an invalid replay context"
+    );
+    assert_eq!(backup.to_bytes().unwrap(), bytes);
+    assert_eq!(store.load().unwrap(), before);
+}
+
+#[test]
+fn subsequent_backup_actions_recheck_intention_objects_and_exact_basis() {
+    use product_backup::VerifiedBackup;
+    use product_decisions::{
+        accept_scene, Choice, DecisionEngine, IntentArchive, IntentionBinding,
+    };
+    let dir = tempdir();
+    let path = dir.path().join("tool");
+    let source = other_shape::capture(other_shape::organizer());
+    let store = ProductStore::create(&path, &source, 20000).unwrap();
+    let runtime = product_runtime::LocalRuntime::default();
+    let scenario = other_shape::scenario(
+        &source,
+        vec![
+            other_shape::add("Copied example"),
+            other_shape::invoke("collect", Default::default()),
+            other_shape::invoke("export_people", Default::default()),
+            SemanticInput::Observe {
+                point: "done".into(),
+            },
+        ],
+    );
+    let scene = accept_scene(
+        &runtime,
+        &source,
+        &scenario,
+        Disclosure::Synthetic,
+        RuntimeLimits::default(),
+    )
+    .unwrap();
+    let archive = IntentArchive::new(store.clone());
+    let engine = DecisionEngine::new(runtime, archive.clone());
+    let prepared = engine
+        .prepare_choice(
+            &store,
+            &source,
+            Choice {
+                id: "retained-example".into(),
+                request: "Keep the tested export".into(),
+                rationale: None,
+                scope: DecisionScope {
+                    operations: ["export_people".into()].into(),
+                    population: Population::All,
+                    conditions: Values::new(),
+                    excluded_records: vec![],
+                    unknowns: vec![],
+                },
+                outcome: DecisionOutcome::KeepCurrent,
+                obligations: vec![],
+                binding: IntentionBinding::ObservedOutcome,
+            },
+            vec![scene],
+            "record-example",
+        )
+        .unwrap();
+    let before = engine.adopt(&store, &prepared).unwrap();
+    let sealed = VerifiedBackup::capture(&store).unwrap();
+    let bytes = sealed.to_bytes().unwrap();
+    let old_bundle = archive.export_for(&before).unwrap();
+    let after = store
+        .apply(
+            before.revision,
+            "later-work",
+            &other_shape::add("Actual later work"),
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    assert!(product_decisions::validate_bundle(&after, &old_bundle).is_err());
+    let fresh_bundle = archive.export_for(&after).unwrap();
+    assert!(product_decisions::validate_bundle(&before, &fresh_bundle).is_err());
+    assert_eq!(VerifiedBackup::capture(&store).unwrap().snapshot(), &after);
+    assert_eq!(sealed.snapshot(), &before);
+    assert_eq!(sealed.to_bytes().unwrap(), bytes);
+    let witness = &after.decisions.decisions[0].witness;
+    let object = path.join(format!("extension-{}.json", witness.as_str()));
+    let original = fs::read(&object).unwrap();
+    let mut opened = product_backup::open_verified(&path, None).unwrap();
+    let locations =
+        product_locations::ToolLocations::create_default_at(&dir.path().join("host")).unwrap();
+    let instance = canonical_digest(IdentityDomain::Evidence, &"intention handoff").unwrap();
+    let shelf =
+        product_backup::CheckpointShelf::for_tool(&locations, &opened.summary.identity, &instance)
+            .unwrap();
+    fs::write(&object, b"{changed intention object}").unwrap();
+    assert!(
+        opened.checkpoint(&shelf).is_err(),
+        "The verified-open handoff must freshly check every reachable intention object"
+    );
+    assert!(
+        VerifiedBackup::capture(&store).is_err(),
+        "The same store handle must re-read the referenced object on a subsequent action"
+    );
+    assert_eq!(
+        sealed.to_bytes().unwrap(),
+        bytes,
+        "A sealed historical backup remains its own immutable value, not current-project authority"
+    );
+    assert_eq!(
+        VerifiedBackup::from_bytes(&bytes).unwrap().snapshot(),
+        &before
+    );
+    fs::write(&object, original).unwrap();
+    assert_eq!(VerifiedBackup::capture(&store).unwrap().snapshot(), &after);
+}
+
+#[test]
+fn opened_checkpoint_rechecks_concurrent_work_and_subsequent_object_corruption() {
+    use product_backup::{open_verified, CheckpointShelf, VerifiedBackup};
+    use product_locations::ToolLocations;
+    let dir = tempdir();
+    let path = dir.path().join("tool");
+    let store = ProductStore::create(&path, &program(false), 20000).unwrap();
+    let mut opened = open_verified(&path, None).unwrap();
+    let before = opened.snapshot.clone();
+    let locations = ToolLocations::create_default_at(&dir.path().join("host")).unwrap();
+    let instance = canonical_digest(IdentityDomain::Evidence, &"open handoff").unwrap();
+    let shelf = CheckpointShelf::for_tool(&locations, &opened.summary.identity, &instance).unwrap();
+    // Another writer commits after verified receipt readback but before the
+    // opened value reaches its installation/checkpoint handoff.
+    let after = store
+        .apply(
+            before.revision,
+            "concurrent-add",
+            &invoke(
+                "add",
+                &[
+                    ("name", text("Concurrent work")),
+                    ("promised", DataValue::Date { days: 20010 }),
+                ],
+            ),
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    let receipt = opened.checkpoint(&shelf).unwrap();
+    assert_eq!(receipt.summary.revision, after.revision);
+    assert_eq!(
+        VerifiedBackup::read(&receipt.path).unwrap().snapshot(),
+        &after
+    );
+    assert_eq!(
+        opened.snapshot, before,
+        "The checkpoint must not relabel the old rendered basis"
+    );
+    let object = path.join(format!(
+        "object-{}.json",
+        canonical_digest(IdentityDomain::Data, &after)
+            .unwrap()
+            .as_str()
+    ));
+    let bytes = fs::read(&object).unwrap();
+    fs::write(&object, b"{corrupted snapshot after handoff}").unwrap();
+    assert!(
+        opened.checkpoint(&shelf).is_err(),
+        "A consumed handoff must not become a cross-action cache"
+    );
+    fs::write(&object, bytes).unwrap();
+    assert_eq!(opened.checkpoint(&shelf).unwrap().digest, receipt.digest);
+}

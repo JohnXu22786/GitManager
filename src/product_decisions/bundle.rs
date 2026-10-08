@@ -23,6 +23,16 @@ impl IntentionBundle {
     pub fn object_count(&self) -> usize {
         self.objects.len()
     }
+    /// Byte freshness only, not validation authority. The caller must already
+    /// hold a validated immutable bundle for the exact current snapshot.
+    pub(crate) fn matches_store_objects(&self, store: &ProductStore) -> Result<bool> {
+        for object in &self.objects {
+            if store.read_extension(&object.digest)? != object.bytes {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
 }
 fn reachable(snapshot: &ProjectSnapshot) -> BTreeSet<Digest> {
     snapshot
@@ -56,6 +66,9 @@ pub fn validate_bundle(snapshot: &ProjectSnapshot, bundle: &IntentionBundle) -> 
     let mut sources = vec![];
     let mut accepted = vec![];
     let mut recipes = vec![];
+    // One immutable committed basis and fixed runtime apply throughout this
+    // call. Each scene is still decoded, validated and admitted independently.
+    let mut committed_context = None;
     for object in &bundle.objects {
         if !found.insert(object.digest.clone()) || !expected.contains(&object.digest) {
             return Err(invalid("duplicate or unrelated intention object"));
@@ -77,7 +90,10 @@ pub fn validate_bundle(snapshot: &ProjectSnapshot, bundle: &IntentionBundle) -> 
                 }
                 for s in &scenes {
                     s.validate()?;
-                    ScopedExecutionContext::committed(snapshot)?.verify_seed(
+                    if committed_context.is_none() {
+                        committed_context = Some(ScopedExecutionContext::committed(snapshot)?);
+                    }
+                    committed_context.as_ref().unwrap().verify_seed(
                         &s.program,
                         &s.scenario.seed,
                         s.scenario.clock_day,

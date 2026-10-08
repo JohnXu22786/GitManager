@@ -3843,6 +3843,127 @@ pub struct ExternalRuntimeManifest {
     pub verified_isolation_description: String,
     pub available: bool,
 }
+/// Auxiliary execution evidence, never serialized into source or saved output.
+/// Only the local interpreter constructs these records from resolved Emit items.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmissionRecord {
+    record: RecordRef,
+    created_program: Digest,
+}
+impl EmissionRecord {
+    pub(crate) fn from_record(row: &Record) -> Self {
+        Self {
+            record: RecordRef {
+                entity: row.entity.clone(),
+                record: row.id.clone(),
+            },
+            created_program: row.created_program.clone(),
+        }
+    }
+    pub fn record(&self) -> &RecordRef {
+        &self.record
+    }
+    pub fn created_program(&self) -> &Digest {
+        &self.created_program
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EmissionExecution {
+    before_data: Digest,
+    before_session: Digest,
+    input: Digest,
+    day: i32,
+}
+/// Opaque, run-local evidence for one emission ordinal. Equal output bytes do
+/// not identify participants. Absence means the entire emission is unverified.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmittedRecordParticipants {
+    source: SourceBinding,
+    program: ArtifactRef,
+    operation: Id,
+    ordinal: usize,
+    output: Digest,
+    records: Option<Vec<EmissionRecord>>,
+    execution: Option<EmissionExecution>,
+}
+impl EmittedRecordParticipants {
+    pub(crate) fn from_execution(
+        program: &CapturedProgram,
+        operation: &str,
+        ordinal: usize,
+        output: &LocalArtifact,
+        records: Option<Vec<EmissionRecord>>,
+    ) -> Self {
+        Self {
+            source: program.binding.clone(),
+            program: program.artifact.clone(),
+            operation: operation.into(),
+            ordinal,
+            output: output.digest.clone(),
+            records,
+            execution: None,
+        }
+    }
+    pub(crate) fn bind_step(
+        &mut self,
+        input: &Digest,
+        before_data: &Digest,
+        before_session: &Digest,
+        day: i32,
+    ) {
+        self.execution = Some(EmissionExecution {
+            input: input.clone(),
+            before_data: before_data.clone(),
+            before_session: before_session.clone(),
+            day,
+        });
+    }
+    pub fn records(&self) -> Option<&[EmissionRecord]> {
+        self.records.as_deref()
+    }
+    pub fn validate_for(
+        &self,
+        program: &CapturedProgram,
+        operation: &str,
+        ordinal: usize,
+        output: &LocalArtifact,
+        step: &TraceStep,
+        day: i32,
+    ) -> Result<()> {
+        output.validate()?;
+        require(
+            self.source == program.binding
+                && self.program == program.artifact
+                && self.operation == operation
+                && self.ordinal == ordinal
+                && ordinal < MAX_ITEMS
+                && self.output == output.digest
+                && step.outcome == StepOutcome::Applied,
+            "emission participants belong to another source, operation, ordinal or artifact",
+        )?;
+        let execution = self.execution.as_ref().ok_or_else(|| {
+            ContractError("emission participants have no committed input step".into())
+        })?;
+        require(
+            execution.before_data == step.before_data
+                && execution.before_session == step.before_session
+                && execution.day == day
+                && execution.input
+                    == canonical_digest(IdentityDomain::Input, &(&step.input, &program.artifact))?,
+            "emission participants belong to another replay input frame",
+        )?;
+        if let Some(records) = &self.records {
+            require(
+                !records.is_empty()
+                    && records.len() == output.rows.len()
+                    && records.len() <= MAX_COLLECTION,
+                "emission participant inventory is incomplete or exceeds bounds",
+            )?;
+        }
+        Ok(())
+    }
+}
+
 /// Local generated-app interpreter contract. It must copy initial state, apply
 /// each input atomically, meter nested evaluation and expose the same production
 /// views/artifacts used by daily work. Adapters cannot commit live project data.
@@ -3879,6 +4000,14 @@ pub trait RuntimeAdapter {
         Err(AdapterError::Unsupported(
             "Adapter cannot inspect emitted artifact provenance".into(),
         ))
+    }
+    /// Fresh auxiliary evidence from actual evaluated Emit items. A legacy
+    /// adapter returning None grants no additional record-scope authority.
+    fn emitted_record_participants<'a>(
+        &self,
+        _run: &'a Self::Run,
+    ) -> std::result::Result<Option<&'a [EmittedRecordParticipants]>, AdapterError> {
+        Ok(None)
     }
     fn data<'a>(&self, run: &'a Self::Run) -> &'a DataSnapshot;
     fn session<'a>(&self, run: &'a Self::Run) -> &'a SessionState;

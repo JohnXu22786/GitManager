@@ -129,6 +129,8 @@ struct State {
     session: SessionState,
     day: i32,
     outputs: Vec<LocalArtifact>,
+    output_participants: Vec<EmittedRecordParticipants>,
+    output_participant_count: usize,
 }
 /// An isolated execution copy. Accessors deliberately do not expose mutation.
 pub struct ProductRun {
@@ -708,6 +710,8 @@ impl RuntimeAdapter for LocalRuntime {
                 session: session.clone(),
                 day: clock_day,
                 outputs: vec![],
+                output_participants: vec![],
+                output_participant_count: 0,
             },
             seed: random_seed,
             limits: limits.clone(),
@@ -753,6 +757,7 @@ impl RuntimeAdapter for LocalRuntime {
         }
         let before_data = run.state.data.identity()?;
         let before_session = run.state.session.identity()?;
+        let before_day = run.state.day;
         let mut next = run.state.clone();
         let mut meter = Meter::new(run.limits.clone(), run.fuel.get(), self.cancelled.clone());
         let mut observation = None;
@@ -815,6 +820,14 @@ impl RuntimeAdapter for LocalRuntime {
             outcome,
             diagnostic,
         };
+        for receipt in &mut run.state.output_participants[output_start..] {
+            receipt.bind_step(
+                &request,
+                &step.before_data,
+                &step.before_session,
+                before_day,
+            );
+        }
         run.trace.push(step.clone());
         result?;
         run.receipts
@@ -829,6 +842,12 @@ impl RuntimeAdapter for LocalRuntime {
     }
     fn emitted_artifacts<'a>(&self, run: &'a ProductRun) -> Result<&'a [LocalArtifact]> {
         Ok(run.artifacts())
+    }
+    fn emitted_record_participants<'a>(
+        &self,
+        run: &'a ProductRun,
+    ) -> Result<Option<&'a [EmittedRecordParticipants]>> {
+        Ok(Some(&run.state.output_participants))
     }
     fn data<'a>(&self, run: &'a ProductRun) -> &'a DataSnapshot {
         &run.state.data

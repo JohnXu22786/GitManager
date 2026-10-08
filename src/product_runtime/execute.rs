@@ -214,6 +214,21 @@ impl Transaction<'_> {
                         .find(|o| &o.id == output)
                         .ok_or_else(|| failed("output absent"))?;
                     let (typ, items) = list(evaluate(app, state, items, env, meter)?)?;
+                    // Auxiliary identity evidence must never change Emit's
+                    // business evaluation or partially certify a collection.
+                    let eligible = matches!(typ, Type::Reference { .. })
+                        && !items.is_empty()
+                        && items.len()
+                            <= MAX_COLLECTION.saturating_sub(state.output_participant_count);
+                    let index = eligible.then(|| {
+                        state
+                            .data
+                            .records
+                            .iter()
+                            .map(|row| ((row.entity.as_str(), row.id.as_str()), row))
+                            .collect::<BTreeMap<_, _>>()
+                    });
+                    let mut participants = eligible.then(|| Vec::with_capacity(items.len()));
                     let mut rows = Vec::new();
                     let header = LocalArtifact::from_rows(
                         output,
@@ -228,6 +243,24 @@ impl Transaction<'_> {
                     }
                     for item in items {
                         meter.tick(1)?;
+                        if participants.is_some() {
+                            let resolved = match &item {
+                                DataValue::Reference { entity, record } => {
+                                    index.as_ref().and_then(|index| {
+                                        index.get(&(entity.as_str(), record.as_str()))
+                                    })
+                                }
+                                _ => None,
+                            };
+                            if let Some(row) = resolved {
+                                participants
+                                    .as_mut()
+                                    .unwrap()
+                                    .push(EmissionRecord::from_record(row));
+                            } else {
+                                participants = None;
+                            }
+                        }
                         let mut local = env.clone();
                         local.insert(binding.clone(), (typ.clone(), item));
                         let row = assignments(app, state, columns, &local, meter)?;
@@ -271,6 +304,16 @@ impl Transaction<'_> {
                     if total > meter.limits.output_bytes || state.outputs.len() >= MAX_ITEMS {
                         return Err(exhausted("cumulative output limit"));
                     }
+                    state.output_participant_count += participants.as_ref().map_or(0, Vec::len);
+                    state
+                        .output_participants
+                        .push(EmittedRecordParticipants::from_execution(
+                            self.program,
+                            self.operation,
+                            state.outputs.len(),
+                            &artifact,
+                            participants,
+                        ));
                     state.outputs.push(artifact);
                 }
             }
