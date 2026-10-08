@@ -415,10 +415,18 @@ fn existing_files_remain_untouched_and_write_errors_are_publication_uncertain() 
 #[test]
 fn traversal_and_replaced_selected_parent_are_refused_without_writes() {
     let saved = Saved::new(OutputFormat::Csv, &["Ada"], false);
-    assert!(saved
-        .prepare(0)
-        .select_destination(&saved.root.join("../escape.csv"))
-        .is_err());
+    // Joining onto a canonical Windows verbatim path normalizes away `..`.
+    // Preserve the raw traversal component so the helper actually receives it.
+    let mut traversal = saved.root.as_os_str().to_os_string();
+    traversal.push(std::path::MAIN_SEPARATOR_STR);
+    traversal.push("..");
+    traversal.push(std::path::MAIN_SEPARATOR_STR);
+    traversal.push("escape.csv");
+    let traversal = PathBuf::from(traversal);
+    assert!(traversal
+        .components()
+        .any(|component| component == std::path::Component::ParentDir));
+    assert!(saved.prepare(0).select_destination(&traversal).is_err());
     let parent = saved.root.join("chosen");
     fs::create_dir(&parent).unwrap();
     let path = parent.join("output.csv");
