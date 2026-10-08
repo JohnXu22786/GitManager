@@ -257,6 +257,55 @@ fn required_feature_absence(
     Some(AdapterError::Invalid(error))
 }
 
+/// Declared output channels can be absent in a real new-feature scene. This
+/// applies only to two complete, exact prospective runs with an actual matching
+/// observation and no artifact of that output on either side. Missing points,
+/// missing columns in an emitted artifact and failed/partial runs stay unknown.
+fn completed_output_absence(
+    comparison: &ComparisonReport,
+    before: &CapturedProgram,
+    after: &CapturedProgram,
+    scene: &ScenarioSpec,
+    target: &ObservationTarget,
+) -> bool {
+    let (point, output) = match target {
+        ObservationTarget::OutputCount { point, output }
+        | ObservationTarget::OutputColumn { point, output, .. } => (point, output),
+        _ => return false,
+    };
+    if comparison.state != EvidenceState::Inconclusive
+        || comparison.witness.is_some()
+        || comparison.runs.len() != 2
+    {
+        return false;
+    }
+    comparison
+        .runs
+        .iter()
+        .zip([(before, "before-run"), (after, "after-run")])
+        .all(|(run, (source, id))| {
+            run.id == id
+                && run.state == EvidenceState::Observed
+                && run.errors.is_empty()
+                && run.uncovered.is_empty()
+                && run.validate().is_ok()
+                && run.binding.source == source.binding
+                && run.binding.artifact == source.artifact
+                && scene.identity().ok().as_ref() == Some(&run.binding.scenario_digest)
+                && scene.input_identity().ok().as_ref() == Some(&run.binding.input_digest)
+                && run
+                    .observations
+                    .iter()
+                    .find(|observation| &observation.point == point)
+                    .is_some_and(|observation| {
+                        !observation
+                            .outputs
+                            .iter()
+                            .any(|artifact| &artifact.output == output)
+                    })
+        })
+}
+
 struct ReplayBudget {
     remaining: Cell<usize>,
     cancelled: Arc<AtomicBool>,
@@ -1495,7 +1544,7 @@ pub fn discover(
                             candidate,
                             &scene,
                             &request.decisions,
-                            target,
+                            target.clone(),
                             hypothesis_search.clone(),
                         )?;
                         if !channels_checked {
@@ -1540,6 +1589,24 @@ pub fn discover(
                                     material_unknowns.insert((alternative.binding.identity()?, candidate.binding.identity()?, scene_equivalence_key(&scene)?), format!("Alternative {id} executions differ in material channels without executable property terms: {}", channels.join(", ")));
                                 }
                             }
+                        }
+                        if *new_feature
+                            && completed_output_absence(
+                                &comparison,
+                                alternative,
+                                candidate,
+                                &scene,
+                                &target,
+                            )
+                        {
+                            let output = match &target {
+                                ObservationTarget::OutputCount { output, .. }
+                                | ObservationTarget::OutputColumn { output, .. } => output,
+                                _ => unreachable!("checked output target"),
+                            };
+                            report.coverage.push(format!("Output {output} was absent on both completed prospective runs at {}; no output-value comparison or witness is claimed", target.point()));
+                            report.runs.extend(comparison.runs);
+                            continue;
                         }
                         entry.state = comparison.state;
                         if !matches!(

@@ -58,6 +58,12 @@ fn authored_result_resolves_to_host_lowered_execution_without_rewriting_provenan
         .unwrap();
     let report = discover(&request, &result, &policy, Arc::new(AtomicBool::new(false))).unwrap();
     assert_eq!(result, original);
+    assert!(report.unverified.is_empty(), "{:?}", report.unverified);
+    assert!(report
+        .coverage
+        .iter()
+        .any(|message| message
+            .contains("Output sheet was absent on both completed prospective runs")));
     assert_eq!(
         report.questions.len(),
         1,
@@ -992,4 +998,86 @@ fn pair_receipt_tag_mutations_and_half_pair_cannot_downgrade_to_legacy() {
         ]);
     assert!(collision.validate().is_err());
     assert_eq!(store.load().unwrap(), healthy);
+}
+
+#[test]
+fn one_sided_output_and_failed_prospective_runs_are_not_equal_absence() {
+    fn output_design(value: i64, emits: bool, fails: bool) -> CapturedProgram {
+        let mut raw =
+            serde_json::to_value(design(value, fixture_producer(), false).program).unwrap();
+        raw["outputs"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id":"plan_sheet","label":"Plan output","format":"csv",
+                "columns":[{"id":"quantity","label":"Quantity","value_type":{"kind":"integer"}}]
+            }));
+        if emits {
+            let items = raw["actions"][6]["steps"][0]["items"].clone();
+            raw["actions"][7]["steps"].as_array_mut().unwrap().push(serde_json::json!({
+                "kind":"emit","output":"plan_sheet","items":items,"binding":"row","columns":{"quantity":int(1)}
+            }));
+        }
+        if fails {
+            raw["actions"][7]["guards"] = serde_json::json!([boolean(false)]);
+        }
+        CapturedProgram::capture(
+            &serde_json::to_vec(&raw).unwrap(),
+            "scope-project",
+            fixture_producer(),
+            None,
+        )
+        .unwrap()
+    }
+    for fails in [false, true] {
+        let dir = tempdir();
+        let store = managed_store(&dir.path().join("tool"));
+        let primary = prepare(&store, &output_design(1, false, false), "primary");
+        let authored = output_design(2, true, fails);
+        let alternative = prepare(&store, &authored, "alternative");
+        let (request, result, mut policy) = discovery(&store, &primary, &authored);
+        let proof = PreparedDiscoveryCandidate::from_result(
+            &store.load().unwrap(),
+            &request,
+            &result,
+            "alternative",
+            alternative.clone(),
+            vec![],
+        )
+        .unwrap();
+        policy
+            .retained_history
+            .as_mut()
+            .unwrap()
+            .map_prepared_result(proof)
+            .unwrap();
+        let report =
+            discover(&request, &result, &policy, Arc::new(AtomicBool::new(false))).unwrap();
+        assert!(
+            !report.unverified.is_empty(),
+            "one-sided or failed execution cannot establish equal absence"
+        );
+        assert!(!report.coverage.iter().any(|message| message
+            .contains("Output plan_sheet was absent on both completed prospective runs")));
+        if fails {
+            assert!(report.questions.is_empty());
+            assert!(report
+                .runs
+                .iter()
+                .any(|run| run.binding.artifact == alternative.target().artifact
+                    && run.state == EvidenceState::Failed));
+        } else {
+            assert!(report.runs.iter().any(|run| run.binding.artifact
+                == alternative.target().artifact
+                && run.state == EvidenceState::Observed
+                && run.observations.iter().any(|observation| observation
+                    .outputs
+                    .iter()
+                    .any(|artifact| artifact.output == "plan_sheet"))));
+            assert!(report
+                .unverified
+                .iter()
+                .any(|message| message.contains("unavailable") || message.contains("unverified")));
+        }
+    }
 }
