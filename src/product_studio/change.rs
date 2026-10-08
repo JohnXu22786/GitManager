@@ -26,6 +26,9 @@ pub(super) struct ChangeView {
     pub can_accept: bool,
     pub experienced: bool,
     pub whole_design: bool,
+    pub equivalent: bool,
+    pub partial_scope: bool,
+    pub scope_rows: Vec<Record>,
     pub operations: Vec<String>,
     pub need: String,
     pub origin: String,
@@ -47,6 +50,8 @@ pub(super) struct ChangeDraft {
     pub lifecycle_note: String,
     pub prepared: Option<PreparedScopedChange>,
     structural: bool,
+    equivalent: bool,
+    lifecycle_evidence: String,
     analysis: change_adapter::Analysis,
     scenario: ScenarioSpec,
     current: RuntimeView,
@@ -141,6 +146,10 @@ impl ChangeDraft {
     ) -> Result<Self, String> {
         let analysis = change_adapter::analyze(&snapshot, &candidate)?;
         let structural = analysis.structural || analysis.patches.is_empty();
+        let equivalent = change_adapter::baseline(&snapshot)?
+            .artifact
+            .semantic_digest
+            == candidate.artifact.semantic_digest;
         let runtime = LocalRuntime::default();
         let scenario = ScenarioSpec {
             version: CONTRACT_VERSION,
@@ -175,6 +184,8 @@ impl ChangeDraft {
             lifecycle_note: String::new(),
             prepared: None,
             structural,
+            equivalent,
+            lifecycle_evidence: String::new(),
             analysis,
             scenario,
             current,
@@ -246,6 +257,27 @@ impl ChangeDraft {
                     .map_err(error)?,
             )
         };
+        let mut checker = engine(store, gate);
+        let report = if let Some(p) = &prepared {
+            checker.check_prepared_discovery_candidate(
+                &self.snapshot,
+                p.target(),
+                p,
+                &[],
+                RuntimeLimits::default(),
+            )
+        } else {
+            checker.check_discovery_candidate(
+                &self.snapshot,
+                &self.candidate,
+                &[],
+                RuntimeLimits::default(),
+            )
+        }
+        .map_err(error)?;
+        if report.disposition != crate::product_decisions::CheckDisposition::Ready {
+            return Err("This proposed design does not yet preserve the saved intentions. It needs repair before it can be offered as an acceptable alternative".into());
+        }
         let target = prepared
             .as_ref()
             .map(|p| p.target())
@@ -360,10 +392,10 @@ impl ChangeDraft {
         };
         let trace = serde_json::to_string(&(record, field, &value, &self.scenario.inputs))
             .map_err(error)?;
-        if self.lifecycle_note.len() + trace.len() + 512 > MAX_TEXT_BYTES {
+        if self.lifecycle_evidence.len() + trace.len() + 512 > MAX_TEXT_BYTES {
             return Err("The completion demonstration is too long to retain. Restart with a shorter copied example".into());
         }
-        self.lifecycle_note
+        self.lifecycle_evidence
             .push_str(&format!("Completion demonstration: {trace}. "));
         self.lifecycles.push(LifecycleBinding {
             entity: record.entity.clone(),
@@ -554,7 +586,69 @@ impl ChangeDraft {
                     .unwrap_or_else(|| id.clone())
             })
             .collect();
-        Ok(ChangeView{basis:Basis::capture(&self.snapshot)?,current:self.current.clone(),alternative:self.alternative.clone(),population:self.population.clone(),missing,lifecycle_options:options,can_accept:self.scenes.is_some()&&!required.is_empty()&&required.is_subset(&experienced),experienced:self.scenes.is_some(),whole_design:self.structural,operations,need:self.need.clone(),origin:match &self.candidate.binding.producer{Producer::Fixture{name}=>format!("Synthetic provider fixture: {name}. Copied work is executed locally."),Producer::LiveAgent{provider,invocation_id,..}=>format!("Actual returned source from {provider}, request {invocation_id}. The scoped executable is a separate host-compiled source."),_=>"Exact retained authored source; this is a fresh rehearsal of the saved choice.".into()},lifecycle_note:self.lifecycle_note.clone(),request:self.request.clone()})
+        let mut scope_rows = vec![];
+        if !self.structural && missing.is_empty() {
+            let runtime = LocalRuntime::default();
+            for row in &self.snapshot.data.records {
+                if row.archived {
+                    continue;
+                }
+                let Some(lifecycle) = self.lifecycles.iter().find(|l| l.entity == row.entity)
+                else {
+                    continue;
+                };
+                let reference = RecordRef {
+                    entity: row.entity.clone(),
+                    record: row.id.clone(),
+                };
+                let completed = runtime
+                    .evaluate_record_projection(
+                        self.snapshot.program().map_err(error)?,
+                        &self.snapshot.data,
+                        &reference,
+                        "record",
+                        &lifecycle.completed,
+                        &Type::Boolean,
+                        self.snapshot.clock_day,
+                    )
+                    .map_err(error)?;
+                if completed == (DataValue::Boolean { value: false }) {
+                    scope_rows.push(row.clone());
+                }
+            }
+        }
+        let origin = match &self.candidate.binding.producer {
+            Producer::Fixture {name}=>format!("Synthetic provider fixture: {name}. Copied work is executed locally."),
+            Producer::LiveAgent {provider,invocation_id,..}=>format!("Actual returned source from {provider}, request {invocation_id}. The scoped executable is a separate host-compiled source."),
+            _=>"Exact retained authored source; this is a fresh rehearsal of the saved choice.".into(),
+        };
+        Ok(ChangeView {
+            basis: Basis::capture(&self.snapshot)?,
+            current: self.current.clone(),
+            alternative: self.alternative.clone(),
+            population: self.population.clone(),
+            missing,
+            lifecycle_options: options,
+            can_accept: (self.equivalent && self.alternative.is_some())
+                || (self.scenes.is_some()
+                    && !required.is_empty()
+                    && required.is_subset(&experienced)),
+            experienced: self.scenes.is_some(),
+            whole_design: self.structural,
+            equivalent: self.equivalent,
+            partial_scope: !self.structural
+                && !self.analysis.patches.iter().any(|p| {
+                    matches!(
+                        p.destination,
+                        EffectDestination::Observable { .. } | EffectDestination::EmitItems { .. }
+                    )
+                }),
+            scope_rows,
+            operations,
+            need: self.need.clone(),
+            origin,
+            lifecycle_note: self.lifecycle_note.clone(),
+        })
     }
     pub fn decision(
         &self,
@@ -588,6 +682,18 @@ impl ChangeDraft {
                 return Err("The experienced source is not the actual provider result".into());
             }
         }
+        if self.equivalent
+            && matches!(outcome, DecisionOutcome::Accept { .. })
+            && self.resolves.is_empty()
+        {
+            let engine = engine(store, gate);
+            return if let Some(prepared) = &self.prepared {
+                engine.prepare_managed_change(store, prepared.clone(), &[], &self.operation)
+            } else {
+                engine.prepare_change(store, &self.candidate, &[], &self.operation)
+            }
+            .map_err(error);
+        }
         let (current, alternative) = self
             .scenes
             .clone()
@@ -620,7 +726,8 @@ impl ChangeDraft {
         let choice = Choice {
             id: id("intention"),
             request: self.need.clone(),
-            rationale: (!self.lifecycle_note.is_empty()).then(|| self.lifecycle_note.clone()),
+            rationale: (!self.lifecycle_note.is_empty())
+                .then(|| format!("{} {}", self.lifecycle_note, self.lifecycle_evidence)),
             scope,
             outcome: outcome.clone(),
             obligations: vec![],

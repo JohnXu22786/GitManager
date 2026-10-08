@@ -348,7 +348,11 @@ impl Worker {
         self.journal(|j| j.provider = Some(pending))?;
         self.page = Page::Consent {
             disclosure: prepared.disclosure().clone(),
-            need: request.request.clone(),
+            need: self
+                .journal
+                .as_ref()
+                .map(|j| j.value.need.clone())
+                .unwrap_or_else(|| request.request.clone()),
             request: request.clone(),
             basis: modify_binding.as_ref().map(|(_, basis)| basis.clone()),
         };
@@ -459,7 +463,10 @@ impl Worker {
             let mut change = ChangeDraft::new(
                 current.snapshot.clone(),
                 captures.remove(0),
-                ready.request.request.clone(),
+                self.journal
+                    .as_ref()
+                    .map(|j| j.value.need.clone())
+                    .unwrap_or_else(|| ready.request.request.clone()),
             )?;
             change.request = Some(ready.request);
             change.result = Some(result);
@@ -1394,9 +1401,20 @@ impl Worker {
                 provider,
                 profile,
             } => self.prepare(need.clone(), *provider, *profile, key, gate, true),
-            Action::Trial { input } => self.change_action(key, gate, |draft, store| {
-                draft.trial(store, input.clone(), gate)
-            }),
+            Action::Trial { input } => {
+                #[cfg(test)]
+                if let Some(pause) = &self.config.hooks.before_preview {
+                    pause.reached.store(true, Ordering::Release);
+                    while !pause.release.load(Ordering::Acquire)
+                        && !gate.cancelled.load(Ordering::Acquire)
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                self.change_action(key, gate, |draft, store| {
+                    draft.trial(store, input.clone(), gate)
+                })
+            }
             Action::Scope { population } => self.change_action(key, gate, |draft, store| {
                 draft.set_scope(store, population.clone(), gate)
             }),

@@ -825,7 +825,7 @@ impl ProductStudio {
                             }
                         }
                         ui.collapsing("Choose these unfinished items", |ui| {
-                            for row in &view.current.retained_records {
+                            for row in &view.scope_rows {
                                 if row.archived {
                                     continue;
                                 }
@@ -863,7 +863,7 @@ impl ProductStudio {
                                 ui,
                                 "studio.scope.selected",
                                 "Apply to these unfinished items",
-                                !busy && !self.scope_selection.is_empty(),
+                                !busy && view.partial_scope && !self.scope_selection.is_empty(),
                             ) {
                                 action = Some(Action::Scope {
                                     population: ScopePopulation::SelectedUnfinished {
@@ -896,7 +896,11 @@ impl ProductStudio {
                     if trace.button(
                         ui,
                         "studio.accept",
-                        "Accept the alternative",
+                        if view.equivalent {
+                            "Apply checked wording update"
+                        } else {
+                            "Accept the alternative"
+                        },
                         !busy && view.can_accept,
                     ) {
                         action = Some(Action::Decide {
@@ -924,7 +928,12 @@ impl ProductStudio {
                         ),
                         ("studio.defer", "Decide later", DecisionOutcome::Deferred),
                     ] {
-                        if trace.button(ui, key, label, !busy && view.experienced) {
+                        if trace.button(
+                            ui,
+                            key,
+                            label,
+                            !busy && view.experienced && !view.equivalent,
+                        ) {
                             action = Some(Action::Decide { outcome });
                         }
                     }
@@ -1211,6 +1220,13 @@ impl ProductStudio {
     }
     pub fn test_can_accept(&self) -> bool {
         matches!(&self.page,Page::Change(v) if v.can_accept)
+    }
+    pub fn test_current_trial(&self) -> Option<&RuntimeView> {
+        if let Page::Change(v) = &self.page {
+            Some(&v.current)
+        } else {
+            None
+        }
     }
     pub fn test_alternative(&self) -> Option<&RuntimeView> {
         if let Page::Change(v) = &self.page {
