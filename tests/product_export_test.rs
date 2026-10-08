@@ -32,6 +32,10 @@ impl Saved {
         let temp = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(temp.path()).unwrap();
         let mut source = organizer();
+        // Query defaults to generated record-ID order. Declare the row order
+        // this fixture expects rather than depending on hash ordering.
+        source["actions"][1]["steps"][0]["items"]["sort"] =
+            json!([{"value":field(var("item"),"name"),"descending":false}]);
         source["outputs"][0]["format"] = json!(format);
         source["outputs"][0]["columns"] = json!([
             {"id":"z_name","label":"Name","value_type":{"kind":"text"}},
