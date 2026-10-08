@@ -3070,3 +3070,98 @@ fn resumed_outputs_keep_history_without_fabricating_participant_authority() {
         run = resumed;
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn scoped_navigation_and_clock_do_not_establish_business_experience() {
+    let dir = tempdir();
+    let root = dir.path();
+    let path = root.join("tool");
+    let store = ProductStore::create(&path, &program(false), 20000).unwrap();
+    let row = add(&store, "existing", "Try this work");
+    let before = store.load().unwrap();
+    let mut studio = ProductStudio::testing(
+        root.into(),
+        Some(transport(root, &program(true))),
+        TestHooks::default(),
+    );
+    settle(&mut studio);
+    change(&mut studio, &path);
+    let mut h = egui_harness::EguiHarness::new(egui::vec2(1600.0, 2400.0));
+    click(
+        &mut h,
+        &mut studio,
+        &format!("current.row.job.{}.complete", row.id),
+    );
+    click(
+        &mut h,
+        &mut studio,
+        &format!("studio.finished.job.{}.done", row.id),
+    );
+    let choices = [
+        "studio.either",
+        "studio.both",
+        "studio.neither",
+        "studio.defer",
+    ];
+    for control in ["current.navigate.new_work", "studio.trial.next-day"] {
+        click(&mut h, &mut studio, control);
+        let trace = frame(&mut h, &mut studio);
+        for key in choices {
+            assert!(
+                !trace.controls[key].enabled,
+                "{control} must not create a business task for {key}"
+            );
+        }
+        assert_eq!(store.load().unwrap(), before);
+    }
+    for outcome in [
+        DecisionOutcome::EitherAcceptable,
+        DecisionOutcome::BothNeeded,
+        DecisionOutcome::NeitherFits,
+        DecisionOutcome::Deferred,
+    ] {
+        studio.test_decide_exact(outcome);
+        settle(&mut studio);
+        assert!(
+            studio.test_notice().contains("business task"),
+            "{}",
+            studio.test_notice()
+        );
+        assert_eq!(
+            store.load().unwrap(),
+            before,
+            "The worker must refuse the same unexperienced choice even without its disabled button"
+        );
+    }
+    click(&mut h, &mut studio, "current.navigate.work");
+    click(
+        &mut h,
+        &mut studio,
+        &format!("current.row.job.{}.calculate", row.id),
+    );
+    let trace = frame(&mut h, &mut studio);
+    for key in choices {
+        assert!(
+            trace.controls[key].enabled,
+            "An actual independently replayed business task must enable {key}: {}",
+            studio.test_notice()
+        );
+    }
+    click(&mut h, &mut studio, "studio.defer");
+    assert_eq!(studio.test_page(), "daily", "{}", studio.test_notice());
+    let saved = store.load().unwrap();
+    assert_eq!(saved.data, before.data);
+    assert_eq!(saved.session, before.session);
+    assert_eq!(saved.clock_day, before.clock_day);
+    assert_eq!(saved.artifacts, before.artifacts);
+    assert_eq!(saved.active_revision, before.active_revision);
+    assert_eq!(
+        saved.decisions.decisions.last().unwrap().outcome,
+        DecisionOutcome::Deferred
+    );
+    assert_eq!(
+        saved.decisions.decisions.last().unwrap().status,
+        DecisionStatus::Pending
+    );
+}

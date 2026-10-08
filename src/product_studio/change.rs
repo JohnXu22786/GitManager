@@ -804,13 +804,14 @@ impl ChangeDraft {
             can_keep_current: experienced_scope && !wording_update,
             can_retain: self.scenes.is_some()
                 && !required.is_empty()
+                && !experienced.is_empty()
                 && !same_alternative
                 && !wording_update,
             same_alternative,
             readiness_notes: vec![],
             whole_design: self.structural,
             wording_update,
-            needs_task: !wording_update && required.is_empty(),
+            needs_task: !wording_update && experienced.is_empty(),
             partial_scope: !self.structural
                 && !self.analysis.patches.iter().any(|p| {
                     matches!(
