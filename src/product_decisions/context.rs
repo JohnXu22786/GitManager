@@ -41,6 +41,55 @@ impl VerifiedDiscoveryScene {
     }
 }
 impl<R: RuntimeAdapter> DecisionEngine<R> {
+    fn pending_scene_package(
+        &self,
+        current: &ProjectSnapshot,
+        decision: &ScopedDecision,
+    ) -> Result<Vec<AcceptedScene>> {
+        if self.archive.snapshot()? != *current {
+            return Err(DecisionError::Unverified(
+                "Saved work changed before reading the pending comparison".into(),
+            ));
+        }
+        if decision.status != DecisionStatus::Pending
+            || !current.decisions.decisions.contains(decision)
+        {
+            return Err(invalid(
+                "the exact pending decision is not in this saved tool",
+            ));
+        }
+        self.archive.accepted_scenes(decision)
+    }
+    /// Reproduce the original scenes of one exact pending decision without
+    /// claiming that Current implements their prospective actions or state.
+    /// Returned originals are checked history, not fresh-copy adoption authority.
+    pub fn pending_original_scenes(
+        &self,
+        current: &ProjectSnapshot,
+        decision: &ScopedDecision,
+    ) -> Result<Vec<AcceptedScene>> {
+        current.validate()?;
+        validate_withdrawal_history(current)?;
+        // The shared package gate verifies the full pending decision, project,
+        // source and ordered scene identities against the exact current store.
+        let scenes = self.pending_scene_package(current, decision)?;
+        for scene in &scenes {
+            let (_, contexts) = self.reproduce_scene(scene, &current.decisions)?;
+            if assess_scope(&decision.scope, &contexts) != ScopeMatch::Applies {
+                return Err(DecisionError::Unverified(
+                    "The original scene does not establish the pending decision's applicability"
+                        .into(),
+                ));
+            }
+        }
+        if self.archive.snapshot()? != *current {
+            return Err(DecisionError::Unverified(
+                "Saved work changed while checking the pending comparison".into(),
+            ));
+        }
+        Ok(scenes)
+    }
+
     /// Project applicable pending history onto the current executable through
     /// its retained source-qualified mappings. Exact prospective-pair scenes
     /// whose new operations are absent from current keep their original replay
@@ -52,6 +101,11 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
     ) -> Result<Vec<VerifiedDiscoveryScene>> {
         current.validate()?;
         validate_withdrawal_history(current)?;
+        if self.archive.snapshot()? != *current {
+            return Err(DecisionError::Unverified(
+                "Saved work changed before checking pending history".into(),
+            ));
+        }
         let target = current.program()?;
         let pending: Vec<_> = current
             .decisions
@@ -62,16 +116,18 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         let mappings = self.current_mappings(current)?;
         let mut result = vec![];
         for decision in pending {
-            let scenes = self.archive.load(&decision.witness)?;
-            validate_scene_bindings(decision, &scenes)?;
-            if scenes
-                .iter()
-                .map(|s| s.scenario.identity())
-                .collect::<std::result::Result<Vec<_>, _>>()?
-                != decision.scenarios
-            {
-                return Err(invalid("pending scene identities differ from the decision"));
-            }
+            let scenes = self.pending_scene_package(current, decision)?;
+            // Ordinary pairs have no compiler rehearsal receipts. Preserve
+            // only two distinct authenticated prospective sources on the same
+            // complete input, with no managed source or Current-side claim.
+            let ordinary_pair = current.editable_scope_context()?.is_none()
+                && scenes.len() == 2
+                && scenes[0].program() != scenes[1].program()
+                && scenes[0].scenario() == scenes[1].scenario()
+                && scenes.iter().all(|scene| {
+                    scene.program() != target
+                        && !crate::product_runtime::has_protected_fields(scene.program())
+                });
             for scene in scenes {
                 let (original, contexts) = self.reproduce_scene(&scene, &current.decisions)?;
                 match assess_scope(&decision.scope, &contexts) {
@@ -86,17 +142,19 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 // A retained two-prospective design may introduce an action
                 // absent from live current. Preserve its actual replay source;
                 // it is not an observation of current or an equivalence claim.
-                // The archive has already checked this exact scene package
-                // against both immutable proofs and their shared recording.
+                // Managed pairs retain their exact compiler proofs. Ordinary
+                // pairs passed the bounded source/input checks above. Both
+                // routes still independently replay originals and assess scope.
                 let paired: Vec<_> = current
                     .scope
                     .rehearsals
                     .values()
                     .filter(|proof| proof.witnesses.get(&decision.id) == Some(&decision.witness))
                     .collect();
-                if paired.len() == 2
+                let managed_pair = paired.len() == 2
                     && paired[0].recorded_by == paired[1].recorded_by
-                    && paired[0].manifest.basis == paired[1].manifest.basis
+                    && paired[0].manifest.basis == paired[1].manifest.basis;
+                if (managed_pair || ordinary_pair)
                     && scene.scenario.validate(&target.program).is_err()
                 {
                     let operations = contexts
@@ -195,6 +253,11 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                     operations,
                 });
             }
+        }
+        if self.archive.snapshot()? != *current {
+            return Err(DecisionError::Unverified(
+                "Saved work changed while checking pending history".into(),
+            ));
         }
         Ok(result)
     }

@@ -745,14 +745,17 @@ fn observation_only_minimum_keeps_original_example_and_replays_actions_for_recor
     assert_eq!(engine(&store).discovery_scenes(&saved).unwrap().len(), 2);
 }
 
-fn current_alternative_queue(
+fn ordinary_or_managed_queue(
     managed: bool,
     synthetic: bool,
+    two_prospective: bool,
 ) -> (
     tempfile::TempDir,
     ProductStore,
     product_store::ProjectSnapshot,
     DiscoveryQueue,
+    DevelopmentResult,
+    DiscoveryPolicy,
 ) {
     let dir = tempdir();
     let path = dir.path().join("tool");
@@ -768,7 +771,12 @@ fn current_alternative_queue(
             .unwrap();
         store
     } else {
-        ProductStore::create(&path, &design(3, fixture_producer(), false), 20000).unwrap()
+        let current = if two_prospective {
+            program(true)
+        } else {
+            design(3, fixture_producer(), false)
+        };
+        ProductStore::create(&path, &current, 20000).unwrap()
     };
     add(&store, "real-row", "Real saved work");
     let basis = store.load().unwrap();
@@ -812,6 +820,12 @@ fn current_alternative_queue(
         },
     };
     let current = basis.program().unwrap();
+    let first = if two_prospective { target } else { current };
+    let second = if two_prospective {
+        design(2, fixture_producer(), false)
+    } else {
+        target.clone()
+    };
     let result = DevelopmentResult {
         producer: fixture_producer(),
         response: DevelopmentResponse {
@@ -819,12 +833,12 @@ fn current_alternative_queue(
             request_digest: d.request().identity().unwrap(),
             candidates: vec![
                 GeneratedCandidate {
-                    id: "current".into(),
-                    source_json: String::from_utf8(current.source_bytes.clone()).unwrap(),
+                    id: "first".into(),
+                    source_json: String::from_utf8(first.source_bytes.clone()).unwrap(),
                 },
                 GeneratedCandidate {
-                    id: "primary".into(),
-                    source_json: String::from_utf8(target.source_bytes.clone()).unwrap(),
+                    id: "second".into(),
+                    source_json: String::from_utf8(second.source_bytes.clone()).unwrap(),
                 },
             ],
             hypotheses: vec![ChoiceHypothesis {
@@ -838,7 +852,7 @@ fn current_alternative_queue(
                     raw_digest: target.artifact.raw_digest.clone(),
                     pointer: "/actions/7".into(),
                 }],
-                alternatives: vec!["current".into(), "primary".into()],
+                alternatives: vec!["first".into(), "second".into()],
                 related_decisions: vec![],
                 scenario_json: serde_json::to_string(&scenario).unwrap(),
                 unknowns: vec![],
@@ -851,15 +865,49 @@ fn current_alternative_queue(
     policy
         .workflow_validity
         .insert("plan".into(), vec![requirement]);
+    if two_prospective {
+        // This is an independent host requirement, not provider-authored
+        // permission to treat an arbitrary missing Current feature as a choice.
+        policy.required_actions.insert("plan".into());
+        policy.requirements.push(RequirementCase {
+            id: "positive-new-plan".into(),
+            scenario: scenario.clone(),
+            properties: vec![AcceptedProperty {
+                id: "positive".into(),
+                description: "The requested action produces a positive plan".into(),
+                predicate: PropertyPredicate::Less {
+                    left: PropertyTerm::Literal {
+                        value_type: Type::Integer,
+                        value: DataValue::Integer { value: 0 },
+                    },
+                    right: PropertyTerm::Observed {
+                        point: "result".into(),
+                        observable: "planned".into(),
+                        value_type: Type::Integer,
+                    },
+                },
+            }],
+        });
+    }
     let q = d
-        .evaluate(&store, result, policy, vec![], cancel())
+        .evaluate(&store, result.clone(), policy.clone(), vec![], cancel())
         .unwrap();
-    (dir, store, basis, q)
+    if two_prospective {
+        assert!(
+            !q.report().questions.is_empty(),
+            "No checked ordinary question: logs={:?}, defects={:?}, unverified={:?}, coverage={:?}",
+            q.report().log,
+            q.report().defects,
+            q.report().unverified,
+            q.report().coverage
+        );
+    }
+    (dir, store, basis, q, result, policy)
 }
 
 #[test]
 fn ordinary_unprepared_design_can_be_experienced_and_selected_on_saved_work() {
-    let (_dir, store, basis, q) = current_alternative_queue(false, false);
+    let (_dir, store, basis, q, _, _) = ordinary_or_managed_queue(false, false, false);
     let pair = open(&store, &q);
     let artifact = pair
         .scenes()
@@ -892,7 +940,7 @@ fn ordinary_unprepared_design_can_be_experienced_and_selected_on_saved_work() {
 }
 
 fn assert_current_alternative_reopens(managed: bool) {
-    let (dir, store, basis, q) = current_alternative_queue(managed, false);
+    let (dir, store, basis, q, _, _) = ordinary_or_managed_queue(managed, false, false);
     let pair = open(&store, &q);
     let alternative = pair
         .scenes()
@@ -981,8 +1029,440 @@ fn managed_current_alternative_pending_choice_reopens_without_current_rehearsal(
 }
 
 #[test]
+fn pending_new_layer_reopens_through_its_rule_comparison() {
+    let dir = tempdir();
+    let store = ProductStore::create(&dir.path().join("tool"), &program(false), 20000).unwrap();
+    let row = add(&store, "row", "Waiting work");
+    action(&store, "wait", "wait", &row);
+    tick(&store, "days", 20003);
+    let basis = store.load().unwrap();
+    let proposal = store
+        .prepare_scoped_change(
+            &program(true),
+            &request(&basis, product_store::scope::ScopePopulation::All),
+            "new-layer",
+        )
+        .unwrap();
+    let scenario = ScenarioSpec {
+        version: 1,
+        id: "pending-rule".into(),
+        label: "Compare a waiting rule".into(),
+        seed: proposal.seed().clone(),
+        session: SessionState::initial(&proposal.target().program).unwrap(),
+        clock_day: basis.clock_day,
+        random_seed: 42,
+        inputs: vec![
+            invoke("calculate", &[("row", reference(&row))]),
+            invoke("complete", &[("row", reference(&row))]),
+            invoke("export", &[]),
+            SemanticInput::Observe {
+                point: "result".into(),
+            },
+        ],
+        validity: vec![],
+    };
+    let checker = engine(&store);
+    let current = checker
+        .accept_prepared_current_scene(&store, &proposal, &scenario, Disclosure::ExplicitlySelected)
+        .unwrap();
+    let alternative = checker
+        .accept_scoped_scene(&store, &proposal, &scenario, Disclosure::ExplicitlySelected)
+        .unwrap();
+    let pending = Choice {
+        id: "pending-rule".into(),
+        request: "Keep this rule choice".into(),
+        rationale: None,
+        scope: proposal.scope().clone(),
+        outcome: DecisionOutcome::Deferred,
+        obligations: vec![],
+        binding: IntentionBinding::ObservedOutcome,
+    };
+    let change = checker
+        .prepare_rehearsed_choice(
+            &store,
+            proposal,
+            pending,
+            vec![current, alternative],
+            &[],
+            "record-rule",
+        )
+        .unwrap();
+    let saved = checker.adopt(&store, &change).unwrap();
+    assert!(matches!(
+        PairExperience::reopen(&store, "pending-rule", "reopen-rule", cancel()),
+        Err(AdmissionError::RuleComparisonRequired)
+    ));
+    assert_eq!(store.load().unwrap(), saved);
+}
+
+#[test]
+fn reopened_choice_observes_actions_after_the_original_last_point() {
+    let dir = tempdir();
+    let current = design(1, fixture_producer(), false);
+    let store = ProductStore::create(&dir.path().join("tool"), &current, 20000).unwrap();
+    let row = add(&store, "row", "Copied work");
+    let basis = store.load().unwrap();
+    let alternative = design(2, fixture_producer(), false);
+    let mut scenario = scene(&basis, &current);
+    scenario
+        .inputs
+        .push(invoke("wait", &[("row", reference(&row))]));
+    let checker = engine(&store);
+    let a = checker
+        .accept_current_scene(&basis, &scenario, Disclosure::ExplicitlySelected)
+        .unwrap();
+    let b = accept_scene(
+        &LocalRuntime::default(),
+        &alternative,
+        &scenario,
+        Disclosure::ExplicitlySelected,
+        RuntimeLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        a.observations().last().unwrap().values["waiting_jobs"],
+        DataValue::Integer { value: 0 }
+    );
+    let mut pending = choice(DecisionOutcome::Deferred);
+    pending.scope.operations.insert("wait".into());
+    let saved = checker
+        .prepare_choice(&store, &current, pending, vec![a, b], "save-tail")
+        .unwrap();
+    checker.adopt(&store, &saved).unwrap();
+    let mut fresh =
+        PairExperience::reopen(&store, "pending-designs", "reopen-tail", cancel()).unwrap();
+    assert!(!fresh.view().minimal);
+    for (index, accepted) in fresh.scenes().unwrap().iter().enumerate() {
+        assert_eq!(
+            accepted.observations().last().unwrap().view,
+            fresh.view().runs[index].observation
+        );
+        assert_eq!(
+            accepted.observations().last().unwrap().values["waiting_jobs"],
+            DataValue::Integer { value: 1 }
+        );
+        assert_eq!(accepted.observations()[0].point, "result");
+    }
+    fresh
+        .trial(
+            &store,
+            invoke("resume", &[("row", reference(&row))]),
+            cancel(),
+        )
+        .unwrap();
+    for (index, accepted) in fresh.scenes().unwrap().iter().enumerate() {
+        assert_eq!(
+            accepted.observations().len(),
+            2,
+            "Only the host-owned trailing point is replaced"
+        );
+        assert_eq!(
+            accepted.observations().last().unwrap().view,
+            fresh.view().runs[index].observation
+        );
+        assert_eq!(
+            accepted.observations().last().unwrap().values["waiting_jobs"],
+            DataValue::Integer { value: 0 }
+        );
+    }
+    let resolved = fresh
+        .prepare_choice(
+            &store,
+            &fresh.view().ticket,
+            DecisionOutcome::KeepCurrent,
+            "tail-current",
+            "resolve-tail",
+            &["pending-designs".into()],
+            cancel(),
+        )
+        .unwrap();
+    let adopted = checker.adopt(&store, &resolved).unwrap();
+    assert_eq!(adopted.data, basis.data);
+    assert_eq!(adopted.session, basis.session);
+}
+
+#[test]
+fn ordinary_prospective_pair_reopens_when_current_lacks_the_new_feature() {
+    let (dir, store, basis, q, mut next_result, policy) =
+        ordinary_or_managed_queue(false, false, true);
+    assert!(!basis
+        .program()
+        .unwrap()
+        .program
+        .actions
+        .iter()
+        .any(|action| action.id == "plan"));
+    let pair = open(&store, &q);
+    assert_eq!(pair.view().labels, ["Option A", "Option B"]);
+    let pending = pair
+        .prepare_choice(
+            &store,
+            &pair.view().ticket,
+            DecisionOutcome::BothNeeded,
+            "new-ordinary-feature",
+            "record-new-feature",
+            &[],
+            cancel(),
+        )
+        .unwrap();
+    let recorded = engine(&store).adopt(&store, &pending).unwrap();
+    assert_eq!(recorded.program().unwrap(), basis.program().unwrap());
+    assert_eq!(recorded.data, basis.data);
+    let late = add(&store, "later-ordinary-feature", "Later saved work");
+    let reopened = ProductStore::open(&dir.path().join("tool")).unwrap();
+    let fresh = PairExperience::reopen(
+        &reopened,
+        "new-ordinary-feature",
+        "reopen-new-feature",
+        cancel(),
+    )
+    .unwrap();
+    assert_eq!(fresh.view().labels, ["Option A", "Option B"]);
+    for scene in fresh.scenes().unwrap() {
+        assert!(scene
+            .scenario()
+            .seed
+            .records
+            .iter()
+            .any(|r| r.id == late.id));
+        assert!(scene
+            .program()
+            .program
+            .actions
+            .iter()
+            .any(|a| a.id == "plan"));
+    }
+    // A saved pending need must survive the next real Modify -> Discover
+    // envelope and retained-history evaluation before the person resolves it.
+    let authored = design(1, fixture_producer(), false);
+    let (modify_request, modify_result) = modify(&reopened, &authored);
+    let next = DiscoveryDraft::after_modify(
+        &reopened,
+        &reopened.load().unwrap(),
+        modify_request,
+        modify_result,
+        "changed",
+        None,
+        "discover-after-pending",
+        "Keep the saved planning need",
+        cancel(),
+    )
+    .unwrap();
+    assert_eq!(next.request().accepted_scenes.len(), 2);
+    assert!(next
+        .request()
+        .accepted_scenes
+        .iter()
+        .all(|scene| scene.decision == "new-ordinary-feature"));
+    next_result.response.request_digest = next.request().identity().unwrap();
+    let repeated = next
+        .evaluate(&reopened, next_result, policy, vec![], cancel())
+        .unwrap();
+    assert!(
+        repeated.report().questions.is_empty(),
+        "{:?}",
+        repeated.report().log
+    );
+    assert!(
+        repeated
+            .report()
+            .log
+            .iter()
+            .any(|entry| entry.disposition == Disposition::Settled),
+        "{:?}",
+        repeated.report().log
+    );
+    let selected = DecisionOutcome::Accept {
+        artifact: fresh.scenes().unwrap()[0]
+            .program()
+            .artifact
+            .program_digest
+            .clone(),
+    };
+    let change = fresh
+        .prepare_choice(
+            &reopened,
+            &fresh.view().ticket,
+            selected,
+            "ordinary-feature-selected",
+            "resolve-new-feature",
+            &["new-ordinary-feature".into()],
+            cancel(),
+        )
+        .unwrap();
+    let adopted = engine(&reopened).adopt(&reopened, &change).unwrap();
+    assert!(adopted
+        .program()
+        .unwrap()
+        .program
+        .actions
+        .iter()
+        .any(|action| action.id == "plan"));
+    assert!(adopted.data.records.iter().any(|r| r.id == late.id));
+    assert!(matches!(
+        adopted.decisions.decisions[0].status,
+        DecisionStatus::Superseded { .. }
+    ));
+}
+
+#[test]
+fn pending_original_replay_requires_exact_fresh_pending_decision() {
+    let (_dir, store, _, q, _, _) = ordinary_or_managed_queue(false, false, false);
+    let pair = open(&store, &q);
+    let prepared = pair
+        .prepare_choice(
+            &store,
+            &pair.view().ticket,
+            DecisionOutcome::Deferred,
+            "history-check",
+            "record-history-check",
+            &[],
+            cancel(),
+        )
+        .unwrap();
+    let checker = engine(&store);
+    let recorded = checker.adopt(&store, &prepared).unwrap();
+    let decision = recorded.decisions.decisions[0].clone();
+    let originals = checker
+        .pending_original_scenes(&recorded, &decision)
+        .unwrap();
+    assert_eq!(originals, pair.scenes().unwrap().to_vec());
+
+    let mut wrong = decision.clone();
+    wrong.id = "absent-decision".into();
+    assert!(checker.pending_original_scenes(&recorded, &wrong).is_err());
+    let mut tampered = decision.clone();
+    tampered.request = "A different claimed need".into();
+    assert!(checker
+        .pending_original_scenes(&recorded, &tampered)
+        .is_err());
+    tampered = decision.clone();
+    tampered.witness = canonical_digest(IdentityDomain::Evidence, &"different-scenes").unwrap();
+    assert!(checker
+        .pending_original_scenes(&recorded, &tampered)
+        .is_err());
+
+    add(&store, "later-history-check", "Later saved work");
+    let current = store.load().unwrap();
+    assert!(checker
+        .pending_original_scenes(&recorded, &decision)
+        .is_err());
+    assert_eq!(
+        checker
+            .pending_original_scenes(&current, &decision)
+            .unwrap(),
+        originals
+    );
+    let reopened =
+        PairExperience::reopen(&store, "history-check", "reopen-history-check", cancel()).unwrap();
+    let selected = reopened
+        .prepare_choice(
+            &store,
+            &reopened.view().ticket,
+            DecisionOutcome::KeepCurrent,
+            "history-selected",
+            "resolve-history-check",
+            &["history-check".into()],
+            cancel(),
+        )
+        .unwrap();
+    let adopted = checker.adopt(&store, &selected).unwrap();
+    let past = adopted
+        .decisions
+        .decisions
+        .iter()
+        .find(|d| d.id == "history-check")
+        .unwrap();
+    assert!(matches!(past.status, DecisionStatus::Superseded { .. }));
+    assert!(checker
+        .pending_original_scenes(&adopted, &decision)
+        .is_err());
+    assert!(checker.pending_original_scenes(&adopted, past).is_err());
+    let active = adopted
+        .decisions
+        .decisions
+        .iter()
+        .find(|d| d.status == DecisionStatus::Active)
+        .unwrap();
+    assert!(checker.pending_original_scenes(&adopted, active).is_err());
+    assert!(checker.discovery_scenes(&adopted).unwrap().is_empty());
+    let mut verifier = engine(&store);
+    let losing_feature =
+        verifier.check_discovery_candidate(&adopted, &program(true), &[], RuntimeLimits::default());
+    assert!(losing_feature.map(|report| report.disposition != CheckDisposition::Ready).unwrap_or(true),
+        "An active promise cannot become unrelated historical evidence when the proposed tool loses its feature");
+    assert_eq!(store.load().unwrap(), adopted);
+}
+
+#[test]
+fn pending_history_keeps_current_replay_and_rejects_mismatched_pairs() {
+    for current_has_feature in [true, false] {
+        let dir = tempdir();
+        let current = if current_has_feature {
+            design(3, fixture_producer(), false)
+        } else {
+            program(true)
+        };
+        let store = ProductStore::create(&dir.path().join("tool"), &current, 20000).unwrap();
+        add(&store, "row", "Saved work");
+        let basis = store.load().unwrap();
+        let a = design(1, fixture_producer(), false);
+        let b = design(2, fixture_producer(), false);
+        let first = scene(&basis, &a);
+        let mut second = first.clone();
+        if !current_has_feature {
+            second.id = "a-different-saved-scenario".into();
+        }
+        let original_a = accept_scene(
+            &LocalRuntime::default(),
+            &a,
+            &first,
+            Disclosure::ExplicitlySelected,
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+        let original_b = accept_scene(
+            &LocalRuntime::default(),
+            &b,
+            &second,
+            Disclosure::ExplicitlySelected,
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+        let checker = engine(&store);
+        let change = checker
+            .prepare_choice(
+                &store,
+                basis.program().unwrap(),
+                choice(DecisionOutcome::BothNeeded),
+                vec![original_a, original_b],
+                "record-boundary",
+            )
+            .unwrap();
+        let saved = checker.adopt(&store, &change).unwrap();
+        if current_has_feature {
+            let mapped = checker.discovery_scenes(&saved).unwrap();
+            assert_eq!(mapped.len(), 2);
+            for scene in mapped {
+                assert_eq!(scene.replay().binding.source, current.binding);
+                assert_ne!(scene.original().binding.source, current.binding);
+            }
+            let mut tampered = saved.clone();
+            tampered.decisions.decisions[0].request = "Altered claimed history".into();
+            assert!(checker.discovery_scenes(&tampered).is_err());
+        } else {
+            assert!(
+                checker.discovery_scenes(&saved).is_err(),
+                "Different original scenarios cannot enter the same-input prospective fallback"
+            );
+        }
+        assert_eq!(store.load().unwrap(), saved);
+    }
+}
+
+#[test]
 fn synthetic_record_example_is_playable_without_fabricating_a_current_copy() {
-    let (_dir, store, basis, q) = current_alternative_queue(false, true);
+    let (_dir, store, basis, q, _, _) = ordinary_or_managed_queue(false, true, false);
     let question = &q.report().questions[0];
     let view = q.checked_view(&store, cancel()).unwrap();
     assert!(view.questions[0].witnesses[0].playable);

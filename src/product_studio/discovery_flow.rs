@@ -14,7 +14,7 @@ use crate::product_discovery::{
 use crate::product_protocol::RuntimeView;
 use crate::product_runtime::{LocalRuntime, ReplayAdmission};
 use crate::product_store::{
-    scope::{PreparedScopedChange, ScopedExecutionContext},
+    scope::{PreparedScopedChange, ScopeTransition, ScopedExecutionContext},
     ProductStore, ProjectSnapshot,
 };
 pub(super) use example::{ExampleExperience, ExamplePlayback};
@@ -671,12 +671,21 @@ impl PairExperience {
         store: &ProductStore,
         basis: ProjectSnapshot,
         sides: [Side; 2],
-        scenario: ScenarioSpec,
+        mut scenario: ScenarioSpec,
         need: String,
         scope: DecisionScope,
         minimal: bool,
         cancelled: Arc<AtomicBool>,
     ) -> Result<Self> {
+        let trial_observation =
+            if matches!(scenario.inputs.last(), Some(SemanticInput::Observe { .. })) {
+                None
+            } else {
+                // Saved or budget-limited witnesses may have actions after their
+                // last observation. Choices must bind the result actually shown.
+                Some(observe_copied_outcome(&mut scenario))
+            };
+        let minimal = minimal && trial_observation.is_none();
         let (views, scenes, trial_day) = replay_pair(store, &basis, &sides, &scenario, cancelled)?;
         Ok(Self {
             basis,
@@ -688,7 +697,7 @@ impl PairExperience {
             views,
             scenes: Some(scenes),
             trial_day,
-            trial_observation: None,
+            trial_observation,
         })
     }
     pub fn view(&self) -> PairView {
@@ -789,21 +798,7 @@ impl PairExperience {
             }
         }
         next.inputs.push(input);
-        let mut ordinal = next.inputs.len();
-        let point = loop {
-            let candidate = format!("copied-outcome-{ordinal}");
-            if !next
-                .inputs
-                .iter()
-                .any(|i| matches!(i, SemanticInput::Observe {point} if point == &candidate))
-            {
-                break candidate;
-            }
-            ordinal += 1;
-        };
-        next.inputs.push(SemanticInput::Observe {
-            point: point.clone(),
-        });
+        let point = observe_copied_outcome(&mut next);
         let (views, scenes, day) = replay_pair(store, &self.basis, &self.sides, &next, cancelled)?;
         self.scenario = next;
         self.views = views;
@@ -819,58 +814,88 @@ impl PairExperience {
         decision: &str,
         operation: &str,
         cancelled: Arc<AtomicBool>,
-    ) -> Result<Self> {
+    ) -> std::result::Result<Self, AdmissionError> {
         let basis = store.load().map_err(error)?;
+        check(store, &basis, &cancelled)?;
         let d = basis
             .decisions
             .decisions
             .iter()
             .find(|d| d.id == decision && d.status == DecisionStatus::Pending)
             .ok_or("This pending choice is no longer available")?;
-        let saved = engine(store, cancelled.clone())
-            .discovery_scenes(&basis)
+        // Checked scene objects retain exact ordinary captures even when those
+        // prospective sources were never installed or added to program history.
+        let scenes = engine(store, cancelled.clone())
+            .pending_original_scenes(&basis, d)
             .map_err(error)?;
-        let scenes: Vec<_> = saved.iter().filter(|s| s.decision() == decision).collect();
+        for scene in &scenes {
+            let source_id =
+                canonical_digest(IdentityDomain::Source, scene.program()).map_err(error)?;
+            if scene.program() != basis.program().map_err(error)?
+                && basis
+                    .scope
+                    .rehearsals
+                    .get(&source_id)
+                    .is_some_and(|proof| proof.manifest.transition == ScopeTransition::Adoption)
+            {
+                // An old new-layer choice still owns its original population.
+                // Never regenerate it as an unrelated whole-design Evolution.
+                return Err(AdmissionError::RuleComparisonRequired);
+            }
+        }
         if scenes.len() != 2 || scenes[0].scenario() != scenes[1].scenario() {
             return Err(
                 "This need requires a new design comparison before it can be reopened".into(),
             );
         }
+        // The engine independently reproduced these exact original sources
+        // and verified scope applicability without pretending that Current can
+        // execute a feature available only in the prospective designs.
         let mut sides = vec![];
         for (index, scene) in scenes.iter().enumerate() {
-            let source = basis
-                .programs
-                .iter()
-                .find(|p| {
-                    p.binding == scene.original().binding.source
-                        && p.artifact == scene.original().binding.artifact
-                })
-                .ok_or("The saved design source is missing")?;
+            let source = scene.program();
+            if source == basis.program().map_err(error)? {
+                sides.push(Side {
+                    source: source.clone(),
+                    prepared: None,
+                });
+                continue;
+            }
             let source_id = canonical_digest(IdentityDomain::Source, source).map_err(error)?;
-            let proof = basis
-                .scope
-                .rehearsals
-                .get(&source_id)
-                .ok_or("This saved comparison is not a managed design pair")?;
-            let authored = basis
-                .programs
-                .iter()
-                .find(|p| {
-                    canonical_digest(IdentityDomain::Source, p).ok().as_ref()
-                        == Some(&proof.manifest.business)
-                })
-                .ok_or("The saved editable design is missing")?;
-            let p = store
-                .prepare_managed_evolution(
-                    authored,
-                    &change_adapter::slot_mappings(&basis, authored)?,
-                    &format!("{operation}-{index}"),
-                )
-                .map_err(error)?;
-            sides.push(Side {
-                source: p.target().clone(),
-                prepared: Some(p),
-            });
+            if let Some(proof) = basis.scope.rehearsals.get(&source_id) {
+                if proof.manifest.transition != ScopeTransition::Evolution {
+                    return Err("This saved rule needs its original comparison".into());
+                }
+                let authored = basis
+                    .programs
+                    .iter()
+                    .find(|p| {
+                        canonical_digest(IdentityDomain::Source, p).ok().as_ref()
+                            == Some(&proof.manifest.business)
+                    })
+                    .ok_or("The saved editable design is missing")?;
+                let p = store
+                    .prepare_managed_evolution(
+                        authored,
+                        &change_adapter::slot_mappings(&basis, authored)?,
+                        &format!("{operation}-{index}"),
+                    )
+                    .map_err(error)?;
+                ScopedExecutionContext::prepared(&basis, &p).map_err(error)?;
+                sides.push(Side {
+                    source: p.target().clone(),
+                    prepared: Some(p),
+                });
+            } else if basis.editable_scope_context().map_err(error)?.is_none() {
+                sides.push(Side {
+                    source: source.clone(),
+                    prepared: None,
+                });
+            } else {
+                return Err(
+                    "Your live rules changed. Open a new comparison for this saved design".into(),
+                );
+            }
         }
         let pair = [sides.remove(0), sides.remove(0)];
         let mut scenario = scenes[0].scenario().clone();
@@ -879,7 +904,7 @@ impl PairExperience {
         scenario.session = shared_session(&basis, &pair)?;
         let need = d.request.clone();
         let scope = d.scope.clone();
-        Self::new(store, basis, pair, scenario, need, scope, false, cancelled)
+        Self::new(store, basis, pair, scenario, need, scope, false, cancelled).map_err(Into::into)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1028,6 +1053,24 @@ impl PairExperience {
         Ok(result)
     }
 }
+fn observe_copied_outcome(scenario: &mut ScenarioSpec) -> Id {
+    let mut ordinal = scenario.inputs.len();
+    let point =
+        loop {
+            let candidate = format!("copied-outcome-{ordinal}");
+            if !scenario.inputs.iter().any(
+                |input| matches!(input, SemanticInput::Observe { point } if point == &candidate),
+            ) {
+                break candidate;
+            }
+            ordinal += 1;
+        };
+    scenario.inputs.push(SemanticInput::Observe {
+        point: point.clone(),
+    });
+    point
+}
+
 fn replay_pair(
     store: &ProductStore,
     basis: &ProjectSnapshot,
