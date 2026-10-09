@@ -1,0 +1,760 @@
+//! Synthetic local host-module tests; no live provider or reachable UI claims.
+#[path = "../src/product_studio/change_adapter.rs"]
+mod change_adapter;
+#[path = "fixtures/product_scope/mod.rs"]
+mod fixture;
+#[path = "../src/product_studio/intention_flow.rs"]
+mod intention_flow;
+#[path = "../src/product_contract.rs"]
+mod product_contract;
+#[path = "../src/product_decisions/mod.rs"]
+mod product_decisions;
+#[path = "../src/product_protocol.rs"]
+mod product_protocol;
+#[path = "../src/product_runtime/mod.rs"]
+mod product_runtime;
+#[path = "../src/product_store/mod.rs"]
+mod product_store;
+use fixture::*;
+use intention_flow::*;
+use product_contract::*;
+use product_decisions::*;
+use product_runtime::LocalRuntime;
+use product_store::{scope::*, ProductStore, ProjectSnapshot};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
+fn cancellation() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(false))
+}
+fn engine(store: &ProductStore) -> DecisionEngine<LocalRuntime> {
+    DecisionEngine::new(LocalRuntime::default(), IntentArchive::new(store.clone()))
+}
+fn scenario(snapshot: &ProjectSnapshot, id: &str) -> ScenarioSpec {
+    ScenarioSpec {
+        version: 1,
+        id: id.into(),
+        label: "Saved work example".into(),
+        seed: snapshot.data.clone(),
+        session: snapshot.session.clone(),
+        clock_day: snapshot.clock_day,
+        random_seed: 42,
+        inputs: vec![
+            invoke("export", &[]),
+            SemanticInput::Observe {
+                point: "result".into(),
+            },
+        ],
+        validity: vec![],
+    }
+}
+fn scope() -> DecisionScope {
+    DecisionScope {
+        operations: ["export".into()].into(),
+        population: Population::All,
+        conditions: Values::new(),
+        excluded_records: vec![],
+        unknowns: vec![],
+    }
+}
+fn choice(id: &str, outcome: DecisionOutcome) -> Choice {
+    Choice {
+        id: id.into(),
+        request: "Keep this way of working".into(),
+        rationale: None,
+        scope: scope(),
+        outcome,
+        obligations: vec![],
+        binding: IntentionBinding::ObservedOutcome,
+    }
+}
+fn record_need(store: &ProductStore, id: &str, outcome: DecisionOutcome) {
+    let e = engine(store);
+    let s = store.load().unwrap();
+    let scene = e
+        .accept_current_scene(&s, &scenario(&s, id), Disclosure::Synthetic)
+        .unwrap();
+    let ready = e
+        .prepare_choice(
+            store,
+            s.program().unwrap(),
+            choice(id, outcome),
+            vec![scene],
+            &format!("record-{id}"),
+        )
+        .unwrap();
+    e.adopt(store, &ready).unwrap();
+}
+fn extended(current: &CapturedProgram) -> CapturedProgram {
+    let mut value = serde_json::to_value(&current.program).unwrap();
+    value["entities"][0]["fields"].as_array_mut().unwrap().push(serde_json::json!({"id":"note","label":"Work note","value_type":{"kind":"optional","item":{"kind":"text"}}}));
+    value["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"set_note","label":"Edit work note","parameters":{"row":{"kind":"reference","entity":"job"},"note":{"kind":"optional","item":{"kind":"text"}}},"guards":[],"steps":[{"kind":"update","record":var("row"),"values":{"note":var("note")}}],"ensures":[]}));
+    value["entities"].as_array_mut().unwrap().push(serde_json::json!({"id":"material","label":"Materials","fields":[{"id":"name","label":"Material","value_type":{"kind":"text"}}],"unique":[],"constraints":[]}));
+    value["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"log_material","label":"Log material","parameters":{"name":{"kind":"text"}},"guards":[],"steps":[{"kind":"create","entity":"material","bind":"material","values":{"name":var("name")}}],"ensures":[]}));
+    capture(value)
+}
+fn response(
+    request: &DevelopmentRequest,
+    candidate: &CapturedProgram,
+    needs: &[&str],
+    retire: &[&str],
+) -> DevelopmentResult {
+    DevelopmentResult {
+        producer: candidate.binding.producer.clone(),
+        response: DevelopmentResponse {
+            version: 1,
+            request_digest: request.identity().unwrap(),
+            candidates: vec![GeneratedCandidate {
+                id: "design".into(),
+                source_json: String::from_utf8(candidate.source_bytes.clone()).unwrap(),
+            }],
+            hypotheses: vec![],
+            unsupported: vec![],
+            evolutions: vec![EvolutionSuggestion {
+                id: "new-design".into(),
+                candidate: "design".into(),
+                needs: needs.iter().map(|v| v.to_string()).collect(),
+                proposed_retirement: retire.iter().map(|v| v.to_string()).collect(),
+                preserved_obligations: request
+                    .decisions
+                    .decisions
+                    .iter()
+                    .filter(|d| d.status == DecisionStatus::Active)
+                    .flat_map(|d| &d.obligations)
+                    .map(|p| p.identity().unwrap())
+                    .collect(),
+                mappings: vec![],
+                scenarios: vec![],
+            }],
+        },
+    }
+}
+struct OnceProvider {
+    result: DevelopmentResult,
+    calls: std::cell::Cell<usize>,
+}
+impl DevelopmentProvider for OnceProvider {
+    fn develop(
+        &self,
+        request: &DevelopmentRequest,
+        _: &dyn Fn() -> bool,
+    ) -> Result<DevelopmentResult, AdapterError> {
+        assert_eq!(request.operation, DevelopmentOperation::Reconcile);
+        assert_eq!(
+            self.calls.replace(self.calls.get() + 1),
+            0,
+            "must not double-call provider"
+        );
+        self.result.response.validate_for(request)?;
+        Ok(self.result.clone())
+    }
+}
+
+#[test]
+fn new_design_retires_only_selected_needs_and_preserves_independent_history() {
+    let dir = tempdir();
+    let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
+    record_need(&store, "first", DecisionOutcome::KeepCurrent);
+    record_need(&store, "second", DecisionOutcome::BothNeeded);
+    record_need(&store, "independent-concrete", DecisionOutcome::KeepCurrent);
+    let e = engine(&store);
+    let s = store.load().unwrap();
+    let scene = e
+        .accept_current_scene(&s, &scenario(&s, "predicate"), Disclosure::Synthetic)
+        .unwrap();
+    let mut property = choice("independent-property", DecisionOutcome::KeepCurrent);
+    property.binding = IntentionBinding::PropertiesOnly;
+    property.obligations.push(AcceptedProperty {
+        id: "empty-export".into(),
+        description: "No phantom work rows".into(),
+        predicate: PropertyPredicate::Equal {
+            left: PropertyTerm::OutputCount {
+                point: "result".into(),
+                output: "sheet".into(),
+            },
+            right: PropertyTerm::Literal {
+                value: DataValue::Integer { value: 0 },
+                value_type: Type::Integer,
+            },
+        },
+    });
+    let ready = e
+        .prepare_choice(
+            &store,
+            s.program().unwrap(),
+            property,
+            vec![scene],
+            "record-property",
+        )
+        .unwrap();
+    let before = e.adopt(&store, &ready).unwrap();
+    let pending = Reconciliation::new(
+        &store,
+        &before,
+        &e,
+        "request",
+        "Support both work needs",
+        &["first".into(), "second".into()],
+        "new-design",
+        "adopt-design",
+        cancellation(),
+    )
+    .unwrap();
+    let candidate = extended(before.program().unwrap());
+    let provider = OnceProvider {
+        result: response(
+            pending.request(),
+            &candidate,
+            &["first", "second"],
+            &["first", "second"],
+        ),
+        calls: std::cell::Cell::new(0),
+    };
+    let mut design = pending
+        .develop(&store, &e, &provider, cancellation())
+        .unwrap();
+    let copied = design
+        .trial(
+            &store,
+            invoke("log_material", &[("name", text("Copied trial"))]),
+            cancellation(),
+        )
+        .unwrap();
+    assert!(copied
+        .retained_records
+        .iter()
+        .any(|r| r.entity == "material"));
+    assert_eq!(provider.calls.get(), 1);
+    assert_eq!(store.load().unwrap(), before);
+    assert_ne!(
+        design.view().candidate.artifact.semantic_digest,
+        before.program().unwrap().artifact.semantic_digest
+    );
+    assert_eq!(design.view().retire, vec!["first", "second"]);
+    assert!(design
+        .view()
+        .preserve
+        .contains(&"independent-concrete".into()));
+    assert!(design
+        .view()
+        .preserve
+        .contains(&"independent-property".into()));
+    let saved = e
+        .adopt(
+            &store,
+            &design.decision(&store, &e, cancellation()).unwrap(),
+        )
+        .unwrap();
+    let reopened = ProductStore::open(dir.path().join("tool")).unwrap();
+    assert_eq!(reopened.load().unwrap(), saved);
+    let history = HistoryView::load(&reopened, &saved, cancellation()).unwrap();
+    assert!(history
+        .decisions
+        .iter()
+        .find(|d| d.decision.id == "first")
+        .unwrap()
+        .status_text
+        .contains("Replaced"));
+    for id in ["independent-concrete", "independent-property"] {
+        assert_eq!(
+            history
+                .decisions
+                .iter()
+                .find(|d| d.decision.id == id)
+                .unwrap()
+                .decision
+                .status,
+            DecisionStatus::Active
+        );
+    }
+    assert_eq!(
+        engine(&reopened).check_current(&saved).unwrap().disposition,
+        CheckDisposition::Ready
+    );
+    let after = apply(
+        &reopened,
+        "use-new-design",
+        invoke("log_material", &[("name", text("Oak"))]),
+    );
+    assert!(after.data.records.iter().any(|r| r.entity == "material"));
+}
+
+#[test]
+fn reconciliation_refuses_stale_results_then_resolves_from_fresh_daily_work() {
+    let dir = tempdir();
+    let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
+    for id in ["first", "second"] {
+        record_need(&store, id, DecisionOutcome::BothNeeded);
+    }
+    let e = engine(&store);
+    let old = store.load().unwrap();
+    let pending = Reconciliation::new(
+        &store,
+        &old,
+        &e,
+        "old-request",
+        "Keep both",
+        &["first".into(), "second".into()],
+        "new-design",
+        "adopt-design",
+        cancellation(),
+    )
+    .unwrap();
+    let candidate = extended(old.program().unwrap());
+    let provider = OnceProvider {
+        result: response(
+            pending.request(),
+            &candidate,
+            &["first", "second"],
+            &["first", "second"],
+        ),
+        calls: std::cell::Cell::new(0),
+    };
+    let late = add(&store, "late-work", "Legitimate later work");
+    assert!(pending
+        .develop(&store, &e, &provider, cancellation())
+        .is_err());
+    assert_eq!(provider.calls.get(), 0);
+    let current = store.load().unwrap();
+    let fresh = Reconciliation::new(
+        &store,
+        &current,
+        &e,
+        "fresh-request",
+        "Keep both",
+        &["first".into(), "second".into()],
+        "new-design",
+        "adopt-design",
+        cancellation(),
+    )
+    .unwrap();
+    let provider = OnceProvider {
+        result: response(
+            fresh.request(),
+            &candidate,
+            &["first", "second"],
+            &["first", "second"],
+        ),
+        calls: std::cell::Cell::new(0),
+    };
+    let design = fresh
+        .develop(&store, &e, &provider, cancellation())
+        .unwrap();
+    let saved = e
+        .adopt(
+            &store,
+            &design.decision(&store, &e, cancellation()).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(row(&saved, &late), row(&current, &late));
+    assert_eq!(saved.data.events, current.data.events);
+    assert_eq!(provider.calls.get(), 1);
+}
+
+#[test]
+fn managed_design_reuses_slots_and_refuses_moved_destinations_stale_basis_and_cancel() {
+    let dir = tempdir();
+    let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
+    let s = store.load().unwrap();
+    let layer = store
+        .prepare_scoped_change(
+            &program(true),
+            &request(&s, ScopePopulation::FutureWork),
+            "scope",
+        )
+        .unwrap();
+    let s = store.adopt_scoped(s.revision, &layer).unwrap();
+    let candidate = extended(&change_adapter::baseline(&s).unwrap());
+    let prepared =
+        prepare_managed_design(&store, &s, &candidate, "new-design", cancellation()).unwrap();
+    assert_eq!(prepared.candidate(), &candidate);
+    assert_eq!(prepared.operation_id(), "new-design");
+    ScopedExecutionContext::prepared(&s, &prepared).unwrap();
+    let mut moved = serde_json::to_value(&candidate.program).unwrap();
+    moved["actions"][3]["steps"].as_array_mut().unwrap().insert(0, serde_json::json!({"kind":"update","record":var("row"),"values":{"waiting":boolean(false)}}));
+    assert!(prepare_managed_design(&store, &s, &capture(moved), "moved", cancellation()).is_err());
+    let cancel = cancellation();
+    cancel.store(true, Ordering::Release);
+    assert!(prepare_managed_design(&store, &s, &candidate, "cancelled", cancel).is_err());
+    add(&store, "late", "Later work");
+    assert!(prepare_managed_design(&store, &s, &candidate, "stale", cancellation()).is_err());
+}
+
+fn scoped_rule(store: &ProductStore) -> Digest {
+    let existing = add(store, "existing", "Existing work");
+    action(store, "wait-existing", "wait", &existing);
+    tick(store, "advance", 20003);
+    let s = store.load().unwrap();
+    let prepared = store
+        .prepare_scoped_change(
+            &program(true),
+            &request(&s, ScopePopulation::All),
+            "bad-rule",
+        )
+        .unwrap();
+    let layer = prepared.layer_id().unwrap().unwrap();
+    let mut example = scenario(&s, "bad-rule-example");
+    example.seed = prepared.seed().clone();
+    example.session = SessionState::initial(&prepared.target().program).unwrap();
+    example.inputs.splice(
+        0..0,
+        [
+            invoke("calculate", &[("row", reference(&existing))]),
+            invoke("complete", &[("row", reference(&existing))]),
+        ],
+    );
+    let e = engine(store);
+    let accepted = e
+        .accept_scoped_scene(store, &prepared, &example, Disclosure::Synthetic)
+        .unwrap();
+    let mut c = choice(
+        "bad-rule-intent",
+        DecisionOutcome::Accept {
+            artifact: prepared.target().artifact.program_digest.clone(),
+        },
+    );
+    c.scope = prepared.scope().clone();
+    let ready = e
+        .prepare_scoped_choice(store, prepared, c, vec![accepted], "bad-rule")
+        .unwrap();
+    e.adopt(store, &ready).unwrap();
+    layer
+}
+
+#[test]
+fn withdrawal_previews_checked_current_data_and_preserves_later_work_after_restart() {
+    let dir = tempdir();
+    let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
+    let layer = scoped_rule(&store);
+    let s = store.load().unwrap();
+    let candidate = extended(&change_adapter::baseline(&s).unwrap());
+    let prepared =
+        prepare_managed_design(&store, &s, &candidate, "add-fields", cancellation()).unwrap();
+    let e = engine(&store);
+    let ready = e
+        .prepare_managed_change(&store, prepared, &[], "add-fields")
+        .unwrap();
+    e.adopt(&store, &ready).unwrap();
+    let later = add(&store, "later", "Later legitimate work");
+    action(&store, "edit-later", "wait", &later);
+    apply(
+        &store,
+        "note-later",
+        invoke(
+            "set_note",
+            &[
+                ("row", reference(&later)),
+                ("note", text("Keep this later note")),
+            ],
+        ),
+    );
+    tick(&store, "later-days", 20006);
+    action(&store, "complete-later", "complete", &later);
+    apply(
+        &store,
+        "material",
+        invoke("log_material", &[("name", text("Oak"))]),
+    );
+    let facts = apply(&store, "output", invoke("export", &[]));
+    let mut withdrawal = Withdrawal::prepare(
+        &store,
+        &facts,
+        &e,
+        &[layer.clone()],
+        "withdraw",
+        cancellation(),
+    )
+    .unwrap();
+    assert_eq!(withdrawal.view().retire, vec!["bad-rule-intent"]);
+    assert_eq!(withdrawal.view().layers, vec![layer.clone()]);
+    let trial = withdrawal
+        .trial(
+            &store,
+            invoke("log_material", &[("name", text("Copied only"))]),
+            cancellation(),
+        )
+        .unwrap();
+    assert!(trial
+        .retained_records
+        .iter()
+        .any(|r| r.entity == "material" && r.values["name"] == text("Copied only")));
+    assert_eq!(store.load().unwrap(), facts);
+    let ready = withdrawal.decision(&store, &e, cancellation()).unwrap();
+    assert_eq!(ready.plan().id, "withdraw");
+    assert_eq!(ready.candidate(), &withdrawal.view().candidate);
+    let saved = e.adopt(&store, &ready).unwrap();
+    assert_eq!(saved.data, facts.data);
+    assert_eq!(saved.artifacts, facts.artifacts);
+    let reopened = ProductStore::open(dir.path().join("tool")).unwrap();
+    assert_eq!(reopened.load().unwrap(), saved);
+    let view = HistoryView::load(&reopened, &saved, cancellation()).unwrap();
+    let rule = view
+        .decisions
+        .iter()
+        .find(|d| d.decision.id == "bad-rule-intent")
+        .unwrap();
+    assert_eq!(
+        rule.decision.status,
+        DecisionStatus::Withdrawn {
+            adoption: "withdraw".into()
+        }
+    );
+    assert!(rule.receipts.iter().any(|r| r.plan.id == "withdraw"));
+    assert!(!view.layers.iter().find(|l| l.id == layer).unwrap().active);
+    assert!(!rule.scenes.is_empty());
+    let continued = add(&reopened, "continued", "After restart");
+    action(&reopened, "continued-wait", "wait", &continued);
+    tick(&reopened, "continued-days", 20008);
+    let result = action(&reopened, "continued-calc", "calculate", &continued);
+    assert_eq!(
+        row(&result, &continued).values["production"],
+        DataValue::Integer { value: 2 }
+    );
+    assert_eq!(row(&result, &later), row(&saved, &later));
+}
+
+#[test]
+fn withdrawal_refuses_stale_or_cancelled_preview_and_independent_conflict() {
+    let dir = tempdir();
+    let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
+    let layer = scoped_rule(&store);
+    record_need(&store, "independent", DecisionOutcome::KeepCurrent);
+    let s = store.load().unwrap();
+    let e = engine(&store);
+    // The independent export promise still needs the changed production rule.
+    assert!(
+        Withdrawal::prepare(&store, &s, &e, &[layer.clone()], "withdraw", cancellation()).is_err()
+    );
+    let later = add(&store, "still-usable", "Continue after refusal");
+    let now = store.load().unwrap();
+    let forward = extended(&change_adapter::baseline(&now).unwrap());
+    let prepared =
+        prepare_managed_design(&store, &now, &forward, "forward", cancellation()).unwrap();
+    let ready = e
+        .prepare_managed_change(&store, prepared, &[], "forward")
+        .unwrap();
+    let repaired = e.adopt(&store, &ready).unwrap();
+    assert_eq!(row(&repaired, &later), row(&now, &later));
+    assert!(repaired
+        .program()
+        .unwrap()
+        .program
+        .actions
+        .iter()
+        .any(|a| a.id == "log_material"));
+    assert!(Withdrawal::prepare(&store, &s, &e, &[layer], "stale", cancellation()).is_err());
+}
+
+#[test]
+fn archive_history_rejects_changed_decisions_foreign_scenes_and_corrupt_objects() {
+    let dir = tempdir();
+    let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
+    record_need(&store, "active", DecisionOutcome::KeepCurrent);
+    record_need(&store, "pending", DecisionOutcome::BothNeeded);
+    let s = store.load().unwrap();
+    let archive = IntentArchive::new(store.clone());
+    let view = HistoryView::load(&store, &s, cancellation()).unwrap();
+    assert_eq!(view.decisions.len(), 2);
+    assert_eq!(view.decisions[1].decision.status, DecisionStatus::Pending);
+    let mut changed = s.decisions.decisions[0].clone();
+    changed.request.push_str(" forged");
+    assert!(archive.accepted_scenes(&changed).is_err());
+    changed = s.decisions.decisions[0].clone();
+    changed.scenarios.reverse();
+    changed.scenarios.push(changed.scenarios[0].clone());
+    assert!(archive.accepted_scenes(&changed).is_err());
+    changed = s.decisions.decisions[0].clone();
+    changed.witness = s.decisions.decisions[1].witness.clone();
+    assert!(archive.accepted_scenes(&changed).is_err());
+    let witness = &s.decisions.decisions[0].witness;
+    let path = dir
+        .path()
+        .join("tool")
+        .join(format!("extension-{}.json", witness.as_str()));
+    std::fs::write(path, b"corrupt").unwrap();
+    assert!(archive.accepted_scenes(&s.decisions.decisions[0]).is_err());
+    assert!(HistoryView::load(&store, &s, cancellation()).is_err());
+}
+
+#[test]
+fn reconciliation_rejects_cosmetic_design_and_unrequested_retirement() {
+    let dir = tempdir();
+    let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
+    for id in ["first", "second"] {
+        record_need(&store, id, DecisionOutcome::BothNeeded);
+    }
+    record_need(&store, "independent", DecisionOutcome::KeepCurrent);
+    let e = engine(&store);
+    let s = store.load().unwrap();
+    for (candidate, retire) in [
+        (s.program().unwrap().clone(), vec!["first", "second"]),
+        (
+            extended(s.program().unwrap()),
+            vec!["first", "second", "independent"],
+        ),
+    ] {
+        let pending = Reconciliation::new(
+            &store,
+            &s,
+            &e,
+            "request",
+            "Keep both",
+            &["first".into(), "second".into()],
+            "new-design",
+            "adopt-design",
+            cancellation(),
+        )
+        .unwrap();
+        let provider = OnceProvider {
+            result: response(pending.request(), &candidate, &["first", "second"], &retire),
+            calls: std::cell::Cell::new(0),
+        };
+        assert!(pending
+            .develop(&store, &e, &provider, cancellation())
+            .is_err());
+        assert_eq!(provider.calls.get(), 1);
+        assert_eq!(store.load().unwrap(), s);
+    }
+}
+
+#[test]
+fn managed_reconciliation_binds_actual_result_target_and_final_operation() {
+    let dir = tempdir();
+    let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
+    let s = store.load().unwrap();
+    let prepared = store
+        .prepare_scoped_change(
+            &program(true),
+            &request(&s, ScopePopulation::FutureWork),
+            "scope",
+        )
+        .unwrap();
+    store.adopt_scoped(s.revision, &prepared).unwrap();
+    for id in ["first", "second"] {
+        record_need(&store, id, DecisionOutcome::BothNeeded);
+    }
+    let s = store.load().unwrap();
+    let e = engine(&store);
+    let request = Reconciliation::new(
+        &store,
+        &s,
+        &e,
+        "request",
+        "Keep both",
+        &["first".into(), "second".into()],
+        "new-design",
+        "exact-operation",
+        cancellation(),
+    )
+    .unwrap();
+    let candidate = extended(&change_adapter::baseline(&s).unwrap());
+    let actual = response(
+        request.request(),
+        &candidate,
+        &["first", "second"],
+        &["first", "second"],
+    );
+    let design = request
+        .develop_prepared(&store, &e, actual, cancellation())
+        .unwrap();
+    assert_eq!(design.view().authored, candidate);
+    assert_ne!(design.view().candidate, candidate);
+    assert_eq!(store.load().unwrap(), s);
+    let ready = design.decision(&store, &e, cancellation()).unwrap();
+    assert_eq!(ready.plan().id, "exact-operation");
+    let saved = e.adopt(&store, &ready).unwrap();
+    assert_eq!(saved.scope.layers, s.scope.layers);
+    assert_eq!(
+        ProductStore::open(dir.path().join("tool"))
+            .unwrap()
+            .load()
+            .unwrap(),
+        saved
+    );
+}
+
+#[test]
+fn checked_withdrawal_cannot_commit_after_daily_work_or_cancellation() {
+    let dir = tempdir();
+    let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
+    let s = store.load().unwrap();
+    let prepared = store
+        .prepare_scoped_change(
+            &program(true),
+            &request(&s, ScopePopulation::FutureWork),
+            "scope",
+        )
+        .unwrap();
+    let layer = prepared.layer_id().unwrap().unwrap();
+    let s = store.adopt_scoped(s.revision, &prepared).unwrap();
+    let e = engine(&store);
+    let withdrawal =
+        Withdrawal::prepare(&store, &s, &e, &[layer.clone()], "withdraw", cancellation()).unwrap();
+    let cancel = cancellation();
+    cancel.store(true, Ordering::Release);
+    assert!(withdrawal.decision(&store, &e, cancel).is_err());
+    let later = add(&store, "later", "Work after preview");
+    assert!(withdrawal.decision(&store, &e, cancellation()).is_err());
+    let facts = store.load().unwrap();
+    let fresh = Withdrawal::prepare(
+        &store,
+        &facts,
+        &e,
+        &[layer],
+        "fresh-withdraw",
+        cancellation(),
+    )
+    .unwrap();
+    let saved = e
+        .adopt(&store, &fresh.decision(&store, &e, cancellation()).unwrap())
+        .unwrap();
+    assert_eq!(row(&saved, &later), row(&facts, &later));
+}
+
+#[path = "../src/ui/product_runtime_view.rs"]
+pub(crate) mod product_runtime_view;
+mod ui {
+    pub(crate) use super::product_runtime_view;
+}
+#[path = "support/egui_harness.rs"]
+mod egui_harness;
+
+#[test]
+fn history_controls_select_exact_ids_despite_equal_business_labels() {
+    let dir = tempdir();
+    let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
+    record_need(&store, "first", DecisionOutcome::BothNeeded);
+    record_need(&store, "second", DecisionOutcome::BothNeeded);
+    let view = HistoryView::load(&store, &store.load().unwrap(), cancellation()).unwrap();
+    let mut state = HistoryState::default();
+    let mut h = egui_harness::EguiHarness::new(egui::vec2(1000.0, 1400.0));
+    let frame = |h: &mut egui_harness::EguiHarness, state: &mut HistoryState| {
+        h.frame(|ctx| {
+            egui::CentralPanel::default()
+                .show(ctx, |ui| state.show(ui, &view, true))
+                .inner
+        })
+    };
+    for key in ["intention-need-first", "intention-need-second"] {
+        let (_, trace) = frame(&mut h, &mut state);
+        let point = trace.controls[key].rect.center();
+        h.press_at(point);
+        frame(&mut h, &mut state);
+        h.release_at(point);
+        frame(&mut h, &mut state);
+    }
+    let (_, trace) = frame(&mut h, &mut state);
+    let point = trace.controls["intention-reconcile"].rect.center();
+    assert!(trace.controls["intention-reconcile"].enabled);
+    h.press_at(point);
+    frame(&mut h, &mut state);
+    h.release_at(point);
+    let (event, _) = frame(&mut h, &mut state);
+    let Event::Reconcile { needs, .. } = event.unwrap() else {
+        panic!("wrong event");
+    };
+    assert_eq!(needs, vec!["first", "second"]);
+    assert_eq!(store.load().unwrap().decisions.decisions.len(), 2);
+}
