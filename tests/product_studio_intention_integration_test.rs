@@ -1236,11 +1236,16 @@ fn mapped_context_fixture(
     let prepared = store
         .prepare_scoped_change(
             &scope_fixture::program(true),
-            &scope_fixture::request(&before, product_store::scope::ScopePopulation::All),
+            &scope_fixture::request(&before, product_store::scope::ScopePopulation::FutureWork),
             "cache-rule",
         )
         .unwrap();
     store.adopt_scoped(before.revision, &prepared).unwrap();
+    scope_fixture::add(
+        &store,
+        "scoped-cache-work",
+        "Work born under the scoped rule",
+    );
     let current = store.load().unwrap();
     let scene = ScenarioSpec {
         version: 1,

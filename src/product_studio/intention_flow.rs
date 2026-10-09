@@ -395,8 +395,9 @@ impl Reconciliation {
             .map_err(error)?;
         #[cfg(test)]
         eprintln!(
-            "Reconciliation developed evolution: {:?}",
-            started.elapsed()
+            "Reconciliation developed evolution: {:?}, admission hits/builds {:?}",
+            started.elapsed(),
+            engine.scope_cache_stats()
         );
         fresh(store, &self.basis, &cancel)?;
         Design::new(store, self, engine, draft, Some(prepared), cancel)
@@ -432,6 +433,11 @@ impl Design {
     ) -> Result<Self> {
         #[cfg(test)]
         let started = std::time::Instant::now();
+        #[cfg(test)]
+        eprintln!(
+            "New-design admission hits/builds before final preparation: {:?}",
+            engine.scope_cache_stats()
+        );
         // Availability comes from the actual adoption gate, not just a response.
         let checked = engine
             .prepare_evolution(store, &draft, &request.operation)
