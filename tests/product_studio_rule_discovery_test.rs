@@ -1079,6 +1079,28 @@ fn pending_future_outcome(outcome: DecisionOutcome) {
     let mut fresh = reopened
         .prepare_scoped_change(source, &scope, "resolve-rule")
         .unwrap();
+    // Adoption initializes this layer's protected provenance. Preserve every
+    // old cell and record fact, then require the complete checked seed record,
+    // including the exact new provenance, rather than filtering metadata out.
+    let prior_archived = row(&facts, &archived);
+    let initialized_archived = fresh
+        .seed()
+        .records
+        .iter()
+        .find(|record| record.entity == prior_archived.entity && record.id == prior_archived.id)
+        .unwrap()
+        .clone();
+    assert_eq!(initialized_archived.entity, prior_archived.entity);
+    assert_eq!(initialized_archived.id, prior_archived.id);
+    assert_eq!(initialized_archived.revision, prior_archived.revision);
+    assert_eq!(
+        initialized_archived.created_program,
+        prior_archived.created_program
+    );
+    assert_eq!(initialized_archived.archived, prior_archived.archived);
+    for (key, value) in &prior_archived.values {
+        assert_eq!(initialized_archived.values.get(key), Some(value));
+    }
     let original = created_scene(&facts).0;
     let mut mapped = original.clone();
     mapped.seed = product_runtime::merged_data(fresh.target(), &original.seed).unwrap();
@@ -1114,7 +1136,7 @@ fn pending_future_outcome(outcome: DecisionOutcome) {
     let adopted = engine(&reopened).adopt(&reopened, &change).unwrap();
     assert_eq!(adopted.data.events, facts.data.events);
     assert_eq!(row(&adopted, &late).values["name"], text("Later real work"));
-    assert_eq!(row(&adopted, &archived), row(&facts, &archived));
+    assert_eq!(row(&adopted, &archived), &initialized_archived);
     assert_eq!(adopted.decisions.decisions[0], facts.decisions.decisions[0]);
     assert_eq!(
         adopted
