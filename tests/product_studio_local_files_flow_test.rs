@@ -658,28 +658,42 @@ fn legacy_recovery_refuses_existing_staged_destinations_and_listed_aliases() {
     assert!(matches!(result, RecoveryOutcome::AttemptFailed { .. }));
     assert_eq!(fs::read(activated.join("CURRENT")).unwrap(), current);
     let snapshot = f.snapshot();
-    let original_id = f.recent.list().unwrap()[0].tool.id.clone();
-    let alias = f.root.join("ORIGINAL");
+    // Simulate moving a closed original tool. Windows deliberately pins open
+    // directories against rename, so release the original store first.
+    let Fixture {
+        _temp,
+        root,
+        store,
+        locations,
+        recent,
+    } = f;
+    drop(store);
+    let reply = |operation: &str, name: &str| DestinationChoice {
+        operation: operation.into(),
+        destination: Some(root.join(name)),
+    };
+    let original_id = recent.list().unwrap()[0].tool.id.clone();
+    let alias = root.join("ORIGINAL");
     let aliases = alias.exists();
-    fs::rename(f.root.join("original"), f.root.join("moved-original")).unwrap();
-    let recent_before = fs::read(f.locations.path().join("recent-tools.json")).unwrap();
+    fs::rename(root.join("original"), root.join("moved-original")).unwrap();
+    let recent_before = fs::read(locations.path().join("recent-tools.json")).unwrap();
     let same = RecoveryDraft::read(&file, "same").unwrap().recover(
-        f.reply("same", "original"),
+        reply("same", "original"),
         "same",
         &AtomicBool::new(false),
-        &f.recent,
-        &f.locations,
+        &recent,
+        &locations,
         2,
         |_| {},
     );
     assert!(matches!(same, RecoveryOutcome::AttemptFailed { .. }));
-    assert!(!f.root.join("original/CURRENT").exists());
+    assert!(!root.join("original/CURRENT").exists());
     let result = RecoveryDraft::read(&file, "alias").unwrap().recover(
-        f.reply("alias", "ORIGINAL"),
+        reply("alias", "ORIGINAL"),
         "alias",
         &AtomicBool::new(false),
-        &f.recent,
-        &f.locations,
+        &recent,
+        &locations,
         2,
         |_| {},
     );
@@ -690,7 +704,7 @@ fn legacy_recovery_refuses_existing_staged_destinations_and_listed_aliases() {
             "instance alias must be refused before CURRENT activation"
         );
         assert_eq!(
-            fs::read(f.locations.path().join("recent-tools.json")).unwrap(),
+            fs::read(locations.path().join("recent-tools.json")).unwrap(),
             recent_before
         );
         println!("ALIAS-COVERAGE legacy_recovery: case-insensitive assertions passed");
@@ -702,7 +716,7 @@ fn legacy_recovery_refuses_existing_staged_destinations_and_listed_aliases() {
         println!("ALIAS-COVERAGE legacy_recovery: case-sensitive assertions passed; case-insensitive branch unrun");
     }
     assert_eq!(
-        ProductStore::open(f.root.join("moved-original"))
+        ProductStore::open(root.join("moved-original"))
             .unwrap()
             .load()
             .unwrap(),
@@ -715,11 +729,14 @@ fn legacy_recovery_refuses_existing_staged_destinations_and_listed_aliases() {
 fn legacy_recovery_rejects_replaced_parent_before_activation() {
     let f = Fixture::new();
     let file = f.root.join("legacy.gmbak");
-    fs::write(&file, legacy_bytes(&f.store)).unwrap();
+    let bytes = legacy_bytes(&f.store);
+    fs::write(&file, &bytes).unwrap();
+    let expected = f.snapshot();
     let parent = f.root.join("destinations");
     fs::create_dir(&parent).unwrap();
     let moved = f.root.join("moved-destinations");
     let draft = RecoveryDraft::read(&file, "replaced").unwrap();
+    let mut replacement_attempted = false;
     let result = draft.recover(
         DestinationChoice {
             operation: "replaced".into(),
@@ -732,15 +749,52 @@ fn legacy_recovery_rejects_replaced_parent_before_activation() {
         2,
         |stage| {
             if stage == UpgradeProgress::Staged {
-                fs::rename(&parent, &moved).unwrap();
-                fs::create_dir(&parent).unwrap();
+                replacement_attempted = true;
+                let renamed = fs::rename(&parent, &moved);
+                #[cfg(windows)]
+                {
+                    // Windows pins directory ancestry by denying delete/rename
+                    // sharing. The attempted replacement must be prevented,
+                    // not enabled by relaxing those production handle flags.
+                    let error = renamed.expect_err("pinned parent must not move");
+                    assert_eq!(error.raw_os_error(), Some(32), "expected sharing violation");
+                }
+                #[cfg(not(windows))]
+                {
+                    renamed.unwrap();
+                    fs::create_dir(&parent).unwrap();
+                }
             }
         },
     );
-    assert!(matches!(result, RecoveryOutcome::AttemptFailed { .. }));
+    assert!(replacement_attempted);
     assert!(!moved.join("fresh/CURRENT").exists());
-    assert!(!parent.join("fresh/CURRENT").exists());
-    assert_eq!(f.recent.list().unwrap().len(), 1);
+    #[cfg(windows)]
+    {
+        let RecoveryOutcome::Recovered(result) = result else {
+            panic!("blocked replacement must leave recovery on the original parent");
+        };
+        assert_eq!(result.destination, parent.join("fresh"));
+        assert_eq!(result.opened.snapshot.data, expected.data);
+        assert_eq!(result.opened.snapshot.artifacts, expected.artifacts);
+        assert_eq!(
+            result.opened.summary.identity,
+            ToolIdentity::from_snapshot(&expected).unwrap()
+        );
+        assert!(result.registration.is_ok());
+        assert!(!moved.exists());
+        assert_eq!(f.recent.list().unwrap().len(), 2);
+        println!("PARENT-COVERAGE legacy_recovery: Windows denied replacement; original destination recovery verified");
+    }
+    #[cfg(not(windows))]
+    {
+        assert!(matches!(result, RecoveryOutcome::AttemptFailed { .. }));
+        assert!(!parent.join("fresh/CURRENT").exists());
+        assert_eq!(f.recent.list().unwrap().len(), 1);
+        println!("PARENT-COVERAGE legacy_recovery: replaced parent rejected before CURRENT");
+    }
+    assert_eq!(f.snapshot(), expected);
+    assert_eq!(fs::read(file).unwrap(), bytes);
 }
 
 #[test]
