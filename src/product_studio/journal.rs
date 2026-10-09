@@ -2,7 +2,7 @@
 use super::*;
 use crate::product_locations::Folder;
 use serde::{Deserialize, Serialize};
-// Complete inherited Modify context must fit the existing strict 1 MiB local
+// Complete inherited change context must fit the existing strict 1 MiB local
 // JSON intake. Old journals retain the same format, digests and read path.
 const JOURNAL_LIMIT: usize = MAX_WIRE_BYTES;
 
@@ -54,6 +54,17 @@ pub(super) struct ProviderAssociation {
     pub issued: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modify: Option<(Association, Basis)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconcile: Option<ReconcileAssociation>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ReconcileAssociation {
+    pub tool: Association,
+    pub basis: Basis,
+    pub needs: Vec<Id>,
+    pub evolution: Id,
+    pub operation: Id,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -145,17 +156,18 @@ impl Journal {
             wire_request,
             wire_source,
             modify,
+            reconcile,
             ..
         }) = &self.provider
         {
             request.validate().map_err(error)?;
-            match (request.operation, modify) {
-                (DevelopmentOperation::Generate, None)
+            match (request.operation, modify, reconcile) {
+                (DevelopmentOperation::Generate, None, None)
                     if request.sources.is_empty() && request.request == self.need =>
                 {
                     ()
                 }
-                (DevelopmentOperation::Modify, Some((tool, basis))) => {
+                (DevelopmentOperation::Modify, Some((tool, basis)), None) => {
                     check(tool)?;
                     if request.project_id != tool.identity.project_id
                         || request
@@ -168,6 +180,52 @@ impl Journal {
                         || request.context.session_digest.as_ref() != Some(&basis.session)
                     {
                         return Err("Invalid interrupted modification association".into());
+                    }
+                }
+                (DevelopmentOperation::Reconcile, None, Some(binding)) => {
+                    check(&binding.tool)?;
+                    let basis = &binding.basis;
+                    let unique: std::collections::BTreeSet<_> = binding.needs.iter().collect();
+                    let prefix = format!("{}\nHost adoption operation ID: {}\nReturn the executable evolution using this exact evolution suggestion ID: {}\nPreserve both accepted needs: {}. Return an executable design, explicit input mappings and exact proposed retirements. Preserve every independent obligation.", self.need, binding.operation, binding.evolution, binding.needs.join(", "));
+                    if binding.needs.is_empty()
+                        || unique.len() != binding.needs.len()
+                        || !valid_id(&binding.evolution)
+                        || !valid_id(&binding.operation)
+                        || binding.evolution == binding.operation
+                        || self.last.as_ref() != Some(&binding.tool)
+                        || request.project_id != binding.tool.identity.project_id
+                        || request
+                            .sources
+                            .last()
+                            .and_then(|s| canonical_digest(IdentityDomain::Source, s).ok())
+                            .as_ref()
+                            != Some(&basis.source)
+                        || request.context.data_digest.as_ref() != Some(&basis.data)
+                        || request.context.session_digest.as_ref() != Some(&basis.session)
+                        || canonical_digest(IdentityDomain::Decision, &request.decisions)
+                            .map_err(error)?
+                            != basis.decisions
+                        || !request.request.starts_with(&prefix)
+                        || binding.needs.iter().any(|id| {
+                            !request.decisions.decisions.iter().any(|d| {
+                                &d.id == id
+                                    && (d.status == DecisionStatus::Active
+                                        || (d.status == DecisionStatus::Pending
+                                            && matches!(
+                                                d.outcome,
+                                                DecisionOutcome::BothNeeded
+                                                    | DecisionOutcome::EitherAcceptable
+                                            )))
+                            })
+                        })
+                        || request
+                            .accepted_scenes
+                            .iter()
+                            .filter(|scene| binding.needs.contains(&scene.decision))
+                            .count()
+                            < 2
+                    {
+                        return Err("Invalid interrupted new-design association".into());
                     }
                 }
                 _ => return Err("Invalid interrupted generation association".into()),
