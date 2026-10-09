@@ -3631,6 +3631,7 @@ fn comparison_panes_serialize_inputs_before_context_transitions() {
         value["views"][0]["kind"]["controls"].as_array_mut().unwrap().push(serde_json::json!({
             "id":"refresh_input","label":"Refresh results","state":"refresh","on_change":"collect"
         }));
+        value["actions"][1]["parameters"] = serde_json::json!({"value":{"kind":"integer"}});
         let original = other_shape::capture(value.clone());
         value["views"][0]["kind"]["columns"].as_array_mut().unwrap().push(serde_json::json!({
             "id":"area","label":"Area","value":other_shape::field(other_shape::var("row"),"area")
@@ -3770,12 +3771,38 @@ fn comparison_panes_serialize_inputs_before_context_transitions() {
             studio.test_alternative().unwrap().observation.controls["refresh_input"],
             DataValue::Integer { value: 1 }
         );
+        assert_eq!(
+            studio
+                .test_current_trial()
+                .unwrap()
+                .observation
+                .selected
+                .len(),
+            1
+        );
+        assert_eq!(
+            studio
+                .test_alternative()
+                .unwrap()
+                .observation
+                .selected
+                .len(),
+            1
+        );
         click(
             &mut h,
             &mut studio,
             &format!("{owner}.control.number_input"),
         );
-        let invalid = edit(&mut h, &mut studio, "invalid");
+        edit(&mut h, &mut studio, "invalid");
+        studio.test_trial(SemanticInput::AdvanceClock { days: 1 });
+        assert!(
+            !studio.is_busy(),
+            "The final clock dispatch must refuse an unfinished edit"
+        );
+        studio.test_decide_exact(DecisionOutcome::Deferred);
+        assert!(!studio.is_busy());
+        let invalid = frame(&mut h, &mut studio);
         assert!(!studio.is_busy());
         blocked(&invalid, owner, other);
         assert!(invalid.controls["studio.return"].enabled);
@@ -3803,13 +3830,6 @@ fn comparison_panes_serialize_inputs_before_context_transitions() {
             !studio.is_busy(),
             "A shortcut cannot bypass the other pane's unfinished edit"
         );
-        studio.test_trial(SemanticInput::AdvanceClock { days: 1 });
-        assert!(
-            !studio.is_busy(),
-            "The final clock dispatch must refuse an unfinished edit"
-        );
-        studio.test_decide_exact(DecisionOutcome::Deferred);
-        assert!(!studio.is_busy());
         assert_eq!(studio.test_current_trial().unwrap(), &frozen);
         click(
             &mut h,
@@ -3872,7 +3892,8 @@ fn comparison_panes_serialize_inputs_before_context_transitions() {
             &mut studio,
             &format!("{owner}.control.number_input"),
         );
-        let invalid = edit(&mut h, &mut studio, "invalid");
+        edit(&mut h, &mut studio, "invalid");
+        let invalid = frame(&mut h, &mut studio);
         blocked(&invalid, owner, other);
         assert!(invalid
             .text
@@ -3945,18 +3966,7 @@ fn scoped_inputs_finish_before_lifecycle_scope_and_day_changes() {
         change(&mut studio, &path);
         let mut h = egui_harness::EguiHarness::new(egui::vec2(1600.0, 2400.0));
         click(&mut h, &mut studio, "current.control.number_input");
-        let invalid = edit(&mut h, &mut studio, "invalid");
-        let finished = format!("studio.finished.job.{}.done", done.id);
-        for key in [
-            finished.as_str(),
-            "studio.no-finished.job",
-            "studio.trial.next-day",
-        ] {
-            assert!(
-                !invalid.controls[key].enabled,
-                "{key} must not replace a pending copied input"
-            );
-        }
+        edit(&mut h, &mut studio, "invalid");
         studio.test_lifecycle_outcome(
             RecordRef {
                 entity: done.entity.clone(),
@@ -3969,6 +3979,18 @@ fn scoped_inputs_finish_before_lifecycle_scope_and_day_changes() {
             "Final lifecycle dispatch must wait for corrected inputs"
         );
         assert!(studio.test_notice().contains("inputs"));
+        let invalid = frame(&mut h, &mut studio);
+        let finished = format!("studio.finished.job.{}.done", done.id);
+        for key in [
+            finished.as_str(),
+            "studio.no-finished.job",
+            "studio.trial.next-day",
+        ] {
+            assert!(
+                !invalid.controls[key].enabled,
+                "{key} must not replace a pending copied input"
+            );
+        }
         edit(&mut h, &mut studio, "0");
         settle(&mut studio);
         click(&mut h, &mut studio, &finished);
@@ -3997,7 +4019,8 @@ fn scoped_inputs_finish_before_lifecycle_scope_and_day_changes() {
         }
         assert!(ready.controls["studio.scope.future"].enabled);
         click(&mut h, &mut studio, &format!("{pane}.control.number_input"));
-        let invalid = edit(&mut h, &mut studio, "invalid");
+        edit(&mut h, &mut studio, "invalid");
+        let invalid = frame(&mut h, &mut studio);
         for key in choices
             .into_iter()
             .chain(["studio.scope.future", "studio.trial.next-day"])
@@ -4061,7 +4084,8 @@ fn scoped_inputs_finish_before_lifecycle_scope_and_day_changes() {
         );
         assert!(fresh.controls["studio.scope.all"].enabled);
         click(&mut h, &mut studio, &format!("{pane}.control.number_input"));
-        let invalid = edit(&mut h, &mut studio, "invalid");
+        edit(&mut h, &mut studio, "invalid");
+        let invalid = frame(&mut h, &mut studio);
         assert!(!invalid.controls["studio.scope.all"].enabled);
         assert!(invalid.controls["studio.return"].enabled);
         assert!(invalid
