@@ -780,10 +780,14 @@ impl ProductStudio {
                     }
                 }
             }
-            Page::Change(mut view) => {
-                view.current.read_only |= inputs_frozen;
-                if let Some(alternative) = &mut view.alternative {
-                    alternative.read_only |= inputs_frozen;
+            Page::Change(view) => {
+                let mut view = std::borrow::Cow::Borrowed(view);
+                if inputs_frozen {
+                    let view = view.to_mut();
+                    view.current.read_only = true;
+                    if let Some(alternative) = &mut view.alternative {
+                        alternative.read_only = true;
+                    }
                 }
                 trace.label(ui, format!("Requested change: {}", view.need));
                 trace.label(ui, view.origin.clone());
