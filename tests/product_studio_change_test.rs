@@ -9,6 +9,8 @@ mod product_contract;
 mod product_decisions;
 #[path = "../src/product_discovery/mod.rs"]
 mod product_discovery;
+#[path = "../src/product_export.rs"]
+mod product_export;
 #[path = "../src/product_locations.rs"]
 mod product_locations;
 #[path = "../src/product_protocol.rs"]

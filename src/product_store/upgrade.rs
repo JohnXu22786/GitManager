@@ -363,6 +363,52 @@ impl ProductStore {
         upgrade: &LegacyUpgrade,
         fresh_only: bool,
         before_activate: F,
+        progress: P,
+        #[cfg(test)] fault: Option<FaultPoint>,
+    ) -> Result<UpgradeSummary>
+    where
+        F: FnOnce(&ProductStore, &ProjectSnapshot) -> Result<()>,
+        P: FnMut(UpgradeProgress),
+    {
+        Self::recover_upgraded_at(
+            path,
+            None,
+            upgrade,
+            fresh_only,
+            before_activate,
+            progress,
+            #[cfg(test)]
+            fault,
+        )
+    }
+    pub(crate) fn recover_upgraded_selected<F, P>(
+        destination: &RecoveryDestination,
+        upgrade: &LegacyUpgrade,
+        before_activate: F,
+        progress: P,
+        #[cfg(test)] fault: Option<FaultPoint>,
+    ) -> Result<UpgradeSummary>
+    where
+        F: FnOnce(&ProductStore, &ProjectSnapshot) -> Result<()>,
+        P: FnMut(UpgradeProgress),
+    {
+        Self::recover_upgraded_at(
+            destination.path(),
+            Some(destination),
+            upgrade,
+            true,
+            before_activate,
+            progress,
+            #[cfg(test)]
+            fault,
+        )
+    }
+    fn recover_upgraded_at<F, P>(
+        path: &Path,
+        selected: Option<&RecoveryDestination>,
+        upgrade: &LegacyUpgrade,
+        fresh_only: bool,
+        before_activate: F,
         mut progress: P,
         #[cfg(test)] fault: Option<FaultPoint>,
     ) -> Result<UpgradeSummary>
@@ -387,7 +433,13 @@ impl ProductStore {
             RuntimeLimits::default(),
             &snapshot.artifacts,
         )?;
-        let (parent, name) = Self::location(path)?;
+        let (parent, name) = match selected {
+            Some(selected) => selected.checked_parts()?,
+            None => {
+                let (parent, name) = Self::location(path)?;
+                (Arc::new(parent), name)
+            }
+        };
         let (root, fresh) = match parent.create_child(&name) {
             Ok(root) => (root, true),
             // Ordinary recovery must claim a new directory atomically. Only
@@ -398,7 +450,7 @@ impl ProductStore {
             Err(error) => return Err(error.into()),
         };
         let store = Self {
-            parent: Arc::new(parent),
+            parent,
             root: Arc::new(root),
             name,
             upgrade_requires_reopen: Arc::new(std::sync::atomic::AtomicBool::new(false)),

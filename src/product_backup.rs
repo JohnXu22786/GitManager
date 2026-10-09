@@ -10,7 +10,7 @@ use crate::product_locations::{
     ToolIdentity, ToolLocations,
 };
 use crate::product_runtime::LocalRuntime;
-use crate::product_store::{ProductStore, ProjectSnapshot, StoreError};
+use crate::product_store::{ProductStore, ProjectSnapshot, RecoveryDestination, StoreError};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -241,6 +241,18 @@ impl VerifiedBackup {
             self.recover_checked(path, verify_instance)
         })
     }
+    pub(crate) fn recover_tool_selected(
+        &self,
+        selected: &RecoveryDestination,
+        recent: &RecentTools,
+        opened_unix_ms: u64,
+    ) -> Result<CreatedTool> {
+        self.validate()?;
+        selected.check()?;
+        recent.create_and_remember(selected.path(), opened_unix_ms, |verify_instance| {
+            self.recover_checked_at(selected.path(), Some(selected), verify_instance)
+        })
+    }
     // Low-level component boundary. Ordinary recovery uses recover_tool so a
     // missing recent path cannot inherit the original instance's checkpoints.
     pub(crate) fn recover_new(&self, path: &Path) -> Result<ProductStore> {
@@ -251,10 +263,21 @@ impl VerifiedBackup {
         path: &Path,
         verify_instance: &dyn Fn() -> Result<()>,
     ) -> Result<ProductStore> {
+        self.recover_checked_at(path, None, verify_instance)
+    }
+    fn recover_checked_at(
+        &self,
+        path: &Path,
+        selected: Option<&RecoveryDestination>,
+        verify_instance: &dyn Fn() -> Result<()>,
+    ) -> Result<ProductStore> {
         self.validate()?;
         let destination = SelectedFile::new(path)?;
         let payload = &self.envelope.payload;
-        let store = ProductStore::create_recovered_with(path, &payload.snapshot, |fresh| {
+        let before_activate = |fresh: &ProductStore| {
+            if let Some(selected) = selected {
+                selected.check()?;
+            }
             destination
                 .check_parent()
                 .map_err(|e| StoreError::Conflict(e.to_string()))?;
@@ -269,8 +292,19 @@ impl VerifiedBackup {
                 .check_parent()
                 .map_err(|e| StoreError::Conflict(e.to_string()))?;
             verify_instance().map_err(|e| StoreError::Conflict(e.to_string()))
-        })?;
+        };
+        let store = match selected {
+            Some(selected) => ProductStore::create_recovered_selected(
+                selected,
+                &payload.snapshot,
+                before_activate,
+            ),
+            None => ProductStore::create_recovered_with(path, &payload.snapshot, before_activate),
+        }?;
         destination.check_parent()?;
+        if let Some(selected) = selected {
+            selected.check()?;
+        }
         if store.load()? != payload.snapshot {
             return Err(OperationIssue::new(
                 IssueKind::Corrupt,
@@ -717,6 +751,7 @@ impl LegacyBackup {
         recent.create_and_remember(path, opened_unix_ms, |verify_instance| {
             self.recover_inner(
                 path,
+                None,
                 &mut progress,
                 true,
                 verify_instance,
@@ -725,6 +760,31 @@ impl LegacyBackup {
             )?;
             // The upgrade's write session is never handed to ordinary editing.
             Ok(ProductStore::open(path)?)
+        })
+    }
+    pub(crate) fn upgrade_recover_tool_selected<P>(
+        &self,
+        selected: &RecoveryDestination,
+        recent: &RecentTools,
+        opened_unix_ms: u64,
+        mut progress: P,
+    ) -> Result<CreatedTool>
+    where
+        P: FnMut(crate::product_store::UpgradeProgress),
+    {
+        selected.check()?;
+        recent.create_and_remember(selected.path(), opened_unix_ms, |verify_instance| {
+            self.recover_inner(
+                selected.path(),
+                Some(selected),
+                &mut progress,
+                true,
+                verify_instance,
+                #[cfg(test)]
+                None,
+            )?;
+            selected.check()?;
+            Ok(ProductStore::open(selected.path())?)
         })
     }
     /// On success, restart, open_verified the chosen path, then register that
@@ -740,6 +800,7 @@ impl LegacyBackup {
     {
         self.recover_inner(
             path,
+            None,
             progress,
             false,
             &|| Ok(()),
@@ -757,11 +818,12 @@ impl LegacyBackup {
     where
         P: FnMut(crate::product_store::UpgradeProgress),
     {
-        self.recover_inner(path, progress, false, &|| Ok(()), Some(fault))
+        self.recover_inner(path, None, progress, false, &|| Ok(()), Some(fault))
     }
     fn recover_inner<P>(
         &self,
         path: &Path,
+        selected: Option<&RecoveryDestination>,
         progress: P,
         fresh_only: bool,
         verify_instance: &dyn Fn() -> Result<()>,
@@ -771,20 +833,34 @@ impl LegacyBackup {
         P: FnMut(crate::product_store::UpgradeProgress),
     {
         let verified = Self::from_bytes(&self.original)?;
-        Ok(ProductStore::recover_upgraded_with(
-            path,
-            &verified.upgrade,
-            fresh_only,
-            |store, snapshot| {
-                verify_instance().map_err(|e| StoreError::Conflict(e.to_string()))?;
-                IntentArchive::new(store.clone())
-                    .restore_for(snapshot, &verified.intentions)
-                    .map_err(|e| StoreError::Corrupt(e.to_string()))?;
-                verify_instance().map_err(|e| StoreError::Conflict(e.to_string()))
-            },
-            progress,
-            #[cfg(test)]
-            fault,
-        )?)
+        let before_activate = |store: &ProductStore, snapshot: &ProjectSnapshot| {
+            if let Some(selected) = selected {
+                selected.check()?;
+            }
+            verify_instance().map_err(|e| StoreError::Conflict(e.to_string()))?;
+            IntentArchive::new(store.clone())
+                .restore_for(snapshot, &verified.intentions)
+                .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+            verify_instance().map_err(|e| StoreError::Conflict(e.to_string()))
+        };
+        Ok(match selected {
+            Some(selected) => ProductStore::recover_upgraded_selected(
+                selected,
+                &verified.upgrade,
+                before_activate,
+                progress,
+                #[cfg(test)]
+                fault,
+            ),
+            None => ProductStore::recover_upgraded_with(
+                path,
+                &verified.upgrade,
+                fresh_only,
+                before_activate,
+                progress,
+                #[cfg(test)]
+                fault,
+            ),
+        }?)
     }
 }
