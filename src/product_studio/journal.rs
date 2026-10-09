@@ -2,7 +2,9 @@
 use super::*;
 use crate::product_locations::Folder;
 use serde::{Deserialize, Serialize};
-const JOURNAL_LIMIT: usize = 256 * 1024;
+// Complete inherited Modify context must fit the existing strict 1 MiB local
+// JSON intake. Old journals retain the same format, digests and read path.
+const JOURNAL_LIMIT: usize = MAX_WIRE_BYTES;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -50,10 +52,17 @@ pub(super) struct ProviderAssociation {
     pub wire_request: String,
     pub wire_source: String,
     pub issued: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modify: Option<(Association, Basis)>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum Interrupted {
+    Change {
+        tool: Association,
+        basis: Basis,
+        plan: AdoptionPlan,
+    },
     Create {
         tool: Association,
     },
@@ -135,15 +144,33 @@ impl Journal {
             profile,
             wire_request,
             wire_source,
+            modify,
             ..
         }) = &self.provider
         {
             request.validate().map_err(error)?;
-            if request.operation != DevelopmentOperation::Generate
-                || !request.sources.is_empty()
-                || request.request != self.need
-            {
-                return Err("Invalid interrupted generation association".into());
+            match (request.operation, modify) {
+                (DevelopmentOperation::Generate, None)
+                    if request.sources.is_empty() && request.request == self.need =>
+                {
+                    ()
+                }
+                (DevelopmentOperation::Modify, Some((tool, basis))) => {
+                    check(tool)?;
+                    if request.project_id != tool.identity.project_id
+                        || request
+                            .sources
+                            .last()
+                            .and_then(|s| canonical_digest(IdentityDomain::Source, s).ok())
+                            .as_ref()
+                            != Some(&basis.source)
+                        || request.context.data_digest.as_ref() != Some(&basis.data)
+                        || request.context.session_digest.as_ref() != Some(&basis.session)
+                    {
+                        return Err("Invalid interrupted modification association".into());
+                    }
+                }
+                _ => return Err("Invalid interrupted generation association".into()),
             }
             let wire = encode_request(
                 request,
@@ -159,6 +186,17 @@ impl Journal {
             }
         }
         match &self.pending {
+            Some(Interrupted::Change { tool, basis, plan }) => {
+                check(tool)?;
+                plan.validate().map_err(error)?;
+                if plan.project_id != tool.identity.project_id
+                    || plan.expected_generation != basis.data_generation
+                    || plan.expected_data != basis.data
+                    || plan.expected_session != basis.session
+                {
+                    return Err("Invalid interrupted change association".into());
+                }
+            }
             Some(Interrupted::Create { tool }) => check(tool)?,
             Some(Interrupted::Daily {
                 tool,

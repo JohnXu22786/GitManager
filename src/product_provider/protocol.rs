@@ -3,9 +3,20 @@ use ring::digest::{digest as hash, SHA256};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const MAX_PROMPT_BYTES: usize = 128 * 1024;
+// A complete, source-qualified managed-tool request can exceed 128 KiB even
+// before examples. This input allowance does not change result or schema limits.
+pub const MAX_PROMPT_BYTES: usize = 1024 * 1024;
 pub const MAX_SCHEMA_BYTES: usize = 32 * 1024;
 pub const MAX_RESULT_BYTES: usize = 1024 * 1024;
+// prompt/schema serialize as Vec<u8>: each byte needs at most three decimal
+// digits and one comma. The remaining validated text is at most 9 KiB and can
+// expand sixfold for JSON controls; 64 KiB also covers bounded IDs and keys.
+pub const MAX_SERIALIZED_REQUEST_BYTES: usize =
+    4 * MAX_PROMPT_BYTES + 4 * MAX_SCHEMA_BYTES + 64 * 1024;
+// The subprocess envelope embeds UTF-8 prompt text as a JSON string. A control
+// byte can require six bytes (\\u0000); correlation and fixed instructions fit
+// within the separately reserved 4 KiB. No external/source parser cap changes.
+pub const MAX_STDIN_BYTES: usize = 6 * MAX_PROMPT_BYTES + 4 * 1024;
 pub const RECEIPT_VERSION: u32 = 1;
 
 pub fn digest(bytes: &[u8]) -> String {

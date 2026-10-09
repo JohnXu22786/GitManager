@@ -314,27 +314,112 @@ pub(super) fn execute_admitted<R: RuntimeAdapter>(
                 SemanticInput::Activate { row: Some(row), .. } => refs.push(row.clone()),
                 _ => {}
             }
-            if admission.is_some()
-                && !event.outputs.is_empty()
-                && crate::product_runtime::has_protected_fields(program)
-            {
-                let artifacts = runtime.emitted_artifacts(&run)?;
-                for digest in &event.outputs {
-                    let output = artifacts
+            let mut unknown_emission = false;
+            if admission.is_some() && !event.outputs.is_empty() {
+                if let Some(receipts) = runtime.emitted_record_participants(&run)? {
+                    let artifacts = runtime.emitted_artifacts(&run)?;
+                    let step = evidence
+                        .trace
+                        .last()
+                        .ok_or_else(|| invalid("emission input step is absent"))?;
+                    if receipts.len() != artifacts.len()
+                        || event.outputs != step.outputs
+                        || event.program != program.artifact.program_digest
+                    {
+                        return Err(DecisionError::Unverified(
+                            "emission participant inventory differs from the actual input event"
+                                .into(),
+                        ));
+                    }
+                    let start = artifacts
+                        .len()
+                        .checked_sub(event.outputs.len())
+                        .ok_or_else(|| invalid("emission receipt ordinal is absent"))?;
+                    let records: BTreeMap<_, _> = after
+                        .records
                         .iter()
-                        .find(|output| &output.digest == digest)
-                        .ok_or_else(|| {
-                            DecisionError::Unverified(
-                                "Emitted scoped output receipt is unavailable".into(),
-                            )
-                        })?;
-                    output.validate()?;
-                    for row in &output.rows {
-                        for (field, value) in row {
-                            if field.starts_with(crate::product_runtime::PROTECTED_FIELD_PREFIX)
-                                && field.ends_with("_record")
+                        .map(|row| ((row.entity.as_str(), row.id.as_str()), row))
+                        .collect();
+                    let mut births = BTreeMap::new();
+                    for birth in &after.events {
+                        for change in birth
+                            .changes
+                            .iter()
+                            .filter(|change| change.before.is_none())
+                        {
+                            births
+                                .entry((change.entity.as_str(), change.record.as_str()))
+                                .and_modify(|entry| *entry = None)
+                                .or_insert(Some(&birth.program));
+                        }
+                    }
+                    for (offset, digest) in event.outputs.iter().enumerate() {
+                        let ordinal = start + offset;
+                        let output = &artifacts[ordinal];
+                        if &output.digest != digest {
+                            return Err(DecisionError::Unverified(
+                                "emission receipt does not name the actual event output".into(),
+                            ));
+                        }
+                        let receipt = &receipts[ordinal];
+                        receipt.validate_for(program, &op, ordinal, output, step, clock_day)?;
+                        let Some(participants) = receipt.records() else {
+                            unknown_emission = true;
+                            continue;
+                        };
+                        let mut emission_refs = Vec::with_capacity(participants.len());
+                        let mut authenticated = true;
+                        for (participant, output_row) in participants.iter().zip(&output.rows) {
+                            let reference = participant.record();
+                            let key = (reference.entity.as_str(), reference.record.as_str());
+                            let born = births.get(&key).copied().flatten();
+                            if !records.get(&key).is_some_and(|row| {
+                                &row.created_program == participant.created_program()
+                            }) || born != Some(participant.created_program())
                             {
-                                input_references(value, &mut refs);
+                                authenticated = false;
+                            }
+                            for (field, value) in output_row {
+                                if field.starts_with(crate::product_runtime::PROTECTED_FIELD_PREFIX)
+                                    && field.ends_with("_record")
+                                    && value
+                                        != &(DataValue::Reference {
+                                            entity: reference.entity.clone(),
+                                            record: reference.record.clone(),
+                                        })
+                                {
+                                    return Err(DecisionError::Unverified("compiler output provenance disagrees with actual emitted participants".into()));
+                                }
+                            }
+                            emission_refs.push(reference.clone());
+                        }
+                        if authenticated {
+                            refs.extend(emission_refs);
+                        } else {
+                            // One missing/ambiguous birth invalidates the whole
+                            // emission, never just the inconvenient participants.
+                            unknown_emission = true;
+                        }
+                    }
+                } else if crate::product_runtime::has_protected_fields(program) {
+                    let artifacts = runtime.emitted_artifacts(&run)?;
+                    for digest in &event.outputs {
+                        let output = artifacts
+                            .iter()
+                            .find(|output| &output.digest == digest)
+                            .ok_or_else(|| {
+                                DecisionError::Unverified(
+                                    "Emitted scoped output receipt is unavailable".into(),
+                                )
+                            })?;
+                        output.validate()?;
+                        for row in &output.rows {
+                            for (field, value) in row {
+                                if field.starts_with(crate::product_runtime::PROTECTED_FIELD_PREFIX)
+                                    && field.ends_with("_record")
+                                {
+                                    input_references(value, &mut refs);
+                                }
                             }
                         }
                     }
@@ -342,7 +427,7 @@ pub(super) fn execute_admitted<R: RuntimeAdapter>(
             }
             refs.sort_by(|a, b| (&a.entity, &a.record).cmp(&(&b.entity, &b.record)));
             refs.dedup();
-            if refs.is_empty() {
+            if refs.is_empty() || unknown_emission {
                 contexts.push(ScopeContext {
                     operation: event.action.clone(),
                     record: None,

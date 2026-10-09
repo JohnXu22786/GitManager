@@ -650,3 +650,119 @@ fn format_upgrade_controls_require_explicit_confirmation_and_reopen_fresh_daily_
         2
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn controls_modify_play_and_record_each_real_nonbinary_choice() {
+    use product_contract::*;
+    for (button, outcome) in [
+        ("studio.either", DecisionOutcome::EitherAcceptable),
+        ("studio.both", DecisionOutcome::BothNeeded),
+        ("studio.neither", DecisionOutcome::NeitherFits),
+        ("studio.defer", DecisionOutcome::Deferred),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let path = root.join("saved-tool");
+        let original = fixture::capture(fixture::organizer());
+        let store = product_store::ProductStore::create(&path, &original, 20000).unwrap();
+        store
+            .apply(
+                0,
+                "first-person",
+                &fixture::add("Ada"),
+                RuntimeLimits::default(),
+            )
+            .unwrap();
+        let before = store.load().unwrap();
+        let mut candidate = fixture::organizer();
+        candidate["actions"][2]["steps"][0]["items"] = fixture::query("person");
+        let mut studio = ProductStudio::testing(
+            root.clone(),
+            Some(transport(&root, candidate, "good")),
+            TestHooks {
+                duplicate_completion: true,
+                ..TestHooks::default()
+            },
+        );
+        let mut h = EguiHarness::new(egui::vec2(1200.0, 2400.0));
+        settle(&mut h, &mut studio);
+        studio.test_open(path);
+        settle(&mut h, &mut studio);
+        let focused = product_contract::RecordRef {
+            entity: before.data.records[0].entity.clone(),
+            record: before.data.records[0].id.clone(),
+        };
+        click(
+            &mut h,
+            &mut studio,
+            &format!("daily.focus.{}.{}", focused.entity, focused.record),
+        );
+        assert!(
+            store.load().unwrap().session.focused_record.is_none(),
+            "focus is renderer-local, not a saved input"
+        );
+        fill(
+            &mut h,
+            &mut studio,
+            "studio.change-need",
+            "Export all people while keeping my selection",
+        );
+        click(&mut h, &mut studio, "studio.modify");
+        settle(&mut h, &mut studio);
+        assert_eq!(studio.test_page(), "consent", "{}", studio.test_notice());
+        assert!(
+            studio
+                .test_prepared_request()
+                .unwrap()
+                .context
+                .selected
+                .contains(&focused),
+            "actual local focus must accompany this Modify request"
+        );
+        assert!(frame(&mut h, &mut studio)
+            .text
+            .iter()
+            .any(|s| s.contains("not automatically sanitized")));
+        click(&mut h, &mut studio, "studio.consent");
+        settle(&mut h, &mut studio);
+        assert_eq!(studio.test_page(), "change", "{}", studio.test_notice());
+        assert!(!frame(&mut h, &mut studio).controls["studio.accept"].enabled);
+        click(&mut h, &mut studio, "current.action.export_button");
+        settle(&mut h, &mut studio);
+        assert_eq!(
+            studio
+                .test_current_trial()
+                .unwrap()
+                .artifacts
+                .last()
+                .unwrap()
+                .rows
+                .len(),
+            0
+        );
+        assert_eq!(
+            studio
+                .test_alternative()
+                .unwrap()
+                .artifacts
+                .last()
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
+        click(&mut h, &mut studio, button);
+        settle(&mut h, &mut studio);
+        assert_eq!(studio.test_page(), "daily", "{}", studio.test_notice());
+        let recorded = store.load().unwrap();
+        assert_eq!(recorded.active_revision, before.active_revision);
+        assert_eq!(recorded.data, before.data);
+        assert_eq!(recorded.session, before.session);
+        assert_eq!(recorded.decisions.decisions[0].outcome, outcome);
+        assert!(frame(&mut h, &mut studio).controls.contains_key(&format!(
+            "studio.resume.{}",
+            recorded.decisions.decisions[0].id
+        )));
+    }
+}

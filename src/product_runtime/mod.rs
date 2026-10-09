@@ -129,6 +129,8 @@ struct State {
     session: SessionState,
     day: i32,
     outputs: Vec<LocalArtifact>,
+    output_participants: Vec<EmittedRecordParticipants>,
+    output_participant_count: usize,
 }
 /// An isolated execution copy. Accessors deliberately do not expose mutation.
 pub struct ProductRun {
@@ -508,6 +510,13 @@ impl LocalRuntime {
         run.state.outputs = artifacts.to_vec();
         Ok(run)
     }
+    #[cfg(test)]
+    pub(crate) fn test_fresh_output_participants<'a>(
+        &self,
+        run: &'a ProductRun,
+    ) -> &'a [EmittedRecordParticipants] {
+        &run.state.output_participants
+    }
     pub fn view_model(&self, run: &ProductRun) -> Result<RuntimeView> {
         let observation = self.observe(run, "view")?;
         Ok(RuntimeView {
@@ -708,6 +717,8 @@ impl RuntimeAdapter for LocalRuntime {
                 session: session.clone(),
                 day: clock_day,
                 outputs: vec![],
+                output_participants: vec![],
+                output_participant_count: 0,
             },
             seed: random_seed,
             limits: limits.clone(),
@@ -753,6 +764,7 @@ impl RuntimeAdapter for LocalRuntime {
         }
         let before_data = run.state.data.identity()?;
         let before_session = run.state.session.identity()?;
+        let before_day = run.state.day;
         let mut next = run.state.clone();
         let mut meter = Meter::new(run.limits.clone(), run.fuel.get(), self.cancelled.clone());
         let mut observation = None;
@@ -784,6 +796,9 @@ impl RuntimeAdapter for LocalRuntime {
         })();
         run.fuel.set(meter.fuel);
         let output_start = run.state.outputs.len();
+        // Restored artifacts have no freshly executed sidecars. Their count
+        // must never index the independent vector of this run's receipts.
+        let participant_start = run.state.output_participants.len();
         let (outcome, diagnostic) = match &result {
             Ok(()) => (StepOutcome::Applied, None),
             Err(e) => (
@@ -815,6 +830,14 @@ impl RuntimeAdapter for LocalRuntime {
             outcome,
             diagnostic,
         };
+        for receipt in &mut run.state.output_participants[participant_start..] {
+            receipt.bind_step(
+                &request,
+                &step.before_data,
+                &step.before_session,
+                before_day,
+            );
+        }
         run.trace.push(step.clone());
         result?;
         run.receipts
@@ -829,6 +852,17 @@ impl RuntimeAdapter for LocalRuntime {
     }
     fn emitted_artifacts<'a>(&self, run: &'a ProductRun) -> Result<&'a [LocalArtifact]> {
         Ok(run.artifacts())
+    }
+    fn emitted_record_participants<'a>(
+        &self,
+        run: &'a ProductRun,
+    ) -> Result<Option<&'a [EmittedRecordParticipants]>> {
+        // Resume preserves historical bytes without inventing execution
+        // receipts for them. A fresh suffix is not a complete inventory.
+        Ok(
+            (run.state.output_participants.len() == run.state.outputs.len())
+                .then_some(run.state.output_participants.as_slice()),
+        )
     }
     fn data<'a>(&self, run: &'a ProductRun) -> &'a DataSnapshot {
         &run.state.data

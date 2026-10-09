@@ -61,6 +61,8 @@ struct Ready {
     request: DevelopmentRequest,
     transport: ProviderTransport,
     epoch: u64,
+    basis: Option<Basis>,
+    association: ProviderAssociation,
 }
 struct OpenTool {
     association: Association,
@@ -74,6 +76,8 @@ struct Worker {
     page: Page,
     ready: Option<Ready>,
     draft: Option<Draft>,
+    change: Option<ChangeDraft>,
+    recent_inputs: Vec<SemanticInput>,
     opened: Option<OpenTool>,
     chosen: Option<PathBuf>,
     generation_blocked: bool,
@@ -104,7 +108,11 @@ impl Worker {
         let durable_pending = self.journal.as_ref().is_some_and(|j| {
             matches!(
                 j.value.pending,
-                Some(Interrupted::Create { .. } | Interrupted::Daily { .. })
+                Some(
+                    Interrupted::Create { .. }
+                        | Interrupted::Daily { .. }
+                        | Interrupted::Change { .. }
+                )
             )
         });
         Update {
@@ -225,6 +233,8 @@ impl Worker {
         profile: CapabilityProfile,
         key: &Key,
         gate: &Gate,
+        modify: bool,
+        focused: Option<RecordRef>,
     ) -> Result<(), String> {
         self.no_pending()?;
         if self.generation_blocked
@@ -235,36 +245,108 @@ impl Worker {
         {
             return Err("The earlier provider process has an unresolved outcome; no new generation was sent".into());
         }
-        let request = DevelopmentRequest {
-            version: CONTRACT_VERSION,
-            id: id("request"),
-            project_id: id("project"),
-            operation: DevelopmentOperation::Generate,
-            request: need.clone(),
-            sources: vec![],
-            context: DevelopmentContext {
-                view: None,
-                selected: vec![],
-                recent_inputs: vec![],
-                data_digest: None,
-                session_digest: None,
-            },
-            examples: vec![],
-            accepted_scenes: vec![],
-            decisions: DecisionGraph {
+        let modify_binding = if modify {
+            let current = self
+                .opened
+                .as_ref()
+                .ok_or("Open the saved tool before requesting a change")?;
+            let basis = Basis::capture(&current.snapshot)?;
+            if key.basis.as_ref() != Some(&basis)
+                || current.store.load().map_err(error)? != current.snapshot
+                || self.today() != basis.day
+            {
+                return Err("The current source, data, session or date changed. Reopen saved work before requesting this change".into());
+            }
+            Some((current.association.clone(), basis))
+        } else {
+            None
+        };
+        let request = if modify {
+            let current = self.opened.as_ref().unwrap();
+            let model = current.store.runtime_view().map_err(error)?;
+            if current.store.load().map_err(error)? != current.snapshot {
+                return Err(
+                    "Saved work changed while its context was captured. Reopen it before sending"
+                        .into(),
+                );
+            }
+            let mut selected = model.observation.selected.clone();
+            if let Some(focused) = focused {
+                if !model.observation.rows.iter().any(|r| r.record == focused)
+                    || !current
+                        .snapshot
+                        .data
+                        .records
+                        .iter()
+                        .any(|r| r.entity == focused.entity && r.id == focused.record)
+                {
+                    return Err("The focused record is no longer in this saved view. Focus current work before requesting the change".into());
+                }
+                if !selected.contains(&focused) {
+                    selected.push(focused);
+                }
+            }
+            if let Some(focused) = &current.snapshot.session.focused_record {
+                if !selected.contains(focused) {
+                    selected.push(focused.clone());
+                }
+            }
+            let context = DevelopmentContext {
+                view: Some(current.snapshot.session.view.clone()),
+                selected,
+                recent_inputs: self.recent_inputs.clone(),
+                data_digest: Some(current.snapshot.data.identity().map_err(error)?),
+                session_digest: Some(current.snapshot.session.identity().map_err(error)?),
+            };
+            DecisionEngine::new(
+                LocalRuntime::with_cancellation(gate.cancelled.clone()),
+                IntentArchive::new(current.store.clone()),
+            )
+            .development_request(
+                &current.snapshot,
+                &id("request"),
+                DevelopmentOperation::Modify,
+                &need,
+                context,
+            )
+            .map_err(error)?
+        } else {
+            DevelopmentRequest {
                 version: CONTRACT_VERSION,
-                revision: 0,
-                decisions: vec![],
-            },
-            unknowns: vec![],
-            required_capabilities: BTreeSet::new(),
+                id: id("request"),
+                project_id: id("project"),
+                operation: DevelopmentOperation::Generate,
+                request: need.clone(),
+                sources: vec![],
+                context: DevelopmentContext {
+                    view: None,
+                    selected: vec![],
+                    recent_inputs: vec![],
+                    data_digest: None,
+                    session_digest: None,
+                },
+                examples: vec![],
+                accepted_scenes: vec![],
+                decisions: DecisionGraph {
+                    version: CONTRACT_VERSION,
+                    revision: 0,
+                    decisions: vec![],
+                },
+                unknowns: vec![],
+                required_capabilities: BTreeSet::new(),
+            }
         };
         request.validate().map_err(error)?;
         self.journal(|j| j.need = need)?;
         self.ready = None;
         self.draft = None;
-        self.opened = None;
-        self.page = Page::Home;
+        self.change = None;
+        if !modify {
+            self.opened = None;
+        }
+        if !modify {
+            self.page = Page::Home;
+        }
         // Only explicitly injected test transports can attest a fixture profile.
         #[cfg(test)]
         let profile = if self.config.transport.is_some() {
@@ -290,11 +372,19 @@ impl Worker {
             wire_request: wire.digest()?,
             wire_source: wire.source_digest,
             issued: false,
+            modify: modify_binding.clone(),
         };
-        self.journal(|j| j.provider = Some(pending))?;
+        self.journal(|j| j.provider = Some(pending.clone()))?;
         self.page = Page::Consent {
             disclosure: prepared.disclosure().clone(),
-            need: request.request.clone(),
+            need: self
+                .journal
+                .as_ref()
+                .map(|j| j.value.need.clone())
+                .unwrap_or_else(|| request.request.clone()),
+            request: request.clone(),
+            review: String::from_utf8(wire.prompt.clone()).map_err(error)?,
+            basis: modify_binding.as_ref().map(|(_, basis)| basis.clone()),
         };
         #[cfg(test)]
         if self.config.transport.is_some() {
@@ -305,10 +395,43 @@ impl Worker {
             request,
             transport,
             epoch: key.epoch,
+            basis: modify_binding.map(|(_, basis)| basis),
+            association: pending,
         });
         Ok(())
     }
     fn generate(&mut self, disclosure: String, key: &Key, gate: &Gate) -> Result<(), String> {
+        #[cfg(test)]
+        match self.config.hooks.provider_association_fault {
+            Some(TestProviderAssociationFault::Missing) => self.journal(|j| j.provider = None)?,
+            Some(TestProviderAssociationFault::DifferentRequest) => {
+                let mut association = self
+                    .journal
+                    .as_ref()
+                    .unwrap()
+                    .value
+                    .provider
+                    .clone()
+                    .unwrap();
+                association
+                    .request
+                    .request
+                    .push_str(" with an unrelated change");
+                let wire = encode_request(
+                    &association.request,
+                    &ProviderOptions {
+                        provider: association.provider,
+                        profile: association.profile,
+                        ..ProviderOptions::default()
+                    },
+                )
+                .map_err(error)?;
+                association.wire_request = wire.digest()?;
+                association.wire_source = wire.source_digest;
+                self.journal(|j| j.provider = Some(association))?;
+            }
+            None => (),
+        }
         let ready = self
             .ready
             .as_ref()
@@ -316,12 +439,33 @@ impl Worker {
         if ready.epoch != key.epoch || ready.prepared.disclosure().digest() != disclosure {
             return Err("The prepared request changed; review it again before authorizing".into());
         }
-        gate.check()?;
-        self.journal(|j| {
-            if let Some(ProviderAssociation { issued, .. }) = &mut j.provider {
-                *issued = true;
+        if let Some(basis) = &ready.basis {
+            let current = self.opened.as_ref().ok_or("The saved tool was closed")?;
+            if key.basis.as_ref() != Some(basis)
+                || Basis::capture(&current.store.load().map_err(error)?)? != *basis
+                || self.today() != basis.day
+            {
+                return Err("Saved work changed after disclosure. Review a fresh change request before sending".into());
             }
-        })?;
+        }
+        let association = self
+            .journal
+            .as_ref()
+            .and_then(|j| j.value.provider.as_ref())
+            .ok_or("The prepared request is no longer available. Go back and prepare a fresh request before sending.")?;
+        if association.issued
+            || canonical_bytes(association).map_err(error)?
+                != canonical_bytes(&ready.association).map_err(error)?
+        {
+            return Err(
+                "The prepared request changed. Go back and prepare a fresh request before sending."
+                    .into(),
+            );
+        }
+        let mut issued = association.clone();
+        issued.issued = true;
+        gate.check()?;
+        self.journal(|j| j.provider = Some(issued))?;
         let ready = self.ready.take().unwrap();
         let consent = ConsentReceipt {
             disclosure_digest: disclosure,
@@ -332,7 +476,11 @@ impl Worker {
         let result = provider.develop(&ready.request, &|| gate.cancelled.load(Ordering::Acquire));
         let receipt = provider.receipt();
         let raw = provider.raw_response();
-        self.page = Page::Home;
+        if ready.basis.is_none() {
+            self.page = Page::Home;
+        } else if let Some(opened) = &self.opened {
+            self.page = daily_page(&opened.association, &opened.store, &opened.snapshot)?;
+        }
         // Dropping the provider/job and any cancellation join stays on this worker.
         drop(provider);
         let terminal = ready.transport.reconcile(&ready.request.id);
@@ -376,6 +524,38 @@ impl Worker {
             .map_err(error)?;
             runtime.validate(&capture).map_err(error)?;
             captures.push(capture);
+        }
+        if let Some(basis) = ready.basis {
+            let current = self
+                .opened
+                .as_ref()
+                .ok_or("The original saved tool is no longer open")?;
+            if Basis::capture(&current.store.load().map_err(error)?)? != basis
+                || self.today() != basis.day
+            {
+                self.page = daily_page(&current.association, &current.store, &current.snapshot)?;
+                return Err("Saved work changed while the provider was working. Its stale result was not adopted; make a fresh change request".into());
+            }
+            let mut change = ChangeDraft::new(
+                current.snapshot.clone(),
+                captures.remove(0),
+                self.journal
+                    .as_ref()
+                    .map(|j| j.value.need.clone())
+                    .unwrap_or_else(|| ready.request.request.clone()),
+            )?;
+            change.request = Some(ready.request);
+            change.result = Some(result);
+            change.raw = Some(raw);
+            change.receipt = Some(receipt);
+            // Retain the actual returned alternative even if its shape needs a
+            // business clarification or a supported design route.
+            let result = change.prepare(&current.store, gate);
+            self.page = Page::Change(change.checked_view(&current.store, gate)?);
+            self.change = Some(change);
+            self.notice =
+                "Try the actual change on copied work. Nothing in your saved tool changed".into();
+            return result;
         }
         let run = empty_run(&captures[0], self.today(), &runtime)?;
         gate.check()?;
@@ -490,19 +670,103 @@ impl Worker {
         };
         let association = Association {
             path,
-            identity: ToolIdentity::from_snapshot(&opened.snapshot).map_err(error)?,
+            identity: opened.summary.identity.clone(),
         };
+        self.install_opened(association, opened)
+    }
+    fn install_opened(
+        &mut self,
+        association: Association,
+        mut opened: crate::product_backup::OpenedTool,
+    ) -> Result<(), String> {
+        // open_verified checked snapshot, intention objects and identity
+        // together. Do not discard that result and open it all again.
+        // daily_page still fences its fresh rendered view to this exact basis.
+        if association.identity != opened.summary.identity {
+            return Err("The verified tool belongs to another saved identity".into());
+        }
         let page = daily_page(&association, &opened.store, &opened.snapshot)?;
         self.opened = Some(OpenTool {
             association: association.clone(),
-            store: opened.store,
-            snapshot: opened.snapshot,
+            store: opened.store.clone(),
+            snapshot: opened.snapshot.clone(),
         });
         self.draft = None;
+        self.change = None;
+        self.recent_inputs.clear();
         self.ready = None;
         self.page = page;
         self.journal(|j| j.last = Some(association.clone()))?;
-        self.post_save(&association);
+        self.post_save_opened(&association, Some(&mut opened));
+        Ok(())
+    }
+    fn return_daily(&mut self, gate: &Gate) -> Result<(), String> {
+        let association = self
+            .opened
+            .as_ref()
+            .ok_or("No saved tool is open")?
+            .association
+            .clone();
+        // Stage every fallible view check before abandoning prepared consent or
+        // copied work. The same verified open is handed to checkpoint creation.
+        let staged = inspect_open(&association.path, Some(&association.identity)).map_err(error)?;
+        #[cfg(test)]
+        if let Some(pause) = &self.config.hooks.before_return_install {
+            pause.reached.store(true, Ordering::Release);
+            while !pause.release.load(Ordering::Acquire) && !gate.cancelled.load(Ordering::Acquire)
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        gate.check()?;
+        let (page, mut verified) = match staged {
+            OpenGate::Ready(opened) => {
+                let page = daily_page(&association, &opened.store, &opened.snapshot)?;
+                (page, Some(opened))
+            }
+            OpenGate::UpgradeRequired(summary) => {
+                if association.identity
+                    != (ToolIdentity {
+                        project_id: summary.project_id.clone(),
+                        first_program: summary.first_program.clone(),
+                    })
+                {
+                    return Err("The saved tool identity changed while returning".into());
+                }
+                (
+                    Page::Upgrade {
+                        tool: association.clone(),
+                        summary,
+                    },
+                    None,
+                )
+            }
+        };
+        if !gate.finish() {
+            return Err(
+                "Returning was cancelled; the prepared request and copied work were kept".into(),
+            );
+        }
+        let abandon_ready = self.ready.is_some();
+        self.journal(|j| {
+            if abandon_ready && j.provider.as_ref().is_some_and(|p| !p.issued) {
+                j.provider = None;
+            }
+            j.last = Some(association.clone());
+        })?;
+        self.opened = verified.as_ref().map(|opened| OpenTool {
+            association: association.clone(),
+            store: opened.store.clone(),
+            snapshot: opened.snapshot.clone(),
+        });
+        self.draft = None;
+        self.change = None;
+        self.ready = None;
+        self.recent_inputs.clear();
+        self.page = page;
+        if let Some(opened) = verified.as_mut() {
+            self.post_save_opened(&association, Some(opened));
+        }
         Ok(())
     }
     fn upgrade(
@@ -522,6 +786,9 @@ impl Worker {
             .is_some_and(|pending| {
                 let (Interrupted::Create { tool: pending_tool }
                 | Interrupted::Daily {
+                    tool: pending_tool, ..
+                }
+                | Interrupted::Change {
                     tool: pending_tool, ..
                 }) = pending;
                 pending_tool != tool
@@ -587,6 +854,13 @@ impl Worker {
         }
     }
     fn post_save(&mut self, tool: &Association) {
+        self.post_save_opened(tool, None);
+    }
+    fn post_save_opened(
+        &mut self,
+        tool: &Association,
+        opened: Option<&mut crate::product_backup::OpenedTool>,
+    ) {
         let result = (|| -> Result<(), String> {
             let locations = self
                 .locations
@@ -595,10 +869,13 @@ impl Worker {
             let recent = RecentTools::open(locations.path()).map_err(error)?;
             let instance = recent.remember(&tool.path, unix_ms()).map_err(error)?;
             let store = &self.opened.as_ref().ok_or("Saved tool is not open")?.store;
-            CheckpointShelf::for_tool(locations, &tool.identity, &instance)
-                .map_err(error)?
-                .capture(store)
-                .map_err(error)?;
+            let shelf =
+                CheckpointShelf::for_tool(locations, &tool.identity, &instance).map_err(error)?;
+            match opened {
+                Some(opened) => opened.checkpoint(&shelf),
+                None => shelf.capture(store),
+            }
+            .map_err(error)?;
             Ok(())
         })();
         if let Err(e) = result {
@@ -775,6 +1052,10 @@ impl Worker {
                 j.pending = None;
                 j.last = Some(association.clone());
             })?;
+            self.recent_inputs.push(input);
+            if self.recent_inputs.len() > 16 {
+                self.recent_inputs.remove(0);
+            }
             self.notice = "Your work was saved".into();
             self.post_save(&association);
             Ok(())
@@ -833,7 +1114,12 @@ impl Worker {
     }
     fn reconcile(&mut self, retry: bool, gate: &Gate) -> Result<(), String> {
         let pending = self.journal.as_ref().and_then(|j| j.value.pending.clone());
-        if let Some(Interrupted::Create { tool } | Interrupted::Daily { tool, .. }) = &pending {
+        if let Some(
+            Interrupted::Create { tool }
+            | Interrupted::Daily { tool, .. }
+            | Interrupted::Change { tool, .. },
+        ) = &pending
+        {
             if matches!(
                 inspect_open(&tool.path, Some(&tool.identity)).map_err(error)?,
                 OpenGate::UpgradeRequired(_)
@@ -845,6 +1131,40 @@ impl Worker {
         }
         match pending {
             None => self.reconcile_provider(),
+            Some(Interrupted::Change {
+                tool,
+                basis: _,
+                plan,
+            }) => {
+                let opened = open_verified(&tool.path, Some(&tool.identity)).map_err(error)?;
+                if has_change_receipt(&opened.snapshot, &plan)? {
+                    self.committed = Some(tool.path.clone());
+                    self.journal(|j| {
+                        j.pending = None;
+                        j.last = Some(tool.clone());
+                    })?;
+                    self.notice =
+                        "The exact saved choice was verified. It was not adopted twice".into();
+                    self.install_opened(tool.clone(), opened)?;
+                    Ok(())
+                } else if retry {
+                    // Opaque replay/adoption authority does not survive restart.
+                    // A verified absence permits fresh work, never blind resend.
+                    self.journal(|j| j.pending = None)?;
+                    self.notice.clear();
+                    self.open(tool.path.clone(), Some(tool.identity))?;
+                    let outcome = "The interrupted change has no saved receipt. Your current work is kept; reopen the choice or request it again for a fresh rehearsal before accepting";
+                    self.notice = if self.notice.is_empty() {
+                        outcome.into()
+                    } else {
+                        format!("{outcome} {}", self.notice)
+                    };
+                    Ok(())
+                } else {
+                    self.notice="A change was interrupted before acknowledgement. Check its exact receipt before making another change; nothing is automatically adopted".into();
+                    Ok(())
+                }
+            }
             Some(Interrupted::Create { tool }) => {
                 let opened = open_verified(&tool.path, Some(&tool.identity)).map_err(|e| {
                     format!(
@@ -1015,6 +1335,226 @@ impl Worker {
         self.notice = format!("The uncommitted save was set aside. Its original location and any partial files were kept at {}. You can explicitly save the draft again or start a new request", tool.path.display());
         Ok(())
     }
+    fn change_action(
+        &mut self,
+        key: &Key,
+        gate: &Gate,
+        action: impl FnOnce(&mut ChangeDraft, &ProductStore) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.no_pending()?;
+        let store = &self
+            .opened
+            .as_ref()
+            .ok_or("Open the saved tool first")?
+            .store;
+        let draft = self.change.as_ref().ok_or("No change is being tried")?;
+        if key.basis.as_ref() != Some(&Basis::capture(&draft.snapshot)?)
+            || self.today() != draft.snapshot.clock_day
+        {
+            return Err(
+                "The comparison's source, data, session or date is stale. Return to saved work"
+                    .into(),
+            );
+        }
+        let mut next = draft.clone();
+        action(&mut next, store)?;
+        let page = Page::Change(next.checked_view(store, gate)?);
+        if !gate.finish() {
+            return Err("Trial cancelled; the previous copied experience was kept".into());
+        }
+        self.change = Some(next);
+        self.page = page;
+        Ok(())
+    }
+    fn pre_checkpoint(&self, tool: &Association, store: &ProductStore) -> Result<(), String> {
+        let locations = self.locations.as_ref().ok_or("Tool location unavailable")?;
+        let recent = RecentTools::open(locations.path()).map_err(error)?;
+        let instance = recent.remember(&tool.path, unix_ms()).map_err(error)?;
+        CheckpointShelf::for_tool(locations, &tool.identity, &instance)
+            .map_err(error)?
+            .capture(store)
+            .map_err(error)?;
+        Ok(())
+    }
+    fn decide(&mut self, outcome: DecisionOutcome, key: &Key, gate: &Gate) -> Result<(), String> {
+        self.no_pending()?;
+        let opened = self.opened.as_ref().ok_or("Open the saved tool first")?;
+        let draft = self
+            .change
+            .as_ref()
+            .ok_or("No experienced change is available")?;
+        let basis = Basis::capture(&draft.snapshot)?;
+        let expected_day = basis.day;
+        if key.basis.as_ref() != Some(&basis) || self.today() != basis.day {
+            return Err("This comparison is stale. Rehearse on current saved work".into());
+        }
+        let change = draft.decision(&opened.store, outcome, &key.operation, gate)?;
+        let plan = change.plan().clone();
+        let tool = opened.association.clone();
+        let store = opened.store.clone();
+        self.pre_checkpoint(&tool, &store)?;
+        self.journal(|j| {
+            j.pending = Some(Interrupted::Change {
+                tool: tool.clone(),
+                basis,
+                plan: plan.clone(),
+            })
+        })?;
+        self.before_commit(gate);
+        if self.today() != expected_day {
+            self.journal(|j| j.pending = None)?;
+            return Err("The date changed before saving. Return to saved work and rehearse a fresh comparison; no choice was committed".into());
+        }
+        if let Err(e) = gate.commit() {
+            self.journal(|j| j.pending = None)?;
+            return Err(e);
+        }
+        let engine =
+            DecisionEngine::new(LocalRuntime::default(), IntentArchive::new(store.clone()));
+        let result = engine.adopt(&store, &change);
+        #[cfg(test)]
+        let result = if result.is_ok() && self.config.hooks.lose_ack.swap(false, Ordering::AcqRel) {
+            Err(crate::product_decisions::DecisionError::Invalid(
+                "injected lost adoption acknowledgement".into(),
+            ))
+        } else {
+            result
+        };
+        let checked = open_verified(&tool.path, Some(&tool.identity)).map_err(|e| {
+            format!("The change outcome is unresolved. Keep its exact receipt association: {e}")
+        })?;
+        if has_change_receipt(&checked.snapshot, &plan)? {
+            self.committed = Some(tool.path.clone());
+            self.after_commit();
+            self.journal(|j| {
+                j.pending = None;
+                j.last = Some(tool.clone());
+            })?;
+            self.notice="Your choice was saved. Continue ordinary work; pending choices did not activate their alternatives".into();
+            self.install_opened(tool, checked)?;
+            Ok(())
+        } else {
+            self.journal(|j| j.pending = None)?;
+            Err(format!(
+                "The change was not saved. Current work is kept. {}",
+                result
+                    .err()
+                    .map(error)
+                    .unwrap_or_else(|| "No matching adoption receipt".into())
+            ))
+        }
+    }
+    fn resume_choice(&mut self, decision: &str, key: &Key, gate: &Gate) -> Result<(), String> {
+        self.no_pending()?;
+        let opened = self.opened.as_ref().ok_or("Open a saved tool first")?;
+        let snapshot = opened.store.load().map_err(error)?;
+        if key.basis.as_ref() != Some(&Basis::capture(&snapshot)?)
+            || snapshot.clock_day != self.today()
+        {
+            return Err("Saved work changed. Reopen it before revisiting this choice".into());
+        }
+        let choice = snapshot
+            .decisions
+            .decisions
+            .iter()
+            .find(|d| d.id == decision && d.status == DecisionStatus::Pending)
+            .ok_or("This choice is no longer pending")?
+            .clone();
+        let matches: Vec<_> = snapshot
+            .scope
+            .rehearsals
+            .values()
+            .filter(|p| p.witnesses.get(decision) == Some(&choice.witness))
+            .collect();
+        let (candidate, request) = if matches.len() == 1 {
+            let proof = matches[0];
+            let candidate_id = proof
+                .layer
+                .as_ref()
+                .map(|l| &l.candidate)
+                .unwrap_or(&proof.manifest.business);
+            let candidate = snapshot
+                .programs
+                .iter()
+                .find(|p| {
+                    canonical_digest(IdentityDomain::Source, *p).ok().as_ref() == Some(candidate_id)
+                })
+                .ok_or("The exact retained authored source is missing")?
+                .clone();
+            (candidate, proof.layer.as_ref().map(|l| l.request.clone()))
+        } else if matches.is_empty() {
+            // Public inheritance independently verifies each retained scene and
+            // supplies its real source. Do not decode private archive objects.
+            let engine = DecisionEngine::new(
+                LocalRuntime::with_cancellation(gate.cancelled.clone()),
+                IntentArchive::new(opened.store.clone()),
+            );
+            let inherited = engine
+                .development_request(
+                    &snapshot,
+                    &id("revisit"),
+                    DevelopmentOperation::Modify,
+                    &choice.request,
+                    DevelopmentContext {
+                        view: Some(snapshot.session.view.clone()),
+                        selected: vec![],
+                        recent_inputs: vec![],
+                        data_digest: Some(snapshot.data.identity().map_err(error)?),
+                        session_digest: Some(snapshot.session.identity().map_err(error)?),
+                    },
+                )
+                .map_err(error)?;
+            let mut alternatives = vec![];
+            for accepted in inherited.accepted_scenes.iter().filter(|s| {
+                s.decision == decision
+                    && s.source != snapshot.program().expect("verified source").artifact
+            }) {
+                let source = inherited
+                    .sources
+                    .iter()
+                    .find(|s| s.artifact == accepted.source)
+                    .ok_or("The archived choice source is missing")?;
+                if !alternatives.contains(source) {
+                    alternatives.push(source.clone());
+                }
+            }
+            if alternatives.len() != 1
+                || crate::product_runtime::has_protected_fields(&alternatives[0])
+            {
+                return Err("This saved choice has no unambiguous current-versus-one ordinary alternative. A fresh design request is needed; no source was substituted".into());
+            }
+            (alternatives.remove(0), None)
+        } else {
+            return Err(
+                "The saved choice has ambiguous rehearsal proofs; no alternative was selected"
+                    .into(),
+            );
+        };
+        let mut draft = ChangeDraft::new(snapshot, candidate, choice.request)?;
+        draft.resolves = vec![decision.into()];
+        if let Some(request) = request {
+            draft.population = request.population;
+            draft.lifecycles = request
+                .lifecycles
+                .into_iter()
+                .map(|mut l| {
+                    l.source = draft.snapshot.active_revision.clone();
+                    l
+                })
+                .collect();
+        }
+        let result = draft.prepare(&opened.store, gate);
+        let page = Page::Change(draft.checked_view(&opened.store, gate)?);
+        if !gate.finish() {
+            return Err(
+                "Opening the retained choice was cancelled; saved work is unchanged".into(),
+            );
+        }
+        self.page = page;
+        self.change = Some(draft);
+        self.notice="This is a fresh comparison on your current saved work. The earlier experiences remain unchanged in history; try the alternatives again before resolving".into();
+        result
+    }
     fn close(&mut self) -> Result<(), String> {
         if self.ready.is_some() {
             self.journal(|j| {
@@ -1025,6 +1565,8 @@ impl Worker {
         }
         self.ready = None;
         self.draft = None;
+        self.change = None;
+        self.recent_inputs.clear();
         self.opened = None;
         self.page = Page::Home;
         self.chosen = None;
@@ -1073,13 +1615,68 @@ impl Worker {
         let key = &command.key;
         let gate = &command.gate;
         gate.check()?;
+        #[cfg(test)]
+        if matches!(
+            &command.action,
+            Action::Decide { .. } | Action::Modify { .. } | Action::ResumeChoice { .. }
+        ) {
+            if let Some(pause) = &self.config.hooks.before_context_transition {
+                pause.reached.store(true, Ordering::Release);
+                while !pause.release.load(Ordering::Acquire)
+                    && !gate.cancelled.load(Ordering::Acquire)
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                gate.check()?;
+            }
+        }
         match &command.action {
             Action::Boot => self.boot(),
             Action::Prepare {
                 need,
                 provider,
                 profile,
-            } => self.prepare(need.clone(), *provider, *profile, key, gate),
+            } => self.prepare(need.clone(), *provider, *profile, key, gate, false, None),
+            Action::Modify {
+                need,
+                provider,
+                profile,
+                focused,
+            } => self.prepare(
+                need.clone(),
+                *provider,
+                *profile,
+                key,
+                gate,
+                true,
+                focused.clone(),
+            ),
+            Action::Trial { input } => {
+                #[cfg(test)]
+                if let Some(pause) = &self.config.hooks.before_preview {
+                    pause.reached.store(true, Ordering::Release);
+                    while !pause.release.load(Ordering::Acquire)
+                        && !gate.cancelled.load(Ordering::Acquire)
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                self.change_action(key, gate, |draft, store| {
+                    draft.trial(store, input.clone(), gate)
+                })
+            }
+            Action::Scope { population } => self.change_action(key, gate, |draft, store| {
+                draft.set_scope(store, population.clone(), gate)
+            }),
+            Action::Finished { record, field } => self.change_action(key, gate, |draft, store| {
+                draft.clarify(store, record, field, gate)
+            }),
+            Action::NoFinished { entity } => self.change_action(key, gate, |draft, store| {
+                draft.no_finished_state(store, entity, gate)
+            }),
+            Action::Decide { outcome } => self.decide(outcome.clone(), key, gate),
+            Action::ResumeChoice { decision } => self.resume_choice(decision, key, gate),
+            Action::ReturnDaily => self.return_daily(gate),
             Action::Consent { disclosure } => self.generate(disclosure.clone(), key, gate),
             Action::Select { candidate } => self.select(*candidate, key, gate),
             Action::Preview { input } => self.preview(input.clone(), key, gate),
@@ -1168,6 +1765,8 @@ pub(super) fn run(
         page: Page::Home,
         ready: None,
         draft: None,
+        change: None,
+        recent_inputs: vec![],
         opened: None,
         chosen: None,
         generation_blocked: false,
@@ -1199,6 +1798,7 @@ pub(super) fn run(
             if matches!(
                 command.action,
                 Action::Prepare { .. }
+                    | Action::Modify { .. }
                     | Action::Consent { .. }
                     | Action::Open { .. }
                     | Action::OpenDialog
@@ -1277,7 +1877,22 @@ fn daily_page(
         tool: tool.clone(),
         basis: Basis::capture(snapshot)?,
         model,
+        choices: snapshot.decisions.decisions.clone(),
     })
+}
+fn has_change_receipt(snapshot: &ProjectSnapshot, plan: &AdoptionPlan) -> Result<bool, String> {
+    let found = snapshot
+        .adoptions
+        .iter()
+        .find(|receipt| receipt.plan.id == plan.id);
+    match found {
+        Some(receipt) if &receipt.plan == plan => Ok(true),
+        Some(_) => Err(
+            "The change operation ID belongs to a different saved plan; it will not be retried"
+                .into(),
+        ),
+        None => Ok(false),
+    }
 }
 fn has_receipt(
     snapshot: &ProjectSnapshot,

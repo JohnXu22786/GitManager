@@ -75,10 +75,22 @@ impl VerifiedBackup {
                 payload,
             },
         };
-        backup.validate()?;
+        // export_for just validated this exact owned snapshot and every
+        // reachable bundle object with the same default execution context.
+        // Neither value is exposed or mutated before becoming this envelope.
+        backup.validate_envelope()?;
+        backup.validate_runtime()?;
         Ok(backup)
     }
     fn validate(&self) -> Result<()> {
+        self.validate_envelope()?;
+        let snapshot = self.snapshot();
+        snapshot.validate()?;
+        validate_bundle(snapshot, &self.envelope.payload.intentions)
+            .map_err(|e| OperationIssue::new(IssueKind::Corrupt, e))?;
+        self.validate_runtime()
+    }
+    fn validate_envelope(&self) -> Result<()> {
         let envelope = &self.envelope;
         if envelope.magic != MAGIC {
             return Err(OperationIssue::new(
@@ -107,9 +119,10 @@ impl VerifiedBackup {
                 "backup or snapshot byte limit",
             ));
         }
-        snapshot.validate()?;
-        validate_bundle(snapshot, &envelope.payload.intentions)
-            .map_err(|e| OperationIssue::new(IssueKind::Corrupt, e))?;
+        Ok(())
+    }
+    fn validate_runtime(&self) -> Result<()> {
+        let snapshot = self.snapshot();
         LocalRuntime::default()
             .resume(
                 snapshot.program()?,
@@ -174,7 +187,8 @@ impl VerifiedBackup {
         Self::from_bytes(&SelectedFile::new(path)?.read(MAX_BACKUP_BYTES)?)
     }
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        self.validate()?;
+        // Both constructors fully validate this private, immutable envelope.
+        // Serialization cannot change its snapshot or reachable object bytes.
         Ok(canonical_bytes(&self.envelope)?)
     }
     pub fn snapshot(&self) -> &ProjectSnapshot {
@@ -187,7 +201,10 @@ impl VerifiedBackup {
         let snapshot = self.snapshot();
         Ok(BackupSummary {
             digest: self.digest().clone(),
-            identity: ToolIdentity::from_snapshot(snapshot)?,
+            identity: ToolIdentity {
+                project_id: snapshot.data.project_id.clone(),
+                first_program: canonical_digest(IdentityDomain::Source, &snapshot.programs[0])?,
+            },
             label: snapshot.program()?.program.label.clone(),
             revision: snapshot.revision,
             records: snapshot.data.records.len(),
@@ -268,6 +285,59 @@ pub struct OpenedTool {
     pub store: ProductStore,
     pub snapshot: ProjectSnapshot,
     pub summary: BackupSummary,
+    checkpoint: Option<OpenedCheckpoint>,
+}
+// A single installation handoff, never retained by the daily-work controller.
+// Its private backup has already passed every cold validation check.
+struct OpenedCheckpoint {
+    backup: VerifiedBackup,
+    folder: Folder,
+    current: Vec<u8>,
+    object: Vec<u8>,
+}
+impl OpenedCheckpoint {
+    fn still_current(&self, store: &ProductStore) -> Result<bool> {
+        let snapshot = self.backup.snapshot();
+        let name = format!(
+            "object-{}.json",
+            self.backup
+                .envelope
+                .payload
+                .intentions
+                .snapshot_digest()
+                .as_str()
+        );
+        if self.folder.read("CURRENT", 16 * 1024)? != self.current
+            || self.folder.read(&name, MAX_SNAPSHOT_BYTES)? != self.object
+            || self.object != canonical_bytes(snapshot)?
+            // load also verifies the pinned directory, complete current
+            // object, runtime/driver/compiler identity and default limits.
+            || store.load()? != *snapshot
+            || !self.backup.envelope.payload.intentions
+                .matches_store_objects(store)
+                .map_err(|e| OperationIssue::new(IssueKind::Corrupt, e))?
+        {
+            return Ok(false);
+        }
+        // Fence the intention reads against a concurrent committed change.
+        Ok(store.load()? == *snapshot
+            && self.folder.read("CURRENT", 16 * 1024)? == self.current
+            && self.folder.read(&name, MAX_SNAPSHOT_BYTES)? == self.object)
+    }
+}
+impl OpenedTool {
+    pub(crate) fn checkpoint(&mut self, shelf: &CheckpointShelf) -> Result<CheckpointReceipt> {
+        // Consume on every attempt, including errors. A later action always
+        // captures and validates again; corruption cannot hide behind a cache.
+        if let Some(opened) = self.checkpoint.take() {
+            if opened.still_current(&self.store).unwrap_or(false) {
+                return shelf.publish_backup(&opened.backup);
+            }
+        }
+        // Changed bytes or any freshness-read error must take the full
+        // validation path. Its errors are reported as normal backup warnings.
+        shelf.capture(&self.store)
+    }
 }
 /// Local and offline. Recent-tool callers supply the saved identity; a
 /// deliberately selected new folder can be inspected without a prior identity.
@@ -282,11 +352,30 @@ pub fn open_verified(path: &Path, expected: Option<&ToolIdentity>) -> Result<Ope
             "this folder identifies a different tool",
         ));
     }
+    let current = folder.read("CURRENT", 16 * 1024)?;
+    let object = folder.read(
+        &format!(
+            "object-{}.json",
+            backup
+                .envelope
+                .payload
+                .intentions
+                .snapshot_digest()
+                .as_str()
+        ),
+        MAX_SNAPSHOT_BYTES,
+    )?;
     folder.check()?;
     Ok(OpenedTool {
         store,
         snapshot: backup.snapshot().clone(),
         summary,
+        checkpoint: Some(OpenedCheckpoint {
+            backup,
+            folder,
+            current,
+            object,
+        }),
     })
 }
 
@@ -337,6 +426,9 @@ impl CheckpointShelf {
     /// instruction to undo an already committed save or delete older backups.
     pub fn capture(&self, store: &ProductStore) -> Result<CheckpointReceipt> {
         let backup = VerifiedBackup::capture(store)?;
+        self.publish_backup(&backup)
+    }
+    fn publish_backup(&self, backup: &VerifiedBackup) -> Result<CheckpointReceipt> {
         let summary = backup.summary()?;
         if summary.identity != self.identity {
             return Err(OperationIssue::new(
@@ -344,14 +436,17 @@ impl CheckpointShelf {
                 "checkpoint tool identity mismatch",
             ));
         }
-        let name = Self::name(&backup);
-        match self.folder.publish(&name, &backup.to_bytes()?, false) {
+        let name = Self::name(backup);
+        let bytes = backup.to_bytes()?;
+        match self.folder.publish(&name, &bytes, false) {
             Ok(()) => (),
             Err(e) if e.kind == IssueKind::Collision => (),
             Err(e) => return Err(e),
         }
-        let actual = VerifiedBackup::from_bytes(&self.folder.read(&name, MAX_BACKUP_BYTES)?)?;
-        if actual.digest() != backup.digest() {
+        // This is still a fresh bounded, safe-path read. Exact equality to the
+        // already validated canonical bytes preserves every intake check; a
+        // changed collision is rejected rather than trusted by name or digest.
+        if self.folder.read(&name, MAX_BACKUP_BYTES)? != bytes {
             return Err(OperationIssue::new(
                 IssueKind::Corrupt,
                 "checkpoint readback mismatch",

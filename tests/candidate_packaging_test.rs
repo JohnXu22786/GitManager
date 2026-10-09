@@ -268,8 +268,20 @@ fn ci_candidate_steps_are_main_push_only_and_read_only() {
         "CARGO_PROFILE_TEST_DEBUG_ASSERTIONS",
         "CARGO_PROFILE_TEST_OVERFLOW_CHECKS",
     ] {
-        assert_eq!(workflow.matches(key).count(), 1);
+        assert_eq!(workflow.matches(key).count(), 2);
     }
+    let focused = workflow.split("  scoped-host-focused:\n").nth(1).unwrap();
+    assert!(focused.contains("if: ${{ github.ref == 'refs/heads/feat/studio-scoped-changes' || github.head_ref == 'feat/studio-scoped-changes' }}"));
+    assert!(focused.contains("runs-on: ubuntu-latest"));
+    for (key, value) in [
+        ("CARGO_PROFILE_TEST_OPT_LEVEL", "1"),
+        ("CARGO_PROFILE_TEST_DEBUG_ASSERTIONS", "true"),
+        ("CARGO_PROFILE_TEST_OVERFLOW_CHECKS", "true"),
+    ] {
+        assert!(focused.contains(&format!("{key}: \"{value}\"")));
+    }
+    assert!(focused.contains("run: cargo test --locked --test product_studio_change_test"));
+    assert!(focused.contains("name: Test scoped host controls\n        if: ${{ !cancelled() }}\n        run: cargo test --locked --test product_end_to_end_test controls_modify_play_and_record_each_real_nonbinary_choice -- --exact"));
     for os in ["ubuntu-latest", "windows-latest", "macos-latest"] {
         assert!(workflow.contains(&format!("          - {os}")));
     }
