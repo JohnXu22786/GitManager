@@ -1007,7 +1007,7 @@ fn managed_future_four_pending_outcomes_inherit_and_resolve_after_later_work() {
             .evaluate(
                 &reopened,
                 next.selection(),
-                next_result,
+                next_result.clone(),
                 DiscoveryPolicy::default(),
                 vec![],
                 cancel(),
@@ -1027,6 +1027,9 @@ fn managed_future_four_pending_outcomes_inherit_and_resolve_after_later_work() {
             "{:?}",
             repeated.report()
         );
+        if outcome == DecisionOutcome::EitherAcceptable {
+            assert_pending_projection_registry(&reopened, &next, &next_result);
+        }
         let late = add(&reopened, "late", "Later real work");
         action(&reopened, "late-wait", "wait", &late);
         action(&reopened, "complete-selected", "complete", &selected);
@@ -1114,6 +1117,109 @@ fn managed_future_four_pending_outcomes_inherit_and_resolve_after_later_work() {
         );
         assert_eq!(ProductStore::open(&path).unwrap().load().unwrap(), adopted);
     }
+}
+
+// A context can contain an old scenario frame without admitting that seed
+// for its new target. It must reproject, then support exact reuse, while an
+// invalid protected seed still fails the fully checked fallback.
+fn assert_pending_projection_registry(
+    store: &ProductStore,
+    draft: &RuleDiscoveryDraft,
+    result: &DevelopmentResult,
+) {
+    let current = store.load().unwrap();
+    let engine = engine(store);
+    let scenes = engine.discovery_scenes(&current).unwrap();
+    let retained = engine.retained_replay_context(&current).unwrap();
+    let prepared = draft.selection().preparation();
+    let context = ScopedExecutionContext::prepared(&current, prepared)
+        .unwrap()
+        .with_correspondences(&retained.correspondence_proofs())
+        .unwrap();
+    assert!(scenes.iter().any(|scene| {
+        context.has_scenario_correspondence(scene.mapped())
+            && context
+                .verify_seed(
+                    prepared.target(),
+                    &scene.mapped().seed,
+                    scene.mapped().clock_day,
+                )
+                .is_err()
+    }));
+    for scene in scenes {
+        context
+            .verify_seed(
+                current.program().unwrap(),
+                &scene.mapped().seed,
+                scene.mapped().clock_day,
+            )
+            .unwrap();
+        let mut mapped = scene.mapped().clone();
+        mapped.seed = product_runtime::merged_data(prepared.target(), &mapped.seed).unwrap();
+        let (projected, actual) = context
+            .project_scenario(
+                current.program().unwrap(),
+                scene.mapped(),
+                prepared.target(),
+                &mapped,
+            )
+            .unwrap();
+        for source in [current.program().unwrap(), prepared.target()] {
+            projected
+                .verify_seed(source, &actual.seed, actual.clock_day)
+                .unwrap();
+        }
+    }
+    let mut history = VerifiedRetainedHistory::load(store).unwrap();
+    history
+        .map_prepared_target(prepared.clone(), vec![])
+        .unwrap();
+    let policy = DiscoveryPolicy {
+        retained_history: Some(history),
+        ..DiscoveryPolicy::default()
+    };
+    // The second pass uses the same opaque projection registry, now populated
+    // with valid exact frames. Both passes must independently settle the pair.
+    for _ in 0..2 {
+        let report = discover(draft.request(), result, &policy, cancel()).unwrap();
+        assert!(report.questions.is_empty(), "{:?}", report);
+        assert!(report.unverified.is_empty(), "{:?}", report.unverified);
+        assert!(report
+            .log
+            .iter()
+            .any(|entry| entry.disposition == Disposition::Settled));
+    }
+    let mut invalid = result.clone();
+    let mut scene = invalid.response.hypotheses[0].scenario().unwrap();
+    let value = scene
+        .seed
+        .records
+        .iter_mut()
+        .flat_map(|record| record.values.iter_mut())
+        .find(|(key, value)| {
+            key.starts_with(RESERVED_PREFIX) && matches!(value, DataValue::Boolean { .. })
+        })
+        .map(|(_, value)| value)
+        .unwrap();
+    if let DataValue::Boolean { value } = value {
+        *value = !*value;
+    }
+    invalid.response.hypotheses[0].scenario_json = serde_json::to_string(&scene).unwrap();
+    let refused = discover(draft.request(), &invalid, &policy, cancel()).unwrap();
+    assert!(refused.questions.is_empty());
+    assert!(refused
+        .log
+        .iter()
+        .all(|entry| entry.disposition != Disposition::Settled));
+    assert!(
+        refused
+            .unverified
+            .iter()
+            .any(|message| message.contains("Accepted scene initialization is unavailable")),
+        "{:?}",
+        refused
+    );
+    assert_eq!(store.load().unwrap(), current);
 }
 
 #[test]

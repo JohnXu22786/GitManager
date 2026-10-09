@@ -513,12 +513,20 @@ impl VerifiedRetainedHistory {
             for context in registry.values().filter(|context| {
                 context.has_scenario_correspondence(scene) && context.admit_target(target).is_ok()
             }) {
-                context
+                // A prepared context also carries older retained scenario
+                // correspondences. Matching one of those frames does not mean
+                // its seed already contains this new target's initialization.
+                // Reuse only an admitted common input; otherwise regenerate it
+                // below through the same checked projection path.
+                if context
                     .verify_seed(before, &scene.seed, scene.clock_day)
-                    .map_err(unavailable)?;
-                context
-                    .verify_seed(target, &scene.seed, scene.clock_day)
-                    .map_err(unavailable)?;
+                    .is_err()
+                    || context
+                        .verify_seed(target, &scene.seed, scene.clock_day)
+                        .is_err()
+                {
+                    continue;
+                }
                 if matched.is_some_and(|prior| {
                     prior.correspondence_proofs() != context.correspondence_proofs()
                 }) {
