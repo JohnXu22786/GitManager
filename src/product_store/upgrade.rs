@@ -361,6 +361,7 @@ impl ProductStore {
     pub(crate) fn recover_upgraded_with<F, P>(
         path: &Path,
         upgrade: &LegacyUpgrade,
+        fresh_only: bool,
         before_activate: F,
         mut progress: P,
         #[cfg(test)] fault: Option<FaultPoint>,
@@ -389,7 +390,9 @@ impl ProductStore {
         let (parent, name) = Self::location(path)?;
         let (root, fresh) = match parent.create_child(&name) {
             Ok(root) => (root, true),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            // Ordinary recovery must claim a new directory atomically. Only
+            // the explicit resumable-upgrade API may inspect an existing inbox.
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists && !fresh_only => {
                 (parent.child(&name)?, false)
             }
             Err(error) => return Err(error.into()),
