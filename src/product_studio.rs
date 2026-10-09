@@ -1290,11 +1290,19 @@ pub struct TestPause {
     pub release: AtomicBool,
 }
 #[cfg(test)]
+#[derive(Clone, Copy)]
+pub enum TestProviderAssociationFault {
+    Missing,
+    DifferentRequest,
+}
+#[cfg(test)]
 #[derive(Clone)]
 pub struct TestHooks {
     pub before_commit: Option<Arc<TestPause>>,
     pub before_preview: Option<Arc<TestPause>>,
     pub before_context_transition: Option<Arc<TestPause>>,
+    pub before_return_install: Option<Arc<TestPause>>,
+    pub provider_association_fault: Option<TestProviderAssociationFault>,
     pub before_destination: Option<Arc<TestPause>>,
     pub before_abandon: Option<Arc<TestPause>>,
     pub fail_creation: Arc<AtomicBool>,
@@ -1312,6 +1320,8 @@ impl Default for TestHooks {
             before_commit: None,
             before_preview: None,
             before_context_transition: None,
+            before_return_install: None,
+            provider_association_fault: None,
             before_destination: None,
             before_abandon: None,
             fail_creation: Arc::new(AtomicBool::new(false)),

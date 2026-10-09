@@ -62,6 +62,7 @@ struct Ready {
     transport: ProviderTransport,
     epoch: u64,
     basis: Option<Basis>,
+    association: ProviderAssociation,
 }
 struct OpenTool {
     association: Association,
@@ -373,7 +374,7 @@ impl Worker {
             issued: false,
             modify: modify_binding.clone(),
         };
-        self.journal(|j| j.provider = Some(pending))?;
+        self.journal(|j| j.provider = Some(pending.clone()))?;
         self.page = Page::Consent {
             disclosure: prepared.disclosure().clone(),
             need: self
@@ -395,10 +396,42 @@ impl Worker {
             transport,
             epoch: key.epoch,
             basis: modify_binding.map(|(_, basis)| basis),
+            association: pending,
         });
         Ok(())
     }
     fn generate(&mut self, disclosure: String, key: &Key, gate: &Gate) -> Result<(), String> {
+        #[cfg(test)]
+        match self.config.hooks.provider_association_fault {
+            Some(TestProviderAssociationFault::Missing) => self.journal(|j| j.provider = None)?,
+            Some(TestProviderAssociationFault::DifferentRequest) => {
+                let mut association = self
+                    .journal
+                    .as_ref()
+                    .unwrap()
+                    .value
+                    .provider
+                    .clone()
+                    .unwrap();
+                association
+                    .request
+                    .request
+                    .push_str(" with an unrelated change");
+                let wire = encode_request(
+                    &association.request,
+                    &ProviderOptions {
+                        provider: association.provider,
+                        profile: association.profile,
+                        ..ProviderOptions::default()
+                    },
+                )
+                .map_err(error)?;
+                association.wire_request = wire.digest()?;
+                association.wire_source = wire.source_digest;
+                self.journal(|j| j.provider = Some(association))?;
+            }
+            None => (),
+        }
         let ready = self
             .ready
             .as_ref()
@@ -415,12 +448,24 @@ impl Worker {
                 return Err("Saved work changed after disclosure. Review a fresh change request before sending".into());
             }
         }
+        let association = self
+            .journal
+            .as_ref()
+            .and_then(|j| j.value.provider.as_ref())
+            .ok_or("The prepared request is no longer available. Go back and prepare a fresh request before sending.")?;
+        if association.issued
+            || canonical_bytes(association).map_err(error)?
+                != canonical_bytes(&ready.association).map_err(error)?
+        {
+            return Err(
+                "The prepared request changed. Go back and prepare a fresh request before sending."
+                    .into(),
+            );
+        }
+        let mut issued = association.clone();
+        issued.issued = true;
         gate.check()?;
-        self.journal(|j| {
-            if let Some(ProviderAssociation { issued, .. }) = &mut j.provider {
-                *issued = true;
-            }
-        })?;
+        self.journal(|j| j.provider = Some(issued))?;
         let ready = self.ready.take().unwrap();
         let consent = ConsentReceipt {
             disclosure_digest: disclosure,
@@ -653,6 +698,75 @@ impl Worker {
         self.page = page;
         self.journal(|j| j.last = Some(association.clone()))?;
         self.post_save_opened(&association, Some(&mut opened));
+        Ok(())
+    }
+    fn return_daily(&mut self, gate: &Gate) -> Result<(), String> {
+        let association = self
+            .opened
+            .as_ref()
+            .ok_or("No saved tool is open")?
+            .association
+            .clone();
+        // Stage every fallible view check before abandoning prepared consent or
+        // copied work. The same verified open is handed to checkpoint creation.
+        let staged = inspect_open(&association.path, Some(&association.identity)).map_err(error)?;
+        #[cfg(test)]
+        if let Some(pause) = &self.config.hooks.before_return_install {
+            pause.reached.store(true, Ordering::Release);
+            while !pause.release.load(Ordering::Acquire) && !gate.cancelled.load(Ordering::Acquire)
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        gate.check()?;
+        let (page, mut verified) = match staged {
+            OpenGate::Ready(opened) => {
+                let page = daily_page(&association, &opened.store, &opened.snapshot)?;
+                (page, Some(opened))
+            }
+            OpenGate::UpgradeRequired(summary) => {
+                if association.identity
+                    != (ToolIdentity {
+                        project_id: summary.project_id.clone(),
+                        first_program: summary.first_program.clone(),
+                    })
+                {
+                    return Err("The saved tool identity changed while returning".into());
+                }
+                (
+                    Page::Upgrade {
+                        tool: association.clone(),
+                        summary,
+                    },
+                    None,
+                )
+            }
+        };
+        if !gate.finish() {
+            return Err(
+                "Returning was cancelled; the prepared request and copied work were kept".into(),
+            );
+        }
+        let abandon_ready = self.ready.is_some();
+        self.journal(|j| {
+            if abandon_ready && j.provider.as_ref().is_some_and(|p| !p.issued) {
+                j.provider = None;
+            }
+            j.last = Some(association.clone());
+        })?;
+        self.opened = verified.as_ref().map(|opened| OpenTool {
+            association: association.clone(),
+            store: opened.store.clone(),
+            snapshot: opened.snapshot.clone(),
+        });
+        self.draft = None;
+        self.change = None;
+        self.ready = None;
+        self.recent_inputs.clear();
+        self.page = page;
+        if let Some(opened) = verified.as_mut() {
+            self.post_save_opened(&association, Some(opened));
+        }
         Ok(())
     }
     fn upgrade(
@@ -1562,18 +1676,7 @@ impl Worker {
             }),
             Action::Decide { outcome } => self.decide(outcome.clone(), key, gate),
             Action::ResumeChoice { decision } => self.resume_choice(decision, key, gate),
-            Action::ReturnDaily => {
-                let current = self.opened.as_ref().ok_or("No saved tool is open")?;
-                let association = current.association.clone();
-                if self.ready.is_some() {
-                    self.journal(|j| {
-                        if j.provider.as_ref().is_some_and(|p| !p.issued) {
-                            j.provider = None;
-                        }
-                    })?;
-                }
-                self.open(association.path, Some(association.identity))
-            }
+            Action::ReturnDaily => self.return_daily(gate),
             Action::Consent { disclosure } => self.generate(disclosure.clone(), key, gate),
             Action::Select { candidate } => self.select(*candidate, key, gate),
             Action::Preview { input } => self.preview(input.clone(), key, gate),

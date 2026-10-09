@@ -4000,6 +4000,11 @@ fn scoped_inputs_finish_before_lifecycle_scope_and_day_changes() {
             &mut studio,
             &format!("current.row.job.{}.calculate", row.id),
         );
+        click(
+            &mut h,
+            &mut studio,
+            &format!("current.row.job.{}.complete", row.id),
+        );
         click(&mut h, &mut studio, "current.action.export");
         let choices = [
             "studio.accept",
@@ -4011,11 +4016,7 @@ fn scoped_inputs_finish_before_lifecycle_scope_and_day_changes() {
         ];
         let ready = frame(&mut h, &mut studio);
         for key in choices {
-            assert!(
-                ready.controls[key].enabled,
-                "{key}: {}",
-                studio.test_notice()
-            );
+            assert!(ready.controls[key].enabled, "{key}: {:?}", ready.text);
         }
         assert!(ready.controls["studio.scope.future"].enabled);
         click(&mut h, &mut studio, &format!("{pane}.control.number_input"));
@@ -4099,5 +4100,222 @@ fn scoped_inputs_finish_before_lifecycle_scope_and_day_changes() {
             before,
             "Leaving copied edits cannot change saved scope, data, date or intentions"
         );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_return_keeps_prepared_request_and_later_consent_correlated() {
+    let dir = tempdir();
+    let root = dir.path();
+    let path = root.join("tool");
+    let original = other_shape::capture(other_shape::organizer());
+    let mut value = other_shape::organizer();
+    value["views"][0]["label"] = serde_json::json!("Members");
+    let candidate = other_shape::capture(value);
+    let store = ProductStore::create(&path, &original, 20000).unwrap();
+    let before = store.load().unwrap();
+    let mut studio = ProductStudio::testing(
+        root.into(),
+        Some(transport(root, &candidate)),
+        TestHooks::default(),
+    );
+    settle(&mut studio);
+    studio.test_open(path.clone());
+    settle(&mut studio);
+    studio.test_modify("Rename the member list");
+    settle(&mut studio);
+    let prepared = studio.test_prepared_request().unwrap().clone();
+    let journal = root.join("studio/session.json");
+    let prepared_journal = fs::read(&journal).unwrap();
+    let mut h = egui_harness::EguiHarness::new(egui::vec2(1600.0, 2400.0));
+    let moved = root.join("temporarily-unavailable-tool");
+    fs::rename(&path, &moved).unwrap();
+    click(&mut h, &mut studio, "studio.return");
+    assert_eq!(studio.test_page(), "consent");
+    assert_eq!(studio.test_prepared_request(), Some(&prepared));
+    assert!(
+        fs::read(&journal).unwrap() == prepared_journal,
+        "A failed Return must not detach still-usable consent from its durable request"
+    );
+    assert!(!root
+        .join("jobs")
+        .read_dir()
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|e| e.path().join("fixture-invocation.json").exists()));
+    fs::rename(&moved, &path).unwrap();
+    click(&mut h, &mut studio, "studio.consent");
+    assert_eq!(studio.test_page(), "change", "{}", studio.test_notice());
+    assert_eq!(
+        root.join("jobs")
+            .read_dir()
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().join("fixture-invocation.json").exists())
+            .count(),
+        1
+    );
+    assert_eq!(store.load().unwrap(), before);
+    click(&mut h, &mut studio, "studio.return");
+    assert_eq!(studio.test_page(), "daily");
+    assert_eq!(store.load().unwrap(), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelled_return_preserves_consent_and_retained_comparison() {
+    use std::sync::{atomic::Ordering, Arc};
+    for retain_choice in [false, true] {
+        let dir = tempdir();
+        let root = dir.path();
+        let path = root.join("tool");
+        let original = other_shape::capture(other_shape::filtered());
+        let mut value = other_shape::filtered();
+        value["views"][0]["kind"]["columns"].as_array_mut().unwrap().push(serde_json::json!({
+            "id":"area","label":"Area","value":other_shape::field(other_shape::var("row"),"area")
+        }));
+        let candidate = other_shape::capture(value);
+        let store = ProductStore::create(&path, &original, 20000).unwrap();
+        store
+            .apply(
+                0,
+                "first",
+                &other_shape::add("Ada"),
+                RuntimeLimits::default(),
+            )
+            .unwrap();
+        let pause = Arc::new(product_studio::TestPause::default());
+        pause.release.store(true, Ordering::Release);
+        let mut studio = ProductStudio::testing(
+            root.into(),
+            Some(transport(root, &candidate)),
+            TestHooks {
+                before_return_install: Some(pause.clone()),
+                ..TestHooks::default()
+            },
+        );
+        settle(&mut studio);
+        studio.test_open(path.clone());
+        settle(&mut studio);
+        studio.test_modify("Show member areas");
+        settle(&mut studio);
+        let mut h = egui_harness::EguiHarness::new(egui::vec2(1600.0, 2400.0));
+        if retain_choice {
+            click(&mut h, &mut studio, "studio.consent");
+            click(&mut h, &mut studio, "current.action.export_button");
+            click(&mut h, &mut studio, "studio.defer");
+            let pending = store
+                .load()
+                .unwrap()
+                .decisions
+                .decisions
+                .last()
+                .unwrap()
+                .id
+                .clone();
+            click(&mut h, &mut studio, &format!("studio.resume.{pending}"));
+            click(&mut h, &mut studio, "current.control.search_input");
+            h.text("copied");
+            frame(&mut h, &mut studio);
+            settle(&mut studio);
+        }
+        let expected_page = studio.test_page();
+        let request = studio.test_prepared_request().cloned();
+        let current = studio.test_current_trial().cloned();
+        let alternative = studio.test_alternative().cloned();
+        let saved = store.load().unwrap();
+        let journal = fs::read(root.join("studio/session.json")).unwrap();
+        pause.reached.store(false, Ordering::Release);
+        pause.release.store(false, Ordering::Release);
+        let ready = frame(&mut h, &mut studio);
+        assert!(ready.controls["studio.return"].enabled);
+        let point = ready.controls["studio.return"].rect.center();
+        h.press_at(point);
+        frame(&mut h, &mut studio);
+        h.release_at(point);
+        frame(&mut h, &mut studio);
+        let start = Instant::now();
+        while !pause.reached.load(Ordering::Acquire) {
+            studio.poll();
+            assert!(start.elapsed() < Duration::from_secs(120));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        click(&mut h, &mut studio, "studio.cancel");
+        pause.release.store(true, Ordering::Release);
+        assert_eq!(
+            studio.test_page(),
+            expected_page,
+            "An accepted Return cancellation must preserve the previously visible context"
+        );
+        assert_eq!(studio.test_prepared_request(), request.as_ref());
+        assert_eq!(studio.test_current_trial(), current.as_ref());
+        assert_eq!(studio.test_alternative(), alternative.as_ref());
+        assert!(
+            fs::read(root.join("studio/session.json")).unwrap() == journal,
+            "Cancelled Return must preserve the exact restart journal"
+        );
+        assert_eq!(store.load().unwrap(), saved);
+        if !retain_choice {
+            click(&mut h, &mut studio, "studio.consent");
+            assert_eq!(studio.test_page(), "change");
+        }
+        click(&mut h, &mut studio, "studio.return");
+        assert_eq!(studio.test_page(), "daily");
+        assert_eq!(
+            store.load().unwrap(),
+            saved,
+            "Deliberate Return keeps the saved data and original retained choice"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn consent_requires_its_exact_durable_request_association() {
+    use product_studio::TestProviderAssociationFault;
+    for fault in [
+        TestProviderAssociationFault::Missing,
+        TestProviderAssociationFault::DifferentRequest,
+    ] {
+        let dir = tempdir();
+        let root = dir.path();
+        let path = root.join("tool");
+        let original = other_shape::capture(other_shape::organizer());
+        let store = ProductStore::create(&path, &original, 20000).unwrap();
+        let before = store.load().unwrap();
+        let mut candidate = other_shape::organizer();
+        candidate["label"] = serde_json::json!("Member work");
+        let mut studio = ProductStudio::testing(
+            root.into(),
+            Some(transport(root, &other_shape::capture(candidate))),
+            TestHooks {
+                provider_association_fault: Some(fault),
+                ..TestHooks::default()
+            },
+        );
+        settle(&mut studio);
+        studio.test_open(path);
+        settle(&mut studio);
+        studio.test_modify("Use a clearer title");
+        settle(&mut studio);
+        let mut h = egui_harness::EguiHarness::new(egui::vec2(1600.0, 2400.0));
+        click(&mut h, &mut studio, "studio.consent");
+        assert!(
+            !root
+                .join("jobs")
+                .read_dir()
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|e| e.path().join("fixture-invocation.json").exists()),
+            "No provider process may run without the exact matching durable request"
+        );
+        assert_eq!(studio.test_page(), "consent");
+        assert!(
+            studio.test_notice().contains("request"),
+            "{}",
+            studio.test_notice()
+        );
+        assert_eq!(store.load().unwrap(), before);
     }
 }
