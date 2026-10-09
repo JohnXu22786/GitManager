@@ -4,6 +4,8 @@
 mod change;
 #[path = "product_studio/change_adapter.rs"]
 mod change_adapter;
+#[path = "product_studio/intention_flow.rs"]
+mod intention_flow;
 #[path = "product_studio/journal.rs"]
 mod journal;
 #[path = "product_studio/worker.rs"]
@@ -29,7 +31,10 @@ use crate::product_store::scope::ScopePopulation;
 use crate::product_store::{ProductStore, ProjectSnapshot, UpgradeProgress, UpgradeSummary};
 use crate::ui::product_runtime_view::{take_shortcuts, ProductRuntimeView, WidgetTrace};
 use change::{ChangeDraft, ChangeView};
-use journal::{Association, Basis, Interrupted, JournalFile, ProviderAssociation, UnsavedInput};
+use journal::{
+    Association, Basis, Interrupted, JournalFile, ProviderAssociation, ReconcileAssociation,
+    UnsavedInput,
+};
 use std::{
     path::{Path, PathBuf},
     sync::{
@@ -154,6 +159,22 @@ enum Action {
     ResumeChoice {
         decision: Id,
     },
+    History,
+    PrepareReconciliation {
+        needs: Vec<Id>,
+        need: String,
+        provider: ProviderKind,
+        profile: CapabilityProfile,
+    },
+    PreviewWithdrawal {
+        layers: Vec<Digest>,
+    },
+    IntentionTrial {
+        input: SemanticInput,
+    },
+    CommitIntention {
+        operation: Id,
+    },
     ReturnDaily,
     Select {
         candidate: usize,
@@ -197,6 +218,19 @@ struct Pending {
     freeze_inputs: bool,
 }
 #[derive(Clone)]
+enum IntentionView {
+    Design(intention_flow::DesignView),
+    Withdrawal(intention_flow::WithdrawalView),
+}
+impl IntentionView {
+    fn preview(&self) -> &RuntimeView {
+        match self {
+            Self::Design(v) => &v.preview,
+            Self::Withdrawal(v) => &v.preview,
+        }
+    }
+}
+#[derive(Clone)]
 enum Page {
     Home,
     Upgrade {
@@ -211,6 +245,16 @@ enum Page {
         basis: Option<Basis>,
     },
     Change(ChangeView),
+    History {
+        tool: Association,
+        basis: Basis,
+        view: intention_flow::HistoryView,
+    },
+    Intention {
+        basis: Basis,
+        view: IntentionView,
+        origin: String,
+    },
     Draft {
         basis: Basis,
         labels: Vec<String>,
@@ -266,6 +310,8 @@ pub struct ProductStudio {
     renderer: ProductRuntimeView,
     alternative_renderer: ProductRuntimeView,
     scope_selection: Vec<RecordRef>,
+    history: intention_flow::HistoryState,
+    history_tool: Option<Association>,
     need: String,
     provider: ProviderKind,
     profile: CapabilityProfile,
@@ -308,6 +354,8 @@ impl ProductStudio {
             renderer: ProductRuntimeView::default(),
             alternative_renderer: ProductRuntimeView::default(),
             scope_selection: vec![],
+            history: intention_flow::HistoryState::default(),
+            history_tool: None,
             need: String::new(),
             provider: ProviderKind::Codex,
             profile: CapabilityProfile::DataOnly,
@@ -335,6 +383,7 @@ impl ProductStudio {
         match &self.page {
             Page::Daily { basis, .. } | Page::Draft { basis, .. } => Some(basis.clone()),
             Page::Change(view) => Some(view.basis.clone()),
+            Page::History { basis, .. } | Page::Intention { basis, .. } => Some(basis.clone()),
             Page::Consent { basis, .. } => basis.clone(),
             _ => None,
         }
@@ -346,6 +395,13 @@ impl ProductStudio {
         matches!(
             action,
             Action::Decide { .. }
+                | Action::History
+                | Action::PrepareReconciliation { .. }
+                | Action::PreviewWithdrawal { .. }
+                | Action::CommitIntention { .. }
+                | Action::IntentionTrial {
+                    input: SemanticInput::AdvanceClock { .. }
+                }
                 | Action::Modify { .. }
                 | Action::ResumeChoice { .. }
                 | Action::Scope { .. }
@@ -358,9 +414,6 @@ impl ProductStudio {
     }
     fn plain_trial_control(&self, input: &SemanticInput) -> bool {
         let SemanticInput::Control { view, control, .. } = input else {
-            return false;
-        };
-        let Page::Change(change) = &self.page else {
             return false;
         };
         let plain = |model: &RuntimeView| {
@@ -394,7 +447,13 @@ impl ProductStudio {
                         .unwrap_or(false)
                 })
         };
-        plain(&change.current) && change.alternative.as_ref().is_none_or(plain)
+        match &self.page {
+            Page::Change(change) => {
+                plain(&change.current) && change.alternative.as_ref().is_none_or(plain)
+            }
+            Page::Intention { view, .. } => plain(view.preview()),
+            _ => false,
+        }
     }
     fn issue(&mut self, action: Action) {
         if self.pending.is_some() {
@@ -417,12 +476,16 @@ impl ProductStudio {
         }
         let renderer = matches!(
             action,
-            Action::Preview { .. } | Action::Daily { .. } | Action::Trial { .. }
+            Action::Preview { .. }
+                | Action::Daily { .. }
+                | Action::Trial { .. }
+                | Action::IntentionTrial { .. }
         );
         // Actions and navigation can replace a copied view or prepared source.
         // Only plain controls on both actual sources keep this editing frame.
         let freeze_inputs = match &action {
             Action::Trial { input } => !self.plain_trial_control(input),
+            Action::IntentionTrial { input } => !self.plain_trial_control(input),
             Action::Daily {
                 input: SemanticInput::Navigate { .. },
             } => true,
@@ -462,6 +525,12 @@ impl ProductStudio {
                         self.renderer = ProductRuntimeView::default();
                         self.alternative_renderer = ProductRuntimeView::default();
                         self.scope_selection.clear();
+                        if let Page::History { tool, .. } = &self.page {
+                            if self.history_tool.as_ref() != Some(tool) {
+                                self.history = intention_flow::HistoryState::default();
+                                self.history_tool = Some(tool.clone());
+                            }
+                        }
                     }
                 }
                 if let Some(need) = update.need {
@@ -520,6 +589,7 @@ impl ProductStudio {
         self.epoch = self.epoch.wrapping_add(1);
         self.page = Page::Home;
         self.renderer = ProductRuntimeView::default();
+        self.alternative_renderer = ProductRuntimeView::default();
         if self.pending.is_some() {
             self.cancel();
             self.closing = true;
@@ -532,6 +602,7 @@ impl ProductStudio {
         let active_model = match &self.page {
             Page::Draft { model, .. } | Page::Daily { model, .. } => Some(model),
             Page::Change(view) => Some(&view.current),
+            Page::Intention { view, .. } => Some(view.preview()),
             _ => None,
         };
         let shortcuts = take_shortcuts(
@@ -764,7 +835,7 @@ impl ProductStudio {
                         disclosure: disclosure.digest(),
                     });
                 }
-                if request.operation == DevelopmentOperation::Modify {
+                if request.operation != DevelopmentOperation::Generate {
                     if trace.button(
                         ui,
                         "studio.return",
@@ -775,6 +846,86 @@ impl ProductStudio {
                     }
                 } else {
                     close = trace.button(ui, "studio.back", "Back without sending", true);
+                }
+            }
+            Page::History { basis, view, .. } => {
+                let (event, widgets) = self.history.show(
+                    ui,
+                    view,
+                    !busy && !self.mutation_blocked && basis.day == today,
+                );
+                trace.append(widgets);
+                if let Some(event) = event {
+                    action = Some(match event {
+                        intention_flow::Event::Reconcile { needs, request } => {
+                            self.need = request.clone();
+                            Action::PrepareReconciliation {
+                                needs,
+                                need: request,
+                                provider: self.provider,
+                                profile: self.profile,
+                            }
+                        }
+                        intention_flow::Event::PreviewWithdrawal { layers } => {
+                            Action::PreviewWithdrawal { layers }
+                        }
+                        _ => Action::ReturnDaily,
+                    });
+                }
+                if basis.day != today
+                    && trace.button(
+                        ui,
+                        "studio.return",
+                        "Return to saved work to update today's date",
+                        !busy,
+                    )
+                {
+                    action = Some(Action::ReturnDaily);
+                }
+            }
+            Page::Intention {
+                basis,
+                view,
+                origin,
+            } => {
+                trace.label(ui, origin.clone());
+                let can_commit =
+                    !busy && !inputs_pending && !self.mutation_blocked && basis.day == today;
+                let (event, widgets) = match view {
+                    IntentionView::Design(view) => view.show(ui, !busy, can_commit),
+                    IntentionView::Withdrawal(view) => view.show(ui, !busy, can_commit),
+                };
+                trace.append(widgets);
+                if let Some(event) = event {
+                    action = Some(match event {
+                        intention_flow::Event::AcceptDesign { operation }
+                        | intention_flow::Event::Withdraw { operation } => {
+                            Action::CommitIntention { operation }
+                        }
+                        _ => Action::ReturnDaily,
+                    });
+                }
+                if inputs_pending {
+                    trace.label(ui, "Finish or correct the copied inputs before saving this change, or explicitly discard them and return.");
+                }
+                if basis.day != today {
+                    trace.label(ui, "Today's date changed. Return to saved work and prepare a fresh preview before saving.");
+                }
+                let mut model = std::borrow::Cow::Borrowed(view.preview());
+                if inputs_frozen || basis.day != today {
+                    model.to_mut().read_only = true;
+                }
+                let output = self.renderer.show(
+                    ui,
+                    &model,
+                    "intention-copy",
+                    !busy && action.is_none(),
+                    false,
+                    &shortcuts,
+                );
+                trace.append(output.trace);
+                if action.is_none() {
+                    action = output.input.map(|input| Action::IntentionTrial { input });
                 }
             }
             Page::Draft {
@@ -1165,6 +1316,14 @@ impl ProductStudio {
                 trace.label(ui, format!("Saved locally: {}", tool.path.display()));
                 trace.label(ui, "Output files cannot be saved in this initial version. Generated output can be inspected below.");
                 close = trace.button(ui, "studio.close", "Close tool", true);
+                if trace.button(
+                    ui,
+                    "studio.history",
+                    "Saved ways of working and rule history",
+                    !busy && !inputs_pending && !self.mutation_blocked && basis.day == today,
+                ) {
+                    action = Some(Action::History);
+                }
                 ui.add_enabled_ui(!busy, |ui| {
                     ui.horizontal(|ui| {
                         ui.selectable_value(&mut self.provider, ProviderKind::Codex, "Codex");
@@ -1354,6 +1513,11 @@ impl ProductStudio {
             Page::Draft { .. } => "draft",
             Page::Daily { .. } => "daily",
             Page::Change(_) => "change",
+            Page::History { .. } => "history",
+            Page::Intention { ref view, .. } => match view {
+                IntentionView::Design(_) => "design",
+                IntentionView::Withdrawal(_) => "withdrawal",
+            },
         }
     }
     pub fn test_modify(&mut self, need: &str) {
@@ -1458,6 +1622,7 @@ impl ProductStudio {
     pub fn test_runtime(&self) -> Option<&RuntimeView> {
         match &self.page {
             Page::Draft { model, .. } | Page::Daily { model, .. } => Some(model),
+            Page::Intention { view, .. } => Some(view.preview()),
             _ => None,
         }
     }
@@ -1582,6 +1747,7 @@ pub fn test_stage_provider(
         wire_source: wire.source_digest,
         issued: true,
         modify: None,
+        reconcile: None,
     });
     journal.write(value).unwrap();
 }

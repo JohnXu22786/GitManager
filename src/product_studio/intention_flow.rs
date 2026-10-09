@@ -289,7 +289,7 @@ impl Reconciliation {
         }) {
             return Err("This choice has no accepted result to preserve. Make a fresh outcome decision first".into());
         }
-        let instruction = format!("{text}\nReturn the executable evolution using this exact evolution suggestion ID: {evolution}");
+        let instruction = format!("{text}\nHost adoption operation ID: {operation}\nReturn the executable evolution using this exact evolution suggestion ID: {evolution}");
         let request = engine
             .reconciliation_request(basis, request_id, &instruction, needs)
             .map_err(error)?;
@@ -449,9 +449,19 @@ impl Design {
         input: SemanticInput,
         cancel: Arc<AtomicBool>,
     ) -> Result<RuntimeView> {
+        self.trial_when(store, input, cancel, || Ok(()))
+    }
+    pub fn trial_when(
+        &mut self,
+        store: &ProductStore,
+        input: SemanticInput,
+        cancel: Arc<AtomicBool>,
+        finish: impl FnOnce() -> Result<()>,
+    ) -> Result<RuntimeView> {
         fresh(store, &self.basis, &cancel)?;
         let (scenario, view) = self.preview.trial(&self.basis, input, cancel.clone())?;
         fresh(store, &self.basis, &cancel)?;
+        finish()?;
         self.preview.scenario = scenario;
         self.preview.view = view.clone();
         self.view.preview = view.clone();
@@ -552,9 +562,19 @@ impl Withdrawal {
         input: SemanticInput,
         cancel: Arc<AtomicBool>,
     ) -> Result<RuntimeView> {
+        self.trial_when(store, input, cancel, || Ok(()))
+    }
+    pub fn trial_when(
+        &mut self,
+        store: &ProductStore,
+        input: SemanticInput,
+        cancel: Arc<AtomicBool>,
+        finish: impl FnOnce() -> Result<()>,
+    ) -> Result<RuntimeView> {
         fresh(store, &self.basis, &cancel)?;
         let (scenario, view) = self.preview.trial(&self.basis, input, cancel.clone())?;
         fresh(store, &self.basis, &cancel)?;
+        finish()?;
         self.preview.scenario = scenario;
         self.preview.view = view.clone();
         self.view.preview = view.clone();
@@ -1024,7 +1044,12 @@ impl HistoricalScene {
     }
 }
 impl DesignView {
-    pub fn show(&self, ui: &mut egui::Ui, interactive: bool) -> (Option<Event>, WidgetTrace) {
+    pub fn show(
+        &self,
+        ui: &mut egui::Ui,
+        interactive: bool,
+        can_commit: bool,
+    ) -> (Option<Event>, WidgetTrace) {
         let mut trace = WidgetTrace::default();
         trace.label(ui, "Try the new design on copied work");
         trace.label(
@@ -1053,7 +1078,7 @@ impl DesignView {
             ui,
             "intention-accept-design",
             "Use this checked design",
-            interactive,
+            interactive && can_commit,
         ) {
             Some(Event::AcceptDesign {
                 operation: self.operation.clone(),
@@ -1072,7 +1097,12 @@ impl DesignView {
     }
 }
 impl WithdrawalView {
-    pub fn show(&self, ui: &mut egui::Ui, interactive: bool) -> (Option<Event>, WidgetTrace) {
+    pub fn show(
+        &self,
+        ui: &mut egui::Ui,
+        interactive: bool,
+        can_commit: bool,
+    ) -> (Option<Event>, WidgetTrace) {
         let mut trace = WidgetTrace::default();
         trace.label(ui, "Preview withdrawing behavior on copied current work");
         trace.label(
@@ -1095,7 +1125,7 @@ impl WithdrawalView {
             ui,
             "intention-withdraw",
             "Withdraw these checked rules",
-            interactive,
+            interactive && can_commit,
         ) {
             Some(Event::Withdraw {
                 operation: self.operation.clone(),
