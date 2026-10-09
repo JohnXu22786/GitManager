@@ -5,7 +5,7 @@ mod handoff;
 mod input;
 mod safe_path;
 mod watcher;
-pub use handoff::{ExternalCompletion, ExternalHandoff};
+pub use handoff::{ExternalCompletion, ExternalHandoff, ExternalHandoffTicket};
 pub use watcher::{SourceUpdate, SourceWatcher};
 
 use crate::{
