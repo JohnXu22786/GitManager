@@ -1055,7 +1055,9 @@ fn managed_future_four_pending_outcomes_inherit_and_resolve_after_later_work() {
                 .find(|d| d.id == "pending-rule")
                 .unwrap()
                 .status,
-            DecisionStatus::Superseded
+            DecisionStatus::Superseded {
+                by: "resolved-rule".into()
+            }
         );
         assert_eq!(
             engine(&reopened)

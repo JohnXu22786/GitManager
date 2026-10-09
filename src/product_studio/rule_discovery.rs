@@ -94,13 +94,6 @@ impl RuleSelection {
     pub fn request(&self) -> &ScopeRequest {
         &self.request
     }
-    pub fn identity(&self) -> Result<Digest> {
-        canonical_digest(
-            IdentityDomain::Source,
-            &(&self.basis, &self.prepared, &self.request, &self.operation),
-        )
-        .map_err(error)
-    }
     fn check(&self, store: &ProductStore, current: &Self, cancelled: &AtomicBool) -> Result<()> {
         check(store, &self.basis, cancelled)?;
         if current != self {
