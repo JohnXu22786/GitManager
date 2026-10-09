@@ -9,7 +9,7 @@ use crate::product_decisions::{CheckDisposition, IntentionBinding};
 use crate::product_runtime::LocalRuntime;
 use crate::product_scenarios::*;
 use history::RetainedRun;
-pub use history::VerifiedRetainedHistory;
+pub use history::{CheckedWitnessReplay, VerifiedRetainedHistory};
 pub use prepared::PreparedDiscoveryCandidate;
 pub use provider::*;
 pub use source::{analyze_delta, SourceDelta};

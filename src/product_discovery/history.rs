@@ -31,6 +31,98 @@ pub struct VerifiedRetainedHistory {
     prepared_targets: BTreeMap<Digest, PreparedScopedChange>,
     prepared_results: Vec<PreparedDiscoveryCandidate>,
 }
+/// Exact checked replay authority for one current-versus-prepared witness.
+/// It is not serializable and cannot authorize adoption or change its sources,
+/// population, starting frame or the preparation from which it was minted.
+#[derive(Clone)]
+pub struct CheckedWitnessReplay {
+    basis: ProjectSnapshot,
+    prepared: PreparedScopedChange,
+    witness: VerifiedWitness,
+    admission: Arc<dyn ReplayAdmission>,
+}
+impl CheckedWitnessReplay {
+    pub fn witness(&self) -> &VerifiedWitness {
+        &self.witness
+    }
+    pub fn check(
+        &self,
+        store: &ProductStore,
+        prepared: &PreparedScopedChange,
+        cancelled: &AtomicBool,
+    ) -> Result<(), AdapterError> {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(AdapterError::Cancelled);
+        }
+        if store.load().map_err(unavailable)? != self.basis || prepared != &self.prepared {
+            return Err(AdapterError::Stale(
+                "witness replay basis or exact preparation changed".into(),
+            ));
+        }
+        Ok(())
+    }
+    pub(crate) fn admission(&self) -> Arc<dyn ReplayAdmission> {
+        self.admission.clone()
+    }
+}
+
+/// A replay handle can extend inputs in its authenticated starting frame, but
+/// cannot borrow another source, day, seed, session or scope projection.
+struct WitnessAdmission {
+    sources: [CapturedProgram; 2],
+    frames: [ScenarioSpec; 2],
+    history: HistoryAdmission,
+}
+impl ReplayAdmission for WitnessAdmission {
+    fn replay_operation_ids(
+        &self,
+        source: &CapturedProgram,
+        scenario: &ScenarioSpec,
+    ) -> Result<Vec<Id>, AdapterError> {
+        if !self.sources.contains(source)
+            || !self.frames.iter().any(|frame| {
+                let mut frame = frame.clone();
+                frame.inputs = scenario.inputs.clone();
+                frame.label = scenario.label.clone();
+                frame == *scenario
+            })
+        {
+            return Err(unavailable(
+                "witness replay changed its authenticated source or input frame",
+            ));
+        }
+        self.history.replay_operation_ids(source, scenario)
+    }
+    fn validate_seed(
+        &self,
+        source: &CapturedProgram,
+        data: &DataSnapshot,
+        day: i32,
+    ) -> Result<(), AdapterError> {
+        if !self.sources.contains(source)
+            || !self
+                .frames
+                .iter()
+                .any(|s| &s.seed == data && s.clock_day == day)
+        {
+            return Err(unavailable(
+                "witness replay changed its source, seed or day",
+            ));
+        }
+        self.history.validate_seed(source, data, day)
+    }
+    fn validate_state(
+        &self,
+        source: &CapturedProgram,
+        data: &DataSnapshot,
+        day: i32,
+    ) -> Result<(), AdapterError> {
+        if !self.sources.contains(source) {
+            return Err(unavailable("witness replay changed its source"));
+        }
+        self.history.validate_state(source, data, day)
+    }
+}
 impl std::fmt::Debug for VerifiedRetainedHistory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VerifiedRetainedHistory")
@@ -249,7 +341,7 @@ impl VerifiedRetainedHistory {
         }
         Ok(self.prepared_results.clone())
     }
-    pub(super) fn replay_admission(&self) -> Result<Arc<dyn ReplayAdmission>, AdapterError> {
+    fn replay_contexts(&self) -> Result<Vec<ScopedExecutionContext>, AdapterError> {
         let mut contexts = vec![self.replay_context.clone()];
         for prepared in self.prepared_targets.values() {
             contexts.push(
@@ -269,10 +361,103 @@ impl VerifiedRetainedHistory {
                 );
             }
         }
+        Ok(contexts)
+    }
+    pub(super) fn replay_admission(&self) -> Result<Arc<dyn ReplayAdmission>, AdapterError> {
         Ok(Arc::new(HistoryAdmission {
-            contexts,
+            contexts: self.replay_contexts()?,
             projected_contexts: self.projected_contexts.clone(),
         }))
+    }
+    /// Preserve the checked projection registry that actually produced this
+    /// witness. A preparation alone loses synthetic creation identities after
+    /// metadata initialization. Reproduce both original and reduced evidence
+    /// before handing any authority to the host.
+    pub fn checked_witness_replay(
+        &self,
+        prepared: &PreparedScopedChange,
+        witness: &VerifiedWitness,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<CheckedWitnessReplay, AdapterError> {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(AdapterError::Cancelled);
+        }
+        let current = self.current.program().map_err(unavailable)?;
+        let id = canonical_digest(IdentityDomain::Source, prepared.target())?;
+        if self.store.load().map_err(unavailable)? != self.current
+            || self.prepared_targets.get(&id) != Some(prepared)
+            || !(witness.matches_sources(current, prepared.target())
+                || witness.matches_sources(prepared.target(), current))
+        {
+            return Err(unavailable(
+                "witness is not the exact registered current/prepared rule pair",
+            ));
+        }
+        let contexts = self.replay_contexts()?;
+        // Freeze the existing registry. Later discovery on another clone must
+        // not expand or change this handle's admitted replay frame.
+        let projected = self
+            .projected_contexts
+            .read()
+            .map_err(|_| unavailable("projected scene admission lock is poisoned"))?
+            .clone();
+        let admission: Arc<dyn ReplayAdmission> = Arc::new(WitnessAdmission {
+            sources: [
+                witness.before_program().clone(),
+                witness.after_program().clone(),
+            ],
+            frames: [
+                witness.initial_scenario().clone(),
+                witness.witness().scenario.clone(),
+            ],
+            history: HistoryAdmission {
+                contexts,
+                projected_contexts: Arc::new(std::sync::RwLock::new(projected)),
+            },
+        });
+        let runtime =
+            LocalRuntime::with_cancellation(cancelled.clone()).with_admission(admission.clone());
+        for (scenario, expected) in [
+            (witness.initial_scenario(), witness.initial_runs()),
+            (
+                &witness.witness().scenario,
+                (&witness.witness().before, &witness.witness().after),
+            ),
+        ] {
+            for (source, expected) in [
+                (witness.before_program(), expected.0),
+                (witness.after_program(), expected.1),
+            ] {
+                if cancelled.load(Ordering::Acquire) {
+                    return Err(AdapterError::Cancelled);
+                }
+                let actual = runtime.replay_admitted(
+                    source,
+                    scenario,
+                    &self.current.decisions,
+                    RuntimeLimits::default(),
+                    "checked-witness-replay",
+                    Some(admission.as_ref()),
+                )?;
+                if actual.state != EvidenceState::Observed
+                    || actual.binding != expected.binding
+                    || actual.observations != expected.observations
+                    || actual.trace != expected.trace
+                {
+                    return Err(unavailable(
+                        "witness replay did not reproduce its exact original evidence",
+                    ));
+                }
+            }
+        }
+        let checked = CheckedWitnessReplay {
+            basis: self.current.clone(),
+            prepared: prepared.clone(),
+            witness: witness.clone(),
+            admission,
+        };
+        checked.check(&self.store, prepared, &cancelled)?;
+        Ok(checked)
     }
     /// Host-authenticated preparation only: both compared executables receive
     /// this same actual scenario. Unknown correspondence remains unavailable.
