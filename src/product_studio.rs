@@ -484,6 +484,10 @@ impl ProductStudio {
         let today = self.today();
         let busy = self.is_busy();
         let inputs_pending = self.inputs_pending();
+        let inputs_frozen = self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| !pending.renderer);
         if busy {
             ui.ctx().request_repaint_after(Duration::from_millis(30));
         }
@@ -776,7 +780,11 @@ impl ProductStudio {
                     }
                 }
             }
-            Page::Change(view) => {
+            Page::Change(mut view) => {
+                view.current.read_only |= inputs_frozen;
+                if let Some(alternative) = &mut view.alternative {
+                    alternative.read_only |= inputs_frozen;
+                }
                 trace.label(ui, format!("Requested change: {}", view.need));
                 trace.label(ui, view.origin.clone());
                 trace.label(ui, "Copied work only. Both sides use the same starting records, date and input sequence. Trial entries never become saved business work.");
@@ -977,7 +985,10 @@ impl ProductStudio {
                         }
                     }
                     if inputs_pending {
-                        trace.label(ui, "Finish or correct the copied inputs below before recording a choice.");
+                        trace.label(
+                            ui,
+                            "Finish or correct the copied inputs below before recording a choice.",
+                        );
                     }
                     if view.same_alternative {
                         trace.label(ui,"Both sides use the same rules. A new pair will not be recorded. Returning to saved work leaves any earlier choices unchanged.");
@@ -1131,7 +1142,7 @@ impl ProductStudio {
                     trace.label(ui, "Finish or correct the work inputs below before requesting a change or revisiting a choice.");
                 }
                 let mut model = model.clone();
-                model.read_only |= self.mutation_blocked || basis.day != today;
+                model.read_only |= inputs_frozen || self.mutation_blocked || basis.day != today;
                 if basis.day != today {
                     trace.label(ui, "The saved tool date differs from today. Current-day work is paused until its date is safely updated; the saved data is kept.");
                     if basis.day < today
@@ -1164,7 +1175,7 @@ impl ProductStudio {
         if close {
             self.close();
         } else if let Some(action) = action {
-            // Editing stays available while a task is busy. A control can also
+            // Editing stays available while an input is pending. A control can also
             // enqueue a new value later in this frame, after a choice button.
             let waiting_for_inputs = self.action_waits_for_inputs(&action);
             self.issue(action);
@@ -1194,6 +1205,7 @@ pub struct TestPause {
 pub struct TestHooks {
     pub before_commit: Option<Arc<TestPause>>,
     pub before_preview: Option<Arc<TestPause>>,
+    pub before_context_transition: Option<Arc<TestPause>>,
     pub before_destination: Option<Arc<TestPause>>,
     pub before_abandon: Option<Arc<TestPause>>,
     pub fail_creation: Arc<AtomicBool>,
@@ -1210,6 +1222,7 @@ impl Default for TestHooks {
         Self {
             before_commit: None,
             before_preview: None,
+            before_context_transition: None,
             before_destination: None,
             before_abandon: None,
             fail_creation: Arc::new(AtomicBool::new(false)),

@@ -1062,8 +1062,7 @@ fn revisited_equivalent_pending_choice_requires_fresh_rehearsal() {
             settle(&mut studio);
             studio.test_consent();
             settle(&mut studio);
-            let mut title_controls =
-                egui_harness::EguiHarness::new(egui::vec2(1400.0, 1800.0));
+            let mut title_controls = egui_harness::EguiHarness::new(egui::vec2(1400.0, 1800.0));
             click(&mut title_controls, &mut studio, "studio.accept");
             assert_eq!(studio.test_page(), "daily", "{}", studio.test_notice());
             let renamed = store.load().unwrap();
@@ -3211,6 +3210,46 @@ fn scoped_navigation_and_clock_do_not_establish_business_experience() {
 #[test]
 fn queued_inputs_finish_before_choices_and_context_changes() {
     use std::sync::{atomic::Ordering, Arc};
+    fn complete_transition(
+        h: &mut egui_harness::EguiHarness,
+        studio: &mut ProductStudio,
+        pause: &product_studio::TestPause,
+        choice: &str,
+        panes: &[&str],
+    ) {
+        pause.reached.store(false, Ordering::Release);
+        pause.release.store(false, Ordering::Release);
+        let ready = frame(h, studio);
+        assert!(ready.controls[choice].enabled);
+        let point = ready.controls[choice].rect.center();
+        h.press_at(point);
+        frame(h, studio);
+        h.release_at(point);
+        frame(h, studio);
+        let start = Instant::now();
+        while !pause.reached.load(Ordering::Acquire) {
+            studio.poll();
+            assert!(start.elapsed() < Duration::from_secs(120));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        for pane in panes {
+            let key = format!("{pane}.control.search_input");
+            let pending = frame(h, studio);
+            let point = pending.controls[&key].rect.center();
+            h.press_at(point);
+            frame(h, studio);
+            h.release_at(point);
+            frame(h, studio);
+            h.text("ignored");
+            let attempted = frame(h, studio);
+            assert!(
+                !attempted.controls[&key].enabled,
+                "{pane} must stop accepting edits after {choice} starts"
+            );
+        }
+        pause.release.store(true, Ordering::Release);
+        settle(studio);
+    }
     for (pane, choice) in [
         ("current", "studio.accept"),
         ("alternative", "studio.defer"),
@@ -3236,12 +3275,15 @@ fn queued_inputs_finish_before_choices_and_context_changes() {
         let before = store.load().unwrap();
         let pause = Arc::new(product_studio::TestPause::default());
         pause.release.store(true, Ordering::Release);
+        let transition = Arc::new(product_studio::TestPause::default());
+        transition.release.store(true, Ordering::Release);
         let mut studio = ProductStudio::testing(
             root.into(),
             Some(transport(root, &candidate)),
             TestHooks {
                 before_preview: Some(pause.clone()),
                 before_commit: Some(pause.clone()),
+                before_context_transition: Some(transition.clone()),
                 ..TestHooks::default()
             },
         );
@@ -3259,7 +3301,11 @@ fn queued_inputs_finish_before_choices_and_context_changes() {
         ];
         let ready = frame(&mut h, &mut studio);
         for key in choices {
-            assert!(ready.controls[key].enabled, "{key}: {}", studio.test_notice());
+            assert!(
+                ready.controls[key].enabled,
+                "{key}: {}",
+                studio.test_notice()
+            );
         }
         let point = ready.controls[choice].rect.center();
 
@@ -3288,7 +3334,10 @@ fn queued_inputs_finish_before_choices_and_context_changes() {
         );
         if pane == "alternative" {
             studio.test_decide_exact(DecisionOutcome::Deferred);
-            assert!(!studio.is_busy(), "The final host gate must refuse queued inputs");
+            assert!(
+                !studio.is_busy(),
+                "The final host gate must refuse queued inputs"
+            );
             assert!(studio.test_notice().contains("inputs"));
         } else {
             h.press_at(point);
@@ -3319,9 +3368,19 @@ fn queued_inputs_finish_before_choices_and_context_changes() {
         }
         let ready = frame(&mut h, &mut studio);
         for key in choices {
-            assert!(ready.controls[key].enabled, "{key}: {}", studio.test_notice());
+            assert!(
+                ready.controls[key].enabled,
+                "{key}: {}",
+                studio.test_notice()
+            );
         }
-        click(&mut h, &mut studio, choice);
+        complete_transition(
+            &mut h,
+            &mut studio,
+            &transition,
+            choice,
+            &["current", "alternative"],
+        );
         assert_eq!(studio.test_page(), "daily", "{}", studio.test_notice());
         let saved = store.load().unwrap();
         assert_eq!(saved.data, before.data);
@@ -3365,14 +3424,29 @@ fn queued_inputs_finish_before_choices_and_context_changes() {
                 .iter()
                 .find(|example| example.scenario.identity().unwrap() == scene.scenario)
                 .unwrap();
+            let controls: Vec<_> = example
+                .scenario
+                .inputs
+                .iter()
+                .filter(|input| matches!(input, SemanticInput::Control { .. }))
+                .cloned()
+                .collect();
+            assert_eq!(
+                controls,
+                ["a", "ab"]
+                    .map(|value| SemanticInput::Control {
+                        view: "people".into(),
+                        control: "search_input".into(),
+                        value: other_shape::string(value),
+                    })
+                    .to_vec(),
+                "The durable source-bound example must retain the exact queued input order"
+            );
             assert_eq!(
                 example.scenario.inputs.last(),
-                Some(&SemanticInput::Control {
-                    view: "people".into(),
-                    control: "search_input".into(),
-                    value: other_shape::string("ab"),
-                }),
-                "The durable source-bound example must retain the latest queued input"
+                Some(&SemanticInput::Observe {
+                    point: "result".into()
+                })
             );
         }
 
@@ -3419,7 +3493,7 @@ fn queued_inputs_finish_before_choices_and_context_changes() {
         let latest = store.load().unwrap();
         assert_eq!(latest.data, saved.data);
         assert_eq!(latest.decisions, saved.decisions);
-        click(&mut h, &mut studio, &context_key);
+        complete_transition(&mut h, &mut studio, &transition, &context_key, &["daily"]);
         if choice == "studio.accept" {
             assert_eq!(studio.test_page(), "consent", "{}", studio.test_notice());
             let request = studio.test_prepared_request().unwrap();

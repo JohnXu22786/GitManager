@@ -1501,6 +1501,21 @@ impl Worker {
         let key = &command.key;
         let gate = &command.gate;
         gate.check()?;
+        #[cfg(test)]
+        if matches!(
+            &command.action,
+            Action::Decide { .. } | Action::Modify { .. } | Action::ResumeChoice { .. }
+        ) {
+            if let Some(pause) = &self.config.hooks.before_context_transition {
+                pause.reached.store(true, Ordering::Release);
+                while !pause.release.load(Ordering::Acquire)
+                    && !gate.cancelled.load(Ordering::Acquire)
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                gate.check()?;
+            }
+        }
         match &command.action {
             Action::Boot => self.boot(),
             Action::Prepare {
