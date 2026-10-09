@@ -194,6 +194,7 @@ struct Pending {
     key: Key,
     gate: Gate,
     renderer: bool,
+    freeze_inputs: bool,
 }
 #[derive(Clone)]
 enum Page {
@@ -344,8 +345,56 @@ impl ProductStudio {
     fn action_waits_for_inputs(&self, action: &Action) -> bool {
         matches!(
             action,
-            Action::Decide { .. } | Action::Modify { .. } | Action::ResumeChoice { .. }
+            Action::Decide { .. }
+                | Action::Modify { .. }
+                | Action::ResumeChoice { .. }
+                | Action::Scope { .. }
+                | Action::Finished { .. }
+                | Action::NoFinished { .. }
+                | Action::Trial {
+                    input: SemanticInput::AdvanceClock { .. }
+                }
         ) && self.inputs_pending()
+    }
+    fn plain_trial_control(&self, input: &SemanticInput) -> bool {
+        let SemanticInput::Control { view, control, .. } = input else {
+            return false;
+        };
+        let Page::Change(change) = &self.page else {
+            return false;
+        };
+        let plain = |model: &RuntimeView| {
+            if model.observation.view != *view {
+                return false;
+            }
+            model
+                .program
+                .views
+                .iter()
+                .find(|v| &v.id == view)
+                .is_some_and(|v| {
+                    let ViewKind::List {
+                        controls,
+                        selection,
+                        ..
+                    } = &v.kind
+                    else {
+                        return false;
+                    };
+                    controls
+                        .iter()
+                        .find(|c| &c.id == control)
+                        .map(|c| c.on_change.is_none())
+                        .or_else(|| {
+                            selection
+                                .as_ref()
+                                .filter(|s| &s.id == control)
+                                .map(|s| s.on_change.is_none())
+                        })
+                        .unwrap_or(false)
+                })
+        };
+        plain(&change.current) && change.alternative.as_ref().is_none_or(plain)
     }
     fn issue(&mut self, action: Action) {
         if self.pending.is_some() {
@@ -370,8 +419,15 @@ impl ProductStudio {
             action,
             Action::Preview { .. } | Action::Daily { .. } | Action::Trial { .. }
         );
+        // Actions and navigation can replace a copied view or prepared source.
+        // Only plain controls on both actual sources keep this editing frame.
+        let freeze_inputs = match &action {
+            Action::Trial { input } => !self.plain_trial_control(input),
+            Action::Preview { .. } | Action::Daily { .. } => false,
+            _ => true,
+        };
         match self.send.try_send(Command { key: key.clone(), gate: gate.clone(), action }) {
-            Ok(()) => self.pending = Some(Pending { key, gate, renderer }),
+            Ok(()) => self.pending = Some(Pending { key, gate, renderer, freeze_inputs }),
             Err(_) => self.notice = "The tool worker is unavailable. Saved work was kept; reopen the app to reconcile unfinished work".into(),
         }
     }
@@ -487,7 +543,7 @@ impl ProductStudio {
         let inputs_frozen = self
             .pending
             .as_ref()
-            .is_some_and(|pending| !pending.renderer);
+            .is_some_and(|pending| pending.freeze_inputs);
         if busy {
             ui.ctx().request_repaint_after(Duration::from_millis(30));
         }
@@ -781,14 +837,6 @@ impl ProductStudio {
                 }
             }
             Page::Change(view) => {
-                let mut view = std::borrow::Cow::Borrowed(view);
-                if inputs_frozen {
-                    let view = view.to_mut();
-                    view.current.read_only = true;
-                    if let Some(alternative) = &mut view.alternative {
-                        alternative.read_only = true;
-                    }
-                }
                 trace.label(ui, format!("Requested change: {}", view.need));
                 trace.label(ui, view.origin.clone());
                 trace.label(ui, "Copied work only. Both sides use the same starting records, date and input sequence. Trial entries never become saved business work.");
@@ -800,7 +848,7 @@ impl ProductStudio {
                     ui,
                     "studio.trial.next-day",
                     "Try one day later on the copies",
-                    !busy,
+                    !busy && !inputs_pending,
                 ) {
                     action = Some(Action::Trial {
                         input: SemanticInput::AdvanceClock { days: 1 },
@@ -819,7 +867,7 @@ impl ProductStudio {
                                 option.record.entity, option.record.record, option.field
                             ),
                             &option.label,
-                            !busy,
+                            !busy && !inputs_pending,
                         ) {
                             action = Some(Action::Finished {
                                 record: option.record.clone(),
@@ -832,7 +880,7 @@ impl ProductStudio {
                             ui,
                             &format!("studio.no-finished.{entity}"),
                             &format!("{label} has no finished state"),
-                            !busy,
+                            !busy && !inputs_pending,
                         ) {
                             action = Some(Action::NoFinished {
                                 entity: entity.clone(),
@@ -855,8 +903,12 @@ impl ProductStudio {
                             ),
                             ("studio.scope.all", "All work", ScopePopulation::All),
                         ] {
-                            if trace.button(ui, key, label, !busy && view.population != population)
-                            {
+                            if trace.button(
+                                ui,
+                                key,
+                                label,
+                                !busy && !inputs_pending && view.population != population,
+                            ) {
                                 action = Some(Action::Scope { population });
                             }
                         }
@@ -881,8 +933,10 @@ impl ProductStudio {
                                     })
                                     .unwrap_or_else(|| row.entity.clone());
                                 let mut selected = self.scope_selection.contains(&reference);
-                                let response = ui
-                                    .add_enabled(!busy, egui::Checkbox::new(&mut selected, label));
+                                let response = ui.add_enabled(
+                                    !busy && !inputs_pending,
+                                    egui::Checkbox::new(&mut selected, label),
+                                );
                                 if response.changed() {
                                     if selected {
                                         self.scope_selection.push(reference.clone());
@@ -899,7 +953,10 @@ impl ProductStudio {
                                 ui,
                                 "studio.scope.selected",
                                 "Apply to these unfinished items",
-                                !busy && view.partial_scope && !self.scope_selection.is_empty(),
+                                !busy
+                                    && !inputs_pending
+                                    && view.partial_scope
+                                    && !self.scope_selection.is_empty(),
                             ) {
                                 action = Some(Action::Scope {
                                     population: ScopePopulation::SelectedUnfinished {
@@ -991,7 +1048,7 @@ impl ProductStudio {
                     if inputs_pending {
                         trace.label(
                             ui,
-                            "Finish or correct the copied inputs below before recording a choice.",
+                            "Finish or correct the copied inputs below before changing scope, advancing the date or recording a choice.",
                         );
                     }
                     if view.same_alternative {
@@ -1000,24 +1057,42 @@ impl ProductStudio {
                         trace.label(ui,"The four unresolved choices retain both actual experiences without changing your live tool. You can reopen them after continuing work.");
                     }
                 }
-                if trace.button(ui, "studio.return", "Return to saved work", !busy) {
+                if inputs_pending {
+                    trace.label(ui, "Returning discards unfinished copied edits. Saved work and earlier choices stay unchanged.");
+                }
+                if trace.button(
+                    ui,
+                    "studio.return",
+                    if inputs_pending {
+                        "Discard copied edits and return"
+                    } else {
+                        "Return to saved work"
+                    },
+                    !busy,
+                ) {
                     action = Some(Action::ReturnDaily);
                 }
                 ui.separator();
                 if let Some(alternative) = &view.alternative {
                     ui.columns(2, |columns| {
                         trace.label(&mut columns[0], "Current");
+                        let mut current = std::borrow::Cow::Borrowed(&view.current);
+                        if inputs_frozen || self.alternative_renderer.pending_edits() {
+                            current.to_mut().read_only = true;
+                        }
                         let output = self.renderer.show(
                             &mut columns[0],
-                            &view.current,
+                            &current,
                             "current",
                             !busy && action.is_none(),
                             false,
                             &shortcuts,
                         );
                         trace.append(output.trace);
+                        let mut current_dispatched = false;
                         if let Some(input) = output.input {
                             if action.is_none() {
+                                current_dispatched = true;
                                 action = Some(Action::Trial { input });
                             }
                         }
@@ -1029,9 +1104,15 @@ impl ProductStudio {
                                 "Alternative"
                             },
                         );
+                        let mut alternative = std::borrow::Cow::Borrowed(alternative);
+                        // Both panes drive one input sequence. Claim this frame
+                        // before the other pane can start a competing edit.
+                        if inputs_frozen || current_dispatched || self.renderer.pending_edits() {
+                            alternative.to_mut().read_only = true;
+                        }
                         let output = self.alternative_renderer.show(
                             &mut columns[1],
-                            alternative,
+                            &alternative,
                             "alternative",
                             !busy && action.is_none(),
                             false,
@@ -1045,9 +1126,13 @@ impl ProductStudio {
                         }
                     });
                 } else {
+                    let mut current = std::borrow::Cow::Borrowed(&view.current);
+                    if inputs_frozen {
+                        current.to_mut().read_only = true;
+                    }
                     let output = self.renderer.show(
                         ui,
-                        &view.current,
+                        &current,
                         "current",
                         !busy && action.is_none(),
                         false,

@@ -3525,3 +3525,555 @@ fn queued_inputs_finish_before_choices_and_context_changes() {
         assert_eq!(store.load().unwrap(), latest);
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn comparison_panes_serialize_inputs_before_context_transitions() {
+    use std::sync::{atomic::Ordering, Arc};
+    fn edit(
+        h: &mut egui_harness::EguiHarness,
+        studio: &mut ProductStudio,
+        value: &str,
+    ) -> product_runtime_view::WidgetTrace {
+        h.key(
+            egui::Key::A,
+            true,
+            egui::Modifiers {
+                ctrl: true,
+                command: true,
+                ..Default::default()
+            },
+        );
+        h.key(egui::Key::A, false, egui::Modifiers::NONE);
+        h.text(value);
+        frame(h, studio)
+    }
+    fn paused_button(
+        h: &mut egui_harness::EguiHarness,
+        studio: &mut ProductStudio,
+        pause: &product_studio::TestPause,
+        key: &str,
+    ) -> product_runtime_view::WidgetTrace {
+        pause.reached.store(false, Ordering::Release);
+        pause.release.store(false, Ordering::Release);
+        let ready = frame(h, studio);
+        assert!(ready.controls[key].enabled);
+        let point = ready.controls[key].rect.center();
+        h.press_at(point);
+        frame(h, studio);
+        h.release_at(point);
+        frame(h, studio);
+        let start = Instant::now();
+        while !pause.reached.load(Ordering::Acquire) {
+            studio.poll();
+            assert!(start.elapsed() < Duration::from_secs(120));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        frame(h, studio)
+    }
+    fn blocked(trace: &product_runtime_view::WidgetTrace, owner: &str, other: &str) {
+        assert!(trace.controls[&format!("{owner}.control.number_input")].enabled);
+        assert!(
+            !trace.controls[&format!("{other}.control.number_input")].enabled,
+            "The other pane must not create a competing edit queue"
+        );
+        for pane in [owner, other] {
+            for key in [
+                format!("{pane}.navigate.new_person"),
+                format!("{pane}.action.export_button"),
+            ] {
+                assert!(
+                    !trace.controls[&key].enabled,
+                    "{key} must wait for the pending edit"
+                );
+            }
+        }
+        for key in [
+            "studio.trial.next-day",
+            "studio.accept",
+            "studio.keep-current",
+            "studio.either",
+            "studio.both",
+            "studio.neither",
+            "studio.defer",
+        ] {
+            assert!(
+                !trace.controls[key].enabled,
+                "{key} must wait for the pending edit"
+            );
+        }
+    }
+    for (owner, other) in [("current", "alternative"), ("alternative", "current")] {
+        let dir = tempdir();
+        let root = dir.path();
+        let path = root.join("tool");
+        let mut value = other_shape::filtered();
+        value["state"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id":"number","label":"Number","value_type":{"kind":"integer"},
+                "initial":{"kind":"integer","value":0}
+            }));
+        value["views"][0]["kind"]["controls"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id":"number_input","label":"Number","state":"number","on_change":null
+            }));
+        value["state"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id":"refresh","label":"Refresh","value_type":{"kind":"integer"},
+                "initial":{"kind":"integer","value":0}
+            }));
+        value["views"][0]["kind"]["controls"].as_array_mut().unwrap().push(serde_json::json!({
+            "id":"refresh_input","label":"Refresh results","state":"refresh","on_change":"collect"
+        }));
+        let original = other_shape::capture(value.clone());
+        value["views"][0]["kind"]["columns"].as_array_mut().unwrap().push(serde_json::json!({
+            "id":"area","label":"Area","value":other_shape::field(other_shape::var("row"),"area")
+        }));
+        let candidate = other_shape::capture(value);
+        let store = ProductStore::create(&path, &original, 20000).unwrap();
+        store
+            .apply(
+                0,
+                "first",
+                &other_shape::add("Ada"),
+                RuntimeLimits::default(),
+            )
+            .unwrap();
+        let before = store.load().unwrap();
+        let pause = Arc::new(product_studio::TestPause::default());
+        pause.release.store(true, Ordering::Release);
+        let mut studio = ProductStudio::testing(
+            root.into(),
+            Some(transport(root, &candidate)),
+            TestHooks {
+                before_preview: Some(pause.clone()),
+                ..TestHooks::default()
+            },
+        );
+        settle(&mut studio);
+        change(&mut studio, &path);
+        let mut h = egui_harness::EguiHarness::new(egui::vec2(1600.0, 2400.0));
+        click(&mut h, &mut studio, "current.action.export_button");
+        click(
+            &mut h,
+            &mut studio,
+            &format!("{owner}.control.number_input"),
+        );
+        pause.reached.store(false, Ordering::Release);
+        pause.release.store(false, Ordering::Release);
+        edit(&mut h, &mut studio, "1");
+        let start = Instant::now();
+        while !pause.reached.load(Ordering::Acquire) {
+            studio.poll();
+            assert!(start.elapsed() < Duration::from_secs(120));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let queued = edit(&mut h, &mut studio, "2");
+        assert!(studio.is_busy());
+        blocked(&queued, owner, other);
+        assert!(queued.controls["studio.cancel"].enabled);
+        assert!(!queued.controls["studio.return"].enabled);
+        pause.release.store(true, Ordering::Release);
+        settle(&mut studio);
+        assert_eq!(
+            studio.test_current_trial().unwrap().observation.controls["number_input"],
+            DataValue::Integer { value: 1 }
+        );
+        // The other pane cannot navigate or run an action in the idle gap
+        // before this pane's newer value is dispatched.
+        let draining = frame(&mut h, &mut studio);
+        blocked(&draining, owner, other);
+        settle(&mut studio);
+        for model in [
+            studio.test_current_trial().unwrap(),
+            studio.test_alternative().unwrap(),
+        ] {
+            assert_eq!(
+                model.observation.controls["number_input"],
+                DataValue::Integer { value: 2 }
+            );
+            assert_eq!(model.observation.view, "people");
+        }
+        assert_eq!(store.load().unwrap(), before);
+        // Once the queue is acknowledged, either pane can navigate and play.
+        let navigation = paused_button(
+            &mut h,
+            &mut studio,
+            &pause,
+            &format!("{other}.navigate.new_person"),
+        );
+        for pane in ["current", "alternative"] {
+            assert!(!navigation.controls[&format!("{pane}.control.number_input")].enabled);
+        }
+        pause.release.store(true, Ordering::Release);
+        settle(&mut studio);
+        assert_eq!(
+            studio.test_current_trial().unwrap().observation.view,
+            "new_person"
+        );
+        assert_eq!(
+            studio.test_alternative().unwrap().observation.view,
+            "new_person"
+        );
+        let navigation = paused_button(
+            &mut h,
+            &mut studio,
+            &pause,
+            &format!("{other}.navigate.people"),
+        );
+        for pane in ["current", "alternative"] {
+            assert!(!navigation.controls[&format!("{pane}.field.name")].enabled);
+        }
+        pause.release.store(true, Ordering::Release);
+        settle(&mut studio);
+        let action = paused_button(
+            &mut h,
+            &mut studio,
+            &pause,
+            &format!("{other}.action.export_button"),
+        );
+        for pane in ["current", "alternative"] {
+            assert!(!action.controls[&format!("{pane}.control.number_input")].enabled);
+        }
+        pause.release.store(true, Ordering::Release);
+        settle(&mut studio);
+        // On-change actions can also replace prepared context.
+        click(
+            &mut h,
+            &mut studio,
+            &format!("{owner}.control.refresh_input"),
+        );
+        pause.reached.store(false, Ordering::Release);
+        pause.release.store(false, Ordering::Release);
+        edit(&mut h, &mut studio, "1");
+        let start = Instant::now();
+        while !pause.reached.load(Ordering::Acquire) {
+            studio.poll();
+            assert!(start.elapsed() < Duration::from_secs(120));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let action = frame(&mut h, &mut studio);
+        for pane in ["current", "alternative"] {
+            for control in ["number_input", "refresh_input"] {
+                assert!(!action.controls[&format!("{pane}.control.{control}")].enabled);
+            }
+        }
+        pause.release.store(true, Ordering::Release);
+        settle(&mut studio);
+        assert_eq!(
+            studio.test_alternative().unwrap().observation.controls["refresh_input"],
+            DataValue::Integer { value: 1 }
+        );
+        click(
+            &mut h,
+            &mut studio,
+            &format!("{owner}.control.number_input"),
+        );
+        let invalid = edit(&mut h, &mut studio, "invalid");
+        assert!(!studio.is_busy());
+        blocked(&invalid, owner, other);
+        assert!(invalid.controls["studio.return"].enabled);
+        assert!(invalid.text.iter().any(|s| s.contains("valid value")));
+        let frozen = studio.test_current_trial().unwrap().clone();
+        for key in [
+            format!("{other}.navigate.new_person"),
+            format!("{other}.action.export_button"),
+            "studio.trial.next-day".into(),
+            "studio.defer".into(),
+        ] {
+            let blocked = frame(&mut h, &mut studio);
+            let point = blocked.controls[&key].rect.center();
+            h.press_at(point);
+            h.release_at(point);
+            frame(&mut h, &mut studio);
+            assert!(!studio.is_busy(), "Disabled {key} must not dispatch");
+            assert_eq!(studio.test_current_trial().unwrap(), &frozen);
+        }
+        h.key(egui::Key::E, true, egui::Modifiers::CTRL);
+        frame(&mut h, &mut studio);
+        h.key(egui::Key::E, false, egui::Modifiers::NONE);
+        frame(&mut h, &mut studio);
+        assert!(
+            !studio.is_busy(),
+            "A shortcut cannot bypass the other pane's unfinished edit"
+        );
+        studio.test_trial(SemanticInput::AdvanceClock { days: 1 });
+        assert!(
+            !studio.is_busy(),
+            "The final clock dispatch must refuse an unfinished edit"
+        );
+        studio.test_decide_exact(DecisionOutcome::Deferred);
+        assert!(!studio.is_busy());
+        assert_eq!(studio.test_current_trial().unwrap(), &frozen);
+        click(
+            &mut h,
+            &mut studio,
+            &format!("{owner}.control.number_input"),
+        );
+        edit(&mut h, &mut studio, "3");
+        settle(&mut studio);
+        assert_eq!(
+            studio.test_alternative().unwrap().observation.controls["number_input"],
+            DataValue::Integer { value: 3 }
+        );
+        click(&mut h, &mut studio, "studio.trial.next-day");
+        assert_eq!(store.load().unwrap(), before);
+        // Cancellation retains the editable value for correction/discard and
+        // never lets the other pane bypass it.
+        click(
+            &mut h,
+            &mut studio,
+            &format!("{owner}.control.number_input"),
+        );
+        pause.reached.store(false, Ordering::Release);
+        pause.release.store(false, Ordering::Release);
+        edit(&mut h, &mut studio, "4");
+        let start = Instant::now();
+        while !pause.reached.load(Ordering::Acquire) {
+            studio.poll();
+            assert!(start.elapsed() < Duration::from_secs(120));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        edit(&mut h, &mut studio, "5");
+        click(&mut h, &mut studio, "studio.cancel");
+        pause.release.store(true, Ordering::Release);
+        let cancelled = frame(&mut h, &mut studio);
+        blocked(&cancelled, owner, other);
+        assert_eq!(
+            studio.test_current_trial().unwrap().observation.controls["number_input"],
+            DataValue::Integer { value: 3 }
+        );
+        click(
+            &mut h,
+            &mut studio,
+            &format!("{owner}.control.number_input.discard"),
+        );
+        click(
+            &mut h,
+            &mut studio,
+            &format!("{other}.action.export_button"),
+        );
+        click(&mut h, &mut studio, "studio.defer");
+        assert_eq!(studio.test_page(), "daily", "{}", studio.test_notice());
+        let retained = store.load().unwrap();
+        assert_eq!(retained.data, before.data);
+        assert_eq!(retained.session, before.session);
+        assert_eq!(retained.clock_day, before.clock_day);
+        let pending = retained.decisions.decisions.last().unwrap().id.clone();
+        click(&mut h, &mut studio, &format!("studio.resume.{pending}"));
+        click(
+            &mut h,
+            &mut studio,
+            &format!("{owner}.control.number_input"),
+        );
+        let invalid = edit(&mut h, &mut studio, "invalid");
+        blocked(&invalid, owner, other);
+        assert!(invalid
+            .text
+            .iter()
+            .any(|s| s.contains("Returning discards")));
+        click(&mut h, &mut studio, "studio.return");
+        assert_eq!(studio.test_page(), "daily");
+        assert_eq!(
+            store.load().unwrap(),
+            retained,
+            "Explicit Return must preserve the original pending choice and all saved work"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn scoped_inputs_finish_before_lifecycle_scope_and_day_changes() {
+    fn edit(
+        h: &mut egui_harness::EguiHarness,
+        studio: &mut ProductStudio,
+        value: &str,
+    ) -> product_runtime_view::WidgetTrace {
+        h.key(
+            egui::Key::A,
+            true,
+            egui::Modifiers {
+                ctrl: true,
+                command: true,
+                ..Default::default()
+            },
+        );
+        h.key(egui::Key::A, false, egui::Modifiers::NONE);
+        h.text(value);
+        frame(h, studio)
+    }
+    fn with_control(paused: bool) -> CapturedProgram {
+        let mut value = serde_json::to_value(program(paused).program).unwrap();
+        value["state"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id":"number","label":"Number","value_type":{"kind":"integer"},
+                "initial":{"kind":"integer","value":0}
+            }));
+        value["views"][0]["kind"]["controls"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id":"number_input","label":"Number","state":"number","on_change":null
+            }));
+        capture(value)
+    }
+    for pane in ["current", "alternative"] {
+        let dir = tempdir();
+        let root = dir.path();
+        let path = root.join("tool");
+        let store = ProductStore::create(&path, &with_control(false), 20000).unwrap();
+        let row = add(&store, "active", "Waiting work");
+        action(&store, "wait", "wait", &row);
+        let done = add(&store, "finished", "Completed work");
+        action(&store, "complete", "complete", &done);
+        let before = store.load().unwrap();
+        let mut studio = ProductStudio::testing(
+            root.into(),
+            Some(transport(root, &with_control(true))),
+            TestHooks::default(),
+        );
+        settle(&mut studio);
+        change(&mut studio, &path);
+        let mut h = egui_harness::EguiHarness::new(egui::vec2(1600.0, 2400.0));
+        click(&mut h, &mut studio, "current.control.number_input");
+        let invalid = edit(&mut h, &mut studio, "invalid");
+        let finished = format!("studio.finished.job.{}.done", done.id);
+        for key in [
+            finished.as_str(),
+            "studio.no-finished.job",
+            "studio.trial.next-day",
+        ] {
+            assert!(
+                !invalid.controls[key].enabled,
+                "{key} must not replace a pending copied input"
+            );
+        }
+        studio.test_lifecycle_outcome(
+            RecordRef {
+                entity: done.entity.clone(),
+                record: done.id.clone(),
+            },
+            "done",
+        );
+        assert!(
+            !studio.is_busy(),
+            "Final lifecycle dispatch must wait for corrected inputs"
+        );
+        assert!(studio.test_notice().contains("inputs"));
+        edit(&mut h, &mut studio, "0");
+        settle(&mut studio);
+        click(&mut h, &mut studio, &finished);
+        click(&mut h, &mut studio, "studio.trial.next-day");
+        click(
+            &mut h,
+            &mut studio,
+            &format!("current.row.job.{}.calculate", row.id),
+        );
+        click(&mut h, &mut studio, "current.action.export");
+        let choices = [
+            "studio.accept",
+            "studio.keep-current",
+            "studio.either",
+            "studio.both",
+            "studio.neither",
+            "studio.defer",
+        ];
+        let ready = frame(&mut h, &mut studio);
+        for key in choices {
+            assert!(
+                ready.controls[key].enabled,
+                "{key}: {}",
+                studio.test_notice()
+            );
+        }
+        assert!(ready.controls["studio.scope.future"].enabled);
+        click(&mut h, &mut studio, &format!("{pane}.control.number_input"));
+        let invalid = edit(&mut h, &mut studio, "invalid");
+        for key in choices
+            .into_iter()
+            .chain(["studio.scope.future", "studio.trial.next-day"])
+        {
+            assert!(
+                !invalid.controls[key].enabled,
+                "{pane}: {key} must wait for corrected inputs"
+            );
+        }
+        let current = studio.test_current_trial().unwrap().clone();
+        let alternative = studio.test_alternative().unwrap().clone();
+        for key in choices
+            .into_iter()
+            .chain(["studio.scope.future", "studio.trial.next-day"])
+        {
+            let trace = frame(&mut h, &mut studio);
+            let point = trace.controls[key].rect.center();
+            h.press_at(point);
+            h.release_at(point);
+            frame(&mut h, &mut studio);
+            assert!(!studio.is_busy(), "Disabled {key} must not dispatch");
+            assert_eq!(studio.test_current_trial().unwrap(), &current);
+        }
+        for population in [
+            ScopePopulation::FutureWork,
+            ScopePopulation::SelectedUnfinished {
+                records: vec![RecordRef {
+                    entity: row.entity.clone(),
+                    record: row.id.clone(),
+                }],
+            },
+        ] {
+            studio.test_scope(population);
+            assert!(
+                !studio.is_busy(),
+                "Final scope dispatch must wait for corrected inputs"
+            );
+            assert!(studio.test_notice().contains("inputs"));
+        }
+        studio.test_trial(SemanticInput::AdvanceClock { days: 1 });
+        assert!(!studio.is_busy());
+        assert_eq!(studio.test_current_trial().unwrap(), &current);
+        assert_eq!(studio.test_alternative().unwrap(), &alternative);
+        assert_eq!(store.load().unwrap(), before);
+        click(&mut h, &mut studio, &format!("{pane}.control.number_input"));
+        edit(&mut h, &mut studio, "7");
+        settle(&mut studio);
+        assert_eq!(
+            studio.test_current_trial().unwrap().observation.controls["number_input"],
+            DataValue::Integer { value: 7 }
+        );
+        assert_eq!(
+            studio.test_alternative().unwrap().observation.controls["number_input"],
+            DataValue::Integer { value: 7 }
+        );
+        click(&mut h, &mut studio, "studio.scope.future");
+        let fresh = frame(&mut h, &mut studio);
+        assert!(
+            !fresh.controls["studio.defer"].enabled,
+            "Changing scope still requires a fresh task"
+        );
+        assert!(fresh.controls["studio.scope.all"].enabled);
+        click(&mut h, &mut studio, &format!("{pane}.control.number_input"));
+        let invalid = edit(&mut h, &mut studio, "invalid");
+        assert!(!invalid.controls["studio.scope.all"].enabled);
+        assert!(invalid.controls["studio.return"].enabled);
+        assert!(invalid
+            .text
+            .iter()
+            .any(|s| s.contains("Returning discards")));
+        click(&mut h, &mut studio, "studio.return");
+        assert_eq!(studio.test_page(), "daily");
+        assert_eq!(
+            store.load().unwrap(),
+            before,
+            "Leaving copied edits cannot change saved scope, data, date or intentions"
+        );
+    }
+}
