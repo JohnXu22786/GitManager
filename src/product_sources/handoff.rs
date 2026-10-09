@@ -3,7 +3,8 @@
 //! event is treated as a successful development run or runtime proof.
 use super::{input, invalid, safe_path, TaskSourceAdapter};
 use crate::product_contract::{
-    AdapterError, CapturedProgram, DevelopmentRequest, Digest, MAX_WIRE_BYTES,
+    canonical_digest, AdapterError, CapturedProgram, DevelopmentRequest, Digest, IdentityDomain,
+    MAX_WIRE_BYTES,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -26,6 +27,22 @@ pub struct ExternalCompletion {
     pub raw_digest: Digest,
     pub program_digest: Digest,
 }
+/// Correlation retained in the existing controller journal alongside its exact
+/// authorized request. This is not cryptographic authority, renewed consent or
+/// proof that an external author ran. Never recover it from untrusted job files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalHandoffTicket {
+    version: u32,
+    project_id: String,
+    task_id: String,
+    created_at: String,
+    repository: PathBuf,
+    worktree: PathBuf,
+    directory: PathBuf,
+    request_digest: Digest,
+    request_bytes_digest: Digest,
+}
 /// Controller-owned bundle. It remains outside the complete task fingerprint
 /// so a completion marker does not introduce a self-referential source digest.
 /// Merely preparing this local bundle does not launch or authorize a Harness.
@@ -43,6 +60,37 @@ impl ExternalHandoff {
         root: &Path,
         request: &DevelopmentRequest,
     ) -> Result<Self, AdapterError> {
+        let baseline = Self::request_baseline(adapter, request)?;
+        adapter.ensure_fresh(&baseline)?;
+        safe_path::directory(root)?;
+        let root = fs::canonicalize(root).map_err(|e| AdapterError::Failed(e.to_string()))?;
+        if root.starts_with(adapter.worktree()) {
+            return Err(invalid("Job bundles must be outside the task source tree"));
+        }
+        let bytes = Self::request_bytes(request)?;
+        // Creation rejects reused IDs, including interrupted/partial old jobs.
+        let directory = safe_path::create_job(&root, &request.id)?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(directory.join("request.json"))
+            .map_err(|e| AdapterError::Failed(e.to_string()))?;
+        file.write_all(&bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|e| AdapterError::Failed(e.to_string()))?;
+        adapter.ensure_fresh(&baseline)?;
+        Ok(Self {
+            adapter: adapter.clone(),
+            directory,
+            request: request.clone(),
+            baseline,
+            request_bytes: bytes,
+        })
+    }
+    fn request_baseline(
+        adapter: &TaskSourceAdapter,
+        request: &DevelopmentRequest,
+    ) -> Result<CapturedProgram, AdapterError> {
         request.validate()?;
         if request.project_id != adapter.project_id() {
             return Err(invalid("Request belongs to another project"));
@@ -62,34 +110,77 @@ impl ExternalHandoff {
             return Err(invalid("Request needs exactly one linked task baseline"));
         }
         let baseline = sources[0].clone();
-        adapter.ensure_fresh(&baseline)?;
-        safe_path::directory(root)?;
-        let root = fs::canonicalize(root).map_err(|e| AdapterError::Failed(e.to_string()))?;
-        if root.starts_with(adapter.worktree()) {
-            return Err(invalid("Job bundles must be outside the task source tree"));
-        }
+        Ok(baseline)
+    }
+    fn request_bytes(request: &DevelopmentRequest) -> Result<Vec<u8>, AdapterError> {
         let bytes = serde_json::to_vec(request).map_err(|e| invalid(e.to_string()))?;
         if bytes.len() > MAX_WIRE_BYTES {
             return Err(invalid("Job bundle exceeds byte limit"));
         }
-        // Creation rejects reused IDs, including interrupted/partial old jobs.
-        let directory = safe_path::create_job(&root, &request.id)?;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(directory.join("request.json"))
-            .map_err(|e| AdapterError::Failed(e.to_string()))?;
-        file.write_all(&bytes)
-            .and_then(|_| file.sync_all())
-            .map_err(|e| AdapterError::Failed(e.to_string()))?;
-        adapter.ensure_fresh(&baseline)?;
-        Ok(Self {
+        Ok(bytes)
+    }
+    pub fn ticket(&self) -> Result<ExternalHandoffTicket, AdapterError> {
+        self.adapter.task()?;
+        self.check_request()?;
+        Ok(ExternalHandoffTicket {
+            version: 1,
+            project_id: self.adapter.project.clone(),
+            task_id: self.adapter.task_id.clone(),
+            created_at: self.adapter.created_at.clone(),
+            repository: self.adapter.repository.clone(),
+            worktree: self.adapter.worktree.clone(),
+            directory: self.directory.clone(),
+            request_digest: self.request.identity()?,
+            // Pin original bytes separately from the canonical domain request.
+            request_bytes_digest: canonical_digest(IdentityDomain::Request, &self.request_bytes)?,
+        })
+    }
+    /// Read-only restoration of an existing controller-associated job. The host
+    /// must supply its saved ticket and exact authorized request, plus its own
+    /// registered root. No preparation, write, invocation or consent occurs.
+    /// The author may still be editing; only ingest can accept a completion.
+    pub fn reopen(
+        adapter: &TaskSourceAdapter,
+        root: &Path,
+        request: &DevelopmentRequest,
+        ticket: &ExternalHandoffTicket,
+    ) -> Result<Self, AdapterError> {
+        let baseline = Self::request_baseline(adapter, request)?;
+        let request_bytes = Self::request_bytes(request)?;
+        safe_path::directory(root)?;
+        let root = fs::canonicalize(root).map_err(|e| AdapterError::Failed(e.to_string()))?;
+        let directory = root.join(&request.id);
+        if root.starts_with(adapter.worktree()) || directory.starts_with(adapter.worktree()) {
+            return Err(invalid("Job bundles must be outside the task source tree"));
+        }
+        if directory != ticket.directory {
+            return Err(invalid(
+                "The saved job belongs to another job root or request",
+            ));
+        }
+        safe_path::directory(&directory)?;
+        let resumed = Self {
             adapter: adapter.clone(),
             directory,
             request: request.clone(),
             baseline,
-            request_bytes: bytes,
-        })
+            request_bytes,
+        };
+        if resumed.ticket()? != *ticket {
+            return Err(invalid(
+                "The saved job request or linked task identity changed",
+            ));
+        }
+        // Do not compare current bytes to the original baseline: legitimate
+        // external edits are expected. The declared artifact path must stay put.
+        if adapter.read_declaration()?.program_path != resumed.baseline.binding.program_path {
+            return Err(invalid("Declared program moved during this request"));
+        }
+        // Reload the registry and exact bundle after inspecting the source.
+        if resumed.ticket()? != *ticket {
+            return Err(invalid("The saved job changed while reopening"));
+        }
+        Ok(resumed)
     }
     pub fn request(&self) -> &DevelopmentRequest {
         &self.request
