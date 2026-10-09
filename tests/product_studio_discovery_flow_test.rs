@@ -745,7 +745,8 @@ fn observation_only_minimum_keeps_original_example_and_replays_actions_for_recor
     assert_eq!(engine(&store).discovery_scenes(&saved).unwrap().len(), 2);
 }
 
-fn ordinary_queue(
+fn current_alternative_queue(
+    managed: bool,
     synthetic: bool,
 ) -> (
     tempfile::TempDir,
@@ -754,12 +755,21 @@ fn ordinary_queue(
     DiscoveryQueue,
 ) {
     let dir = tempdir();
-    let store = ProductStore::create(
-        &dir.path().join("tool"),
-        &design(3, fixture_producer(), false),
-        20000,
-    )
-    .unwrap();
+    let path = dir.path().join("tool");
+    let store = if managed {
+        let store = managed_store(&path);
+        let existing = prepare(
+            &store,
+            &design(3, fixture_producer(), false),
+            "existing-plan",
+        );
+        store
+            .adopt_scoped(store.load().unwrap().revision, &existing)
+            .unwrap();
+        store
+    } else {
+        ProductStore::create(&path, &design(3, fixture_producer(), false), 20000).unwrap()
+    };
     add(&store, "real-row", "Real saved work");
     let basis = store.load().unwrap();
     let authored = design(1, fixture_producer(), false);
@@ -770,13 +780,14 @@ fn ordinary_queue(
         m,
         r,
         "changed",
-        None,
+        managed.then(|| prepare(&store, &authored, "prospective-plan")),
         "discover-synthetic",
         "Show planning alternatives",
         cancel(),
     )
     .unwrap();
-    let mut scenario = scene(&basis, &authored);
+    let target = &d.request().sources[1];
+    let mut scenario = scene(&basis, target);
     if synthetic {
         scenario.seed.records[0].id = "synthetic-only".into();
         scenario.seed.events.clear();
@@ -813,7 +824,7 @@ fn ordinary_queue(
                 },
                 GeneratedCandidate {
                     id: "primary".into(),
-                    source_json: String::from_utf8(authored.source_bytes.clone()).unwrap(),
+                    source_json: String::from_utf8(target.source_bytes.clone()).unwrap(),
                 },
             ],
             hypotheses: vec![ChoiceHypothesis {
@@ -823,8 +834,8 @@ fn ordinary_queue(
                 action: "plan".into(),
                 observable: "planned".into(),
                 sources: vec![SourceLocus {
-                    relative_path: authored.binding.program_path.clone(),
-                    raw_digest: authored.artifact.raw_digest.clone(),
+                    relative_path: target.binding.program_path.clone(),
+                    raw_digest: target.artifact.raw_digest.clone(),
                     pointer: "/actions/7".into(),
                 }],
                 alternatives: vec!["current".into(), "primary".into()],
@@ -848,7 +859,7 @@ fn ordinary_queue(
 
 #[test]
 fn ordinary_unprepared_design_can_be_experienced_and_selected_on_saved_work() {
-    let (_dir, store, basis, q) = ordinary_queue(false);
+    let (_dir, store, basis, q) = current_alternative_queue(false, false);
     let pair = open(&store, &q);
     let artifact = pair
         .scenes()
@@ -880,9 +891,98 @@ fn ordinary_unprepared_design_can_be_experienced_and_selected_on_saved_work() {
     assert_eq!(store.load().unwrap(), adopted);
 }
 
+fn assert_current_alternative_reopens(managed: bool) {
+    let (dir, store, basis, q) = current_alternative_queue(managed, false);
+    let pair = open(&store, &q);
+    let alternative = pair
+        .scenes()
+        .unwrap()
+        .iter()
+        .find(|scene| scene.program() != basis.program().unwrap())
+        .unwrap()
+        .program()
+        .clone();
+    let change = pair
+        .prepare_choice(
+            &store,
+            &pair.view().ticket,
+            DecisionOutcome::Deferred,
+            "pending-current-alternative",
+            "record-current-alternative",
+            &[],
+            cancel(),
+        )
+        .unwrap();
+    let recorded = engine(&store).adopt(&store, &change).unwrap();
+    assert_eq!(recorded.program().unwrap(), basis.program().unwrap());
+    assert_eq!(recorded.data, basis.data);
+    assert_eq!(recorded.session, basis.session);
+    if !managed {
+        assert!(!recorded.programs.contains(&alternative),
+            "This regression needs the ordinary alternative retained only in its checked scene object");
+    }
+    let late = add(&store, "later-current-alternative", "Later real work");
+    let reopened = ProductStore::open(&dir.path().join("tool")).unwrap();
+    let fresh_basis = reopened.load().unwrap();
+    let fresh = PairExperience::reopen(
+        &reopened,
+        "pending-current-alternative",
+        "reopen-current-alternative",
+        cancel(),
+    )
+    .unwrap();
+    assert!(fresh.view().labels.iter().any(|label| label == "Current"));
+    assert!(!fresh.view().minimal);
+    for scene in fresh.scenes().unwrap() {
+        assert_eq!(scene.scenario().seed, fresh_basis.data);
+        assert!(scene
+            .scenario()
+            .seed
+            .records
+            .iter()
+            .any(|r| r.id == late.id));
+    }
+    if !managed {
+        assert!(fresh
+            .scenes()
+            .unwrap()
+            .iter()
+            .any(|scene| scene.program() == &alternative));
+    }
+    let resolved = fresh
+        .prepare_choice(
+            &reopened,
+            &fresh.view().ticket,
+            DecisionOutcome::KeepCurrent,
+            "selected-current",
+            "resolve-current-alternative",
+            &["pending-current-alternative".into()],
+            cancel(),
+        )
+        .unwrap();
+    let adopted = engine(&reopened).adopt(&reopened, &resolved).unwrap();
+    assert_eq!(adopted.program().unwrap(), fresh_basis.program().unwrap());
+    assert_eq!(adopted.data.records, fresh_basis.data.records);
+    assert_eq!(adopted.data.events, fresh_basis.data.events);
+    assert!(matches!(
+        adopted.decisions.decisions[0].status,
+        DecisionStatus::Superseded { .. }
+    ));
+}
+
+#[test]
+fn ordinary_current_alternative_pending_choice_reopens_from_archived_capture() {
+    assert_current_alternative_reopens(false);
+}
+
+#[test]
+fn managed_current_alternative_pending_choice_reopens_without_current_rehearsal() {
+    assert_current_alternative_reopens(true);
+}
+
 #[test]
 fn synthetic_record_example_is_playable_without_fabricating_a_current_copy() {
-    let (_dir, store, basis, q) = ordinary_queue(true);
+    let (_dir, store, basis, q) = current_alternative_queue(false, true);
     let question = &q.report().questions[0];
     let view = q.checked_view(&store, cancel()).unwrap();
     assert!(view.questions[0].witnesses[0].playable);
