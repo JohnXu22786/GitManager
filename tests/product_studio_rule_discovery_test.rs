@@ -413,6 +413,13 @@ fn created_scene(current: &product_store::ProjectSnapshot) -> (ScenarioSpec, Rec
 fn discovery_result(draft: &RuleDiscoveryDraft, scene: &ScenarioSpec) -> DevelopmentResult {
     let before = &draft.request().sources[0];
     let after = &draft.request().sources[1];
+    // The compact fixture changes the stored calculation, while the original
+    // fixture changes the displayed/exported expression directly.
+    let (action, pointer) = if draft.selection().request().operations.contains("export") {
+        ("export", "/views/0/kind/columns/1/value")
+    } else {
+        ("calculate", "/actions/3")
+    };
     DevelopmentResult {
         producer: Producer::Fixture {
             name: "Offline discover result".into(),
@@ -434,12 +441,12 @@ fn discovery_result(draft: &RuleDiscoveryDraft, scene: &ScenarioSpec) -> Develop
                 id: "waiting-choice".into(),
                 statement: "Waiting changes production calculations".into(),
                 kind: HypothesisKind::UnresolvedChoice,
-                action: "export".into(),
+                action: action.into(),
                 observable: "waiting_jobs".into(),
                 sources: vec![SourceLocus {
                     relative_path: after.binding.program_path.clone(),
                     raw_digest: after.artifact.raw_digest.clone(),
-                    pointer: "/views/0/kind/columns/1/value".into(),
+                    pointer: pointer.into(),
                 }],
                 alternatives: vec!["before".into(), "after".into()],
                 related_decisions: vec![],
@@ -1192,14 +1199,23 @@ fn oversized_managed_context_is_refused_before_transport_without_changing_work()
     let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
     let (_, _, candidate) = managed(&store, false);
     let current = store.load().unwrap();
-    let (req, _) = modify(&store, &candidate, "wide-managed");
-    let bytes = serde_json::to_vec(&req).unwrap().len();
-    let error = encode_request(&req, &ProviderOptions::default())
+    let (req, result) = modify(&store, &candidate, "wide-managed");
+    let modify_wire = encode_request(&req, &ProviderOptions::default()).unwrap();
+    let d = draft_from(
+        &store,
+        req,
+        result,
+        ScopePopulation::FutureWork,
+        "wide-managed",
+    );
+    let req = d.request();
+    let bytes = serde_json::to_vec(req).unwrap().len();
+    let error = encode_request(req, &ProviderOptions::default())
         .err()
         .expect("The full multi-slot retained context exceeds the fixed transport bound");
     eprintln!(
-        "Bounded managed request {}: {} serialized request bytes; {error:?}",
-        req.id, bytes
+        "Bounded managed {:?} request {}: {} serialized request bytes; preceding Modify prompt {} bytes; fixed prompt cap {} bytes; {error:?}",
+        req.operation, req.id, bytes, modify_wire.prompt.len(), product_provider::MAX_PROMPT_BYTES
     );
     assert!(format!("{error:?}").contains("prompt must be bounded"));
     assert_eq!(store.load().unwrap(), current);
