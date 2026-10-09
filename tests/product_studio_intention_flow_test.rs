@@ -1113,6 +1113,24 @@ fn history_keeps_nonbinary_outcomes_distinct_and_does_not_accept_rejected_exampl
             trace.controls[&format!("intention-need-{id}")].enabled,
             selectable
         );
+        let point = trace.controls[&format!("intention-details-{id}")]
+            .rect
+            .center();
+        let frame = |h: &mut egui_harness::EguiHarness, state: &mut HistoryState| {
+            h.frame(|ctx| {
+                egui::CentralPanel::default()
+                    .show(ctx, |ui| state.show(ui, &view, true))
+                    .inner
+            })
+        };
+        h.press_at(point);
+        frame(&mut h, &mut state);
+        h.release_at(point);
+        frame(&mut h, &mut state);
+        let (_, expanded) = frame(&mut h, &mut state);
+        let expanded = expanded.text.join("\n");
+        assert!(expanded.contains("Recorded result at"), "{expanded}");
+        assert!(!expanded.contains("Accepted result"), "{expanded}");
         if !selectable {
             let result = Reconciliation::new(
                 &store,

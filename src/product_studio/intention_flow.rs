@@ -871,7 +871,7 @@ impl HistoricalScene {
             trace.label(
                 ui,
                 format!(
-                    "Accepted result at {}: {} visible rows, {} selected",
+                    "Recorded result at {}: {} visible rows, {} selected",
                     observed.point,
                     observed.view.rows.len(),
                     observed.view.selected.len()
