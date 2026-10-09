@@ -509,6 +509,8 @@ fn managed_reconciliation_binds_actual_result_target_and_final_operation() {
     for id in ["first", "second"] {
         record_need(&store, id, DecisionOutcome::BothNeeded);
     }
+    record_need(&store, "rejected-history", DecisionOutcome::NeitherFits);
+    record_need(&store, "deferred-history", DecisionOutcome::Deferred);
     let s = store.load().unwrap();
     let e = engine(&store);
     let request = Reconciliation::new(
@@ -538,6 +540,12 @@ fn managed_reconciliation_binds_actual_result_target_and_final_operation() {
         .develop_prepared(&store, &e, actual, cancellation())
         .unwrap();
     assert_eq!(design.view().authored, candidate);
+    assert!(design.view().preserve.is_empty());
+    assert_eq!(
+        design.view().pending,
+        vec!["rejected-history", "deferred-history"]
+    );
+    assert_eq!(design.view().addressed, vec!["first", "second"]);
     assert_ne!(design.view().candidate, candidate);
     assert_eq!(store.load().unwrap(), s);
     let ready = design.decision(&store, &e, cancellation()).unwrap();
@@ -566,10 +574,18 @@ fn checked_withdrawal_cannot_commit_after_daily_work_or_cancellation() {
         )
         .unwrap();
     let layer = prepared.layer_id().unwrap().unwrap();
-    let s = store.adopt_scoped(s.revision, &prepared).unwrap();
+    store.adopt_scoped(s.revision, &prepared).unwrap();
+    record_need(&store, "rejected-history", DecisionOutcome::NeitherFits);
+    record_need(&store, "deferred-history", DecisionOutcome::Deferred);
+    let s = store.load().unwrap();
     let e = engine(&store);
     let withdrawal =
         Withdrawal::prepare(&store, &s, &e, &[layer.clone()], "withdraw", cancellation()).unwrap();
+    assert!(withdrawal.view().preserve.is_empty());
+    assert_eq!(
+        withdrawal.view().pending,
+        vec!["rejected-history", "deferred-history"]
+    );
     let cancel = cancellation();
     cancel.store(true, Ordering::Release);
     assert!(withdrawal.decision(&store, &e, cancel).is_err());
@@ -1223,4 +1239,126 @@ fn history_renders_control_and_form_only_recorded_values() {
     assert!(text.contains("Promised date:"), "{text}");
     assert!(!text.contains("Accepted result"), "{text}");
     assert_eq!(store.load().unwrap(), saved);
+}
+
+#[test]
+fn history_distinguishes_selected_records_and_recorded_action_availability() {
+    let dir = tempdir();
+    let mut value = serde_json::to_value(program(false).program).unwrap();
+    value["state"] = serde_json::json!([{"id":"picked","label":"Picked work","value_type":{"kind":"list","item":{"kind":"reference","entity":"job"}},"initial":{"kind":"list","item_type":{"kind":"reference","entity":"job"},"items":[]}}]);
+    value["views"][0]["kind"]["selection"] =
+        serde_json::json!({"id":"pick","state":"picked","on_change":null});
+    value["views"][0]["actions"] = serde_json::json!([
+        {"id":"export_button","label":"Export results","placement":"toolbar","action":"export","arguments":{},"enabled":boolean(true)},
+        {"id":"complete_button","label":"Complete work","placement":"row","action":"complete","arguments":{"row":var("row")},"enabled":boolean(true)}]);
+    let captured = capture(value.clone());
+    let store = ProductStore::create(dir.path().join("tool"), &captured, 20000).unwrap();
+    let first = add(&store, "first-row", "First job");
+    let second = add(&store, "second-row", "Second job");
+    let basis = store.load().unwrap();
+    let selected = |row: &Record| SemanticInput::Control {
+        view: "work".into(),
+        control: "pick".into(),
+        value: DataValue::List {
+            item_type: Type::reference("job"),
+            items: vec![reference(row)],
+        },
+    };
+    let mut example = scenario(&basis, "first-example");
+    example.inputs.insert(0, selected(&first));
+    let a = accept_scene(
+        &LocalRuntime::default(),
+        &captured,
+        &example,
+        Disclosure::Synthetic,
+        RuntimeLimits::default(),
+    )
+    .unwrap();
+    value["views"][0]["actions"][0]["enabled"] = serde_json::to_value(boolean(false)).unwrap();
+    value["views"][0]["actions"][1]["enabled"] = serde_json::to_value(boolean(false)).unwrap();
+    let alternate = capture(value);
+    example.id = "second-example".into();
+    example.inputs[0] = selected(&second);
+    let b = accept_scene(
+        &LocalRuntime::default(),
+        &alternate,
+        &example,
+        Disclosure::Synthetic,
+        RuntimeLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        a.observations()[0]
+            .view
+            .rows
+            .iter()
+            .map(|r| &r.cells)
+            .collect::<Vec<_>>(),
+        b.observations()[0]
+            .view
+            .rows
+            .iter()
+            .map(|r| &r.cells)
+            .collect::<Vec<_>>()
+    );
+    assert_ne!(
+        a.observations()[0].view.selected,
+        b.observations()[0].view.selected
+    );
+    assert_ne!(
+        a.observations()[0].view.enabled_actions,
+        b.observations()[0].view.enabled_actions
+    );
+    assert_ne!(
+        a.observations()[0].view.rows[0].enabled_actions,
+        b.observations()[0].view.rows[0].enabled_actions
+    );
+    let e = engine(&store);
+    let ready = e
+        .prepare_choice(
+            &store,
+            &captured,
+            choice("selection-history", DecisionOutcome::BothNeeded),
+            vec![a, b],
+            "record-selection",
+        )
+        .unwrap();
+    let saved = e.adopt(&store, &ready).unwrap();
+    let view = HistoryView::load(&store, &saved, cancellation()).unwrap();
+    let mut state = HistoryState::default();
+    let mut h = egui_harness::EguiHarness::new(egui::vec2(1300.0, 1800.0));
+    let frame = |h: &mut egui_harness::EguiHarness, state: &mut HistoryState| {
+        h.frame(|ctx| {
+            egui::CentralPanel::default()
+                .show(ctx, |ui| state.show(ui, &view, true))
+                .inner
+        })
+    };
+    let (_, trace) = frame(&mut h, &mut state);
+    let point = trace.controls["intention-details-selection-history"]
+        .rect
+        .center();
+    h.press_at(point);
+    frame(&mut h, &mut state);
+    h.release_at(point);
+    frame(&mut h, &mut state);
+    let (_, trace) = frame(&mut h, &mut state);
+    let text = trace.text.join("\n");
+    assert!(text.contains("Recorded view: Work"), "{text}");
+    for row in [&first, &second] {
+        assert!(
+            text.contains(&format!("Selected work: job / {}", row.id)),
+            "{text}"
+        );
+    }
+    assert!(
+        text.contains("Available toolbar actions: Export results"),
+        "{text}"
+    );
+    assert!(text.contains("Available toolbar actions: none"), "{text}");
+    assert!(
+        text.contains("Available row actions: Complete work"),
+        "{text}"
+    );
+    assert!(text.contains("Available row actions: none"), "{text}");
 }

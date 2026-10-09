@@ -118,6 +118,24 @@ fn outcome_text(decision: &ScopedDecision, binding: IntentionBinding) -> &'stati
         DecisionOutcome::Deferred => "Decision deferred; no result was accepted",
     }
 }
+fn preserved_promises(basis: &ProjectSnapshot, plan: &AdoptionPlan) -> Vec<Id> {
+    basis
+        .decisions
+        .decisions
+        .iter()
+        .filter(|d| d.status == DecisionStatus::Active && plan.required_decisions.contains(&d.id))
+        .map(|d| d.id.clone())
+        .collect()
+}
+fn pending_history(basis: &ProjectSnapshot, plan: &AdoptionPlan) -> Vec<Id> {
+    basis
+        .decisions
+        .decisions
+        .iter()
+        .filter(|d| d.status == DecisionStatus::Pending && !plan.retire_decisions.contains(&d.id))
+        .map(|d| d.id.clone())
+        .collect()
+}
 fn scope_text(scope: &DecisionScope) -> String {
     let population = match &scope.population {
         Population::All => "All work".into(),
@@ -369,6 +387,8 @@ pub(super) struct DesignView {
     pub candidate: CapturedProgram,
     pub retire: Vec<Id>,
     pub preserve: Vec<Id>,
+    pub addressed: Vec<Id>,
+    pub pending: Vec<Id>,
     pub preview: RuntimeView,
 }
 pub(super) struct Design {
@@ -406,17 +426,9 @@ impl Design {
             authored: draft.authored_candidate().clone(),
             candidate: draft.candidate().clone(),
             retire: checked.plan().retire_decisions.clone(),
-            preserve: request
-                .basis
-                .decisions
-                .decisions
-                .iter()
-                .filter(|d| {
-                    matches!(d.status, DecisionStatus::Active | DecisionStatus::Pending)
-                        && !checked.plan().retire_decisions.contains(&d.id)
-                })
-                .map(|d| d.id.clone())
-                .collect(),
+            preserve: preserved_promises(&request.basis, checked.plan()),
+            addressed: draft.suggestion().needs.clone(),
+            pending: pending_history(&request.basis, checked.plan()),
             preview: preview.view.clone(),
         };
         fresh(store, &request.basis, &cancel)?;
@@ -471,6 +483,7 @@ pub(super) struct WithdrawalView {
     pub layers: Vec<Digest>,
     pub retire: Vec<Id>,
     pub preserve: Vec<Id>,
+    pub pending: Vec<Id>,
     pub candidate: CapturedProgram,
     pub preview: RuntimeView,
 }
@@ -516,16 +529,8 @@ impl Withdrawal {
             operation: operation.into(),
             layers: layers.to_vec(),
             retire: checked.plan().retire_decisions.clone(),
-            preserve: basis
-                .decisions
-                .decisions
-                .iter()
-                .filter(|d| {
-                    matches!(d.status, DecisionStatus::Active | DecisionStatus::Pending)
-                        && !checked.plan().retire_decisions.contains(&d.id)
-                })
-                .map(|d| d.id.clone())
-                .collect(),
+            preserve: preserved_promises(basis, checked.plan()),
+            pending: pending_history(basis, checked.plan()),
             candidate: checked.candidate().clone(),
             preview: preview.view.clone(),
         };
@@ -871,6 +876,45 @@ impl HistoricalScene {
             trace.label(
                 ui,
                 format!(
+                    "Recorded view: {} ({})",
+                    view.map(|v| v.label.as_str())
+                        .unwrap_or(&observed.view.view),
+                    observed.view.view
+                ),
+            );
+            let action_labels = |ids: &BTreeSet<Id>| {
+                if ids.is_empty() {
+                    return "none".into();
+                }
+                ids.iter()
+                    .map(|id| {
+                        view.and_then(|v| v.actions.iter().find(|a| &a.id == id))
+                            .map(|a| a.label.clone())
+                            .unwrap_or_else(|| id.clone())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            trace.label(
+                ui,
+                format!(
+                    "Available toolbar actions: {}",
+                    action_labels(&observed.view.enabled_actions)
+                ),
+            );
+            if observed.view.selected.is_empty() {
+                trace.label(ui, "Selected work: none");
+            }
+            for record in &observed.view.selected {
+                trace.label(
+                    ui,
+                    format!("Selected work: {} / {}", record.entity, record.record),
+                );
+            }
+
+            trace.label(
+                ui,
+                format!(
                     "Recorded result at {}: {} visible rows, {} selected",
                     observed.point,
                     observed.view.rows.len(),
@@ -934,6 +978,13 @@ impl HistoricalScene {
                     ui,
                     format!("{} / {} · {cells}", row.record.entity, row.record.record),
                 );
+                trace.label(
+                    ui,
+                    format!(
+                        "Available row actions: {}",
+                        action_labels(&row.enabled_actions)
+                    ),
+                );
             }
             if observed.view.rows.len() > 20 {
                 trace.label(
@@ -979,9 +1030,23 @@ impl DesignView {
         trace.label(
             ui,
             format!(
-                "Proposed replacement of: {}. Independent needs kept: {}",
+                "Proposed replacement of: {}. Checked active promises kept: {}",
                 self.retire.join(", "),
                 self.preserve.join(", ")
+            ),
+        );
+        trace.label(
+            ui,
+            format!(
+                "New design checked against these selected needs: {}",
+                self.addressed.join(", ")
+            ),
+        );
+        trace.label(
+            ui,
+            format!(
+                "Pending choice history retained, not a checked promise: {}",
+                self.pending.join(", ")
             ),
         );
         let event = if trace.button(
@@ -1013,12 +1078,19 @@ impl WithdrawalView {
         trace.label(
             ui,
             format!(
-                "Intentions retired: {}. Other needs kept: {}",
+                "Intentions retired: {}. Checked active promises kept: {}",
                 self.retire.join(", "),
                 self.preserve.join(", ")
             ),
         );
         trace.label(ui, "Saved records, later edits, completed facts, events and earlier outputs stay. Previously performed external actions are not undone.");
+        trace.label(
+            ui,
+            format!(
+                "Pending choice history retained, not a checked promise: {}",
+                self.pending.join(", ")
+            ),
+        );
         let event = if trace.button(
             ui,
             "intention-withdraw",
