@@ -1,6 +1,7 @@
 //! Source-bound discovery and copied pair experience. The shared host owns
 //! provider consent, worker fencing, renderer drafts, journal and final commit.
 use super::change_adapter;
+#[path = "discovery_flow/example.rs"]
 mod example;
 use crate::product_contract::*;
 use crate::product_decisions::{
