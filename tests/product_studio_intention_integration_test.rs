@@ -76,7 +76,10 @@ fn settle(h: &mut EguiHarness, s: &mut ProductStudio) {
             "{}",
             s.test_notice()
         );
-        std::thread::sleep(Duration::from_millis(2));
+        // The actual busy host requests a repaint every 30 ms. Match that
+        // cadence instead of making the renderer compete with its worker in
+        // a 2 ms redraw loop; the same 120-second completion gate still applies.
+        std::thread::sleep(Duration::from_millis(30));
     }
     frame(h, s);
 }
