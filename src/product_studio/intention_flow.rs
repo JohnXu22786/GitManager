@@ -90,6 +90,34 @@ pub(super) struct HistoryView {
     pub layers: Vec<LayerView>,
     pub receipts: Vec<AdoptionReceipt>,
 }
+fn reconcilable(decision: &ScopedDecision) -> bool {
+    decision.status == DecisionStatus::Active
+        || (decision.status == DecisionStatus::Pending
+            && matches!(
+                decision.outcome,
+                DecisionOutcome::BothNeeded | DecisionOutcome::EitherAcceptable
+            ))
+}
+fn outcome_text(decision: &ScopedDecision, binding: IntentionBinding) -> &'static str {
+    match decision.outcome {
+        DecisionOutcome::Accept { .. } => match binding {
+            IntentionBinding::ObservedOutcome => "Chose this design; recorded promise: keep the experienced result",
+            IntentionBinding::PropertiesOnly => "Chose this design; recorded promise: keep the explicitly chosen conditions",
+        },
+        DecisionOutcome::KeepCurrent => match binding {
+            IntentionBinding::ObservedOutcome => "Kept the then-current behavior; recorded promise: keep the experienced result",
+            IntentionBinding::PropertiesOnly => "Kept the then-current behavior; recorded promise: keep the explicitly chosen conditions",
+        },
+        DecisionOutcome::EitherAcceptable => {
+            "Either option is acceptable; no single option was chosen"
+        }
+        DecisionOutcome::BothNeeded => {
+            "Both ways of working are needed; this choice has not saved a combined design"
+        }
+        DecisionOutcome::NeitherFits => "Neither example fits; neither result was accepted",
+        DecisionOutcome::Deferred => "Decision deferred; no result was accepted",
+    }
+}
 fn scope_text(scope: &DecisionScope) -> String {
     let population = match &scope.population {
         Population::All => "All work".into(),
@@ -233,8 +261,19 @@ impl Reconciliation {
         if !valid_id(evolution) || !valid_id(operation) {
             return Err("Invalid new-design operation identity".into());
         }
+        if needs.iter().any(|id| {
+            basis
+                .decisions
+                .decisions
+                .iter()
+                .find(|d| &d.id == id)
+                .is_some_and(|d| !reconcilable(d))
+        }) {
+            return Err("This choice has no accepted result to preserve. Make a fresh outcome decision first".into());
+        }
+        let instruction = format!("{text}\nReturn the executable evolution using this exact evolution suggestion ID: {evolution}");
         let request = engine
-            .reconciliation_request(basis, request_id, text, needs)
+            .reconciliation_request(basis, request_id, &instruction, needs)
             .map_err(error)?;
         fresh(store, basis, &cancel)?;
         Ok(Self {
@@ -672,24 +711,17 @@ impl HistoryState {
         let mut trace = WidgetTrace::default();
         let mut event = None;
         self.needs.retain(|id| {
-            view.decisions.iter().any(|d| {
-                &d.decision.id == id
-                    && matches!(
-                        d.decision.status,
-                        DecisionStatus::Active | DecisionStatus::Pending
-                    )
-            })
+            view.decisions
+                .iter()
+                .any(|d| &d.decision.id == id && reconcilable(&d.decision))
         });
         self.layers
             .retain(|id| view.layers.iter().any(|l| &l.id == id && l.active));
         trace.label(ui, "Your saved ways of working");
-        trace.label(ui, "These are the original accepted examples and saved receipts. They are history, not a fresh test of today's work.");
+        trace.label(ui, "These are the original compared examples, recorded choices and saved receipts. They are history, not a fresh test of today's work.");
         for item in &view.decisions {
             ui.push_id(&item.decision.id, |ui| {
-                let eligible = matches!(
-                    item.decision.status,
-                    DecisionStatus::Active | DecisionStatus::Pending
-                );
+                let eligible = reconcilable(&item.decision);
                 let mut selected = self.needs.contains(&item.decision.id);
                 let response = trace.control(
                     &format!("intention-need-{}", item.decision.id),
@@ -706,14 +738,7 @@ impl HistoryState {
                     }
                 }
                 trace.label(ui, format!("{} · {}", item.status_text, item.scope_text));
-                let binding = match item.binding {
-                    IntentionBinding::ObservedOutcome => "Keep the experienced result",
-                    IntentionBinding::PropertiesOnly => "Keep the explicitly chosen conditions",
-                };
-                trace.label(
-                    ui,
-                    format!("{binding}; {} accepted examples", item.scenes.len()),
-                );
+                trace.label(ui, format!("{}; {} recorded examples", outcome_text(&item.decision, item.binding), item.scenes.len()));
                 let detail = ui.collapsing("Examples and saved change receipts", |ui| {
                     trace.label(ui, format!("Intention {}", item.decision.id));
                     for scene in &item.scenes { scene.show(ui, &mut trace); }

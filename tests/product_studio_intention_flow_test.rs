@@ -142,6 +142,9 @@ impl DevelopmentProvider for OnceProvider {
         _: &dyn Fn() -> bool,
     ) -> Result<DevelopmentResult, AdapterError> {
         assert_eq!(request.operation, DevelopmentOperation::Reconcile);
+        assert!(request
+            .request
+            .contains("evolution suggestion ID: new-design"));
         assert_eq!(
             self.calls.replace(self.calls.get() + 1),
             0,
@@ -521,6 +524,10 @@ fn managed_reconciliation_binds_actual_result_target_and_final_operation() {
     )
     .unwrap();
     let candidate = extended(&change_adapter::baseline(&s).unwrap());
+    assert!(request
+        .request()
+        .request
+        .contains("evolution suggestion ID: new-design"));
     let actual = response(
         request.request(),
         &candidate,
@@ -713,6 +720,9 @@ mod distinct_needs {
         ) -> Result<DevelopmentResult, AdapterError> {
             assert_eq!(self.calls.replace(self.calls.get() + 1), 0);
             assert_eq!(request.operation, DevelopmentOperation::Reconcile);
+            assert!(request
+                .request
+                .contains("evolution suggestion ID: split-design"));
             assert!(request.sources.iter().any(|p| p
                 .program
                 .actions
@@ -1053,4 +1063,70 @@ fn history_displays_original_results_sources_and_unassociated_receipts() {
     );
     assert!(text.contains("save-pending"), "{text}");
     assert!(text.contains("No birth association is inferred"), "{text}");
+}
+
+#[test]
+fn history_keeps_nonbinary_outcomes_distinct_and_does_not_accept_rejected_examples() {
+    for (id, outcome, label, selectable) in [
+        (
+            "either",
+            DecisionOutcome::EitherAcceptable,
+            "Either option is acceptable",
+            true,
+        ),
+        (
+            "both",
+            DecisionOutcome::BothNeeded,
+            "Both ways of working are needed",
+            true,
+        ),
+        (
+            "neither",
+            DecisionOutcome::NeitherFits,
+            "Neither example fits",
+            false,
+        ),
+        (
+            "later",
+            DecisionOutcome::Deferred,
+            "Decision deferred",
+            false,
+        ),
+    ] {
+        let dir = tempdir();
+        let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
+        record_need(&store, id, outcome);
+        let basis = store.load().unwrap();
+        let view = HistoryView::load(&store, &basis, cancellation()).unwrap();
+        let mut state = HistoryState::default();
+        let mut h = egui_harness::EguiHarness::new(egui::vec2(1000.0, 1400.0));
+        let (_, trace) = h.frame(|ctx| {
+            egui::CentralPanel::default()
+                .show(ctx, |ui| state.show(ui, &view, true))
+                .inner
+        });
+        let text = trace.text.join("\n");
+        assert!(text.contains(label), "{text}");
+        assert!(!text.contains("Keep the experienced result"), "{text}");
+        assert!(!text.contains("accepted examples"), "{text}");
+        assert_eq!(
+            trace.controls[&format!("intention-need-{id}")].enabled,
+            selectable
+        );
+        if !selectable {
+            let result = Reconciliation::new(
+                &store,
+                &basis,
+                &engine(&store),
+                "request",
+                "Keep these needs",
+                &[id.into()],
+                "design",
+                "save",
+                cancellation(),
+            );
+            assert!(result.err().unwrap().contains("no accepted result"));
+        }
+        assert_eq!(store.load().unwrap(), basis);
+    }
 }
