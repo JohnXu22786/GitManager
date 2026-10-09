@@ -48,23 +48,12 @@ pub(super) fn prepare_managed_design(
     operation: &str,
     cancel: Arc<AtomicBool>,
 ) -> Result<PreparedScopedChange> {
-    #[cfg(test)]
-    let started = std::time::Instant::now();
     fresh(store, basis, &cancel)?;
     let mappings = change_adapter::slot_mappings(basis, candidate)?;
-    #[cfg(test)]
-    eprintln!("Managed design slot mappings: {:?}", started.elapsed());
     let prepared = store
         .prepare_managed_evolution(candidate, &mappings, operation)
         .map_err(error)?;
-    #[cfg(test)]
-    eprintln!("Managed design store preparation: {:?}", started.elapsed());
     ScopedExecutionContext::prepared(basis, &prepared).map_err(error)?;
-    #[cfg(test)]
-    eprintln!(
-        "Managed design independent admission: {:?}",
-        started.elapsed()
-    );
     fresh(store, basis, &cancel)?;
     Ok(prepared)
 }
@@ -349,8 +338,6 @@ impl Reconciliation {
         result: DevelopmentResult,
         cancel: Arc<AtomicBool>,
     ) -> Result<Design> {
-        #[cfg(test)]
-        let started = std::time::Instant::now();
         fresh(store, &self.basis, &cancel)?;
         result.response.validate_for(&self.request).map_err(error)?;
         let suggestion = result
@@ -379,11 +366,6 @@ impl Reconciliation {
             &self.operation,
             cancel.clone(),
         )?;
-        #[cfg(test)]
-        eprintln!(
-            "Reconciliation managed preparation complete: {:?}",
-            started.elapsed()
-        );
         let draft = engine
             .develop_prepared_evolution(
                 result,
@@ -393,12 +375,6 @@ impl Reconciliation {
                 &|| cancel.load(Ordering::Acquire),
             )
             .map_err(error)?;
-        #[cfg(test)]
-        eprintln!(
-            "Reconciliation developed evolution: {:?}, admission hits/builds {:?}",
-            started.elapsed(),
-            engine.scope_cache_stats()
-        );
         fresh(store, &self.basis, &cancel)?;
         Design::new(store, self, engine, draft, Some(prepared), cancel)
     }
@@ -431,13 +407,6 @@ impl Design {
         prepared: Option<PreparedScopedChange>,
         cancel: Arc<AtomicBool>,
     ) -> Result<Self> {
-        #[cfg(test)]
-        let started = std::time::Instant::now();
-        #[cfg(test)]
-        eprintln!(
-            "New-design admission hits/builds before final preparation: {:?}",
-            engine.scope_cache_stats()
-        );
         // Availability comes from the actual adoption gate, not just a response.
         let checked = engine
             .prepare_evolution(store, &draft, &request.operation)
@@ -445,11 +414,6 @@ impl Design {
         if checked.candidate() != draft.candidate() {
             return Err("New-design target differs from its verified adoption".into());
         }
-        #[cfg(test)]
-        eprintln!(
-            "New-design verified adoption preparation: {:?}",
-            started.elapsed()
-        );
         let preview = CopyPreview::new(
             &request.basis,
             draft.candidate(),
@@ -457,8 +421,6 @@ impl Design {
             &request.operation,
             cancel.clone(),
         )?;
-        #[cfg(test)]
-        eprintln!("New-design copied runtime: {:?}", started.elapsed());
         let view = DesignView {
             operation: request.operation.clone(),
             authored: draft.authored_candidate().clone(),

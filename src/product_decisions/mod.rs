@@ -208,8 +208,6 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         }
     }
     fn scope_context(&self) -> Result<ScopedExecutionContext> {
-        #[cfg(test)]
-        let diagnostic_started = std::time::Instant::now();
         let current = match self.archive.snapshot() {
             Ok(current) => current,
             Err(error) => {
@@ -229,26 +227,12 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             if cached.key == key {
                 #[cfg(test)]
                 self.admission_hits.set(self.admission_hits.get() + 1);
-                #[cfg(test)]
-                eprintln!(
-                    "scope admission HIT hits/builds={:?} proofs={} elapsed={:?}",
-                    self.scope_cache_stats(),
-                    key.correspondences.len(),
-                    diagnostic_started.elapsed()
-                );
                 return Ok(cached.context.clone());
             }
         }
         self.clear_admission_cache();
         #[cfg(test)]
         self.admission_builds.set(self.admission_builds.get() + 1);
-        #[cfg(test)]
-        eprintln!(
-            "scope admission BUILD START hits/builds={:?} proofs={} elapsed={:?}",
-            self.scope_cache_stats(),
-            key.correspondences.len(),
-            diagnostic_started.elapsed()
-        );
         let context = if let Some(prepared) = &key.prepared {
             if key.rehearsal.is_some() {
                 return Err(invalid(
@@ -262,13 +246,6 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             ScopedExecutionContext::committed(&key.current)?
         };
         let context = context.with_correspondences(&key.correspondences)?;
-        #[cfg(test)]
-        eprintln!(
-            "scope admission BUILD END hits/builds={:?} proofs={} elapsed={:?}",
-            self.scope_cache_stats(),
-            key.correspondences.len(),
-            diagnostic_started.elapsed()
-        );
         self.admission_cache.replace(Some(AdmissionCache {
             key,
             context: context.clone(),
@@ -281,11 +258,6 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
     #[cfg(test)]
     pub(crate) fn scope_cache_stats(&self) -> (usize, usize) {
         (self.admission_hits.get(), self.admission_builds.get())
-    }
-    #[cfg(test)]
-    pub(crate) fn test_disable_projected_context_reuse(&self) {
-        // The pre-optimization reference path always regenerates extensions.
-        self.clear_admission_cache();
     }
     pub(crate) fn retained_replay_context(
         &self,
@@ -346,29 +318,9 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         limits: RuntimeLimits,
         id: &str,
     ) -> Result<(RunEvidence, Vec<ScopeContext>, ScenarioSpec)> {
-        #[cfg(test)]
-        let diagnostic_started = std::time::Instant::now();
-        #[cfg(test)]
-        eprintln!(
-            "mapped scene START {id} hits/builds={:?} pending_proofs={}",
-            self.scope_cache_stats(),
-            self.pending_correspondences.borrow().len()
-        );
-        let (context, actual) = {
-            let admitted = self.scope_context()?;
-            #[cfg(test)]
-            eprintln!(
-                "mapped scene ADMITTED {id} elapsed={:?}",
-                diagnostic_started.elapsed()
-            );
-            admitted.project_scenario(source, original, target, mapped)?
-        };
-        #[cfg(test)]
-        eprintln!(
-            "mapped scene PROJECTED {id} elapsed={:?} checked_proofs={}",
-            diagnostic_started.elapsed(),
-            context.correspondence_proofs().len()
-        );
+        let (context, actual) = self
+            .scope_context()?
+            .project_scenario(source, original, target, mapped)?;
         self.pending_correspondences
             .borrow_mut()
             .extend(context.correspondence_proofs());
@@ -381,13 +333,6 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             id,
             Some(&context),
         )?;
-        #[cfg(test)]
-        eprintln!(
-            "mapped scene EXECUTED {id} elapsed={:?} state={:?} hits/builds={:?}",
-            diagnostic_started.elapsed(),
-            run.state,
-            self.scope_cache_stats()
-        );
         Ok((run, contexts, actual))
     }
     fn capture_mapped_scene(

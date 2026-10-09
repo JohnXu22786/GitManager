@@ -576,8 +576,6 @@ impl Worker {
             approval_reference: format!("studio-click-{}", key.operation),
             expires_at_unix_ms: unix_ms().saturating_add(5 * 60_000),
         };
-        #[cfg(test)]
-        let generation_started = std::time::Instant::now();
         let provider = ready.prepared.authorize(consent.clone());
         let ordinary = ready.reconciliation.is_some()
             && self.opened.as_ref().is_some_and(|o| {
@@ -611,13 +609,6 @@ impl Worker {
                 ),
             )
         };
-        #[cfg(test)]
-        if ready.reconciliation.is_some() {
-            eprintln!(
-                "Studio reconciliation provider returned: {:?}",
-                generation_started.elapsed()
-            );
-        }
         let receipt = provider.receipt();
         let raw = provider.raw_response();
         if ready.basis.is_none() {
