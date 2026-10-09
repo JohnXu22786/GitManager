@@ -153,135 +153,6 @@ impl DevelopmentProvider for OnceProvider {
 }
 
 #[test]
-fn new_design_retires_only_selected_needs_and_preserves_independent_history() {
-    let dir = tempdir();
-    let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
-    record_need(&store, "first", DecisionOutcome::KeepCurrent);
-    record_need(&store, "second", DecisionOutcome::BothNeeded);
-    record_need(&store, "independent-concrete", DecisionOutcome::KeepCurrent);
-    let e = engine(&store);
-    let s = store.load().unwrap();
-    let scene = e
-        .accept_current_scene(&s, &scenario(&s, "predicate"), Disclosure::Synthetic)
-        .unwrap();
-    let mut property = choice("independent-property", DecisionOutcome::KeepCurrent);
-    property.binding = IntentionBinding::PropertiesOnly;
-    property.obligations.push(AcceptedProperty {
-        id: "empty-export".into(),
-        description: "No phantom work rows".into(),
-        predicate: PropertyPredicate::Equal {
-            left: PropertyTerm::OutputCount {
-                point: "result".into(),
-                output: "sheet".into(),
-            },
-            right: PropertyTerm::Literal {
-                value: DataValue::Integer { value: 0 },
-                value_type: Type::Integer,
-            },
-        },
-    });
-    let ready = e
-        .prepare_choice(
-            &store,
-            s.program().unwrap(),
-            property,
-            vec![scene],
-            "record-property",
-        )
-        .unwrap();
-    let before = e.adopt(&store, &ready).unwrap();
-    let pending = Reconciliation::new(
-        &store,
-        &before,
-        &e,
-        "request",
-        "Support both work needs",
-        &["first".into(), "second".into()],
-        "new-design",
-        "adopt-design",
-        cancellation(),
-    )
-    .unwrap();
-    let candidate = extended(before.program().unwrap());
-    let provider = OnceProvider {
-        result: response(
-            pending.request(),
-            &candidate,
-            &["first", "second"],
-            &["first", "second"],
-        ),
-        calls: std::cell::Cell::new(0),
-    };
-    let mut design = pending
-        .develop(&store, &e, &provider, cancellation())
-        .unwrap();
-    let copied = design
-        .trial(
-            &store,
-            invoke("log_material", &[("name", text("Copied trial"))]),
-            cancellation(),
-        )
-        .unwrap();
-    assert!(copied
-        .retained_records
-        .iter()
-        .any(|r| r.entity == "material"));
-    assert_eq!(provider.calls.get(), 1);
-    assert_eq!(store.load().unwrap(), before);
-    assert_ne!(
-        design.view().candidate.artifact.semantic_digest,
-        before.program().unwrap().artifact.semantic_digest
-    );
-    assert_eq!(design.view().retire, vec!["first", "second"]);
-    assert!(design
-        .view()
-        .preserve
-        .contains(&"independent-concrete".into()));
-    assert!(design
-        .view()
-        .preserve
-        .contains(&"independent-property".into()));
-    let saved = e
-        .adopt(
-            &store,
-            &design.decision(&store, &e, cancellation()).unwrap(),
-        )
-        .unwrap();
-    let reopened = ProductStore::open(dir.path().join("tool")).unwrap();
-    assert_eq!(reopened.load().unwrap(), saved);
-    let history = HistoryView::load(&reopened, &saved, cancellation()).unwrap();
-    assert!(history
-        .decisions
-        .iter()
-        .find(|d| d.decision.id == "first")
-        .unwrap()
-        .status_text
-        .contains("Replaced"));
-    for id in ["independent-concrete", "independent-property"] {
-        assert_eq!(
-            history
-                .decisions
-                .iter()
-                .find(|d| d.decision.id == id)
-                .unwrap()
-                .decision
-                .status,
-            DecisionStatus::Active
-        );
-    }
-    assert_eq!(
-        engine(&reopened).check_current(&saved).unwrap().disposition,
-        CheckDisposition::Ready
-    );
-    let after = apply(
-        &reopened,
-        "use-new-design",
-        invoke("log_material", &[("name", text("Oak"))]),
-    );
-    assert!(after.data.records.iter().any(|r| r.entity == "material"));
-}
-
-#[test]
 fn reconciliation_refuses_stale_results_then_resolves_from_fresh_daily_work() {
     let dir = tempdir();
     let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
@@ -757,4 +628,429 @@ fn history_controls_select_exact_ids_despite_equal_business_labels() {
     };
     assert_eq!(needs, vec!["first", "second"]);
     assert_eq!(store.load().unwrap().decisions.decisions.len(), 2);
+}
+
+#[path = "fixtures/product_runtime/mod.rs"]
+mod evolution_fixture;
+mod distinct_needs {
+    use super::evolution_fixture::*;
+    use super::{
+        cancellation, intention_flow::*, product_contract::*, product_decisions::*,
+        product_runtime::LocalRuntime, product_store::ProductStore,
+    };
+    use serde_json::json;
+    fn scope() -> DecisionScope {
+        DecisionScope {
+            operations: ["export_people".into()].into(),
+            population: Population::All,
+            conditions: Values::new(),
+            excluded_records: vec![],
+            unknowns: vec![],
+        }
+    }
+    fn accepted(p: &CapturedProgram, id: &str) -> AcceptedScene {
+        accepted_for(p, id, "export_people")
+    }
+    fn accepted_for(p: &CapturedProgram, id: &str, action: &str) -> AcceptedScene {
+        let mut s = scenario(
+            p,
+            vec![
+                add("Ada"),
+                invoke("collect", Values::new()),
+                invoke(action, Values::new()),
+                SemanticInput::Observe {
+                    point: "done".into(),
+                },
+            ],
+        );
+        s.id = id.into();
+        accept_scene(
+            &LocalRuntime::default(),
+            p,
+            &s,
+            Disclosure::Synthetic,
+            RuntimeLimits::default(),
+        )
+        .unwrap()
+    }
+    fn choice(id: &str, outcome: DecisionOutcome) -> Choice {
+        Choice {
+            id: id.into(),
+            request: "Preserve this accepted work example".into(),
+            rationale: None,
+            scope: scope(),
+            outcome,
+            obligations: vec![],
+            binding: IntentionBinding::ObservedOutcome,
+        }
+    }
+    fn invariant() -> AcceptedProperty {
+        AcceptedProperty {
+            id: "count-match".into(),
+            description: "Preview count equals actual output rows".into(),
+            predicate: PropertyPredicate::Equal {
+                left: PropertyTerm::Observed {
+                    point: "done".into(),
+                    observable: "selected_count".into(),
+                    value_type: Type::Integer,
+                },
+                right: PropertyTerm::OutputCount {
+                    point: "done".into(),
+                    output: "roster".into(),
+                },
+            },
+        }
+    }
+    struct FixtureProvider {
+        response: DevelopmentResponse,
+        calls: std::cell::Cell<usize>,
+    }
+    impl DevelopmentProvider for FixtureProvider {
+        fn develop(
+            &self,
+            request: &DevelopmentRequest,
+            _: &dyn Fn() -> bool,
+        ) -> Result<DevelopmentResult, AdapterError> {
+            assert_eq!(self.calls.replace(self.calls.get() + 1), 0);
+            assert_eq!(request.operation, DevelopmentOperation::Reconcile);
+            assert!(request.sources.iter().any(|p| p
+                .program
+                .actions
+                .iter()
+                .any(|a| a.id == "export_people")));
+            assert!(request.accepted_scenes.len() >= 2);
+            let mut response = self.response.clone();
+            response.request_digest = request.identity()?;
+            Ok(DevelopmentResult {
+                response,
+                producer: Producer::Fixture {
+                    name: "Explicit synthetic evolution response".into(),
+                },
+            })
+        }
+    }
+    #[test]
+    fn new_design_reconciles_distinct_workflows_and_preserves_independent_history() {
+        let dir = super::fixture::tempdir();
+        let p = capture(organizer());
+        let store = ProductStore::create(dir.path().join("tool"), &p, 20000).unwrap();
+        let engine =
+            DecisionEngine::new(LocalRuntime::default(), IntentArchive::new(store.clone()));
+        let a = accepted(&p, "gathered");
+        let prepared = engine
+            .prepare_choice(
+                &store,
+                &p,
+                choice("old-default", DecisionOutcome::KeepCurrent),
+                vec![a.clone()],
+                "save-default",
+            )
+            .unwrap();
+        engine.adopt(&store, &prepared).unwrap();
+        let concrete = engine
+            .prepare_choice(
+                &store,
+                &p,
+                choice("independent-concrete", DecisionOutcome::KeepCurrent),
+                vec![a.clone()],
+                "save-concrete",
+            )
+            .unwrap();
+        engine.adopt(&store, &concrete).unwrap();
+        let mut invariant_choice = choice("independent", DecisionOutcome::KeepCurrent);
+        invariant_choice.obligations = vec![invariant()];
+        invariant_choice.binding = IntentionBinding::PropertiesOnly;
+        let prepared = engine
+            .prepare_choice(
+                &store,
+                &p,
+                invariant_choice,
+                vec![a.clone()],
+                "save-invariant",
+            )
+            .unwrap();
+        engine.adopt(&store, &prepared).unwrap();
+        let mut empty_program = organizer();
+        empty_program["actions"][2]["steps"].as_array_mut().unwrap().insert(0,json!({"kind":"set_state","state":"selected","value":{"kind":"literal","value_type":{"kind":"list","item":{"kind":"reference","entity":"person"}},"value":empty("person")}}));
+        empty_program["actions"][2]["id"] = json!("one_off_original");
+        empty_program["views"][0]["actions"][0]["action"] = json!("one_off_original");
+        let b = accepted_for(&capture(empty_program), "one-off", "one_off_original");
+        let prepared = engine
+            .prepare_choice(
+                &store,
+                &p,
+                {
+                    let mut c = choice("second-need", DecisionOutcome::BothNeeded);
+                    c.scope.operations = ["one_off_original".into()].into();
+                    c
+                },
+                vec![b.clone()],
+                "save-second",
+            )
+            .unwrap();
+        let before = engine.adopt(&store, &prepared).unwrap();
+        assert_ne!(a.observations(), b.observations());
+        assert_eq!(a.observations()[0].outputs[0].rows.len(), 1);
+        assert_eq!(b.observations()[0].outputs[0].rows.len(), 0);
+        let pending = Reconciliation::new(
+            &store,
+            &before,
+            &engine,
+            "synthesize",
+            "Support both accepted ways of working",
+            &["old-default".into(), "second-need".into()],
+            "split-design",
+            "adopt-design",
+            cancellation(),
+        )
+        .unwrap();
+        let request = pending.request();
+        // This clearly fixture-origin provider response adds a new durable audit entity
+        // and transaction, rather than renaming a demonstration's third button.
+        let mut design = organizer();
+        design["entities"].as_array_mut().unwrap().push(json!({"id":"dispatch","label":"Dispatch log","fields":[{"id":"purpose","label":"Purpose","value_type":{"kind":"text"}}],"unique":[],"constraints":[]}));
+        let mut special = design["actions"][2].clone();
+        special["id"] = json!("dispatch_one_off");
+        special["steps"].as_array_mut().unwrap().insert(0,json!({"kind":"set_state","state":"selected","value":{"kind":"literal","value_type":{"kind":"list","item":{"kind":"reference","entity":"person"}},"value":empty("person")}}));
+        special["steps"].as_array_mut().unwrap().insert(0,json!({"kind":"create","entity":"dispatch","values":{"purpose":text("One-off work completed")},"bind":"logged"}));
+        design["actions"].as_array_mut().unwrap().push(special);
+        design["views"][0]["actions"].as_array_mut().unwrap().push(json!({"id":"one_off_button","label":"One-off dispatch","placement":"toolbar","action":"dispatch_one_off","arguments":{},"enabled":yes()}));
+        let mut mapped = b.scenario().clone();
+        mapped.inputs[2] = invoke("dispatch_one_off", Values::new());
+        let response = DevelopmentResponse {
+            version: 1,
+            request_digest: request.identity().unwrap(),
+            candidates: vec![GeneratedCandidate {
+                id: "new-design".into(),
+                source_json: serde_json::to_string(&design).unwrap(),
+            }],
+            hypotheses: vec![],
+            evolutions: vec![EvolutionSuggestion {
+                id: "split-design".into(),
+                candidate: "new-design".into(),
+                needs: vec!["old-default".into(), "second-need".into()],
+                proposed_retirement: vec!["old-default".into()],
+                preserved_obligations: vec![invariant().identity().unwrap()],
+                mappings: vec![SemanticMapping {
+                    from: SemanticKey {
+                        kind: SemanticKind::Action,
+                        entity: None,
+                        id: "one_off_original".into(),
+                    },
+                    to: SemanticKey {
+                        kind: SemanticKind::Action,
+                        entity: None,
+                        id: "dispatch_one_off".into(),
+                    },
+                }],
+                scenarios: vec![SuggestedScenarioMapping {
+                    source_program: None,
+                    original: b.scenario().identity().unwrap(),
+                    replacement_json: serde_json::to_string(&mapped).unwrap(),
+                    explanation: "Use the new explicit one-off transaction".into(),
+                }],
+            }],
+            unsupported: vec![],
+        };
+        let provider = FixtureProvider {
+            response: response.clone(),
+            calls: std::cell::Cell::new(0),
+        };
+        let mut design = pending
+            .develop(&store, &engine, &provider, cancellation())
+            .unwrap();
+        assert_eq!(provider.calls.get(), 1);
+        assert_eq!(design.view().retire, vec!["old-default"]);
+        assert!(design
+            .view()
+            .preserve
+            .contains(&"independent-concrete".into()));
+        assert!(design.view().preserve.contains(&"independent".into()));
+        let preview = design
+            .trial(
+                &store,
+                invoke("dispatch_one_off", Values::new()),
+                cancellation(),
+            )
+            .unwrap();
+        assert!(preview
+            .retained_records
+            .iter()
+            .any(|r| r.entity == "dispatch"));
+        assert_eq!(store.load().unwrap(), before); // Keep, reject, and defer are all non-committing.
+        assert!(matches!(
+            design.view().candidate.binding.producer,
+            Producer::Fixture { .. }
+        ));
+        let ready = design.decision(&store, &engine, cancellation()).unwrap();
+        assert_eq!(store.load().unwrap(), before);
+        assert!(ready.report().runs.len() >= 4);
+        let adopted = engine.adopt(&store, &ready).unwrap();
+        assert!(
+            matches!(&adopted.decisions.decisions.iter().find(|d|d.id=="old-default").unwrap().status,DecisionStatus::Superseded{by} if by=="split-design")
+        );
+        assert_eq!(
+            adopted
+                .decisions
+                .decisions
+                .iter()
+                .find(|d| d.id == "independent")
+                .unwrap()
+                .status,
+            DecisionStatus::Active
+        );
+        assert_eq!(
+            adopted
+                .decisions
+                .decisions
+                .iter()
+                .find(|d| d.id == "old-default")
+                .unwrap()
+                .witness,
+            before.decisions.decisions[0].witness
+        );
+        assert_eq!(
+            ProductStore::open(dir.path().join("tool"))
+                .unwrap()
+                .load()
+                .unwrap(),
+            adopted
+        );
+        let fresh = DecisionEngine::new(LocalRuntime::default(), IntentArchive::new(store.clone()));
+        assert_eq!(
+            fresh
+                .check_all(&adopted.decisions, adopted.program().unwrap(), &[])
+                .unwrap()
+                .disposition,
+            CheckDisposition::Ready
+        );
+        let history = HistoryView::load(&store, &adopted, cancellation()).unwrap();
+        assert!(history
+            .decisions
+            .iter()
+            .find(|d| d.decision.id == "old-default")
+            .unwrap()
+            .status_text
+            .contains("Replaced"));
+        assert_eq!(
+            history
+                .decisions
+                .iter()
+                .find(|d| d.decision.id == "second-need")
+                .unwrap()
+                .decision
+                .status,
+            DecisionStatus::Pending
+        );
+        for id in ["independent", "independent-concrete"] {
+            assert_eq!(
+                history
+                    .decisions
+                    .iter()
+                    .find(|d| d.decision.id == id)
+                    .unwrap()
+                    .decision
+                    .status,
+                DecisionStatus::Active
+            );
+        }
+        let successor = history
+            .decisions
+            .iter()
+            .find(|d| d.decision.id == "split-design")
+            .unwrap();
+        let second = history
+            .decisions
+            .iter()
+            .find(|d| d.decision.id == "split-design-second-need")
+            .unwrap();
+        assert_eq!(
+            successor.scenes[0].accepted.observations()[0].outputs[0]
+                .rows
+                .len(),
+            1
+        );
+        assert_eq!(
+            second.scenes[0].accepted.observations()[0].outputs[0]
+                .rows
+                .len(),
+            0
+        );
+    }
+}
+
+#[test]
+fn history_displays_original_results_sources_and_unassociated_receipts() {
+    let dir = tempdir();
+    let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
+    add(&store, "work", "Oak frame");
+    record_need(&store, "first", DecisionOutcome::KeepCurrent);
+    let before = store.load().unwrap();
+    let mut original = before.program().unwrap().clone();
+    original.binding.producer = Producer::Fixture {
+        name: "Different original capture".into(),
+    };
+    original.validate().unwrap();
+    let scene = accept_scene(
+        &LocalRuntime::default(),
+        &original,
+        &scenario(&before, "second"),
+        Disclosure::Synthetic,
+        RuntimeLimits::default(),
+    )
+    .unwrap();
+    let e = engine(&store);
+    let pending = e
+        .prepare_choice(
+            &store,
+            before.program().unwrap(),
+            choice("second", DecisionOutcome::BothNeeded),
+            vec![scene],
+            "save-pending",
+        )
+        .unwrap();
+    let saved = e.adopt(&store, &pending).unwrap();
+    let view = HistoryView::load(&store, &saved, cancellation()).unwrap();
+    assert_eq!(
+        view.decisions[0].scenes[0]
+            .accepted
+            .program()
+            .artifact
+            .program_digest,
+        view.decisions[1].scenes[0]
+            .accepted
+            .program()
+            .artifact
+            .program_digest
+    );
+    assert_ne!(
+        view.decisions[0].scenes[0].source,
+        view.decisions[1].scenes[0].source
+    );
+    assert!(view.decisions[1].receipts.is_empty()); // Never invent a birth association.
+    let mut state = HistoryState::default();
+    let mut h = egui_harness::EguiHarness::new(egui::vec2(1200.0, 1800.0));
+    let frame = |h: &mut egui_harness::EguiHarness, state: &mut HistoryState| {
+        h.frame(|ctx| {
+            egui::CentralPanel::default()
+                .show(ctx, |ui| state.show(ui, &view, true))
+                .inner
+        })
+    };
+    let (_, trace) = frame(&mut h, &mut state);
+    let point = trace.controls["intention-details-first"].rect.center();
+    h.press_at(point);
+    frame(&mut h, &mut state);
+    h.release_at(point);
+    frame(&mut h, &mut state);
+    let (_, trace) = frame(&mut h, &mut state);
+    let text = trace.text.join("\n");
+    assert!(text.contains("Oak frame"), "{text}");
+    assert!(text.contains("Work results: 1 output rows"), "{text}");
+    assert!(
+        text.contains(view.decisions[0].scenes[0].source.as_str()),
+        "{text}"
+    );
+    assert!(text.contains("save-pending"), "{text}");
+    assert!(text.contains("No birth association is inferred"), "{text}");
 }

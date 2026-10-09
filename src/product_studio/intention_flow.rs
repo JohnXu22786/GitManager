@@ -12,7 +12,7 @@ use crate::product_store::{
     scope::{PreparedScopedChange, ScopePopulation, ScopedExecutionContext},
     AdoptionReceipt, ProductStore, ProjectSnapshot,
 };
-use crate::ui::product_runtime_view::WidgetTrace;
+use crate::ui::product_runtime_view::{value_text, WidgetTrace};
 use std::{
     collections::BTreeSet,
     sync::{
@@ -59,13 +59,19 @@ pub(super) fn prepare_managed_design(
 }
 
 #[derive(Clone)]
+pub(super) struct HistoricalScene {
+    pub accepted: AcceptedScene,
+    /// The entire original capture, including source bytes and producer binding.
+    pub source: Digest,
+}
+#[derive(Clone)]
 pub(super) struct DecisionView {
     pub decision: ScopedDecision,
     pub status_text: String,
     pub scope_text: String,
     pub binding: IntentionBinding,
     /// Original source-qualified evidence, not a claim about today's behavior.
-    pub scenes: Vec<AcceptedScene>,
+    pub scenes: Vec<HistoricalScene>,
     /// Exact receipt membership, not guessed creation/ownership by label.
     pub receipts: Vec<AdoptionReceipt>,
 }
@@ -115,7 +121,18 @@ impl HistoryView {
         let mut decisions = vec![];
         for decision in &basis.decisions.decisions {
             cancelled(&cancel)?;
-            let scenes = archive.accepted_scenes(decision).map_err(error)?;
+            let scenes = archive
+                .accepted_scenes(decision)
+                .map_err(error)?
+                .into_iter()
+                .map(|accepted| {
+                    Ok(HistoricalScene {
+                        source: canonical_digest(IdentityDomain::Source, accepted.program())
+                            .map_err(error)?,
+                        accepted,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
             let status_text = match &decision.status {
                 DecisionStatus::Active => "In use".into(),
                 DecisionStatus::Pending => "Still to decide".into(),
@@ -697,30 +714,16 @@ impl HistoryState {
                     ui,
                     format!("{binding}; {} accepted examples", item.scenes.len()),
                 );
-                ui.collapsing("Examples and saved change receipts", |ui| {
-                    ui.label(format!("Intention {}", item.decision.id));
-                    for scene in &item.scenes {
-                        ui.label(format!(
-                            "{} · original program {} · scene {}",
-                            scene.scenario().label,
-                            scene.program().program.label,
-                            scene.scenario().id
-                        ));
-                        ui.label(format!(
-                            "Source {}",
-                            scene.program().artifact.program_digest.as_str()
-                        ));
+                let detail = ui.collapsing("Examples and saved change receipts", |ui| {
+                    trace.label(ui, format!("Intention {}", item.decision.id));
+                    for scene in &item.scenes { scene.show(ui, &mut trace); }
+                    for property in &item.decision.obligations { trace.label(ui, &property.description); }
+                    if item.receipts.is_empty() {
+                        trace.label(ui, "No exact intention-to-receipt membership is recorded. The complete saved-change inventory is below.");
                     }
-                    for property in &item.decision.obligations {
-                        ui.label(&property.description);
-                    }
-                    for receipt in &item.receipts {
-                        ui.label(format!(
-                            "Saved change {} · revision {}",
-                            receipt.plan.id, receipt.revision
-                        ));
-                    }
+                    for receipt in &item.receipts { trace.label(ui, format!("Checked or retired in saved change {} · revision {}", receipt.plan.id, receipt.revision)); }
                 });
+                trace.control(&format!("intention-details-{}", item.decision.id), detail.header_response);
             });
         }
         let response = ui.add_enabled(
@@ -793,10 +796,131 @@ impl HistoryState {
                 layers: self.layers.iter().cloned().collect(),
             });
         }
+        trace.label(ui, "All saved changes");
+        trace.label(ui, "Verified receipt inventory. No birth association is inferred for an intention without exact recorded membership.");
+        for receipt in &view.receipts {
+            trace.label(
+                ui,
+                format!(
+                    "Saved change {} · revision {} · source {} → {}",
+                    receipt.plan.id,
+                    receipt.revision,
+                    receipt.previous.as_str(),
+                    receipt.active.as_str()
+                ),
+            );
+        }
         if trace.button(ui, "intention-return", "Return to saved work", interactive) {
             event = Some(Event::ReturnToWork);
         }
         (event, trace)
+    }
+}
+impl HistoricalScene {
+    fn show(&self, ui: &mut egui::Ui, trace: &mut WidgetTrace) {
+        let scene = &self.accepted;
+        let program = &scene.program().program;
+        trace.label(
+            ui,
+            format!(
+                "Historical example: {} · original program {} · scene {}",
+                scene.scenario().label,
+                program.label,
+                scene.scenario().id
+            ),
+        );
+        trace.label(
+            ui,
+            format!("Original source capture {}", self.source.as_str()),
+        );
+        trace.label(
+            ui,
+            format!(
+                "Original producer {:?} · source bytes {}",
+                scene.program().binding.producer,
+                scene.program().binding.source_digest.as_str()
+            ),
+        );
+        for observed in scene.observations() {
+            let view = program.views.iter().find(|v| v.id == observed.view.view);
+            trace.label(
+                ui,
+                format!(
+                    "Accepted result at {}: {} visible rows, {} selected",
+                    observed.point,
+                    observed.view.rows.len(),
+                    observed.view.selected.len()
+                ),
+            );
+            for (id, value) in &observed.values {
+                let label = program
+                    .observables
+                    .iter()
+                    .find(|o| &o.id == id)
+                    .map(|o| o.label.as_str())
+                    .unwrap_or(id);
+                trace.label(ui, format!("{label}: {}", value_text(value)));
+            }
+            let columns = match view.map(|v| &v.kind) {
+                Some(ViewKind::List { columns, .. } | ViewKind::Detail { columns, .. }) => {
+                    columns.as_slice()
+                }
+                _ => &[],
+            };
+            for row in observed.view.rows.iter().take(20) {
+                let cells = row
+                    .cells
+                    .iter()
+                    .map(|(id, value)| {
+                        let label = columns
+                            .iter()
+                            .find(|c| &c.id == id)
+                            .map(|c| c.label.as_str())
+                            .unwrap_or(id);
+                        format!("{label}: {}", value_text(value))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                trace.label(
+                    ui,
+                    format!("{} / {} · {cells}", row.record.entity, row.record.record),
+                );
+            }
+            if observed.view.rows.len() > 20 {
+                trace.label(
+                    ui,
+                    "Showing the first 20 visible rows of this retained example",
+                );
+            }
+            for artifact in &observed.outputs {
+                let label = program
+                    .outputs
+                    .iter()
+                    .find(|o| o.id == artifact.output)
+                    .map(|o| o.label.as_str())
+                    .unwrap_or(&artifact.output);
+                trace.label(ui, format!("{label}: {} output rows", artifact.rows.len()));
+                for row in artifact.rows.iter().take(20) {
+                    trace.label(
+                        ui,
+                        artifact
+                            .columns
+                            .iter()
+                            .map(|column| {
+                                format!("{}: {}", column.label, value_text(&row[&column.id]))
+                            })
+                            .collect::<Vec<_>>()
+                            .join("; "),
+                    );
+                }
+                if artifact.rows.len() > 20 {
+                    trace.label(
+                        ui,
+                        "Showing the first 20 output rows of this retained example",
+                    );
+                }
+            }
+        }
     }
 }
 impl DesignView {
