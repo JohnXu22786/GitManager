@@ -525,22 +525,50 @@ impl TaskSourceFlow {
         flow.pending = Some(pending);
         Ok(flow)
     }
-    pub fn reopen_external(&mut self, root: &Path, cancelled: &AtomicBool) -> Result<()> {
-        check_cancelled(cancelled)?;
+    fn check_reopen_cancellation(
+        &mut self,
+        request_id: &str,
+        operation_cancelled: &AtomicBool,
+        handoff_cancelled: &AtomicBool,
+    ) -> Result<()> {
+        // Explicit abandonment wins when both signals arrive together.
+        if handoff_cancelled.load(Ordering::Acquire) {
+            self.cancel_external(request_id)?;
+            return Err(AdapterError::Cancelled);
+        }
+        check_cancelled(operation_cancelled)
+    }
+    /// Cancellation of this read (for example, a superseded page) preserves the
+    /// unfinished job and its ticket. Only explicit abandonment of this exact
+    /// handoff makes local intake terminal, as in cancel_external/submit/intake.
+    /// The host supplies distinct signals and durably records the pending slot.
+    /// Neither signal claims to stop an independently running external author.
+    pub fn reopen_external(
+        &mut self,
+        root: &Path,
+        operation_cancelled: &AtomicBool,
+        handoff_cancelled: &AtomicBool,
+    ) -> Result<()> {
         if !matches!(self.external, ExternalStatus::Interrupted { .. }) {
             return Err(invalid("Only an interrupted job can be reopened"));
         }
-        let pending = self
+        let request_id = self
             .pending
             .as_ref()
-            .ok_or_else(|| invalid("No saved external request"))?;
-        let ticket = pending.ticket.as_ref().ok_or_else(|| AdapterError::Unsupported(
-            "The original job association is unavailable. Keep this job interrupted, or abandon local intake and request a new change with a new ID.".into()))?;
-        let handoff = ExternalHandoff::reopen(&self.adapter, root, &pending.request, ticket)?;
-        check_cancelled(cancelled)?;
-        self.external = ExternalStatus::AwaitingCompletion {
-            request_id: pending.request.id.clone(),
-        };
+            .ok_or_else(|| invalid("No saved external request"))?
+            .request
+            .id
+            .clone();
+        self.check_reopen_cancellation(&request_id, operation_cancelled, handoff_cancelled)?;
+        let pending = self.pending_for(&request_id)?;
+        let handoff = pending.ticket.as_ref().ok_or_else(|| AdapterError::Unsupported(
+            "The original job association is unavailable. Keep this job interrupted, or abandon local intake and request a new change with a new ID.".into()))
+            .and_then(|ticket| ExternalHandoff::reopen(&self.adapter, root, &pending.request, ticket));
+        // Check both signals even if the read failed. A superseded read does not
+        // discard recovery; explicit abandonment must still clear its projection.
+        self.check_reopen_cancellation(&request_id, operation_cancelled, handoff_cancelled)?;
+        let handoff = handoff?;
+        self.external = ExternalStatus::AwaitingCompletion { request_id };
         self.handoff = Some(handoff);
         Ok(())
     }

@@ -677,7 +677,7 @@ fn reopened_pending_job_keeps_partial_completion_pending_and_accepts_later_submi
     let pending: PendingExternal = serde_json::from_slice(&pending_bytes).unwrap();
     let mut flow = TaskSourceFlow::interrupted("project", &task.record.id, pending).unwrap();
     let before = job_files(&root);
-    flow.reopen_external(&root, &active()).unwrap();
+    flow.reopen_external(&root, &active(), &active()).unwrap();
     assert_eq!(before, job_files(&root));
     assert!(flow
         .intake_external(&request.id, &active())
@@ -782,7 +782,7 @@ fn reopen_never_recaptures_stale_completion_as_current_and_absent_ticket_stays_i
     .unwrap();
     let mut flow =
         TaskSourceFlow::interrupted("project", &task.record.id, pending.clone()).unwrap();
-    flow.reopen_external(&root, &active()).unwrap();
+    flow.reopen_external(&root, &active(), &active()).unwrap();
     assert!(matches!(
         flow.intake_external(&request.id, &active()),
         Err(AdapterError::Stale(_))
@@ -795,7 +795,7 @@ fn reopen_never_recaptures_stale_completion_as_current_and_absent_ticket_stays_i
         serde_json::from_value(missing).unwrap(),
     )
     .unwrap();
-    assert!(flow.reopen_external(&root, &active()).is_err());
+    assert!(flow.reopen_external(&root, &active(), &active()).is_err());
     assert!(matches!(
         flow.view().external,
         ExternalStatus::Interrupted { .. }
@@ -897,4 +897,157 @@ fn terminal_jobs_are_not_returned_as_restart_pending_but_decisions_remain_inspec
             &request.decisions
         );
     }
+}
+
+#[test]
+fn cancelled_reopen_is_terminal_and_cannot_be_journaled_or_resumed_again() {
+    let task = Task::new();
+    let jobs = job_root();
+    let request = request(&task, "cancel-reopen");
+    let mut original = task.flow();
+    original
+        .prepare_external(jobs.path(), &request, &active())
+        .unwrap();
+    original.submit_external(&request.id, &active()).unwrap();
+    let pending = original.pending_external().unwrap().clone();
+    drop(original);
+    let mut resumed = TaskSourceFlow::interrupted("project", &task.record.id, pending).unwrap();
+    let before = job_files(jobs.path());
+    assert!(matches!(
+        resumed.reopen_external(jobs.path(), &active(), &AtomicBool::new(true)),
+        Err(AdapterError::Cancelled)
+    ));
+    assert!(matches!(
+        resumed.view().external,
+        ExternalStatus::Cancelled { .. }
+    ));
+    assert!(resumed.pending_external().is_none());
+    assert!(resumed
+        .reopen_external(jobs.path(), &active(), &active())
+        .is_err());
+    assert!(resumed.intake_external(&request.id, &active()).is_err());
+    assert_eq!(before, job_files(jobs.path()));
+}
+
+// The saved ticket comes from the controller's own exact pending association.
+// This synthetic machine participant continues independently of the UI read.
+fn external_machine(
+    task: &Task,
+    root: &std::path::Path,
+    pending: &PendingExternal,
+) -> product_sources::ExternalHandoff {
+    let value = serde_json::to_value(pending).unwrap();
+    let ticket: product_sources::ExternalHandoffTicket =
+        serde_json::from_value(value["ticket"].clone()).unwrap();
+    product_sources::ExternalHandoff::reopen(
+        &TaskSourceAdapter::link("project", &task.record.id).unwrap(),
+        root,
+        pending.request(),
+        &ticket,
+    )
+    .unwrap()
+}
+
+#[test]
+fn read_cancellation_preserves_recovery_for_late_completion_after_restart() {
+    let task = Task::new();
+    let jobs = job_root();
+    let request = request(&task, "cancel-only-read");
+    let mut original = task.flow();
+    original
+        .prepare_external(jobs.path(), &request, &active())
+        .unwrap();
+    let pending = original.pending_external().unwrap().clone();
+    let machine = external_machine(&task, jobs.path(), &pending);
+    let saved = serde_json::to_vec(&pending).unwrap();
+    drop(original);
+    let mut resumed = TaskSourceFlow::interrupted("project", &task.record.id, pending).unwrap();
+    let before = job_files(jobs.path());
+    assert!(matches!(
+        resumed.reopen_external(jobs.path(), &AtomicBool::new(true), &active()),
+        Err(AdapterError::Cancelled)
+    ));
+    assert!(matches!(
+        resumed.view().external,
+        ExternalStatus::Interrupted { .. }
+    ));
+    assert!(resumed.view().can_reopen);
+    assert_eq!(
+        serde_json::to_vec(resumed.pending_external().unwrap()).unwrap(),
+        saved
+    );
+    assert_eq!(job_files(jobs.path()), before);
+    // Cancelling this read neither abandoned intake nor stopped the author.
+    task.edit("Author finished after the cancelled read");
+    machine.submit_current_program().unwrap();
+    let persisted = serde_json::to_vec(resumed.pending_external().unwrap()).unwrap();
+    drop(resumed);
+    let mut restarted = TaskSourceFlow::interrupted(
+        "project",
+        &task.record.id,
+        serde_json::from_slice(&persisted).unwrap(),
+    )
+    .unwrap();
+    restarted
+        .reopen_external(jobs.path(), &active(), &active())
+        .unwrap();
+    let edit = restarted
+        .intake_external(&request.id, &active())
+        .unwrap()
+        .unwrap();
+    assert_eq!(edit.request(), &request);
+    assert_eq!(
+        edit.capture().program.label,
+        "Author finished after the cancelled read"
+    );
+    assert!(matches!(
+        edit.capture().binding.producer,
+        Producer::ExternalAuthor { .. }
+    ));
+    assert!(restarted.pending_external().is_none());
+}
+
+#[test]
+fn simultaneous_read_and_handoff_cancellation_rejects_late_completion_after_restart() {
+    let task = Task::new();
+    let jobs = job_root();
+    let request = request(&task, "cancel-read-and-job");
+    let mut original = task.flow();
+    original
+        .prepare_external(jobs.path(), &request, &active())
+        .unwrap();
+    let pending = original.pending_external().unwrap().clone();
+    let machine = external_machine(&task, jobs.path(), &pending);
+    drop(original);
+    let mut resumed = TaskSourceFlow::interrupted("project", &task.record.id, pending).unwrap();
+    let before = job_files(jobs.path());
+    assert!(matches!(
+        resumed.reopen_external(jobs.path(), &AtomicBool::new(true), &AtomicBool::new(true)),
+        Err(AdapterError::Cancelled)
+    ));
+    assert!(matches!(
+        resumed.view().external,
+        ExternalStatus::Cancelled { .. }
+    ));
+    assert!(!resumed.view().can_reopen);
+    assert_eq!(job_files(jobs.path()), before);
+    assert!(resumed.pending_external().is_none());
+    assert!(resumed
+        .reopen_external(jobs.path(), &active(), &active())
+        .is_err());
+    // The independent author can still finish; local abandonment is not a kill.
+    task.edit("Late external completion after local abandonment");
+    machine.submit_current_program().unwrap();
+    assert!(resumed.intake_external(&request.id, &active()).is_err());
+    let persisted = serde_json::to_vec(&resumed.pending_external()).unwrap();
+    assert_eq!(persisted, b"null");
+    let restored: Option<PendingExternal> = serde_json::from_slice(&persisted).unwrap();
+    assert!(restored.is_none());
+    drop(resumed);
+    let mut restarted = task.flow();
+    assert!(restarted.intake_external(&request.id, &active()).is_err());
+    assert_eq!(
+        settle(&mut restarted).program.label,
+        "Late external completion after local abandonment"
+    );
 }
