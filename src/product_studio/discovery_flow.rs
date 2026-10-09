@@ -65,6 +65,70 @@ fn capture(
     .map_err(error)
 }
 
+/// The shared host must preserve the existing scoped-rule route instead of
+/// discarding a prepared layer's chosen population to fit whole-design play.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum AdmissionError {
+    RuleComparisonRequired,
+    Unavailable(String),
+}
+impl std::fmt::Display for AdmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RuleComparisonRequired => f.write_str("Keep this rule change in its existing comparison so the choice of which work it applies to is preserved"),
+            Self::Unavailable(message) => f.write_str(message),
+        }
+    }
+}
+impl From<String> for AdmissionError {
+    fn from(message: String) -> Self {
+        Self::Unavailable(message)
+    }
+}
+impl From<&str> for AdmissionError {
+    fn from(message: &str) -> Self {
+        Self::Unavailable(message.into())
+    }
+}
+fn require_evolution(
+    store: &ProductStore,
+    basis: &ProjectSnapshot,
+    prepared: &PreparedScopedChange,
+    cancelled: &AtomicBool,
+) -> std::result::Result<(), AdmissionError> {
+    check(store, basis, cancelled)?;
+    ScopedExecutionContext::prepared(basis, prepared).map_err(error)?;
+    if prepared.initialization().is_some() {
+        // Only new scoped layers carry this independently checked receipt.
+        return Err(AdmissionError::RuleComparisonRequired);
+    }
+    if basis.editable_scope_context().map_err(error)?.is_none() {
+        return Err("This prepared design needs a managed whole-design comparison".into());
+    }
+    // Regenerate through the public compiler rather than infer transition kind
+    // from labels, producer prose, or the apparent observed effect.
+    let mut rebuilt = store
+        .prepare_managed_evolution(
+            prepared.candidate(),
+            &change_adapter::slot_mappings(basis, prepared.candidate())?,
+            prepared.operation_id(),
+        )
+        .map_err(error)?;
+    check(store, basis, cancelled)?;
+    let mut original = prepared.clone();
+    // Replay correspondences were checked above and do not change transition,
+    // frozen population, compiler input or target identity.
+    rebuilt.correspondences.clear();
+    original.correspondences.clear();
+    if rebuilt != original {
+        return Err(
+            "This design needs a compatible whole-design preparation before it can be explored"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub(super) struct PreparedAlternative {
     pub id: Id,
@@ -97,7 +161,7 @@ impl DiscoveryDraft {
         id: &str,
         need: &str,
         cancelled: Arc<AtomicBool>,
-    ) -> Result<Self> {
+    ) -> std::result::Result<Self, AdmissionError> {
         check(store, basis, &cancelled)?;
         modify_request.validate().map_err(error)?;
         modify_result.validate_for(&modify_request).map_err(error)?;
@@ -117,7 +181,7 @@ impl DiscoveryDraft {
             if p.candidate() != &authored {
                 return Err("The prepared design differs from the returned change".into());
             }
-            ScopedExecutionContext::prepared(basis, p).map_err(error)?;
+            require_evolution(store, basis, p, &cancelled)?;
             p.target().clone()
         } else {
             if basis.editable_scope_context().map_err(error)?.is_some() {
@@ -224,7 +288,7 @@ impl DiscoveryDraft {
         mut policy: DiscoveryPolicy,
         alternatives: Vec<PreparedAlternative>,
         cancelled: Arc<AtomicBool>,
-    ) -> Result<DiscoveryQueue> {
+    ) -> std::result::Result<DiscoveryQueue, AdmissionError> {
         check(store, &self.basis, &cancelled)?;
         result.validate_for(&self.request).map_err(error)?;
         let mut history = VerifiedRetainedHistory::load(store).map_err(error)?;
@@ -249,6 +313,7 @@ impl DiscoveryDraft {
             if !ids.insert(alternative.id.clone()) {
                 return Err("A returned design was prepared twice".into());
             }
+            require_evolution(store, &self.basis, &alternative.prepared, &cancelled)?;
             let checked = PreparedDiscoveryCandidate::from_result(
                 &self.basis,
                 &self.request,

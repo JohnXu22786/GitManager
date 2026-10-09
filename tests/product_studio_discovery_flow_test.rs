@@ -124,6 +124,95 @@ fn open(store: &ProductStore, q: &DiscoveryQueue) -> PairExperience {
 }
 
 #[test]
+fn new_scope_layers_route_back_to_their_original_rule_comparison() {
+    for managed in [false, true] {
+        let dir = tempdir();
+        let store = if managed {
+            managed_store(&dir.path().join("tool"))
+        } else {
+            ProductStore::create(&dir.path().join("tool"), &program(false), 20000).unwrap()
+        };
+        let basis = store.load().unwrap();
+        let authored = program(true);
+        let (m, r) = modify(&store, &authored);
+        let layer = store
+            .prepare_scoped_change(
+                &authored,
+                &request(&basis, product_store::scope::ScopePopulation::FutureWork),
+                "prospective-layer",
+            )
+            .unwrap();
+        assert!(matches!(
+            DiscoveryDraft::after_modify(
+                &store,
+                &basis,
+                m.clone(),
+                r.clone(),
+                "changed",
+                Some(layer.clone()),
+                "discover-layer",
+                "Pause future work",
+                cancel()
+            ),
+            Err(AdmissionError::RuleComparisonRequired)
+        ));
+        if managed {
+            let primary = prepare(&store, &authored, "whole-design");
+            let d = DiscoveryDraft::after_modify(
+                &store,
+                &basis,
+                m,
+                r,
+                "changed",
+                Some(primary),
+                "discover-whole",
+                "Explore the whole design",
+                cancel(),
+            )
+            .unwrap();
+            let result = DevelopmentResult {
+                producer: authored.binding.producer.clone(),
+                response: DevelopmentResponse {
+                    version: 1,
+                    request_digest: d.request().identity().unwrap(),
+                    candidates: vec![
+                        GeneratedCandidate {
+                            id: "primary".into(),
+                            source_json: String::from_utf8(
+                                d.request().sources[1].source_bytes.clone(),
+                            )
+                            .unwrap(),
+                        },
+                        GeneratedCandidate {
+                            id: "layer".into(),
+                            source_json: String::from_utf8(authored.source_bytes.clone()).unwrap(),
+                        },
+                    ],
+                    hypotheses: vec![],
+                    evolutions: vec![],
+                    unsupported: vec![],
+                },
+            };
+            assert!(matches!(
+                d.evaluate(
+                    &store,
+                    result,
+                    DiscoveryPolicy::default(),
+                    vec![PreparedAlternative {
+                        id: "layer".into(),
+                        prepared: layer,
+                        mappings: vec![]
+                    }],
+                    cancel()
+                ),
+                Err(AdmissionError::RuleComparisonRequired)
+            ));
+        }
+        assert_eq!(store.load().unwrap(), basis);
+    }
+}
+
+#[test]
 fn exact_modify_then_discover_keeps_authored_and_compiled_results_distinct() {
     let dir = tempdir();
     let store = managed_store(&dir.path().join("tool"));
@@ -656,8 +745,14 @@ fn observation_only_minimum_keeps_original_example_and_replays_actions_for_recor
     assert_eq!(engine(&store).discovery_scenes(&saved).unwrap().len(), 2);
 }
 
-#[test]
-fn synthetic_record_example_is_playable_without_fabricating_a_current_copy() {
+fn ordinary_queue(
+    synthetic: bool,
+) -> (
+    tempfile::TempDir,
+    ProductStore,
+    product_store::ProjectSnapshot,
+    DiscoveryQueue,
+) {
     let dir = tempdir();
     let store = ProductStore::create(
         &dir.path().join("tool"),
@@ -682,8 +777,10 @@ fn synthetic_record_example_is_playable_without_fabricating_a_current_copy() {
     )
     .unwrap();
     let mut scenario = scene(&basis, &authored);
-    scenario.seed.records[0].id = "synthetic-only".into();
-    scenario.seed.events.clear();
+    if synthetic {
+        scenario.seed.records[0].id = "synthetic-only".into();
+        scenario.seed.events.clear();
+    }
     scenario.inputs.insert(
         0,
         invoke("wait", &[("row", reference(&scenario.seed.records[0]))]),
@@ -746,6 +843,46 @@ fn synthetic_record_example_is_playable_without_fabricating_a_current_copy() {
     let q = d
         .evaluate(&store, result, policy, vec![], cancel())
         .unwrap();
+    (dir, store, basis, q)
+}
+
+#[test]
+fn ordinary_unprepared_design_can_be_experienced_and_selected_on_saved_work() {
+    let (_dir, store, basis, q) = ordinary_queue(false);
+    let pair = open(&store, &q);
+    let artifact = pair
+        .scenes()
+        .unwrap()
+        .iter()
+        .find(|scene| scene.program() != basis.program().unwrap())
+        .unwrap()
+        .program()
+        .artifact
+        .program_digest
+        .clone();
+    let selected = pair
+        .prepare_choice(
+            &store,
+            &pair.view().ticket,
+            DecisionOutcome::Accept {
+                artifact: artifact.clone(),
+            },
+            "ordinary-choice",
+            "ordinary-adoption",
+            &[],
+            cancel(),
+        )
+        .unwrap();
+    let adopted = engine(&store).adopt(&store, &selected).unwrap();
+    assert_eq!(adopted.program().unwrap().artifact.program_digest, artifact);
+    assert_eq!(adopted.data.records, basis.data.records);
+    assert_eq!(adopted.data.events, basis.data.events);
+    assert_eq!(store.load().unwrap(), adopted);
+}
+
+#[test]
+fn synthetic_record_example_is_playable_without_fabricating_a_current_copy() {
+    let (_dir, store, basis, q) = ordinary_queue(true);
     let question = &q.report().questions[0];
     let view = q.checked_view(&store, cancel()).unwrap();
     assert!(view.questions[0].witnesses[0].playable);
