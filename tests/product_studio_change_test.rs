@@ -4584,7 +4584,13 @@ fn comparison_form_drafts_block_both_panes_and_scoped_transitions() {
         }
         click(&mut h, &mut studio, "current.form.discard");
         click(&mut h, &mut studio, &finished);
-        click(&mut h, &mut studio, "current.navigate.work");
+        // Lifecycle clarification starts fresh copies from the saved session.
+        for model in [
+            studio.test_current_trial().unwrap(),
+            studio.test_alternative().unwrap(),
+        ] {
+            assert_eq!(model.observation.view, "work");
+        }
         click(&mut h, &mut studio, "studio.trial.next-day");
         click(
             &mut h,
