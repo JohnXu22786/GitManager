@@ -1221,3 +1221,213 @@ fn daily_checkpoint_handoff_rechecks_bytes_and_reports_saved_work_warning() {
     assert_eq!(store.load().unwrap(), saved);
     assert_eq!(saved.data.records.len(), 1);
 }
+
+fn mapped_context_fixture(
+    root: &Path,
+) -> (ProductStore, product_store::scope::PreparedScopedChange) {
+    let store = ProductStore::create(
+        root.join("cache-tool"),
+        &scope_fixture::program(false),
+        20000,
+    )
+    .unwrap();
+    scope_fixture::add(&store, "first-cache-work", "Accepted work");
+    let before = store.load().unwrap();
+    let prepared = store
+        .prepare_scoped_change(
+            &scope_fixture::program(true),
+            &scope_fixture::request(&before, product_store::scope::ScopePopulation::All),
+            "cache-rule",
+        )
+        .unwrap();
+    store.adopt_scoped(before.revision, &prepared).unwrap();
+    let current = store.load().unwrap();
+    let scene = ScenarioSpec {
+        version: 1,
+        id: "cache-scene".into(),
+        label: "Keep current work output".into(),
+        seed: current.data.clone(),
+        session: current.session.clone(),
+        clock_day: current.clock_day,
+        random_seed: 0,
+        inputs: vec![
+            scope_fixture::invoke("export", &[]),
+            SemanticInput::Observe {
+                point: "done".into(),
+            },
+        ],
+        validity: vec![],
+    };
+    let e = engine(&store);
+    let accepted = e
+        .accept_current_scene(&current, &scene, Disclosure::Synthetic)
+        .unwrap();
+    let choice = Choice {
+        id: "cache-promise".into(),
+        request: "Keep the actual exported work".into(),
+        rationale: None,
+        scope: DecisionScope {
+            operations: ["export".into()].into(),
+            population: Population::All,
+            conditions: Values::new(),
+            excluded_records: vec![],
+            unknowns: vec![],
+        },
+        outcome: DecisionOutcome::KeepCurrent,
+        obligations: vec![],
+        binding: IntentionBinding::ObservedOutcome,
+    };
+    let checked = e
+        .prepare_choice(
+            &store,
+            current.program().unwrap(),
+            choice,
+            vec![accepted],
+            "cache-choice",
+        )
+        .unwrap();
+    e.adopt(&store, &checked).unwrap();
+    scope_fixture::add(&store, "later-cache-work", "Later legitimate work");
+    let current = store.load().unwrap();
+    let mut candidate =
+        serde_json::to_value(mapping_fixture::baseline(&current).unwrap().program).unwrap();
+    candidate["entities"][0]["fields"].as_array_mut().unwrap().push(serde_json::json!({"id":"extra_note","label":"Additional note","value_type":{"kind":"optional","item":{"kind":"text"}}}));
+    let candidate = scope_fixture::capture(candidate);
+    let maps = mapping_fixture::slot_mappings(&current, &candidate).unwrap();
+    let prepared = store
+        .prepare_managed_evolution(&candidate, &maps, "cache-evolution")
+        .unwrap();
+    (store, prepared)
+}
+#[test]
+fn derived_mapping_context_is_reused_only_inside_the_same_verified_operation() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let (store, prepared) = mapped_context_fixture(&root);
+    let current = store.load().unwrap();
+    let e = engine(&store);
+    let checked = e
+        .prepare_managed_change(&store, prepared.clone(), &[], "cache-evolution")
+        .unwrap();
+    assert_eq!(checked.report().disposition, CheckDisposition::Ready);
+    assert!(!checked.report().runs.is_empty());
+    assert_eq!(
+        e.scope_cache_stats().1,
+        1,
+        "A checked projected proof extension must not rebuild the same full admission"
+    );
+    assert!(e.scope_cache_stats().0 > 0);
+    let first = e.scope_cache_stats();
+    let cold = engine(&store);
+    cold.test_disable_projected_context_reuse();
+    let independently_regenerated = cold
+        .prepare_managed_change(&store, prepared.clone(), &[], "cache-evolution")
+        .unwrap();
+    assert_eq!(checked.plan(), independently_regenerated.plan());
+    assert_eq!(
+        checked.report().checks,
+        independently_regenerated.report().checks
+    );
+    assert_eq!(
+        checked.report().runs,
+        independently_regenerated.report().runs
+    );
+    assert!(cold.scope_cache_stats().1 > first.1);
+    let object = root.join("cache-tool").join(format!(
+        "extension-{}.json",
+        current.decisions.decisions[0].witness.as_str()
+    ));
+    let original = fs::read(&object).unwrap();
+    fs::write(&object, b"changed intention object").unwrap();
+    assert!(e
+        .prepare_managed_change(&store, prepared.clone(), &[], "cache-evolution")
+        .is_err());
+    assert!(cold
+        .prepare_managed_change(&store, prepared.clone(), &[], "cache-evolution")
+        .is_err());
+    fs::write(&object, original).unwrap();
+    assert_eq!(
+        e.prepare_managed_change(&store, prepared.clone(), &[], "cache-evolution")
+            .unwrap()
+            .report()
+            .disposition,
+        CheckDisposition::Ready
+    );
+    assert!(
+        e.scope_cache_stats().1 > first.1,
+        "A later operation must independently admit its basis again"
+    );
+    scope_fixture::add(
+        &store,
+        "new-live-data",
+        "Do not accept stale mapped evidence",
+    );
+    assert!(e.adopt(&store, &checked).is_err());
+    assert!(cold.adopt(&store, &independently_regenerated).is_err());
+    assert!(e
+        .prepare_managed_change(&store, prepared.clone(), &[], "cache-evolution")
+        .is_err());
+    assert!(cold
+        .prepare_managed_change(&store, prepared, &[], "cache-evolution")
+        .is_err());
+    assert_eq!(
+        store.load().unwrap().data.records.len(),
+        current.data.records.len() + 1
+    );
+}
+#[test]
+fn projected_context_reuse_cannot_admit_forged_proofs_cancellation_or_exhausted_fuel() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let (store, prepared) = mapped_context_fixture(&root);
+    let current = store.load().unwrap();
+    let mut forged = prepared.clone();
+    let proof = product_store::scope::ScopeCorrespondence {
+        source: current.program().unwrap().clone(),
+        original: current.data.clone(),
+        target: canonical_digest(IdentityDomain::Source, &"unrelated target").unwrap(),
+        day: current.clock_day,
+        projected: prepared.seed().identity().unwrap(),
+        operation_seed: current.data.identity().unwrap(),
+        scenario: None,
+    };
+    forged
+        .correspondences
+        .insert(proof.identity().unwrap(), proof);
+    for reuse in [true, false] {
+        let e = engine(&store);
+        if !reuse {
+            e.test_disable_projected_context_reuse();
+        }
+        assert!(e
+            .prepare_managed_change(&store, forged.clone(), &[], "cache-evolution")
+            .is_err());
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let cancelled_engine = DecisionEngine::new(
+            LocalRuntime::with_cancellation(cancelled),
+            IntentArchive::new(store.clone()),
+        );
+        if !reuse {
+            cancelled_engine.test_disable_projected_context_reuse();
+        }
+        assert!(cancelled_engine
+            .prepare_managed_change(&store, prepared.clone(), &[], "cache-evolution")
+            .is_err());
+        let mut limited = engine(&store);
+        if !reuse {
+            limited.test_disable_projected_context_reuse();
+        }
+        let result = limited.check_prepared_discovery_candidate(
+            &current,
+            prepared.target(),
+            &prepared,
+            &[],
+            RuntimeLimits {
+                fuel: 1,
+                ..RuntimeLimits::default()
+            },
+        );
+        assert!(result.is_err() || result.unwrap().disposition != CheckDisposition::Ready);
+    }
+    assert_eq!(store.load().unwrap(), current);
+}

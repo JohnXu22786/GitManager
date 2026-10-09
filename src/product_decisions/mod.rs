@@ -259,6 +259,11 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
     pub(crate) fn scope_cache_stats(&self) -> (usize, usize) {
         (self.admission_hits.get(), self.admission_builds.get())
     }
+    #[cfg(test)]
+    pub(crate) fn test_disable_projected_context_reuse(&self) {
+        // The pre-optimization reference path always regenerates extensions.
+        self.clear_admission_cache();
+    }
     pub(crate) fn retained_replay_context(
         &self,
         current: &ProjectSnapshot,
