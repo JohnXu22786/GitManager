@@ -63,6 +63,72 @@ struct Ready {
     epoch: u64,
     basis: Option<Basis>,
     association: ProviderAssociation,
+    reconciliation: Option<intention_flow::Reconciliation>,
+}
+struct DesignEvidence {
+    association: ProviderAssociation,
+    raw: Vec<u8>,
+    receipt: JobReceipt,
+    consent: ConsentReceipt,
+}
+impl DesignEvidence {
+    fn check(&self, design: &intention_flow::Design) -> Result<(), String> {
+        let request = &self.association.request;
+        let binding = self
+            .association
+            .reconcile
+            .as_ref()
+            .ok_or("Missing new-design request binding")?;
+        let response = DevelopmentResponse::parse(&self.raw).map_err(error)?;
+        response.validate_for(request).map_err(error)?;
+        let view = design.view();
+        let suggestion = response
+            .evolutions
+            .iter()
+            .find(|e| e.id == binding.evolution)
+            .ok_or("New-design response lost its exact evolution")?;
+        let source = response
+            .candidates
+            .iter()
+            .find(|c| c.id == suggestion.candidate)
+            .ok_or("New-design response lost its executable")?;
+        let capture = CapturedProgram::capture(
+            source.source_json.as_bytes(),
+            &request.project_id,
+            view.authored.binding.producer.clone(),
+            None,
+        )
+        .map_err(error)?;
+        if capture != view.authored
+            || view.operation != binding.operation
+            || suggestion.needs.iter().collect::<BTreeSet<_>>()
+                != binding.needs.iter().collect::<BTreeSet<_>>()
+            || self.receipt.state != JobState::TransportValidated
+            || self.receipt.request_id != request.id
+            || self.receipt.provider != self.association.provider
+            || self.receipt.request_digest != self.association.wire_request
+            || self.receipt.source_digest != self.association.wire_source
+            || self.receipt.disclosure.digest() != self.consent.disclosure_digest
+            || self.receipt.consent.as_ref() != Some(&self.consent)
+        {
+            return Err(
+                "The new design no longer matches its actual response, consent and receipt".into(),
+            );
+        }
+        DevelopmentResult {
+            response,
+            producer: view.authored.binding.producer,
+        }
+        .validate_for(request)
+        .map_err(error)
+    }
+}
+enum IntentionDraft {
+    Design {
+        design: intention_flow::Design,
+        evidence: DesignEvidence,
+    },
+    Withdrawal(intention_flow::Withdrawal),
 }
 struct OpenTool {
     association: Association,
@@ -77,6 +143,7 @@ struct Worker {
     ready: Option<Ready>,
     draft: Option<Draft>,
     change: Option<ChangeDraft>,
+    intention: Option<IntentionDraft>,
     recent_inputs: Vec<SemanticInput>,
     opened: Option<OpenTool>,
     chosen: Option<PathBuf>,
@@ -336,17 +403,46 @@ impl Worker {
                 required_capabilities: BTreeSet::new(),
             }
         };
+        self.prepare_request(
+            need,
+            provider,
+            profile,
+            key,
+            gate,
+            request,
+            modify_binding,
+            None,
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_request(
+        &mut self,
+        need: String,
+        provider: ProviderKind,
+        profile: CapabilityProfile,
+        key: &Key,
+        gate: &Gate,
+        request: DevelopmentRequest,
+        modify: Option<(Association, Basis)>,
+        reconcile: Option<ReconcileAssociation>,
+        reconciliation: Option<intention_flow::Reconciliation>,
+    ) -> Result<(), String> {
+        self.no_pending()?;
+        if self.generation_blocked
+            || self
+                .journal
+                .as_ref()
+                .is_some_and(|j| j.value.provider.is_some())
+        {
+            return Err("The earlier provider process has an unresolved outcome; no new generation was sent".into());
+        }
         request.validate().map_err(error)?;
-        self.journal(|j| j.need = need)?;
-        self.ready = None;
-        self.draft = None;
-        self.change = None;
-        if !modify {
-            self.opened = None;
-        }
-        if !modify {
-            self.page = Page::Home;
-        }
+        self.journal(|j| j.need = need.clone())?;
+        let basis = modify
+            .as_ref()
+            .map(|(_, basis)| basis.clone())
+            .or_else(|| reconcile.as_ref().map(|r| r.basis.clone()));
         // Only explicitly injected test transports can attest a fixture profile.
         #[cfg(test)]
         let profile = if self.config.transport.is_some() {
@@ -372,19 +468,26 @@ impl Worker {
             wire_request: wire.digest()?,
             wire_source: wire.source_digest,
             issued: false,
-            modify: modify_binding.clone(),
+            modify,
+            reconcile,
         };
-        self.journal(|j| j.provider = Some(pending.clone()))?;
+        self.journal(|j| {
+            j.need = need.clone();
+            j.provider = Some(pending.clone());
+        })?;
+        self.ready = None;
+        self.draft = None;
+        self.change = None;
+        self.intention = None;
+        if basis.is_none() {
+            self.opened = None;
+        }
         self.page = Page::Consent {
             disclosure: prepared.disclosure().clone(),
-            need: self
-                .journal
-                .as_ref()
-                .map(|j| j.value.need.clone())
-                .unwrap_or_else(|| request.request.clone()),
+            need,
             request: request.clone(),
-            review: String::from_utf8(wire.prompt.clone()).map_err(error)?,
-            basis: modify_binding.as_ref().map(|(_, basis)| basis.clone()),
+            review: String::from_utf8(wire.prompt).map_err(error)?,
+            basis: basis.clone(),
         };
         #[cfg(test)]
         if self.config.transport.is_some() {
@@ -395,8 +498,9 @@ impl Worker {
             request,
             transport,
             epoch: key.epoch,
-            basis: modify_binding.map(|(_, basis)| basis),
+            basis,
             association: pending,
+            reconciliation,
         });
         Ok(())
     }
@@ -440,7 +544,7 @@ impl Worker {
             return Err("The prepared request changed; review it again before authorizing".into());
         }
         if let Some(basis) = &ready.basis {
-            let current = self.opened.as_ref().ok_or("The saved tool was closed")?;
+            let current = self.current(key)?;
             if key.basis.as_ref() != Some(basis)
                 || Basis::capture(&current.store.load().map_err(error)?)? != *basis
                 || self.today() != basis.day
@@ -472,30 +576,131 @@ impl Worker {
             approval_reference: format!("studio-click-{}", key.operation),
             expires_at_unix_ms: unix_ms().saturating_add(5 * 60_000),
         };
-        let provider = ready.prepared.authorize(consent);
-        let result = provider.develop(&ready.request, &|| gate.cancelled.load(Ordering::Acquire));
+        let provider = ready.prepared.authorize(consent.clone());
+        let ordinary = ready.reconciliation.is_some()
+            && self.opened.as_ref().is_some_and(|o| {
+                !o.snapshot
+                    .scope
+                    .compositions
+                    .contains_key(&o.snapshot.active_revision)
+            });
+        let (developed, result) = if ordinary {
+            let current = self.opened.as_ref().unwrap();
+            let engine = DecisionEngine::new(
+                LocalRuntime::with_cancellation(gate.cancelled.clone()),
+                IntentArchive::new(current.store.clone()),
+            );
+            (
+                Some(ready.reconciliation.as_ref().unwrap().develop(
+                    &current.store,
+                    &engine,
+                    &provider,
+                    gate.cancelled.clone(),
+                )),
+                None,
+            )
+        } else {
+            (
+                None,
+                Some(
+                    provider
+                        .develop(&ready.request, &|| gate.cancelled.load(Ordering::Acquire))
+                        .map_err(error),
+                ),
+            )
+        };
         let receipt = provider.receipt();
         let raw = provider.raw_response();
         if ready.basis.is_none() {
             self.page = Page::Home;
-        } else if let Some(opened) = &self.opened {
-            self.page = daily_page(&opened.association, &opened.store, &opened.snapshot)?;
+        } else if ready.reconciliation.is_none() {
+            if let Some(opened) = &self.opened {
+                self.page = daily_page(&opened.association, &opened.store, &opened.snapshot)?;
+            }
         }
         // Dropping the provider/job and any cancellation join stays on this worker.
         drop(provider);
         let terminal = ready.transport.reconcile(&ready.request.id);
         match &terminal {
             Ok(receipt)
-                if receipt.state.is_terminal() && receipt.state != JobState::Interrupted =>
+                if receipt.request_id == ready.request.id
+                    && receipt.request_digest == ready.association.wire_request
+                    && receipt.source_digest == ready.association.wire_source
+                    && receipt.state.is_terminal()
+                    && receipt.state != JobState::Interrupted =>
             {
                 self.journal(|j| j.provider = None)?
             }
-            Ok(receipt) if receipt.state == JobState::Prepared => {
+            Ok(receipt)
+                if receipt.state == JobState::Prepared
+                    && receipt.request_id == ready.request.id
+                    && receipt.request_digest == ready.association.wire_request
+                    && receipt.source_digest == ready.association.wire_source =>
+            {
                 self.journal(|j| j.provider = None)?
             }
             _ => self.generation_blocked = true,
         }
-        let result = result.map_err(error)?;
+        if ready.reconciliation.is_some() {
+            // A managed result reaches the domain verifier only after the real
+            // transport has supplied the exact authorized terminal receipt.
+            if let Some(receipt) = &receipt {
+                if receipt.state != JobState::TransportValidated
+                    || receipt.request_id != ready.request.id
+                    || receipt.request_digest != ready.association.wire_request
+                    || receipt.source_digest != ready.association.wire_source
+                    || receipt.provider != ready.association.provider
+                    || receipt.disclosure.digest() != consent.disclosure_digest
+                    || receipt.consent.as_ref() != Some(&consent)
+                {
+                    return Err(
+                        "New-design provider receipt differs from the exact authorized request"
+                            .into(),
+                    );
+                }
+            }
+            let design = if let Some(developed) = developed {
+                developed?
+            } else {
+                let result = result.ok_or("Missing actual new-design result")??;
+                let raw = raw
+                    .as_ref()
+                    .ok_or("No actual provider response bytes were returned")?;
+                result.validate_for(&ready.request).map_err(error)?;
+                if DevelopmentResponse::parse(raw).map_err(error)? != result.response {
+                    return Err(
+                        "The actual new-design result differs from its response bytes".into(),
+                    );
+                }
+                let current = self.current(key)?;
+                let engine = DecisionEngine::new(
+                    LocalRuntime::with_cancellation(gate.cancelled.clone()),
+                    IntentArchive::new(current.store.clone()),
+                );
+                ready.reconciliation.as_ref().unwrap().develop_prepared(
+                    &current.store,
+                    &engine,
+                    result,
+                    gate.cancelled.clone(),
+                )?
+            };
+            self.current(key)?;
+            let evidence = DesignEvidence {
+                association: ready.association,
+                raw: raw.ok_or("No actual provider response bytes were returned")?,
+                receipt: receipt.ok_or("No actual provider receipt was returned")?,
+                consent,
+            };
+            evidence.check(&design)?;
+            if !gate.finish() {
+                return Err("New-design preview cancelled; saved work was kept".into());
+            }
+            self.intention = Some(IntentionDraft::Design { design, evidence });
+            self.page = self.intention_page()?;
+            self.notice = "The actual returned new design was checked against the selected needs and independent promises. Try copied work before choosing to save it".into();
+            return Ok(());
+        }
+        let result = result.ok_or("Missing actual provider result")??;
         gate.check()?;
         let receipt = receipt.ok_or("No actual provider receipt was returned")?;
         let raw = raw.ok_or("No actual provider response bytes were returned")?;
@@ -693,6 +898,7 @@ impl Worker {
         });
         self.draft = None;
         self.change = None;
+        self.intention = None;
         self.recent_inputs.clear();
         self.ready = None;
         self.page = page;
@@ -761,6 +967,7 @@ impl Worker {
         });
         self.draft = None;
         self.change = None;
+        self.intention = None;
         self.ready = None;
         self.recent_inputs.clear();
         self.page = page;
@@ -1034,14 +1241,14 @@ impl Worker {
             fresh
                 .store
                 .apply(basis.revision, &operation, &input, RuntimeLimits::default());
-        let checked = open_verified(&association.path, Some(&association.identity)).map_err(|e| format!("The save outcome is unresolved: {e}. Keep this operation for exact reconciliation"))?;
+        let mut checked = open_verified(&association.path, Some(&association.identity)).map_err(|e| format!("The save outcome is unresolved: {e}. Keep this operation for exact reconciliation"))?;
         if has_receipt(&checked.snapshot, &operation, &input)? {
             self.committed = Some(association.path.clone());
             self.after_commit();
             self.opened = Some(OpenTool {
                 association: association.clone(),
-                store: checked.store,
-                snapshot: checked.snapshot,
+                store: checked.store.clone(),
+                snapshot: checked.snapshot.clone(),
             });
             self.page = daily_page(
                 &association,
@@ -1057,7 +1264,7 @@ impl Worker {
                 self.recent_inputs.remove(0);
             }
             self.notice = "Your work was saved".into();
-            self.post_save(&association);
+            self.post_save_opened(&association, Some(&mut checked));
             Ok(())
         } else {
             // A fresh verified snapshot has no such receipt: no acknowledged
@@ -1335,6 +1542,201 @@ impl Worker {
         self.notice = format!("The uncommitted save was set aside. Its original location and any partial files were kept at {}. You can explicitly save the draft again or start a new request", tool.path.display());
         Ok(())
     }
+    fn current(&self, key: &Key) -> Result<&OpenTool, String> {
+        let current = self.opened.as_ref().ok_or("Open the saved tool first")?;
+        let fresh = current.store.load().map_err(error)?;
+        if fresh != current.snapshot
+            || key.basis.as_ref() != Some(&Basis::capture(&fresh)?)
+            || ToolIdentity::from_snapshot(&fresh).map_err(error)? != current.association.identity
+            || self.today() != fresh.clock_day
+        {
+            return Err("Saved work, its location, source or today's date changed. Return to saved work and prepare a fresh preview".into());
+        }
+        Ok(current)
+    }
+    fn history(&mut self, key: &Key, gate: &Gate) -> Result<(), String> {
+        self.no_pending()?;
+        let current = self.current(key)?;
+        let view = intention_flow::HistoryView::load(
+            &current.store,
+            &current.snapshot,
+            gate.cancelled.clone(),
+        )?;
+        let basis = Basis::capture(&current.snapshot)?;
+        let tool = current.association.clone();
+        if !gate.finish() {
+            return Err("Opening history was cancelled; saved work was kept".into());
+        }
+        self.change = None;
+        self.intention = None;
+        self.page = Page::History { tool, basis, view };
+        Ok(())
+    }
+    fn prepare_reconciliation(
+        &mut self,
+        needs: &[Id],
+        need: &str,
+        provider: ProviderKind,
+        profile: CapabilityProfile,
+        key: &Key,
+        gate: &Gate,
+    ) -> Result<(), String> {
+        self.no_pending()?;
+        let current = self.current(key)?;
+        if !matches!(self.page, Page::History { .. }) {
+            return Err("Choose the exact saved needs from history first".into());
+        }
+        let engine = DecisionEngine::new(
+            LocalRuntime::with_cancellation(gate.cancelled.clone()),
+            IntentArchive::new(current.store.clone()),
+        );
+        let binding = ReconcileAssociation {
+            tool: current.association.clone(),
+            basis: Basis::capture(&current.snapshot)?,
+            needs: needs.to_vec(),
+            evolution: id("evolution"),
+            operation: id("adopt-design"),
+        };
+        let reconciliation = intention_flow::Reconciliation::new(
+            &current.store,
+            &current.snapshot,
+            &engine,
+            &id("request"),
+            need,
+            needs,
+            &binding.evolution,
+            &binding.operation,
+            gate.cancelled.clone(),
+        )?;
+        let request = reconciliation.request().clone();
+        self.prepare_request(
+            need.into(),
+            provider,
+            profile,
+            key,
+            gate,
+            request,
+            None,
+            Some(binding),
+            Some(reconciliation),
+        )
+    }
+    fn preview_withdrawal(
+        &mut self,
+        layers: &[Digest],
+        key: &Key,
+        gate: &Gate,
+    ) -> Result<(), String> {
+        self.no_pending()?;
+        let current = self.current(key)?;
+        if !matches!(self.page, Page::History { .. }) {
+            return Err("Choose the exact rules from saved history first".into());
+        }
+        let engine = DecisionEngine::new(
+            LocalRuntime::with_cancellation(gate.cancelled.clone()),
+            IntentArchive::new(current.store.clone()),
+        );
+        let withdrawal = intention_flow::Withdrawal::prepare(&current.store, &current.snapshot, &engine, layers, &key.operation, gate.cancelled.clone()).map_err(|e| format!("This rule cannot safely be withdrawn on current work. Saved work remains usable. Return to work, or request a compatible new design that keeps the independent promises. {e}"))?;
+        if !gate.finish() {
+            return Err("Withdrawal preview cancelled; saved work was kept".into());
+        }
+        self.intention = Some(IntentionDraft::Withdrawal(withdrawal));
+        self.page = self.intention_page()?;
+        Ok(())
+    }
+    fn intention_page(&self) -> Result<Page, String> {
+        let basis = Basis::capture(
+            &self
+                .opened
+                .as_ref()
+                .ok_or("The saved tool was closed")?
+                .snapshot,
+        )?;
+        let (view, origin) = match self
+            .intention
+            .as_ref()
+            .ok_or("No checked preview is available")?
+        {
+            IntentionDraft::Design { design, .. } => {
+                let view = design.view();
+                let origin = match &view.authored.binding.producer {
+                    Producer::Fixture { name } => format!("Synthetic transport fixture: {name}. This is not live AI generation."),
+                    Producer::LiveAgent { provider, invocation_id, .. } => format!("Returned by {provider}, request {invocation_id}. Selected needs were independently executed locally."),
+                    _ => return Err("Unexpected new-design provenance".into()),
+                };
+                (IntentionView::Design(view), origin)
+            }
+            IntentionDraft::Withdrawal(withdrawal) => (
+                IntentionView::Withdrawal(withdrawal.view()),
+                "Local checked withdrawal on copies of current saved work. No AI request is sent."
+                    .into(),
+            ),
+        };
+        Ok(Page::Intention {
+            basis,
+            view,
+            origin,
+        })
+    }
+    fn intention_trial(
+        &mut self,
+        input: SemanticInput,
+        key: &Key,
+        gate: &Gate,
+    ) -> Result<(), String> {
+        self.no_pending()?;
+        let store = self.current(key)?.store.clone();
+        let finish = || {
+            if gate.finish() {
+                Ok(())
+            } else {
+                Err("Copied input cancelled; the prior copied work was kept".into())
+            }
+        };
+        match self
+            .intention
+            .as_mut()
+            .ok_or("No checked copied preview is available")?
+        {
+            IntentionDraft::Design { design, .. } => {
+                design.trial_when(&store, input, gate.cancelled.clone(), finish)?;
+            }
+            IntentionDraft::Withdrawal(withdrawal) => {
+                withdrawal.trial_when(&store, input, gate.cancelled.clone(), finish)?;
+            }
+        }
+        self.page = self.intention_page()?;
+        Ok(())
+    }
+    fn commit_intention(&mut self, operation: &str, key: &Key, gate: &Gate) -> Result<(), String> {
+        self.no_pending()?;
+        let current = self.current(key)?;
+        let basis = Basis::capture(&current.snapshot)?;
+        let engine = DecisionEngine::new(
+            LocalRuntime::with_cancellation(gate.cancelled.clone()),
+            IntentArchive::new(current.store.clone()),
+        );
+        let (change, notice) = match self
+            .intention
+            .as_ref()
+            .ok_or("No checked preview is available")?
+        {
+            IntentionDraft::Design { design, evidence } => {
+                evidence.check(design)?;
+                if design.view().operation != operation {
+                    return Err("This design belongs to another adoption operation".into());
+                }
+                (design.decision(&current.store, &engine, gate.cancelled.clone())?, "The checked new design was saved. Only the named old intentions were replaced; independent promises and later work were kept")
+            }
+            IntentionDraft::Withdrawal(withdrawal) => {
+                if withdrawal.view().operation != operation {
+                    return Err("This withdrawal belongs to another adoption operation".into());
+                }
+                (withdrawal.decision(&current.store, &engine, gate.cancelled.clone())?, "The selected rules were withdrawn on current work. Later records, edits, completed facts, events and earlier outputs were kept")
+            }
+        };
+        self.commit_change(change, basis, gate, notice)
+    }
     fn change_action(
         &mut self,
         key: &Key,
@@ -1384,11 +1786,30 @@ impl Worker {
             .as_ref()
             .ok_or("No experienced change is available")?;
         let basis = Basis::capture(&draft.snapshot)?;
-        let expected_day = basis.day;
         if key.basis.as_ref() != Some(&basis) || self.today() != basis.day {
             return Err("This comparison is stale. Rehearse on current saved work".into());
         }
         let change = draft.decision(&opened.store, outcome, &key.operation, gate)?;
+        self.commit_change(change, basis, gate, "Your choice was saved. Continue ordinary work; pending choices did not activate their alternatives")
+    }
+    fn commit_change(
+        &mut self,
+        change: crate::product_decisions::VerifiedChange,
+        basis: Basis,
+        gate: &Gate,
+        notice: &str,
+    ) -> Result<(), String> {
+        self.no_pending()?;
+        let opened = self.opened.as_ref().ok_or("Open the saved tool first")?;
+        let fresh = opened.store.load().map_err(error)?;
+        if Basis::capture(&fresh)? != basis
+            || fresh != opened.snapshot
+            || ToolIdentity::from_snapshot(&fresh).map_err(error)? != opened.association.identity
+            || self.today() != basis.day
+        {
+            return Err("Saved work changed before this checked change could be saved".into());
+        }
+        let expected_day = basis.day;
         let plan = change.plan().clone();
         let tool = opened.association.clone();
         let store = opened.store.clone();
@@ -1430,7 +1851,7 @@ impl Worker {
                 j.pending = None;
                 j.last = Some(tool.clone());
             })?;
-            self.notice="Your choice was saved. Continue ordinary work; pending choices did not activate their alternatives".into();
+            self.notice = notice.into();
             self.install_opened(tool, checked)?;
             Ok(())
         } else {
@@ -1566,6 +1987,7 @@ impl Worker {
         self.ready = None;
         self.draft = None;
         self.change = None;
+        self.intention = None;
         self.recent_inputs.clear();
         self.opened = None;
         self.page = Page::Home;
@@ -1618,7 +2040,13 @@ impl Worker {
         #[cfg(test)]
         if matches!(
             &command.action,
-            Action::Decide { .. } | Action::Modify { .. } | Action::ResumeChoice { .. }
+            Action::Decide { .. }
+                | Action::Modify { .. }
+                | Action::ResumeChoice { .. }
+                | Action::History
+                | Action::PrepareReconciliation { .. }
+                | Action::PreviewWithdrawal { .. }
+                | Action::CommitIntention { .. }
         ) {
             if let Some(pause) = &self.config.hooks.before_context_transition {
                 pause.reached.store(true, Ordering::Release);
@@ -1676,8 +2104,44 @@ impl Worker {
             }),
             Action::Decide { outcome } => self.decide(outcome.clone(), key, gate),
             Action::ResumeChoice { decision } => self.resume_choice(decision, key, gate),
+            Action::History => self.history(key, gate),
+            Action::PrepareReconciliation {
+                needs,
+                need,
+                provider,
+                profile,
+            } => self.prepare_reconciliation(needs, need, *provider, *profile, key, gate),
+            Action::PreviewWithdrawal { layers } => self.preview_withdrawal(layers, key, gate),
+            Action::CommitIntention { operation } => self.commit_intention(operation, key, gate),
+            Action::IntentionTrial { input } => {
+                #[cfg(test)]
+                if let Some(pause) = &self.config.hooks.before_preview {
+                    pause.reached.store(true, Ordering::Release);
+                    while !pause.release.load(Ordering::Acquire)
+                        && !gate.cancelled.load(Ordering::Acquire)
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                self.intention_trial(input.clone(), key, gate)
+            }
             Action::ReturnDaily => self.return_daily(gate),
-            Action::Consent { disclosure } => self.generate(disclosure.clone(), key, gate),
+            Action::Consent { disclosure } => {
+                let result = self.generate(disclosure.clone(), key, gate);
+                if result.is_err()
+                    && self.ready.is_none()
+                    && matches!(&self.page, Page::Consent { request, .. } if request.operation == DevelopmentOperation::Reconcile)
+                {
+                    if let Some(opened) = &self.opened {
+                        if let Ok(page) =
+                            daily_page(&opened.association, &opened.store, &opened.snapshot)
+                        {
+                            self.page = page;
+                        }
+                    }
+                }
+                result
+            }
             Action::Select { candidate } => self.select(*candidate, key, gate),
             Action::Preview { input } => self.preview(input.clone(), key, gate),
             Action::Save => self.save(key, gate),
@@ -1766,6 +2230,7 @@ pub(super) fn run(
         ready: None,
         draft: None,
         change: None,
+        intention: None,
         recent_inputs: vec![],
         opened: None,
         chosen: None,
@@ -1799,6 +2264,7 @@ pub(super) fn run(
                 command.action,
                 Action::Prepare { .. }
                     | Action::Modify { .. }
+                    | Action::PrepareReconciliation { .. }
                     | Action::Consent { .. }
                     | Action::Open { .. }
                     | Action::OpenDialog
