@@ -83,7 +83,7 @@ fn date(days: i32) -> Option<NaiveDate> {
 }
 
 /// Uncommitted widget state, never an executable plan or authoritative session.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ValueEditor {
     text: String,
     checked: bool,
@@ -318,6 +318,11 @@ enum QueuedInput {
 pub struct ProductRuntimeView {
     view_key: Option<(Digest, Id)>,
     fields: BTreeMap<Id, ValueEditor>,
+    // Exact local drafts, including invalid text, relative to initial defaults
+    // or the last acknowledged submission. A later edit survives an older ACK.
+    acknowledged_fields: BTreeMap<Id, ValueEditor>,
+    dirty_fields: BTreeSet<Id>,
+    pending_form: Option<BTreeMap<Id, ValueEditor>>,
     controls: BTreeMap<Id, ValueEditor>,
     observed_controls: Values,
     queued_inputs: VecDeque<QueuedInput>,
@@ -336,6 +341,17 @@ impl ProductRuntimeView {
     /// Called only for the exact controller-owned request acknowledgement.
     pub(crate) fn acknowledge(&mut self, successful: bool) {
         let pending = self.pending_control.take();
+        if let Some(submitted) = self.pending_form.take() {
+            if successful {
+                self.acknowledged_fields = submitted;
+                self.dirty_fields = self
+                    .fields
+                    .iter()
+                    .filter(|(id, editor)| self.acknowledged_fields.get(*id) != Some(*editor))
+                    .map(|(id, _)| id.clone())
+                    .collect();
+            }
+        }
         if !successful {
             self.queued_inputs.clear();
             self.failed_controls
@@ -350,7 +366,9 @@ impl ProductRuntimeView {
         }
     }
     pub(crate) fn pending_edits(&self) -> bool {
-        !self.dirty_controls.is_empty() || !self.queued_inputs.is_empty()
+        !self.dirty_controls.is_empty()
+            || !self.dirty_fields.is_empty()
+            || !self.queued_inputs.is_empty()
     }
     /// `interactive` allows one request now. Local text editing remains available
     /// while a request is pending; valid controls retain their event order.
@@ -392,7 +410,7 @@ impl ProductRuntimeView {
         }
         let interactive = interactive && !model.read_only;
         let trace = &mut output.trace;
-        if !model.read_only && self.dirty_controls.is_empty() {
+        if !model.read_only && self.dirty_controls.is_empty() && self.dirty_fields.is_empty() {
             for shortcut in shortcuts {
                 let Some(binding) = view.actions.iter().find(|action| &action.id == shortcut)
                 else {
@@ -422,7 +440,7 @@ impl ProductRuntimeView {
             for issue in &model.issues { trace.label(ui, issue); }
             if model.read_only { trace.label(ui, "Read-only: changes are unavailable"); }
             ui.horizontal_wrapped(|ui| for target in &model.program.views {
-                if trace.button(ui, &format!("{prefix}.navigate.{}",target.id), &target.label, interactive && self.dirty_controls.is_empty() && self.queued_inputs.is_empty() && target.id != view.id) { output.input = Some(SemanticInput::Navigate { view: target.id.clone() }); }
+                if trace.button(ui, &format!("{prefix}.navigate.{}",target.id), &target.label, interactive && !self.pending_edits() && target.id != view.id) { output.input = Some(SemanticInput::Navigate { view: target.id.clone() }); }
             });
             match &view.kind {
                 ViewKind::List { controls, selection, columns, entity, .. } => {
@@ -487,8 +505,15 @@ impl ProductRuntimeView {
                         for field in fields {
                             let Some(typ) = action.parameters.get(&field.parameter) else { continue; };
                             let editor = self.fields.entry(field.parameter.clone()).or_insert_with(|| ValueEditor::new(typ, model.observation.form_values.get(&field.parameter).or_else(|| defaults.get(&field.parameter))));
+                            self.acknowledged_fields.entry(field.parameter.clone()).or_insert_with(|| editor.clone());
                             trace.label(ui, &field.label);
-                            ui.add_enabled_ui(!model.read_only, |ui| editor.show(ui, typ, &model.retained_records, &format!("{prefix}.field.{}",field.parameter),trace));
+                            if ui.add_enabled_ui(!model.read_only, |ui| editor.show(ui, typ, &model.retained_records, &format!("{prefix}.field.{}",field.parameter),trace)).inner {
+                                if self.acknowledged_fields.get(&field.parameter) == Some(&*editor) {
+                                    self.dirty_fields.remove(&field.parameter);
+                                } else {
+                                    self.dirty_fields.insert(field.parameter.clone());
+                                }
+                            }
                         }
                         let arguments = action.parameters.iter().map(|(id, typ)| {
                             let value = if let Some(editor) = self.fields.get(id) { editor.value(typ) } else { model.observation.form_values.get(id).or_else(|| defaults.get(id)).cloned() };
@@ -496,12 +521,20 @@ impl ProductRuntimeView {
                         }).collect::<Option<Values>>();
                         let valid = arguments.as_ref().is_some_and(|args| validate_input(&SemanticInput::Submit { view: view.id.clone(), arguments: args.clone() }, &model.program).is_ok());
                         if trace.button(ui,&format!("{prefix}.submit"),&action.label,interactive && valid && self.queued_inputs.is_empty()) {
+                            self.pending_form = Some(self.fields.clone());
                             output.input = Some(SemanticInput::Submit { view:view.id.clone(),arguments:arguments.unwrap() });
+                        }
+                        if !self.dirty_fields.is_empty() {
+                            trace.label(ui,"This form has changes that have not been submitted. Submit it or discard those changes before continuing elsewhere.");
+                            if trace.button(ui,&format!("{prefix}.form.discard"),"Discard unsubmitted form changes",interactive) {
+                                self.fields = self.acknowledged_fields.clone();
+                                self.dirty_fields.clear();
+                            }
                         }
                     }
                 }
             }
-            let actions_ready = interactive && self.dirty_controls.is_empty() && self.queued_inputs.is_empty();
+            let actions_ready = interactive && !self.pending_edits();
             ui.horizontal_wrapped(|ui| for binding in view.actions.iter().filter(|a| a.placement == ActionPlacement::Toolbar) {
                 if trace.button(ui,&format!("{prefix}.action.{}",binding.id),&binding.label,actions_ready && model.observation.enabled_actions.contains(&binding.id)) {
                     output.input = Some(SemanticInput::Activate { view:view.id.clone(),binding:binding.id.clone(),row:None });
@@ -512,7 +545,7 @@ impl ProductRuntimeView {
                 let label = model.program.outputs.iter().find(|o| o.id == artifact.output).map(|o| o.label.as_str()).unwrap_or(&artifact.output);
                 trace.label(ui,format!("{label}: {} rows, {} bytes ({:?})",artifact.rows.len(),artifact.bytes.len(),artifact.format));
                 for row in &artifact.rows { for column in &artifact.columns { if let Some(value) = row.get(&column.id) { trace.label(ui,format!("{}: {}",column.label,value_text(value))); } } ui.separator(); }
-                if allow_export && trace.button(ui,&format!("{prefix}.output.{index}.save"),"Save output…",interactive && self.queued_inputs.is_empty() && self.dirty_controls.is_empty() && artifact.validate().is_ok()) { output.export=Some(artifact.digest.clone()); }
+                if allow_export && trace.button(ui,&format!("{prefix}.output.{index}.save"),"Save output…",interactive && !self.pending_edits() && artifact.validate().is_ok()) { output.export=Some(artifact.digest.clone()); }
                 if !allow_export { trace.label(ui,"Preview output stays in this comparison"); }
             }
             if !model.history.results.is_empty() {
@@ -539,6 +572,19 @@ impl ProductRuntimeView {
                 ui.collapsing("All retained data", |ui| for record in &model.retained_records { trace.label(ui,format!("{} / {}{}",record.entity,record.id,if record.archived {" (archived)"} else {""})); for (field,value) in &record.values { trace.label(ui,format!("{field}: {}",value_text(value))); } });
             }
         });
+        if !self.dirty_fields.is_empty() {
+            // Navigation and shortcuts are drawn before the form. Recheck after
+            // editing so a same-frame input cannot discard the new draft.
+            self.queued_inputs
+                .retain(|input| !matches!(input, QueuedInput::Shortcut(_)));
+            if matches!(
+                output.input,
+                Some(SemanticInput::Navigate { .. } | SemanticInput::Activate { .. })
+            ) {
+                output.input = None;
+            }
+            output.export = None;
+        }
         if interactive && output.input.is_none() && output.export.is_none() {
             match self.queued_inputs.pop_front() {
                 Some(QueuedInput::Control(control, value, revision)) => {

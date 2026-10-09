@@ -4319,3 +4319,403 @@ fn consent_requires_its_exact_durable_request_association() {
         assert_eq!(store.load().unwrap(), before);
     }
 }
+
+#[cfg(unix)]
+fn replace_form_text(
+    h: &mut egui_harness::EguiHarness,
+    studio: &mut ProductStudio,
+    key: &str,
+    value: &str,
+) {
+    let trace = frame(h, studio);
+    assert!(trace.controls[key].enabled, "{key}: {:?}", trace.text);
+    let point = trace.controls[key].rect.center();
+    h.press_at(point);
+    frame(h, studio);
+    h.release_at(point);
+    frame(h, studio);
+    h.key(
+        egui::Key::A,
+        true,
+        egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        },
+    );
+    h.key(egui::Key::A, false, egui::Modifiers::NONE);
+    h.text(value);
+    frame(h, studio);
+}
+
+#[cfg(unix)]
+fn press_until_paused(
+    h: &mut egui_harness::EguiHarness,
+    studio: &mut ProductStudio,
+    pause: &product_studio::TestPause,
+    key: &str,
+) {
+    use std::sync::atomic::Ordering;
+    pause.reached.store(false, Ordering::Release);
+    pause.release.store(false, Ordering::Release);
+    let trace = frame(h, studio);
+    assert!(trace.controls[key].enabled, "{key}: {:?}", trace.text);
+    let point = trace.controls[key].rect.center();
+    h.press_at(point);
+    frame(h, studio);
+    h.release_at(point);
+    frame(h, studio);
+    let start = Instant::now();
+    while !pause.reached.load(Ordering::Acquire) {
+        studio.poll();
+        assert!(
+            start.elapsed() < Duration::from_secs(120),
+            "{}",
+            studio.test_notice()
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn daily_form_drafts_preserve_submission_acknowledgements_and_context() {
+    use std::sync::{atomic::Ordering, Arc};
+    let dir = tempdir();
+    let root = dir.path();
+    let path = root.join("tool");
+    let mut source = other_shape::organizer();
+    source["actions"][0]["parameters"]["number"] = serde_json::json!({"kind":"integer"});
+    source["actions"][0]["guards"] = serde_json::json!([{"kind":"not","value":{"kind":"equal","left":other_shape::var("name"),"right":other_shape::text("refuse")}}]);
+    source["views"][1]["kind"]["fields"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({"parameter":"number","label":"Number"}));
+    source["views"][1]["kind"]["defaults"] = serde_json::json!({"name":{"kind":"text","value":"Default"},"area":{"kind":"text","value":"north"},"number":{"kind":"integer","value":0}});
+    source["views"][1]["actions"] = source["views"][0]["actions"].clone();
+    source["views"][1]["keys"] = source["views"][0]["keys"].clone();
+    let original = other_shape::capture(source.clone());
+    source["label"] = serde_json::json!("Updated club");
+    let store = ProductStore::create(&path, &original, 20000).unwrap();
+    let pause = Arc::new(product_studio::TestPause::default());
+    pause.release.store(true, Ordering::Release);
+    let mut studio = ProductStudio::testing(
+        root.into(),
+        Some(transport(root, &other_shape::capture(source))),
+        TestHooks {
+            before_commit: Some(pause.clone()),
+            ..TestHooks::default()
+        },
+    );
+    settle(&mut studio);
+    studio.test_open(path);
+    settle(&mut studio);
+    let mut h = egui_harness::EguiHarness::new(egui::vec2(1600.0, 2400.0));
+    replace_form_text(
+        &mut h,
+        &mut studio,
+        "studio.change-need",
+        "Use a clearer title",
+    );
+    click(&mut h, &mut studio, "daily.navigate.new_person");
+    let baseline = store.load().unwrap();
+    assert!(
+        frame(&mut h, &mut studio).controls["studio.modify"].enabled,
+        "Initial defaults are not unfinished edits"
+    );
+    replace_form_text(&mut h, &mut studio, "daily.field.name", "Ada");
+    studio.test_modify("Use a clearer title");
+    assert!(
+        !studio.is_busy(),
+        "Same-frame Modify must preserve an unsubmitted form"
+    );
+    let dirty = frame(&mut h, &mut studio);
+    for key in [
+        "studio.modify",
+        "daily.navigate.people",
+        "daily.action.export_button",
+    ] {
+        assert!(
+            !dirty.controls[key].enabled,
+            "{key} must preserve the form draft"
+        );
+    }
+    assert!(dirty.controls["daily.submit"].enabled);
+    h.key(
+        egui::Key::E,
+        true,
+        egui::Modifiers {
+            ctrl: true,
+            ..Default::default()
+        },
+    );
+    frame(&mut h, &mut studio);
+    h.key(egui::Key::E, false, egui::Modifiers::NONE);
+    assert!(!studio.is_busy(), "A shortcut cannot bypass a form draft");
+    assert_eq!(store.load().unwrap(), baseline);
+    replace_form_text(&mut h, &mut studio, "daily.field.name", "Default");
+    assert!(
+        frame(&mut h, &mut studio).controls["studio.modify"].enabled,
+        "Reverting to the original draft is clean"
+    );
+    replace_form_text(&mut h, &mut studio, "daily.field.number", "invalid");
+    assert!(!frame(&mut h, &mut studio).controls["daily.submit"].enabled);
+    click(&mut h, &mut studio, "daily.form.discard");
+    assert!(frame(&mut h, &mut studio).controls["studio.modify"].enabled);
+    replace_form_text(&mut h, &mut studio, "daily.field.name", "Ada");
+    press_until_paused(&mut h, &mut studio, &pause, "daily.submit");
+    // Ordinary same-view submission permits the next draft while the first
+    // request is pending; its acknowledgement must not clear that newer draft.
+    replace_form_text(&mut h, &mut studio, "daily.field.name", "Bea");
+    pause.release.store(true, Ordering::Release);
+    settle(&mut studio);
+    assert_eq!(store.load().unwrap().data.records.len(), 1);
+    assert_eq!(
+        store.load().unwrap().data.records[0].values["name"],
+        other_shape::string("Ada")
+    );
+    assert!(!frame(&mut h, &mut studio).controls["studio.modify"].enabled);
+    click(&mut h, &mut studio, "daily.submit");
+    let saved = store.load().unwrap();
+    assert_eq!(saved.data.records.len(), 2);
+    assert!(saved
+        .data
+        .records
+        .iter()
+        .any(|r| r.values["name"] == other_shape::string("Bea")));
+    assert!(frame(&mut h, &mut studio).controls["studio.modify"].enabled);
+    replace_form_text(&mut h, &mut studio, "daily.field.name", "Cancelled");
+    press_until_paused(&mut h, &mut studio, &pause, "daily.submit");
+    replace_form_text(&mut h, &mut studio, "daily.field.name", "Still here");
+    click(&mut h, &mut studio, "studio.cancel");
+    pause.release.store(true, Ordering::Release);
+    assert_eq!(store.load().unwrap(), saved);
+    assert!(!frame(&mut h, &mut studio).controls["studio.modify"].enabled);
+    click(&mut h, &mut studio, "daily.submit");
+    assert!(store
+        .load()
+        .unwrap()
+        .data
+        .records
+        .iter()
+        .any(|r| r.values["name"] == other_shape::string("Still here")));
+    let saved = store.load().unwrap();
+    replace_form_text(&mut h, &mut studio, "daily.field.name", "refuse");
+    click(&mut h, &mut studio, "daily.submit");
+    assert_eq!(store.load().unwrap(), saved);
+    assert!(
+        !frame(&mut h, &mut studio).controls["studio.modify"].enabled,
+        "Failed submissions retain their correction path"
+    );
+    replace_form_text(&mut h, &mut studio, "daily.field.name", "Corrected");
+    click(&mut h, &mut studio, "daily.submit");
+    assert!(store
+        .load()
+        .unwrap()
+        .data
+        .records
+        .iter()
+        .any(|r| r.values["name"] == other_shape::string("Corrected")));
+    assert!(frame(&mut h, &mut studio).controls["studio.modify"].enabled);
+    let before_navigation = store.load().unwrap();
+    press_until_paused(&mut h, &mut studio, &pause, "daily.navigate.people");
+    assert!(
+        !frame(&mut h, &mut studio).controls["daily.field.name"].enabled,
+        "An in-flight view change must not accept text into the departing form"
+    );
+    pause.release.store(true, Ordering::Release);
+    settle(&mut studio);
+    assert_eq!(studio.test_runtime().unwrap().observation.view, "people");
+    assert_eq!(store.load().unwrap().data, before_navigation.data);
+}
+
+#[cfg(unix)]
+#[test]
+fn comparison_form_drafts_block_both_panes_and_scoped_transitions() {
+    use std::sync::{atomic::Ordering, Arc};
+    for (owner, other) in [("current", "alternative"), ("alternative", "current")] {
+        let dir = tempdir();
+        let root = dir.path();
+        let path = root.join("tool");
+        let store = ProductStore::create(&path, &program(false), 20000).unwrap();
+        let row = add(&store, "active", "Waiting work");
+        action(&store, "wait", "wait", &row);
+        let done = add(&store, "finished", "Completed work");
+        action(&store, "complete", "complete", &done);
+        let before = store.load().unwrap();
+        let pause = Arc::new(product_studio::TestPause::default());
+        pause.release.store(true, Ordering::Release);
+        let mut studio = ProductStudio::testing(
+            root.into(),
+            Some(transport(root, &program(true))),
+            TestHooks {
+                before_preview: Some(pause.clone()),
+                ..TestHooks::default()
+            },
+        );
+        settle(&mut studio);
+        change(&mut studio, &path);
+        let mut h = egui_harness::EguiHarness::new(egui::vec2(1600.0, 2400.0));
+        let finished = format!("studio.finished.job.{}.done", done.id);
+        click(&mut h, &mut studio, "current.navigate.new_work");
+        replace_form_text(&mut h, &mut studio, "current.field.name", "Unsent work");
+        studio.test_lifecycle_outcome(
+            RecordRef {
+                entity: done.entity.clone(),
+                record: done.id.clone(),
+            },
+            "done",
+        );
+        assert!(
+            !studio.is_busy(),
+            "Lifecycle dispatch must preserve the form"
+        );
+        let dirty = frame(&mut h, &mut studio);
+        for key in [
+            finished.as_str(),
+            "studio.no-finished.job",
+            "studio.trial.next-day",
+            "current.navigate.work",
+        ] {
+            assert!(
+                !dirty.controls[key].enabled,
+                "{key} must wait for a submitted or discarded form"
+            );
+        }
+        click(&mut h, &mut studio, "current.form.discard");
+        click(&mut h, &mut studio, &finished);
+        click(&mut h, &mut studio, "current.navigate.work");
+        click(&mut h, &mut studio, "studio.trial.next-day");
+        click(
+            &mut h,
+            &mut studio,
+            &format!("current.row.job.{}.calculate", row.id),
+        );
+        click(
+            &mut h,
+            &mut studio,
+            &format!("current.row.job.{}.complete", row.id),
+        );
+        click(&mut h, &mut studio, "current.action.export");
+        click(&mut h, &mut studio, &format!("{owner}.navigate.new_work"));
+        let choices = [
+            "studio.accept",
+            "studio.keep-current",
+            "studio.either",
+            "studio.both",
+            "studio.neither",
+            "studio.defer",
+        ];
+        let ready = frame(&mut h, &mut studio);
+        for key in choices {
+            assert!(ready.controls[key].enabled, "{key}: {:?}", ready.text);
+        }
+        replace_form_text(
+            &mut h,
+            &mut studio,
+            &format!("{owner}.field.name"),
+            "New draft",
+        );
+        studio.test_scope(ScopePopulation::FutureWork);
+        assert!(!studio.is_busy());
+        studio.test_trial(SemanticInput::AdvanceClock { days: 1 });
+        assert!(!studio.is_busy());
+        studio.test_decide_exact(DecisionOutcome::Deferred);
+        assert!(!studio.is_busy());
+        let dirty = frame(&mut h, &mut studio);
+        for key in choices
+            .into_iter()
+            .chain(["studio.scope.future", "studio.trial.next-day"])
+        {
+            assert!(
+                !dirty.controls[key].enabled,
+                "{owner}: {key} must preserve the draft"
+            );
+        }
+        assert!(!dirty.controls[&format!("{other}.field.name")].enabled);
+        assert!(!dirty.controls[&format!("{other}.submit")].enabled);
+        for pane in [owner, other] {
+            assert!(!dirty.controls[&format!("{pane}.navigate.work")].enabled);
+        }
+        assert!(dirty.controls[&format!("{owner}.submit")].enabled);
+        replace_form_text(
+            &mut h,
+            &mut studio,
+            &format!("{owner}.field.promised"),
+            "invalid",
+        );
+        assert!(!frame(&mut h, &mut studio).controls[&format!("{owner}.submit")].enabled);
+        replace_form_text(
+            &mut h,
+            &mut studio,
+            &format!("{owner}.field.promised"),
+            "2024-10-14",
+        );
+        let current = studio.test_current_trial().unwrap().clone();
+        let alternative = studio.test_alternative().unwrap().clone();
+        press_until_paused(&mut h, &mut studio, &pause, &format!("{owner}.submit"));
+        let submitting = frame(&mut h, &mut studio);
+        for pane in [owner, other] {
+            assert!(
+                !submitting.controls[&format!("{pane}.field.name")].enabled,
+                "Copied submission may rebuild the prepared source; later edits must wait"
+            );
+        }
+        click(&mut h, &mut studio, "studio.cancel");
+        pause.release.store(true, Ordering::Release);
+        assert_eq!(studio.test_current_trial().unwrap(), &current);
+        assert_eq!(studio.test_alternative().unwrap(), &alternative);
+        assert!(!frame(&mut h, &mut studio).controls["studio.scope.future"].enabled);
+        click(&mut h, &mut studio, &format!("{owner}.submit"));
+        for model in [
+            studio.test_current_trial().unwrap(),
+            studio.test_alternative().unwrap(),
+        ] {
+            assert!(model
+                .retained_records
+                .iter()
+                .any(|r| r.values.get("name") == Some(&text("New draft"))));
+        }
+        assert_eq!(store.load().unwrap(), before);
+        assert!(frame(&mut h, &mut studio).controls["studio.scope.future"].enabled);
+        replace_form_text(
+            &mut h,
+            &mut studio,
+            &format!("{other}.field.name"),
+            "Discard this",
+        );
+        click(&mut h, &mut studio, &format!("{other}.form.discard"));
+        click(&mut h, &mut studio, "studio.defer");
+        let saved = store.load().unwrap();
+        let pending = saved.decisions.decisions.last().unwrap().id.clone();
+        assert_eq!(saved.data, before.data);
+        click(&mut h, &mut studio, &format!("studio.resume.{pending}"));
+        if studio.test_current_trial().unwrap().observation.view != "new_work" {
+            click(&mut h, &mut studio, "current.navigate.new_work");
+        }
+        replace_form_text(
+            &mut h,
+            &mut studio,
+            "current.field.name",
+            "Return discards only this draft",
+        );
+        assert!(frame(&mut h, &mut studio)
+            .text
+            .iter()
+            .any(|s| s.contains("Returning discards")));
+        click(&mut h, &mut studio, "studio.return");
+        assert_eq!(store.load().unwrap(), saved);
+        click(&mut h, &mut studio, "daily.navigate.new_work");
+        let daily_basis = store.load().unwrap();
+        replace_form_text(&mut h, &mut studio, "daily.field.name", "Revisit must wait");
+        studio.test_resume_choice(&pending);
+        assert!(!studio.is_busy());
+        assert!(!frame(&mut h, &mut studio).controls[&format!("studio.resume.{pending}")].enabled);
+        assert_eq!(store.load().unwrap(), daily_basis);
+        click(&mut h, &mut studio, "daily.form.discard");
+        click(&mut h, &mut studio, &format!("studio.resume.{pending}"));
+        assert_eq!(studio.test_page(), "change");
+        click(&mut h, &mut studio, "studio.return");
+        assert_eq!(store.load().unwrap(), daily_basis);
+    }
+}

@@ -423,6 +423,9 @@ impl ProductStudio {
         // Only plain controls on both actual sources keep this editing frame.
         let freeze_inputs = match &action {
             Action::Trial { input } => !self.plain_trial_control(input),
+            Action::Daily {
+                input: SemanticInput::Navigate { .. },
+            } => true,
             Action::Preview { .. } | Action::Daily { .. } => false,
             _ => true,
         };
@@ -1228,7 +1231,7 @@ impl ProductStudio {
                     }
                 }
                 if inputs_pending {
-                    trace.label(ui, "Finish or correct the work inputs below before requesting a change or revisiting a choice.");
+                    trace.label(ui, "Finish, correct or discard the work inputs below before requesting a change or revisiting a choice. Closing the tool discards unfinished edits.");
                 }
                 let mut model = model.clone();
                 model.read_only |= inputs_frozen || self.mutation_blocked || basis.day != today;
