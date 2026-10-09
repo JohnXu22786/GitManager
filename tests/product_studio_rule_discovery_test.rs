@@ -996,7 +996,9 @@ fn managed_future_four_pending_outcomes_inherit_and_resolve_after_later_work() {
             ScopePopulation::FutureWork,
             "next-rule",
         );
-        let next_result = discovery_result(&next, &original);
+        // Repeat the exact current-business trace the user experienced and
+        // retained, not a broader proposal that reduction removed from it.
+        let next_result = discovery_result(&next, copy.original_scenario());
         #[cfg(unix)]
         let (next_result, _) = transport(
             &dir.path().join("next-discover"),
@@ -1028,7 +1030,7 @@ fn managed_future_four_pending_outcomes_inherit_and_resolve_after_later_work() {
             repeated.report()
         );
         if outcome == DecisionOutcome::EitherAcceptable {
-            assert_pending_projection_registry(&reopened, &next, &next_result);
+            assert_pending_projection_registry(&reopened, &next, &next_result, &original);
         }
         let late = add(&reopened, "late", "Later real work");
         action(&reopened, "late-wait", "wait", &late);
@@ -1126,6 +1128,7 @@ fn assert_pending_projection_registry(
     store: &ProductStore,
     draft: &RuleDiscoveryDraft,
     result: &DevelopmentResult,
+    broader: &ScenarioSpec,
 ) {
     let current = store.load().unwrap();
     let engine = engine(store);
@@ -1189,6 +1192,37 @@ fn assert_pending_projection_registry(
             .iter()
             .any(|entry| entry.disposition == Disposition::Settled));
     }
+    // The original full proposal also waits, advances time and completes the
+    // new record. The retained minimum did not experience that sequence, so
+    // replaying it is not evidence that its full material outcome was settled.
+    let experienced = result.response.hypotheses[0].scenario().unwrap();
+    let actions = |scene: &ScenarioSpec| {
+        scene
+            .inputs
+            .iter()
+            .filter_map(|input| match input {
+                SemanticInput::Invoke { action, .. } => Some(action.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_ne!(actions(&experienced), actions(broader));
+    let broader_result = discovery_result(draft, broader);
+    let unresolved = discover(draft.request(), &broader_result, &policy, cancel()).unwrap();
+    assert!(unresolved.questions.is_empty());
+    assert!(unresolved
+        .log
+        .iter()
+        .all(|entry| entry.disposition != Disposition::Settled));
+    assert!(
+        unresolved
+            .unverified
+            .iter()
+            .any(|message| message == "Retained material observation correspondence is unresolved"),
+        "{:?}",
+        unresolved
+    );
+
     let mut invalid = result.clone();
     let mut scene = invalid.response.hypotheses[0].scenario().unwrap();
     let value = scene
