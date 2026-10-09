@@ -246,6 +246,7 @@ enum Page {
     },
     Change(ChangeView),
     History {
+        tool: Association,
         basis: Basis,
         view: intention_flow::HistoryView,
     },
@@ -310,6 +311,7 @@ pub struct ProductStudio {
     alternative_renderer: ProductRuntimeView,
     scope_selection: Vec<RecordRef>,
     history: intention_flow::HistoryState,
+    history_tool: Option<Association>,
     need: String,
     provider: ProviderKind,
     profile: CapabilityProfile,
@@ -353,6 +355,7 @@ impl ProductStudio {
             alternative_renderer: ProductRuntimeView::default(),
             scope_selection: vec![],
             history: intention_flow::HistoryState::default(),
+            history_tool: None,
             need: String::new(),
             provider: ProviderKind::Codex,
             profile: CapabilityProfile::DataOnly,
@@ -522,8 +525,11 @@ impl ProductStudio {
                         self.renderer = ProductRuntimeView::default();
                         self.alternative_renderer = ProductRuntimeView::default();
                         self.scope_selection.clear();
-                        if matches!(self.page, Page::History { .. }) {
-                            self.history = intention_flow::HistoryState::default();
+                        if let Page::History { tool, .. } = &self.page {
+                            if self.history_tool.as_ref() != Some(tool) {
+                                self.history = intention_flow::HistoryState::default();
+                                self.history_tool = Some(tool.clone());
+                            }
                         }
                     }
                 }
@@ -842,7 +848,7 @@ impl ProductStudio {
                     close = trace.button(ui, "studio.back", "Back without sending", true);
                 }
             }
-            Page::History { basis, view } => {
+            Page::History { basis, view, .. } => {
                 let (event, widgets) = self.history.show(
                     ui,
                     view,
@@ -852,6 +858,7 @@ impl ProductStudio {
                 if let Some(event) = event {
                     action = Some(match event {
                         intention_flow::Event::Reconcile { needs, request } => {
+                            self.need = request.clone();
                             Action::PrepareReconciliation {
                                 needs,
                                 need: request,

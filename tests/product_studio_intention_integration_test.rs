@@ -520,7 +520,7 @@ fn actual_controls_reconcile_distinct_needs_once_and_adopt_only_after_copied_tri
             .status,
         DecisionStatus::Pending
     );
-    assert_eq!(saved.data, before.data);
+    assert_added_entity_preserves_data(&before.data, &saved.data, "dispatch");
     assert_eq!(invocation_count(&root), 1);
     drop(s);
     while !stopped.load(Ordering::Acquire) {
@@ -678,7 +678,7 @@ fn withdrawal_controls_preserve_later_created_edited_completed_fields_events_out
     hooks.today.store(20003, Ordering::Release);
     let clock = hooks.today.clone();
     let stopped = hooks.stopped.clone();
-    hooks.lose_ack.store(true, Ordering::Release);
+    let lose_ack = hooks.lose_ack.clone();
     let (mut s, mut h) = open(&root, None, hooks);
     click(&mut h, &mut s, "daily.navigate.add_work");
     settle(&mut h, &mut s);
@@ -738,6 +738,7 @@ fn withdrawal_controls_preserve_later_created_edited_completed_fields_events_out
     click(&mut h, &mut s, "intention-copy.submit");
     settle(&mut h, &mut s);
     assert_eq!(store.load().unwrap(), facts);
+    lose_ack.store(true, Ordering::Release);
     click(&mut h, &mut s, "intention-withdraw");
     settle(&mut h, &mut s);
     assert_eq!(s.test_page(), "daily", "{}", s.test_notice());
@@ -906,7 +907,7 @@ fn incompatible_withdrawal_keeps_work_usable_and_managed_reconciliation_can_repa
     settle(&mut h, &mut s);
     assert_eq!(s.test_page(), "daily", "{}", s.test_notice());
     let saved = store.load().unwrap();
-    assert_eq!(saved.data, current.data);
+    assert_added_entity_preserves_data(&current.data, &saved.data, "correction");
     assert_eq!(saved.artifacts, current.artifacts);
     assert_eq!(
         saved
@@ -1131,4 +1132,92 @@ fn restarted_reconcile_rejects_tampered_purpose_basis_needs_evolution_and_operat
         assert_eq!(fs::read(&file).unwrap(), corrupt);
         assert_eq!(store.load().unwrap(), before);
     }
+}
+
+fn assert_added_entity_preserves_data(before: &DataSnapshot, after: &DataSnapshot, added: &str) {
+    assert_eq!(after.version, before.version);
+    assert_eq!(after.project_id, before.project_id);
+    assert_eq!(after.generation, before.generation);
+    assert_eq!(after.records, before.records);
+    assert_eq!(after.events, before.events);
+    assert_eq!(after.schema.len(), before.schema.len() + 1);
+    for entity in &before.schema {
+        assert!(after.schema.contains(entity));
+    }
+    assert!(after.schema.iter().any(|entity| entity.id == added));
+}
+#[cfg(unix)]
+#[test]
+fn history_draft_and_exact_selection_survive_back_and_provider_cancel() {
+    for mode in ["good", "slow"] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let (store, response) = distinct_needs(&root);
+        let before = store.load().unwrap();
+        let transport = transport(&root, &response, mode);
+        let (mut s, mut h) = open(&root, Some(transport), TestHooks::default());
+        choose_needs(&mut h, &mut s);
+        let first = s.test_prepared_request().unwrap().clone();
+        if mode == "slow" {
+            click(&mut h, &mut s, "studio.consent");
+            wait_until(|| invocation_count(&root) == 1);
+            click(&mut h, &mut s, "studio.cancel");
+            settle(&mut h, &mut s);
+            s.test_open(root.join("tool"));
+            settle(&mut h, &mut s);
+        } else {
+            click(&mut h, &mut s, "studio.return");
+            settle(&mut h, &mut s);
+        }
+        assert_eq!(
+            s.test_need(),
+            "Keep collected exports and separate one-off work"
+        );
+        click(&mut h, &mut s, "studio.history");
+        settle(&mut h, &mut s);
+        assert!(frame(&mut h, &mut s).controls["intention-reconcile"].enabled);
+        click(&mut h, &mut s, "intention-reconcile");
+        settle(&mut h, &mut s);
+        let request = s.test_prepared_request().unwrap();
+        assert!(request
+            .request
+            .starts_with("Keep collected exports and separate one-off work\n"));
+        assert!(request
+            .request
+            .contains("Preserve both accepted needs: old-default, second-need."));
+        assert_ne!(request.id, first.id);
+        assert_eq!(invocation_count(&root), usize::from(mode == "slow"));
+        assert_eq!(store.load().unwrap(), before);
+    }
+}
+#[test]
+fn daily_checkpoint_handoff_rechecks_bytes_and_reports_saved_work_warning() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let store = seeded(&root);
+    let pause = std::sync::Arc::new(product_studio::TestPause::default());
+    let hooks = TestHooks {
+        after_commit: Some(pause.clone()),
+        ..TestHooks::default()
+    };
+    let (mut s, mut h) = open(&root, None, hooks);
+    s.test_daily(fixture::add("Saved before backup failure"));
+    wait_until(|| pause.reached.load(Ordering::Acquire));
+    let saved = store.load().unwrap();
+    let object = root.join(format!(
+        "tool/extension-{}.json",
+        saved.decisions.decisions[0].witness.as_str()
+    ));
+    let original = fs::read(&object).unwrap();
+    fs::write(&object, b"broken after verified commit").unwrap();
+    pause.release.store(true, Ordering::Release);
+    settle(&mut h, &mut s);
+    assert!(
+        s.test_notice().contains("saved and usable") && s.test_notice().contains("Do not repeat"),
+        "{}",
+        s.test_notice()
+    );
+    fs::write(&object, original).unwrap();
+    assert_eq!(store.load().unwrap(), saved);
+    assert_eq!(saved.data.records.len(), 1);
 }

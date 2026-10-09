@@ -576,6 +576,8 @@ impl Worker {
             approval_reference: format!("studio-click-{}", key.operation),
             expires_at_unix_ms: unix_ms().saturating_add(5 * 60_000),
         };
+        #[cfg(test)]
+        let generation_started = std::time::Instant::now();
         let provider = ready.prepared.authorize(consent.clone());
         let ordinary = ready.reconciliation.is_some()
             && self.opened.as_ref().is_some_and(|o| {
@@ -609,12 +611,21 @@ impl Worker {
                 ),
             )
         };
+        #[cfg(test)]
+        if ready.reconciliation.is_some() {
+            eprintln!(
+                "Studio reconciliation provider returned: {:?}",
+                generation_started.elapsed()
+            );
+        }
         let receipt = provider.receipt();
         let raw = provider.raw_response();
         if ready.basis.is_none() {
             self.page = Page::Home;
-        } else if let Some(opened) = &self.opened {
-            self.page = daily_page(&opened.association, &opened.store, &opened.snapshot)?;
+        } else if ready.reconciliation.is_none() {
+            if let Some(opened) = &self.opened {
+                self.page = daily_page(&opened.association, &opened.store, &opened.snapshot)?;
+            }
         }
         // Dropping the provider/job and any cancellation join stays on this worker.
         drop(provider);
@@ -1239,14 +1250,14 @@ impl Worker {
             fresh
                 .store
                 .apply(basis.revision, &operation, &input, RuntimeLimits::default());
-        let checked = open_verified(&association.path, Some(&association.identity)).map_err(|e| format!("The save outcome is unresolved: {e}. Keep this operation for exact reconciliation"))?;
+        let mut checked = open_verified(&association.path, Some(&association.identity)).map_err(|e| format!("The save outcome is unresolved: {e}. Keep this operation for exact reconciliation"))?;
         if has_receipt(&checked.snapshot, &operation, &input)? {
             self.committed = Some(association.path.clone());
             self.after_commit();
             self.opened = Some(OpenTool {
                 association: association.clone(),
-                store: checked.store,
-                snapshot: checked.snapshot,
+                store: checked.store.clone(),
+                snapshot: checked.snapshot.clone(),
             });
             self.page = daily_page(
                 &association,
@@ -1262,7 +1273,7 @@ impl Worker {
                 self.recent_inputs.remove(0);
             }
             self.notice = "Your work was saved".into();
-            self.post_save(&association);
+            self.post_save_opened(&association, Some(&mut checked));
             Ok(())
         } else {
             // A fresh verified snapshot has no such receipt: no acknowledged
@@ -1561,12 +1572,13 @@ impl Worker {
             gate.cancelled.clone(),
         )?;
         let basis = Basis::capture(&current.snapshot)?;
+        let tool = current.association.clone();
         if !gate.finish() {
             return Err("Opening history was cancelled; saved work was kept".into());
         }
         self.change = None;
         self.intention = None;
-        self.page = Page::History { basis, view };
+        self.page = Page::History { tool, basis, view };
         Ok(())
     }
     fn prepare_reconciliation(
@@ -2123,7 +2135,22 @@ impl Worker {
                 self.intention_trial(input.clone(), key, gate)
             }
             Action::ReturnDaily => self.return_daily(gate),
-            Action::Consent { disclosure } => self.generate(disclosure.clone(), key, gate),
+            Action::Consent { disclosure } => {
+                let result = self.generate(disclosure.clone(), key, gate);
+                if result.is_err()
+                    && self.ready.is_none()
+                    && matches!(&self.page, Page::Consent { request, .. } if request.operation == DevelopmentOperation::Reconcile)
+                {
+                    if let Some(opened) = &self.opened {
+                        if let Ok(page) =
+                            daily_page(&opened.association, &opened.store, &opened.snapshot)
+                        {
+                            self.page = page;
+                        }
+                    }
+                }
+                result
+            }
             Action::Select { candidate } => self.select(*candidate, key, gate),
             Action::Preview { input } => self.preview(input.clone(), key, gate),
             Action::Save => self.save(key, gate),
