@@ -120,6 +120,7 @@ impl RuleDiscoveryDraft {
         candidate: &str,
         selection: RuleSelection,
         id: &str,
+        need: &str,
         cancelled: Arc<AtomicBool>,
     ) -> Result<Self> {
         selection.check(store, &selection, &cancelled)?;
@@ -165,7 +166,7 @@ impl RuleDiscoveryDraft {
                 id: id.into(),
                 project_id: basis.data.project_id.clone(),
                 operation: DevelopmentOperation::Discover,
-                request: modify_request.request.clone(),
+                request: need.into(),
                 sources: vec![
                     basis.program().map_err(error)?.clone(),
                     selection.prepared.target().clone(),

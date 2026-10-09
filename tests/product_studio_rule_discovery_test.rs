@@ -267,6 +267,8 @@ fn cancel() -> Arc<AtomicBool> {
 fn engine(store: &ProductStore) -> DecisionEngine<LocalRuntime> {
     DecisionEngine::new(LocalRuntime::default(), IntentArchive::new(store.clone()))
 }
+const ORIGINAL_NEED: &str = "Change how waiting contributes to production; preserve commitments";
+
 fn modify(
     store: &ProductStore,
     candidate: &CapturedProgram,
@@ -278,7 +280,7 @@ fn modify(
             &current,
             &format!("modify-{id}"),
             DevelopmentOperation::Modify,
-            "Change how waiting contributes to production; preserve commitments",
+            ORIGINAL_NEED,
             DevelopmentContext {
                 view: Some("work".into()),
                 selected: vec![],
@@ -338,6 +340,7 @@ fn draft_from(
         "changed",
         selection,
         &format!("discover-{id}"),
+        ORIGINAL_NEED,
         cancel(),
     )
     .unwrap()
@@ -886,239 +889,254 @@ fn scenes(store: &ProductStore, copy: &RuleCopyTrace) -> Vec<AcceptedScene> {
     ]
 }
 #[test]
-fn managed_future_four_pending_outcomes_inherit_and_resolve_after_later_work() {
-    for outcome in [
-        DecisionOutcome::EitherAcceptable,
-        DecisionOutcome::BothNeeded,
-        DecisionOutcome::NeitherFits,
-        DecisionOutcome::Deferred,
-    ] {
-        let dir = tempdir();
-        let path = dir.path().join("tool");
-        let store = ProductStore::create(&path, &compact_program(false), 20000).unwrap();
-        let (selected, archived, candidate) = managed(&store, true);
-        let current = store.load().unwrap();
-        let (req, result) = modify(&store, &candidate, "future-rule");
-        #[cfg(unix)]
-        let (result, _) = transport(&dir.path().join("modify"), &req, &result);
-        let d = draft_from(
+fn managed_future_either_acceptable_inherits_and_resolves_after_later_work() {
+    pending_future_outcome(DecisionOutcome::EitherAcceptable);
+}
+
+#[test]
+fn managed_future_both_needed_inherits_and_resolves_after_later_work() {
+    pending_future_outcome(DecisionOutcome::BothNeeded);
+}
+
+#[test]
+fn managed_future_neither_fits_inherits_and_resolves_after_later_work() {
+    pending_future_outcome(DecisionOutcome::NeitherFits);
+}
+
+#[test]
+fn managed_future_deferred_inherits_and_resolves_after_later_work() {
+    pending_future_outcome(DecisionOutcome::Deferred);
+}
+
+fn pending_future_outcome(outcome: DecisionOutcome) {
+    eprintln!("Pending flow {outcome:?}: prepare and discover");
+    let dir = tempdir();
+    let path = dir.path().join("tool");
+    let store = ProductStore::create(&path, &compact_program(false), 20000).unwrap();
+    let (selected, archived, candidate) = managed(&store, true);
+    let current = store.load().unwrap();
+    let (req, result) = modify(&store, &candidate, "future-rule");
+    #[cfg(unix)]
+    let (result, _) = transport(&dir.path().join("modify"), &req, &result);
+    let d = draft_from(
+        &store,
+        req,
+        result,
+        ScopePopulation::FutureWork,
+        "future-rule",
+    );
+    let original = created_scene(&current).0;
+    let result = discovery_result(&d, &original);
+    #[cfg(unix)]
+    let (result, _) = transport(&dir.path().join("discover"), d.request(), &result);
+    let q = d
+        .evaluate(
             &store,
-            req,
+            d.selection(),
             result,
-            ScopePopulation::FutureWork,
-            "future-rule",
+            DiscoveryPolicy::default(),
+            vec![],
+            cancel(),
+        )
+        .unwrap();
+    let copy = first_copy(&store, &d, &q);
+    let accepted = scenes(&store, &copy);
+    for scene in &accepted {
+        let rows = &scene.observations().last().unwrap().outputs[0].rows;
+        let selected_output = rows
+            .iter()
+            .find(|r| r["name"] == text("Selected commitment"))
+            .unwrap();
+        assert_eq!(
+            selected_output["production"],
+            DataValue::Integer { value: 0 }
         );
-        let original = created_scene(&current).0;
-        let result = discovery_result(&d, &original);
-        #[cfg(unix)]
-        let (result, _) = transport(&dir.path().join("discover"), d.request(), &result);
-        let q = d
-            .evaluate(
-                &store,
-                d.selection(),
-                result,
-                DiscoveryPolicy::default(),
-                vec![],
-                cancel(),
-            )
-            .unwrap();
-        let copy = first_copy(&store, &d, &q);
-        let accepted = scenes(&store, &copy);
-        for scene in &accepted {
-            let rows = &scene.observations().last().unwrap().outputs[0].rows;
-            let selected_output = rows
-                .iter()
-                .find(|r| r["name"] == text("Selected commitment"))
-                .unwrap();
-            assert_eq!(
-                selected_output["production"],
-                DataValue::Integer { value: 0 }
-            );
-            assert_eq!(selected_output["promised"], DataValue::Date { days: 20020 });
-        }
-        let e = engine(&store);
-        let change = e
-            .prepare_rehearsed_choice(
-                &store,
-                copy.preparation().clone(),
-                choice(&copy, outcome.clone(), "pending-rule"),
-                accepted,
-                &[],
-                "record-pending",
-            )
-            .unwrap();
-        let saved = e.adopt(&store, &change).unwrap();
-        assert_eq!(saved.data, current.data);
-        assert_eq!(saved.session, current.session);
-        assert_eq!(saved.clock_day, current.clock_day);
-        assert_eq!(saved.active_revision, current.active_revision);
-        assert_eq!(saved.artifacts, current.artifacts);
-        assert_eq!(saved.scope.layers, current.scope.layers);
-        assert_eq!(saved.scope.initializations, current.scope.initializations);
-        assert_eq!(saved.scope.compositions, current.scope.compositions);
-        assert_eq!(saved.scope.adoptions, current.scope.adoptions);
-        assert_eq!(saved.decisions.decisions[0], current.decisions.decisions[0]);
-        let pending = saved
+        assert_eq!(selected_output["promised"], DataValue::Date { days: 20020 });
+    }
+    let e = engine(&store);
+    let change = e
+        .prepare_rehearsed_choice(
+            &store,
+            copy.preparation().clone(),
+            choice(&copy, outcome.clone(), "pending-rule"),
+            accepted,
+            &[],
+            "record-pending",
+        )
+        .unwrap();
+    let saved = e.adopt(&store, &change).unwrap();
+    assert_eq!(saved.data, current.data);
+    assert_eq!(saved.session, current.session);
+    assert_eq!(saved.clock_day, current.clock_day);
+    assert_eq!(saved.active_revision, current.active_revision);
+    assert_eq!(saved.artifacts, current.artifacts);
+    assert_eq!(saved.scope.layers, current.scope.layers);
+    assert_eq!(saved.scope.initializations, current.scope.initializations);
+    assert_eq!(saved.scope.compositions, current.scope.compositions);
+    assert_eq!(saved.scope.adoptions, current.scope.adoptions);
+    assert_eq!(saved.decisions.decisions[0], current.decisions.decisions[0]);
+    let pending = saved
+        .decisions
+        .decisions
+        .iter()
+        .find(|d| d.id == "pending-rule")
+        .unwrap();
+    assert_eq!(pending.status, DecisionStatus::Pending);
+    assert_eq!(pending.outcome, outcome);
+    let reopened = ProductStore::open(&path).unwrap();
+    assert_eq!(reopened.load().unwrap(), saved);
+    assert_eq!(
+        saved
+            .scope
+            .rehearsals
+            .values()
+            .filter(|r| r.witnesses.contains_key("pending-rule"))
+            .count(),
+        1
+    );
+    // A new actual request inherits the retained pair rather than asking
+    // again about the same unchanged business consequences.
+    let (next_req, next_result) = modify(&reopened, copy.preparation().candidate(), "next-rule");
+    assert!(next_req
+        .decisions
+        .decisions
+        .iter()
+        .any(|d| d.id == "pending-rule"));
+    assert!(!next_req.accepted_scenes.is_empty());
+    #[cfg(unix)]
+    let (next_result, _) = transport(&dir.path().join("next-modify"), &next_req, &next_result);
+    let next = draft_from(
+        &reopened,
+        next_req,
+        next_result,
+        ScopePopulation::FutureWork,
+        "next-rule",
+    );
+    // Repeat the exact current-business trace the user experienced and
+    // retained, not a broader proposal that reduction removed from it.
+    let next_result = discovery_result(&next, copy.original_scenario());
+    #[cfg(unix)]
+    let (next_result, _) = transport(
+        &dir.path().join("next-discover"),
+        next.request(),
+        &next_result,
+    );
+    let repeated = next
+        .evaluate(
+            &reopened,
+            next.selection(),
+            next_result.clone(),
+            DiscoveryPolicy::default(),
+            vec![],
+            cancel(),
+        )
+        .unwrap();
+    assert!(
+        repeated.report().questions.is_empty(),
+        "{:?}",
+        repeated.report()
+    );
+    assert!(
+        repeated
+            .report()
+            .log
+            .iter()
+            .any(|l| l.disposition == Disposition::Settled),
+        "{:?}",
+        repeated.report()
+    );
+    eprintln!("Pending flow {outcome:?}: exact saved contrast settled");
+    if outcome == DecisionOutcome::EitherAcceptable {
+        assert_pending_projection_registry(&reopened, &next, &next_result, &original);
+    }
+    eprintln!("Pending flow {outcome:?}: later work and fresh resolution");
+    let late = add(&reopened, "late", "Later real work");
+    action(&reopened, "late-wait", "wait", &late);
+    action(&reopened, "complete-selected", "complete", &selected);
+    let facts = reopened.load().unwrap();
+    assert_eq!(row(&facts, &archived), row(&current, &archived));
+    let reopened = ProductStore::open(&path).unwrap();
+    assert_eq!(reopened.load().unwrap(), facts);
+    // Reopen through the retained one-layer proof, exactly as the host
+    // does, and freshly prepare against the later saved work.
+    let proof = facts
+        .scope
+        .rehearsals
+        .values()
+        .find(|p| p.witnesses.contains_key("pending-rule"))
+        .unwrap();
+    let layer = proof.layer.as_ref().unwrap();
+    let source = facts
+        .programs
+        .iter()
+        .find(|p| canonical_digest(IdentityDomain::Source, *p).unwrap() == layer.candidate)
+        .unwrap();
+    let mut scope = layer.request.clone();
+    for lifecycle in &mut scope.lifecycles {
+        lifecycle.source = facts.active_revision.clone();
+    }
+    assert_eq!(scope.population, ScopePopulation::FutureWork);
+    let mut fresh = reopened
+        .prepare_scoped_change(source, &scope, "resolve-rule")
+        .unwrap();
+    let original = created_scene(&facts).0;
+    let mut mapped = original.clone();
+    mapped.seed = product_runtime::merged_data(fresh.target(), &original.seed).unwrap();
+    let (context, actual) = ScopedExecutionContext::prepared(&facts, &fresh)
+        .unwrap()
+        .project_scenario(facts.program().unwrap(), &original, fresh.target(), &mapped)
+        .unwrap();
+    fresh.correspondences = context.correspondence_proofs();
+    let alternative = engine(&reopened)
+        .accept_scoped_scene(&reopened, &fresh, &actual, Disclosure::Synthetic)
+        .unwrap();
+    let accepted = Choice {
+        id: "resolved-rule".into(),
+        request: "Adopt this freshly experienced future rule".into(),
+        rationale: None,
+        scope: fresh.scope().clone(),
+        outcome: DecisionOutcome::Accept {
+            artifact: fresh.target().artifact.program_digest.clone(),
+        },
+        obligations: vec![],
+        binding: IntentionBinding::ObservedOutcome,
+    };
+    let change = engine(&reopened)
+        .prepare_scoped_resolution(
+            &reopened,
+            fresh,
+            accepted,
+            vec![alternative],
+            &["pending-rule".into()],
+            "resolve-rule",
+        )
+        .unwrap();
+    let adopted = engine(&reopened).adopt(&reopened, &change).unwrap();
+    assert_eq!(adopted.data.events, facts.data.events);
+    assert_eq!(row(&adopted, &late).values["name"], text("Later real work"));
+    assert_eq!(row(&adopted, &archived), row(&facts, &archived));
+    assert_eq!(adopted.decisions.decisions[0], facts.decisions.decisions[0]);
+    assert_eq!(
+        adopted
             .decisions
             .decisions
             .iter()
             .find(|d| d.id == "pending-rule")
-            .unwrap();
-        assert_eq!(pending.status, DecisionStatus::Pending);
-        assert_eq!(pending.outcome, outcome);
-        let reopened = ProductStore::open(&path).unwrap();
-        assert_eq!(reopened.load().unwrap(), saved);
-        assert_eq!(
-            saved
-                .scope
-                .rehearsals
-                .values()
-                .filter(|r| r.witnesses.contains_key("pending-rule"))
-                .count(),
-            1
-        );
-        // A new actual request inherits the retained pair rather than asking
-        // again about the same unchanged business consequences.
-        let (next_req, next_result) =
-            modify(&reopened, copy.preparation().candidate(), "next-rule");
-        assert!(next_req
-            .decisions
-            .decisions
-            .iter()
-            .any(|d| d.id == "pending-rule"));
-        assert!(!next_req.accepted_scenes.is_empty());
-        #[cfg(unix)]
-        let (next_result, _) = transport(&dir.path().join("next-modify"), &next_req, &next_result);
-        let next = draft_from(
-            &reopened,
-            next_req,
-            next_result,
-            ScopePopulation::FutureWork,
-            "next-rule",
-        );
-        // Repeat the exact current-business trace the user experienced and
-        // retained, not a broader proposal that reduction removed from it.
-        let next_result = discovery_result(&next, copy.original_scenario());
-        #[cfg(unix)]
-        let (next_result, _) = transport(
-            &dir.path().join("next-discover"),
-            next.request(),
-            &next_result,
-        );
-        let repeated = next
-            .evaluate(
-                &reopened,
-                next.selection(),
-                next_result.clone(),
-                DiscoveryPolicy::default(),
-                vec![],
-                cancel(),
-            )
-            .unwrap();
-        assert!(
-            repeated.report().questions.is_empty(),
-            "{:?}",
-            repeated.report()
-        );
-        assert!(
-            repeated
-                .report()
-                .log
-                .iter()
-                .any(|l| l.disposition == Disposition::Settled),
-            "{:?}",
-            repeated.report()
-        );
-        if outcome == DecisionOutcome::EitherAcceptable {
-            assert_pending_projection_registry(&reopened, &next, &next_result, &original);
-        }
-        let late = add(&reopened, "late", "Later real work");
-        action(&reopened, "late-wait", "wait", &late);
-        action(&reopened, "complete-selected", "complete", &selected);
-        let facts = reopened.load().unwrap();
-        assert_eq!(row(&facts, &archived), row(&current, &archived));
-        let reopened = ProductStore::open(&path).unwrap();
-        assert_eq!(reopened.load().unwrap(), facts);
-        // Reopen through the retained one-layer proof, exactly as the host
-        // does, and freshly prepare against the later saved work.
-        let proof = facts
-            .scope
-            .rehearsals
-            .values()
-            .find(|p| p.witnesses.contains_key("pending-rule"))
-            .unwrap();
-        let layer = proof.layer.as_ref().unwrap();
-        let source = facts
-            .programs
-            .iter()
-            .find(|p| canonical_digest(IdentityDomain::Source, *p).unwrap() == layer.candidate)
-            .unwrap();
-        let mut scope = layer.request.clone();
-        for lifecycle in &mut scope.lifecycles {
-            lifecycle.source = facts.active_revision.clone();
-        }
-        assert_eq!(scope.population, ScopePopulation::FutureWork);
-        let mut fresh = reopened
-            .prepare_scoped_change(source, &scope, "resolve-rule")
-            .unwrap();
-        let original = created_scene(&facts).0;
-        let mut mapped = original.clone();
-        mapped.seed = product_runtime::merged_data(fresh.target(), &original.seed).unwrap();
-        let (context, actual) = ScopedExecutionContext::prepared(&facts, &fresh)
             .unwrap()
-            .project_scenario(facts.program().unwrap(), &original, fresh.target(), &mapped)
-            .unwrap();
-        fresh.correspondences = context.correspondence_proofs();
-        let alternative = engine(&reopened)
-            .accept_scoped_scene(&reopened, &fresh, &actual, Disclosure::Synthetic)
-            .unwrap();
-        let accepted = Choice {
-            id: "resolved-rule".into(),
-            request: "Adopt this freshly experienced future rule".into(),
-            rationale: None,
-            scope: fresh.scope().clone(),
-            outcome: DecisionOutcome::Accept {
-                artifact: fresh.target().artifact.program_digest.clone(),
-            },
-            obligations: vec![],
-            binding: IntentionBinding::ObservedOutcome,
-        };
-        let change = engine(&reopened)
-            .prepare_scoped_resolution(
-                &reopened,
-                fresh,
-                accepted,
-                vec![alternative],
-                &["pending-rule".into()],
-                "resolve-rule",
-            )
-            .unwrap();
-        let adopted = engine(&reopened).adopt(&reopened, &change).unwrap();
-        assert_eq!(adopted.data.events, facts.data.events);
-        assert_eq!(row(&adopted, &late).values["name"], text("Later real work"));
-        assert_eq!(row(&adopted, &archived), row(&facts, &archived));
-        assert_eq!(adopted.decisions.decisions[0], facts.decisions.decisions[0]);
-        assert_eq!(
-            adopted
-                .decisions
-                .decisions
-                .iter()
-                .find(|d| d.id == "pending-rule")
-                .unwrap()
-                .status,
-            DecisionStatus::Superseded {
-                by: "resolved-rule".into()
-            }
-        );
-        assert_eq!(
-            engine(&reopened)
-                .check_current(&adopted)
-                .unwrap()
-                .disposition,
-            CheckDisposition::Ready
-        );
-        assert_eq!(ProductStore::open(&path).unwrap().load().unwrap(), adopted);
-    }
+            .status,
+        DecisionStatus::Superseded {
+            by: "resolved-rule".into()
+        }
+    );
+    assert_eq!(
+        engine(&reopened)
+            .check_current(&adopted)
+            .unwrap()
+            .disposition,
+        CheckDisposition::Ready
+    );
+    assert_eq!(ProductStore::open(&path).unwrap().load().unwrap(), adopted);
+    eprintln!("Pending flow {outcome:?}: resolved and reopened");
 }
 
 // A context can contain an old scenario frame without admitting that seed
@@ -1472,6 +1490,8 @@ fn oversized_managed_context_is_refused_before_transport_without_changing_work()
     let current = store.load().unwrap();
     let (req, result) = modify(&store, &candidate, "wide-managed");
     let modify_wire = encode_request(&req, &ProviderOptions::default()).unwrap();
+    let modify_id = req.identity().unwrap();
+    let producer = result.producer.clone();
     let d = draft_from(
         &store,
         req,
@@ -1480,6 +1500,38 @@ fn oversized_managed_context_is_refused_before_transport_without_changing_work()
         "wide-managed",
     );
     let req = d.request();
+    assert_eq!(d.modify_request().identity().unwrap(), modify_id);
+    assert_eq!(d.modify_result().producer, producer);
+    assert_eq!(d.modify_result().response.request_digest, modify_id);
+    assert_eq!(d.modify_request().operation, DevelopmentOperation::Modify);
+    assert_eq!(req.operation, DevelopmentOperation::Discover);
+    assert_ne!(req.id, d.modify_request().id);
+    assert_eq!(req.request.lines().next(), Some(ORIGINAL_NEED));
+    assert_eq!(req.request.matches(ORIGINAL_NEED).count(), 1);
+    for section in [
+        "Host-verified editing guide:",
+        "Host-verified intention bindings",
+        "Retained source-qualified replay mappings;",
+    ] {
+        let inherited = d.modify_request().request.matches(section).count();
+        assert!(inherited <= 1);
+        assert_eq!(
+            req.request.matches(section).count(),
+            inherited,
+            "Discover must inherit each applicable {section} exactly once"
+        );
+    }
+    let guide = req
+        .request
+        .lines()
+        .find(|line| line.starts_with("Host-verified editing guide:"))
+        .unwrap();
+    let index: serde_json::Value =
+        serde_json::from_str(&guide[guide.find('{').unwrap()..]).unwrap();
+    assert!(index["editable_source"].is_null());
+    assert!(!req.accepted_scenes.is_empty());
+    assert_eq!(req.accepted_scenes, d.modify_request().accepted_scenes);
+    assert_eq!(req.decisions, current.decisions);
     let bytes = serde_json::to_vec(req).unwrap().len();
     let error = encode_request(req, &ProviderOptions::default())
         .err()
