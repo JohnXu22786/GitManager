@@ -583,6 +583,112 @@ fn reconcile_consent_return_restart_and_tampered_association_never_send() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn interrupted_reconcile_keeps_other_tools_writable_across_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let (original, response) = distinct_needs(&root);
+    let before = original.load().unwrap();
+    let transport = transport(&root, &response, "good");
+    let hooks = TestHooks::default();
+    let stopped = hooks.stopped.clone();
+    let (mut s, mut h) = open(&root, Some(transport.clone()), hooks);
+    choose_needs(&mut h, &mut s);
+    let request = s.test_prepared_request().unwrap().clone();
+    drop(s);
+    wait_until(|| stopped.load(Ordering::Acquire));
+
+    // Inject the same ownerless-process crash used by the existing provider
+    // restart regression, retaining the actual prepared Reconcile binding.
+    let session = root.join("studio/session.json");
+    let mut journal: serde_json::Value =
+        serde_json::from_slice(&fs::read(&session).unwrap()).unwrap();
+    journal["provider"]["issued"] = serde_json::json!(true);
+    fs::write(&session, serde_json::to_vec(&journal).unwrap()).unwrap();
+    let binding = journal["provider"].clone();
+    let mut receipt = transport.inspect(&request.id).unwrap();
+    receipt.state = product_provider::JobState::Running;
+    fs::write(
+        root.join("jobs").join(&request.id).join("receipt.json"),
+        serde_json::to_vec(&receipt).unwrap(),
+    )
+    .unwrap();
+
+    let other_path = root.join("other-tool");
+    let other =
+        ProductStore::create(&other_path, &fixture::capture(fixture::organizer()), 20000).unwrap();
+    let hooks = TestHooks {
+        folder_choice: Some(other_path.clone()),
+        ..TestHooks::default()
+    };
+    let stopped = hooks.stopped.clone();
+    let mut s = ProductStudio::testing(root.clone(), Some(transport.clone()), hooks);
+    settle(&mut h, &mut s);
+    assert!(s.test_generation_blocked());
+    assert_eq!(
+        transport.inspect(&request.id).unwrap().state,
+        product_provider::JobState::Interrupted
+    );
+    click(&mut h, &mut s, "studio.close");
+    settle(&mut h, &mut s);
+    click(&mut h, &mut s, "studio.open");
+    settle(&mut h, &mut s);
+    assert_eq!(s.test_page(), "daily", "{}", s.test_notice());
+    let journal: serde_json::Value = serde_json::from_slice(&fs::read(&session).unwrap()).unwrap();
+    assert_eq!(journal["last"]["path"], serde_json::json!(other_path));
+    assert_eq!(journal["provider"], binding);
+
+    for (index, name) in ["First offline work", "Second offline work"]
+        .iter()
+        .enumerate()
+    {
+        click(&mut h, &mut s, "daily.navigate.new_person");
+        settle(&mut h, &mut s);
+        fill(&mut h, &mut s, "daily.field.name", name);
+        fill(&mut h, &mut s, "daily.field.area", "north");
+        click(&mut h, &mut s, "daily.submit");
+        settle(&mut h, &mut s);
+        assert_eq!(other.load().unwrap().data.records.len(), index + 1);
+        let journal: serde_json::Value =
+            serde_json::from_slice(&fs::read(&session).unwrap()).unwrap();
+        assert!(journal["pending"].is_null());
+        assert_eq!(journal["provider"], binding);
+        click(&mut h, &mut s, "daily.navigate.people");
+        settle(&mut h, &mut s);
+    }
+    drop(s);
+    wait_until(|| stopped.load(Ordering::Acquire));
+    let mut s = ProductStudio::testing(root.clone(), Some(transport), TestHooks::default());
+    settle(&mut h, &mut s);
+    assert_eq!(s.test_page(), "daily", "{}", s.test_notice());
+    assert!(s.test_generation_blocked());
+    assert_eq!(s.test_runtime().unwrap().retained_records.len(), 2);
+    click(&mut h, &mut s, "daily.navigate.new_person");
+    settle(&mut h, &mut s);
+    fill(&mut h, &mut s, "daily.field.name", "After restart");
+    fill(&mut h, &mut s, "daily.field.area", "north");
+    click(&mut h, &mut s, "daily.submit");
+    settle(&mut h, &mut s);
+    let saved = other.load().unwrap();
+    assert_eq!(saved.data.records.len(), 3);
+    for name in ["First offline work", "Second offline work", "After restart"] {
+        assert!(saved
+            .data
+            .records
+            .iter()
+            .any(|record| { record.values.get("name") == Some(&fixture::string(name)) }));
+    }
+    let journal: serde_json::Value = serde_json::from_slice(&fs::read(&session).unwrap()).unwrap();
+    assert!(journal["pending"].is_null());
+    assert_eq!(journal["provider"], binding);
+    assert_eq!(original.load().unwrap(), before);
+    assert_eq!(invocation_count(&root), 0);
+    click(&mut h, &mut s, "studio.close");
+    settle(&mut h, &mut s);
+    assert!(!frame(&mut h, &mut s).controls["studio.prepare"].enabled);
+}
+
 #[path = "../src/product_studio/change_adapter.rs"]
 mod mapping_fixture;
 #[path = "fixtures/product_scope/mod.rs"]

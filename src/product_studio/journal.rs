@@ -192,7 +192,6 @@ impl Journal {
                         || !valid_id(&binding.evolution)
                         || !valid_id(&binding.operation)
                         || binding.evolution == binding.operation
-                        || self.last.as_ref() != Some(&binding.tool)
                         || request.project_id != binding.tool.identity.project_id
                         || request
                             .sources
