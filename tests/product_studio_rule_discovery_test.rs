@@ -319,7 +319,14 @@ fn draft_from(
         None,
     )
     .unwrap();
-    let scope = request(&snapshot, population);
+    let scope = change_adapter::request(
+        &snapshot,
+        &source,
+        population,
+        fixture::request(&snapshot, ScopePopulation::All).lifecycles,
+        Default::default(),
+    )
+    .unwrap();
     let prepared = store.prepare_scoped_change(&source, &scope, id).unwrap();
     let selection =
         RuleSelection::checked(store, &snapshot, prepared, scope, id, cancel()).unwrap();
@@ -498,7 +505,13 @@ fn transport(
     fs::create_dir(&home).unwrap();
     let t =
         ProviderTransport::new_fixture(root.join("jobs"), ProviderKind::Codex, bin, home).unwrap();
-    let p = prepare_development(t, request, ProviderOptions::default()).unwrap();
+    let p = prepare_development(t, request, ProviderOptions::default()).unwrap_or_else(|error| {
+        panic!(
+            "request {} ({} serialized bytes): {error:?}",
+            request.id,
+            serde_json::to_vec(request).unwrap().len()
+        )
+    });
     let c = ConsentReceipt {
         disclosure_digest: p.disclosure().digest(),
         approval_reference: "Fictional offline test only".into(),
@@ -736,7 +749,21 @@ fn duplicate_observation_invalidates_example_and_copy_checks_current_data() {
         .is_err());
 }
 
-fn managed(store: &ProductStore) -> (Record, Record, CapturedProgram) {
+fn compact_program(pause: bool) -> CapturedProgram {
+    // A stored production result is the sole changed semantic slot. Completion
+    // preserves that result; both the view and export expose it unchanged.
+    let mut raw = serde_json::to_value(program(pause).program).unwrap();
+    raw["actions"][4]["steps"][0]["values"]
+        .as_object_mut()
+        .unwrap()
+        .remove("production");
+    raw["actions"][6]["steps"][0]["columns"]["production"] =
+        serde_json::to_value(field("row", "production")).unwrap();
+    raw["views"][0]["kind"]["columns"][1]["value"] =
+        serde_json::to_value(field("row", "production")).unwrap();
+    capture(raw)
+}
+fn managed(store: &ProductStore, compact: bool) -> (Record, Record, CapturedProgram) {
     let selected = add(store, "selected", "Selected commitment");
     let archived = add(store, "archived", "Completed history");
     action(store, "finish-old", "complete", &archived);
@@ -744,20 +771,27 @@ fn managed(store: &ProductStore) -> (Record, Record, CapturedProgram) {
     action(store, "wait-selected", "wait", &selected);
     tick(store, "day", 20003);
     let current = store.load().unwrap();
+    let authored = if compact {
+        compact_program(true)
+    } else {
+        program(true)
+    };
+    let population = ScopePopulation::SelectedUnfinished {
+        records: vec![RecordRef {
+            entity: selected.entity.clone(),
+            record: selected.id.clone(),
+        }],
+    };
+    let scope = change_adapter::request(
+        &current,
+        &authored,
+        population,
+        fixture::request(&current, ScopePopulation::All).lifecycles,
+        Default::default(),
+    )
+    .unwrap();
     let first = store
-        .prepare_scoped_change(
-            &program(true),
-            &request(
-                &current,
-                ScopePopulation::SelectedUnfinished {
-                    records: vec![RecordRef {
-                        entity: selected.entity.clone(),
-                        record: selected.id.clone(),
-                    }],
-                },
-            ),
-            "selected-rule",
-        )
+        .prepare_scoped_change(&authored, &scope, "selected-rule")
         .unwrap();
     let scene = ScenarioSpec {
         version: 1,
@@ -796,13 +830,18 @@ fn managed(store: &ProductStore) -> (Record, Record, CapturedProgram) {
         .prepare_scoped_choice(store, first, choice, vec![accepted], "selected-rule")
         .unwrap();
     e.adopt(store, &change).unwrap();
-    let mut raw = serde_json::to_value(program(true).program).unwrap();
-    for pointer in [
-        "/actions/3/steps/0/values/production",
-        "/actions/4/steps/0/values/production",
-        "/actions/6/steps/0/columns/production",
-        "/views/0/kind/columns/1/value",
-    ] {
+    let mut raw = serde_json::to_value(authored.program).unwrap();
+    let pointers: &[&str] = if compact {
+        &["/actions/3/steps/0/values/production"]
+    } else {
+        &[
+            "/actions/3/steps/0/values/production",
+            "/actions/4/steps/0/values/production",
+            "/actions/6/steps/0/columns/production",
+            "/views/0/kind/columns/1/value",
+        ]
+    };
+    for pointer in pointers {
         let old = raw.pointer(pointer).unwrap().clone();
         *raw.pointer_mut(pointer).unwrap() =
             serde_json::json!({"kind":"add","left":old,"right":int(1)});
@@ -849,8 +888,8 @@ fn managed_future_four_pending_outcomes_inherit_and_resolve_after_later_work() {
     ] {
         let dir = tempdir();
         let path = dir.path().join("tool");
-        let store = ProductStore::create(&path, &program(false), 20000).unwrap();
-        let (selected, archived, candidate) = managed(&store);
+        let store = ProductStore::create(&path, &compact_program(false), 20000).unwrap();
+        let (selected, archived, candidate) = managed(&store, true);
         let current = store.load().unwrap();
         let (req, result) = modify(&store, &candidate, "future-rule");
         #[cfg(unix)]
@@ -1071,7 +1110,7 @@ fn managed_future_four_pending_outcomes_inherit_and_resolve_after_later_work() {
 }
 
 #[test]
-fn observation_only_minimum_is_playable_but_not_an_adoption_trace() {
+fn observation_only_minimum_uses_its_checked_action_bearing_original() {
     let dir = tempdir();
     let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
     let row = add(&store, "row", "Waiting");
@@ -1079,28 +1118,90 @@ fn observation_only_minimum_is_playable_but_not_an_adoption_trace() {
     tick(&store, "days", 20003);
     let current = store.load().unwrap();
     let d = draft(&store, &program(true), ScopePopulation::All, "primary");
-    let scene = ScenarioSpec {
+    let mut scene = ScenarioSpec {
         version: 1,
-        id: "observation-only".into(),
-        label: "Observed timing".into(),
+        id: "observation-minimum".into(),
+        label: "Observe an exported timing result".into(),
         seed: current.data.clone(),
         session: current.session.clone(),
         clock_day: current.clock_day,
         random_seed: 42,
-        inputs: vec![SemanticInput::Observe {
-            point: "result".into(),
-        }],
+        inputs: vec![
+            invoke("export", &[]),
+            SemanticInput::Observe {
+                point: "result".into(),
+            },
+        ],
         validity: vec![],
     };
     let q = queue(&store, &d, &scene);
-    assert!(!q.report().questions.is_empty(), "{:?}", q.report());
-    let question = &q.report().questions[0];
-    assert!(q
-        .open_example(&store, d.selection(), &question.id, 0, cancel())
-        .is_ok());
-    assert!(q
-        .copy_trace(&store, d.selection(), &question.id, 0, cancel())
-        .is_err());
+    let (question, index, witness) = q
+        .report()
+        .questions
+        .iter()
+        .find_map(|q| {
+            q.witnesses
+                .iter()
+                .enumerate()
+                .find(|(_, w)| {
+                    w.witness()
+                        .scenario
+                        .inputs
+                        .iter()
+                        .all(|i| matches!(i, SemanticInput::Observe { .. }))
+                })
+                .map(|(index, w)| (q, index, w))
+        })
+        .expect("The real exported example must reduce to an observation-only view witness");
+    let example = q
+        .open_example(&store, d.selection(), &question.id, index, cancel())
+        .unwrap();
+    assert_eq!(example.scenario(), &witness.witness().scenario);
+    let copy = q
+        .copy_trace(&store, d.selection(), &question.id, index, cancel())
+        .unwrap();
+    assert!(copy
+        .original_scenario()
+        .inputs
+        .iter()
+        .any(|i| matches!(i,SemanticInput::Invoke { action, .. } if action=="export")));
+    assert_ne!(
+        copy.original_scenario().inputs,
+        witness.witness().scenario.inputs
+    );
+    assert!(copy
+        .evidence()
+        .iter()
+        .all(|r| r.state == EvidenceState::Observed));
+    // A provider's actionless original is correctly irrelevant. It cannot
+    // manufacture a question or a scoped adoption merely from a visible value.
+    scene.inputs.remove(0);
+    let actionless = queue(&store, &d, &scene);
+    assert!(actionless.report().questions.is_empty());
+    assert!(actionless
+        .report()
+        .log
+        .iter()
+        .any(|l| l.disposition == Disposition::Irrelevant));
+    assert_eq!(store.load().unwrap(), current);
+}
+
+#[test]
+fn oversized_managed_context_is_refused_before_transport_without_changing_work() {
+    let dir = tempdir();
+    let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
+    let (_, _, candidate) = managed(&store, false);
+    let current = store.load().unwrap();
+    let (req, _) = modify(&store, &candidate, "wide-managed");
+    let bytes = serde_json::to_vec(&req).unwrap().len();
+    let error = encode_request(&req, &ProviderOptions::default())
+        .err()
+        .expect("The full multi-slot retained context exceeds the fixed transport bound");
+    eprintln!(
+        "Bounded managed request {}: {} serialized request bytes; {error:?}",
+        req.id, bytes
+    );
+    assert!(format!("{error:?}").contains("prompt must be bounded"));
     assert_eq!(store.load().unwrap(), current);
 }
 
