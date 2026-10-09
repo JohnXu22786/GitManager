@@ -32,6 +32,39 @@ impl IntentArchive {
     pub fn new(store: ProductStore) -> Self {
         Self { store }
     }
+    /// Checked historical scene bodies for a decision still present in this
+    /// store. Integrity and exact graph bindings are verified; this read does
+    /// not claim that historical observations are fresh execution evidence.
+    pub fn accepted_scenes(&self, decision: &ScopedDecision) -> Result<Vec<AcceptedScene>> {
+        let current = self.store.load()?;
+        if !current.decisions.decisions.contains(decision) {
+            return Err(DecisionError::Unverified(
+                "The selected intention changed or is not in this saved tool".into(),
+            ));
+        }
+        let scenes = self.load(&decision.witness)?;
+        validate_scene_bindings(decision, &scenes)?;
+        if scenes
+            .iter()
+            .map(|scene| scene.scenario.identity())
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            != decision.scenarios
+            || scenes.iter().any(|scene| {
+                scene.program.binding.project_id != current.data.project_id
+                    || scene.scenario.seed.project_id != current.data.project_id
+            })
+        {
+            return Err(invalid(
+                "accepted scenes differ from their exact stored intention",
+            ));
+        }
+        if self.store.load()? != current {
+            return Err(DecisionError::Unverified(
+                "Saved work changed while reading intention history".into(),
+            ));
+        }
+        Ok(scenes)
+    }
     pub(super) fn stage(&self, scenes: &[AcceptedScene]) -> Result<Digest> {
         if scenes.is_empty() || scenes.len() > MAX_ITEMS {
             return Err(invalid("accepted scene count is outside limits"));
