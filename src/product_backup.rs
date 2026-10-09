@@ -700,6 +700,33 @@ impl LegacyBackup {
     pub fn original_bytes(&self) -> &[u8] {
         &self.original
     }
+    /// Explicit ordinary recovery always creates a separate instance. Unlike
+    /// the resumable upgrade API, this refuses even a matching existing inbox.
+    /// Instance/path checks run before CURRENT; registration failure afterward
+    /// is retained as a saved-tool warning, never a request to repeat creation.
+    pub fn upgrade_recover_tool<P>(
+        &self,
+        path: &Path,
+        recent: &RecentTools,
+        opened_unix_ms: u64,
+        mut progress: P,
+    ) -> Result<CreatedTool>
+    where
+        P: FnMut(crate::product_store::UpgradeProgress),
+    {
+        recent.create_and_remember(path, opened_unix_ms, |verify_instance| {
+            self.recover_inner(
+                path,
+                &mut progress,
+                true,
+                verify_instance,
+                #[cfg(test)]
+                None,
+            )?;
+            // The upgrade's write session is never handed to ordinary editing.
+            Ok(ProductStore::open(path)?)
+        })
+    }
     /// On success, restart, open_verified the chosen path, then register that
     /// new instance. A failed pre-pointer attempt leaves only staged immutable
     /// files; the original backup and any existing tool remain untouched.
@@ -714,6 +741,8 @@ impl LegacyBackup {
         self.recover_inner(
             path,
             progress,
+            false,
+            &|| Ok(()),
             #[cfg(test)]
             None,
         )
@@ -728,12 +757,14 @@ impl LegacyBackup {
     where
         P: FnMut(crate::product_store::UpgradeProgress),
     {
-        self.recover_inner(path, progress, Some(fault))
+        self.recover_inner(path, progress, false, &|| Ok(()), Some(fault))
     }
     fn recover_inner<P>(
         &self,
         path: &Path,
         progress: P,
+        fresh_only: bool,
+        verify_instance: &dyn Fn() -> Result<()>,
         #[cfg(test)] fault: Option<crate::product_store::FaultPoint>,
     ) -> Result<crate::product_store::UpgradeSummary>
     where
@@ -743,10 +774,13 @@ impl LegacyBackup {
         Ok(ProductStore::recover_upgraded_with(
             path,
             &verified.upgrade,
+            fresh_only,
             |store, snapshot| {
+                verify_instance().map_err(|e| StoreError::Conflict(e.to_string()))?;
                 IntentArchive::new(store.clone())
                     .restore_for(snapshot, &verified.intentions)
-                    .map_err(|e| StoreError::Corrupt(e.to_string()))
+                    .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+                verify_instance().map_err(|e| StoreError::Conflict(e.to_string()))
             },
             progress,
             #[cfg(test)]
