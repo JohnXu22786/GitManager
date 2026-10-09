@@ -1149,6 +1149,7 @@ fn assert_pending_projection_registry(
                 )
                 .is_err()
     }));
+    let mut retained_frames = vec![];
     for scene in scenes {
         context
             .verify_seed(
@@ -1172,7 +1173,19 @@ fn assert_pending_projection_registry(
                 .verify_seed(source, &actual.seed, actual.clock_day)
                 .unwrap();
         }
+        retained_frames.push(actual);
     }
+    let original = result.response.hypotheses[0].scenario().unwrap();
+    let mut mapped = original.clone();
+    mapped.seed = product_runtime::merged_data(prepared.target(), &original.seed).unwrap();
+    let (_, proposed_frame) = context
+        .project_scenario(
+            current.program().unwrap(),
+            &original,
+            prepared.target(),
+            &mapped,
+        )
+        .unwrap();
     let mut history = VerifiedRetainedHistory::load(store).unwrap();
     history
         .map_prepared_target(prepared.clone(), vec![])
@@ -1192,6 +1205,124 @@ fn assert_pending_projection_registry(
             .iter()
             .any(|entry| entry.disposition == Disposition::Settled));
     }
+    let history = policy.retained_history.as_ref().unwrap();
+    let retained = &retained_frames[0];
+    assert_ne!(proposed_frame.seed, retained.seed);
+    assert!(history
+        .equivalent_prepared_frames(
+            current.program().unwrap(),
+            prepared.target(),
+            &proposed_frame,
+            retained,
+            &cancel(),
+        )
+        .unwrap());
+    for change in [
+        "business",
+        "action",
+        "day",
+        "environment",
+        "provenance",
+        "missing_origin",
+        "unknown_cell",
+    ] {
+        let mut changed = proposed_frame.clone();
+        match change {
+            "business" => {
+                changed.seed.records[0]
+                    .values
+                    .insert("promised".into(), DataValue::Date { days: 20021 });
+            }
+            "action" => {
+                changed.inputs.insert(0, invoke("export", &[]));
+            }
+            "day" => changed.clock_day += 1,
+            "environment" => changed.random_seed += 1,
+            "missing_origin" => changed.id = "unbound-projected-frame".into(),
+            "unknown_cell" => {
+                changed.seed.schema[0].fields.push(FieldDefinition {
+                    id: "gm_scope_unaccounted_member".into(),
+                    label: "Unaccounted provenance".into(),
+                    value_type: Type::Optional {
+                        item: Box::new(Type::Boolean),
+                    },
+                });
+                changed.seed.records[0].values.insert(
+                    "gm_scope_unaccounted_member".into(),
+                    DataValue::Boolean { value: true },
+                );
+            }
+            "provenance" => {
+                let value = changed
+                    .seed
+                    .records
+                    .iter_mut()
+                    .flat_map(|r| r.values.iter_mut())
+                    .find(|(key, value)| {
+                        key.starts_with(RESERVED_PREFIX)
+                            && matches!(value, DataValue::Boolean { .. })
+                    })
+                    .map(|(_, value)| value)
+                    .unwrap();
+                if let DataValue::Boolean { value } = value {
+                    *value = !*value;
+                }
+            }
+            _ => unreachable!(),
+        }
+        assert_ne!(
+            history
+                .equivalent_prepared_frames(
+                    current.program().unwrap(),
+                    prepared.target(),
+                    &changed,
+                    retained,
+                    &cancel(),
+                )
+                .ok(),
+            Some(true),
+            "{change}"
+        );
+    }
+    let cancelled = cancel();
+    cancelled.store(true, Ordering::Release);
+    assert!(matches!(
+        history.equivalent_prepared_frames(
+            current.program().unwrap(),
+            prepared.target(),
+            &proposed_frame,
+            retained,
+            &cancelled,
+        ),
+        Err(AdapterError::Cancelled)
+    ));
+    // Forged/cyclic correspondence origins cannot enter the checked inventory.
+    let proof = context
+        .correspondence_proofs()
+        .values()
+        .find(|proof| proof.scenario.is_some())
+        .unwrap()
+        .clone();
+    for cyclic in [false, true] {
+        let mut forged = proof.clone();
+        if cyclic {
+            let pair = forged.scenario.as_mut().unwrap();
+            pair.original = pair.projected.clone();
+            forged.original = pair.projected.seed.clone();
+        } else {
+            forged.operation_seed =
+                canonical_digest(IdentityDomain::Data, &"missing origin").unwrap();
+        }
+        let mut invalid = prepared.clone();
+        invalid
+            .correspondences
+            .insert(forged.identity().unwrap(), forged);
+        assert!(VerifiedRetainedHistory::load(store)
+            .unwrap()
+            .map_prepared_target(invalid, vec![])
+            .is_err());
+    }
+
     // The original full proposal also waits, advances time and completes the
     // new record. The retained minimum did not experience that sequence, so
     // replaying it is not evidence that its full material outcome was settled.
