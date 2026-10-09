@@ -21,8 +21,8 @@ use std::{
     },
 };
 type Result<T> = std::result::Result<T, String>;
-fn error(e: impl std::fmt::Display) -> String {
-    e.to_string()
+fn error(e: impl std::fmt::Debug) -> String {
+    format!("{e:?}")
 }
 fn cancelled(flag: &AtomicBool) -> Result<()> {
     if flag.load(Ordering::Acquire) {
@@ -883,6 +883,30 @@ impl HistoricalScene {
                     .iter()
                     .find(|o| &o.id == id)
                     .map(|o| o.label.as_str())
+                    .unwrap_or(id);
+                trace.label(ui, format!("{label}: {}", value_text(value)));
+            }
+            let controls = match view.map(|v| &v.kind) {
+                Some(ViewKind::List { controls, .. }) => controls.as_slice(),
+                _ => &[],
+            };
+            for (id, value) in &observed.view.controls {
+                let label = controls
+                    .iter()
+                    .find(|c| &c.id == id)
+                    .map(|c| c.label.as_str())
+                    .unwrap_or(id);
+                trace.label(ui, format!("{label}: {}", value_text(value)));
+            }
+            let fields = match view.map(|v| &v.kind) {
+                Some(ViewKind::Form { fields, .. }) => fields.as_slice(),
+                _ => &[],
+            };
+            for (id, value) in &observed.view.form_values {
+                let label = fields
+                    .iter()
+                    .find(|f| &f.parameter == id)
+                    .map(|f| f.label.as_str())
                     .unwrap_or(id);
                 trace.label(ui, format!("{label}: {}", value_text(value)));
             }

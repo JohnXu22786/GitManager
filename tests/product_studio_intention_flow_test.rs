@@ -1148,3 +1148,79 @@ fn history_keeps_nonbinary_outcomes_distinct_and_does_not_accept_rejected_exampl
         assert_eq!(store.load().unwrap(), basis);
     }
 }
+
+#[test]
+fn history_renders_control_and_form_only_recorded_values() {
+    let dir = tempdir();
+    let mut value = serde_json::to_value(program(false).program).unwrap();
+    value["observables"] = serde_json::json!([]);
+    value["state"] = serde_json::json!([{"id":"search","label":"Search text","value_type":{"kind":"text"},"initial":text("")}]);
+    value["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"remember_filter","label":"Remember filter","parameters":{},"guards":[],"steps":[{"kind":"set_state","state":"search","value":{"kind":"state","state":"search"}}],"ensures":[]}));
+    value["views"][0]["kind"]["controls"] = serde_json::json!([{"id":"search_control","label":"Search jobs","state":"search","on_change":"remember_filter"}]);
+    value["views"].as_array_mut().unwrap().push(serde_json::json!({"id":"entry","label":"Work entry","kind":{"kind":"form","action":"add","fields":[{"parameter":"name","label":"Work name"},{"parameter":"promised","label":"Promised date"}],"defaults":{"name":text("Unsubmitted form"),"promised":{"kind":"date","days":20020}}},"actions":[],"keys":[]}));
+    let captured = capture(value);
+    let store = ProductStore::create(dir.path().join("tool"), &captured, 20000).unwrap();
+    let basis = store.load().unwrap();
+    let mut example = scenario(&basis, "controls-form");
+    example.inputs = vec![
+        SemanticInput::Control {
+            view: "work".into(),
+            control: "search_control".into(),
+            value: text("North district"),
+        },
+        SemanticInput::Observe {
+            point: "control".into(),
+        },
+        SemanticInput::Navigate {
+            view: "entry".into(),
+        },
+        SemanticInput::Observe {
+            point: "form".into(),
+        },
+    ];
+    let e = engine(&store);
+    let accepted = e
+        .accept_current_scene(&basis, &example, Disclosure::Synthetic)
+        .unwrap();
+    assert!(accepted
+        .observations()
+        .iter()
+        .all(|o| o.values.is_empty() && o.view.rows.is_empty() && o.outputs.is_empty()));
+    let mut selected = choice("form-control", DecisionOutcome::Deferred);
+    selected.scope.operations = ["remember_filter".into()].into();
+    let ready = e
+        .prepare_choice(
+            &store,
+            basis.program().unwrap(),
+            selected,
+            vec![accepted],
+            "save-form-control",
+        )
+        .unwrap();
+    let saved = e.adopt(&store, &ready).unwrap();
+    let view = HistoryView::load(&store, &saved, cancellation()).unwrap();
+    let mut state = HistoryState::default();
+    let mut h = egui_harness::EguiHarness::new(egui::vec2(1200.0, 1600.0));
+    let frame = |h: &mut egui_harness::EguiHarness, state: &mut HistoryState| {
+        h.frame(|ctx| {
+            egui::CentralPanel::default()
+                .show(ctx, |ui| state.show(ui, &view, true))
+                .inner
+        })
+    };
+    let (_, trace) = frame(&mut h, &mut state);
+    let point = trace.controls["intention-details-form-control"]
+        .rect
+        .center();
+    h.press_at(point);
+    frame(&mut h, &mut state);
+    h.release_at(point);
+    frame(&mut h, &mut state);
+    let (_, trace) = frame(&mut h, &mut state);
+    let text = trace.text.join("\n");
+    assert!(text.contains("Search jobs: North district"), "{text}");
+    assert!(text.contains("Work name: Unsubmitted form"), "{text}");
+    assert!(text.contains("Promised date:"), "{text}");
+    assert!(!text.contains("Accepted result"), "{text}");
+    assert_eq!(store.load().unwrap(), saved);
+}
