@@ -1171,7 +1171,7 @@ fn history_renders_control_and_form_only_recorded_values() {
     let mut value = serde_json::to_value(program(false).program).unwrap();
     value["observables"] = serde_json::json!([]);
     value["state"] = serde_json::json!([{"id":"search","label":"Search text","value_type":{"kind":"text"},"initial":text("")}]);
-    value["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"remember_filter","label":"Remember filter","parameters":{},"guards":[],"steps":[{"kind":"set_state","state":"search","value":{"kind":"state","state":"search"}}],"ensures":[]}));
+    value["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"remember_filter","label":"Remember filter","parameters":{"value":{"kind":"text"}},"guards":[],"steps":[{"kind":"set_state","state":"search","value":var("value")}],"ensures":[]}));
     value["views"][0]["kind"]["controls"] = serde_json::json!([{"id":"search_control","label":"Search jobs","state":"search","on_change":"remember_filter"}]);
     value["views"].as_array_mut().unwrap().push(serde_json::json!({"id":"entry","label":"Work entry","kind":{"kind":"form","action":"add","fields":[{"parameter":"name","label":"Work name"},{"parameter":"promised","label":"Promised date"}],"defaults":{"name":text("Unsubmitted form"),"promised":{"kind":"date","days":20020}}},"actions":[],"keys":[]}));
     let captured = capture(value);
