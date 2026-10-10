@@ -12,6 +12,12 @@ mod journal;
 mod local_files_flow;
 #[path = "product_studio/local_files_host.rs"]
 mod local_files_host;
+#[path = "product_studio/task_source_flow.rs"]
+mod task_source_flow;
+#[path = "product_studio/task_source_host.rs"]
+mod task_source_host;
+#[path = "product_studio/task_source_machine.rs"]
+mod task_source_machine;
 #[path = "product_studio/worker.rs"]
 mod worker;
 use crate::product_backup::{
@@ -127,8 +133,35 @@ struct Key {
     epoch: u64,
     operation: String,
     basis: Option<Basis>,
+    task: Option<task_source_host::Link>,
+    task_source: Option<SourceBinding>,
 }
 enum Action {
+    Tasks {
+        focused: Option<RecordRef>,
+    },
+    TaskPoll,
+    TaskLink {
+        task_id: Id,
+    },
+    TaskReview,
+    TaskRequest {
+        need: String,
+        provider: ProviderKind,
+    },
+    TaskAuthorize {
+        disclosure: Digest,
+    },
+    TaskDecline,
+    TaskInspect {
+        request_id: Id,
+    },
+    TaskReopen {
+        request_id: Id,
+    },
+    TaskAbandon {
+        request_id: Id,
+    },
     Files,
     Export {
         basis: Digest,
@@ -264,6 +297,9 @@ impl IntentionView {
 }
 #[derive(Clone)]
 enum Page {
+    Tasks {
+        basis: Basis,
+    },
     LocalFiles(local_files_host::View),
     Home,
     Upgrade {
@@ -305,6 +341,7 @@ enum Page {
 }
 #[derive(Clone)]
 struct Update {
+    task: task_source_host::View,
     page: Option<Page>,
     need: Option<String>,
     recent: Vec<RecentEntry>,
@@ -336,9 +373,13 @@ struct Config {
 }
 
 pub struct ProductStudio {
+    task: task_source_host::View,
+    next_task_poll: std::time::Instant,
     send: mpsc::SyncSender<Command>,
     receive: mpsc::Receiver<Completion>,
     pending: Option<Pending>,
+    source_poll: Option<Pending>,
+    deferred_command: Option<Command>,
     session: String,
     epoch: u64,
     page: Page,
@@ -382,9 +423,13 @@ impl ProductStudio {
         let clock = config.hooks.today.clone();
         std::thread::spawn(move || worker::run(config, commands, complete));
         let mut studio = Self {
+            task: task_source_host::View::default(),
+            next_task_poll: std::time::Instant::now() + Duration::from_millis(500),
             send,
             receive,
             pending: None,
+            source_poll: None,
+            deferred_command: None,
             session: id("session"),
             epoch: 0,
             page: Page::Home,
@@ -421,7 +466,9 @@ impl ProductStudio {
     fn basis(&self) -> Option<Basis> {
         match &self.page {
             Page::LocalFiles(view) => view.origin().map(|o| o.basis.clone()),
-            Page::Daily { basis, .. } | Page::Draft { basis, .. } => Some(basis.clone()),
+            Page::Daily { basis, .. } | Page::Draft { basis, .. } | Page::Tasks { basis } => {
+                Some(basis.clone())
+            }
             Page::Change(view) => Some(view.basis.clone()),
             Page::History { basis, .. } | Page::Intention { basis, .. } => Some(basis.clone()),
             Page::Consent { basis, .. } => basis.clone(),
@@ -434,7 +481,12 @@ impl ProductStudio {
     fn action_waits_for_inputs(&self, action: &Action) -> bool {
         matches!(
             action,
-            Action::Files
+            Action::Tasks { .. }
+                | Action::TaskLink { .. }
+                | Action::TaskReview
+                | Action::TaskRequest { .. }
+                | Action::TaskAuthorize { .. }
+                | Action::Files
                 | Action::Export { .. }
                 | Action::SaveBackup { .. }
                 | Action::ChooseImport
@@ -504,6 +556,7 @@ impl ProductStudio {
     }
     fn issue(&mut self, action: Action) {
         if self.pending.is_some() {
+            self.notice = "An operation is already pending; the original command was kept. Wait or cancel it before choosing another".into();
             return;
         }
         if self.action_waits_for_inputs(&action) {
@@ -515,6 +568,13 @@ impl ProductStudio {
             epoch: self.epoch,
             operation: id("operation"),
             basis: self.basis(),
+            task: self.task.link.clone(),
+            task_source: self
+                .task
+                .source
+                .as_ref()
+                .and_then(|s| s.last_capture.as_ref())
+                .map(|s| s.binding.clone()),
         };
         let gate = Gate::default();
         // Initialization must finish even if the user immediately changes panels.
@@ -537,25 +597,90 @@ impl ProductStudio {
                 input: SemanticInput::Navigate { .. },
             } => true,
             Action::Preview { .. } | Action::Daily { .. } => false,
+            Action::TaskPoll => false,
             _ => true,
         };
-        match self.send.try_send(Command { key: key.clone(), gate: gate.clone(), action }) {
-            Ok(()) => self.pending = Some(Pending { key, gate, renderer, freeze_inputs }),
-            Err(_) => self.notice = "The tool worker is unavailable. Saved work was kept; reopen the app to reconcile unfinished work".into(),
+        let command = Command {
+            key: key.clone(),
+            gate: gate.clone(),
+            action,
+        };
+        let pending = Pending {
+            key,
+            gate,
+            renderer,
+            freeze_inputs,
+        };
+        if self.source_poll.is_some() {
+            // Retain exactly the clicked command and its original identities.
+            // A later click cannot replace it, and the worker revalidates it.
+            self.deferred_command = Some(command);
+            self.pending = Some(pending);
+            self.notice = "Your exact command is waiting for the current source read".into();
+        } else {
+            match self.send.try_send(command) {
+                Ok(()) => self.pending = Some(pending),
+                Err(_) => self.notice = "The tool worker is unavailable. Saved work was kept; reopen the app to reconcile unfinished work".into(),
+            }
         }
+    }
+    /// The same single worker polls sources without occupying the foreground
+    /// busy slot. App also uses this bounded cadence while this panel is hidden.
+    pub fn repaint_after(&self) -> Option<Duration> {
+        if self.is_busy() {
+            Some(Duration::from_millis(30))
+        } else if self.source_poll.is_some() {
+            Some(Duration::from_millis(100))
+        } else if self.task.linked {
+            Some(Duration::from_millis(500))
+        } else {
+            None
+        }
+    }
+    fn start_source_poll(&mut self) {
+        self.issue(Action::TaskPoll);
+        self.source_poll = self.pending.take();
     }
     /// Called by App before selecting any panel, so navigation never abandons
     /// provider cleanup, durable acknowledgements, or pending store work.
     pub fn poll(&mut self) {
         while let Ok(completion) = self.receive.try_recv() {
+            if self.source_poll.as_ref().map(|p| &p.key) == Some(&completion.key) {
+                self.source_poll = None;
+                self.next_task_poll = std::time::Instant::now() + Duration::from_millis(500);
+                if completion.key.session == self.session
+                    && completion.key.epoch == self.epoch
+                    && !self.closing
+                    && completion.key.task == self.task.link
+                    && completion.update.task.link == self.task.link
+                {
+                    // A source read can only refresh the matching link's status.
+                    // It cannot replace a foreground page, request, draft or notice.
+                    self.task.source = completion.update.task.source;
+                    self.task.message = completion.update.task.message;
+                    self.task.can_review = completion.update.task.can_review;
+                    self.task.pending = completion.update.task.pending;
+                    self.generation_blocked = completion.update.generation_blocked;
+                }
+                if let Some(command) = self.deferred_command.take() {
+                    if self.send.try_send(command).is_err() {
+                        self.pending = None;
+                        self.notice =
+                            "The worker is unavailable; the queued command was not run".into();
+                    }
+                }
+                continue;
+            }
             if self.pending.as_ref().map(|p| &p.key) != Some(&completion.key) {
                 continue;
             }
             let renderer_request = self.pending.as_ref().is_some_and(|p| p.renderer);
             self.pending = None;
+            self.next_task_poll = std::time::Instant::now() + Duration::from_millis(500);
             let fresh =
                 completion.key.session == self.session && completion.key.epoch == self.epoch;
             let update = completion.update;
+            self.task = update.task;
             self.recent = update.recent;
             self.file_interruption = update.file_interruption;
             self.recovery_attempts = update.recovery_attempts;
@@ -606,6 +731,17 @@ impl ProductStudio {
                 self.issue(Action::Close);
             }
         }
+        // A bounded worker command coalesces native events and periodically
+        // reconciles missed ones. Never read a worktree on the egui thread.
+        if !self.is_busy()
+            && self.source_poll.is_none()
+            && !self.closing
+            && self.task.linked
+            && !self.inputs_pending()
+            && std::time::Instant::now() >= self.next_task_poll
+        {
+            self.start_source_poll();
+        }
         // Clock changes are ordinary receipt-bound store operations, not a
         // different rendering clock. Retry failures only on explicit request.
         if !self.is_busy() && !self.mutation_blocked && !self.closing {
@@ -635,6 +771,9 @@ impl ProductStudio {
         accepted
     }
     fn close(&mut self) {
+        if let Some(poll) = &self.source_poll {
+            poll.gate.cancel();
+        }
         self.epoch = self.epoch.wrapping_add(1);
         self.page = Page::Home;
         self.renderer = ProductRuntimeView::default();
@@ -661,6 +800,9 @@ impl ProductStudio {
             &mut trace,
         );
         let today = self.today();
+        if self.task.linked {
+            ui.ctx().request_repaint_after(Duration::from_millis(500));
+        }
         let busy = self.is_busy();
         let inputs_pending = self.inputs_pending();
         let inputs_frozen = self
@@ -683,6 +825,9 @@ impl ProductStudio {
         let mut action = None;
         let mut close = false;
         if busy {
+            if self.deferred_command.is_some() {
+                trace.label(ui, "Your exact command is pending behind a source read. Additional commands cannot replace it.");
+            }
             trace.label(ui, "Working… You can continue using the other app panels.");
             match self
                 .pending
@@ -782,6 +927,13 @@ impl ProductStudio {
             }
         }
         match &self.page {
+            Page::Tasks { .. } => {
+                if action.is_none() {
+                    action =
+                        self.task
+                            .show(ui, &mut trace, !busy, &mut self.need, &mut self.provider);
+                }
+            }
             Page::LocalFiles(view) => {
                 if let Some(next) =
                     view.show(ui, &mut trace, !busy, self.file_interruption.is_none())
@@ -1459,6 +1611,16 @@ impl ProductStudio {
                         "Trusted Harness (review broader access before sending)",
                     );
                 });
+                if trace.button(
+                    ui,
+                    "studio.tasks",
+                    "Link or review an existing development task",
+                    !busy && !inputs_pending,
+                ) {
+                    action = Some(Action::Tasks {
+                        focused: self.renderer.focused_record().cloned(),
+                    });
+                }
                 trace.label(ui, "What should work differently here?");
                 trace.control(
                     "studio.change-need",
@@ -1563,6 +1725,9 @@ impl Drop for ProductStudio {
         if let Some(pending) = &self.pending {
             pending.gate.cancel();
         }
+        if let Some(poll) = &self.source_poll {
+            poll.gate.cancel();
+        }
     }
 }
 
@@ -1581,6 +1746,12 @@ pub enum TestProviderAssociationFault {
 #[cfg(test)]
 #[derive(Clone)]
 pub struct TestHooks {
+    pub task_product_executable: Option<PathBuf>,
+    pub before_task_analysis: Option<Arc<TestPause>>,
+    pub before_task_completion_commit: Option<Arc<TestPause>>,
+    pub before_task_review_publish: Option<Arc<TestPause>>,
+    pub after_task_review_publish: Option<Arc<TestPause>>,
+    pub before_task_abandon_write: Option<Arc<TestPause>>,
     pub before_commit: Option<Arc<TestPause>>,
     pub before_preview: Option<Arc<TestPause>>,
     pub before_context_transition: Option<Arc<TestPause>>,
@@ -1606,6 +1777,12 @@ pub struct TestHooks {
 impl Default for TestHooks {
     fn default() -> Self {
         Self {
+            task_product_executable: None,
+            before_task_analysis: None,
+            before_task_completion_commit: None,
+            before_task_review_publish: None,
+            after_task_review_publish: None,
+            before_task_abandon_write: None,
             before_commit: None,
             before_preview: None,
             before_context_transition: None,
@@ -1647,6 +1824,7 @@ impl ProductStudio {
                 local_files_host::View::Diagnosis { .. } => "diagnosis",
                 local_files_host::View::Report { .. } => "file-report",
             },
+            Page::Tasks { .. } => "tasks",
             Page::Home => "home",
             Page::Upgrade { .. } => "upgrade",
             Page::Consent { .. } => "consent",
@@ -1682,11 +1860,58 @@ impl ProductStudio {
             None
         }
     }
+    pub fn test_task_request(&mut self, need: &str) {
+        self.issue(Action::TaskRequest {
+            need: need.into(),
+            provider: ProviderKind::Codex,
+        });
+    }
+    pub fn test_task_authorize(&mut self) {
+        if let Some(d) = &self.task.consent {
+            self.issue(Action::TaskAuthorize {
+                disclosure: d.digest.clone(),
+            });
+        }
+    }
+    pub fn test_task_review(&mut self) {
+        self.issue(Action::TaskReview);
+    }
+    pub fn test_task_abandon(&mut self, request: &str) {
+        self.issue(Action::TaskAbandon {
+            request_id: request.into(),
+        });
+    }
+    pub fn test_task_reopen(&mut self, request: &str) {
+        self.issue(Action::TaskReopen {
+            request_id: request.into(),
+        });
+    }
+    pub fn test_source_polling(&self) -> bool {
+        self.source_poll.is_some()
+    }
+    pub fn test_task_refresh(&mut self) {
+        self.issue(Action::TaskPoll);
+    }
+    pub fn test_task_source_producer(&self) -> Option<&Producer> {
+        Some(
+            &self
+                .task
+                .source
+                .as_ref()?
+                .last_capture
+                .as_ref()?
+                .binding
+                .producer,
+        )
+    }
+    pub fn test_task_can_review(&self) -> bool {
+        self.task.can_review
+    }
     pub fn test_prepared_request(&self) -> Option<&DevelopmentRequest> {
         if let Page::Consent { request, .. } = &self.page {
             Some(request)
         } else {
-            None
+            self.task.consent.as_ref().map(|d| &d.request)
         }
     }
     pub fn test_lifecycle_outcome(&mut self, record: RecordRef, field: &str) {
@@ -1945,3 +2170,28 @@ pub use local_files_host::DialogResult as TestFileDialog;
 
 #[cfg(test)]
 pub use local_files_host::test_seed_recovery_history;
+
+/// Registered-ID machine route, selected before native GUI initialization.
+pub(crate) fn machine_command(args: &[std::ffi::OsString]) -> Option<Result<String, String>> {
+    task_source_machine::command(args)
+}
+
+#[cfg(test)]
+pub fn test_task_machine(
+    root: &Path,
+    operation: &str,
+    task: &str,
+    request: &str,
+) -> Result<String, String> {
+    task_source_machine::execute(root, operation, task, request)
+}
+
+#[cfg(test)]
+pub fn test_task_machine_after_submit(
+    root: &Path,
+    task: &str,
+    request: &str,
+    after_submit: &mut dyn FnMut(),
+) -> Result<String, String> {
+    task_source_machine::test_execute_after_submit(root, task, request, after_submit)
+}

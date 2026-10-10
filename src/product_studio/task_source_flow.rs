@@ -497,16 +497,18 @@ impl TaskSourceFlow {
             || pending
                 .request
                 .sources
-                .iter()
-                .filter(|source| {
-                    source
-                        .binding
-                        .task
-                        .as_ref()
-                        .is_some_and(|task| task.task_id == task_id)
-                })
-                .count()
-                != 1
+                .first()
+                .and_then(|source| source.binding.task.as_ref())
+                .map(|task| task.task_id.as_str())
+                != Some(task_id)
+            || pending.request.sources.first().is_some_and(|baseline| {
+                pending
+                    .request
+                    .sources
+                    .iter()
+                    .skip(1)
+                    .any(|source| source.binding == baseline.binding)
+            })
         {
             return Err(invalid(
                 "The interrupted request belongs to another project or task",

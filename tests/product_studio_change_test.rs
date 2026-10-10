@@ -1,4 +1,14 @@
 //! Offline controller regressions. No live AI, native GUI, or user acceptance proof.
+#[path = "../src/harness.rs"]
+mod harness;
+#[path = "../src/task_verification.rs"]
+mod task_verification;
+#[path = "../src/task_delivery.rs"]
+mod task_delivery;
+#[path = "../src/tasks.rs"]
+mod tasks;
+#[path = "../src/product_sources/mod.rs"]
+mod product_sources;
 #[path = "fixtures/product_scope/mod.rs"]
 mod fixture;
 #[path = "../src/product_backup.rs"]
