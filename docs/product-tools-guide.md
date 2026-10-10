@@ -1,10 +1,63 @@
 # Local tool storage and recovery helpers
 
-These are host APIs for the generated-tool runtime. The backup and location
-helpers are not yet registered in the desktop controller or native dialogs.
-This document is an integration contract, not a claim that the complete
-ordinary-user recovery journey is already available. The existing order-tool
-format and workflow remain separate; these helpers do not migrate them.
+Studio now connects these helpers through **Saved files, backups and recovery**
+on an open generated tool. The existing order-tool format and workflow remain
+separate. Headless control tests use explicit synthetic dialogs; native OS
+dialogs and the final packaged desktop journey require separate verification.
+
+## Everyday file operations
+
+- Open a saved generated-tool folder from the home page, or select a recent tool.
+  Opening verifies the saved tool. Supported older formats show an explicit
+  local upgrade and restart step; incompatible formats are kept unchanged.
+- Open **Saved files, backups and recovery** to see the original saved output
+  occurrences. **Save this exact output…** saves that occurrence without running
+  its action again. The file picker suggests CSV or JSON as originally produced.
+  Existing files are never replaced, even when their bytes match.
+- **Save a checked backup copy…** exports a verified `.gmbak` file. **Open a
+  backup file…** first checks its complete contents and presents a preview.
+- Recovery suggests a fresh folder in the normal generated-tool location.
+  **Choose a different parent folder…** creates a new suggestion; review its
+  displayed destination before **Recover and verify this separate copy**.
+  Recovery preserves the original tool and backup. Later work outside the
+  backup is not included, and recovery does not undo external actions.
+- A recovered copy is reopened for verification and gets its own recent entry
+  and automatic checkpoint shelf. The original stays selected until you choose
+  **Open the verified separate copy**.
+- **Check saved work** diagnoses the current tool. The home page also offers
+  **Check this tool or recover a backup** for each exact recent instance, even
+  when its current pointer or snapshot is damaged. Only checked automatic
+  backups are offered; no backup is deleted.
+
+Pending form or control edits must finish or be explicitly discarded before
+leaving their input page. File operations run on the shared worker and honor
+cancellation before their final write boundary. Once writing begins, Studio
+reports the actual checked or uncertain result instead of pretending Cancel
+removed an external file. A native dialog that cannot distinguish closure from
+failure is reported as an indeterminate selection, not a confirmed cancellation.
+
+If an external file attempt is interrupted, its exact selected destination is
+kept in the host restart record. Restart inspects it but never repeats the write.
+Matching output bytes or a valid tool at that location are inspection evidence,
+not proof that the interrupted operation succeeded. Keep any files there and
+finish reviewing the attempt before starting another file write. Ordinary saved
+work remains available.
+
+If an unfinished original save cannot be reconciled because its files are
+damaged, you can still recover a verified backup into a separate folder. Only
+**Keep the original attempt and open this verified separate copy** moves that
+exact unconfirmed attempt into preserved host history and enables new work in
+the verified copy. The original attempt, including entered values or its full
+change plan, remains available for read-only review after restart. It is never
+retried or described as committed. The saved copy and the pending association
+are checked again before that explicit switch. Existing entries are never
+dropped: a full history (16 entries) or the unchanged 1 MiB host-journal limit
+refuses the switch while preserving the original attempt and recovered files.
+Inspection and returning home remain available.
+
+No credentials, additional permissions or new project storage schema are
+introduced. These are additive optional host-journal records; old records
+without them keep their existing format and read path.
 
 ## What is preserved
 
@@ -108,7 +161,7 @@ checkpoint namespace. Use the stable recent-entry instance ID so a recovered
 copy cannot replace the original instance's checkpoint sequence. A deliberate
 relocation keeps the same instance ID and checkpoint namespace.
 
-The controller must:
+The controller uses these boundaries:
 
 1. Open through `open_verified`; retain the returned snapshot/revision and
    actual runtime outputs for the normal optimistic operation checks
@@ -152,9 +205,9 @@ automatically replace the current one.
 Path operations reuse the store's pinned descriptor/no-reparse implementation.
 Traversal, symlink/hard-link redirection, replaced folders and collisions are
 refused. These helpers do not grant generated programs file access, change
-authentication or security configuration, migrate old projects, or publish a
-release.
+authentication or security configuration, or publish a release. Older generated
+tools and backups use only the supported checked upgrade paths.
 
-Component fixtures and CI are implementation evidence. Complete controller
-hooks, ordinary-person operation, native dialogs/IME, and the integrated
-current-build product acceptance remain separate verification work.
+Component fixtures, headless host controls and CI are implementation evidence.
+Ordinary-person operation, native dialogs/IME and integrated current-build
+packaged product acceptance remain separate verification work.

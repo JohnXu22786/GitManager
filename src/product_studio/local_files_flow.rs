@@ -7,7 +7,7 @@
 use crate::product_backup::{BackupSummary, VerifiedBackup};
 use crate::product_contract::{canonical_digest, Digest, Id, IdentityDomain, OutputFormat};
 use crate::product_export::{ArtifactSelection, ExportError, ExportOutcome, PreparedExport};
-use crate::product_locations::OperationIssue;
+use crate::product_locations::{OperationIssue, SelectedFile};
 use crate::product_store::{ProductStore, ProjectSnapshot};
 use std::{
     collections::BTreeMap,
@@ -246,36 +246,76 @@ impl BackupDraft {
     pub fn summary(&self) -> &BackupSummary {
         &self.summary
     }
+    pub fn select_destination(
+        self,
+        choice: DestinationChoice,
+        active_operation: &str,
+        cancelled: &AtomicBool,
+    ) -> Result<SelectedBackup> {
+        let path = choice.resolve(&self.operation, active_operation, cancelled)?;
+        let file = SelectedFile::new(&path).map_err(|e| e.to_string())?;
+        Ok(SelectedBackup {
+            draft: self,
+            destination: path,
+            file,
+        })
+    }
     pub fn publish(
         self,
         choice: DestinationChoice,
         active_operation: &str,
         cancelled: &AtomicBool,
     ) -> BackupOutcome {
-        let path = match choice.resolve(&self.operation, active_operation, cancelled) {
-            Ok(path) => path,
-            Err(error) => return BackupOutcome::NotAttempted(error),
-        };
-        if let Err(error) = fresh(&self.store, self.backup.snapshot()) {
+        match self.select_destination(choice, active_operation, cancelled) {
+            Ok(selected) => selected.publish(cancelled),
+            Err(error) => BackupOutcome::NotAttempted(error),
+        }
+    }
+}
+/// One-use backup selection retains the actual parent through publication.
+pub struct SelectedBackup {
+    draft: BackupDraft,
+    destination: PathBuf,
+    file: SelectedFile,
+}
+impl SelectedBackup {
+    pub fn publish(self, cancelled: &AtomicBool) -> BackupOutcome {
+        if let Err(error) = fresh(&self.draft.store, self.draft.backup.snapshot()) {
             return BackupOutcome::NotAttempted(error);
         }
         if cancelled.load(Ordering::Acquire) {
             return BackupOutcome::NotAttempted("Backup cancelled before writing.".into());
         }
-        // export_new can fail after writing. It cannot prove absence on error.
-        match self.backup.export_new(&path) {
+        if let Err(error) = self.file.check_parent() {
+            return BackupOutcome::NotAttempted(error.to_string());
+        }
+        let result = (|| -> std::result::Result<BackupSummary, OperationIssue> {
+            self.file.write_new(&self.draft.backup.to_bytes()?)?;
+            let verified = VerifiedBackup::from_bytes(
+                &self.file.read(crate::product_backup::MAX_BACKUP_BYTES)?,
+            )?;
+            if verified.digest() != self.draft.backup.digest() {
+                return Err(OperationIssue::new(
+                    crate::product_locations::IssueKind::Corrupt,
+                    "backup export readback changed",
+                ));
+            }
+            verified.summary()
+        })();
+        match result {
             Ok(summary) => BackupOutcome::Verified {
-                destination: path,
+                destination: self.destination,
                 summary,
             },
             Err(issue) => BackupOutcome::Uncertain {
-                destination: path,
-                summary: self.summary,
+                destination: self.destination,
+                summary: self.draft.summary,
                 issue,
             },
         }
     }
 }
+
 pub fn backup_report(outcome: &BackupOutcome) -> FileReport {
     match outcome {
         BackupOutcome::NotAttempted(message) => FileReport { status: PublicationStatus::NotAttempted, message: message.clone(), destination: None, issue: None },

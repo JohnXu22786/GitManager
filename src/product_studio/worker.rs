@@ -1,4 +1,6 @@
 use super::*;
+#[path = "local_files_worker.rs"]
+mod local_files_worker;
 use crate::product_provider::{unix_ms, JobReceipt};
 use std::collections::BTreeSet;
 
@@ -144,6 +146,8 @@ struct Worker {
     draft: Option<Draft>,
     change: Option<ChangeDraft>,
     intention: Option<IntentionDraft>,
+    recovery: Option<local_files_worker::Recovery>,
+    recovered_location: Option<crate::product_store::RecoveryDestination>,
     recent_inputs: Vec<SemanticInput>,
     opened: Option<OpenTool>,
     chosen: Option<PathBuf>,
@@ -187,6 +191,18 @@ impl Worker {
             need: None,
             recent,
             notice,
+            file_interruption: self.file_attempt_notice(),
+            recovery_attempts: self
+                .journal
+                .as_ref()
+                .map(|j| {
+                    j.value
+                        .recovery_handoffs
+                        .iter()
+                        .map(journal::RecoveryHandoff::review)
+                        .collect()
+                })
+                .unwrap_or_default(),
             destination: self
                 .chosen
                 .clone()
@@ -479,6 +495,8 @@ impl Worker {
         self.draft = None;
         self.change = None;
         self.intention = None;
+        self.recovery = None;
+        self.recovered_location = None;
         if basis.is_none() {
             self.opened = None;
         }
@@ -899,6 +917,8 @@ impl Worker {
         self.draft = None;
         self.change = None;
         self.intention = None;
+        self.recovery = None;
+        self.recovered_location = None;
         self.recent_inputs.clear();
         self.ready = None;
         self.page = page;
@@ -968,6 +988,8 @@ impl Worker {
         self.draft = None;
         self.change = None;
         self.intention = None;
+        self.recovery = None;
+        self.recovered_location = None;
         self.ready = None;
         self.recent_inputs.clear();
         self.page = page;
@@ -1569,6 +1591,8 @@ impl Worker {
         }
         self.change = None;
         self.intention = None;
+        self.recovery = None;
+        self.recovered_location = None;
         self.page = Page::History { tool, basis, view };
         Ok(())
     }
@@ -1988,21 +2012,13 @@ impl Worker {
         self.draft = None;
         self.change = None;
         self.intention = None;
+        self.recovery = None;
+        self.recovered_location = None;
         self.recent_inputs.clear();
         self.opened = None;
         self.page = Page::Home;
         self.chosen = None;
         Ok(())
-    }
-    fn pick_folder(&self, _title: &str) -> Option<PathBuf> {
-        #[cfg(test)]
-        {
-            self.config.hooks.folder_choice.clone()
-        }
-        #[cfg(not(test))]
-        {
-            rfd::FileDialog::new().set_title(_title).pick_folder()
-        }
     }
     fn before_abandon(&self, _gate: &Gate) {
         #[cfg(test)]
@@ -2059,6 +2075,21 @@ impl Worker {
             }
         }
         match &command.action {
+            Action::Files => self.files(key, gate),
+            Action::Export { basis, selection } => self.export_file(basis, selection, key, gate),
+            Action::SaveBackup { basis } => self.backup_file(basis, key, gate),
+            Action::ChooseImport => self.choose_import(key, gate),
+            Action::Diagnose { recent } => self.diagnose_file(recent.as_ref(), key, gate),
+            Action::ReviewRecovery => self.review_recovery(key, gate),
+            Action::RecoveryLocation { operation } => self.recovery_location(operation, key, gate),
+            Action::RecoverFile {
+                operation,
+                backup,
+                destination,
+            } => self.recover_file(operation, backup, destination, key, gate),
+            Action::OpenRecovered { selection } => self.open_recovered(selection, key, gate),
+            Action::FilesBack => self.files_back(key, gate),
+            Action::AcknowledgeFile { operation } => self.acknowledge_file(operation, gate),
             Action::Boot => self.boot(),
             Action::Prepare {
                 need,
@@ -2148,16 +2179,30 @@ impl Worker {
             Action::Daily { input } => self.daily(input.clone(), key, gate),
             Action::Open { path, expected } => self.open(path.clone(), expected.clone()),
             Action::Upgrade { tool, summary } => self.upgrade(tool, summary, gate),
-            Action::OpenDialog => match self.pick_folder("Open a saved generated-tool folder") {
-                Some(path) => {
-                    gate.check()?;
-                    self.open(path, None)
+            Action::OpenDialog => {
+                let path = self
+                    .file_dialog(
+                        local_files_host::DialogKind::Folder,
+                        "Open a saved generated-tool folder",
+                    )
+                    .selected()?;
+                gate.check()?;
+                // Stage verification before the navigation completion boundary.
+                let opened = inspect_open(&path, None).map_err(error)?;
+                if !gate.finish() {
+                    return Err("Opening was cancelled; previous work was kept".into());
                 }
-                None => {
-                    self.notice = "Folder selection cancelled; no tool was opened".into();
-                    Ok(())
+                match opened {
+                    OpenGate::Ready(opened) => self.install_opened(
+                        Association {
+                            path,
+                            identity: opened.summary.identity.clone(),
+                        },
+                        opened,
+                    ),
+                    OpenGate::UpgradeRequired(_) => self.open(path, None),
                 }
-            },
+            }
             Action::ChooseDestination => {
                 #[cfg(test)]
                 if let Some(pause) = &self.config.hooks.before_destination {
@@ -2169,21 +2214,23 @@ impl Worker {
                     }
                 }
                 gate.check()?;
-                match self.pick_folder("Choose where to keep this tool's data") {
-                    Some(path) => {
-                        ToolLocations::chosen(&path).map_err(error)?;
-                        if !gate.finish() {
-                            return Err("Folder selection cancelled; the draft and previous destination were kept".into());
-                        }
-                        self.chosen = Some(path);
-                        Ok(())
-                    }
-                    None => {
-                        self.notice = "Folder selection cancelled; nothing was saved and no other destination was selected".into();
-                        Ok(())
-                    }
+                let path = self
+                    .file_dialog(
+                        local_files_host::DialogKind::Folder,
+                        "Choose where to keep this tool's data",
+                    )
+                    .selected()?;
+                ToolLocations::chosen(&path).map_err(error)?;
+                if !gate.finish() {
+                    return Err(
+                        "Folder selection cancelled; the draft and previous destination were kept"
+                            .into(),
+                    );
                 }
+                self.chosen = Some(path);
+                Ok(())
             }
+
             Action::Reconcile => self.reconcile(true, gate),
             Action::AbandonCreation => self.abandon_creation(gate),
             Action::AbandonDaily => self.abandon_daily(gate),
@@ -2231,6 +2278,8 @@ pub(super) fn run(
         draft: None,
         change: None,
         intention: None,
+        recovery: None,
+        recovered_location: None,
         recent_inputs: vec![],
         opened: None,
         chosen: None,

@@ -8,6 +8,10 @@ mod change_adapter;
 mod intention_flow;
 #[path = "product_studio/journal.rs"]
 mod journal;
+#[path = "product_studio/local_files_flow.rs"]
+mod local_files_flow;
+#[path = "product_studio/local_files_host.rs"]
+mod local_files_host;
 #[path = "product_studio/worker.rs"]
 mod worker;
 use crate::product_backup::{
@@ -125,6 +129,34 @@ struct Key {
     basis: Option<Basis>,
 }
 enum Action {
+    Files,
+    Export {
+        basis: Digest,
+        selection: crate::product_export::ArtifactSelection,
+    },
+    SaveBackup {
+        basis: Digest,
+    },
+    ChooseImport,
+    Diagnose {
+        recent: Option<Digest>,
+    },
+    ReviewRecovery,
+    RecoveryLocation {
+        operation: Id,
+    },
+    RecoverFile {
+        operation: Id,
+        backup: Digest,
+        destination: PathBuf,
+    },
+    OpenRecovered {
+        selection: local_files_host::RecoveredSelection,
+    },
+    FilesBack,
+    AcknowledgeFile {
+        operation: Id,
+    },
     Boot,
     Prepare {
         need: String,
@@ -232,6 +264,7 @@ impl IntentionView {
 }
 #[derive(Clone)]
 enum Page {
+    LocalFiles(local_files_host::View),
     Home,
     Upgrade {
         tool: Association,
@@ -276,6 +309,8 @@ struct Update {
     need: Option<String>,
     recent: Vec<RecentEntry>,
     notice: String,
+    file_interruption: Option<(Id, String)>,
+    recovery_attempts: Vec<(String, String)>,
     destination: Option<PathBuf>,
     mutation_blocked: bool,
     generation_blocked: bool,
@@ -318,6 +353,8 @@ pub struct ProductStudio {
     recent: Vec<RecentEntry>,
     destination: Option<PathBuf>,
     notice: String,
+    file_interruption: Option<(Id, String)>,
+    recovery_attempts: Vec<(String, String)>,
     mutation_blocked: bool,
     generation_blocked: bool,
     unresolved: bool,
@@ -362,6 +399,8 @@ impl ProductStudio {
             recent: vec![],
             destination: None,
             notice: String::new(),
+            file_interruption: None,
+            recovery_attempts: vec![],
             mutation_blocked: true,
             generation_blocked: true,
             unresolved: false,
@@ -381,6 +420,7 @@ impl ProductStudio {
     }
     fn basis(&self) -> Option<Basis> {
         match &self.page {
+            Page::LocalFiles(view) => view.origin().map(|o| o.basis.clone()),
             Page::Daily { basis, .. } | Page::Draft { basis, .. } => Some(basis.clone()),
             Page::Change(view) => Some(view.basis.clone()),
             Page::History { basis, .. } | Page::Intention { basis, .. } => Some(basis.clone()),
@@ -394,7 +434,14 @@ impl ProductStudio {
     fn action_waits_for_inputs(&self, action: &Action) -> bool {
         matches!(
             action,
-            Action::Decide { .. }
+            Action::Files
+                | Action::Export { .. }
+                | Action::SaveBackup { .. }
+                | Action::ChooseImport
+                | Action::Diagnose { .. }
+                | Action::RecoverFile { .. }
+                | Action::OpenRecovered { .. }
+                | Action::Decide { .. }
                 | Action::History
                 | Action::PrepareReconciliation { .. }
                 | Action::PreviewWithdrawal { .. }
@@ -510,6 +557,8 @@ impl ProductStudio {
                 completion.key.session == self.session && completion.key.epoch == self.epoch;
             let update = completion.update;
             self.recent = update.recent;
+            self.file_interruption = update.file_interruption;
+            self.recovery_attempts = update.recovery_attempts;
             self.mutation_blocked = update.mutation_blocked;
             self.generation_blocked = update.generation_blocked;
             self.unresolved = update.pending;
@@ -697,7 +746,49 @@ impl ProductStudio {
                 }
             }
         }
+        if !self.recovery_attempts.is_empty() {
+            trace.label(ui, format!("Your original interrupted attempt was kept and not repeated or confirmed. {} preserved attempt(s) remain available for review.", self.recovery_attempts.len()));
+            ui.collapsing("Review preserved original attempts", |ui| {
+                for (index, (summary, detail)) in self.recovery_attempts.iter().enumerate() {
+                    ui.push_id(index, |ui| {
+                        trace.label(ui, summary);
+                        ui.collapsing("Original entered values and operation", |ui| {
+                            egui::ScrollArea::vertical()
+                                .max_height(260.0)
+                                .show(ui, |ui| {
+                                    let mut text = detail.as_str();
+                                    ui.add(
+                                        egui::TextEdit::multiline(&mut text)
+                                            .interactive(false)
+                                            .desired_width(f32::INFINITY),
+                                    );
+                                });
+                        });
+                    });
+                }
+            });
+        }
+        if let Some((operation, message)) = &self.file_interruption {
+            trace.label(ui, message);
+            if trace.button(
+                ui,
+                "studio.file-reviewed",
+                "Keep these files and finish reviewing this attempt",
+                !busy,
+            ) {
+                action = Some(Action::AcknowledgeFile {
+                    operation: operation.clone(),
+                });
+            }
+        }
         match &self.page {
+            Page::LocalFiles(view) => {
+                if let Some(next) =
+                    view.show(ui, &mut trace, !busy, self.file_interruption.is_none())
+                {
+                    action = Some(next);
+                }
+            }
             Page::Upgrade { tool, summary } => {
                 trace.label(ui, "This saved generated tool needs a local format upgrade before you can continue working.");
                 trace.label(
@@ -772,6 +863,9 @@ impl ProductStudio {
                 if trace.button(ui, "studio.open", "Open a saved tool…", !busy) {
                     action = Some(Action::OpenDialog);
                 }
+                if trace.button(ui, "studio.import", "Open a backup file…", !busy) {
+                    action = Some(Action::ChooseImport);
+                }
                 trace.label(ui, "Recent tools");
                 for entry in &self.recent {
                     let label = format!("{} ({:?})", entry.tool.label, entry.availability);
@@ -784,6 +878,16 @@ impl ProductStudio {
                         action = Some(Action::Open {
                             path: entry.tool.path.clone(),
                             expected: Some(entry.tool.identity.clone()),
+                        });
+                    }
+                    if trace.button(
+                        ui,
+                        &format!("studio.diagnose.{}", entry.tool.id.as_str()),
+                        "Check this tool or recover a backup",
+                        !busy,
+                    ) {
+                        action = Some(Action::Diagnose {
+                            recent: Some(entry.tool.id.clone()),
                         });
                     }
                 }
@@ -1314,7 +1418,22 @@ impl ProductStudio {
                     ),
                 );
                 trace.label(ui, format!("Saved locally: {}", tool.path.display()));
-                trace.label(ui, "Output files cannot be saved in this initial version. Generated output can be inspected below.");
+                if trace.button(
+                    ui,
+                    "studio.files",
+                    "Saved files, backups and recovery",
+                    !busy && !inputs_pending,
+                ) {
+                    action = Some(Action::Files);
+                }
+                if trace.button(
+                    ui,
+                    "studio.diagnose",
+                    "Check saved work",
+                    !busy && !inputs_pending,
+                ) {
+                    action = Some(Action::Diagnose { recent: None });
+                }
                 close = trace.button(ui, "studio.close", "Close tool", true);
                 if trace.button(
                     ui,
@@ -1425,6 +1544,8 @@ impl ProductStudio {
         }
         if close {
             self.close();
+        } else if matches!(action, Some(Action::Close)) {
+            self.close();
         } else if let Some(action) = action {
             // Editing stays available while an input is pending. A control can also
             // enqueue a new value later in this frame, after a choice button.
@@ -1469,6 +1590,12 @@ pub struct TestHooks {
     pub before_abandon: Option<Arc<TestPause>>,
     pub fail_creation: Arc<AtomicBool>,
     pub folder_choice: Option<PathBuf>,
+    pub file_dialog: Option<TestFileDialog>,
+    pub before_file_effect: Option<Arc<TestPause>>,
+    pub after_file_staged: Option<Arc<TestPause>>,
+    pub before_recovery_handoff: Option<Arc<TestPause>>,
+    pub file_dialog_queue: Arc<std::sync::Mutex<std::collections::VecDeque<TestFileDialog>>>,
+    pub interrupt_file: Option<bool>,
     pub after_commit: Option<Arc<TestPause>>,
     pub lose_ack: Arc<AtomicBool>,
     pub stopped: Arc<AtomicBool>,
@@ -1488,6 +1615,12 @@ impl Default for TestHooks {
             before_abandon: None,
             fail_creation: Arc::new(AtomicBool::new(false)),
             folder_choice: None,
+            file_dialog: None,
+            before_file_effect: None,
+            after_file_staged: None,
+            before_recovery_handoff: None,
+            file_dialog_queue: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            interrupt_file: None,
             after_commit: None,
             lose_ack: Arc::new(AtomicBool::new(false)),
             stopped: Arc::new(AtomicBool::new(false)),
@@ -1505,8 +1638,15 @@ impl ProductStudio {
             hooks,
         })
     }
+    #[allow(dead_code)]
     pub fn test_page(&self) -> &'static str {
         match self.page {
+            Page::LocalFiles(ref view) => match view {
+                local_files_host::View::Inventory { .. } => "files",
+                local_files_host::View::Import { .. } => "import",
+                local_files_host::View::Diagnosis { .. } => "diagnosis",
+                local_files_host::View::Report { .. } => "file-report",
+            },
             Page::Home => "home",
             Page::Upgrade { .. } => "upgrade",
             Page::Consent { .. } => "consent",
@@ -1799,3 +1939,9 @@ pub fn test_stage_change(root: &Path, path: &Path, before: &ProjectSnapshot, pla
     });
     journal.write(value).unwrap();
 }
+
+#[cfg(test)]
+pub use local_files_host::DialogResult as TestFileDialog;
+
+#[cfg(test)]
+pub use local_files_host::test_seed_recovery_history;

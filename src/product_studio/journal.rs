@@ -93,6 +93,57 @@ pub(super) struct UnsavedInput {
     pub summary: String,
     pub explanation: String,
 }
+/// An external publication intent is not a receipt and never authorizes replay.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct FileAttempt {
+    pub operation: Id,
+    pub tool: Option<Association>,
+    pub basis: Option<Basis>,
+    pub destination: PathBuf,
+    pub target: FileTarget,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum FileTarget {
+    Output {
+        inventory_index: usize,
+        artifact: Digest,
+        bytes_digest: Digest,
+        byte_count: usize,
+    },
+    Backup {
+        digest: Digest,
+    },
+    Recovery {
+        backup: Digest,
+        identity: ToolIdentity,
+    },
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RecoveryHandoff {
+    pub operation: Id,
+    pub original: Interrupted,
+    pub recovered: Association,
+}
+impl RecoveryHandoff {
+    pub fn review(&self) -> (String, String) {
+        let (tool, summary) = match &self.original {
+            Interrupted::Create { tool } => (tool, "Original tool creation".to_string()),
+            Interrupted::Daily {
+                tool,
+                operation,
+                input,
+                ..
+            } => (tool, format!("Original input {operation}: {input:?}")),
+            Interrupted::Change { tool, plan, .. } => {
+                (tool, format!("Original rule change {}: {plan:?}", plan.id))
+            }
+        };
+        (format!("Your original interrupted attempt was kept and not repeated or confirmed. Original: {}. Separate working copy: {}", tool.path.display(), self.recovered.path.display()), summary)
+    }
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Journal {
@@ -104,6 +155,11 @@ pub(super) struct Journal {
     pub provider: Option<ProviderAssociation>,
     pub abandoned_creation: Option<Association>,
     pub last_unsaved: Option<UnsavedInput>,
+    // Additive optional host metadata; old records retain their exact shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_file: Option<FileAttempt>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recovery_handoffs: Vec<RecoveryHandoff>,
 }
 impl Default for Journal {
     fn default() -> Self {
@@ -116,6 +172,8 @@ impl Default for Journal {
             provider: None,
             abandoned_creation: None,
             last_unsaved: None,
+            local_file: None,
+            recovery_handoffs: vec![],
         }
     }
 }
@@ -133,6 +191,40 @@ impl Journal {
             }
             Ok(())
         };
+        if let Some(file) = &self.local_file {
+            if !valid_id(&file.operation)
+                || !file.destination.is_absolute()
+                || file.destination.as_os_str().len() > 4096
+                || file.destination.components().count() > 128
+                || file.destination.components().any(|c| {
+                    matches!(
+                        c,
+                        std::path::Component::ParentDir | std::path::Component::CurDir
+                    )
+                })
+                || file.tool.is_some() != file.basis.is_some()
+            {
+                return Err("Invalid interrupted local-file association; files were kept".into());
+            }
+            if let Some(tool) = &file.tool {
+                check(tool)?;
+            }
+            match &file.target {
+                FileTarget::Output { byte_count, .. }
+                    if file.tool.is_none()
+                        || *byte_count > crate::product_locations::MAX_LOCAL_BYTES =>
+                {
+                    return Err("Invalid interrupted output association".into())
+                }
+                FileTarget::Backup { .. } if file.tool.is_none() => {
+                    return Err("Invalid interrupted backup association".into())
+                }
+                FileTarget::Recovery { identity, .. } if !valid_id(&identity.project_id) => {
+                    return Err("Invalid interrupted recovery identity".into())
+                }
+                _ => (),
+            }
+        }
         if let Some(unsaved) = &self.last_unsaved {
             check(&unsaved.tool)?;
             if !valid_id(&unsaved.operation)
@@ -242,32 +334,47 @@ impl Journal {
                 return Err("Interrupted generation identity changed".into());
             }
         }
-        match &self.pending {
-            Some(Interrupted::Change { tool, basis, plan }) => {
-                check(tool)?;
-                plan.validate().map_err(error)?;
-                if plan.project_id != tool.identity.project_id
-                    || plan.expected_generation != basis.data_generation
-                    || plan.expected_data != basis.data
-                    || plan.expected_session != basis.session
-                {
-                    return Err("Invalid interrupted change association".into());
+        if self.recovery_handoffs.len() > 16 {
+            return Err("The preserved recovery-attempt history is full. All previous attempts and files were kept.".into());
+        }
+        let mut operations = std::collections::BTreeSet::new();
+        for handoff in &self.recovery_handoffs {
+            check(&handoff.recovered)?;
+            if !valid_id(&handoff.operation) || !operations.insert(&handoff.operation) {
+                return Err("Invalid preserved recovery-attempt identity".into());
+            }
+        }
+        for pending in self
+            .pending
+            .iter()
+            .chain(self.recovery_handoffs.iter().map(|h| &h.original))
+        {
+            match pending {
+                Interrupted::Change { tool, basis, plan } => {
+                    check(tool)?;
+                    plan.validate().map_err(error)?;
+                    if plan.project_id != tool.identity.project_id
+                        || plan.expected_generation != basis.data_generation
+                        || plan.expected_data != basis.data
+                        || plan.expected_session != basis.session
+                    {
+                        return Err("Invalid interrupted change association".into());
+                    }
+                }
+                Interrupted::Create { tool } => check(tool)?,
+                Interrupted::Daily {
+                    tool,
+                    operation,
+                    input,
+                    ..
+                } => {
+                    check(tool)?;
+                    if !valid_id(operation) {
+                        return Err("Invalid interrupted operation identity".into());
+                    }
+                    validate_input_shape(input).map_err(error)?;
                 }
             }
-            Some(Interrupted::Create { tool }) => check(tool)?,
-            Some(Interrupted::Daily {
-                tool,
-                operation,
-                input,
-                ..
-            }) => {
-                check(tool)?;
-                if !valid_id(operation) {
-                    return Err("Invalid interrupted operation identity".into());
-                }
-                validate_input_shape(input).map_err(error)?;
-            }
-            None => (),
         }
         Ok(())
     }
