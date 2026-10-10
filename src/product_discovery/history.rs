@@ -31,6 +31,98 @@ pub struct VerifiedRetainedHistory {
     prepared_targets: BTreeMap<Digest, PreparedScopedChange>,
     prepared_results: Vec<PreparedDiscoveryCandidate>,
 }
+/// Exact checked replay authority for one current-versus-prepared witness.
+/// It is not serializable and cannot authorize adoption or change its sources,
+/// population, starting frame or the preparation from which it was minted.
+#[derive(Clone)]
+pub struct CheckedWitnessReplay {
+    basis: ProjectSnapshot,
+    prepared: PreparedScopedChange,
+    witness: VerifiedWitness,
+    admission: Arc<dyn ReplayAdmission>,
+}
+impl CheckedWitnessReplay {
+    pub fn witness(&self) -> &VerifiedWitness {
+        &self.witness
+    }
+    pub fn check(
+        &self,
+        store: &ProductStore,
+        prepared: &PreparedScopedChange,
+        cancelled: &AtomicBool,
+    ) -> Result<(), AdapterError> {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(AdapterError::Cancelled);
+        }
+        if store.load().map_err(unavailable)? != self.basis || prepared != &self.prepared {
+            return Err(AdapterError::Stale(
+                "witness replay basis or exact preparation changed".into(),
+            ));
+        }
+        Ok(())
+    }
+    pub(crate) fn admission(&self) -> Arc<dyn ReplayAdmission> {
+        self.admission.clone()
+    }
+}
+
+/// A replay handle can extend inputs in its authenticated starting frame, but
+/// cannot borrow another source, day, seed, session or scope projection.
+struct WitnessAdmission {
+    sources: [CapturedProgram; 2],
+    frames: [ScenarioSpec; 2],
+    history: HistoryAdmission,
+}
+impl ReplayAdmission for WitnessAdmission {
+    fn replay_operation_ids(
+        &self,
+        source: &CapturedProgram,
+        scenario: &ScenarioSpec,
+    ) -> Result<Vec<Id>, AdapterError> {
+        if !self.sources.contains(source)
+            || !self.frames.iter().any(|frame| {
+                let mut frame = frame.clone();
+                frame.inputs = scenario.inputs.clone();
+                frame.label = scenario.label.clone();
+                frame == *scenario
+            })
+        {
+            return Err(unavailable(
+                "witness replay changed its authenticated source or input frame",
+            ));
+        }
+        self.history.replay_operation_ids(source, scenario)
+    }
+    fn validate_seed(
+        &self,
+        source: &CapturedProgram,
+        data: &DataSnapshot,
+        day: i32,
+    ) -> Result<(), AdapterError> {
+        if !self.sources.contains(source)
+            || !self
+                .frames
+                .iter()
+                .any(|s| &s.seed == data && s.clock_day == day)
+        {
+            return Err(unavailable(
+                "witness replay changed its source, seed or day",
+            ));
+        }
+        self.history.validate_seed(source, data, day)
+    }
+    fn validate_state(
+        &self,
+        source: &CapturedProgram,
+        data: &DataSnapshot,
+        day: i32,
+    ) -> Result<(), AdapterError> {
+        if !self.sources.contains(source) {
+            return Err(unavailable("witness replay changed its source"));
+        }
+        self.history.validate_state(source, data, day)
+    }
+}
 impl std::fmt::Debug for VerifiedRetainedHistory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VerifiedRetainedHistory")
@@ -249,7 +341,7 @@ impl VerifiedRetainedHistory {
         }
         Ok(self.prepared_results.clone())
     }
-    pub(super) fn replay_admission(&self) -> Result<Arc<dyn ReplayAdmission>, AdapterError> {
+    fn replay_contexts(&self) -> Result<Vec<ScopedExecutionContext>, AdapterError> {
         let mut contexts = vec![self.replay_context.clone()];
         for prepared in self.prepared_targets.values() {
             contexts.push(
@@ -269,10 +361,103 @@ impl VerifiedRetainedHistory {
                 );
             }
         }
+        Ok(contexts)
+    }
+    pub(super) fn replay_admission(&self) -> Result<Arc<dyn ReplayAdmission>, AdapterError> {
         Ok(Arc::new(HistoryAdmission {
-            contexts,
+            contexts: self.replay_contexts()?,
             projected_contexts: self.projected_contexts.clone(),
         }))
+    }
+    /// Preserve the checked projection registry that actually produced this
+    /// witness. A preparation alone loses synthetic creation identities after
+    /// metadata initialization. Reproduce both original and reduced evidence
+    /// before handing any authority to the host.
+    pub fn checked_witness_replay(
+        &self,
+        prepared: &PreparedScopedChange,
+        witness: &VerifiedWitness,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<CheckedWitnessReplay, AdapterError> {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(AdapterError::Cancelled);
+        }
+        let current = self.current.program().map_err(unavailable)?;
+        let id = canonical_digest(IdentityDomain::Source, prepared.target())?;
+        if self.store.load().map_err(unavailable)? != self.current
+            || self.prepared_targets.get(&id) != Some(prepared)
+            || !(witness.matches_sources(current, prepared.target())
+                || witness.matches_sources(prepared.target(), current))
+        {
+            return Err(unavailable(
+                "witness is not the exact registered current/prepared rule pair",
+            ));
+        }
+        let contexts = self.replay_contexts()?;
+        // Freeze the existing registry. Later discovery on another clone must
+        // not expand or change this handle's admitted replay frame.
+        let projected = self
+            .projected_contexts
+            .read()
+            .map_err(|_| unavailable("projected scene admission lock is poisoned"))?
+            .clone();
+        let admission: Arc<dyn ReplayAdmission> = Arc::new(WitnessAdmission {
+            sources: [
+                witness.before_program().clone(),
+                witness.after_program().clone(),
+            ],
+            frames: [
+                witness.initial_scenario().clone(),
+                witness.witness().scenario.clone(),
+            ],
+            history: HistoryAdmission {
+                contexts,
+                projected_contexts: Arc::new(std::sync::RwLock::new(projected)),
+            },
+        });
+        let runtime =
+            LocalRuntime::with_cancellation(cancelled.clone()).with_admission(admission.clone());
+        for (scenario, expected) in [
+            (witness.initial_scenario(), witness.initial_runs()),
+            (
+                &witness.witness().scenario,
+                (&witness.witness().before, &witness.witness().after),
+            ),
+        ] {
+            for (source, expected) in [
+                (witness.before_program(), expected.0),
+                (witness.after_program(), expected.1),
+            ] {
+                if cancelled.load(Ordering::Acquire) {
+                    return Err(AdapterError::Cancelled);
+                }
+                let actual = runtime.replay_admitted(
+                    source,
+                    scenario,
+                    &self.current.decisions,
+                    RuntimeLimits::default(),
+                    "checked-witness-replay",
+                    Some(admission.as_ref()),
+                )?;
+                if actual.state != EvidenceState::Observed
+                    || actual.binding != expected.binding
+                    || actual.observations != expected.observations
+                    || actual.trace != expected.trace
+                {
+                    return Err(unavailable(
+                        "witness replay did not reproduce its exact original evidence",
+                    ));
+                }
+            }
+        }
+        let checked = CheckedWitnessReplay {
+            basis: self.current.clone(),
+            prepared: prepared.clone(),
+            witness: witness.clone(),
+            admission,
+        };
+        checked.check(&self.store, prepared, &cancelled)?;
+        Ok(checked)
     }
     /// Host-authenticated preparation only: both compared executables receive
     /// this same actual scenario. Unknown correspondence remains unavailable.
@@ -328,12 +513,20 @@ impl VerifiedRetainedHistory {
             for context in registry.values().filter(|context| {
                 context.has_scenario_correspondence(scene) && context.admit_target(target).is_ok()
             }) {
-                context
+                // A prepared context also carries older retained scenario
+                // correspondences. Matching one of those frames does not mean
+                // its seed already contains this new target's initialization.
+                // Reuse only an admitted common input; otherwise regenerate it
+                // below through the same checked projection path.
+                if context
                     .verify_seed(before, &scene.seed, scene.clock_day)
-                    .map_err(unavailable)?;
-                context
-                    .verify_seed(target, &scene.seed, scene.clock_day)
-                    .map_err(unavailable)?;
+                    .is_err()
+                    || context
+                        .verify_seed(target, &scene.seed, scene.clock_day)
+                        .is_err()
+                {
+                    continue;
+                }
                 if matched.is_some_and(|prior| {
                     prior.correspondence_proofs() != context.correspondence_proofs()
                 }) {
@@ -373,6 +566,239 @@ impl VerifiedRetainedHistory {
             .verify_seed(before, &actual.seed, actual.clock_day)
             .map_err(unavailable)?;
         Ok((actual, Some(context)))
+    }
+    /// Input-frame equivalence only, never settlement or adoption authority.
+    /// Callers must first reproduce and compare every material outcome. No
+    /// business cell, schema, event, input or execution evidence is rewritten.
+    pub(crate) fn equivalent_prepared_frames(
+        &self,
+        before: &CapturedProgram,
+        after: &CapturedProgram,
+        left: &ScenarioSpec,
+        right: &ScenarioSpec,
+        cancelled: &AtomicBool,
+    ) -> Result<bool, AdapterError> {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(AdapterError::Cancelled);
+        }
+        if self.store.load().map_err(unavailable)? != self.current {
+            return Err(unavailable("retained frame basis changed"));
+        }
+        let current = self.current.program().map_err(unavailable)?;
+        let target = if before == current {
+            after
+        } else if after == current {
+            before
+        } else {
+            return Ok(false);
+        };
+        let Some(prepared) = self
+            .prepared_targets
+            .get(&canonical_digest(IdentityDomain::Source, target)?)
+        else {
+            return Ok(false);
+        };
+        if prepared.initialization().is_none() {
+            return Ok(false);
+        }
+        if left.version != right.version
+            || left.session != right.session
+            || left.clock_day != right.clock_day
+            || left.random_seed != right.random_seed
+            || left.validity != right.validity
+            || left.inputs.len() != right.inputs.len()
+            || !left.inputs.iter().zip(&right.inputs).all(|(a, b)| {
+                a == b
+                    || matches!(
+                        (a, b),
+                        (SemanticInput::Observe { .. }, SemanticInput::Observe { .. })
+                    )
+            })
+        {
+            return Ok(false);
+        }
+        let mut contexts = self.replay_contexts()?;
+        contexts.extend(
+            self.projected_contexts
+                .read()
+                .map_err(|_| unavailable("projected scene admission lock is poisoned"))?
+                .values()
+                .cloned(),
+        );
+        let admission = HistoryAdmission {
+            contexts: contexts.clone(),
+            projected_contexts: self.projected_contexts.clone(),
+        };
+        let mut namespaces = vec![];
+        for source in [before, after] {
+            for scene in [left, right] {
+                // Both real sources must admit the exact frame, including its
+                // original creation namespace, before origins can be compared.
+                namespaces.push(admission.replay_operation_ids(source, scene)?);
+            }
+        }
+        if namespaces.iter().any(|ids| ids != &namespaces[0]) {
+            // Valid but different business inputs are not equivalent. An
+            // unavailable or ambiguous namespace already failed admission.
+            return Ok(false);
+        }
+        let mut proofs = BTreeMap::new();
+        for context in &contexts {
+            for (id, proof) in context.correspondence_proofs() {
+                if proofs.get(&id).is_some_and(|prior| prior != &proof) {
+                    return Err(unavailable("retained origin proof is ambiguous"));
+                }
+                proofs.insert(id, proof);
+                if proofs.len() > MAX_ITEMS {
+                    return Err(unavailable("retained origin inventory exceeds bounds"));
+                }
+            }
+        }
+        let mut sources: BTreeMap<_, _> = self
+            .current
+            .programs
+            .iter()
+            .chain(&self.context.sources)
+            .map(|source| {
+                Ok((
+                    canonical_digest(IdentityDomain::Source, source)?,
+                    source.clone(),
+                ))
+            })
+            .collect::<Result<_, AdapterError>>()?;
+        for prepared in self.prepared_targets.values() {
+            for source in [prepared.candidate(), prepared.target()] {
+                sources.insert(
+                    canonical_digest(IdentityDomain::Source, source)?,
+                    source.clone(),
+                );
+            }
+        }
+        let schema = &prepared.candidate().program.entities;
+        let mut checked_schemas = BTreeSet::new();
+        let mut origin = |scene: &ScenarioSpec| -> Result<DataSnapshot, AdapterError> {
+            let mut pending = vec![(scene.clone(), None::<Digest>, BTreeSet::new())];
+            let mut root: Option<DataSnapshot> = None;
+            let mut visited = 0usize;
+            while let Some((frame, expected, mut path)) = pending.pop() {
+                if cancelled.load(Ordering::Acquire) {
+                    return Err(AdapterError::Cancelled);
+                }
+                visited += 1;
+                if visited > MAX_ITEMS || !path.insert(frame.identity()?) {
+                    return Err(unavailable("retained origin is cyclic or exceeds bounds"));
+                }
+                let seed = frame.seed.identity()?;
+                if expected.as_ref() == Some(&seed)
+                    || (expected.is_none() && frame.seed == self.current.data)
+                {
+                    if root.as_ref().is_some_and(|prior| prior != &frame.seed) {
+                        return Err(unavailable(
+                            "retained frame has ambiguous original business input",
+                        ));
+                    }
+                    root = Some(frame.seed);
+                    continue;
+                }
+                let matching: Vec<_> = proofs
+                    .values()
+                    .filter(|proof| {
+                        proof
+                            .scenario
+                            .as_ref()
+                            .is_some_and(|pair| same_input_frame(&pair.projected, &frame))
+                    })
+                    .collect();
+                if matching.is_empty() {
+                    return Err(unavailable("retained frame lacks an exact checked origin"));
+                }
+                for proof in matching {
+                    if expected
+                        .as_ref()
+                        .is_some_and(|id| id != &proof.operation_seed)
+                        || proof.projected != seed
+                    {
+                        return Err(unavailable("retained origin namespace is ambiguous"));
+                    }
+                    let pair = proof.scenario.as_ref().expect("matched scenario proof");
+                    // This route concerns compiler initialization only. A
+                    // business-schema or semantic-input migration needs its
+                    // own checked correspondence, not this equivalence gate.
+                    if pair.original.session != pair.projected.session
+                        || pair.original.inputs != pair.projected.inputs
+                        || pair.original.clock_day != pair.projected.clock_day
+                        || pair.original.random_seed != pair.projected.random_seed
+                        || pair.original.validity != pair.projected.validity
+                    {
+                        return Err(unavailable(
+                            "retained origin changes the execution environment or inputs",
+                        ));
+                    }
+                    let target = sources
+                        .get(&proof.target)
+                        .ok_or_else(|| unavailable("retained origin target is missing"))?;
+                    for source in [&proof.source, target] {
+                        let id = canonical_digest(IdentityDomain::Source, source)?;
+                        if checked_schemas.insert(id)
+                            && self.checked_business_schema(source, &contexts)? != *schema
+                        {
+                            return Err(unavailable(
+                                "retained origin changes ordinary business schema",
+                            ));
+                        }
+                    }
+                    let mut previous = pair.original.clone();
+                    // A structural reduction keeps its actual inputs. Only the
+                    // independently checked ancestor frame is followed back.
+                    previous.inputs = frame.inputs.clone();
+                    pending.push((previous, Some(proof.operation_seed.clone()), path.clone()));
+                }
+            }
+            root.ok_or_else(|| unavailable("retained original business input is unavailable"))
+        };
+        Ok(origin(left)? == origin(right)?)
+    }
+    fn checked_business_schema(
+        &self,
+        source: &CapturedProgram,
+        contexts: &[ScopedExecutionContext],
+    ) -> Result<Vec<EntityDefinition>, AdapterError> {
+        if !contexts
+            .iter()
+            .any(|context| context.provenance_columns(source).is_ok())
+        {
+            return Err(unavailable(
+                "retained source has no checked compiler manifest",
+            ));
+        }
+        let id = canonical_digest(IdentityDomain::Source, source)?;
+        if let Some(prepared) = self.prepared_targets.get(&id) {
+            return Ok(prepared.candidate().program.entities.clone());
+        }
+        let manifest = self.current.scope.compositions.get(&id).or_else(|| {
+            self.current
+                .scope
+                .rehearsals
+                .get(&id)
+                .map(|proof| &proof.manifest)
+        });
+        if let Some(manifest) = manifest {
+            let business = self
+                .current
+                .programs
+                .iter()
+                .chain(&self.context.sources)
+                .find(|p| {
+                    canonical_digest(IdentityDomain::Source, *p).ok().as_ref()
+                        == Some(&manifest.business)
+                })
+                .ok_or_else(|| unavailable("retained ordinary schema source is missing"))?;
+            return Ok(business.program.entities.clone());
+        }
+        if crate::product_runtime::has_protected_fields(source) {
+            return Err(unavailable("retained schema lacks its ordinary source"));
+        }
+        Ok(source.program.entities.clone())
     }
     fn projection(
         engine: &DecisionEngine<LocalRuntime>,
@@ -755,6 +1181,16 @@ impl VerifiedRetainedHistory {
         let before = outcomes.pop().unwrap();
         Ok((selected.clone(), before, after))
     }
+}
+
+fn same_input_frame(left: &ScenarioSpec, right: &ScenarioSpec) -> bool {
+    left.version == right.version
+        && left.id == right.id
+        && left.seed == right.seed
+        && left.session == right.session
+        && left.clock_day == right.clock_day
+        && left.random_seed == right.random_seed
+        && left.validity == right.validity
 }
 
 /// Original execution evidence plus a separately executed target trace used

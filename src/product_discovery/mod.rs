@@ -9,7 +9,7 @@ use crate::product_decisions::{CheckDisposition, IntentionBinding};
 use crate::product_runtime::LocalRuntime;
 use crate::product_scenarios::*;
 use history::RetainedRun;
-pub use history::VerifiedRetainedHistory;
+pub use history::{CheckedWitnessReplay, VerifiedRetainedHistory};
 pub use prepared::PreparedDiscoveryCandidate;
 pub use provider::*;
 pub use source::{analyze_delta, SourceDelta};
@@ -1907,22 +1907,59 @@ pub fn discover(
                                                 && same_pair(&current_pair, &expected_pair)
                                                 && same_pair(&replay_pair, &expected_pair)
                                             {
-                                                let direct = scene_equivalence_key(
+                                                // Material profiles and both sampled pairs
+                                                // already match above. Only checked scoped
+                                                // origins may bridge different provenance
+                                                // envelopes around the same business input.
+                                                let equivalent =
+                                                    |left: &ScenarioSpec, right: &ScenarioSpec| {
+                                                        if scene_equivalence_key(left)?
+                                                            == scene_equivalence_key(right)?
+                                                        {
+                                                            return Ok(true);
+                                                        }
+                                                        match &policy.retained_history {
+                                                            Some(history) => history
+                                                                .equivalent_prepared_frames(
+                                                                    witness.before_program(),
+                                                                    witness.after_program(),
+                                                                    left,
+                                                                    right,
+                                                                    &cancelled,
+                                                                ),
+                                                            None => Ok(false),
+                                                        }
+                                                    };
+                                                let (direct, frame_available) = match equivalent(
                                                     witness.initial_scenario(),
-                                                )? == scene_equivalence_key(
                                                     &retained_scene,
-                                                )? || scene_equivalence_key(
-                                                    &witness.witness().scenario,
-                                                )? == scene_equivalence_key(
-                                                    &retained_scene,
-                                                )?;
+                                                )
+                                                .and_then(|same| {
+                                                    if same {
+                                                        Ok(true)
+                                                    } else {
+                                                        equivalent(
+                                                            &witness.witness().scenario,
+                                                            &retained_scene,
+                                                        )
+                                                    }
+                                                }) {
+                                                    Ok(same) => (same, true),
+                                                    Err(error) => {
+                                                        unavailable = true;
+                                                        report.unverified.push(format!("Retained input-frame equivalence is unverified: {error:?}"));
+                                                        (false, false)
+                                                    }
+                                                };
                                                 if direct {
                                                     matched.insert(index);
                                                     settled_pairs.insert(pair_key.clone());
-                                                } else if comparisons >= policy.max_comparisons {
+                                                } else if frame_available
+                                                    && comparisons >= policy.max_comparisons
+                                                {
                                                     unavailable = true;
                                                     report.unverified.push("Retained-scene comparison budget exhausted; equivalence is unverified".into());
-                                                } else {
+                                                } else if frame_available {
                                                     comparisons += 1;
                                                     let normalized = engine.minimize(
                                                         witness.before_program(),
@@ -1934,11 +1971,18 @@ pub fn discover(
                                                     )?;
                                                     report.runs.extend(normalized.runs);
                                                     if let Some(normalized) = normalized.witness {
-                                                        if scene_equivalence_key(
+                                                        let same_frame = match equivalent(
                                                             &normalized.witness().scenario,
-                                                        )? == scene_equivalence_key(
                                                             &witness.witness().scenario,
-                                                        )? {
+                                                        ) {
+                                                            Ok(same) => same,
+                                                            Err(error) => {
+                                                                unavailable = true;
+                                                                report.unverified.push(format!("Retained reduced-frame equivalence is unverified: {error:?}"));
+                                                                false
+                                                            }
+                                                        };
+                                                        if same_frame {
                                                             matched.insert(index);
                                                             settled_pairs.insert(pair_key.clone());
                                                         } else if normalized
