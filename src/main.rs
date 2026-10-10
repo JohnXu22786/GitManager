@@ -31,6 +31,7 @@ mod product_locations;
 mod product_backup;
 mod product_export;
 mod product_studio;
+mod product_sources;
 
 use eframe::egui;
 use std::path::{Path, PathBuf};
@@ -264,6 +265,13 @@ fn renderer_for_process(value: Option<&std::ffi::OsStr>) -> std::io::Result<efra
 }
 
 fn main() -> eframe::Result<()> {
+    if let Some(result) = product_studio::machine_command(&std::env::args_os().skip(1).collect::<Vec<_>>()) {
+        match result {
+            Ok(output) => println!("{output}"),
+            Err(error) => { eprintln!("{error}"); std::process::exit(1); }
+        }
+        return Ok(());
+    }
     let app_title = format!("Git Manager v{}", version_info::VERSION);
     let options = eframe::NativeOptions {
         renderer: renderer_for_process(std::env::var_os("GIT_MANAGER_RENDERER").as_deref())

@@ -1,6 +1,8 @@
 use super::*;
 #[path = "local_files_worker.rs"]
 mod local_files_worker;
+#[path = "task_source_worker.rs"]
+mod task_source_worker;
 use crate::product_provider::{unix_ms, JobReceipt};
 use std::collections::BTreeSet;
 
@@ -138,6 +140,7 @@ struct OpenTool {
     snapshot: ProjectSnapshot,
 }
 struct Worker {
+    task: task_source_worker::State,
     config: Config,
     locations: Option<ToolLocations>,
     journal: Option<JournalFile>,
@@ -187,6 +190,7 @@ impl Worker {
             )
         });
         Update {
+            task: self.task_view(),
             page: Some(self.page.clone()),
             need: None,
             recent,
@@ -210,7 +214,12 @@ impl Worker {
             mutation_blocked: self.journal.is_none() || durable_pending,
             generation_blocked: self.journal.is_none()
                 || self.generation_blocked
-                || durable_pending,
+                || durable_pending
+                || self
+                    .journal
+                    .as_ref()
+                    .and_then(|j| j.value.task.as_ref())
+                    .is_some_and(|t| t.external.is_some()),
             pending: pending && self.ready.is_none(),
             abandon_creation: self
                 .journal
@@ -321,6 +330,11 @@ impl Worker {
     ) -> Result<(), String> {
         self.no_pending()?;
         if self.generation_blocked
+            || self
+                .journal
+                .as_ref()
+                .and_then(|j| j.value.task.as_ref())
+                .is_some_and(|t| t.external.is_some())
             || self
                 .journal
                 .as_ref()
@@ -449,6 +463,11 @@ impl Worker {
             || self
                 .journal
                 .as_ref()
+                .and_then(|j| j.value.task.as_ref())
+                .is_some_and(|t| t.external.is_some())
+            || self
+                .journal
+                .as_ref()
                 .is_some_and(|j| j.value.provider.is_some())
         {
             return Err("The earlier provider process has an unresolved outcome; no new generation was sent".into());
@@ -494,6 +513,7 @@ impl Worker {
         self.ready = None;
         self.draft = None;
         self.change = None;
+        self.task.evidence = None;
         self.intention = None;
         self.recovery = None;
         self.recovered_location = None;
@@ -775,6 +795,7 @@ impl Worker {
             // business clarification or a supported design route.
             let result = change.prepare(&current.store, gate);
             self.page = Page::Change(change.checked_view(&current.store, gate)?);
+            self.task.evidence = None;
             self.change = Some(change);
             self.notice =
                 "Try the actual change on copied work. Nothing in your saved tool changed".into();
@@ -916,6 +937,7 @@ impl Worker {
         });
         self.draft = None;
         self.change = None;
+        self.task.evidence = None;
         self.intention = None;
         self.recovery = None;
         self.recovered_location = None;
@@ -924,6 +946,7 @@ impl Worker {
         self.page = page;
         self.journal(|j| j.last = Some(association.clone()))?;
         self.post_save_opened(&association, Some(&mut opened));
+        self.restore_task(&Gate::default())?;
         Ok(())
     }
     fn return_daily(&mut self, gate: &Gate) -> Result<(), String> {
@@ -987,6 +1010,7 @@ impl Worker {
         });
         self.draft = None;
         self.change = None;
+        self.task.evidence = None;
         self.intention = None;
         self.recovery = None;
         self.recovered_location = None;
@@ -1590,6 +1614,7 @@ impl Worker {
             return Err("Opening history was cancelled; saved work was kept".into());
         }
         self.change = None;
+        self.task.evidence = None;
         self.intention = None;
         self.recovery = None;
         self.recovered_location = None;
@@ -1759,7 +1784,7 @@ impl Worker {
                 (withdrawal.decision(&current.store, &engine, gate.cancelled.clone())?, "The selected rules were withdrawn on current work. Later records, edits, completed facts, events and earlier outputs were kept")
             }
         };
-        self.commit_change(change, basis, gate, notice)
+        self.commit_change(change, basis, gate, notice, None)
     }
     fn change_action(
         &mut self,
@@ -1768,6 +1793,13 @@ impl Worker {
         action: impl FnOnce(&mut ChangeDraft, &ProductStore) -> Result<(), String>,
     ) -> Result<(), String> {
         self.no_pending()?;
+        let operation = self
+            .change
+            .as_ref()
+            .ok_or("No change is being tried")?
+            .operation
+            .clone();
+        self.check_task_evidence(&operation, gate)?;
         let store = &self
             .opened
             .as_ref()
@@ -1784,9 +1816,19 @@ impl Worker {
         }
         let mut next = draft.clone();
         action(&mut next, store)?;
-        let page = Page::Change(next.checked_view(store, gate)?);
+        let mut view = next.checked_view(store, gate)?;
+        if self.has_task_evidence(&operation) {
+            view.origin = "Actual captured external task edits. Independent copied execution is local; no live author or service receipt is invented".into();
+        }
+        let page = Page::Change(view);
+        self.check_task_evidence(&operation, gate)?;
         if !gate.finish() {
             return Err("Trial cancelled; the previous copied experience was kept".into());
+        }
+        if let Some((bound, _)) = &mut self.task.evidence {
+            if bound == &operation {
+                *bound = next.operation.clone();
+            }
         }
         self.change = Some(next);
         self.page = page;
@@ -1813,8 +1855,11 @@ impl Worker {
         if key.basis.as_ref() != Some(&basis) || self.today() != basis.day {
             return Err("This comparison is stale. Rehearse on current saved work".into());
         }
+        let source_operation = self
+            .has_task_evidence(&draft.operation)
+            .then(|| draft.operation.clone());
         let change = draft.decision(&opened.store, outcome, &key.operation, gate)?;
-        self.commit_change(change, basis, gate, "Your choice was saved. Continue ordinary work; pending choices did not activate their alternatives")
+        self.commit_change(change, basis, gate, "Your choice was saved. Continue ordinary work; pending choices did not activate their alternatives", source_operation.as_deref())
     }
     fn commit_change(
         &mut self,
@@ -1822,8 +1867,12 @@ impl Worker {
         basis: Basis,
         gate: &Gate,
         notice: &str,
+        source_operation: Option<&str>,
     ) -> Result<(), String> {
         self.no_pending()?;
+        if let Some(operation) = source_operation {
+            self.check_task_evidence(operation, gate)?;
+        }
         let opened = self.opened.as_ref().ok_or("Open the saved tool first")?;
         let fresh = opened.store.load().map_err(error)?;
         if Basis::capture(&fresh)? != basis
@@ -1849,6 +1898,12 @@ impl Worker {
         if self.today() != expected_day {
             self.journal(|j| j.pending = None)?;
             return Err("The date changed before saving. Return to saved work and rehearse a fresh comparison; no choice was committed".into());
+        }
+        if let Some(operation) = source_operation {
+            if let Err(e) = self.check_task_evidence(operation, gate) {
+                self.journal(|j| j.pending = None)?;
+                return Err(e);
+            }
         }
         if let Err(e) = gate.commit() {
             self.journal(|j| j.pending = None)?;
@@ -1975,6 +2030,7 @@ impl Worker {
                     .into(),
             );
         };
+        let task_evidence = self.retained_task_evidence(&candidate, gate)?;
         let mut draft = ChangeDraft::new(snapshot, candidate, choice.request)?;
         draft.resolves = vec![decision.into()];
         if let Some(request) = request {
@@ -1989,13 +2045,24 @@ impl Worker {
                 .collect();
         }
         let result = draft.prepare(&opened.store, gate);
-        let page = Page::Change(draft.checked_view(&opened.store, gate)?);
+        let mut view = draft.checked_view(&opened.store, gate)?;
+        if let Some(evidence) = &task_evidence {
+            self.task
+                .flow
+                .as_ref()
+                .ok_or("The retained choice's linked task is unavailable")?
+                .check_before_adoption(evidence, &gate.cancelled)
+                .map_err(error)?;
+            view.origin = "Actual captured external task edits. Independent copied execution is local; no live author or service receipt is invented".into();
+        }
+        let page = Page::Change(view);
         if !gate.finish() {
             return Err(
                 "Opening the retained choice was cancelled; saved work is unchanged".into(),
             );
         }
         self.page = page;
+        self.task.evidence = task_evidence.map(|evidence| (draft.operation.clone(), evidence));
         self.change = Some(draft);
         self.notice="This is a fresh comparison on your current saved work. The earlier experiences remain unchanged in history; try the alternatives again before resolving".into();
         result
@@ -2011,6 +2078,7 @@ impl Worker {
         self.ready = None;
         self.draft = None;
         self.change = None;
+        self.task.evidence = None;
         self.intention = None;
         self.recovery = None;
         self.recovered_location = None;
@@ -2018,6 +2086,7 @@ impl Worker {
         self.opened = None;
         self.page = Page::Home;
         self.chosen = None;
+        self.task = task_source_worker::State::default();
         Ok(())
     }
     fn before_abandon(&self, _gate: &Gate) {
@@ -2056,7 +2125,8 @@ impl Worker {
         #[cfg(test)]
         if matches!(
             &command.action,
-            Action::Decide { .. }
+            Action::TaskReopen { .. }
+                | Action::Decide { .. }
                 | Action::Modify { .. }
                 | Action::ResumeChoice { .. }
                 | Action::History
@@ -2075,6 +2145,19 @@ impl Worker {
             }
         }
         match &command.action {
+            Action::Tasks { focused } => self.tasks(focused.clone(), key, gate),
+            Action::TaskPoll => self.poll_task(gate),
+            Action::TaskLink { task_id } => self.link_task(task_id, key, gate),
+            Action::TaskReview => self.review_task(key, gate),
+            Action::TaskRequest { need, provider } => self.task_request(need, *provider, key, gate),
+            Action::TaskAuthorize { disclosure } => self.authorize_task(disclosure, key, gate),
+            Action::TaskDecline => {
+                self.decline_task();
+                Ok(())
+            }
+            Action::TaskInspect { request_id } => self.inspect_task(request_id),
+            Action::TaskReopen { request_id } => self.reopen_task(request_id, gate),
+            Action::TaskAbandon { request_id } => self.abandon_task(request_id, gate),
             Action::Files => self.files(key, gate),
             Action::Export { basis, selection } => self.export_file(basis, selection, key, gate),
             Action::SaveBackup { basis } => self.backup_file(basis, key, gate),
@@ -2270,6 +2353,7 @@ pub(super) fn run(
     complete: mpsc::SyncSender<Completion>,
 ) {
     let mut host = Worker {
+        task: task_source_worker::State::default(),
         config,
         locations: None,
         journal: None,
@@ -2301,7 +2385,7 @@ pub(super) fn run(
         epoch = command.key.epoch;
         last_operation = Some(command.key.operation.clone());
         host.committed = None;
-        if !matches!(command.action, Action::Close) {
+        if !matches!(command.action, Action::Close | Action::TaskPoll) {
             host.notice.clear();
         }
         let mut result = host.handle(&command);
@@ -2327,10 +2411,14 @@ pub(super) fn run(
             );
         }
         if let Err(e) = &result {
-            host.notice = match &host.committed {
+            if matches!(command.action, Action::TaskPoll) {
+                host.task.view.message = e.clone();
+            } else {
+                host.notice = match &host.committed {
                 Some(path) => format!("Your work was saved at {}, but finishing the view or restart record failed: {e}. Do not repeat the operation", path.display()),
                 None => e.clone(),
             };
+            }
         }
         let mut update = host.update();
         if matches!(command.action, Action::Boot) {

@@ -144,6 +144,37 @@ impl RecoveryHandoff {
         (format!("Your original interrupted attempt was kept and not repeated or confirmed. Original: {}. Separate working copy: {}", tool.path.display(), self.recovered.path.display()), summary)
     }
 }
+/// Existing task authority pins, not a second task registry.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TaskAssociation {
+    pub tool: Association,
+    pub task_id: Id,
+    pub created_at: String,
+    pub repository: PathBuf,
+    pub worktree: PathBuf,
+    pub external: Option<ExternalAssociation>,
+    // Consumed context is evidence history, never pending launch/submit authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed: Option<CompletedTask>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CompletedTask {
+    pub external: ExternalAssociation,
+    pub capture: CapturedProgram,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ExternalAssociation {
+    pub pending: task_source_flow::PendingExternal,
+    pub basis: Basis,
+    pub provider: ProviderKind,
+    pub disclosure: Digest,
+    pub approval_operation: Id,
+    // Written before invocation. A lost launch acknowledgement never retries.
+    pub launch_attempted: bool,
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Journal {
@@ -160,6 +191,8 @@ pub(super) struct Journal {
     pub local_file: Option<FileAttempt>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recovery_handoffs: Vec<RecoveryHandoff>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskAssociation>,
 }
 impl Default for Journal {
     fn default() -> Self {
@@ -174,6 +207,7 @@ impl Default for Journal {
             last_unsaved: None,
             local_file: None,
             recovery_handoffs: vec![],
+            task: None,
         }
     }
 }
@@ -191,6 +225,76 @@ impl Journal {
             }
             Ok(())
         };
+        if let Some(task) = &self.task {
+            check(&task.tool)?;
+            if !valid_id(&task.task_id)
+                || task.created_at.is_empty()
+                || task.created_at.len() > MAX_TEXT_BYTES
+                || !task.repository.is_absolute()
+                || !task.worktree.is_absolute()
+            {
+                return Err("Invalid linked task association".into());
+            }
+            if task.external.is_some() && task.completed.is_some() {
+                return Err("A task cannot have pending and consumed authority together".into());
+            }
+            for external in task
+                .external
+                .iter()
+                .chain(task.completed.iter().map(|c| &c.external))
+            {
+                let request = external.pending.request();
+                request.validate().map_err(error)?;
+                let disclosure =
+                    task_source_host::Disclosure::new(request.clone(), external.provider)?;
+                if disclosure.digest != external.disclosure
+                    || !valid_id(&external.approval_operation)
+                    || request.operation != DevelopmentOperation::Modify
+                    || request.project_id != task.tool.identity.project_id
+                    || request.context.data_digest.as_ref() != Some(&external.basis.data)
+                    || request.context.session_digest.as_ref() != Some(&external.basis.session)
+                    || canonical_digest(IdentityDomain::Decision, &request.decisions)
+                        .map_err(error)?
+                        != external.basis.decisions
+                    || request
+                        .sources
+                        .first()
+                        .and_then(|s| s.binding.task.as_ref())
+                        .map(|t| &t.task_id)
+                        != Some(&task.task_id)
+                    || !request.sources.iter().any(|s| {
+                        canonical_digest(IdentityDomain::Source, s).ok().as_ref()
+                            == Some(&external.basis.source)
+                    })
+                {
+                    return Err("Invalid authorized task handoff association".into());
+                }
+            }
+        }
+        if let Some(task) = &self.task {
+            if let Some(completed) = &task.completed {
+                completed.capture.validate().map_err(error)?;
+                if !completed.external.launch_attempted
+                    || completed.capture.binding.project_id != task.tool.identity.project_id
+                    || completed.capture.binding.task.as_ref().map(|t| &t.task_id)
+                        != Some(&task.task_id)
+                    || !matches!(
+                        completed.capture.binding.producer,
+                        Producer::ExternalAuthor { .. }
+                    )
+                    || completed
+                        .external
+                        .pending
+                        .request()
+                        .sources
+                        .first()
+                        .map(|s| &s.binding.program_path)
+                        != Some(&completed.capture.binding.program_path)
+                {
+                    return Err("Invalid consumed task source association".into());
+                }
+            }
+        }
         if let Some(file) = &self.local_file {
             if !valid_id(&file.operation)
                 || !file.destination.is_absolute()
@@ -409,6 +513,16 @@ impl JournalFile {
         };
         result.value.validate()?;
         Ok(result)
+    }
+    /// Read the same atomic bounded journal without competing for its writer
+    /// lock. Machine callers cannot create a new association or accept a path.
+    pub fn read_only(root: &Path) -> Result<Journal, String> {
+        let folder = Folder::open(&root.join("studio")).map_err(error)?;
+        let bytes = folder.read("session.json", JOURNAL_LIMIT).map_err(error)?;
+        let json = crate::tool_proposal_input::parse_json_bytes(&bytes).map_err(error)?;
+        let value: Journal = serde_json::from_value(json).map_err(error)?;
+        value.validate()?;
+        Ok(value)
     }
     pub fn write(&mut self, value: Journal) -> Result<(), String> {
         value.validate()?;

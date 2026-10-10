@@ -3480,7 +3480,9 @@ impl eframe::App for App {
             }
         }
         self.product_studio.poll();
-        if self.product_studio.is_busy() { ctx.request_repaint_after(std::time::Duration::from_millis(30)); }
+        if let Some(delay) = self.product_studio.repaint_after() {
+            ctx.request_repaint_after(delay);
+        }
         self.process_pending_ops(ctx);
         self.process_task_verification(ctx);
         self.process_task_integrated_verification(ctx);

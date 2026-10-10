@@ -95,9 +95,12 @@ impl ExternalHandoff {
         if request.project_id != adapter.project_id() {
             return Err(invalid("Request belongs to another project"));
         }
-        let sources: Vec<_> = request
+        // External handoffs designate the first source as the editable task
+        // baseline. Later captures may be historical intentions from this same
+        // task; they must remain unchanged and are never fallback baselines.
+        let baseline = request
             .sources
-            .iter()
+            .first()
             .filter(|source| {
                 source
                     .binding
@@ -105,11 +108,18 @@ impl ExternalHandoff {
                     .as_ref()
                     .is_some_and(|task| task.task_id == adapter.task_id())
             })
-            .collect();
-        if sources.len() != 1 {
-            return Err(invalid("Request needs exactly one linked task baseline"));
+            .ok_or_else(|| {
+                invalid("The first request source must be the linked editable task baseline")
+            })?;
+        if request
+            .sources
+            .iter()
+            .skip(1)
+            .any(|source| source.binding == baseline.binding)
+        {
+            return Err(invalid("Duplicate editable task baseline is ambiguous"));
         }
-        let baseline = sources[0].clone();
+        let baseline = baseline.clone();
         Ok(baseline)
     }
     fn request_bytes(request: &DevelopmentRequest) -> Result<Vec<u8>, AdapterError> {
