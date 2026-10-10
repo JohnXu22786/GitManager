@@ -652,14 +652,12 @@ fn first_editable_baseline_preserves_distinct_same_task_history_and_refuses_ambi
     let current = adapter.capture_current().unwrap();
     let mut request = task_request(current.clone(), "same-task-history");
     request.sources.push(historical.clone());
-    let root = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    // Normalize our owned temp root before the strict no-follow boundary.
+    let root = fs::canonicalize(root_dir.path()).unwrap();
     let mut flow = flow_fixture::TaskSourceFlow::link("runtime-project", &task.record.id).unwrap();
     let invocation = flow
-        .prepare_external(
-            root.path(),
-            &request,
-            &std::sync::atomic::AtomicBool::new(false),
-        )
+        .prepare_external(&root, &request, &std::sync::atomic::AtomicBool::new(false))
         .unwrap();
     assert_eq!(invocation.baseline(), &current);
     assert_eq!(
@@ -674,7 +672,7 @@ fn first_editable_baseline_preserves_distinct_same_task_history_and_refuses_ambi
     )
     .unwrap();
     reopened
-        .reopen_external(root.path(), &false.into(), &false.into())
+        .reopen_external(&root, &false.into(), &false.into())
         .unwrap();
     for (name, sources) in [
         ("duplicate-first", vec![current.clone(), current.clone()]),
@@ -684,9 +682,7 @@ fn first_editable_baseline_preserves_distinct_same_task_history_and_refuses_ambi
         bad.sources = sources;
         let mut next =
             flow_fixture::TaskSourceFlow::link("runtime-project", &task.record.id).unwrap();
-        assert!(next
-            .prepare_external(root.path(), &bad, &false.into())
-            .is_err());
+        assert!(next.prepare_external(&root, &bad, &false.into()).is_err());
     }
     let mut value = serde_json::to_value(&pending).unwrap();
     value["request"]["sources"]
@@ -698,14 +694,12 @@ fn first_editable_baseline_preserves_distinct_same_task_history_and_refuses_ambi
         flow_fixture::TaskSourceFlow::interrupted("runtime-project", &task.record.id, tampered)
             .unwrap();
     assert!(next
-        .reopen_external(root.path(), &false.into(), &false.into())
+        .reopen_external(&root, &false.into(), &false.into())
         .is_err());
     let mut wrong = task_request(current, "wrong-first");
     wrong.sources[0].binding.task.as_mut().unwrap().task_id = "another-task".into();
     let mut next = flow_fixture::TaskSourceFlow::link("runtime-project", &task.record.id).unwrap();
-    assert!(next
-        .prepare_external(root.path(), &wrong, &false.into())
-        .is_err());
+    assert!(next.prepare_external(&root, &wrong, &false.into()).is_err());
 }
 
 #[test]
@@ -1081,9 +1075,10 @@ fn subsequent_handoff_keeps_identical_current_once_and_distinct_accepted_task_hi
     assert_eq!(request.accepted_scenes.len(), 2);
     request.validate().unwrap();
     let jobs = tempfile::tempdir().unwrap();
+    let jobs_root = fs::canonicalize(jobs.path()).unwrap();
     let mut next = flow_fixture::TaskSourceFlow::link("runtime-project", &task.record.id).unwrap();
     let invocation = next
-        .prepare_external(jobs.path(), &request, &false.into())
+        .prepare_external(&jobs_root, &request, &false.into())
         .unwrap();
     assert_eq!(invocation.request(), &request);
     assert_eq!(invocation.baseline(), &current);
