@@ -1505,7 +1505,7 @@ fn observation_only_minimum_uses_its_checked_action_bearing_original() {
 }
 
 #[test]
-fn oversized_managed_context_is_refused_before_transport_without_changing_work() {
+fn managed_context_uses_lossless_prompt_without_changing_work() {
     let dir = tempdir();
     let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
     let (_, _, candidate) = managed(&store, false);
@@ -1555,14 +1555,21 @@ fn oversized_managed_context_is_refused_before_transport_without_changing_work()
     assert_eq!(req.accepted_scenes, d.modify_request().accepted_scenes);
     assert_eq!(req.decisions, current.decisions);
     let bytes = serde_json::to_vec(req).unwrap().len();
-    let error = encode_request(req, &ProviderOptions::default())
-        .err()
-        .expect("The full multi-slot retained context exceeds the fixed transport bound");
+    assert!(bytes > product_provider::MAX_PROMPT_BYTES);
+    let wire = encode_request(req, &ProviderOptions::default()).unwrap();
+    assert!(wire.prompt.len() <= product_provider::MAX_PROMPT_BYTES);
+    let prompt: serde_json::Value = serde_json::from_slice(&wire.prompt).unwrap();
+    let encoded = serde_json::to_vec(&prompt["request"]).unwrap();
+    let restored = ExactUtf8DevelopmentRequest::parse(&encoded)
+        .unwrap()
+        .to_request()
+        .unwrap();
+    assert_eq!(&restored, req);
+    assert_eq!(restored.identity().unwrap(), req.identity().unwrap());
     eprintln!(
-        "Bounded managed {:?} request {}: {} serialized request bytes; preceding Modify prompt {} bytes; fixed prompt cap {} bytes; {error:?}",
-        req.operation, req.id, bytes, modify_wire.prompt.len(), product_provider::MAX_PROMPT_BYTES
+        "Bounded managed {:?} request {}: {} original request bytes; exact UTF-8 prompt {} bytes; preceding Modify prompt {} bytes; unchanged cap {} bytes",
+        req.operation, req.id, bytes, wire.prompt.len(), modify_wire.prompt.len(), product_provider::MAX_PROMPT_BYTES
     );
-    assert!(format!("{error:?}").contains("prompt must be bounded"));
     assert_eq!(store.load().unwrap(), current);
 }
 
