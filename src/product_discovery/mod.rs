@@ -3,6 +3,7 @@
 mod history;
 mod prepared;
 mod provider;
+mod request_codec;
 mod source;
 use crate::product_contract::*;
 use crate::product_decisions::{CheckDisposition, IntentionBinding};
@@ -12,6 +13,7 @@ use history::RetainedRun;
 pub use history::{CheckedWitnessReplay, VerifiedRetainedHistory};
 pub use prepared::PreparedDiscoveryCandidate;
 pub use provider::*;
+pub use request_codec::ExactUtf8DevelopmentRequest;
 pub use source::{analyze_delta, SourceDelta};
 use std::{
     cell::Cell,
