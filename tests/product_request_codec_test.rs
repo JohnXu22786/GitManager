@@ -739,22 +739,27 @@ fn prompt_fallback_obeys_exact_legacy_and_compact_boundaries() {
         format!("{:?}", encode_request(&request, &options).unwrap_err())
             .contains("prompt must be bounded")
     );
-    let dir = tempdir();
-    let home = dir.path().join("home");
-    std::fs::create_dir(&home).unwrap();
-    let jobs = dir.path().join("jobs");
-    let transport = product_provider::ProviderTransport::new_fixture(
-        jobs.clone(),
-        product_provider::ProviderKind::Codex,
-        dir.path().join("missing-cli"),
-        home,
-    )
-    .unwrap();
-    let error = prepare_development(transport, &request, options)
-        .err()
-        .expect("still-too-large must fail before provider preparation");
-    assert!(format!("{error:?}").contains("prompt must be bounded"));
-    assert_eq!(std::fs::read_dir(jobs).unwrap().count(), 0);
+    // CLI fixture preparation is supported on Linux/macOS only. Keep every
+    // codec and complete-prompt boundary assertion above portable.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let dir = tempdir();
+        let home = dir.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let jobs = dir.path().join("jobs");
+        let transport = product_provider::ProviderTransport::new_fixture(
+            jobs.clone(),
+            product_provider::ProviderKind::Codex,
+            dir.path().join("missing-cli"),
+            home,
+        )
+        .unwrap();
+        let error = prepare_development(transport, &request, options)
+            .err()
+            .expect("still-too-large must fail before provider preparation");
+        assert!(format!("{error:?}").contains("prompt must be bounded"));
+        assert_eq!(std::fs::read_dir(jobs).unwrap().count(), 0);
+    }
 }
 
 fn legacy_prompt(request: &DevelopmentRequest) -> Vec<u8> {
@@ -923,20 +928,29 @@ fn still_oversized_selected_context_refuses_before_preparation_and_keeps_work() 
         request.examples.len(),
         encoded.len()
     );
-    let home = dir.path().join("home");
-    std::fs::create_dir(&home).unwrap();
-    let jobs = dir.path().join("jobs");
-    let transport = product_provider::ProviderTransport::new_fixture(
-        jobs.clone(),
-        product_provider::ProviderKind::Codex,
-        dir.path().join("missing-cli"),
-        home,
-    )
-    .unwrap();
-    let error = prepare_development(transport, &request, options)
-        .err()
-        .expect("complete selected context must refuse when still too large");
-    assert!(format!("{error:?}").contains("prompt must be bounded"));
-    assert_eq!(std::fs::read_dir(jobs).unwrap().count(), 0);
+    assert!(
+        format!("{:?}", encode_request(&request, &options).unwrap_err())
+            .contains("prompt must be bounded")
+    );
+    // Preserve portable refusal and store checks without constructing the
+    // unsupported Windows CLI fixture transport.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let home = dir.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let jobs = dir.path().join("jobs");
+        let transport = product_provider::ProviderTransport::new_fixture(
+            jobs.clone(),
+            product_provider::ProviderKind::Codex,
+            dir.path().join("missing-cli"),
+            home,
+        )
+        .unwrap();
+        let error = prepare_development(transport, &request, options)
+            .err()
+            .expect("complete selected context must refuse when still too large");
+        assert!(format!("{error:?}").contains("prompt must be bounded"));
+        assert_eq!(std::fs::read_dir(jobs).unwrap().count(), 0);
+    }
     assert_eq!(store.load().unwrap(), current);
 }
