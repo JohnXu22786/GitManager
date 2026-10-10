@@ -1858,7 +1858,16 @@ impl Worker {
         let source_operation = self
             .has_task_evidence(&draft.operation)
             .then(|| draft.operation.clone());
+        #[cfg(test)]
+        let diagnostic_started = std::time::Instant::now();
+        #[cfg(test)]
+        eprintln!("decide: final decision preparation begins");
         let change = draft.decision(&opened.store, outcome, &key.operation, gate)?;
+        #[cfg(test)]
+        eprintln!(
+            "decide: final decision prepared after {:?}",
+            diagnostic_started.elapsed()
+        );
         self.commit_change(change, basis, gate, "Your choice was saved. Continue ordinary work; pending choices did not activate their alternatives", source_operation.as_deref())
     }
     fn commit_change(
@@ -1869,6 +1878,10 @@ impl Worker {
         notice: &str,
         source_operation: Option<&str>,
     ) -> Result<(), String> {
+        #[cfg(test)]
+        let diagnostic_started = std::time::Instant::now();
+        #[cfg(test)]
+        eprintln!("commit_change: freshness check begins");
         self.no_pending()?;
         if let Some(operation) = source_operation {
             self.check_task_evidence(operation, gate)?;
@@ -1886,7 +1899,17 @@ impl Worker {
         let plan = change.plan().clone();
         let tool = opened.association.clone();
         let store = opened.store.clone();
+        #[cfg(test)]
+        eprintln!(
+            "commit_change: pre-checkpoint begins at {:?}",
+            diagnostic_started.elapsed()
+        );
         self.pre_checkpoint(&tool, &store)?;
+        #[cfg(test)]
+        eprintln!(
+            "commit_change: pre-checkpoint finished at {:?}",
+            diagnostic_started.elapsed()
+        );
         self.journal(|j| {
             j.pending = Some(Interrupted::Change {
                 tool: tool.clone(),
@@ -1911,7 +1934,18 @@ impl Worker {
         }
         let engine =
             DecisionEngine::new(LocalRuntime::default(), IntentArchive::new(store.clone()));
+        #[cfg(test)]
+        eprintln!(
+            "commit_change: adoption begins at {:?}",
+            diagnostic_started.elapsed()
+        );
         let result = engine.adopt(&store, &change);
+        #[cfg(test)]
+        eprintln!(
+            "commit_change: adoption returned (ok={}) at {:?}",
+            result.is_ok(),
+            diagnostic_started.elapsed()
+        );
         #[cfg(test)]
         let result = if result.is_ok() && self.config.hooks.lose_ack.swap(false, Ordering::AcqRel) {
             Err(crate::product_decisions::DecisionError::Invalid(
@@ -1920,9 +1954,19 @@ impl Worker {
         } else {
             result
         };
+        #[cfg(test)]
+        eprintln!(
+            "commit_change: verified reopen begins at {:?}",
+            diagnostic_started.elapsed()
+        );
         let checked = open_verified(&tool.path, Some(&tool.identity)).map_err(|e| {
             format!("The change outcome is unresolved. Keep its exact receipt association: {e}")
         })?;
+        #[cfg(test)]
+        eprintln!(
+            "commit_change: verified reopen finished at {:?}",
+            diagnostic_started.elapsed()
+        );
         if has_change_receipt(&checked.snapshot, &plan)? {
             self.committed = Some(tool.path.clone());
             self.after_commit();
@@ -1931,7 +1975,17 @@ impl Worker {
                 j.last = Some(tool.clone());
             })?;
             self.notice = notice.into();
+            #[cfg(test)]
+            eprintln!(
+                "commit_change: install begins at {:?}",
+                diagnostic_started.elapsed()
+            );
             self.install_opened(tool, checked)?;
+            #[cfg(test)]
+            eprintln!(
+                "commit_change: install finished at {:?}",
+                diagnostic_started.elapsed()
+            );
             Ok(())
         } else {
             self.journal(|j| j.pending = None)?;

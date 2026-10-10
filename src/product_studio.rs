@@ -4,6 +4,12 @@
 mod change;
 #[path = "product_studio/change_adapter.rs"]
 mod change_adapter;
+#[path = "product_studio/discovery_flow.rs"]
+mod discovery_flow;
+#[path = "product_studio/rule_discovery.rs"]
+mod rule_discovery;
+#[cfg(test)]
+pub use change::rule_trace_testing;
 #[path = "product_studio/intention_flow.rs"]
 mod intention_flow;
 #[path = "product_studio/journal.rs"]
