@@ -2,6 +2,8 @@
 //! activation pointer. Legacy order projects are never read or rewritten here.
 mod files;
 mod json;
+mod recovery_destination;
+pub(crate) use recovery_destination::RecoveryDestination;
 pub mod scope;
 mod upgrade;
 use crate::product_contract::*;
@@ -368,6 +370,32 @@ impl ProductStore {
     where
         F: FnOnce(&ProductStore) -> Result<()>,
     {
+        Self::create_recovered_at(path.as_ref(), None, snapshot, before_activate)
+    }
+    pub(crate) fn create_recovered_selected<F>(
+        destination: &RecoveryDestination,
+        snapshot: &ProjectSnapshot,
+        before_activate: F,
+    ) -> Result<Self>
+    where
+        F: FnOnce(&ProductStore) -> Result<()>,
+    {
+        Self::create_recovered_at(
+            destination.path(),
+            Some(destination),
+            snapshot,
+            before_activate,
+        )
+    }
+    fn create_recovered_at<F>(
+        path: &Path,
+        selected: Option<&RecoveryDestination>,
+        snapshot: &ProjectSnapshot,
+        before_activate: F,
+    ) -> Result<Self>
+    where
+        F: FnOnce(&ProductStore) -> Result<()>,
+    {
         snapshot.validate()?;
         if canonical_bytes(snapshot)?.len() > MAX_STORE_BYTES {
             return Err(StoreError::Invalid(
@@ -383,10 +411,16 @@ impl ProductStore {
             RuntimeLimits::default(),
             &snapshot.artifacts,
         )?;
-        let (parent, name) = Self::location(path.as_ref())?;
+        let (parent, name) = match selected {
+            Some(selected) => selected.checked_parts()?,
+            None => {
+                let (parent, name) = Self::location(path)?;
+                (Arc::new(parent), name)
+            }
+        };
         let root = parent.create_child(&name)?;
         let store = Self {
-            parent: Arc::new(parent),
+            parent,
             root: Arc::new(root),
             name,
             upgrade_requires_reopen: Arc::new(std::sync::atomic::AtomicBool::new(false)),

@@ -29,6 +29,7 @@ mod product_decisions;
 mod product_discovery;
 mod product_locations;
 mod product_backup;
+mod product_export;
 mod product_studio;
 
 use eframe::egui;

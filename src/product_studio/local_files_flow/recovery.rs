@@ -9,7 +9,9 @@ use crate::product_decisions::IntentionBundle;
 use crate::product_locations::{
     CreatedTool, IssueKind, OperationIssue, RecentTools, SelectedFile, ToolIdentity, ToolLocations,
 };
-use crate::product_store::{LegacyUpgrade, ProductStore, ProjectSnapshot, UpgradeProgress};
+use crate::product_store::{
+    LegacyUpgrade, ProductStore, ProjectSnapshot, RecoveryDestination, UpgradeProgress,
+};
 use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
@@ -103,7 +105,53 @@ impl RecoveryDraft {
         recent: &RecentTools,
         locations: &ToolLocations,
         opened_unix_ms: u64,
+        progress: impl FnMut(UpgradeProgress),
+    ) -> RecoveryOutcome {
+        self.recover_at(
+            choice,
+            active_operation,
+            cancelled,
+            recent,
+            locations,
+            opened_unix_ms,
+            progress,
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn recover_selected(
+        self,
+        selected: &RecoveryDestination,
+        choice: DestinationChoice,
+        active_operation: &str,
+        cancelled: &AtomicBool,
+        recent: &RecentTools,
+        locations: &ToolLocations,
+        opened_unix_ms: u64,
+        progress: impl FnMut(UpgradeProgress),
+    ) -> RecoveryOutcome {
+        self.recover_at(
+            choice,
+            active_operation,
+            cancelled,
+            recent,
+            locations,
+            opened_unix_ms,
+            progress,
+            Some(selected),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn recover_at(
+        self,
+        choice: DestinationChoice,
+        active_operation: &str,
+        cancelled: &AtomicBool,
+        recent: &RecentTools,
+        locations: &ToolLocations,
+        opened_unix_ms: u64,
         mut progress: impl FnMut(UpgradeProgress),
+        selected: Option<&RecoveryDestination>,
     ) -> RecoveryOutcome {
         let path = match choice.resolve(&self.preview.operation, active_operation, cancelled) {
             Ok(path) => path,
@@ -112,11 +160,28 @@ impl RecoveryDraft {
         if cancelled.load(Ordering::Acquire) {
             return RecoveryOutcome::NotAttempted("Recovery cancelled before writing.".into());
         }
-        let created = match &self.intake {
-            BackupIntake::Current(backup) => backup.recover_tool(&path, recent, opened_unix_ms),
-            BackupIntake::UpgradeRequired(legacy) => {
+        if let Some(selected) = selected {
+            if selected.path() != path {
+                return RecoveryOutcome::NotAttempted(
+                    "The selected recovery destination changed.".into(),
+                );
+            }
+            if let Err(error) = selected.check() {
+                return RecoveryOutcome::NotAttempted(error.to_string());
+            }
+        }
+        let created = match (&self.intake, selected) {
+            (BackupIntake::Current(backup), None) => {
+                backup.recover_tool(&path, recent, opened_unix_ms)
+            }
+            (BackupIntake::Current(backup), Some(selected)) => {
+                backup.recover_tool_selected(selected, recent, opened_unix_ms)
+            }
+            (BackupIntake::UpgradeRequired(legacy), None) => {
                 legacy.upgrade_recover_tool(&path, recent, opened_unix_ms, &mut progress)
             }
+            (BackupIntake::UpgradeRequired(legacy), Some(selected)) => legacy
+                .upgrade_recover_tool_selected(selected, recent, opened_unix_ms, &mut progress),
         };
         match created {
             Err(issue) => RecoveryOutcome::AttemptFailed {
