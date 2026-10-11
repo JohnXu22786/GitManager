@@ -2,8 +2,15 @@
 use super::*;
 use crate::product_locations::Folder;
 use serde::{Deserialize, Serialize};
-// Complete inherited change context must fit the existing strict 1 MiB local
-// JSON intake. Old journals retain the same format, digests and read path.
+#[path = "journal_format.rs"]
+mod format;
+#[path = "journal_upgrade.rs"]
+mod upgrade;
+#[cfg(test)]
+#[path = "journal_upgrade_tests.rs"]
+mod upgrade_tests;
+// Complete inherited context must fit the unchanged strict 1 MiB intake.
+// Only startup's dedicated upgrader can read the previous disk format.
 const JOURNAL_LIMIT: usize = MAX_WIRE_BYTES;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,7 +193,7 @@ pub(super) struct Journal {
     pub provider: Option<ProviderAssociation>,
     pub abandoned_creation: Option<Association>,
     pub last_unsaved: Option<UnsavedInput>,
-    // Additive optional host metadata; old records retain their exact shape.
+    // Optional host metadata is preserved by the startup migration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_file: Option<FileAttempt>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -198,7 +205,7 @@ impl Default for Journal {
     fn default() -> Self {
         Self {
             magic: "gitmanager.generated-tool-host".into(),
-            version: 1,
+            version: 2,
             need: String::new(),
             last: None,
             pending: None,
@@ -214,7 +221,7 @@ impl Default for Journal {
 impl Journal {
     fn validate(&self) -> Result<(), String> {
         if self.magic != "gitmanager.generated-tool-host"
-            || self.version != 1
+            || self.version != 2
             || self.need.len() > MAX_TEXT_BYTES
         {
             return Err("The restart information is damaged or belongs to an unsupported version; it was kept unchanged".into());
@@ -489,21 +496,60 @@ pub(super) struct JournalFile {
     _lock: crate::product_locations::WriteLock,
     pub value: Journal,
 }
+fn read_optional(folder: &Folder) -> Result<Option<Vec<u8>>, String> {
+    folder.check().map_err(error)?;
+    match std::fs::symlink_metadata(folder.path().join("session.json")) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            folder.check().map_err(error)?;
+            Ok(None)
+        }
+        Err(e) => Err(error(e)),
+        Ok(_) => folder
+            .read("session.json", JOURNAL_LIMIT)
+            .map(Some)
+            .map_err(error),
+    }
+}
 impl JournalFile {
+    /// Upgrade handles are released before returning this inert byte identity.
+    /// The caller must then open a fresh current-format host session.
+    pub fn upgrade(root: &Path, report: impl FnMut(u8)) -> Result<Option<String>, String> {
+        Ok(match upgrade::run(root, report)? {
+            upgrade::Outcome::Current => None,
+            upgrade::Outcome::RestartRequired { digest } => Some(digest),
+        })
+    }
     pub fn open(root: &Path) -> Result<Self, String> {
+        Self::reopen(root, None)
+    }
+    pub fn reopen(root: &Path, activated: Option<&str>) -> Result<Self, String> {
+        #[cfg(test)]
+        upgrade::checkpoint(root, upgrade::TestPoint::BeforeOpen)?;
         let folder = Folder::ensure(&root.join("studio")).map_err(error)?;
         let lock = folder
             .lock()
             .map_err(|e| format!("Generated-tool restart information is busy: {e}"))?;
-        let value = match std::fs::symlink_metadata(folder.path().join("session.json")) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Journal::default(),
-            Err(e) => return Err(error(e)),
-            Ok(_) => {
-                let bytes = folder.read("session.json", JOURNAL_LIMIT).map_err(error)?;
-                let json = crate::tool_proposal_input::parse_json_bytes(&bytes).map_err(error)?;
-                serde_json::from_value(json).map_err(|e| {
-                    format!("The restart information could not be read and was kept unchanged: {e}")
-                })?
+        let value = match read_optional(&folder)? {
+            Some(bytes) => {
+                if activated
+                    .is_some_and(|expected| crate::product_provider::digest(&bytes) != expected)
+                {
+                    return Err("The activated restart information changed before fresh reopening; files were kept and writes are paused".into());
+                }
+                format::decode(&bytes)?
+            }
+            None => {
+                if activated.is_some() {
+                    return Err(
+                        "The activated restart information is missing; writes are paused".into(),
+                    );
+                }
+                let value = Journal::default();
+                folder
+                    .publish("session.json", &format::encode(&value)?, false)
+                    .map_err(error)?;
+                folder.sync().map_err(error)?;
+                value
             }
         };
         let result = Self {
@@ -511,27 +557,19 @@ impl JournalFile {
             _lock: lock,
             value,
         };
-        result.value.validate()?;
+        #[cfg(test)]
+        upgrade::checkpoint(root, upgrade::TestPoint::Opened)?;
         Ok(result)
     }
-    /// Read the same atomic bounded journal without competing for its writer
-    /// lock. Machine callers cannot create a new association or accept a path.
+    /// Machine callers read only the current atomic format. They never acquire
+    /// a writer lock, create a directory, migrate or renew any association.
     pub fn read_only(root: &Path) -> Result<Journal, String> {
         let folder = Folder::open(&root.join("studio")).map_err(error)?;
         let bytes = folder.read("session.json", JOURNAL_LIMIT).map_err(error)?;
-        let json = crate::tool_proposal_input::parse_json_bytes(&bytes).map_err(error)?;
-        let value: Journal = serde_json::from_value(json).map_err(error)?;
-        value.validate()?;
-        Ok(value)
+        format::decode(&bytes)
     }
     pub fn write(&mut self, value: Journal) -> Result<(), String> {
-        value.validate()?;
-        let bytes = canonical_bytes(&value).map_err(error)?;
-        if bytes.len() > JOURNAL_LIMIT {
-            return Err(
-                "This input exceeds the bounded restart record; nothing was submitted".into(),
-            );
-        }
+        let bytes = format::encode(&value)?;
         self.folder
             .publish("session.json", &bytes, true)
             .map_err(error)?;

@@ -264,13 +264,39 @@ impl Worker {
             Ok(())
         }
     }
-    fn boot(&mut self) -> Result<(), String> {
+    fn boot(&mut self, gate: &Gate) -> Result<(), String> {
+        // Boot must precede all runtime/provider/task evidence. No such handle
+        // may survive the journal's migration and fresh-session boundary.
+        if self.journal.is_some()
+            || self.ready.is_some()
+            || self.draft.is_some()
+            || self.change.is_some()
+            || self.intention.is_some()
+            || self.opened.is_some()
+            || self.recovery.is_some()
+            || self.recovered_location.is_some()
+            || self.task.flow.is_some()
+            || self.task.evidence.is_some()
+        {
+            return Err("Restart initialization requires an empty host session".into());
+        }
         self.locations = Some(match &self.config.root {
             Some(root) => ToolLocations::chosen(root).map_err(error)?,
             None => ToolLocations::default_location().map_err(error)?,
         });
-        self.journal = Some(JournalFile::open(self.locations.as_ref().unwrap().path())?);
-        if let Err(e) = self.reconcile(false, &Gate::default()) {
+        let root = self.locations.as_ref().unwrap().path();
+        let activated = JournalFile::upgrade(root, |stage| {
+            gate.upgrade_stage.store(stage, Ordering::Release);
+        })?;
+        if activated.is_some() {
+            gate.upgrade_stage.store(10, Ordering::Release);
+        }
+        self.journal = Some(JournalFile::reopen(root, activated.as_deref()).map_err(|e| {
+            if activated.is_some() {
+                format!("Restart information was updated, but a fresh host session could not open. {e}. Restart GitManager before continuing; the original backup is kept")
+            } else { e }
+        })?);
+        if let Err(e) = self.reconcile(false, gate) {
             self.notice = e;
         }
         if self.opened.is_none() && !matches!(self.page, Page::Upgrade { .. }) {
@@ -280,6 +306,9 @@ impl Worker {
                     self.notice = format!("Your last tool could not be opened. {e}");
                 }
             }
+        }
+        if activated.is_some() {
+            self.notice = format!("Restart information updated and a fresh host session reopened. The original backup is kept. {}", self.notice);
         }
         Ok(())
     }
@@ -2173,7 +2202,7 @@ impl Worker {
             Action::OpenRecovered { selection } => self.open_recovered(selection, key, gate),
             Action::FilesBack => self.files_back(key, gate),
             Action::AcknowledgeFile { operation } => self.acknowledge_file(operation, gate),
-            Action::Boot => self.boot(),
+            Action::Boot => self.boot(gate),
             Action::Prepare {
                 need,
                 provider,

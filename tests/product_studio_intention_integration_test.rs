@@ -1234,7 +1234,18 @@ fn restarted_reconcile_rejects_tampered_purpose_basis_needs_evolution_and_operat
         let mut value: serde_json::Value =
             serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
         match field {
-            "purpose" => value["provider"]["request"]["operation"] = serde_json::json!("modify"),
+            "purpose" => {
+                let envelope: product_discovery::ExactUtf8DevelopmentRequest =
+                    serde_json::from_value(value["provider"]["request"].clone()).unwrap();
+                let mut request = envelope.to_request().unwrap();
+                request.operation = DevelopmentOperation::Modify;
+                // Keep the envelope digest coherent so this still exercises the
+                // journal's semantic purpose binding, not an unknown field/hash.
+                value["provider"]["request"] = serde_json::to_value(
+                    product_discovery::ExactUtf8DevelopmentRequest::from_request(&request).unwrap(),
+                )
+                .unwrap();
+            }
             "source" | "data" | "decisions" => {
                 value["provider"]["reconcile"]["basis"][field] = serde_json::to_value(
                     canonical_digest(IdentityDomain::Evidence, &"wrong basis").unwrap(),
