@@ -206,7 +206,171 @@ fn prepared_replay(
     Ok((bound, context, actual))
 }
 
+fn finish_trial_observation(scenario: &mut ScenarioSpec) -> Result<(), String> {
+    if matches!(scenario.inputs.last(), Some(SemanticInput::Observe { .. })) {
+        return Ok(());
+    }
+    if scenario.inputs.len() >= MAX_ITEMS {
+        return Err(
+            "This comparison needs room to observe its final outcome. Restart the copied trial"
+                .into(),
+        );
+    }
+    let used: BTreeSet<_> = scenario
+        .inputs
+        .iter()
+        .filter_map(|input| {
+            if let SemanticInput::Observe { point } = input {
+                Some(point.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+    let point = std::iter::once("result".to_string())
+        .chain((0..MAX_ITEMS).map(|index| format!("trial-result-{index}")))
+        .find(|point| !used.contains(point.as_str()))
+        .ok_or("This comparison has no unused final observation point")?;
+    scenario.inputs.push(SemanticInput::Observe { point });
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "../../tests/fixtures/product_rule_trace/mod.rs"]
+pub mod rule_trace_testing;
+
 impl ChangeDraft {
+    /// Carry one checked current-business copy into the existing choice path.
+    /// An exact discovery example cannot call this method in place of a copy.
+    pub fn import_rule_trace(
+        &mut self,
+        store: &ProductStore,
+        selection: &super::rule_discovery::RuleSelection,
+        trace: &super::rule_discovery::RuleCopyTrace,
+        gate: &Gate,
+    ) -> Result<(), String> {
+        self.scenes = None;
+        self.alternative = None;
+        gate.check()?;
+        self.check(store)?;
+        if self.structural || !self.missing().is_empty() {
+            return Err("Choose one complete scoped rule before importing its checked copy".into());
+        }
+        let prepared = self
+            .prepared
+            .as_ref()
+            .ok_or("Prepare the selected rule before importing its copied work")?;
+        // Validate even the old input proofs before normalizing their inventory.
+        // A legitimate edited trial can have different input correspondences,
+        // but cannot change any part of the compiled business selection.
+        ScopedExecutionContext::prepared(&self.snapshot, prepared).map_err(error)?;
+        let mut selected = selection.preparation().clone();
+        let mut current = prepared.clone();
+        selected.correspondences.clear();
+        current.correspondences.clear();
+        if current != selected || prepared.candidate() != &self.candidate {
+            return Err("The prepared rule changed. Discover the current selection again".into());
+        }
+        let request = change_adapter::request(
+            &self.snapshot,
+            &self.candidate,
+            self.population.clone(),
+            self.lifecycles.clone(),
+            self.scope_operations.clone(),
+        )?;
+        let current = super::rule_discovery::RuleSelection::checked(
+            store,
+            &self.snapshot,
+            selection.preparation().clone(),
+            request,
+            &self.operation,
+            gate.cancelled.clone(),
+        )?;
+        trace.check(store, &current, gate.cancelled.clone())?;
+        let original = trace.original_scenario();
+        if original.seed != self.snapshot.data
+            || original.session != self.snapshot.session
+            || original.clock_day != self.snapshot.clock_day
+        {
+            return Err(
+                "The copied trace does not start from this exact saved business frame".into(),
+            );
+        }
+        let (prepared, admission, scenario) =
+            prepared_replay(&self.snapshot, current.preparation(), original)?;
+        if &prepared != trace.preparation() || &scenario != trace.scenario() {
+            return Err(
+                "The copied rule's input mapping could not be independently reproduced".into(),
+            );
+        }
+        let checker = engine(store, gate);
+        let current_scene = checker
+            .accept_prepared_current_scene(
+                store,
+                &prepared,
+                &scenario,
+                Disclosure::ExplicitlySelected,
+            )
+            .map_err(error)?;
+        let alternative_scene = checker
+            .accept_scoped_scene(store, &prepared, &scenario, Disclosure::ExplicitlySelected)
+            .map_err(error)?;
+        let runtime = LocalRuntime::with_cancellation(gate.cancelled.clone());
+        let mut views = vec![];
+        let mut days = vec![];
+        let mut used = BTreeSet::new();
+        for scene in [&current_scene, &alternative_scene] {
+            // Witness order is independent of which source is current.
+            let index = trace
+                .evidence()
+                .iter()
+                .position(|expected| {
+                    expected.binding.source == scene.program().binding
+                        && expected.binding.artifact == scene.program().artifact
+                })
+                .ok_or("The copied evidence belongs to a different source")?;
+            if !used.insert(index) {
+                return Err("The copied evidence does not name two exact rule alternatives".into());
+            }
+            let observed = runtime
+                .replay_admitted(
+                    scene.program(),
+                    &scenario,
+                    &self.snapshot.decisions,
+                    RuntimeLimits::default(),
+                    "rule-playback",
+                    Some(&admission),
+                )
+                .map_err(error)?;
+            if observed != trace.evidence()[index]
+                || scene.observations() != observed.observations
+                || scene.evidence().trace != observed.trace
+            {
+                return Err(
+                    "The checked copied outcome could not be independently reproduced".into(),
+                );
+            }
+            let (view, day) = replay_view(&runtime, scene.program(), &scenario, &admission)?;
+            if view != trace.views()[index] {
+                return Err("The copied display differs from its checked business outcome".into());
+            }
+            views.push(view);
+            days.push(day);
+        }
+        if days[0] != days[1] {
+            return Err("The copied versions did not keep the same simulated date".into());
+        }
+        gate.check()?;
+        self.check(store)?;
+        self.prepared = Some(prepared);
+        self.scenario = original.clone();
+        self.current = views.remove(0);
+        self.alternative = Some(views.remove(0));
+        self.trial_day = days[0];
+        self.scenes = Some((current_scene, alternative_scene));
+        Ok(())
+    }
+
     pub fn new(
         snapshot: ProjectSnapshot,
         candidate: CapturedProgram,
@@ -519,9 +683,32 @@ impl ChangeDraft {
         input: SemanticInput,
         gate: &Gate,
     ) -> Result<(), String> {
+        // Revocation belongs to the receiver even when staging or replay fails.
+        let previous_display = self.alternative.take();
+        self.scenes = None;
+        let mut next = self.clone();
+        next.alternative = previous_display;
+        #[cfg(test)]
+        let started = std::time::Instant::now();
+        #[cfg(test)]
+        eprintln!("trial_input: start {input:?}");
+        next.trial_input(store, input, gate)?;
+        #[cfg(test)]
+        eprintln!("trial_input: finished after {:?}", started.elapsed());
+        gate.check()?;
+        next.check(store)?;
+        *self = next;
+        Ok(())
+    }
+    fn trial_input(
+        &mut self,
+        store: &ProductStore,
+        input: SemanticInput,
+        gate: &Gate,
+    ) -> Result<(), String> {
         self.check(store)?;
         gate.check()?;
-        if self.scenario.inputs.len() >= MAX_ITEMS - 1 {
+        if self.scenario.inputs.len() >= MAX_ITEMS {
             return Err(
                 "This comparison has reached its action limit. Restart the copied trial".into(),
             );
@@ -578,9 +765,7 @@ impl ChangeDraft {
         // Observation is explicitly part of the exact independently replayed
         // scene; keep the editable trace without accumulating hidden observes.
         let mut proof = scenario.clone();
-        proof.inputs.push(SemanticInput::Observe {
-            point: "result".into(),
-        });
+        finish_trial_observation(&mut proof)?;
         let (prepared, admission, proof) = if let Some(p) = &self.prepared {
             let (bound, context, actual) = prepared_replay(&self.snapshot, p, &proof)?;
             (Some(bound), context, actual)
@@ -786,7 +971,12 @@ impl ChangeDraft {
         // Raw source identities remain distinct when only wording differs.
         let same_alternative = self.alternative.is_some()
             && target.artifact.semantic_digest
-                == self.snapshot.program().map_err(error)?.artifact.semantic_digest;
+                == self
+                    .snapshot
+                    .program()
+                    .map_err(error)?
+                    .artifact
+                    .semantic_digest;
         Ok(ChangeView {
             basis: Basis::capture(&self.snapshot)?,
             current: self.current.clone(),
@@ -843,6 +1033,12 @@ impl ChangeDraft {
              "This copied example has not verified the full chosen scope for recording Keep current. Returning to saved work leaves the existing tool and earlier choices unchanged."),
         ] {
             if *ready {
+                #[cfg(test)]
+                let started = std::time::Instant::now();
+                #[cfg(test)]
+                let label = format!("{outcome:?}");
+                #[cfg(test)]
+                eprintln!("checked_view: preparing {label}");
                 if let Err(error) = self.decision(store, outcome, &id("readiness"), gate) {
                     *ready = false;
                     view.readiness_notes.push(note.into());
@@ -851,6 +1047,8 @@ impl ChangeDraft {
                     #[cfg(not(test))]
                     let _ = error;
                 }
+                #[cfg(test)]
+                eprintln!("checked_view: finished {label} after {:?}", started.elapsed());
             }
         }
         gate.check()?;
