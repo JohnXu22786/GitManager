@@ -8,6 +8,102 @@ use std::path::{Component, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 static TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(test)]
+pub(crate) mod file_sync_testing {
+    use std::collections::BTreeMap;
+    use std::io;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    fn faults() -> &'static Mutex<BTreeMap<PathBuf, Arc<AtomicUsize>>> {
+        static FAULTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<AtomicUsize>>>> = OnceLock::new();
+        FAULTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+    pub(crate) struct FileSyncFault {
+        path: PathBuf,
+        attempts: Arc<AtomicUsize>,
+    }
+    impl FileSyncFault {
+        pub(crate) fn attempts(&self) -> usize {
+            self.attempts.load(Ordering::Acquire)
+        }
+    }
+    impl Drop for FileSyncFault {
+        fn drop(&mut self) {
+            faults()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.path);
+        }
+    }
+    pub(crate) fn fail(path: PathBuf) -> FileSyncFault {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        assert!(faults()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(path.clone(), attempts.clone())
+            .is_none());
+        FileSyncFault { path, attempts }
+    }
+    pub(super) fn before_sync(path: &Path) -> io::Result<()> {
+        if let Some(attempts) = faults().lock().unwrap_or_else(|e| e.into_inner()).get(path) {
+            attempts.fetch_add(1, Ordering::Release);
+            return Err(io::Error::other("injected file-content sync failure"));
+        }
+        Ok(())
+    }
+    fn directory() -> (tempfile::TempDir, super::Directory, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let directory = super::Directory::open(&root).unwrap();
+        (temp, directory, root)
+    }
+    #[test]
+    fn synced_read_is_bounded_and_ordinary_read_never_syncs() {
+        let (_temp, directory, root) = directory();
+        let bytes = b"exact retained bytes";
+        let path = root.join("backup");
+        std::fs::write(&path, bytes).unwrap();
+        let fault = fail(path.clone());
+        assert!(directory.read_and_sync("backup", bytes.len() - 1).is_err());
+        assert_eq!(fault.attempts(), 0);
+        assert_eq!(directory.read("backup", bytes.len()).unwrap(), bytes);
+        assert_eq!(fault.attempts(), 0);
+        assert!(directory.read_and_sync("backup", bytes.len()).is_err());
+        assert_eq!(fault.attempts(), 1);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        drop(fault);
+        assert_eq!(
+            directory.read_and_sync("backup", bytes.len()).unwrap(),
+            bytes
+        );
+    }
+    #[test]
+    fn synced_read_rejects_missing_traversing_and_special_paths() {
+        let (_temp, directory, root) = directory();
+        assert!(directory.read_and_sync("missing", 32).is_err());
+        assert!(!root.join("missing").exists());
+        assert!(directory.read_and_sync("../outside", 32).is_err());
+        std::fs::create_dir(root.join("not-a-file")).unwrap();
+        assert!(directory.read_and_sync("not-a-file", 32).is_err());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn synced_read_rejects_symbolic_and_hard_links() {
+        let (_temp, directory, root) = directory();
+        let bytes = b"unchanged linked bytes";
+        let source = root.join("source");
+        std::fs::write(&source, bytes).unwrap();
+        std::os::unix::fs::symlink(&source, root.join("symbolic")).unwrap();
+        assert!(directory.read_and_sync("symbolic", 32).is_err());
+        std::fs::hard_link(&source, root.join("hard")).unwrap();
+        assert!(directory.read_and_sync("hard", 32).is_err());
+        assert!(directory.read_and_sync("source", 32).is_err());
+        assert_eq!(std::fs::read(source).unwrap(), bytes);
+    }
+}
+
 pub(crate) struct WriteLock {
     file: File,
 }
@@ -149,7 +245,15 @@ impl Directory {
         }
     }
     pub fn read(&self, name: &str, limit: usize) -> io::Result<Vec<u8>> {
-        let mut file = self.open_file(OsStr::new(name), false, false)?;
+        self.read_file(name, limit, false)
+    }
+    pub fn read_and_sync(&self, name: &str, limit: usize) -> io::Result<Vec<u8>> {
+        self.read_file(name, limit, true)
+    }
+    fn read_file(&self, name: &str, limit: usize, sync: bool) -> io::Result<Vec<u8>> {
+        // FlushFileBuffers requires write access on Windows. Use the same
+        // checked opener and share flags, without creating or changing a file.
+        let mut file = self.open_file(OsStr::new(name), sync && cfg!(windows), false)?;
         let meta = file.metadata()?;
         if !meta.is_file() || meta.len() > limit as u64 {
             return Err(unsafe_path());
@@ -158,6 +262,13 @@ impl Directory {
         (&mut file).take(limit as u64 + 1).read_to_end(&mut bytes)?;
         if bytes.len() > limit {
             return Err(unsafe_path());
+        }
+        if sync {
+            #[cfg(test)]
+            file_sync_testing::before_sync(&self.path.join(name))?;
+            // Sync the descriptor that supplied these bounded bytes, never a
+            // second path-based handle which could name a different object.
+            file.sync_all()?;
         }
         Ok(bytes)
     }

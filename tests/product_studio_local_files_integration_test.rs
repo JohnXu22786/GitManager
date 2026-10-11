@@ -584,7 +584,7 @@ fn close_after_external_effect_rejects_late_page_and_restart_never_exports_twice
     assert_eq!(store.load().unwrap(), before);
 }
 #[test]
-fn old_host_journal_opens_without_rewrite_and_bad_file_association_fails_closed() {
+fn old_host_journal_upgrades_with_exact_backup_and_bad_file_association_fails_closed() {
     use std::sync::{atomic::AtomicBool, Arc};
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
@@ -604,7 +604,12 @@ fn old_host_journal_opens_without_rewrite_and_bad_file_association_fails_closed(
     let mut h = EguiHarness::new(egui::vec2(1500.0, 2400.0));
     settle(&mut h, &mut s);
     assert_eq!(s.test_need(), "Remember my original need");
-    assert_eq!(fs::read(&path).unwrap(), old);
+    let current: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(current["version"], 2);
+    let backup = root
+        .join("studio")
+        .join(format!("session-v1-{}.json", product_provider::digest(old)));
+    assert_eq!(fs::read(backup).unwrap(), old);
     stopped(s, &flag);
     let mut bad: serde_json::Value = serde_json::from_slice(old).unwrap();
     bad["local_file"] = serde_json::json!({"operation":"bad","tool":null,"basis":null,"destination":"relative","target":{"kind":"backup","digest":"0".repeat(64)}});
