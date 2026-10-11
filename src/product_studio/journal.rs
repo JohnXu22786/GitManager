@@ -536,7 +536,19 @@ impl JournalFile {
                 {
                     return Err("The activated restart information changed before fresh reopening; files were kept and writes are paused".into());
                 }
-                format::decode(&bytes)?
+                let value = format::decode(&bytes)?;
+                // The upgrader released a different writer lock. Even equal
+                // bytes can now belong to a newly published, unsynced inode.
+                let synced = folder
+                    .read_and_sync("session.json", JOURNAL_LIMIT)
+                    .map_err(|e| format!("Fresh restart information durability is unconfirmed: {e:?}. Writes are paused"))?;
+                if synced != bytes {
+                    return Err("Restart information changed during fresh reopening; files were kept and writes are paused".into());
+                }
+                #[cfg(test)]
+                upgrade::checkpoint(root, upgrade::TestPoint::BeforeSync)?;
+                folder.sync().map_err(|e| format!("Fresh restart information durability is unconfirmed: {e:?}. Writes are paused"))?;
+                value
             }
             None => {
                 if activated.is_some() {

@@ -718,6 +718,52 @@ fn lost_activation_acknowledgement_is_reconciled_without_rollback() {
     unchanged(&root, &current);
 }
 #[test]
+fn lost_activation_ack_and_current_file_sync_failure_keep_outcome_uncertain() {
+    let (_temp, root) = root();
+    let value = journal(&root, DevelopmentOperation::Modify);
+    let old = legacy(&root, &value);
+    let fault = Folder::test_fail_file_sync(root.join("studio/session.json"));
+    let hook = upgrade::test_hook(&root, |point| {
+        if point == TestPoint::AfterRename {
+            Err("publication durability acknowledgement missing".into())
+        } else {
+            Ok(())
+        }
+    });
+    let result = upgrade::run(&root, |_| {});
+    assert!(
+        result.is_err(),
+        "exact v2 bytes do not confirm activation when file sync fails"
+    );
+    assert!(result.err().unwrap().contains("uncertain"));
+    assert_eq!(fault.attempts(), 1);
+    let current = fs::read(root.join("studio/session.json")).unwrap();
+    assert_eq!(
+        canonical_bytes(&format::decode(&current).unwrap()).unwrap(),
+        canonical_bytes(&value).unwrap()
+    );
+    assert_eq!(fs::read(backup(&root, &old)).unwrap(), old);
+    assert_eq!(
+        canonical_bytes(&JournalFile::read_only(&root).unwrap()).unwrap(),
+        canonical_bytes(&value).unwrap()
+    );
+    assert_eq!(fault.attempts(), 1, "read-only inspection must not sync");
+    drop(hook);
+    assert!(
+        upgrade::run(&root, |_| {}).is_err(),
+        "a v2 restart must retry the still-failing file sync before accepting Current"
+    );
+    assert_eq!(fault.attempts(), 2);
+    unchanged(&root, &current);
+    assert_eq!(fs::read(backup(&root, &old)).unwrap(), old);
+    drop(fault);
+    assert!(matches!(
+        upgrade::run(&root, |_| {}).unwrap(),
+        Outcome::Current
+    ));
+    unchanged(&root, &current);
+}
+#[test]
 fn postactivation_readback_or_sync_uncertainty_blocks_then_reopens_exact_v2() {
     for fault in [TestPoint::BeforeReadback, TestPoint::BeforeSync] {
         let (_temp, root) = root();
@@ -741,6 +787,13 @@ fn postactivation_readback_or_sync_uncertainty_blocks_then_reopens_exact_v2() {
             2
         );
         assert_eq!(fs::read(backup(&root, &old)).unwrap(), old);
+        if fault == TestPoint::BeforeSync {
+            assert!(
+                upgrade::run(&root, |_| {}).is_err(),
+                "a v2 restart must retry the still-failing directory sync"
+            );
+            unchanged(&root, &current);
+        }
         drop(hook);
         assert!(matches!(
             upgrade::run(&root, |_| {}).unwrap(),
@@ -804,6 +857,46 @@ fn writer_contention_preserves_original_records() {
     unchanged(&root, &old);
     drop(lock);
     drop(folder);
+}
+fn reused_backup_sync_failure_keeps_v1(race: bool) {
+    let (_temp, root) = root();
+    let value = Journal::default();
+    let old = legacy(&root, &value);
+    let path = backup(&root, &old);
+    if !race {
+        fs::write(&path, &old).unwrap();
+    }
+    let fault = Folder::test_fail_file_sync(path.clone());
+    let hook = race.then(|| {
+        let path = path.clone();
+        let old = old.clone();
+        upgrade::test_hook(&root, move |point| {
+            if point == TestPoint::BeforeBackupPublish {
+                fs::write(&path, &old).unwrap();
+            }
+            Ok(())
+        })
+    });
+    let result = upgrade::run(&root, |_| {});
+    assert!(
+        result.is_err(),
+        "v2 must not activate when exact backup contents cannot be synced; race={race}"
+    );
+    assert_eq!(fault.attempts(), 1);
+    unchanged(&root, &old);
+    assert_eq!(fs::read(&path).unwrap(), old);
+    drop(hook);
+    drop(fault);
+    migrated(&root, &value);
+    assert_eq!(fs::read(path).unwrap(), old);
+}
+#[test]
+fn existing_exact_backup_content_sync_failure_preserves_v1() {
+    reused_backup_sync_failure_keeps_v1(false);
+}
+#[test]
+fn raced_exact_backup_content_sync_failure_preserves_v1() {
+    reused_backup_sync_failure_keeps_v1(true);
 }
 #[cfg(unix)]
 #[test]
@@ -933,6 +1026,66 @@ fn stop(studio: ProductStudio, hooks: &TestHooks) {
     while !hooks.stopped.load(Ordering::Acquire) {
         assert!(start.elapsed() < Duration::from_secs(20));
         std::thread::sleep(Duration::from_millis(2));
+    }
+}
+#[test]
+fn fresh_reopen_requires_synced_bytes_under_its_own_lock() {
+    for migrated in [false, true] {
+        for file_sync in [false, true] {
+            let (_temp, root) = root();
+            let mut value = Journal::default();
+            let old = if migrated {
+                Some(legacy(&root, &value))
+            } else {
+                install(&root, &format::encode(&value).unwrap());
+                None
+            };
+            let activated = JournalFile::upgrade(&root, |_| {}).unwrap();
+            assert_eq!(activated.is_some(), migrated);
+            if !migrated {
+                value.need = "a competing host's newly visible current record".into();
+            }
+            let visible = format::encode(&value).unwrap();
+            let folder = Folder::open(&root.join("studio")).unwrap();
+            {
+                let _writer = folder.lock().expect("upgrader released its writer lock");
+                folder.publish("session.json", &visible, true).unwrap();
+            }
+            // A new inode can be visible in this lock gap, even with identical
+            // bytes. Fresh authority must confirm its own descriptor's durability.
+            let fault = file_sync.then(|| {
+                Folder::test_fail_file_sync(root.join("studio/session.json"))
+            });
+            let hook = (!file_sync).then(|| {
+                upgrade::test_hook(&root, |point| {
+                    if point == TestPoint::BeforeSync {
+                        Err("fresh-session directory sync failed".into())
+                    } else {
+                        Ok(())
+                    }
+                })
+            });
+            assert!(
+                JournalFile::reopen(&root, activated.as_deref()).is_err(),
+                "fresh reopening must block on its own sync failure; migrated={migrated}, file_sync={file_sync}"
+            );
+            if let Some(fault) = &fault {
+                assert_eq!(fault.attempts(), 1);
+            }
+            unchanged(&root, &visible);
+            assert!(folder.lock().is_ok(), "failed reopening must release its lock");
+            if let Some(old) = &old {
+                assert_eq!(fs::read(backup(&root, old)).unwrap(), *old);
+            }
+            drop(fault);
+            drop(hook);
+            let fresh = JournalFile::reopen(&root, activated.as_deref()).unwrap();
+            assert_eq!(
+                canonical_bytes(&fresh.value).unwrap(),
+                canonical_bytes(&value).unwrap()
+            );
+            unchanged(&root, &visible);
+        }
     }
 }
 #[test]

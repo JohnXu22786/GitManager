@@ -85,9 +85,9 @@ fn progress(root: &Path, report: &mut impl FnMut(u8), stage: u8) -> Result<(), S
     Ok(())
 }
 fn verify_backup(folder: &Folder, name: &str, original: &[u8]) -> Result<(), String> {
-    let retained = folder
-        .read(name, JOURNAL_LIMIT)
-        .map_err(|e| format!("The original restart backup could not be verified: {e:?}"))?;
+    let retained = folder.read_and_sync(name, JOURNAL_LIMIT).map_err(|e| {
+        format!("The original restart backup could not be verified and synced: {e:?}")
+    })?;
     if retained != original
         || crate::product_provider::digest(&retained) != crate::product_provider::digest(original)
     {
@@ -129,9 +129,11 @@ fn activate(root: &Path, folder: &Folder, original: &[u8], current: &[u8]) -> Re
     checkpoint(root, TestPoint::BeforeReadback).map_err(|e| {
         format!("Restart activation outcome is uncertain: {e}. Keep both files and restart")
     })?;
-    let observed = folder.read("session.json", JOURNAL_LIMIT).map_err(|e| {
-        format!("Restart activation outcome is uncertain: {e:?}. Keep both files and restart")
-    })?;
+    let observed = folder
+        .read_and_sync("session.json", JOURNAL_LIMIT)
+        .map_err(|e| {
+            format!("Restart activation outcome is uncertain: {e:?}. Keep both files and restart")
+        })?;
     if observed == current {
         format::decode(&observed)
             .map_err(|e| format!("Activated restart information could not be verified: {e}"))?;
@@ -158,7 +160,21 @@ fn run_locked(root: &Path, report: &mut impl FnMut(u8)) -> Result<Outcome, Strin
     };
     let json = crate::tool_proposal_input::parse_json_bytes(&original).map_err(error)?;
     match json.get("version").and_then(serde_json::Value::as_u64) {
-        Some(2) => { format::decode(&original)?; return Ok(Outcome::Current); }
+        Some(2) => {
+            format::decode(&original)?;
+            // A prior activation can have made v2 visible before reporting a
+            // sync failure. Process restart alone does not confirm durability.
+            let synced = folder
+                .read_and_sync("session.json", JOURNAL_LIMIT)
+                .map_err(|e| format!("Restart information durability is unconfirmed: {e:?}. Keep all files and restart"))?;
+            if synced != original {
+                return Err("Restart information changed while confirming durability; files were kept and writes are paused".into());
+            }
+            #[cfg(test)]
+            checkpoint(root, TestPoint::BeforeSync)?;
+            folder.sync().map_err(|e| format!("Restart information durability is unconfirmed: {e:?}. Keep all files and restart"))?;
+            return Ok(Outcome::Current);
+        }
         Some(1) => (),
         _ => return Err("The restart information is damaged or belongs to an unsupported version; it was kept unchanged".into()),
     }

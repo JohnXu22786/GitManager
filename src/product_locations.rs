@@ -15,6 +15,8 @@ use std::path::{Component, Path, PathBuf};
 // Directory or file handle is part of the public helper contract.
 #[path = "product_store/files.rs"]
 mod files;
+#[cfg(test)]
+pub(crate) use files::file_sync_testing::FileSyncFault;
 pub(crate) use files::WriteLock;
 
 pub(crate) const MAX_LOCAL_BYTES: usize = 64 * 1024 * 1024;
@@ -178,6 +180,10 @@ pub(crate) struct Folder {
     directory: files::Directory,
 }
 impl Folder {
+    #[cfg(test)]
+    pub(crate) fn test_fail_file_sync(path: PathBuf) -> FileSyncFault {
+        files::file_sync_testing::fail(path)
+    }
     pub(crate) fn open(path: &Path) -> Result<Self> {
         safe_absolute(path)?;
         Ok(Self {
@@ -235,6 +241,12 @@ impl Folder {
         Ok(())
     }
     pub(crate) fn read(&self, name: &str, limit: usize) -> Result<Vec<u8>> {
+        self.read_file(name, limit, false)
+    }
+    pub(crate) fn read_and_sync(&self, name: &str, limit: usize) -> Result<Vec<u8>> {
+        self.read_file(name, limit, true)
+    }
+    fn read_file(&self, name: &str, limit: usize, sync: bool) -> Result<Vec<u8>> {
         self.check()?;
         safe_filename(name)?;
         if limit > MAX_LOCAL_BYTES {
@@ -255,7 +267,11 @@ impl Folder {
                 "the selected file exceeds the byte limit",
             ));
         }
-        let bytes = self.directory.read(name, limit)?;
+        let bytes = if sync {
+            self.directory.read_and_sync(name, limit)?
+        } else {
+            self.directory.read(name, limit)?
+        };
         self.check()?;
         Ok(bytes)
     }
