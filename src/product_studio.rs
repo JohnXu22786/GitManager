@@ -845,6 +845,20 @@ impl ProductStudio {
                     ui,
                     "Upgrade verified. Restarting the tool with a fresh open session…",
                 ),
+                Some(6) => trace.label(
+                    ui,
+                    "Updating saved restart information… Your saved tools are kept",
+                ),
+                Some(7) => trace.label(
+                    ui,
+                    "Restart information staged locally; the original is kept",
+                ),
+                Some(8) => trace.label(ui, "Exact requests and interrupted attempts verified"),
+                Some(9) => trace.label(ui, "Activating restart information; do not close the app"),
+                Some(10) => trace.label(
+                    ui,
+                    "Restart information updated. Reopening a fresh host session…",
+                ),
                 _ => (),
             }
             if trace.button(
