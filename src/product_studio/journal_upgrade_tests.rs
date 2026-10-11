@@ -795,7 +795,7 @@ fn unequal_or_unsafe_backup_and_no_clobber_races_block_without_overwrite() {
     unchanged(&root, &old);
 }
 #[test]
-fn writer_contention_and_directory_replacement_preserve_original_records() {
+fn writer_contention_preserves_original_records() {
     let (_temp, root) = root();
     let old = legacy(&root, &Journal::default());
     let folder = Folder::open(&root.join("studio")).unwrap();
@@ -804,6 +804,12 @@ fn writer_contention_and_directory_replacement_preserve_original_records() {
     unchanged(&root, &old);
     drop(lock);
     drop(folder);
+}
+#[cfg(unix)]
+#[test]
+fn directory_replacement_blocks_upgrade_and_preserves_original_records() {
+    let (_temp, root) = root();
+    let old = legacy(&root, &Journal::default());
     let original = root.join("studio");
     let moved = root.join("original-studio");
     let hook = upgrade::test_hook(&root, {
@@ -822,6 +828,54 @@ fn writer_contention_and_directory_replacement_preserve_original_records() {
     assert!(!original.join("session.json").exists());
     assert!(!backup(&root, &old).exists());
     drop(hook);
+}
+#[cfg(windows)]
+#[test]
+fn pinned_directory_denies_replacement_until_migration_releases_handles() {
+    let (_temp, root) = root();
+    let value = Journal::default();
+    let old = legacy(&root, &value);
+    let original = root.join("studio");
+    let moved = root.join("original-studio");
+    let attempted = Arc::new(AtomicBool::new(false));
+    let hook = upgrade::test_hook(&root, {
+        let root = root.clone();
+        let original = original.clone();
+        let moved = moved.clone();
+        let old = old.clone();
+        let attempted = attempted.clone();
+        move |point| {
+            if point == TestPoint::BeforeBackup {
+                // Windows pins every ancestor without FILE_SHARE_DELETE.
+                // The attack must be denied, rather than simulated by
+                // weakening those handles to match Unix rename semantics.
+                let error = fs::rename(&original, &moved).unwrap_err();
+                assert_eq!(error.raw_os_error(), Some(32));
+                assert!(!moved.exists());
+                unchanged(&root, &old);
+                attempted.store(true, Ordering::Release);
+            }
+            Ok(())
+        }
+    });
+    migrated(&root, &value);
+    assert!(attempted.load(Ordering::Acquire));
+    assert_eq!(fs::read(backup(&root, &old)).unwrap(), old);
+    assert!(!moved.exists());
+    drop(hook);
+    // Once the dedicated upgrader returns, none of its directory handles
+    // may survive into the fresh host session. Check actual OS release.
+    fs::rename(&original, &moved).unwrap();
+    assert!(!original.exists());
+    let current = format::decode(&fs::read(moved.join("session.json")).unwrap()).unwrap();
+    assert_eq!(
+        canonical_bytes(&current).unwrap(),
+        canonical_bytes(&value).unwrap()
+    );
+    assert_eq!(
+        fs::read(moved.join(backup(&root, &old).file_name().unwrap())).unwrap(),
+        old
+    );
 }
 #[cfg(unix)]
 #[test]
@@ -1074,12 +1128,21 @@ fn migrated_issued_request_never_resends_or_imports_a_late_file_on_repeated_boot
     let (_temp, root) = root();
     let value = journal(&root, DevelopmentOperation::Generate);
     let old = legacy(&root, &value);
-    let jobs = root.join("fixture-jobs");
+    // Windows canonicalization adds a verbatim prefix, whereas this fixture
+    // transport walks ordinary path components. Keep the host's canonical
+    // identity and prove that the native fixture spelling is the same root.
+    let fixture_root = if cfg!(windows) {
+        _temp.path().to_path_buf()
+    } else {
+        root.clone()
+    };
+    assert_eq!(fs::canonicalize(&fixture_root).unwrap(), root);
+    let jobs = fixture_root.join("fixture-jobs");
     let transport = ProviderTransport::new_fixture(
         jobs.clone(),
         ProviderKind::Claude,
-        root.join("never-execute-this-missing-cli"),
-        root.clone(),
+        fixture_root.join("never-execute-this-missing-cli"),
+        fixture_root,
     )
     .unwrap();
     let job = jobs.join("original-request");
