@@ -1,4 +1,6 @@
 //! Synthetic egui and dialog fixtures; not native OS dialogs, packaged GUI or live AI evidence.
+#[path = "../src/product_studio/change_adapter.rs"]
+mod change_adapter;
 #[path = "fixtures/product_runtime/mod.rs"]
 mod fixture;
 #[path = "../src/harness.rs"]
@@ -29,8 +31,12 @@ mod product_scenarios;
 mod product_sources;
 #[path = "../src/product_store/mod.rs"]
 mod product_store;
+#[path = "fixtures/product_scope/mod.rs"]
+mod scope_fixture;
 #[path = "../src/tool_proposal_input.rs"]
 mod tool_proposal_input;
+#[path = "support/discovery_wide.rs"]
+mod wide_fixture;
 mod ui {
     pub(crate) use super::product_runtime_view;
 }
@@ -143,6 +149,9 @@ struct TaskFixture {
 }
 impl TaskFixture {
     fn new() -> Self {
+        Self::with_program(fixture::capture(fixture::organizer()))
+    }
+    fn with_program(program: product_contract::CapturedProgram) -> Self {
         let lease = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         static HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
         HOME.get_or_init(|| {
@@ -166,21 +175,12 @@ impl TaskFixture {
             .unwrap();
         fs::create_dir(source.join(".gitmanager")).unwrap();
         fs::write(source.join(".gitmanager/product.json"), serde_json::to_vec(&serde_json::json!({
-            "version":1,"project_id":"runtime-project","artifact_kind":"generated_app","program_path":"app.json"
+            "version":1,"project_id":program.binding.project_id,"artifact_kind":"generated_app","program_path":"app.json"
         })).unwrap()).unwrap();
-        fs::write(
-            source.join("app.json"),
-            serde_json::to_vec(&fixture::organizer()).unwrap(),
-        )
-        .unwrap();
+        fs::write(source.join("app.json"), program.source_bytes.clone()).unwrap();
         let record = tasks::TaskRecord::from_worktree("Synthetic existing task", &source).unwrap();
         tasks::TaskRegistry::load().add(record.clone()).unwrap();
-        let store = ProductStore::create(
-            root.join("tool"),
-            &fixture::capture(fixture::organizer()),
-            20000,
-        )
-        .unwrap();
+        let store = ProductStore::create(root.join("tool"), &program, 20000).unwrap();
         Self {
             _lease: lease,
             _temp: temp,
@@ -2135,6 +2135,53 @@ fn a_second_authorized_handoff_reuses_accepted_task_source_without_replaying_the
 }
 
 #[cfg(target_os = "linux")]
+fn assert_only_checked_external_lineage_added(before: &[u8], after: &[u8]) {
+    product_studio::journal_testing::roundtrip(after)
+        .expect("The new lineage must strictly correlate with the entire actual completion");
+    let mut retained: serde_json::Value = serde_json::from_slice(after).unwrap();
+    let lineage = retained
+        .as_object_mut()
+        .unwrap()
+        .remove("discovery")
+        .unwrap();
+    assert!(lineage["original"].is_null());
+    assert!(lineage["discover"].is_null());
+    assert!(lineage["accepted_case"].is_null());
+    assert_eq!(
+        lineage["need"],
+        retained["task"]["completed"]["external"]["original_need"]
+    );
+    assert_eq!(
+        lineage["external"]["approval_operation"],
+        retained["task"]["completed"]["external"]["approval_operation"]
+    );
+    assert_eq!(
+        lineage["external"]["after"]["binding"],
+        retained["task"]["completed"]["capture"]["binding"]
+    );
+    assert_eq!(
+        lineage["external"]["after"]["artifact"],
+        retained["task"]["completed"]["capture"]["artifact"]
+    );
+    assert_eq!(
+        lineage["external"]["after"]["program"],
+        retained["task"]["completed"]["capture"]["program"]
+    );
+    assert_eq!(
+        serde_json::to_value(
+            lineage["external"]["after"]["source_utf8"]
+                .as_str()
+                .unwrap()
+                .as_bytes()
+        )
+        .unwrap(),
+        retained["task"]["completed"]["capture"]["source_bytes"]
+    );
+    assert_eq!(product_contract::canonical_bytes(&retained).unwrap(), before,
+        "Successful explicit Review may add only its exact uncommitted lineage; the entire earlier envelope remains byte-exact");
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn cancelled_completed_analysis_retries_in_session_with_its_original_request() {
     use std::sync::{atomic::Ordering, Arc};
@@ -2192,7 +2239,7 @@ fn cancelled_completed_analysis_retries_in_session_with_its_original_request() {
         .text
         .iter()
         .any(|t| t == &format!("Requested change: {}", request.request)));
-    assert_eq!(fs::read(&path).unwrap(), terminal);
+    assert_only_checked_external_lineage_added(&terminal, &fs::read(&path).unwrap());
     assert_eq!(fs::read(&harness.log).unwrap(), launched);
     assert_eq!(task.store.load().unwrap(), saved);
 }
@@ -2244,9 +2291,9 @@ fn completed_analysis_recovers_when_source_returns_to_the_exact_authorized_captu
         .text
         .iter()
         .any(|t| t == &format!("Requested change: {}", request.request)));
-    assert_eq!(
-        fs::read(task.root.join("studio/session.json")).unwrap(),
-        terminal
+    assert_only_checked_external_lineage_added(
+        &terminal,
+        &fs::read(task.root.join("studio/session.json")).unwrap(),
     );
     assert_eq!(task.store.load().unwrap(), saved);
 }
@@ -2320,9 +2367,9 @@ fn restarted_completed_source_can_be_revalidated_after_temporary_drift() {
         .text
         .iter()
         .any(|t| t == &format!("Requested change: {}", request.request)));
-    assert_eq!(
-        fs::read(task.root.join("studio/session.json")).unwrap(),
-        terminal
+    assert_only_checked_external_lineage_added(
+        &terminal,
+        &fs::read(task.root.join("studio/session.json")).unwrap(),
     );
     assert_eq!(fs::read(&harness.log).unwrap(), launched);
     assert_eq!(task.store.load().unwrap(), saved);
@@ -2976,7 +3023,11 @@ fn task_publication_cancel(page: bool) {
     } else {
         assert!(studio.test_task_can_review());
     }
-    assert_eq!(fs::read(&path).unwrap(), terminal);
+    if page {
+        assert_only_checked_external_lineage_added(&terminal, &fs::read(&path).unwrap());
+    } else {
+        assert_eq!(fs::read(&path).unwrap(), terminal);
+    }
     assert_eq!(fs::read(&harness.log).unwrap(), launched);
     assert_eq!(task.store.load().unwrap(), saved);
 }
@@ -3301,4 +3352,1810 @@ fn resumed_task_neither_fits_rechecks_source_at_final_recording_gate() {
 #[test]
 fn resumed_task_deferred_rechecks_source_at_final_recording_gate() {
     resumed_task_choice_freshness("final", product_contract::DecisionOutcome::Deferred);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn discover_uses_actual_external_capture_and_plain_original_need_without_fake_modify_receipt() {
+    use std::os::unix::fs::PermissionsExt;
+    let task = TaskFixture::new();
+    let harness = SyntheticHarness::new(&task);
+    let executable = task.root.join("external-discovery-synthetic.py");
+    let guard = product_provider::fixture_executable_write_guard();
+    let body = "{'version':1,'request_digest':json.loads(wire['prompt'])['request_digest'],'candidates':[],'hypotheses':[],'evolutions':[],'unsupported':['Synthetic external discovery has no hypotheses']}";
+    fs::write(
+        &executable,
+        include_str!("fixtures/provider_transport/fake_cli.py").replace(
+            "{'passed': True, 'text': wire['prompt'], 'command': 'untrusted-do-not-execute'}",
+            body,
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(executable.with_extension("json"), br#"{"mode":"good"}"#).unwrap();
+    let home = task.root.join("external-discovery-home");
+    fs::create_dir(&home).unwrap();
+    let transport = product_provider::ProviderTransport::new_fixture(
+        task.root.join("discovery-jobs"),
+        product_provider::ProviderKind::Codex,
+        executable,
+        home,
+    )
+    .unwrap();
+    drop(guard);
+    let (mut studio, mut h) = task.open_with_transport(TestHooks::default(), Some(transport));
+    let need = "Keep my exact human request separate from inherited task guidance";
+    studio.test_task_request(need);
+    settle(&mut h, &mut studio);
+    let original = studio.test_prepared_request().unwrap().clone();
+    studio.test_task_authorize();
+    settle(&mut h, &mut studio);
+    assert_eq!(harness.read()["synthetic"], true);
+    let mut edited = fixture::organizer();
+    edited["label"] = serde_json::json!("Actual external discovery source");
+    let kind = edited["views"][0]["kind"].clone();
+    edited["views"].as_array_mut().unwrap().push(serde_json::json!({"id":"second_list","label":"Actual external view","kind":kind,"actions":[],"keys":[]}));
+    fs::write(
+        task.source.join("app.json"),
+        serde_json::to_vec(&edited).unwrap(),
+    )
+    .unwrap();
+    product_studio::test_task_machine(&task.root, "submit", &task.record.id, &original.id).unwrap();
+    studio.test_task_refresh();
+    settle(&mut h, &mut studio);
+    await_text(&mut h, &mut studio, "Actual external discovery source");
+    await_review_control(&mut h, &mut studio);
+    studio.test_task_review();
+    settle(&mut h, &mut studio);
+    assert_eq!(studio.test_page(), "change", "{}", studio.test_notice());
+    let journal: serde_json::Value =
+        serde_json::from_slice(&fs::read(task.root.join("studio/session.json")).unwrap()).unwrap();
+    assert_eq!(
+        journal["task"]["completed"]["external"]["original_need"],
+        need
+    );
+    assert_eq!(journal["discovery"]["need"], need);
+    assert!(
+        journal["discovery"]["original"].is_null(),
+        "ExternalAuthor must never acquire a fake Modify receipt or response"
+    );
+    let before = task.store.load().unwrap();
+    click(&mut h, &mut studio, "studio.discover");
+    settle(&mut h, &mut studio);
+    let request = studio.test_prepared_request().unwrap().clone();
+    assert_eq!(
+        request.operation,
+        product_contract::DevelopmentOperation::Discover
+    );
+    assert_ne!(request.id, original.id);
+    assert_eq!(request.context, original.context);
+    assert_eq!(request.sources[0], before.program().unwrap().clone());
+    assert!(matches!(
+        request.sources[1].binding.producer,
+        product_contract::Producer::ExternalAuthor { .. }
+    ));
+    assert_eq!(
+        request.sources[1].source_bytes,
+        fs::read(task.source.join("app.json")).unwrap()
+    );
+    click(&mut h, &mut studio, "studio.consent");
+    settle(&mut h, &mut studio);
+    assert_eq!(studio.test_page(), "discovery", "{}", studio.test_notice());
+    assert_eq!(task.store.load().unwrap(), before);
+}
+
+#[cfg(unix)]
+fn wide_fixture_transport(root: &Path) -> product_provider::ProviderTransport {
+    use std::os::unix::fs::PermissionsExt;
+    let executable = root.join("wide-discovery-fixture.py");
+    let _guard = product_provider::fixture_executable_write_guard();
+    let body = "dict(cfg['response'],request_digest=json.loads(wire['prompt'])['request_digest'])";
+    fs::write(
+        &executable,
+        include_str!("fixtures/provider_transport/fake_cli.py").replace(
+            "{'passed': True, 'text': wire['prompt'], 'command': 'untrusted-do-not-execute'}",
+            body,
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(executable.with_extension("json"), br#"{"mode":"good"}"#).unwrap();
+    let home = root.join("wide-fixture-home");
+    fs::create_dir(&home).unwrap();
+    product_provider::ProviderTransport::new_fixture(
+        root.join("wide-fixture-jobs"),
+        product_provider::ProviderKind::Codex,
+        executable,
+        home,
+    )
+    .unwrap()
+}
+fn wide_response(root: &Path, response: &product_contract::DevelopmentResponse) {
+    fs::write(
+        root.join("wide-discovery-fixture.json"),
+        serde_json::to_vec(&serde_json::json!({"mode":"good", "response":response})).unwrap(),
+    )
+    .unwrap();
+}
+fn stop_wide(studio: ProductStudio, stopped: &std::sync::atomic::AtomicBool) {
+    drop(studio);
+    let start = Instant::now();
+    while !stopped.load(std::sync::atomic::Ordering::Acquire) {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "The sole writer must stop before fresh reopen"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+#[cfg(unix)]
+#[test]
+fn authentic_wide_managed_host_journal_fits_at_every_boundary_with_real_task_and_recovery() {
+    use product_contract::*;
+    use std::sync::{atomic::Ordering, Arc, Mutex};
+    let task = TaskFixture::with_program(scope_fixture::program(false));
+    let backup = task.root.join("original.gmbak");
+    product_backup::VerifiedBackup::capture(&task.store)
+        .unwrap()
+        .export_new(&backup)
+        .unwrap();
+    product_studio::test_stage_daily(
+        &task.root,
+        &task.root.join("tool"),
+        scope_fixture::invoke(
+            "add",
+            &[
+                ("name", scope_fixture::text("Original unconfirmed work")),
+                ("promised", DataValue::Date { days: 20020 }),
+            ],
+        ),
+        false,
+    );
+    let journal_path = task.root.join("studio/session.json");
+    let pending = serde_json::from_slice::<serde_json::Value>(&fs::read(&journal_path).unwrap())
+        .unwrap()["pending"]
+        .clone();
+    fs::write(
+        task.root.join("tool/CURRENT"),
+        b"Synthetic damaged original pointer",
+    )
+    .unwrap();
+    let hooks = TestHooks {
+        folder_choice: Some(backup),
+        ..Default::default()
+    };
+    let stopped = hooks.stopped.clone();
+    let mut studio = ProductStudio::testing(task.root.clone(), None, hooks);
+    let mut h = EguiHarness::new(egui::vec2(1500.0, 5000.0));
+    settle(&mut h, &mut studio);
+    click(&mut h, &mut studio, "studio.import");
+    settle(&mut h, &mut studio);
+    let recovered = studio
+        .test_recovery_target()
+        .expect(studio.test_notice())
+        .to_path_buf();
+    click(&mut h, &mut studio, "studio.recover");
+    settle(&mut h, &mut studio);
+    click(&mut h, &mut studio, "studio.open-recovered");
+    settle(&mut h, &mut studio);
+    assert_eq!(studio.test_location(), Some(recovered.as_path()));
+    let recovery = serde_json::from_slice::<serde_json::Value>(&fs::read(&journal_path).unwrap())
+        .unwrap()["recovery_handoffs"]
+        .clone();
+    assert_eq!(recovery[0]["original"], pending);
+    stop_wide(studio, &stopped);
+    let store = ProductStore::open(&recovered).unwrap();
+    let (_, _, candidate) = wide_fixture::managed(&store, false);
+    let current = store.load().unwrap();
+    assert_eq!(current.clock_day, 20003);
+    let transport = wide_fixture_transport(&task.root);
+    let hooks = TestHooks::default();
+    hooks.today.store(20003, Ordering::Release);
+    let stopped = hooks.stopped.clone();
+    let mut studio = ProductStudio::testing(task.root.clone(), Some(transport.clone()), hooks);
+    settle(&mut h, &mut studio);
+    assert_eq!(studio.test_location(), Some(recovered.as_path()));
+    click(&mut h, &mut studio, "studio.tasks");
+    settle(&mut h, &mut studio);
+    click(
+        &mut h,
+        &mut studio,
+        &format!("studio.task.{}", task.record.id),
+    );
+    settle(&mut h, &mut studio);
+    let linked = serde_json::from_slice::<serde_json::Value>(&fs::read(&journal_path).unwrap())
+        .unwrap()["task"]
+        .clone();
+    assert_eq!(linked["task_id"], task.record.id);
+    assert!(linked["external"].is_null() && linked["completed"].is_null());
+    click(&mut h, &mut studio, "studio.tasks-back");
+    settle(&mut h, &mut studio);
+    let publications = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+    let observer = product_studio::journal_testing::observe_synced(&task.root, {
+        let publications = publications.clone();
+        move |bytes| {
+            eprintln!(
+                "Observed authentic wide synced journal: {} bytes",
+                bytes.len()
+            );
+            publications.lock().unwrap().push(bytes);
+        }
+    });
+    let need = "Change how waiting contributes to production; preserve commitments";
+    studio.test_modify(need);
+    settle(&mut h, &mut studio);
+    let modify = studio
+        .test_prepared_request()
+        .unwrap_or_else(|| panic!("Wide Modify disclosure: {}", studio.test_notice()))
+        .clone();
+    wide_response(
+        &task.root,
+        &DevelopmentResponse {
+            version: 1,
+            request_digest: modify.identity().unwrap(),
+            candidates: vec![GeneratedCandidate {
+                id: "actual-change".into(),
+                source_json: String::from_utf8(candidate.source_bytes.clone()).unwrap(),
+            }],
+            hypotheses: vec![],
+            evolutions: vec![],
+            unsupported: vec![],
+        },
+    );
+    studio.test_consent();
+    settle(&mut h, &mut studio);
+    assert_eq!(studio.test_page(), "change", "{}", studio.test_notice());
+    click(&mut h, &mut studio, "studio.scope.future");
+    settle(&mut h, &mut studio);
+    click(&mut h, &mut studio, "studio.discover");
+    settle(&mut h, &mut studio);
+    let discover = studio
+        .test_prepared_request()
+        .unwrap_or_else(|| panic!("Wide Discover disclosure: {}", studio.test_notice()))
+        .clone();
+    assert_eq!(discover.operation, DevelopmentOperation::Discover);
+    let domain_size = serde_json::to_vec(&discover).unwrap().len();
+    let wire = product_discovery::encode_request(&discover, &Default::default()).unwrap();
+    assert!(
+        domain_size > product_provider::MAX_PROMPT_BYTES,
+        "The real wide domain must exercise lossless compact request intake: {domain_size}"
+    );
+    assert!(wire.prompt.len() <= product_provider::MAX_PROMPT_BYTES);
+    let (original_scene, created) = wide_fixture::created_scene(&current);
+    let mut scene = original_scene.clone();
+    scene.inputs = vec![
+        original_scene.inputs[0].clone(),
+        scope_fixture::invoke("calculate", &[("row", scope_fixture::reference(&created))]),
+        SemanticInput::Observe {
+            point: "result".into(),
+        },
+    ];
+    scene.validate(&current.program().unwrap().program).unwrap();
+    let after = &discover.sources[1];
+    wide_response(
+        &task.root,
+        &DevelopmentResponse {
+            version: 1,
+            request_digest: discover.identity().unwrap(),
+            candidates: vec![
+                GeneratedCandidate {
+                    id: "before".into(),
+                    source_json: String::from_utf8(discover.sources[0].source_bytes.clone())
+                        .unwrap(),
+                },
+                GeneratedCandidate {
+                    id: "after".into(),
+                    source_json: String::from_utf8(after.source_bytes.clone()).unwrap(),
+                },
+            ],
+            hypotheses: vec![ChoiceHypothesis {
+                id: "waiting-choice".into(),
+                statement: "New work shows an extra production day under the changed calculation"
+                    .into(),
+                kind: HypothesisKind::UnresolvedChoice,
+                action: "calculate".into(),
+                observable: "waiting_jobs".into(),
+                sources: vec![SourceLocus {
+                    relative_path: after.binding.program_path.clone(),
+                    raw_digest: after.artifact.raw_digest.clone(),
+                    pointer: "/views/0/kind/columns/1/value".into(),
+                }],
+                alternatives: vec!["before".into(), "after".into()],
+                related_decisions: vec![],
+                scenario_json: serde_json::to_string(&scene).unwrap(),
+                unknowns: vec![],
+            }],
+            evolutions: vec![],
+            unsupported: vec![],
+        },
+    );
+    click(&mut h, &mut studio, "studio.consent");
+    settle(&mut h, &mut studio);
+    assert_eq!(studio.test_page(), "discovery", "{}", studio.test_notice());
+    let trace = frame(&mut h, &mut studio);
+    let copy = trace
+        .controls
+        .iter()
+        .find(|(key, c)| key.starts_with("studio.discovery.copy.") && c.enabled)
+        .map(|(key, _)| key.clone())
+        .unwrap_or_else(|| {
+            panic!(
+                "The authentic wide rule needs a real checked business copy: {:?}",
+                trace.text
+            )
+        });
+    click(&mut h, &mut studio, &copy);
+    settle(&mut h, &mut studio);
+    assert_eq!(
+        studio.test_page(),
+        "change",
+        "A fixed rule must use its real checked receiver: {}",
+        studio.test_notice()
+    );
+    click(&mut h, &mut studio, "studio.either");
+    settle(&mut h, &mut studio);
+    assert_eq!(studio.test_page(), "daily", "{}", studio.test_notice());
+    let saved = store.load().unwrap();
+    assert_eq!(saved.active_revision, current.active_revision);
+    assert_eq!(saved.data, current.data);
+    assert!(matches!(
+        saved.decisions.decisions.last().unwrap().outcome,
+        DecisionOutcome::EitherAcceptable
+    ));
+    let terminal = fs::read(&journal_path).unwrap();
+    stop_wide(studio, &stopped);
+    let hooks = TestHooks::default();
+    hooks.today.store(20003, Ordering::Release);
+    let stopped = hooks.stopped.clone();
+    let mut studio = ProductStudio::testing(task.root.clone(), None, hooks);
+    settle(&mut h, &mut studio);
+    click(&mut h, &mut studio, "studio.reopen-discovery");
+    settle(&mut h, &mut studio);
+    assert!(frame(&mut h, &mut studio)
+        .text
+        .iter()
+        .any(|line| line.contains("report is stale")));
+    assert!(
+        store.load().unwrap() == saved,
+        "Restart must not repeat the pending choice or business work"
+    );
+    let restart = fs::read(&journal_path).unwrap();
+    stop_wide(studio, &stopped);
+    drop(observer);
+    let mut records = publications.lock().unwrap().clone();
+    records.push(terminal);
+    records.push(restart);
+    let mut stages = std::collections::BTreeSet::new();
+    let mut max_bytes = 0;
+    for bytes in &records {
+        max_bytes = max_bytes.max(bytes.len());
+        assert!(bytes.len() <= MAX_WIRE_BYTES);
+        assert_eq!(
+            product_studio::journal_testing::roundtrip(bytes).unwrap(),
+            *bytes
+        );
+        let value: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(value["task"], linked);
+        assert_eq!(value["recovery_handoffs"], recovery);
+        for (request, completion) in product_studio::journal_testing::invocations(bytes).unwrap() {
+            assert!(
+                request == modify || request == discover,
+                "Retained requests must be exact host-prepared domains"
+            );
+            if let Some((raw, receipt)) = completion {
+                let wire =
+                    product_discovery::encode_request(&request, &Default::default()).unwrap();
+                let actual = transport
+                    .ingest(&request.id, &wire.digest().unwrap(), &wire.source_digest)
+                    .unwrap()
+                    .expect("The actual completed fixture response must remain correlated");
+                assert_eq!(raw, actual.final_bytes);
+                assert_eq!(
+                    canonical_bytes(&receipt).unwrap(),
+                    canonical_bytes(&actual.receipt).unwrap()
+                );
+            }
+        }
+        let origin = &value["discovery"]["original"];
+        let disc = &value["discovery"]["discover"];
+        if !origin["completed"].is_null() && value["provider"]["lineage_request"] == modify.id {
+            stages.insert("modify-terminal");
+        }
+        if !origin["completed"].is_null() && value["provider"].is_null() {
+            stages.insert("modify-cleared");
+        }
+        if !disc.is_null() && value["provider"]["issued"] == false {
+            stages.insert("discover-prepared");
+        }
+        if disc["issued"] == true && disc["completed"].is_null() {
+            stages.insert("discover-issued");
+        }
+        if !disc["completed"].is_null() && value["provider"].is_null() {
+            stages.insert("discover-result");
+        }
+        if value["pending"]["kind"] == "change" {
+            stages.insert("choice-prepared");
+        }
+        eprintln!("Authentic wide complete host publication: {} bytes; provider {:?}; pending {:?}; Modify raw {}; Discover raw {}",bytes.len(),value["provider"]["issued"],value["pending"]["kind"],origin["completed"]["raw"]["raw_bytes"],disc["completed"]["raw"]["raw_bytes"]);
+    }
+    assert_eq!(
+        stages,
+        [
+            "modify-terminal",
+            "modify-cleared",
+            "discover-prepared",
+            "discover-issued",
+            "discover-result",
+            "choice-prepared"
+        ]
+        .into()
+    );
+    let jobs: Vec<_> = fs::read_dir(task.root.join("wide-fixture-jobs"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_type().unwrap().is_dir())
+        .collect();
+    assert_eq!(jobs.len(), 2, "Restart cannot issue a third provider job");
+    eprintln!("Authentic wide domain {domain_size}; exact prompt {}; maximum complete journal {max_bytes}; {} real synced publications plus terminal/restart reads",wire.prompt.len(),records.len()-2);
+}
+
+#[cfg(target_os = "linux")]
+fn completed_external_discovery_origin(
+    task: &TaskFixture,
+    hooks: TestHooks,
+) -> (ProductStudio, EguiHarness) {
+    let (mut studio, mut h) = task.open_with(hooks);
+    studio.test_task_request("Exact original need for retained external discovery");
+    settle(&mut h, &mut studio);
+    let request = studio.test_prepared_request().unwrap().clone();
+    studio.test_task_authorize();
+    settle(&mut h, &mut studio);
+    task.edit_label("Actual external origin for correlation");
+    product_studio::test_task_machine(&task.root, "submit", &task.record.id, &request.id).unwrap();
+    studio.test_task_refresh();
+    settle(&mut h, &mut studio);
+    await_text(
+        &mut h,
+        &mut studio,
+        "Actual external origin for correlation",
+    );
+    await_review_control(&mut h, &mut studio);
+    studio.test_task_review();
+    settle(&mut h, &mut studio);
+    assert_eq!(studio.test_page(), "change", "{}", studio.test_notice());
+    let bytes = fs::read(task.root.join("studio/session.json")).unwrap();
+    let record: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(record["discovery"]["external"].is_object());
+    assert!(record["task"]["completed"].is_object());
+    product_studio::journal_testing::roundtrip(&bytes)
+        .expect("The actual untampered complete origin must decode");
+    (studio, h)
+}
+#[cfg(target_os = "linux")]
+#[test]
+fn external_discovery_restart_rejects_approval_not_matching_actual_completed_handoff() {
+    let task = TaskFixture::new();
+    let harness = SyntheticHarness::new(&task);
+    let hooks = TestHooks::default();
+    let stopped = hooks.stopped.clone();
+    let (studio, mut h) = completed_external_discovery_origin(&task, hooks);
+    harness.read();
+    let saved = task.store.load().unwrap();
+    stop_wide(studio, &stopped);
+    let path = task.root.join("studio/session.json");
+    let mut journal: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let original = journal["task"]["completed"]["external"]["approval_operation"].clone();
+    journal["discovery"]["external"]["approval_operation"] =
+        serde_json::json!("different-valid-approval");
+    assert_ne!(
+        journal["discovery"]["external"]["approval_operation"],
+        original
+    );
+    let tampered = serde_json::to_vec(&journal).unwrap();
+    fs::write(&path, &tampered).unwrap();
+    let mut restarted = ProductStudio::testing(task.root.clone(), None, TestHooks::default());
+    settle(&mut h, &mut restarted);
+    assert!(
+        restarted.test_generation_blocked(),
+        "Contradictory external approval was accepted on restart: {}",
+        restarted.test_notice()
+    );
+    assert_eq!(fs::read(&path).unwrap(), tampered);
+    assert_eq!(task.store.load().unwrap(), saved);
+}
+#[cfg(target_os = "linux")]
+#[test]
+fn external_discovery_cannot_replace_the_plain_need_even_when_both_local_copies_agree() {
+    let task = TaskFixture::new();
+    let harness = SyntheticHarness::new(&task);
+    let hooks = TestHooks::default();
+    let stopped = hooks.stopped.clone();
+    let (studio, mut h) = completed_external_discovery_origin(&task, hooks);
+    harness.read();
+    let saved = task.store.load().unwrap();
+    stop_wide(studio, &stopped);
+    let path = task.root.join("studio/session.json");
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    value["discovery"]["need"] =
+        serde_json::json!("A different human request that was never authorized");
+    value["task"]["completed"]["external"]["original_need"] = value["discovery"]["need"].clone();
+    let tampered = serde_json::to_vec(&value).unwrap();
+    product_studio::journal_testing::roundtrip(&tampered)
+        .expect("The bounded correlated fields alone are insufficient to prove the original need");
+    fs::write(&path, &tampered).unwrap();
+    let mut restarted = ProductStudio::testing(task.root.clone(), None, TestHooks::default());
+    settle(&mut h, &mut restarted);
+    click(&mut h, &mut restarted, "studio.reopen-discovery");
+    settle(&mut h, &mut restarted);
+    assert_ne!(restarted.test_page(), "change");
+    assert!(
+        restarted.test_notice().contains("original human need"),
+        "{}",
+        restarted.test_notice()
+    );
+    assert_eq!(fs::read(&path).unwrap(), tampered);
+    assert_eq!(task.store.load().unwrap(), saved);
+}
+#[cfg(target_os = "linux")]
+#[test]
+fn legacy_completed_task_without_plain_need_remains_reviewable_but_cannot_invent_discovery_lineage()
+{
+    let task = TaskFixture::new();
+    let harness = SyntheticHarness::new(&task);
+    let hooks = TestHooks::default();
+    let stopped = hooks.stopped.clone();
+    let (studio, mut h) = completed_external_discovery_origin(&task, hooks);
+    harness.read();
+    let saved = task.store.load().unwrap();
+    stop_wide(studio, &stopped);
+    let path = task.root.join("studio/session.json");
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    value.as_object_mut().unwrap().remove("discovery");
+    value["task"]["completed"]["external"]
+        .as_object_mut()
+        .unwrap()
+        .remove("original_need");
+    let legacy = serde_json::to_vec(&value).unwrap();
+    product_studio::journal_testing::roundtrip(&legacy).unwrap();
+    fs::write(&path, &legacy).unwrap();
+    let mut studio = ProductStudio::testing(task.root.clone(), None, TestHooks::default());
+    settle(&mut h, &mut studio);
+    click(&mut h, &mut studio, "studio.tasks");
+    settle(&mut h, &mut studio);
+    await_review_control(&mut h, &mut studio);
+    studio.test_task_review();
+    settle(&mut h, &mut studio);
+    assert_eq!(studio.test_page(), "change", "{}", studio.test_notice());
+    assert!(frame(&mut h, &mut studio)
+        .text
+        .iter()
+        .any(|text| text.contains("Original human need unavailable")));
+    click(&mut h, &mut studio, "studio.discover");
+    settle(&mut h, &mut studio);
+    assert_eq!(studio.test_page(), "change");
+    assert!(studio.test_prepared_request().is_none());
+    let retained: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(retained["discovery"].is_null());
+    assert!(retained["task"]["completed"]["external"]["original_need"].is_null());
+    assert_eq!(task.store.load().unwrap(), saved);
+}
+#[cfg(target_os = "linux")]
+#[test]
+fn new_explicit_task_authorization_replaces_only_its_older_external_discovery_lineage() {
+    let task = TaskFixture::new();
+    let harness = SyntheticHarness::new(&task);
+    let (mut studio, mut h) = completed_external_discovery_origin(&task, TestHooks::default());
+    harness.read();
+    let saved = task.store.load().unwrap();
+    click(&mut h, &mut studio, "studio.return");
+    settle(&mut h, &mut studio);
+    click(&mut h, &mut studio, "studio.tasks");
+    settle(&mut h, &mut studio);
+    await_text(
+        &mut h,
+        &mut studio,
+        "Actual external origin for correlation",
+    );
+    studio.test_task_request("A separately authorized new external task request");
+    settle(&mut h, &mut studio);
+    assert!(
+        studio.test_prepared_request().is_some(),
+        "{}",
+        studio.test_notice()
+    );
+    let path = task.root.join("studio/session.json");
+    let prepared: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(
+        prepared["discovery"]["external"].is_object(),
+        "Disclosure alone must preserve the old exact lineage"
+    );
+    studio.test_task_authorize();
+    settle(&mut h, &mut studio);
+    let issued: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(
+        issued["task"]["external"].is_object(),
+        "{}",
+        studio.test_notice()
+    );
+    assert!(issued["task"]["completed"].is_null());
+    assert!(
+        issued["discovery"].is_null(),
+        "An explicitly replaced completion cannot leave its old Discover authority current"
+    );
+    assert_eq!(task.store.load().unwrap(), saved);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn explicit_relink_supersedes_uncommitted_external_analysis_but_background_edit_does_not() {
+    let task = TaskFixture::new();
+    let harness = SyntheticHarness::new(&task);
+    let (mut studio, mut h) = completed_external_discovery_origin(&task, TestHooks::default());
+    harness.read();
+    let saved = task.store.load().unwrap();
+    let path = task.root.join("studio/session.json");
+    let retained: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let source = task.data_home.join("second-source");
+    let repo = git2::Repository::init(&source).unwrap();
+    let tree = repo
+        .find_tree(repo.index().unwrap().write_tree().unwrap())
+        .unwrap();
+    let who = git2::Signature::now("Synthetic fixture", "fixture@invalid.example").unwrap();
+    repo.commit(
+        Some("HEAD"),
+        &who,
+        &who,
+        "Synthetic second task",
+        &tree,
+        &[],
+    )
+    .unwrap();
+    fs::create_dir(source.join(".gitmanager")).unwrap();
+    fs::write(
+        source.join(".gitmanager/product.json"),
+        fs::read(task.source.join(".gitmanager/product.json")).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        source.join("app.json"),
+        serde_json::to_vec(&fixture::organizer()).unwrap(),
+    )
+    .unwrap();
+    let second = tasks::TaskRecord::from_worktree("Another synthetic task", &source).unwrap();
+    tasks::TaskRegistry::load().add(second.clone()).unwrap();
+    click(&mut h, &mut studio, "studio.return");
+    settle(&mut h, &mut studio);
+    click(&mut h, &mut studio, "studio.tasks");
+    settle(&mut h, &mut studio);
+    task.edit_label("Background edit does not supersede analysis");
+    studio.test_task_refresh();
+    settle(&mut h, &mut studio);
+    await_text(
+        &mut h,
+        &mut studio,
+        "Background edit does not supersede analysis",
+    );
+    let polled: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(polled["discovery"], retained["discovery"]);
+    assert_eq!(polled["task"]["completed"], retained["task"]["completed"]);
+    let warned = frame(&mut h, &mut studio)
+        .text
+        .iter()
+        .any(|t| t.contains("supersede") && t.contains("Discover"));
+    click(&mut h, &mut studio, &format!("studio.task.{}", second.id));
+    settle(&mut h, &mut studio);
+    let relinked: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(relinked["task"]["task_id"],second.id,"An explicit relink must atomically replace the task and supersede its old uncommitted analysis: {}",studio.test_notice());
+    assert!(
+        warned,
+        "The ordinary task selector must disclose supersession before the explicit relink"
+    );
+    assert!(relinked["discovery"].is_null());
+    assert!(relinked["task"]["external"].is_null());
+    assert!(relinked["task"]["completed"].is_null());
+    assert_eq!(task.store.load().unwrap(), saved);
+    tasks::TaskRegistry::load().unlink(&second.id).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn actual_managed_design_new_feature_has_a_candidate_only_typed_acceptance_path() {
+    use product_contract::*;
+    use std::sync::atomic::Ordering;
+    let task = TaskFixture::with_program(wide_fixture::compact_program(false));
+    wide_fixture::managed(&task.store, true);
+    let current = task.store.load().unwrap();
+    assert!(current.editable_scope_context().unwrap().is_some());
+    let mut raw =
+        serde_json::to_value(change_adapter::baseline(&current).unwrap().program).unwrap();
+    raw["state"].as_array_mut().unwrap().push(serde_json::json!({"id":"feature_count","label":"New feature count","value_type":{"kind":"integer"},"initial":{"kind":"integer","value":0}}));
+    raw["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"new_feature","label":"Try the new feature","parameters":{},"guards":[],"steps":[{"kind":"set_state","state":"feature_count","value":{"kind":"literal","value_type":{"kind":"integer"},"value":{"kind":"integer","value":1}}}],"ensures":[]}));
+    raw["observables"].as_array_mut().unwrap().push(serde_json::json!({"id":"feature_count","label":"New feature count","value":{"kind":"state","state":"feature_count"}}));
+    raw["views"][0]["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"new_feature_button","label":"Try the new feature","action":"new_feature","placement":"toolbar","arguments":{},"enabled":scope_fixture::boolean(true)}));
+    let candidate = scope_fixture::capture(raw);
+    assert!(!current
+        .program()
+        .unwrap()
+        .program
+        .actions
+        .iter()
+        .any(|a| a.id == "new_feature"));
+    let transport = wide_fixture_transport(&task.root);
+    let hooks = TestHooks::default();
+    hooks.today.store(20003, Ordering::Release);
+    let stopped = hooks.stopped.clone();
+    let mut studio = ProductStudio::testing(task.root.clone(), Some(transport.clone()), hooks);
+    let mut h = EguiHarness::new(egui::vec2(1500.0, 5000.0));
+    settle(&mut h, &mut studio);
+    studio.test_open(task.root.join("tool"));
+    settle(&mut h, &mut studio);
+    studio.test_modify(
+        "Add a separately demonstrated new feature while preserving earlier scoped work",
+    );
+    settle(&mut h, &mut studio);
+    let request = studio
+        .test_prepared_request()
+        .unwrap_or_else(|| panic!("{}", studio.test_notice()))
+        .clone();
+    wide_response(
+        &task.root,
+        &DevelopmentResponse {
+            version: 1,
+            request_digest: request.identity().unwrap(),
+            candidates: vec![GeneratedCandidate {
+                id: "new-feature".into(),
+                source_json: String::from_utf8(candidate.source_bytes.clone()).unwrap(),
+            }],
+            hypotheses: vec![],
+            evolutions: vec![],
+            unsupported: vec![],
+        },
+    );
+    studio.test_consent();
+    settle(&mut h, &mut studio);
+    assert_eq!(
+        studio.test_page(),
+        "change",
+        "The real valid managed candidate must reach review: {}",
+        studio.test_notice()
+    );
+    click(&mut h, &mut studio, "studio.feature-example");
+    settle(&mut h, &mut studio);
+    assert_eq!(
+        studio.test_page(),
+        "discovery-requirement",
+        "A candidate-only example must not require Current to validate new state or actions: {}",
+        studio.test_notice()
+    );
+    click(
+        &mut h,
+        &mut studio,
+        "feature-candidate.action.new_feature_button",
+    );
+    settle(&mut h, &mut studio);
+    click(
+        &mut h,
+        &mut studio,
+        "studio.feature.accept.observed.feature_count",
+    );
+    settle(&mut h, &mut studio);
+    let value: serde_json::Value =
+        serde_json::from_slice(&fs::read(task.root.join("studio/session.json")).unwrap()).unwrap();
+    assert_ne!(value["discovery"]["accepted_case"]["target_source"],value["discovery"]["accepted_case"]["authored_source"],"The accepted case must run the actual compiled managed target, never fall back to an uncompiled authored design");
+    assert_eq!(
+        value["discovery"]["accepted_case"]["required_actions"],
+        serde_json::json!(["new_feature"])
+    );
+    assert_eq!(
+        value["discovery"]["accepted_case"]["property"]["predicate"]["right"]["value"],
+        serde_json::json!({"kind":"integer","value":1})
+    );
+    click(&mut h, &mut studio, "studio.feature.back");
+    settle(&mut h, &mut studio);
+    for id in [
+        "studio.accept",
+        "studio.keep-current",
+        "studio.either",
+        "studio.both",
+        "studio.neither",
+        "studio.defer",
+    ] {
+        assert!(
+            !frame(&mut h, &mut studio)
+                .controls
+                .get(id)
+                .is_some_and(|c| c.enabled),
+            "Analysis-only target must not grant {id}"
+        );
+    }
+    stop_wide(studio, &stopped);
+    let hooks = TestHooks::default();
+    hooks.today.store(20003, Ordering::Release);
+    let mut studio = ProductStudio::testing(task.root.clone(), Some(transport), hooks);
+    settle(&mut h, &mut studio);
+    click(&mut h, &mut studio, "studio.reopen-discovery");
+    settle(&mut h, &mut studio);
+    assert_eq!(
+        studio.test_page(),
+        "change",
+        "Restart must reconstruct the exact compiled analysis target: {}",
+        studio.test_notice()
+    );
+    let reopened: serde_json::Value =
+        serde_json::from_slice(&fs::read(task.root.join("studio/session.json")).unwrap()).unwrap();
+    assert_eq!(
+        reopened["discovery"]["accepted_case"],
+        value["discovery"]["accepted_case"]
+    );
+    click(&mut h, &mut studio, "studio.discover");
+    settle(&mut h, &mut studio);
+    assert_eq!(
+        studio.test_page(),
+        "consent",
+        "The real managed Discover disclosure must be reachable: {}",
+        studio.test_notice()
+    );
+    let request = studio.test_prepared_request().unwrap();
+    assert_eq!(
+        serde_json::to_value(
+            canonical_digest(IdentityDomain::Source, &request.sources[1]).unwrap()
+        )
+        .unwrap(),
+        value["discovery"]["accepted_case"]["target_source"]
+    );
+    assert!(
+        request
+            .examples
+            .iter()
+            .any(|e| e.disclosure == Disclosure::ExplicitlySelected
+                && !e.scenario.validity.is_empty())
+    );
+    assert_eq!(task.store.load().unwrap(), current);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn actual_external_new_state_design_reaches_candidate_only_acceptance_and_exact_disclosure() {
+    let task = TaskFixture::new();
+    let harness = SyntheticHarness::new(&task);
+    let transport = wide_fixture_transport(&task.root);
+    let (mut studio, mut h) = task.open_with_transport(TestHooks::default(), Some(transport));
+    let saved = task.store.load().unwrap();
+    assert!(saved.editable_scope_context().unwrap().is_none());
+    studio.test_task_request("Add a separately checked new-state feature to my actual linked tool");
+    settle(&mut h, &mut studio);
+    let request = studio.test_prepared_request().unwrap().clone();
+    studio.test_task_authorize();
+    settle(&mut h, &mut studio);
+    assert_eq!(harness.read()["synthetic"], true);
+    let mut raw = fixture::organizer();
+    raw["label"] = serde_json::json!("Actual ordinary new-state task completion");
+    raw["state"].as_array_mut().unwrap().push(serde_json::json!({"id":"feature_count","label":"New feature count","value_type":{"kind":"integer"},"initial":{"kind":"integer","value":0}}));
+    raw["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"new_feature","label":"Try the new feature","parameters":{},"guards":[],"steps":[{"kind":"set_state","state":"feature_count","value":{"kind":"literal","value_type":{"kind":"integer"},"value":{"kind":"integer","value":1}}}],"ensures":[]}));
+    raw["observables"].as_array_mut().unwrap().push(serde_json::json!({"id":"feature_count","label":"New feature count","value":{"kind":"state","state":"feature_count"}}));
+    raw["views"][0]["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"new_feature_button","label":"Try the new feature","action":"new_feature","placement":"toolbar","arguments":{},"enabled":scope_fixture::boolean(true)}));
+    fixture::capture(raw.clone()).validate().unwrap();
+    fs::write(
+        task.source.join("app.json"),
+        serde_json::to_vec(&raw).unwrap(),
+    )
+    .unwrap();
+    product_studio::test_task_machine(&task.root, "submit", &task.record.id, &request.id).unwrap();
+    studio.test_task_refresh();
+    settle(&mut h, &mut studio);
+    await_text(
+        &mut h,
+        &mut studio,
+        "Actual ordinary new-state task completion",
+    );
+    let path = task.root.join("studio/session.json");
+    let completed: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        completed["task"]["completed"]["external"]["pending"]["request"],
+        serde_json::to_value(&request).unwrap()
+    );
+    await_review_control(&mut h, &mut studio);
+    studio.test_task_review();
+    settle(&mut h, &mut studio);
+    assert_eq!(
+        studio.test_page(),
+        "change",
+        "Actual new-state ExternalAuthor review must not require a fictitious Current replay: {}",
+        studio.test_notice()
+    );
+    click(&mut h, &mut studio, "studio.feature-example");
+    settle(&mut h, &mut studio);
+    click(
+        &mut h,
+        &mut studio,
+        "feature-candidate.action.new_feature_button",
+    );
+    settle(&mut h, &mut studio);
+    click(
+        &mut h,
+        &mut studio,
+        "studio.feature.accept.observed.feature_count",
+    );
+    settle(&mut h, &mut studio);
+    let accepted: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(accepted["discovery"]["original"].is_null());
+    assert_eq!(
+        accepted["discovery"]["accepted_case"]["required_actions"],
+        serde_json::json!(["new_feature"])
+    );
+    click(&mut h, &mut studio, "studio.feature.back");
+    settle(&mut h, &mut studio);
+    assert!(!frame(&mut h, &mut studio)
+        .controls
+        .get("studio.accept")
+        .is_some_and(|c| c.enabled));
+    click(&mut h, &mut studio, "studio.discover");
+    settle(&mut h, &mut studio);
+    assert_eq!(studio.test_page(), "consent", "{}", studio.test_notice());
+    assert_eq!(
+        studio.test_prepared_request().unwrap().operation,
+        product_contract::DevelopmentOperation::Discover
+    );
+    assert_eq!(task.store.load().unwrap(), saved);
+}
+
+// Synthetic services, but actual registry completion, compiled managed sources,
+// separate consent, ordinary copy/choice controls, durable rehearsal and restart.
+#[cfg(target_os = "linux")]
+fn managed_external_pair_retains_origin(mode: &str) {
+    use product_contract::*;
+    use std::sync::{atomic::Ordering, Arc};
+    let task = TaskFixture::with_program(wide_fixture::compact_program(false));
+    wide_fixture::managed(&task.store, true);
+    let current = task.store.load().unwrap();
+    assert!(current.editable_scope_context().unwrap().is_some());
+    let harness = SyntheticHarness::new(&task);
+    let transport = wide_fixture_transport(&task.root);
+    let hooks = TestHooks::default();
+    hooks.today.store(current.clock_day, Ordering::Release);
+    let stopped = hooks.stopped.clone();
+    let (mut studio, mut h) = task.open_with_transport(hooks, Some(transport));
+    studio.test_task_request(
+        "Explore how new work is named while keeping existing scoped commitments",
+    );
+    settle(&mut h, &mut studio);
+    let original = studio.test_prepared_request().unwrap().clone();
+    studio.test_task_authorize();
+    settle(&mut h, &mut studio);
+    assert_eq!(harness.read()["synthetic"], true);
+    let mut authored =
+        serde_json::to_value(change_adapter::baseline(&current).unwrap().program).unwrap();
+    authored["label"] = serde_json::json!("Actual external managed naming design");
+    authored["actions"][0]["steps"][0]["values"]["name"] = serde_json::to_value(
+        scope_fixture::lit(scope_fixture::text("Authored new work name"), Type::Text),
+    )
+    .unwrap();
+    let list = authored["views"][0]["kind"].clone();
+    authored["views"].as_array_mut().unwrap().push(serde_json::json!({"id":"second_list","label":"External extra view","kind":list,"actions":[],"keys":[]}));
+    fs::write(
+        task.source.join("app.json"),
+        serde_json::to_vec(&authored).unwrap(),
+    )
+    .unwrap();
+    product_studio::test_task_machine(&task.root, "submit", &task.record.id, &original.id).unwrap();
+    studio.test_task_refresh();
+    settle(&mut h, &mut studio);
+    await_review_control(&mut h, &mut studio);
+    click(&mut h, &mut studio, "studio.task-review");
+    settle(&mut h, &mut studio);
+    assert_eq!(
+        studio.test_page(),
+        "change",
+        "Managed authored review: {}",
+        studio.test_notice()
+    );
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(task.root.join("studio/session.json")).unwrap()).unwrap();
+    assert!(
+        record["discovery"]["original"].is_null(),
+        "No fabricated Modify receipt"
+    );
+    let actual_authored: CapturedProgram =
+        serde_json::from_value(record["task"]["completed"]["capture"].clone()).unwrap();
+    assert_eq!(
+        actual_authored.binding.task.as_ref().unwrap().task_id,
+        task.record.id
+    );
+    click(&mut h, &mut studio, "studio.discover");
+    settle(&mut h, &mut studio);
+    assert_eq!(
+        studio.test_page(),
+        "consent",
+        "Exact managed Discover disclosure: {}",
+        studio.test_notice()
+    );
+    let request = studio.test_prepared_request().unwrap().clone();
+    assert_eq!(request.operation, DevelopmentOperation::Discover);
+    assert_eq!(&request.sources[0], current.program().unwrap());
+    assert_ne!(
+        request.sources[1], actual_authored,
+        "Discover must use the actual compiled target"
+    );
+    assert!(request.sources[1].binding.task.is_none());
+    assert!(request.sources[0].binding.task.is_none());
+    let scene = ScenarioSpec {
+        version: 1,
+        id: "managed-naming-choice".into(),
+        label: "Create new work with its supplied name".into(),
+        seed: current.data.clone(),
+        session: current.session.clone(),
+        clock_day: current.clock_day,
+        random_seed: 42,
+        inputs: vec![
+            scope_fixture::invoke(
+                "add",
+                &[
+                    ("name", scope_fixture::text("Example new work")),
+                    ("promised", DataValue::Date { days: 20020 }),
+                ],
+            ),
+            SemanticInput::Observe {
+                point: "done".into(),
+            },
+        ],
+        validity: vec![],
+    };
+    for source in &request.sources[..2] {
+        scene.validate(&source.program).unwrap();
+    }
+    assert_ne!(
+        request.sources[0].program.actions[0], request.sources[1].program.actions[0],
+        "The checked action really changed"
+    );
+    wide_response(
+        &task.root,
+        &DevelopmentResponse {
+            version: 1,
+            request_digest: request.identity().unwrap(),
+            candidates: vec![
+                GeneratedCandidate {
+                    id: "current".into(),
+                    source_json: String::from_utf8(request.sources[0].source_bytes.clone())
+                        .unwrap(),
+                },
+                GeneratedCandidate {
+                    id: "captured".into(),
+                    source_json: String::from_utf8(request.sources[1].source_bytes.clone())
+                        .unwrap(),
+                },
+            ],
+            hypotheses: vec![ChoiceHypothesis {
+                id: "managed-external-pair".into(),
+                statement: "Creating work can retain its entered name or use a fixed name".into(),
+                kind: HypothesisKind::UnresolvedChoice,
+                action: "add".into(),
+                observable: "waiting_jobs".into(),
+                sources: vec![SourceLocus {
+                    relative_path: request.sources[1].binding.program_path.clone(),
+                    raw_digest: request.sources[1].artifact.raw_digest.clone(),
+                    pointer: "/actions/0/steps/0/values/name".into(),
+                }],
+                alternatives: vec!["current".into(), "captured".into()],
+                related_decisions: vec![],
+                scenario_json: serde_json::to_string(&scene).unwrap(),
+                unknowns: vec![],
+            }],
+            evolutions: vec![],
+            unsupported: vec![],
+        },
+    );
+    click(&mut h, &mut studio, "studio.consent");
+    settle(&mut h, &mut studio);
+    assert_eq!(studio.test_page(), "discovery", "{}", studio.test_notice());
+    let report = studio
+        .test_discovery_report()
+        .expect("Complete current checked report");
+    eprintln!("Managed origin checked dispositions: {:?}; defects: {:?}; unverified: {:?}; changed symbols: {:?}", report.log, report.defects, report.unverified, report.delta.changed_symbols);
+    for run in report.runs.iter().take(8) {
+        eprintln!(
+            "Managed origin run {}: {:?}, task={:?}, errors={:?}, uncovered={:?}",
+            run.id, run.state, run.binding.source.task, run.errors, run.uncovered
+        );
+    }
+    let trace = frame(&mut h, &mut studio);
+    let copies: Vec<_> = trace
+        .controls
+        .iter()
+        .filter(|(key, c)| key.starts_with("studio.discovery.copy.") && c.enabled)
+        .map(|(key, _)| key.clone())
+        .collect();
+    assert_eq!(
+        copies.len(),
+        1,
+        "Expected one valid exact-candidate managed question: {:?}",
+        trace.text
+    );
+    click(&mut h, &mut studio, &copies[0]);
+    settle(&mut h, &mut studio);
+    assert_eq!(
+        studio.test_page(),
+        "discovery-copy",
+        "Whole-design pair required: {}",
+        studio.test_notice()
+    );
+    click(&mut h, &mut studio, "studio.discovery.choose.5");
+    settle(&mut h, &mut studio);
+    assert_eq!(studio.test_page(), "daily", "{}", studio.test_notice());
+    let saved = task.store.load().unwrap();
+    let choice = saved.decisions.decisions.last().unwrap().clone();
+    assert_eq!(choice.status, DecisionStatus::Pending);
+    let scenes = product_decisions::IntentArchive::new(task.store.clone())
+        .accepted_scenes(&choice)
+        .unwrap();
+    assert_eq!(scenes.len(), 2);
+    assert!(
+        scenes.iter().all(|s| s.program().binding.task.is_none()),
+        "Compiled scene producers must retain their real identity"
+    );
+    assert!(scenes.iter().any(|s| s.program() == &request.sources[1]));
+    assert!(
+        saved.programs.contains(&actual_authored),
+        "The existing archive must retain the exact authored capture"
+    );
+    assert!(
+        saved
+            .scope
+            .rehearsals
+            .values()
+            .any(
+                |proof| proof.witnesses.get(&choice.id) == Some(&choice.witness)
+                    && proof.manifest.business
+                        == canonical_digest(IdentityDomain::Source, &actual_authored).unwrap()
+            ),
+        "The checked rehearsal must bind the saved choice to its true authored source"
+    );
+    if mode == "control" {
+        let backup = product_backup::VerifiedBackup::capture(&task.store).unwrap();
+        let bytes = backup.to_bytes().unwrap();
+        let verified = product_backup::VerifiedBackup::from_bytes(&bytes).unwrap();
+        assert_eq!(verified.to_bytes().unwrap(), bytes);
+        assert_eq!(verified.snapshot(), &saved);
+        assert!(verified.snapshot().programs.contains(&actual_authored));
+    }
+    if matches!(mode, "replacement" | "replacement-control") {
+        click(&mut h, &mut studio, "studio.tasks");
+        settle(&mut h, &mut studio);
+        click(&mut h, &mut studio, "studio.task-need");
+        h.key(
+            egui::Key::A,
+            true,
+            egui::Modifiers {
+                ctrl: true,
+                command: true,
+                ..Default::default()
+            },
+        );
+        frame(&mut h, &mut studio);
+        h.key(egui::Key::A, false, egui::Modifiers::NONE);
+        h.text("An explicitly separate later author request");
+        frame(&mut h, &mut studio);
+        let started = Instant::now();
+        loop {
+            let trace = frame(&mut h, &mut studio);
+            if !studio.test_source_polling()
+                && trace
+                    .controls
+                    .get("studio.external-request")
+                    .is_some_and(|control| control.enabled)
+            {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "Actual settled-source request control never became available: {}; {:?}",
+                studio.test_notice(),
+                trace.text
+            );
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        click(&mut h, &mut studio, "studio.external-request");
+        settle(&mut h, &mut studio);
+        let later = studio
+            .test_prepared_request()
+            .unwrap_or_else(|| {
+                panic!(
+                    "Explicit later request disclosure unavailable: {}",
+                    studio.test_notice()
+                )
+            })
+            .id
+            .clone();
+        studio.test_task_authorize();
+        settle(&mut h, &mut studio);
+        studio.test_task_abandon(&later);
+        settle(&mut h, &mut studio);
+        let record: serde_json::Value =
+            serde_json::from_slice(&fs::read(task.root.join("studio/session.json")).unwrap())
+                .unwrap();
+        assert!(record["discovery"].is_null() && record["task"]["completed"].is_null());
+        studio.test_open(task.root.join("tool"));
+        settle(&mut h, &mut studio);
+    }
+    studio.test_daily(scope_fixture::invoke(
+        "add",
+        &[
+            ("name", scope_fixture::text("Later independent saved work")),
+            ("promised", DataValue::Date { days: 20021 }),
+        ],
+    ));
+    settle(&mut h, &mut studio);
+    let later_work = task.store.load().unwrap();
+    assert!(later_work
+        .data
+        .records
+        .iter()
+        .any(|row| row.values.get("name")
+            == Some(&scope_fixture::text("Later independent saved work"))));
+    stop_wide(studio, &stopped);
+    if mode == "entry" || mode == "replacement" {
+        fs::write(
+            task.source.join("unrelated-origin-drift.txt"),
+            "Changed original full source after saving managed pair",
+        )
+        .unwrap();
+    } else if mode == "removed" {
+        tasks::TaskRegistry::load().unlink(&task.record.id).unwrap();
+    } else if mode == "task-replacement" {
+        let mut replacement = task.record.clone();
+        replacement.created_at.push_str("-different-identity");
+        tasks::TaskRegistry::load().unlink(&task.record.id).unwrap();
+        tasks::TaskRegistry::load().add(replacement).unwrap();
+    }
+    let pause = Arc::new(product_studio::TestPause::default());
+    pause.release.store(mode != "final", Ordering::Release);
+    let hooks = TestHooks {
+        before_commit: Some(pause.clone()),
+        ..Default::default()
+    };
+    hooks.today.store(current.clock_day, Ordering::Release);
+    let mut studio = ProductStudio::testing(task.root.clone(), None, hooks);
+    settle(&mut h, &mut studio);
+    studio.test_open(task.root.join("tool"));
+    settle(&mut h, &mut studio);
+    click(&mut h, &mut studio, &format!("studio.resume.{}", choice.id));
+    settle(&mut h, &mut studio);
+    if matches!(
+        mode,
+        "entry" | "removed" | "replacement" | "task-replacement"
+    ) {
+        assert_eq!(
+            studio.test_page(),
+            "daily",
+            "An archived managed pair must retain its original authored source gate: {}",
+            studio.test_notice()
+        );
+        assert_eq!(task.store.load().unwrap(), later_work);
+        return;
+    }
+    assert_eq!(
+        studio.test_page(),
+        "discovery-copy",
+        "Unchanged author origin must allow later business work: {}",
+        studio.test_notice()
+    );
+    click(&mut h, &mut studio, "studio.discovery.choose.2");
+    if mode == "final" {
+        let start = Instant::now();
+        while !pause.reached.load(Ordering::Acquire) {
+            frame(&mut h, &mut studio);
+            assert!(
+                start.elapsed() < Duration::from_secs(60),
+                "Final gate not reached: {}",
+                studio.test_notice()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        fs::write(
+            task.source.join("unrelated-origin-drift.txt"),
+            "Changed original source at final recording",
+        )
+        .unwrap();
+        pause.release.store(true, Ordering::Release);
+    }
+    settle(&mut h, &mut studio);
+    let after = task.store.load().unwrap();
+    if mode == "final" {
+        assert_eq!(
+            after, later_work,
+            "Final recording must recheck original author, not just compiled scenes"
+        );
+    } else {
+        assert_eq!(after.data, later_work.data);
+        assert!(
+            matches!(
+                after
+                    .decisions
+                    .decisions
+                    .iter()
+                    .find(|d| d.id == choice.id)
+                    .unwrap()
+                    .status,
+                DecisionStatus::Superseded { .. }
+            ),
+            "Unchanged-origin final resolution failed: {}",
+            studio.test_notice()
+        );
+        assert_eq!(after.program().unwrap(), later_work.program().unwrap());
+    }
+}
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_external_pair_reopen_rejects_original_source_drift_after_later_work() {
+    managed_external_pair_retains_origin("entry");
+}
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_external_pair_reopen_rejects_removed_original_task() {
+    managed_external_pair_retains_origin("removed");
+}
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_external_pair_final_recording_rechecks_original_source() {
+    managed_external_pair_retains_origin("final");
+}
+#[cfg(target_os = "linux")]
+#[test]
+fn unchanged_managed_external_pair_resolves_after_restart_and_later_business_work() {
+    managed_external_pair_retains_origin("control");
+}
+#[cfg(target_os = "linux")]
+#[test]
+fn replaced_session_lineage_cannot_erase_managed_pending_pair_origin() {
+    managed_external_pair_retains_origin("replacement");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn replaced_session_lineage_preserves_unchanged_managed_pair_resolution() {
+    managed_external_pair_retains_origin("replacement-control");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_external_pair_reopen_rejects_replaced_registered_task_identity() {
+    managed_external_pair_retains_origin("task-replacement");
+}
+
+// Both edits use the ordinary request/disclosure/authorization/review controls.
+// Services and author edits are synthetic; Current's first capture is genuinely
+// adopted before the same registered task produces the second candidate.
+#[cfg(target_os = "linux")]
+fn second_external_edit_keeps_candidate_origin(mode: &str) {
+    use product_contract::*;
+    use std::sync::{atomic::Ordering, Arc};
+    let task = TaskFixture::with_program(wide_fixture::compact_program(false));
+    let initial = task.store.load().unwrap();
+    let harness = SyntheticHarness::new(&task);
+    let hooks = TestHooks::default();
+    hooks.today.store(initial.clock_day, Ordering::Release);
+    let stopped = hooks.stopped.clone();
+    let (mut studio, mut h) =
+        task.open_with_transport(hooks, Some(wide_fixture_transport(&task.root)));
+    let authorize = |studio: &mut ProductStudio, h: &mut EguiHarness, need: &str| {
+        click(h, studio, "studio.task-need");
+        h.key(
+            egui::Key::A,
+            true,
+            egui::Modifiers {
+                ctrl: true,
+                command: true,
+                ..Default::default()
+            },
+        );
+        frame(h, studio);
+        h.key(egui::Key::A, false, egui::Modifiers::NONE);
+        h.text(need);
+        frame(h, studio);
+        let started = Instant::now();
+        loop {
+            let trace = frame(h, studio);
+            if !studio.test_source_polling()
+                && trace
+                    .controls
+                    .get("studio.external-request")
+                    .is_some_and(|c| c.enabled)
+            {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "Request control unavailable: {}; {:?}",
+                studio.test_notice(),
+                trace.text
+            );
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        click(h, studio, "studio.external-request");
+        settle(h, studio);
+        let request = studio
+            .test_prepared_request()
+            .expect("Actual request disclosure")
+            .clone();
+        click(h, studio, "studio.external-authorize");
+        settle(h, studio);
+        let started = Instant::now();
+        loop {
+            let logged = fs::read(&harness.log)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+            if logged.as_ref().is_some_and(|value| {
+                value["journal"]["task"]["external"]["pending"]["request"]["id"] == request.id
+            }) {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "Exact authorized request was not invoked"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        request
+    };
+    let first = authorize(
+        &mut studio,
+        &mut h,
+        "Update the title while preserving existing behavior",
+    );
+    let mut authored = serde_json::to_value(&initial.program().unwrap().program).unwrap();
+    authored["label"] = serde_json::json!("First adopted external design");
+    fs::write(
+        task.source.join("app.json"),
+        serde_json::to_vec(&authored).unwrap(),
+    )
+    .unwrap();
+    product_studio::test_task_machine(&task.root, "submit", &task.record.id, &first.id).unwrap();
+    studio.test_task_refresh();
+    settle(&mut h, &mut studio);
+    await_review_control(&mut h, &mut studio);
+    click(&mut h, &mut studio, "studio.task-review");
+    settle(&mut h, &mut studio);
+    assert_eq!(
+        studio.test_page(),
+        "change",
+        "First review: {}",
+        studio.test_notice()
+    );
+    let journal_path = task.root.join("studio/session.json");
+    let first_journal: serde_json::Value =
+        serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+    let first_capture: CapturedProgram =
+        serde_json::from_value(first_journal["task"]["completed"]["capture"].clone()).unwrap();
+    assert_eq!(
+        first_capture.binding.task.as_ref().unwrap().task_id,
+        task.record.id
+    );
+    click(&mut h, &mut studio, "studio.accept");
+    settle(&mut h, &mut studio);
+    assert_eq!(
+        studio.test_page(),
+        "daily",
+        "First adoption: {}",
+        studio.test_notice()
+    );
+    let current = task.store.load().unwrap();
+    assert_eq!(
+        current.program().unwrap(),
+        &first_capture,
+        "Current must be the exact adopted first ExternalAuthor capture"
+    );
+    assert!(current.editable_scope_context().unwrap().is_none());
+    click(&mut h, &mut studio, "studio.tasks");
+    settle(&mut h, &mut studio);
+    let second = authorize(
+        &mut studio,
+        &mut h,
+        "Explore how new work is named while preserving existing work",
+    );
+    assert_ne!(first.id, second.id);
+    assert!(second.sources.contains(&first_capture));
+    authored["label"] = serde_json::json!("Second external naming design");
+    authored["actions"][0]["steps"][0]["values"]["name"] = serde_json::to_value(
+        scope_fixture::lit(scope_fixture::text("Authored new work name"), Type::Text),
+    )
+    .unwrap();
+    let list = authored["views"][0]["kind"].clone();
+    authored["views"].as_array_mut().unwrap().push(serde_json::json!({"id":"second_list","label":"Second design extra view","kind":list,"actions":[],"keys":[]}));
+    fs::write(
+        task.source.join("app.json"),
+        serde_json::to_vec(&authored).unwrap(),
+    )
+    .unwrap();
+    product_studio::test_task_machine(&task.root, "submit", &task.record.id, &second.id).unwrap();
+    studio.test_task_refresh();
+    settle(&mut h, &mut studio);
+    await_review_control(&mut h, &mut studio);
+    click(&mut h, &mut studio, "studio.task-review");
+    settle(&mut h, &mut studio);
+    assert_eq!(
+        studio.test_page(),
+        "change",
+        "Second review: {}",
+        studio.test_notice()
+    );
+    let second_journal: serde_json::Value =
+        serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+    let second_capture: CapturedProgram =
+        serde_json::from_value(second_journal["task"]["completed"]["capture"].clone()).unwrap();
+    assert!(
+        second_journal["discovery"]["original"].is_null(),
+        "No invented Modify receipt"
+    );
+    for field in ["task_id", "created_at", "repository", "worktree"] {
+        assert!(!first_journal["task"][field].is_null());
+        assert_eq!(
+            first_journal["task"][field], second_journal["task"][field],
+            "Both authorizations must retain the same full registered task identity"
+        );
+    }
+    assert!(matches!(
+        first_capture.binding.producer,
+        Producer::ExternalAuthor { .. }
+    ));
+    assert!(matches!(
+        second_capture.binding.producer,
+        Producer::ExternalAuthor { .. }
+    ));
+    assert_eq!(
+        second_capture.binding.task.as_ref().unwrap().task_id,
+        task.record.id
+    );
+    assert_ne!(
+        first_capture.binding.task, second_capture.binding.task,
+        "Distinct full task-source fingerprints must survive both real completions"
+    );
+    assert_eq!(
+        task.store.load().unwrap().program().unwrap(),
+        &first_capture
+    );
+    click(&mut h, &mut studio, "studio.discover");
+    settle(&mut h, &mut studio);
+    assert_eq!(
+        studio.test_page(),
+        "consent",
+        "Second Discover disclosure: {}",
+        studio.test_notice()
+    );
+    let request = studio.test_prepared_request().unwrap().clone();
+    assert_eq!(request.operation, DevelopmentOperation::Discover);
+    assert_eq!(request.sources[0], first_capture);
+    assert_eq!(request.sources[1], second_capture);
+    let scene = ScenarioSpec {
+        version: 1,
+        id: "second-author-choice".into(),
+        label: "Create work with its supplied name".into(),
+        seed: current.data.clone(),
+        session: current.session.clone(),
+        clock_day: current.clock_day,
+        random_seed: 42,
+        inputs: vec![
+            scope_fixture::invoke(
+                "add",
+                &[
+                    ("name", scope_fixture::text("Example new work")),
+                    ("promised", DataValue::Date { days: 20020 }),
+                ],
+            ),
+            SemanticInput::Observe {
+                point: "done".into(),
+            },
+        ],
+        validity: vec![],
+    };
+    for source in &request.sources[..2] {
+        scene.validate(&source.program).unwrap();
+    }
+    assert_ne!(
+        request.sources[0].program.actions[0],
+        request.sources[1].program.actions[0]
+    );
+    wide_response(
+        &task.root,
+        &DevelopmentResponse {
+            version: 1,
+            request_digest: request.identity().unwrap(),
+            candidates: vec![
+                GeneratedCandidate {
+                    id: "current".into(),
+                    source_json: String::from_utf8(request.sources[0].source_bytes.clone())
+                        .unwrap(),
+                },
+                GeneratedCandidate {
+                    id: "captured".into(),
+                    source_json: String::from_utf8(request.sources[1].source_bytes.clone())
+                        .unwrap(),
+                },
+            ],
+            hypotheses: vec![ChoiceHypothesis {
+                id: "second-author-pair".into(),
+                statement: "Creating work can retain its entered name or use a fixed name".into(),
+                kind: HypothesisKind::UnresolvedChoice,
+                action: "add".into(),
+                observable: "waiting_jobs".into(),
+                sources: vec![SourceLocus {
+                    relative_path: second_capture.binding.program_path.clone(),
+                    raw_digest: second_capture.artifact.raw_digest.clone(),
+                    pointer: "/actions/0/steps/0/values/name".into(),
+                }],
+                alternatives: vec!["current".into(), "captured".into()],
+                related_decisions: vec![],
+                scenario_json: serde_json::to_string(&scene).unwrap(),
+                unknowns: vec![],
+            }],
+            evolutions: vec![],
+            unsupported: vec![],
+        },
+    );
+    click(&mut h, &mut studio, "studio.consent");
+    settle(&mut h, &mut studio);
+    let report = studio
+        .test_discovery_report()
+        .expect("Checked second-edit report");
+    eprintln!(
+        "Second-author dispositions: {:?}; defects: {:?}; unverified: {:?}",
+        report.log, report.defects, report.unverified
+    );
+    let trace = frame(&mut h, &mut studio);
+    let copies: Vec<_> = trace
+        .controls
+        .iter()
+        .filter(|(key, c)| key.starts_with("studio.discovery.copy.") && c.enabled)
+        .map(|(key, _)| key.clone())
+        .collect();
+    assert_eq!(
+        copies.len(),
+        1,
+        "Expected genuine Current/second-candidate question: {:?}; {}",
+        trace.text,
+        studio.test_notice()
+    );
+    click(&mut h, &mut studio, &copies[0]);
+    settle(&mut h, &mut studio);
+    assert_eq!(studio.test_page(), "discovery-copy");
+    click(&mut h, &mut studio, "studio.discovery.choose.5");
+    settle(&mut h, &mut studio);
+    assert_eq!(
+        studio.test_page(),
+        "daily",
+        "Save second-edit pending choice: {}",
+        studio.test_notice()
+    );
+    let saved = task.store.load().unwrap();
+    let choice = saved.decisions.decisions.last().unwrap().clone();
+    assert_eq!(choice.status, DecisionStatus::Pending);
+    let scenes = product_decisions::IntentArchive::new(task.store.clone())
+        .accepted_scenes(&choice)
+        .unwrap();
+    assert_eq!(scenes.len(), 2);
+    assert!(scenes.iter().any(|s| s.program() == &first_capture));
+    assert!(scenes.iter().any(|s| s.program() == &second_capture));
+    assert_eq!(saved.program().unwrap(), &first_capture);
+    studio.test_daily(scope_fixture::invoke(
+        "add",
+        &[
+            ("name", scope_fixture::text("Later independent saved work")),
+            ("promised", DataValue::Date { days: 20021 }),
+        ],
+    ));
+    settle(&mut h, &mut studio);
+    let later_work = task.store.load().unwrap();
+    assert!(later_work
+        .data
+        .records
+        .iter()
+        .any(|row| row.values.get("name")
+            == Some(&scope_fixture::text("Later independent saved work"))));
+    let backup = product_backup::VerifiedBackup::capture(&task.store)
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+    assert_eq!(
+        product_backup::VerifiedBackup::from_bytes(&backup)
+            .unwrap()
+            .snapshot(),
+        &later_work
+    );
+    stop_wide(studio, &stopped);
+    if mode == "entry" {
+        fs::write(
+            task.source.join("second-source-drift.txt"),
+            "Changed second author source after pending choice",
+        )
+        .unwrap();
+    }
+    if mode == "removed" {
+        tasks::TaskRegistry::load().unlink(&task.record.id).unwrap();
+    }
+    let pause = Arc::new(product_studio::TestPause::default());
+    pause.release.store(mode != "final", Ordering::Release);
+    let hooks = TestHooks {
+        before_commit: Some(pause.clone()),
+        ..Default::default()
+    };
+    hooks.today.store(initial.clock_day, Ordering::Release);
+    let mut studio = ProductStudio::testing(task.root.clone(), None, hooks);
+    settle(&mut h, &mut studio);
+    studio.test_open(task.root.join("tool"));
+    settle(&mut h, &mut studio);
+    click(&mut h, &mut studio, &format!("studio.resume.{}", choice.id));
+    settle(&mut h, &mut studio);
+    if matches!(mode, "entry" | "removed") {
+        assert_eq!(
+            studio.test_page(),
+            "daily",
+            "Second candidate must retain its original source gate: {}",
+            studio.test_notice()
+        );
+        assert_eq!(task.store.load().unwrap(), later_work);
+        return;
+    }
+    assert_eq!(studio.test_page(), "discovery-copy", "The unchanged second author must reopen after later work; adopted Current is historical: {}", studio.test_notice());
+    click(&mut h, &mut studio, "studio.discovery.choose.2");
+    if mode == "final" {
+        let started = Instant::now();
+        while !pause.reached.load(Ordering::Acquire) {
+            frame(&mut h, &mut studio);
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "Final second-author gate not reached: {}",
+                studio.test_notice()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        fs::write(
+            task.source.join("second-source-drift.txt"),
+            "Second source changed at final recording",
+        )
+        .unwrap();
+        pause.release.store(true, Ordering::Release);
+    }
+    settle(&mut h, &mut studio);
+    let after = task.store.load().unwrap();
+    if mode == "final" {
+        assert_eq!(
+            after, later_work,
+            "Final recording must recheck the second candidate's real source"
+        );
+    } else {
+        assert_eq!(after.data, later_work.data);
+        assert_eq!(after.program().unwrap(), &first_capture);
+        assert!(
+            matches!(
+                after
+                    .decisions
+                    .decisions
+                    .iter()
+                    .find(|d| d.id == choice.id)
+                    .unwrap()
+                    .status,
+                DecisionStatus::Superseded { .. }
+            ),
+            "Unchanged second-author resolution: {}",
+            studio.test_notice()
+        );
+    }
+}
+#[cfg(target_os = "linux")]
+#[test]
+fn second_authorized_edit_reopens_with_historical_external_current() {
+    second_external_edit_keeps_candidate_origin("control");
+}
+#[cfg(target_os = "linux")]
+#[test]
+fn second_authorized_edit_reopen_rejects_candidate_source_drift() {
+    second_external_edit_keeps_candidate_origin("entry");
+}
+#[cfg(target_os = "linux")]
+#[test]
+fn second_authorized_edit_reopen_rejects_candidate_task_removal() {
+    second_external_edit_keeps_candidate_origin("removed");
+}
+#[cfg(target_os = "linux")]
+#[test]
+fn second_authorized_edit_final_recording_rechecks_candidate_source() {
+    second_external_edit_keeps_candidate_origin("final");
 }

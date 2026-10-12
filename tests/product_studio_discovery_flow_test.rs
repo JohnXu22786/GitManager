@@ -232,7 +232,7 @@ fn exact_modify_then_discover_keeps_authored_and_compiled_results_distinct() {
         *d.primary_preparation().unwrap().candidate()
     );
     assert!(d
-        .prepare_alternatives(&store, d.modify_result(), "wrong", cancel())
+        .prepare_alternatives(&store, d.modify_result().unwrap(), "wrong", cancel())
         .is_err());
     let (result, policy) = response(&store, &d, 2);
     let original = result.clone();
@@ -1021,6 +1021,75 @@ fn assert_current_alternative_reopens(managed: bool) {
 #[test]
 fn ordinary_current_alternative_pending_choice_reopens_from_archived_capture() {
     assert_current_alternative_reopens(false);
+}
+
+#[test]
+fn pending_pair_origin_roles_follow_checked_sources_in_either_scene_order() {
+    for reverse in [false, true] {
+        let (_dir, store, basis, queue, _, _) = ordinary_or_managed_queue(false, false, false);
+        let pair = open(&store, &queue);
+        let mut scenes = pair.scenes().unwrap().to_vec();
+        let alternative = scenes
+            .iter()
+            .find(|scene| scene.program() != basis.program().unwrap())
+            .unwrap()
+            .program()
+            .clone();
+        if reverse {
+            scenes.reverse();
+        }
+        let expected_order: Vec<_> = scenes.iter().map(|scene| scene.program().clone()).collect();
+        let checker = engine(&store);
+        let change = checker
+            .prepare_choice(
+                &store,
+                basis.program().unwrap(),
+                Choice {
+                    id: "ordered-pending-pair".into(),
+                    request: "Keep both actual planning experiences for later".into(),
+                    rationale: None,
+                    scope: DecisionScope {
+                        operations: ["plan".into()].into(),
+                        population: Population::All,
+                        conditions: Values::new(),
+                        excluded_records: vec![],
+                        unknowns: vec![],
+                    },
+                    outcome: DecisionOutcome::Deferred,
+                    obligations: vec![],
+                    binding: IntentionBinding::ObservedOutcome,
+                },
+                scenes,
+                "record-ordered-pair",
+            )
+            .unwrap();
+        checker.adopt(&store, &change).unwrap();
+        let reopened = PairExperience::reopen(
+            &store,
+            "ordered-pending-pair",
+            "reopen-ordered-pair",
+            cancel(),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened
+                .scenes()
+                .unwrap()
+                .iter()
+                .map(|scene| scene.program().clone())
+                .collect::<Vec<_>>(),
+            expected_order,
+            "The authentic archive retains either scene orientation"
+        );
+        assert_eq!(
+            reopened
+                .prospective_authored_sources()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![alternative],
+            "Only exact installed Current is historical, regardless of its scene position"
+        );
+    }
 }
 
 #[test]

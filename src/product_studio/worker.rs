@@ -1,4 +1,6 @@
 use super::*;
+#[path = "discovery_worker.rs"]
+mod discovery_worker;
 #[path = "local_files_worker.rs"]
 mod local_files_worker;
 #[path = "task_source_worker.rs"]
@@ -139,6 +141,12 @@ struct OpenTool {
     store: ProductStore,
     snapshot: ProjectSnapshot,
 }
+// One immutable current-run report, independent of transient executable authority.
+// View contains an Arc to the bounded report; it is never serialized as proof.
+struct CachedDiscoveryReport {
+    tool: Association,
+    view: discovery_host::View,
+}
 struct Worker {
     task: task_source_worker::State,
     config: Config,
@@ -148,6 +156,9 @@ struct Worker {
     ready: Option<Ready>,
     draft: Option<Draft>,
     change: Option<ChangeDraft>,
+    discovery: Option<discovery_worker::State>,
+    cached_discovery_report: Option<CachedDiscoveryReport>,
+    feature: Option<discovery_policy::Trial>,
     intention: Option<IntentionDraft>,
     recovery: Option<local_files_worker::Recovery>,
     recovered_location: Option<crate::product_store::RecoveryDestination>,
@@ -161,6 +172,13 @@ struct Worker {
 impl Worker {
     fn update(&self) -> Update {
         let mut notice = self.notice.clone();
+        let unresolved_write = self
+            .journal
+            .as_ref()
+            .is_some_and(JournalFile::writes_blocked);
+        if unresolved_write && !notice.contains("Restart information publication is unresolved") {
+            notice.push_str(" Restart information publication is unresolved. Files were kept; restart GitManager for a fresh checked reopen before another write or refresh. Do not repeat an operation already reported saved.");
+        }
         let recent = match self
             .locations
             .as_ref()
@@ -211,9 +229,15 @@ impl Worker {
                 .chosen
                 .clone()
                 .or_else(|| self.locations.as_ref().map(|l| l.path().to_path_buf())),
-            mutation_blocked: self.journal.is_none() || durable_pending,
+            mutation_blocked: self.journal.is_none() || unresolved_write || durable_pending,
             generation_blocked: self.journal.is_none()
+                || unresolved_write
                 || self.generation_blocked
+                || self
+                    .journal
+                    .as_ref()
+                    .and_then(|j| j.value.provider.as_ref())
+                    .is_some_and(|p| p.issued)
                 || durable_pending
                 || self
                     .journal
@@ -248,9 +272,28 @@ impl Worker {
             .ok_or("Restart information is unavailable; new writes are paused")?;
         let mut value = journal.value.clone();
         edit(&mut value);
-        journal.write(value)
+        // A disclosure or unrelated journal update does not change this origin.
+        // Only a successful publication may invalidate the retained report;
+        // preflight refusal keeps the previous coherent record and cache.
+        let keep_report = self.cached_discovery_report.as_ref().is_none_or(|cached| {
+            value.discovery.as_ref().is_some_and(|record| {
+                record.tool == cached.tool
+                    && record
+                        .identity()
+                        .is_ok_and(|identity| identity == cached.view.lineage)
+            })
+        });
+        journal.write(value)?;
+        if !keep_report {
+            self.cached_discovery_report = None;
+        }
+        Ok(())
     }
     fn no_pending(&self) -> Result<(), String> {
+        self.journal
+            .as_ref()
+            .ok_or("Restart information is unavailable; new writes are paused")?
+            .require_writable()?;
         if self
             .journal
             .as_ref()
@@ -271,6 +314,7 @@ impl Worker {
             || self.ready.is_some()
             || self.draft.is_some()
             || self.change.is_some()
+            || self.discovery.is_some()
             || self.intention.is_some()
             || self.opened.is_some()
             || self.recovery.is_some()
@@ -369,7 +413,7 @@ impl Worker {
                 .as_ref()
                 .is_some_and(|j| j.value.provider.is_some())
         {
-            return Err("The earlier provider process has an unresolved outcome; no new generation was sent".into());
+            return Err("The earlier provider request or its durable completion is unresolved; no new generation was sent".into());
         }
         let modify_binding = if modify {
             let current = self
@@ -499,7 +543,7 @@ impl Worker {
                 .as_ref()
                 .is_some_and(|j| j.value.provider.is_some())
         {
-            return Err("The earlier provider process has an unresolved outcome; no new generation was sent".into());
+            return Err("The earlier provider request or its durable completion is unresolved; no new generation was sent".into());
         }
         request.validate().map_err(error)?;
         self.journal(|j| j.need = need.clone())?;
@@ -535,13 +579,37 @@ impl Worker {
             modify,
             reconcile,
         };
+        let lineage = pending
+            .modify
+            .as_ref()
+            .map(|(tool, basis)| {
+                Ok::<_, String>(discovery_host::Record {
+                    tool: tool.clone(),
+                    basis: basis.clone(),
+                    need: need.clone(),
+                    original: Some(discovery_host::Invocation::prepared(
+                        &request,
+                        prepared.disclosure(),
+                    )?),
+                    external: None,
+                    selected: None,
+                    selection: None,
+                    discover: None,
+                    accepted_case: None,
+                })
+            })
+            .transpose()?;
         self.journal(|j| {
             j.need = need.clone();
             j.provider = Some(pending.clone());
+            if let Some(lineage) = lineage {
+                j.discovery = Some(lineage);
+            }
         })?;
         self.ready = None;
         self.draft = None;
         self.change = None;
+        self.discovery = None;
         self.task.evidence = None;
         self.intention = None;
         self.recovery = None;
@@ -572,6 +640,13 @@ impl Worker {
         Ok(())
     }
     fn generate(&mut self, disclosure: String, key: &Key, gate: &Gate) -> Result<(), String> {
+        if self
+            .ready
+            .as_ref()
+            .is_some_and(|r| r.request.operation == DevelopmentOperation::Discover)
+        {
+            return self.run_discover(disclosure, key, gate);
+        }
         #[cfg(test)]
         match self.config.hooks.provider_association_fault {
             Some(TestProviderAssociationFault::Missing) => self.journal(|j| j.provider = None)?,
@@ -635,14 +710,26 @@ impl Worker {
         }
         let mut issued = association.clone();
         issued.issued = true;
-        gate.check()?;
-        self.journal(|j| j.provider = Some(issued))?;
-        let ready = self.ready.take().unwrap();
         let consent = ConsentReceipt {
             disclosure_digest: disclosure,
             approval_reference: format!("studio-click-{}", key.operation),
             expires_at_unix_ms: unix_ms().saturating_add(5 * 60_000),
         };
+        gate.check()?;
+        self.journal(|j| {
+            if let Some(lineage) = &mut j.discovery {
+                if let Some(original) = lineage
+                    .original
+                    .as_mut()
+                    .filter(|i| i.request().is_ok_and(|r| r.id == issued.request.id))
+                {
+                    original.issued = true;
+                    original.consent = Some(consent.clone());
+                }
+            }
+            j.provider = Some(issued);
+        })?;
+        let ready = self.ready.take().unwrap();
         let provider = ready.prepared.authorize(consent.clone());
         let ordinary = ready.reconciliation.is_some()
             && self.opened.as_ref().is_some_and(|o| {
@@ -671,7 +758,21 @@ impl Worker {
                 None,
                 Some(
                     provider
-                        .develop(&ready.request, &|| gate.cancelled.load(Ordering::Acquire))
+                        .develop(&ready.request, &|| {
+                            #[cfg(test)]
+                            if self
+                                .config
+                                .hooks
+                                .cancel_after_validated_provider
+                                .load(Ordering::Acquire)
+                                && provider
+                                    .receipt()
+                                    .is_some_and(|r| r.state == JobState::TransportValidated)
+                            {
+                                gate.cancelled.store(true, Ordering::Release);
+                            }
+                            gate.cancelled.load(Ordering::Acquire)
+                        })
                         .map_err(error),
                 ),
             )
@@ -688,13 +789,41 @@ impl Worker {
         // Dropping the provider/job and any cancellation join stays on this worker.
         drop(provider);
         let terminal = ready.transport.reconcile(&ready.request.id);
+        let mut modify_completion_retained = false;
+        if ready.request.operation == DevelopmentOperation::Modify {
+            if let (Some(Ok(result)), Some(raw), Some(receipt)) = (&result, &raw, &receipt) {
+                let mut lineage = self
+                    .journal
+                    .as_ref()
+                    .and_then(|j| j.value.discovery.clone())
+                    .ok_or(
+                        "The exact original Modify lineage is missing; the issued request was kept",
+                    )?;
+                if lineage.original_request()? != ready.request {
+                    return Err(
+                        "The original Modify lineage was replaced; its issued association was kept"
+                            .into(),
+                    );
+                }
+                lineage
+                    .provider_original_mut()?
+                    .finish(result, raw, receipt)?;
+                lineage.selected = result.response.candidates.first().map(|c| c.id.clone());
+                // Durability precedes clearing the issued association or exposing any copied result.
+                self.journal(|j| j.discovery = Some(lineage))?;
+                modify_completion_retained = true;
+            }
+        }
         match &terminal {
             Ok(receipt)
                 if receipt.request_id == ready.request.id
                     && receipt.request_digest == ready.association.wire_request
                     && receipt.source_digest == ready.association.wire_source
                     && receipt.state.is_terminal()
-                    && receipt.state != JobState::Interrupted =>
+                    && receipt.state != JobState::Interrupted
+                    && !(ready.request.operation == DevelopmentOperation::Modify
+                        && receipt.state == JobState::TransportValidated
+                        && !modify_completion_retained) =>
             {
                 self.journal(|j| j.provider = None)?
             }
@@ -813,17 +942,32 @@ impl Worker {
                 captures.remove(0),
                 self.journal
                     .as_ref()
-                    .map(|j| j.value.need.clone())
-                    .unwrap_or_else(|| ready.request.request.clone()),
+                    .and_then(|j| j.value.discovery.as_ref())
+                    .ok_or("Missing original change need")?
+                    .need
+                    .clone(),
             )?;
             change.request = Some(ready.request);
             change.result = Some(result);
             change.raw = Some(raw);
             change.receipt = Some(receipt);
+            let selection = discovery_host::Selection {
+                operation: change.operation.clone(),
+                population: change.population.clone(),
+                lifecycles: change.lifecycles.clone(),
+                operations: change.scope_operations().clone(),
+            };
+            self.journal(|j| j.discovery.as_mut().unwrap().selection = Some(selection))?;
+            let current = self
+                .opened
+                .as_ref()
+                .ok_or("The original saved tool is no longer open")?;
             // Retain the actual returned alternative even if its shape needs a
             // business clarification or a supported design route.
             let result = change.prepare(&current.store, gate);
-            self.page = Page::Change(change.checked_view(&current.store, gate)?);
+            let mut view = change.checked_view(&current.store, gate)?;
+            self.decorate_change(&mut view)?;
+            self.page = Page::Change(view);
             self.task.evidence = None;
             self.change = Some(change);
             self.notice =
@@ -966,6 +1110,10 @@ impl Worker {
         });
         self.draft = None;
         self.change = None;
+        self.discovery = self
+            .discovery
+            .take()
+            .and_then(discovery_worker::State::report_only);
         self.task.evidence = None;
         self.intention = None;
         self.recovery = None;
@@ -974,6 +1122,13 @@ impl Worker {
         self.ready = None;
         self.page = page;
         self.journal(|j| j.last = Some(association.clone()))?;
+        if self
+            .cached_discovery_report
+            .as_ref()
+            .is_some_and(|cached| cached.tool != association)
+        {
+            self.cached_discovery_report = None;
+        }
         self.post_save_opened(&association, Some(&mut opened));
         self.restore_task(&Gate::default())?;
         Ok(())
@@ -1373,6 +1528,24 @@ impl Worker {
             self.notice = "The earlier request was prepared but never authorized or sent. Review a fresh disclosure to continue".into();
             return Ok(());
         }
+        let retained = self
+            .journal
+            .as_ref()
+            .and_then(|j| j.value.discovery.as_ref())
+            .and_then(|r| r.invocation(&request.id).ok());
+        if retained.is_some_and(|invocation| invocation.completed.is_some()) {
+            let invocation = retained.unwrap();
+            invocation.validate()?;
+            if invocation.request()? != request {
+                return Err(
+                    "The durable terminal result belongs to a different exact request".into(),
+                );
+            }
+            self.journal(|j| j.provider = None)?;
+            self.generation_blocked = false;
+            self.notice = "The exact terminal response was already durable. Its old request was not resent and its consent was not renewed".into();
+            return Ok(());
+        }
         let transport = self.transport(provider)?;
         let receipt = transport.reconcile(&request.id)?;
         if receipt.request_digest != wire_request
@@ -1388,7 +1561,38 @@ impl Worker {
             self.generation_blocked = true;
             self.notice = "The earlier provider was interrupted and its process cleanup is unconfirmed. No late file was imported and no new request will be submitted. Resolve that provider process before generating again; saved tools remain usable offline".into();
         } else {
-            self.journal(|j| j.provider = None)?;
+            // Only a new exact lineage may retain completion here. Old v1/v2
+            // absence stays absent; no directory scan or automatic resend.
+            let mut lineage = self
+                .journal
+                .as_ref()
+                .and_then(|j| j.value.discovery.clone())
+                .filter(|r| r.invocation(&request.id).is_ok());
+            if receipt.state == JobState::TransportValidated {
+                if let Some(record) = &mut lineage {
+                    let result = transport.ingest(&request.id, &wire_request, &wire_source)?.ok_or("The terminal raw response is unavailable; its issued association was kept")?;
+                    record
+                        .invocation_mut(&request.id)?
+                        .retain_ingested(&result)?;
+                    if request.operation == DevelopmentOperation::Modify
+                        && record.selected.is_none()
+                    {
+                        record.selected = record
+                            .provider_original()?
+                            .result()?
+                            .response
+                            .candidates
+                            .first()
+                            .map(|c| c.id.clone());
+                    }
+                }
+            }
+            self.journal(|j| {
+                if let Some(record) = lineage {
+                    j.discovery = Some(record);
+                }
+                j.provider = None;
+            })?;
             self.generation_blocked = false;
             self.notice = format!("The earlier provider request ended as {:?}. Its draft was not reopened and nothing was resubmitted. Your original need was kept", receipt.state);
         }
@@ -1643,6 +1847,12 @@ impl Worker {
             return Err("Opening history was cancelled; saved work was kept".into());
         }
         self.change = None;
+        // History is navigation within this host run. Retain the complete
+        // report for the same checked lineage, without copied choice authority.
+        self.discovery = self
+            .discovery
+            .take()
+            .and_then(discovery_worker::State::report_only);
         self.task.evidence = None;
         self.intention = None;
         self.recovery = None;
@@ -1822,37 +2032,45 @@ impl Worker {
         action: impl FnOnce(&mut ChangeDraft, &ProductStore) -> Result<(), String>,
     ) -> Result<(), String> {
         self.no_pending()?;
-        let operation = self
+        let mut next = self
             .change
             .as_ref()
             .ok_or("No change is being tried")?
-            .operation
             .clone();
+        let operation = next.operation.clone();
+        // Revoke the actual published receiver before any fallible/cancelled
+        // staging. Clearing only `next` would preserve old usable authority.
+        self.change.as_mut().unwrap().clear_readiness();
+        let mut revoked = self.change.as_ref().unwrap().view()?;
+        self.decorate_change(&mut revoked)?;
+        self.page = Page::Change(revoked);
         self.check_task_evidence(&operation, gate)?;
         let store = &self
             .opened
             .as_ref()
             .ok_or("Open the saved tool first")?
             .store;
-        let draft = self.change.as_ref().ok_or("No change is being tried")?;
-        if key.basis.as_ref() != Some(&Basis::capture(&draft.snapshot)?)
-            || self.today() != draft.snapshot.clock_day
+        if key.basis.as_ref() != Some(&Basis::capture(&next.snapshot)?)
+            || self.today() != next.snapshot.clock_day
         {
             return Err(
                 "The comparison's source, data, session or date is stale. Return to saved work"
                     .into(),
             );
         }
-        let mut next = draft.clone();
         action(&mut next, store)?;
         let mut view = next.checked_view(store, gate)?;
         if self.has_task_evidence(&operation) {
             view.origin = "Actual captured external task edits. Independent copied execution is local; no live author or service receipt is invented".into();
         }
+        self.decorate_change(&mut view)?;
         let page = Page::Change(view);
         self.check_task_evidence(&operation, gate)?;
         if !gate.finish() {
-            return Err("Trial cancelled; the previous copied experience was kept".into());
+            return Err(
+                "Trial cancelled; copied work was kept and previous choice readiness was revoked"
+                    .into(),
+            );
         }
         if let Some((bound, _)) = &mut self.task.evidence {
             if bound == &operation {
@@ -1912,7 +2130,19 @@ impl Worker {
         #[cfg(test)]
         eprintln!("commit_change: freshness check begins");
         self.no_pending()?;
+        if self.generation_blocked
+            || self
+                .journal
+                .as_ref()
+                .is_some_and(|j| j.value.provider.is_some())
+        {
+            return Err("Resolve the provider result and its durable exact evidence before saving a dependent choice".into());
+        }
         if let Some(operation) = source_operation {
+            if !self.has_task_evidence(operation) {
+                return Err("The exact original task source proof is unavailable".into());
+            }
+
             self.check_task_evidence(operation, gate)?;
         }
         let opened = self.opened.as_ref().ok_or("Open the saved tool first")?;
@@ -2036,6 +2266,12 @@ impl Worker {
         {
             return Err("Saved work changed. Reopen it before revisiting this choice".into());
         }
+        // This prefix selects the original pair UI only; the helper still reconstructs
+        // and verifies the actual archived scenes before exposing any choice.
+        if decision.starts_with("discovery-") && self.reopen_discovery_pair(decision, key, gate)? {
+            return Ok(());
+        }
+        let opened = self.opened.as_ref().ok_or("Open a saved tool first")?;
         let choice = snapshot
             .decisions
             .decisions
@@ -2161,6 +2397,7 @@ impl Worker {
         self.ready = None;
         self.draft = None;
         self.change = None;
+        self.discovery = None;
         self.task.evidence = None;
         self.intention = None;
         self.recovery = None;
@@ -2205,6 +2442,13 @@ impl Worker {
         let key = &command.key;
         let gate = &command.gate;
         gate.check()?;
+        // Even a queued refresh must not reconcile against pre-publication
+        // memory after an uncertain rename. Closing keeps the lock until drop.
+        if !matches!(command.action, Action::Close | Action::Boot) {
+            if let Some(journal) = &self.journal {
+                journal.require_writable()?;
+            }
+        }
         #[cfg(test)]
         if matches!(
             &command.action,
@@ -2228,6 +2472,28 @@ impl Worker {
             }
         }
         match &command.action {
+            Action::Discover => self.prepare_discover(key, gate),
+            Action::FeatureExample => self.feature_example(key, gate),
+            Action::FeatureTrial { input } => self.feature_trial(input.clone(), key, gate),
+            Action::FeatureAccept { ticket, offered } => {
+                self.feature_accept(ticket, offered, key, gate)
+            }
+            Action::FeatureBack => self.discovery_back(key, gate),
+            Action::ReopenDiscovery => self.reopen_discovery(key, gate),
+            Action::SelectModify { candidate } => self.select_modify(candidate, key, gate),
+            Action::DiscoveryBack => self.discovery_back(key, gate),
+            Action::DiscoveryReport => self.discovery_report(key, gate),
+            Action::DiscoveryReset => self.discovery_reset(key, gate),
+            Action::DiscoveryTrial { input } => self.discovery_trial(input.clone(), key, gate),
+            Action::DiscoveryChoose { ticket, choice } => {
+                self.discovery_choose(ticket, *choice, key, gate)
+            }
+            Action::DiscoveryExample { question, witness } => {
+                self.discovery_example(question, *witness, key, gate)
+            }
+            Action::DiscoveryCopy { question, witness } => {
+                self.discovery_copy(question, *witness, key, gate)
+            }
             Action::Tasks { focused } => self.tasks(focused.clone(), key, gate),
             Action::TaskPoll => self.poll_task(gate),
             Action::TaskLink { task_id } => self.link_task(task_id, key, gate),
@@ -2444,6 +2710,9 @@ pub(super) fn run(
         ready: None,
         draft: None,
         change: None,
+        discovery: None,
+        cached_discovery_report: None,
+        feature: None,
         intention: None,
         recovery: None,
         recovered_location: None,

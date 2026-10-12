@@ -31,6 +31,7 @@ pub(super) struct View {
     pub source: Option<task_source_flow::View>,
     pub message: String,
     pub linked: bool,
+    pub relink_supersedes_discovery: bool,
     pub can_review: bool,
     pub consent: Option<Disclosure>,
     pub inspection: Option<String>,
@@ -117,6 +118,9 @@ impl View {
                 trace.label(ui, "No registered development tasks are available. Existing Git task controls can register a worktree.");
             }
             let pending = self.pending.is_some();
+            if self.relink_supersedes_discovery {
+                trace.label(ui, "Choosing a different task will supersede the older uncommitted Discover analysis. Saved choices and business work are kept; selecting a task does not authorize a new author request.");
+            }
             for task in &self.choices {
                 if trace.button(
                     ui,

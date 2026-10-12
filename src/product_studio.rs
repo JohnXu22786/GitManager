@@ -6,6 +6,12 @@ mod change;
 mod change_adapter;
 #[path = "product_studio/discovery_flow.rs"]
 mod discovery_flow;
+#[path = "product_studio/discovery_host.rs"]
+mod discovery_host;
+#[path = "product_studio/discovery_policy.rs"]
+mod discovery_policy;
+#[path = "product_response_storage.rs"]
+mod response_storage;
 #[path = "product_studio/rule_discovery.rs"]
 mod rule_discovery;
 #[cfg(test)]
@@ -14,6 +20,8 @@ pub use change::rule_trace_testing;
 mod intention_flow;
 #[path = "product_studio/journal.rs"]
 mod journal;
+#[cfg(test)]
+pub use journal::journal_testing;
 #[path = "product_studio/local_files_flow.rs"]
 mod local_files_flow;
 #[path = "product_studio/local_files_host.rs"]
@@ -211,6 +219,38 @@ enum Action {
         profile: CapabilityProfile,
         focused: Option<RecordRef>,
     },
+    Discover,
+    ReopenDiscovery,
+    FeatureExample,
+    FeatureTrial {
+        input: SemanticInput,
+    },
+    FeatureAccept {
+        ticket: Digest,
+        offered: String,
+    },
+    FeatureBack,
+    SelectModify {
+        candidate: Id,
+    },
+    DiscoveryBack,
+    DiscoveryReport,
+    DiscoveryReset,
+    DiscoveryTrial {
+        input: SemanticInput,
+    },
+    DiscoveryChoose {
+        ticket: Digest,
+        choice: usize,
+    },
+    DiscoveryExample {
+        question: Id,
+        witness: usize,
+    },
+    DiscoveryCopy {
+        question: Id,
+        witness: usize,
+    },
     Trial {
         input: SemanticInput,
     },
@@ -320,6 +360,9 @@ enum Page {
         basis: Option<Basis>,
     },
     Change(ChangeView),
+    Discovery(discovery_host::View),
+    DiscoveryRequirement(discovery_policy::View),
+    DiscoveryExperience(discovery_host::ExperienceView),
     History {
         tool: Association,
         basis: Basis,
@@ -476,6 +519,9 @@ impl ProductStudio {
                 Some(basis.clone())
             }
             Page::Change(view) => Some(view.basis.clone()),
+            Page::Discovery(view) => Some(view.basis.clone()),
+            Page::DiscoveryRequirement(view) => Some(view.basis.clone()),
+            Page::DiscoveryExperience(view) => Some(view.basis.clone()),
             Page::History { basis, .. } | Page::Intention { basis, .. } => Some(basis.clone()),
             Page::Consent { basis, .. } => basis.clone(),
             _ => None,
@@ -499,6 +545,20 @@ impl ProductStudio {
                 | Action::Diagnose { .. }
                 | Action::RecoverFile { .. }
                 | Action::OpenRecovered { .. }
+                | Action::ReopenDiscovery
+                | Action::SelectModify { .. }
+                | Action::Discover
+                | Action::FeatureExample
+                | Action::FeatureAccept { .. }
+                | Action::FeatureBack
+                | Action::DiscoveryExample { .. }
+                | Action::DiscoveryCopy { .. }
+                | Action::DiscoveryChoose { .. }
+                | Action::DiscoveryReset
+                | Action::DiscoveryReport
+                | Action::DiscoveryTrial {
+                    input: SemanticInput::AdvanceClock { .. }
+                }
                 | Action::Decide { .. }
                 | Action::History
                 | Action::PrepareReconciliation { .. }
@@ -557,6 +617,8 @@ impl ProductStudio {
                 plain(&change.current) && change.alternative.as_ref().is_none_or(plain)
             }
             Page::Intention { view, .. } => plain(view.preview()),
+            Page::DiscoveryExperience(view) => plain(&view.runs[0]) && plain(&view.runs[1]),
+            Page::DiscoveryRequirement(view) => plain(&view.model),
             _ => false,
         }
     }
@@ -592,12 +654,16 @@ impl ProductStudio {
             Action::Preview { .. }
                 | Action::Daily { .. }
                 | Action::Trial { .. }
+                | Action::DiscoveryTrial { .. }
+                | Action::FeatureTrial { .. }
                 | Action::IntentionTrial { .. }
         );
         // Actions and navigation can replace a copied view or prepared source.
         // Only plain controls on both actual sources keep this editing frame.
         let freeze_inputs = match &action {
-            Action::Trial { input } => !self.plain_trial_control(input),
+            Action::Trial { input }
+            | Action::DiscoveryTrial { input }
+            | Action::FeatureTrial { input } => !self.plain_trial_control(input),
             Action::IntentionTrial { input } => !self.plain_trial_control(input),
             Action::Daily {
                 input: SemanticInput::Navigate { .. },
@@ -796,6 +862,8 @@ impl ProductStudio {
         let active_model = match &self.page {
             Page::Draft { model, .. } | Page::Daily { model, .. } => Some(model),
             Page::Change(view) => Some(&view.current),
+            Page::DiscoveryExperience(view) => Some(&view.runs[0]),
+            Page::DiscoveryRequirement(view) => Some(&view.model),
             Page::Intention { view, .. } => Some(view.preview()),
             _ => None,
         };
@@ -1104,7 +1172,11 @@ impl ProductStudio {
                 if trace.button(
                     ui,
                     "studio.consent",
-                    "Allow this exact request and generate",
+                    if request.operation == DevelopmentOperation::Discover {
+                        "Allow this exact Discover request"
+                    } else {
+                        "Allow this exact request and generate"
+                    },
                     !busy && !self.generation_blocked,
                 ) {
                     action = Some(Action::Consent {
@@ -1266,7 +1338,112 @@ impl ProductStudio {
                     }
                 }
             }
+            Page::DiscoveryRequirement(view) => {
+                trace.label(ui, "Try the new feature on a candidate-only copy of your actual work. Current is not claimed to support these new actions.");
+                trace.label(ui, format!("Copied date: {}", view.day));
+                trace.label(ui, "Running or viewing this copy does not approve a requirement. Choose one exact typed result below only if it is needed for this example.");
+                if !view.can_accept {
+                    trace.label(ui, "No newly added action has been exercised in this example. A renamed action alone is not a new-feature requirement.");
+                }
+                if view.accepted {
+                    trace.label(ui, "One exact typed result was explicitly accepted for this copied example. This is not adoption or a universal promise.");
+                }
+                for offer in &view.offers {
+                    if trace.button(
+                        ui,
+                        &format!("studio.feature.accept.{}", offer.id),
+                        &offer.label,
+                        !busy
+                            && !inputs_pending
+                            && !self.mutation_blocked
+                            && view.can_accept
+                            && view.basis.day == today,
+                    ) {
+                        action = Some(Action::FeatureAccept {
+                            ticket: view.ticket.clone(),
+                            offered: offer.id.clone(),
+                        });
+                    }
+                }
+                if view.offers.is_empty() {
+                    trace.label(ui, "This display has no supported typed observed value, row or emitted output to select. No expected result was invented.");
+                }
+                if trace.button(
+                    ui,
+                    "studio.feature.back",
+                    "Back to the original copied change",
+                    !busy && !inputs_pending,
+                ) {
+                    action = Some(Action::FeatureBack);
+                }
+                let mut model = view.model.clone();
+                model.read_only |=
+                    inputs_frozen || self.mutation_blocked || view.basis.day != today;
+                let output = self.renderer.show(
+                    ui,
+                    &model,
+                    "feature-candidate",
+                    !busy && action.is_none(),
+                    false,
+                    &shortcuts,
+                );
+                trace.append(output.trace);
+                if action.is_none() {
+                    action = output.input.map(|input| Action::FeatureTrial { input });
+                }
+            }
+            Page::DiscoveryExperience(view) => {
+                action = discovery_host::show_experience(
+                    view,
+                    ui,
+                    &mut trace,
+                    &mut self.renderer,
+                    &mut self.alternative_renderer,
+                    busy,
+                    inputs_frozen,
+                    self.mutation_blocked,
+                    today,
+                    &shortcuts,
+                );
+            }
+            Page::Discovery(view) => {
+                action = view.show(
+                    ui,
+                    &mut trace,
+                    !busy && !inputs_pending && !self.mutation_blocked && view.basis.day == today,
+                );
+            }
             Page::Change(view) => {
+                for (candidate, label) in &view.candidate_choices {
+                    if trace.button(
+                        ui,
+                        &format!("studio.modified-candidate.{candidate}"),
+                        &format!("Try returned design: {label}"),
+                        !busy
+                            && !inputs_pending
+                            && view.selected_candidate.as_ref() != Some(candidate),
+                    ) {
+                        action = Some(Action::SelectModify {
+                            candidate: candidate.clone(),
+                        });
+                    }
+                }
+                if trace.button(
+                    ui,
+                    "studio.discover",
+                    "Review a separate Discover request",
+                    !busy && !inputs_pending && !self.generation_blocked && view.basis.day == today,
+                ) {
+                    action = Some(Action::Discover);
+                }
+                if trace.button(
+                    ui,
+                    "studio.feature-example",
+                    "Try a new feature and explicitly keep one needed result",
+                    !busy && !inputs_pending && !self.generation_blocked && view.basis.day == today,
+                ) {
+                    action = Some(Action::FeatureExample);
+                }
                 trace.label(ui, format!("Requested change: {}", view.need));
                 trace.label(ui, view.origin.clone());
                 trace.label(ui, "Copied work only. Both sides use the same starting records, date and input sequence. Trial entries never become saved business work.");
@@ -1592,6 +1769,14 @@ impl ProductStudio {
                 trace.label(ui, format!("Saved locally: {}", tool.path.display()));
                 if trace.button(
                     ui,
+                    "studio.reopen-discovery",
+                    "Review my last change and Discover evidence",
+                    !busy && !inputs_pending,
+                ) {
+                    action = Some(Action::ReopenDiscovery);
+                }
+                if trace.button(
+                    ui,
                     "studio.files",
                     "Saved files, backups and recovery",
                     !busy && !inputs_pending,
@@ -1774,9 +1959,11 @@ pub struct TestHooks {
     pub before_task_abandon_write: Option<Arc<TestPause>>,
     pub before_commit: Option<Arc<TestPause>>,
     pub before_preview: Option<Arc<TestPause>>,
+    pub before_discovery_evaluation: Option<Arc<TestPause>>,
     pub before_context_transition: Option<Arc<TestPause>>,
     pub before_return_install: Option<Arc<TestPause>>,
     pub provider_association_fault: Option<TestProviderAssociationFault>,
+    pub cancel_after_validated_provider: Arc<AtomicBool>,
     pub before_destination: Option<Arc<TestPause>>,
     pub before_abandon: Option<Arc<TestPause>>,
     pub fail_creation: Arc<AtomicBool>,
@@ -1805,9 +1992,11 @@ impl Default for TestHooks {
             before_task_abandon_write: None,
             before_commit: None,
             before_preview: None,
+            before_discovery_evaluation: None,
             before_context_transition: None,
             before_return_install: None,
             provider_association_fault: None,
+            cancel_after_validated_provider: Arc::new(AtomicBool::new(false)),
             before_destination: None,
             before_abandon: None,
             fail_creation: Arc::new(AtomicBool::new(false)),
@@ -1851,6 +2040,15 @@ impl ProductStudio {
             Page::Draft { .. } => "draft",
             Page::Daily { .. } => "daily",
             Page::Change(_) => "change",
+            Page::Discovery(_) => "discovery",
+            Page::DiscoveryRequirement(_) => "discovery-requirement",
+            Page::DiscoveryExperience(ref view) => {
+                if view.ticket.is_some() {
+                    "discovery-copy"
+                } else {
+                    "discovery-example"
+                }
+            }
             Page::History { .. } => "history",
             Page::Intention { ref view, .. } => match view {
                 IntentionView::Design(_) => "design",
@@ -1946,6 +2144,19 @@ impl ProductStudio {
     pub fn test_trial(&mut self, input: SemanticInput) {
         self.issue(Action::Trial { input });
     }
+    pub fn test_feature_trial(&mut self, input: SemanticInput) {
+        self.issue(Action::FeatureTrial { input });
+    }
+    pub fn test_reissue_displayed_feature_acceptance(&mut self, offered: &str) {
+        if let Page::DiscoveryRequirement(view) = &self.page {
+            // Test a late queued command carrying the actual prior ticket,
+            // independent of the current renderer's disabled button.
+            self.issue(Action::FeatureAccept {
+                ticket: view.ticket.clone(),
+                offered: offered.into(),
+            });
+        }
+    }
     pub fn test_decide(&mut self, outcome: DecisionOutcome) {
         let outcome = if matches!(outcome, DecisionOutcome::Accept { .. }) {
             if let Page::Change(view) = &self.page {
@@ -1982,6 +2193,20 @@ impl ProductStudio {
                 .collect()
         } else {
             vec![]
+        }
+    }
+    pub fn test_discovery_report(&self) -> Option<&crate::product_discovery::DiscoveryReport> {
+        if let Page::Discovery(view) = &self.page {
+            view.report.as_deref()
+        } else {
+            None
+        }
+    }
+    pub fn test_discovery_runs(&self) -> Option<&[RuntimeView; 2]> {
+        if let Page::DiscoveryExperience(view) = &self.page {
+            Some(&view.runs)
+        } else {
+            None
         }
     }
     pub fn test_current_trial(&self) -> Option<&RuntimeView> {

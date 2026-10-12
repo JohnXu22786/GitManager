@@ -414,6 +414,7 @@ fn task(root: &Path, ticket: bool, launched: bool, completed: bool) -> TaskAssoc
         pending["ticket"] = json!({ "version":1, "project_id":"runtime-project", "task_id":"task-id", "created_at":"2026-01-01T00:00:00Z", "repository":root.join("repository"), "worktree":root.join("worktree"), "directory":root.join("external-task-jobs/original-request"), "request_digest":request.identity().unwrap(), "request_bytes_digest":canonical_digest(IdentityDomain::Request, &serde_json::to_vec(&request).unwrap()).unwrap() });
     }
     let external = ExternalAssociation {
+        original_need: None,
         pending: serde_json::from_value(pending).unwrap(),
         basis,
         provider: ProviderKind::Codex,
@@ -1053,9 +1054,8 @@ fn fresh_reopen_requires_synced_bytes_under_its_own_lock() {
             }
             // A new inode can be visible in this lock gap, even with identical
             // bytes. Fresh authority must confirm its own descriptor's durability.
-            let fault = file_sync.then(|| {
-                Folder::test_fail_file_sync(root.join("studio/session.json"))
-            });
+            let fault =
+                file_sync.then(|| Folder::test_fail_file_sync(root.join("studio/session.json")));
             let hook = (!file_sync).then(|| {
                 upgrade::test_hook(&root, |point| {
                     if point == TestPoint::BeforeSync {
@@ -1073,7 +1073,10 @@ fn fresh_reopen_requires_synced_bytes_under_its_own_lock() {
                 assert_eq!(fault.attempts(), 1);
             }
             unchanged(&root, &visible);
-            assert!(folder.lock().is_ok(), "failed reopening must release its lock");
+            assert!(
+                folder.lock().is_ok(),
+                "failed reopening must release its lock"
+            );
             if let Some(old) = &old {
                 assert_eq!(fs::read(backup(&root, old)).unwrap(), *old);
             }
@@ -1343,5 +1346,207 @@ fn migrated_daily_attempt_preserves_real_saved_work_and_never_auto_replays() {
         );
         assert_eq!(fs::read(backup(&root, &old)).unwrap(), old);
         stop(studio, &hooks);
+    }
+}
+
+#[test]
+fn ordinary_rename_uncertainty_cannot_be_overwritten_before_fresh_reopen() {
+    let (_temp, root) = root();
+    let mut file = JournalFile::open(&root).unwrap();
+    let old = canonical_bytes(&file.value).unwrap();
+    let mut next = file.value.clone();
+    next.need = "Exact terminal result metadata survives uncertain sync".into();
+    let hook = upgrade::test_hook(&root, |point| {
+        if point == TestPoint::WriteActivated {
+            Err("injected directory sync uncertainty after actual rename".into())
+        } else {
+            Ok(())
+        }
+    });
+    assert!(file.write(next.clone()).is_err());
+    let published = fs::read(root.join("studio/session.json")).unwrap();
+    assert_eq!(
+        format::decode(&published).unwrap().need,
+        next.need,
+        "The failure must occur after actual publication"
+    );
+    assert_eq!(
+        canonical_bytes(&file.value).unwrap(),
+        old,
+        "A failed sync must not acknowledge the new value"
+    );
+    drop(hook);
+    assert!(
+        file.write(Journal::default()).is_err(),
+        "An uncertain writer must not overwrite newly published evidence with its old memory"
+    );
+    assert_eq!(
+        fs::read(root.join("studio/session.json")).unwrap(),
+        published
+    );
+    let other_root = root.clone();
+    assert!(
+        std::thread::spawn(move || JournalFile::open(&other_root).is_err())
+            .join()
+            .unwrap(),
+        "The unresolved host keeps its sole writer lock"
+    );
+    drop(file);
+    let mut fresh = JournalFile::reopen(&root, None).unwrap();
+    assert_eq!(fresh.value.need, next.need);
+    fresh.write(next).unwrap();
+}
+
+#[test]
+fn whole_record_preflight_refusal_does_not_latch_a_normal_writer() {
+    let (_temp, root) = root();
+    let mut file = JournalFile::open(&root).unwrap();
+    let original = fs::read(root.join("studio/session.json")).unwrap();
+    let mut invalid = file.value.clone();
+    invalid.need = "x".repeat(MAX_TEXT_BYTES + 1);
+    assert!(file.write(invalid).is_err());
+    assert_eq!(
+        fs::read(root.join("studio/session.json")).unwrap(),
+        original
+    );
+    let mut valid = file.value.clone();
+    valid.need = "Normal daily work remains available after a bounded preflight refusal".into();
+    file.write(valid.clone()).unwrap();
+    assert_eq!(JournalFile::read_only(&root).unwrap().need, valid.need);
+}
+
+#[test]
+fn host_publication_uncertainty_blocks_refresh_and_later_writes_without_repeating_work() {
+    for fail_at in [1, 2] {
+        let (_temp, root) = root();
+        let path = root.join("real-tool");
+        let store = ProductStore::create(&path, &source(), 20000).unwrap();
+        let before = store.load().unwrap();
+        let hooks = TestHooks::default();
+        let mut studio = ProductStudio::testing(root.clone(), None, hooks.clone());
+        settle(&mut studio);
+        studio.test_open(path.clone());
+        settle(&mut studio);
+        assert!(!studio.mutation_blocked);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook = upgrade::test_hook(&root, {
+            let calls = calls.clone();
+            move |point| {
+                if point == TestPoint::WriteActivated
+                    && calls.fetch_add(1, Ordering::AcqRel) + 1 == fail_at
+                {
+                    Err("injected uncertain directory sync after actual host publication".into())
+                } else {
+                    Ok(())
+                }
+            }
+        });
+        studio.test_daily(fixture::add("Original exact work"));
+        settle(&mut studio);
+        assert_eq!(calls.load(Ordering::Acquire), fail_at);
+        assert!(studio.mutation_blocked && studio.test_generation_blocked());
+        assert!(
+            studio.test_notice().contains("publication is unresolved"),
+            "{}",
+            studio.test_notice()
+        );
+        let published = fs::read(root.join("studio/session.json")).unwrap();
+        let saved = store.load().unwrap();
+        if fail_at == 1 {
+            assert_eq!(saved, before);
+            assert!(format::decode(&published).unwrap().pending.is_some());
+        } else {
+            assert_eq!(saved.data.records.len(), before.data.records.len() + 1);
+            assert!(format::decode(&published).unwrap().pending.is_none());
+            assert!(
+                studio.test_notice().contains("Your work was saved"),
+                "{}",
+                studio.test_notice()
+            );
+        }
+        drop(hook);
+        // A refresh or reconciliation queued after the failed completion must
+        // not clear or overwrite the actual on-disk outcome using old memory.
+        studio.test_task_refresh();
+        settle(&mut studio);
+        studio.test_reconcile();
+        settle(&mut studio);
+        studio.test_daily(fixture::add("Must never be replayed"));
+        settle(&mut studio);
+        assert!(studio.mutation_blocked && studio.test_generation_blocked());
+        assert_eq!(
+            fs::read(root.join("studio/session.json")).unwrap(),
+            published
+        );
+        assert_eq!(store.load().unwrap(), saved);
+        assert!(studio.test_notice().contains("fresh checked reopen"));
+        stop(studio, &hooks);
+        let hooks = TestHooks::default();
+        let mut fresh = ProductStudio::testing(root.clone(), None, hooks.clone());
+        settle(&mut fresh);
+        assert_eq!(store.load().unwrap(), saved, "Restart must not replay work");
+        if fail_at == 1 {
+            assert!(
+                fresh.mutation_blocked,
+                "The durable unconfirmed input still needs reconciliation"
+            );
+            fresh.test_abandon_daily();
+            settle(&mut fresh);
+        }
+        assert!(!fresh.mutation_blocked, "{}", fresh.test_notice());
+        assert_eq!(store.load().unwrap(), saved);
+        stop(fresh, &hooks);
+    }
+}
+
+#[test]
+fn optional_plain_task_need_keeps_old_v2_absence_but_never_extends_the_frozen_v1_decoder() {
+    for completed in [false, true] {
+        let (_temp, root) = root();
+        let mut value = Journal {
+            task: Some(task(&root, true, true, completed)),
+            ..Default::default()
+        };
+        let absent = format::encode(&value).unwrap();
+        let restored = format::decode(&absent).unwrap();
+        let external = if completed {
+            &restored
+                .task
+                .as_ref()
+                .unwrap()
+                .completed
+                .as_ref()
+                .unwrap()
+                .external
+        } else {
+            restored.task.as_ref().unwrap().external.as_ref().unwrap()
+        };
+        assert!(external.original_need.is_none());
+        assert!(restored.discovery.is_none());
+        let external = if completed {
+            &mut value
+                .task
+                .as_mut()
+                .unwrap()
+                .completed
+                .as_mut()
+                .unwrap()
+                .external
+        } else {
+            value.task.as_mut().unwrap().external.as_mut().unwrap()
+        };
+        external.original_need = Some("Exact new plain UI need".into());
+        let current = format::encode(&value).unwrap();
+        assert_eq!(
+            format::encode(&format::decode(&current).unwrap()).unwrap(),
+            current
+        );
+        let old = serde_json::to_vec(&legacy_value(&value)).unwrap();
+        install(&root, &old);
+        assert!(
+            upgrade::run(&root, |_| {}).is_err(),
+            "The frozen v1 field inventory cannot admit later optional evidence"
+        );
+        unchanged(&root, &old);
     }
 }
