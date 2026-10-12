@@ -6,6 +6,7 @@ enum Draft {
     Whole(whole::DiscoveryDraft),
     Rule(rule::RuleDiscoveryDraft),
 }
+#[derive(Clone)]
 enum Experience {
     WholeExample(whole::ExampleExperience),
     RuleExample(rule::RuleExample),
@@ -45,27 +46,34 @@ impl Worker {
             .and_then(|j| j.value.discovery.as_ref())
             .filter(|r| r.basis == view.basis && r.need == view.need)
         {
-            if let Ok(result) = record
-                .provider_original()
-                .and_then(host::Invocation::result)
-            {
-                view.candidate_choices = result
-                    .response
-                    .candidates
-                    .iter()
-                    .map(|c| {
-                        let source = CapturedProgram::capture(
-                            c.source_json.as_bytes(),
-                            &record.tool.identity.project_id,
-                            result.producer.clone(),
-                            None,
-                        )
-                        .map_err(error)?;
-                        Ok((c.id.clone(), source.program.label))
-                    })
-                    .collect::<Result<_, String>>()?;
-                view.selected_candidate = record.selected.clone();
-            }
+            Self::decorate_selected_record(record, view)?;
+        }
+        Ok(())
+    }
+    fn decorate_selected_record(
+        record: &host::Record,
+        view: &mut ChangeView,
+    ) -> Result<(), String> {
+        if let Ok(result) = record
+            .provider_original()
+            .and_then(host::Invocation::result)
+        {
+            view.candidate_choices = result
+                .response
+                .candidates
+                .iter()
+                .map(|c| {
+                    let source = CapturedProgram::capture(
+                        c.source_json.as_bytes(),
+                        &record.tool.identity.project_id,
+                        result.producer.clone(),
+                        None,
+                    )
+                    .map_err(error)?;
+                    Ok((c.id.clone(), source.program.label))
+                })
+                .collect::<Result<_, String>>()?;
+            view.selected_candidate = record.selected.clone();
         }
         Ok(())
     }
@@ -162,10 +170,15 @@ impl Worker {
         });
         let store = self.opened.as_ref().unwrap().store.clone();
         let mut view = change.checked_view(&store, gate)?;
+        Self::decorate_selected_record(&record, &mut view)?;
         self.current(key)?;
         gate.check()?;
+        #[cfg(test)]
+        self.test_discovery_publication_pause(gate);
+        // Once durable selection replacement begins, late cancellation cannot
+        // claim the old lineage was kept. All fallible view work is staged above.
+        gate.commit()?;
         self.journal(|j| j.discovery = Some(record))?;
-        self.decorate_change(&mut view)?;
         self.change = Some(change);
         self.discovery = None;
         self.page = Page::Change(view);
@@ -397,6 +410,16 @@ impl Worker {
         self.feature = Some(trial);
         Ok(())
     }
+    #[cfg(test)]
+    fn test_discovery_publication_pause(&self, gate: &Gate) {
+        if let Some(pause) = &self.config.hooks.before_discovery_publication {
+            pause.reached.store(true, Ordering::Release);
+            while !pause.release.load(Ordering::Acquire) && !gate.cancelled.load(Ordering::Acquire)
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
     pub(super) fn feature_trial(
         &mut self,
         input: SemanticInput,
@@ -404,18 +427,19 @@ impl Worker {
         gate: &Gate,
     ) -> Result<(), String> {
         let mut record = self.feature_fresh(key, gate)?;
-        let mut scenario = self
+        let feature = self
             .feature
-            .as_ref()
-            .ok_or("Open an actual candidate example first")?
-            .scenario
-            .clone();
-        // Revoke the actual published case before a failed changed replay.
+            .as_mut()
+            .ok_or("Open an actual candidate example first")?;
+        let mut scenario = feature.scenario.clone();
+        // Keep the last published copied work for correction or retry, but revoke
+        // its actual acceptance authority before any fallible journal or replay.
+        feature.revoke_acceptance();
         if let Page::DiscoveryRequirement(view) = &mut self.page {
             view.can_accept = false;
             view.accepted = false;
+            view.acceptance_revoked = true;
         }
-        self.feature = None;
         record.accepted_case = None;
         record.discover = None;
         self.journal(|j| j.discovery = Some(record.clone()))?;
@@ -428,13 +452,16 @@ impl Worker {
             Some(&scenario),
             gate,
         )?;
+        #[cfg(test)]
+        self.test_discovery_publication_pause(gate);
+        let view = trial.view()?;
         self.feature_fresh(key, gate)?;
         if !gate.finish() {
             return Err(
                 "The changed copied result was cancelled; its old acceptance was revoked".into(),
             );
         }
-        self.page = Page::DiscoveryRequirement(trial.view()?);
+        self.page = Page::DiscoveryRequirement(view);
         self.feature = Some(trial);
         Ok(())
     }
@@ -543,11 +570,16 @@ impl Worker {
             modify: None,
             reconcile: None,
         };
+        let review = String::from_utf8(wire.prompt).map_err(error)?;
+        #[cfg(test)]
+        self.pause_disclosure_publication(gate);
         self.current(key)?;
         if let Some(operation) = &source_operation {
             self.check_task_evidence(operation, gate)?;
         }
-        gate.check()?;
+        // Replacing completed analysis is irreversible once its journal write
+        // begins. This claims publication, not consent to send the request.
+        gate.commit()?;
         self.journal(|j| {
             j.discovery = Some(record.clone());
             j.provider = Some(association.clone());
@@ -556,7 +588,7 @@ impl Worker {
             disclosure: prepared.disclosure().clone(),
             need: record.need,
             request: request.clone(),
-            review: String::from_utf8(wire.prompt).map_err(error)?,
+            review,
             basis: Some(record.basis.clone()),
         };
         self.discovery = Some(State {
@@ -925,8 +957,9 @@ impl Worker {
                     .change
                     .as_mut()
                     .ok_or("The original fixed rule is unavailable")?;
-                change.clear_readiness();
+                change.revoke_choices();
                 self.page = Page::Change(change.view()?);
+                let mut changed = change.clone();
                 let trace = queue.copy_trace(
                     &store,
                     &selection,
@@ -934,17 +967,16 @@ impl Worker {
                     witness,
                     gate.cancelled.clone(),
                 )?;
-                self.change
-                    .as_mut()
-                    .unwrap()
-                    .import_rule_trace(&store, &selection, &trace, gate)?;
+                // Imported readiness belongs only to this unpublished clone.
+                changed.import_rule_trace(&store, &selection, &trace, gate)?;
+                #[cfg(test)]
+                self.test_discovery_publication_pause(gate);
+                let view = changed.checked_view(&store, gate)?;
                 self.discovery_fresh(key, gate)?;
-                let view = self.change.as_ref().unwrap().checked_view(&store, gate)?;
                 if !gate.finish() {
-                    self.change.as_mut().unwrap().clear_readiness();
-                    self.page = Page::Change(self.change.as_ref().unwrap().view()?);
                     return Err("The copied rule was cancelled before publication".into());
                 }
+                self.change = Some(changed);
                 self.page = Page::Change(view);
             }
         }
@@ -985,11 +1017,17 @@ impl Worker {
             .discovery
             .as_mut()
             .ok_or("No checked copied experience is available")?;
-        let view = match state
+        let published = state
             .experience
             .as_mut()
-            .ok_or("Open an actual example or copied pair first")?
-        {
+            .ok_or("Open an actual example or copied pair first")?;
+        if let Experience::Pair(pair) = published {
+            pair.revoke_choices();
+        }
+        // A cancelled input is still pending in the UI. It must not enter the
+        // live scenario until its checked models are published successfully.
+        let mut experience = published.clone();
+        let view = match &mut experience {
             Experience::WholeExample(example) => {
                 example.trial(&store, input, gate.cancelled.clone())?;
                 host::ExperienceView::example(key.basis.clone().unwrap(), example.view())
@@ -1015,12 +1053,15 @@ impl Worker {
                 )
             }
         };
+        #[cfg(test)]
+        self.test_discovery_publication_pause(gate);
         self.discovery_fresh(key, gate)?;
         if !gate.finish() {
             return Err(
                 "The new copied input was cancelled; previous choice readiness was revoked".into(),
             );
         }
+        self.discovery.as_mut().unwrap().experience = Some(experience);
         self.page = Page::DiscoveryExperience(view);
         Ok(())
     }

@@ -880,6 +880,11 @@ impl PairExperience {
     pub fn scenes(&self) -> Option<&[AcceptedScene; 2]> {
         self.scenes.as_ref()
     }
+    /// Revoke authority while retaining the last published copied work for retry.
+    pub fn revoke_choices(&mut self) {
+        self.scenes = None;
+        self.minimal = false;
+    }
     /// Compiler output has its own honest producer and no task binding. The
     /// independently checked preparation retains its exact authored source;
     /// reopening reconstructs this from the archived rehearsal manifest.
@@ -906,8 +911,7 @@ impl PairExperience {
         cancelled: Arc<AtomicBool>,
     ) -> Result<()> {
         // A failed or cancelled new input must not leave old choice authority.
-        self.scenes = None;
-        self.minimal = false;
+        self.revoke_choices();
         check(store, &self.basis, &cancelled)?;
         let mut next = self.scenario.clone();
         if let Some(point) = &self.trial_observation {

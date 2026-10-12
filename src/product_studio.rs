@@ -1342,7 +1342,9 @@ impl ProductStudio {
                 trace.label(ui, "Try the new feature on a candidate-only copy of your actual work. Current is not claimed to support these new actions.");
                 trace.label(ui, format!("Copied date: {}", view.day));
                 trace.label(ui, "Running or viewing this copy does not approve a requirement. Choose one exact typed result below only if it is needed for this example.");
-                if !view.can_accept {
+                if view.acceptance_revoked {
+                    trace.label(ui, "Any earlier acceptance was revoked. The copied work is kept; try it again before choosing a typed result.");
+                } else if !view.can_accept {
                     trace.label(ui, "No newly added action has been exercised in this example. A renamed action alone is not a new-feature requirement.");
                 }
                 if view.accepted {
@@ -1957,9 +1959,12 @@ pub struct TestHooks {
     pub before_task_review_publish: Option<Arc<TestPause>>,
     pub after_task_review_publish: Option<Arc<TestPause>>,
     pub before_task_abandon_write: Option<Arc<TestPause>>,
+    pub before_task_lineage_publish: Option<Arc<TestPause>>,
+    pub before_disclosure_publication: Option<Arc<TestPause>>,
     pub before_commit: Option<Arc<TestPause>>,
     pub before_preview: Option<Arc<TestPause>>,
     pub before_discovery_evaluation: Option<Arc<TestPause>>,
+    pub before_discovery_publication: Option<Arc<TestPause>>,
     pub before_context_transition: Option<Arc<TestPause>>,
     pub before_return_install: Option<Arc<TestPause>>,
     pub provider_association_fault: Option<TestProviderAssociationFault>,
@@ -1990,9 +1995,12 @@ impl Default for TestHooks {
             before_task_review_publish: None,
             after_task_review_publish: None,
             before_task_abandon_write: None,
+            before_task_lineage_publish: None,
+            before_disclosure_publication: None,
             before_commit: None,
             before_preview: None,
             before_discovery_evaluation: None,
+            before_discovery_publication: None,
             before_context_transition: None,
             before_return_install: None,
             provider_association_fault: None,
@@ -2200,6 +2208,23 @@ impl ProductStudio {
             view.report.as_deref()
         } else {
             None
+        }
+    }
+    pub fn test_feature_run(&self) -> Option<&RuntimeView> {
+        if let Page::DiscoveryRequirement(view) = &self.page {
+            Some(&view.model)
+        } else {
+            None
+        }
+    }
+    pub fn test_reissue_displayed_discovery_choice(&mut self, choice: usize) {
+        if let Page::DiscoveryExperience(view) = &self.page {
+            if let Some(ticket) = &view.ticket {
+                self.issue(Action::DiscoveryChoose {
+                    ticket: ticket.clone(),
+                    choice,
+                });
+            }
         }
     }
     pub fn test_discovery_runs(&self) -> Option<&[RuntimeView; 2]> {

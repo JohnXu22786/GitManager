@@ -273,15 +273,17 @@ impl Worker {
         let mut value = journal.value.clone();
         edit(&mut value);
         // A disclosure or unrelated journal update does not change this origin.
+        // Committing a different selected tool ends the single report's lifetime.
         // Only a successful publication may invalidate the retained report;
         // preflight refusal keeps the previous coherent record and cache.
         let keep_report = self.cached_discovery_report.as_ref().is_none_or(|cached| {
-            value.discovery.as_ref().is_some_and(|record| {
-                record.tool == cached.tool
-                    && record
-                        .identity()
-                        .is_ok_and(|identity| identity == cached.view.lineage)
-            })
+            value.last.as_ref() == Some(&cached.tool)
+                && value.discovery.as_ref().is_some_and(|record| {
+                    record.tool == cached.tool
+                        && record
+                            .identity()
+                            .is_ok_and(|identity| identity == cached.view.lineage)
+                })
         });
         journal.write(value)?;
         if !keep_report {
@@ -518,6 +520,16 @@ impl Worker {
             None,
         )
     }
+    #[cfg(test)]
+    fn pause_disclosure_publication(&self, gate: &Gate) {
+        if let Some(pause) = &self.config.hooks.before_disclosure_publication {
+            pause.reached.store(true, Ordering::Release);
+            while !pause.release.load(Ordering::Acquire) && !gate.cancelled.load(Ordering::Acquire)
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
     #[allow(clippy::too_many_arguments)]
     fn prepare_request(
         &mut self,
@@ -599,6 +611,15 @@ impl Worker {
                 })
             })
             .transpose()?;
+        let review = String::from_utf8(wire.prompt).map_err(error)?;
+        #[cfg(test)]
+        self.pause_disclosure_publication(gate);
+        if lineage.is_some() {
+            self.current(key)?;
+            // A new Modify disclosure replaces the old completed lineage.
+            // Sending still requires its separate exact disclosure consent.
+            gate.commit()?;
+        }
         self.journal(|j| {
             j.need = need.clone();
             j.provider = Some(pending.clone());
@@ -621,7 +642,7 @@ impl Worker {
             disclosure: prepared.disclosure().clone(),
             need,
             request: request.clone(),
-            review: String::from_utf8(wire.prompt).map_err(error)?,
+            review,
             basis: basis.clone(),
         };
         #[cfg(test)]
@@ -1067,7 +1088,11 @@ impl Worker {
         Ok(())
     }
     fn open(&mut self, path: PathBuf, expected: Option<ToolIdentity>) -> Result<(), String> {
-        let opened = match inspect_open(&path, expected.as_ref()).map_err(error)? {
+        let opened = inspect_open(&path, expected.as_ref()).map_err(error)?;
+        self.install_inspected(path, opened)
+    }
+    fn install_inspected(&mut self, path: PathBuf, opened: OpenGate) -> Result<(), String> {
+        let opened = match opened {
             OpenGate::UpgradeRequired(summary) => {
                 let tool = Association {
                     path,
@@ -1122,13 +1147,6 @@ impl Worker {
         self.ready = None;
         self.page = page;
         self.journal(|j| j.last = Some(association.clone()))?;
-        if self
-            .cached_discovery_report
-            .as_ref()
-            .is_some_and(|cached| cached.tool != association)
-        {
-            self.cached_discovery_report = None;
-        }
         self.post_save_opened(&association, Some(&mut opened));
         self.restore_task(&Gate::default())?;
         Ok(())
@@ -2040,7 +2058,7 @@ impl Worker {
         let operation = next.operation.clone();
         // Revoke the actual published receiver before any fallible/cancelled
         // staging. Clearing only `next` would preserve old usable authority.
-        self.change.as_mut().unwrap().clear_readiness();
+        self.change.as_mut().unwrap().revoke_choices();
         let mut revoked = self.change.as_ref().unwrap().view()?;
         self.decorate_change(&mut revoked)?;
         self.page = Page::Change(revoked);
@@ -2609,7 +2627,15 @@ impl Worker {
             Action::Preview { input } => self.preview(input.clone(), key, gate),
             Action::Save => self.save(key, gate),
             Action::Daily { input } => self.daily(input.clone(), key, gate),
-            Action::Open { path, expected } => self.open(path.clone(), expected.clone()),
+            Action::Open { path, expected } => {
+                let opened = inspect_open(path, expected.as_ref()).map_err(error)?;
+                // Recent-tool selection publishes the same durable association
+                // as the folder picker; cancellation must precede that boundary.
+                if !gate.finish() {
+                    return Err("Opening was cancelled; previous work was kept".into());
+                }
+                self.install_inspected(path.clone(), opened)
+            }
             Action::Upgrade { tool, summary } => self.upgrade(tool, summary, gate),
             Action::OpenDialog => {
                 let path = self
@@ -2624,16 +2650,7 @@ impl Worker {
                 if !gate.finish() {
                     return Err("Opening was cancelled; previous work was kept".into());
                 }
-                match opened {
-                    OpenGate::Ready(opened) => self.install_opened(
-                        Association {
-                            path,
-                            identity: opened.summary.identity.clone(),
-                        },
-                        opened,
-                    ),
-                    OpenGate::UpgradeRequired(_) => self.open(path, None),
-                }
+                self.install_inspected(path, opened)
             }
             Action::ChooseDestination => {
                 #[cfg(test)]

@@ -71,6 +71,8 @@ pub(super) struct ChangeDraft {
     trial_day: i32,
     alternative: Option<RuntimeView>,
     scenes: Option<(AcceptedScene, AcceptedScene)>,
+    // Retained copied displays and edit buffers are not decision authority.
+    choices_revoked: bool,
 }
 fn engine(store: &ProductStore, gate: &Gate) -> DecisionEngine<LocalRuntime> {
     DecisionEngine::new(
@@ -381,8 +383,12 @@ impl ChangeDraft {
         self.scope_operations = operations;
     }
     pub fn clear_readiness(&mut self) {
-        self.scenes = None;
+        self.revoke_choices();
         self.alternative = None;
+    }
+    pub fn revoke_choices(&mut self) {
+        self.scenes = None;
+        self.choices_revoked = true;
     }
     pub fn rule_selection(
         &self,
@@ -422,8 +428,7 @@ impl ChangeDraft {
         trace: &super::rule_discovery::RuleCopyTrace,
         gate: &Gate,
     ) -> Result<(), String> {
-        self.scenes = None;
-        self.alternative = None;
+        self.clear_readiness();
         gate.check()?;
         self.check(store)?;
         if self.structural || !self.missing().is_empty() {
@@ -541,6 +546,7 @@ impl ChangeDraft {
         self.alternative = Some(views.remove(0));
         self.trial_day = days[0];
         self.scenes = Some((current_scene, alternative_scene));
+        self.choices_revoked = false;
         Ok(())
     }
 
@@ -599,6 +605,7 @@ impl ChangeDraft {
             trial_day,
             alternative: None,
             scenes: None,
+            choices_revoked: true,
         })
     }
     pub fn missing(&self) -> Vec<(Id, String)> {
@@ -782,6 +789,7 @@ impl ChangeDraft {
         self.trial_day = trial_day;
         self.alternative = Some(alternative);
         self.scenes = None;
+        self.choices_revoked = false;
         Ok(())
     }
     pub fn check(&self, store: &ProductStore) -> Result<(), String> {
@@ -905,11 +913,10 @@ impl ChangeDraft {
         input: SemanticInput,
         gate: &Gate,
     ) -> Result<(), String> {
-        // Revocation belongs to the receiver even when staging or replay fails.
-        let previous_display = self.alternative.take();
-        self.scenes = None;
+        // Revoke authority on the receiver, while retaining the previous copied
+        // models so cancelled or failed input can be corrected and tried again.
+        self.revoke_choices();
         let mut next = self.clone();
-        next.alternative = previous_display;
         #[cfg(test)]
         let started = std::time::Instant::now();
         #[cfg(test)]
@@ -919,6 +926,7 @@ impl ChangeDraft {
         eprintln!("trial_input: finished after {:?}", started.elapsed());
         gate.check()?;
         next.check(store)?;
+        next.choices_revoked = false;
         *self = next;
         Ok(())
     }
@@ -1180,7 +1188,8 @@ impl ChangeDraft {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let experienced_scope = self.scenes.is_some()
+        let experienced_scope = !self.choices_revoked
+            && self.scenes.is_some()
             && !required.is_empty()
             && required.is_subset(&experienced)
             && unavailable_tasks.is_empty();
@@ -1217,9 +1226,11 @@ impl ChangeDraft {
             population: self.population.clone(),
             missing,
             lifecycle_options: options,
-            can_accept: (wording_update && self.alternative.is_some()) || experienced_scope,
+            can_accept: !self.choices_revoked
+                && ((wording_update && self.alternative.is_some()) || experienced_scope),
             can_keep_current: experienced_scope && !wording_update,
-            can_retain: self.scenes.is_some()
+            can_retain: !self.choices_revoked
+                && self.scenes.is_some()
                 && !required.is_empty()
                 && !experienced.is_empty()
                 && !same_alternative
@@ -1288,6 +1299,9 @@ impl ChangeDraft {
     ) -> Result<VerifiedChange, String> {
         self.check(store)?;
         gate.check()?;
+        if self.choices_revoked {
+            return Err("Try the copied work again before recording this choice".into());
+        }
         if let (Some(request), Some(result), Some(raw), Some(receipt)) =
             (&self.request, &self.result, &self.raw, &self.receipt)
         {

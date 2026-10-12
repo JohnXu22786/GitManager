@@ -3355,11 +3355,8 @@ fn resumed_task_deferred_rechecks_source_at_final_recording_gate() {
 }
 
 #[cfg(target_os = "linux")]
-#[test]
-fn discover_uses_actual_external_capture_and_plain_original_need_without_fake_modify_receipt() {
+fn external_discovery_transport(task: &TaskFixture) -> product_provider::ProviderTransport {
     use std::os::unix::fs::PermissionsExt;
-    let task = TaskFixture::new();
-    let harness = SyntheticHarness::new(&task);
     let executable = task.root.join("external-discovery-synthetic.py");
     let guard = product_provider::fixture_executable_write_guard();
     let body = "{'version':1,'request_digest':json.loads(wire['prompt'])['request_digest'],'candidates':[],'hypotheses':[],'evolutions':[],'unsupported':['Synthetic external discovery has no hypotheses']}";
@@ -3383,6 +3380,15 @@ fn discover_uses_actual_external_capture_and_plain_original_need_without_fake_mo
     )
     .unwrap();
     drop(guard);
+    transport
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn discover_uses_actual_external_capture_and_plain_original_need_without_fake_modify_receipt() {
+    let task = TaskFixture::new();
+    let harness = SyntheticHarness::new(&task);
+    let transport = external_discovery_transport(&task);
     let (mut studio, mut h) = task.open_with_transport(TestHooks::default(), Some(transport));
     let need = "Keep my exact human request separate from inherited task guidance";
     studio.test_task_request(need);
@@ -3804,7 +3810,15 @@ fn completed_external_discovery_origin(
     task: &TaskFixture,
     hooks: TestHooks,
 ) -> (ProductStudio, EguiHarness) {
-    let (mut studio, mut h) = task.open_with(hooks);
+    completed_external_discovery_origin_with_transport(task, hooks, None)
+}
+#[cfg(target_os = "linux")]
+fn completed_external_discovery_origin_with_transport(
+    task: &TaskFixture,
+    hooks: TestHooks,
+    transport: Option<product_provider::ProviderTransport>,
+) -> (ProductStudio, EguiHarness) {
+    let (mut studio, mut h) = task.open_with_transport(hooks, transport);
     studio.test_task_request("Exact original need for retained external discovery");
     settle(&mut h, &mut studio);
     let request = studio.test_prepared_request().unwrap().clone();
@@ -4055,6 +4069,404 @@ fn explicit_relink_supersedes_uncommitted_external_analysis_but_background_edit_
     assert!(relinked["task"]["completed"].is_null());
     assert_eq!(task.store.load().unwrap(), saved);
     tasks::TaskRegistry::load().unlink(&second.id).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+fn task_lineage_publication_cancel(
+    authorize: bool,
+    after_publication: bool,
+    changed_after_authorization: bool,
+) {
+    use std::sync::{atomic::Ordering, Arc};
+    let task = TaskFixture::new();
+    let harness = SyntheticHarness::new(&task);
+    // Count actual synthetic process invocations, including identical retries.
+    // The fixture still writes its usual exact argv/journal snapshot.
+    let calls = harness._dir.path().join("calls.jsonl");
+    let executable = harness._dir.path().join("codex");
+    let mut script = fs::read_to_string(&executable).unwrap();
+    script.push_str(&format!("\nwith pathlib.Path({:?}).open('a') as calls:\n    calls.write(json.dumps({{'argv': sys.argv, 'journal': journal}}) + '\\n')\n", calls.to_str().unwrap()));
+    fs::write(&executable, script).unwrap();
+    let before = Arc::new(product_studio::TestPause::default());
+    before.release.store(true, Ordering::Release);
+    let hooks = TestHooks {
+        before_task_lineage_publish: Some(before.clone()),
+        ..Default::default()
+    };
+    let stopped = hooks.stopped.clone();
+    let (mut studio, mut h) = completed_external_discovery_origin_with_transport(
+        &task,
+        hooks,
+        Some(external_discovery_transport(&task)),
+    );
+    harness.read();
+    click(&mut h, &mut studio, "studio.discover");
+    settle(&mut h, &mut studio);
+    let discover = studio.test_prepared_request().unwrap().clone();
+    click(&mut h, &mut studio, "studio.consent");
+    settle(&mut h, &mut studio);
+    assert_eq!(studio.test_page(), "discovery", "{}", studio.test_notice());
+    let report = format!(
+        "{:?}",
+        studio
+            .test_discovery_report()
+            .expect("Actual external Discover report")
+    );
+    let path = task.root.join("studio/session.json");
+    let completed: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(completed["discovery"]["external"].is_object());
+    assert!(completed["discovery"]["discover"]["completed"].is_object());
+    assert_eq!(
+        completed["discovery"]["discover"]["request"]["request"]["id"],
+        discover.id
+    );
+    click(&mut h, &mut studio, "studio.return");
+    settle(&mut h, &mut studio);
+
+    let second = if authorize {
+        None
+    } else {
+        let source = task.data_home.join("second-lineage-source");
+        let repo = git2::Repository::init(&source).unwrap();
+        let tree = repo
+            .find_tree(repo.index().unwrap().write_tree().unwrap())
+            .unwrap();
+        let who = git2::Signature::now("Synthetic fixture", "fixture@invalid.example").unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &who,
+            &who,
+            "Synthetic lineage task",
+            &tree,
+            &[],
+        )
+        .unwrap();
+        fs::create_dir(source.join(".gitmanager")).unwrap();
+        fs::write(
+            source.join(".gitmanager/product.json"),
+            fs::read(task.source.join(".gitmanager/product.json")).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            source.join("app.json"),
+            serde_json::to_vec(&fixture::organizer()).unwrap(),
+        )
+        .unwrap();
+        let second =
+            tasks::TaskRecord::from_worktree("Other synthetic lineage task", &source).unwrap();
+        tasks::TaskRegistry::load().add(second.clone()).unwrap();
+        Some(second)
+    };
+    click(&mut h, &mut studio, "studio.tasks");
+    settle(&mut h, &mut studio);
+    await_text(
+        &mut h,
+        &mut studio,
+        "Actual external origin for correlation",
+    );
+    let request = if authorize {
+        click(&mut h, &mut studio, "studio.task-need");
+        h.key(
+            egui::Key::A,
+            true,
+            egui::Modifiers {
+                ctrl: true,
+                command: true,
+                ..Default::default()
+            },
+        );
+        frame(&mut h, &mut studio);
+        h.key(egui::Key::A, false, egui::Modifiers::NONE);
+        h.text("Explicit replacement request at the lineage publication boundary");
+        frame(&mut h, &mut studio);
+        let started = Instant::now();
+        loop {
+            let trace = frame(&mut h, &mut studio);
+            if !studio.test_source_polling()
+                && trace
+                    .controls
+                    .get("studio.external-request")
+                    .is_some_and(|c| c.enabled)
+            {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "Fresh request control unavailable: {}; {:?}",
+                studio.test_notice(),
+                trace.text
+            );
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        click(&mut h, &mut studio, "studio.external-request");
+        settle(&mut h, &mut studio);
+        Some(
+            studio
+                .test_prepared_request()
+                .expect("Actual explicit disclosure")
+                .clone(),
+        )
+    } else {
+        assert!(frame(&mut h, &mut studio)
+            .text
+            .iter()
+            .any(|text| text.contains("supersede") && text.contains("Discover")));
+        None
+    };
+    fn job_files(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        fn visit(path: &Path, out: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>) {
+            for entry in fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                let kind = entry.file_type().unwrap();
+                if kind.is_dir() {
+                    visit(&entry.path(), out);
+                } else {
+                    assert!(kind.is_file());
+                    out.insert(entry.path(), fs::read(entry.path()).unwrap());
+                }
+            }
+        }
+        let mut result = std::collections::BTreeMap::new();
+        if root.exists() {
+            visit(root, &mut result);
+        }
+        result
+    }
+    let original_jobs = job_files(&task.root.join("external-task-jobs"));
+    let discover_jobs = job_files(&task.root.join("discovery-jobs"));
+    assert!(!original_jobs.is_empty() && !discover_jobs.is_empty());
+    let old_bytes = fs::read(&path).unwrap();
+    let old: serde_json::Value = serde_json::from_slice(&old_bytes).unwrap();
+    assert_eq!(
+        old["discovery"], completed["discovery"],
+        "Navigation and disclosure cannot supersede lineage"
+    );
+    let saved = task.store.load().unwrap();
+    let launch_bytes = fs::read(&calls).unwrap();
+    assert_eq!(
+        std::str::from_utf8(&launch_bytes).unwrap().lines().count(),
+        1
+    );
+    let actual_pause = if after_publication {
+        Arc::new(product_studio::TestPause::default())
+    } else {
+        before.clone()
+    };
+    let observer = if after_publication {
+        let pause = actual_pause.clone();
+        let new_task = second.as_ref().map(|t| t.id.clone());
+        let new_request = request.as_ref().map(|r| r.id.clone());
+        Some(product_studio::journal_testing::after_publish(
+            &task.root,
+            move |bytes| {
+                let value: serde_json::Value =
+                    serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+                let replaced = if let Some(id) = &new_task {
+                    value["task"]["task_id"] == *id
+                } else {
+                    value["task"]["external"]["pending"]["request"]["id"]
+                        == *new_request.as_ref().unwrap()
+                };
+                if replaced
+                    && value["discovery"].is_null()
+                    && !pause.reached.swap(true, Ordering::AcqRel)
+                {
+                    let started = Instant::now();
+                    while !pause.release.load(Ordering::Acquire) {
+                        if started.elapsed() > Duration::from_secs(120) {
+                            return Err("Actual lineage publication was not released".into());
+                        }
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                }
+                Ok(())
+            },
+        ))
+    } else {
+        before.reached.store(false, Ordering::Release);
+        before.release.store(false, Ordering::Release);
+        None
+    };
+    let action = second
+        .as_ref()
+        .map(|t| format!("studio.task.{}", t.id))
+        .unwrap_or_else(|| "studio.external-authorize".into());
+    click(&mut h, &mut studio, &action);
+    await_task_pause(&mut h, &mut studio, &actual_pause);
+    let cancel_enabled = frame(&mut h, &mut studio).controls["studio.cancel"].enabled;
+    let published_bytes = fs::read(&path).unwrap();
+    let calls_at_boundary = fs::read(&calls).unwrap();
+    if changed_after_authorization {
+        assert!(authorize && after_publication);
+        task.edit_label(
+            "Actual source drift after durable authorization and before ticket preparation",
+        );
+    }
+    let accepted = if after_publication {
+        studio.test_cancel()
+    } else {
+        click(&mut h, &mut studio, "studio.cancel");
+        true
+    };
+    let cancel_notice = studio.test_notice().to_owned();
+    actual_pause.release.store(true, Ordering::Release);
+    settle(&mut h, &mut studio);
+    drop(observer);
+    if let Some(second) = &second {
+        tasks::TaskRegistry::load().unlink(&second.id).unwrap();
+    }
+    assert_eq!(
+        calls_at_boundary, launch_bytes,
+        "Relinking or publishing intake cannot itself invoke or repeat a Harness"
+    );
+    assert_eq!(task.store.load().unwrap(), saved);
+    if after_publication {
+        let published: serde_json::Value = serde_json::from_slice(&published_bytes).unwrap();
+        assert!(published["discovery"].is_null());
+        assert!(!accepted && !cancel_enabled, "Irreversible task lineage publication accepted cancellation: enabled={cancel_enabled}, accepted={accepted}, notice={cancel_notice}");
+        assert!(
+            cancel_notice.contains("completion boundary"),
+            "{cancel_notice}"
+        );
+        assert!(
+            !studio.test_notice().to_lowercase().contains("cancelled"),
+            "{}",
+            studio.test_notice()
+        );
+        let now: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(now["discovery"].is_null());
+        assert!(now["task"]["completed"].is_null());
+        if changed_after_authorization {
+            assert_eq!(fs::read(&calls).unwrap(), launch_bytes);
+            assert_eq!(
+                now["task"]["external"]["pending"]["request"]["id"],
+                request.as_ref().unwrap().id
+            );
+            assert_eq!(now["task"]["external"]["launch_attempted"], false);
+            assert!(now["task"]["external"]["pending"]["ticket"].is_null());
+            assert!(
+                studio.test_notice().to_lowercase().contains("source"),
+                "The actual source refusal must be reported: {}",
+                studio.test_notice()
+            );
+            assert!(
+                frame(&mut h, &mut studio)
+                    .text
+                    .iter()
+                    .any(|text| text.contains("exact request is retained")
+                        && text.contains("No automatic relaunch")),
+                "The committed interrupted state must be visible"
+            );
+            let retained = fs::read(&path).unwrap();
+            product_studio::journal_testing::roundtrip(&retained).unwrap();
+            studio.test_task_refresh();
+            settle(&mut h, &mut studio);
+            assert_eq!(fs::read(&path).unwrap(), retained);
+            assert_eq!(fs::read(&calls).unwrap(), launch_bytes);
+            stop_wide(studio, &stopped);
+            studio = ProductStudio::testing(task.root.clone(), None, TestHooks::default());
+            settle(&mut h, &mut studio);
+            click(&mut h, &mut studio, "studio.tasks");
+            settle(&mut h, &mut studio);
+            assert_eq!(fs::read(&path).unwrap(), retained, "Restart must retain the real committed unissued request without rollback or automatic ticket preparation");
+            assert_eq!(
+                fs::read(&calls).unwrap(),
+                launch_bytes,
+                "A failed committed authorization must never relaunch on restart"
+            );
+        } else if let Some(request) = &request {
+            let started = Instant::now();
+            loop {
+                let bytes = fs::read(&calls).unwrap();
+                let lines: Vec<serde_json::Value> = std::str::from_utf8(&bytes)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                if lines.len() == 2 {
+                    assert_eq!(
+                        lines[1]["journal"]["task"]["external"]["pending"]["request"]["id"],
+                        request.id
+                    );
+                    break;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "The separately explicitly authorized exact replacement was not invoked once"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(
+                now["task"]["external"]["pending"]["request"]["id"],
+                request.id
+            );
+            assert_eq!(now["task"]["external"]["launch_attempted"], true);
+        } else {
+            assert_eq!(fs::read(&calls).unwrap(), launch_bytes);
+            assert_eq!(now["task"]["task_id"], second.as_ref().unwrap().id);
+            assert!(now["task"]["external"].is_null());
+        }
+    } else {
+        assert!(accepted && cancel_enabled);
+        assert_eq!(fs::read(&path).unwrap(), old_bytes, "Accepted prepublication cancellation must retain exact original task and Discover lineage");
+        assert_eq!(fs::read(&calls).unwrap(), launch_bytes);
+        assert_eq!(studio.test_prepared_request(), request.as_ref());
+        click(&mut h, &mut studio, "studio.tasks-back");
+        settle(&mut h, &mut studio);
+        click(&mut h, &mut studio, "studio.reopen-discovery");
+        settle(&mut h, &mut studio);
+        assert_eq!(
+            format!(
+                "{:?}",
+                studio
+                    .test_discovery_report()
+                    .expect("The exact original same-run full report remains")
+            ),
+            report
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(&path).unwrap()).unwrap()
+                ["discovery"],
+            old["discovery"]
+        );
+        assert_eq!(fs::read(&calls).unwrap(), launch_bytes);
+    }
+    assert_eq!(task.store.load().unwrap(), saved);
+    for (path, bytes) in original_jobs {
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+    assert_eq!(
+        job_files(&task.root.join("discovery-jobs")),
+        discover_jobs,
+        "No Discover invocation or resend is authorized by task navigation"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cancelled_task_relink_before_publication_preserves_exact_discovery_lineage() {
+    task_lineage_publication_cancel(false, false, false);
+}
+#[cfg(target_os = "linux")]
+#[test]
+fn published_task_relink_refuses_late_cancel_without_authorizing_a_harness() {
+    task_lineage_publication_cancel(false, true, false);
+}
+#[cfg(target_os = "linux")]
+#[test]
+fn cancelled_task_authorization_before_publication_preserves_exact_discovery_lineage() {
+    task_lineage_publication_cancel(true, false, false);
+}
+#[cfg(target_os = "linux")]
+#[test]
+fn published_task_authorization_refuses_late_cancel_and_launches_only_its_exact_request() {
+    task_lineage_publication_cancel(true, true, false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn source_drift_after_committed_authorization_retains_unissued_request_without_launch_or_resend() {
+    task_lineage_publication_cancel(true, true, true);
 }
 
 #[cfg(unix)]

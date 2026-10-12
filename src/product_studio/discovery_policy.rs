@@ -39,6 +39,7 @@ pub(super) struct Trial {
     pub offers: Vec<Offer>,
     pub required_actions: BTreeSet<Id>,
     pub accepted: bool,
+    acceptance_revoked: bool,
 }
 #[derive(Clone)]
 pub(super) struct View {
@@ -49,6 +50,7 @@ pub(super) struct View {
     pub offers: Vec<Offer>,
     pub can_accept: bool,
     pub accepted: bool,
+    pub acceptance_revoked: bool,
 }
 fn new_actions(
     before: &AppDefinition,
@@ -265,7 +267,12 @@ impl Trial {
             day,
             offers,
             accepted: false,
+            acceptance_revoked: false,
         })
+    }
+    pub fn revoke_acceptance(&mut self) {
+        self.acceptance_revoked = true;
+        self.accepted = false;
     }
     pub fn ticket(&self) -> Result<Digest, String> {
         canonical_digest(
@@ -287,8 +294,9 @@ impl Trial {
             day: self.day,
             ticket: self.ticket()?,
             offers: self.offers.clone(),
-            can_accept: !self.required_actions.is_empty(),
+            can_accept: !self.acceptance_revoked && !self.required_actions.is_empty(),
             accepted: self.accepted,
+            acceptance_revoked: self.acceptance_revoked,
         })
     }
     pub fn accept(
@@ -297,7 +305,11 @@ impl Trial {
         offered: &str,
         approval: &str,
     ) -> Result<AcceptedCase, String> {
-        if &self.ticket()? != ticket || !valid_id(approval) || self.required_actions.is_empty() {
+        if self.acceptance_revoked
+            || &self.ticket()? != ticket
+            || !valid_id(approval)
+            || self.required_actions.is_empty()
+        {
             return Err(
                 "Try an actual newly added action and explicitly choose its latest typed result"
                     .into(),

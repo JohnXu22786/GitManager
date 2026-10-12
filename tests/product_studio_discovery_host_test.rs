@@ -1,4 +1,6 @@
 //! Offline controller regressions. No live AI, native GUI, or user acceptance proof.
+#[path = "../src/product_studio/change_adapter.rs"]
+mod change_adapter;
 #[path = "fixtures/product_runtime/mod.rs"]
 mod fixture;
 #[path = "../src/harness.rs"]
@@ -29,6 +31,8 @@ mod product_scenarios;
 mod product_sources;
 #[path = "../src/product_store/mod.rs"]
 mod product_store;
+#[path = "fixtures/product_scope/mod.rs"]
+mod scope_fixture;
 #[path = "../src/task_delivery.rs"]
 mod task_delivery;
 #[path = "../src/task_verification.rs"]
@@ -37,6 +41,8 @@ mod task_verification;
 mod tasks;
 #[path = "../src/tool_proposal_input.rs"]
 mod tool_proposal_input;
+#[path = "support/discovery_wide.rs"]
+mod wide_fixture;
 mod ui {
     pub(crate) use super::product_runtime_view;
 }
@@ -473,6 +479,21 @@ fn accepted_feature_case_with_state(
     egui_harness::EguiHarness,
     serde_json::Value,
 ) {
+    accepted_feature_case_with_options(root, hooks, extra_state, false)
+}
+
+#[cfg(unix)]
+fn accepted_feature_case_with_options(
+    root: &Path,
+    hooks: TestHooks,
+    extra_state: bool,
+    require_matches: bool,
+) -> (
+    ProductStudio,
+    ProductStore,
+    egui_harness::EguiHarness,
+    serde_json::Value,
+) {
     let transport = transport(&root);
     let config_path = root.join("discover-fixture.json");
     let mut cfg: serde_json::Value =
@@ -481,6 +502,15 @@ fn accepted_feature_case_with_state(
     let query = program["actions"][1]["steps"][0]["items"].clone();
     program["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"collect_new","label":"Replace with these matches","parameters":{},"guards":[],"steps":[{"kind":"set_state","state":"selected","value":query}],"ensures":[]}));
     program["views"][0]["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"collect_new_button","label":"Replace with these matches","action":"collect_new","placement":"toolbar","arguments":{},"enabled":yes()}));
+    if require_matches {
+        // A valid UI action with a real business postcondition, used to test correction
+        // after runtime refusal rather than injecting a malformed command.
+        program["actions"][3]["ensures"] = serde_json::json!([{
+            "kind":"less",
+            "left":{"kind":"literal","value_type":{"kind":"integer"},"value":{"kind":"integer","value":0}},
+            "right":{"kind":"count","items":query}
+        }]);
+    }
     if extra_state {
         program["state"].as_array_mut().unwrap().push(serde_json::json!({"id":"feature_runs","label":"New feature executions","value_type":{"kind":"integer"},"initial":{"kind":"integer","value":0}}));
         program["actions"][3]["steps"].as_array_mut().unwrap().push(serde_json::json!({"kind":"set_state","state":"feature_runs","value":{"kind":"literal","value_type":{"kind":"integer"},"value":{"kind":"integer","value":1}}}));
@@ -1911,6 +1941,320 @@ fn a_fresh_host_process_has_no_cached_full_report_or_stale_choice_authority() {
     );
 }
 #[cfg(unix)]
+fn exact_recent_control(root: &Path, path: &Path) -> String {
+    let entry = product_locations::RecentTools::open(root)
+        .unwrap()
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.tool.path == path)
+        .expect("Actual registered tool");
+    format!("studio.recent.{}", entry.tool.id.as_str())
+}
+#[cfg(unix)]
+fn report_cache_selection_route(route: usize) {
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let other_path = root.join("other-tool");
+    let legacy = if route == 0 {
+        let other = ProductStore::create(other_path.clone(), &capture(organizer()), 20000).unwrap();
+        let snapshot = other.load().unwrap();
+        assert!(snapshot.scope.layers.is_empty());
+        // The same complete, checksummed format-one fixture used by the
+        // existing Studio upgrade tests. Opening must not migrate it.
+        let mut wire = serde_json::to_value(&snapshot).unwrap();
+        wire.as_object_mut().unwrap().remove("scope");
+        wire["version"] = serde_json::json!(1);
+        let bytes = canonical_bytes(&wire).unwrap();
+        let digest = canonical_digest(IdentityDomain::Data, &wire).unwrap();
+        let object = other_path.join(format!("object-{}.json", digest.as_str()));
+        fs::write(&object, &bytes).unwrap();
+        let pointer = canonical_bytes(&serde_json::json!({
+            "magic":"gitmanager.generated-project", "version":1,
+            "project_id":snapshot.data.project_id, "revision":snapshot.revision,
+            "object":digest
+        }))
+        .unwrap();
+        fs::write(other_path.join("CURRENT"), &pointer).unwrap();
+        Some((object, bytes, pointer))
+    } else {
+        None
+    };
+    let hooks = TestHooks {
+        folder_choice: matches!(route, 0 | 2).then(|| other_path.clone()),
+        ..Default::default()
+    };
+    let (mut studio, store, mut h) = discovered_with_hooks(&root, hooks);
+    let report = format!(
+        "{:?}",
+        studio
+            .test_discovery_report()
+            .expect("Actual complete report")
+    );
+    save_report_pending(&mut h, &mut studio, &store, 5);
+    let saved = store.load().unwrap();
+    let lineage = journal(&root)["discovery"].clone();
+    let selected = journal(&root)["last"].clone();
+    let jobs = report_job_artifacts(&root);
+    let original_recent = exact_recent_control(&root, &root.join("tool"));
+    click(&mut h, &mut studio, "studio.close");
+    let mut created = None;
+    match route {
+        0 => {
+            click(&mut h, &mut studio, "studio.open");
+            assert_eq!(studio.test_page(), "upgrade", "{}", studio.test_notice());
+            assert!(frame(&mut h, &mut studio).controls["studio.upgrade"].enabled);
+            assert_eq!(
+                journal(&root)["last"]["path"],
+                serde_json::json!(other_path)
+            );
+            assert_ne!(journal(&root)["last"], selected);
+            click(&mut h, &mut studio, "studio.back");
+        }
+        1 | 3 => {
+            replace_copied_text(
+                &mut h,
+                &mut studio,
+                "studio.need",
+                "Create a separate synthetic tool after reviewing its request",
+            );
+            click(&mut h, &mut studio, "studio.prepare");
+            assert_eq!(studio.test_page(), "consent", "{}", studio.test_notice());
+            let request = studio.test_prepared_request().unwrap().clone();
+            assert_eq!(request.operation, DevelopmentOperation::Generate);
+            assert_eq!(journal(&root)["provider"]["issued"], false);
+            assert_eq!(journal(&root)["last"], selected);
+            assert_eq!(journal(&root)["discovery"], lineage);
+            let prepared = report_job_artifacts(&root);
+            assert_eq!(prepared.len(), jobs.len() + 1);
+            for (id, bytes) in &jobs {
+                assert_eq!(&prepared[id], bytes);
+            }
+            let receipt: product_provider::JobReceipt =
+                serde_json::from_str(prepared[&request.id]["receipt.json"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(receipt.request_id, request.id);
+            assert_eq!(receipt.state, product_provider::JobState::Prepared);
+            assert!(
+                receipt.consent.is_none()
+                    && receipt.started_at_unix_ms.is_none()
+                    && receipt.finished_at_unix_ms.is_none()
+                    && receipt.exit_code.is_none()
+                    && receipt.session_id.is_none()
+                    && receipt.result_digest.is_none()
+            );
+            assert!(
+                prepared[&request.id]["fixture-invocation.json"].is_null()
+                    && prepared[&request.id]["result.json"].is_null()
+                    && prepared[&request.id]["final.json"].is_null()
+            );
+            if route == 3 {
+                click(&mut h, &mut studio, "studio.back");
+                assert!(journal(&root)["provider"].is_null());
+                assert_eq!(journal(&root)["last"], selected);
+                assert_eq!(report_job_artifacts(&root), prepared);
+            } else {
+                // Only this separately consented Generate may invoke. Neither
+                // navigation nor old Discover evidence authorizes it.
+                click(&mut h, &mut studio, "studio.consent");
+                assert_eq!(studio.test_page(), "draft", "{}", studio.test_notice());
+                let completed = report_job_artifacts(&root);
+                let receipt: product_provider::JobReceipt =
+                    serde_json::from_str(completed[&request.id]["receipt.json"].as_str().unwrap())
+                        .unwrap();
+                assert_eq!(
+                    receipt.state,
+                    product_provider::JobState::TransportValidated
+                );
+                assert!(receipt.consent.is_some() && receipt.started_at_unix_ms.is_some());
+                assert!(completed[&request.id]["fixture-invocation.json"].is_string());
+                click(&mut h, &mut studio, "studio.keep");
+                assert_eq!(studio.test_page(), "daily", "{}", studio.test_notice());
+                let path = studio.test_location().unwrap().to_path_buf();
+                assert_ne!(path, root.join("tool"));
+                let other = ProductStore::open(&path).unwrap();
+                let snapshot = other.load().unwrap();
+                assert_eq!(snapshot.data.project_id, request.project_id);
+                assert_eq!(journal(&root)["last"]["path"], serde_json::json!(path));
+                assert_eq!(
+                    journal(&root)["last"]["identity"],
+                    serde_json::to_value(
+                        product_locations::ToolIdentity::from_snapshot(&snapshot).unwrap()
+                    )
+                    .unwrap()
+                );
+                assert_ne!(journal(&root)["last"], selected);
+                created = Some((other, snapshot));
+                click(&mut h, &mut studio, "studio.close");
+            }
+        }
+        2 => {
+            assert!(!other_path.exists());
+            click(&mut h, &mut studio, "studio.open");
+            assert_eq!(studio.test_page(), "home", "{}", studio.test_notice());
+            assert!(!studio.test_notice().is_empty());
+            assert_eq!(journal(&root)["last"], selected);
+            assert!(!other_path.exists());
+        }
+        _ => unreachable!(),
+    }
+    let navigation_jobs = report_job_artifacts(&root);
+    for (id, bytes) in &jobs {
+        assert_eq!(&navigation_jobs[id], bytes);
+    }
+    assert_eq!(
+        navigation_jobs.len(),
+        jobs.len() + usize::from(matches!(route, 1 | 3))
+    );
+    assert_eq!(
+        navigation_jobs
+            .values()
+            .filter(|job| job["fixture-invocation.json"].is_string())
+            .count(),
+        jobs.len() + usize::from(route == 1)
+    );
+    assert_eq!(journal(&root)["discovery"], lineage);
+    click(&mut h, &mut studio, &original_recent);
+    click(&mut h, &mut studio, "studio.reopen-discovery");
+    assert_stale_report_has_no_authority(&mut h, &mut studio);
+    if matches!(route, 0 | 1) {
+        assert!(
+            studio.test_discovery_report().is_none(),
+            "Committed foreign tool route {route} must invalidate the prior single report cache"
+        );
+        assert_missing_report_details_do_not_invent_a_previous_session(&mut h, &mut studio);
+    } else {
+        assert_eq!(
+            format!(
+                "{:?}",
+                studio.test_discovery_report().expect(
+                    "An unsuccessful or prepared-only selection must preserve the exact old report"
+                )
+            ),
+            report
+        );
+    }
+    assert_eq!(journal(&root)["discovery"], lineage);
+    assert_eq!(store.load().unwrap(), saved);
+    assert_eq!(report_job_artifacts(&root), navigation_jobs);
+    if let Some((object, bytes, pointer)) = legacy {
+        assert_eq!(fs::read(object).unwrap(), bytes);
+        assert_eq!(fs::read(other_path.join("CURRENT")).unwrap(), pointer);
+    }
+    if let Some((other, snapshot)) = created {
+        assert_eq!(other.load().unwrap(), snapshot);
+    }
+}
+#[cfg(unix)]
+#[test]
+fn committed_foreign_upgrade_selection_invalidates_the_prior_report_cache() {
+    report_cache_selection_route(0);
+}
+#[cfg(unix)]
+#[test]
+fn explicitly_saved_new_tool_invalidates_the_prior_report_cache() {
+    report_cache_selection_route(1);
+}
+#[cfg(unix)]
+#[test]
+fn failed_foreign_open_keeps_the_exact_same_run_report_cache() {
+    report_cache_selection_route(2);
+}
+#[cfg(unix)]
+#[test]
+fn declined_generate_disclosure_keeps_the_exact_same_run_report_cache() {
+    report_cache_selection_route(3);
+}
+#[cfg(unix)]
+#[test]
+fn published_recent_tool_selection_refuses_late_cancel_after_cache_replacement() {
+    use std::sync::{atomic::Ordering, Arc};
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let other_path = root.join("other-tool");
+    let other = ProductStore::create(other_path.clone(), &capture(organizer()), 20000).unwrap();
+    let other_saved = other.load().unwrap();
+    let other_id = product_locations::RecentTools::open(&root)
+        .unwrap()
+        .remember(&other_path, product_provider::unix_ms())
+        .unwrap();
+    let (mut studio, store, mut h) = discovered(&root);
+    assert!(studio.test_discovery_report().is_some());
+    save_report_pending(&mut h, &mut studio, &store, 5);
+    let saved = store.load().unwrap();
+    let original_recent = exact_recent_control(&root, &root.join("tool"));
+    let before = journal(&root);
+    let jobs = report_job_artifacts(&root);
+    click(&mut h, &mut studio, "studio.close");
+    let pause = Arc::new(product_studio::TestPause::default());
+    let observer = product_studio::journal_testing::after_publish(&root, {
+        let pause = pause.clone();
+        let other_path = other_path.clone();
+        move |bytes| {
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            if value["last"]["path"] == serde_json::json!(other_path) {
+                pause.reached.store(true, Ordering::Release);
+                let start = Instant::now();
+                while !pause.release.load(Ordering::Acquire) {
+                    if start.elapsed() > Duration::from_secs(120) {
+                        return Err(
+                            "Test did not release the actual Recent selection publication".into(),
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+            Ok(())
+        }
+    });
+    pause_copied_publication(
+        &mut h,
+        &mut studio,
+        &pause,
+        &format!("studio.recent.{}", other_id.as_str()),
+    );
+    let published = journal(&root);
+    let cancel_enabled = frame(&mut h, &mut studio).controls["studio.cancel"].enabled;
+    let accepted = studio.test_cancel();
+    let late_notice = studio.test_notice().to_owned();
+    pause.release.store(true, Ordering::Release);
+    settle(&mut studio);
+    drop(observer);
+    let completed_page = studio.test_page().to_owned();
+    let completed_notice = studio.test_notice().to_owned();
+    eprintln!("Recent selection before: {before}");
+    eprintln!("Recent selection committed: {published}");
+    eprintln!("Recent selection cancel enabled={cancel_enabled} accepted={accepted}; page={completed_page}; late={late_notice}; completed={completed_notice}");
+    assert_eq!(published["last"]["path"], serde_json::json!(other_path));
+    assert_ne!(published["last"], before["last"]);
+    assert_eq!(journal(&root)["last"], published["last"]);
+    assert_eq!(journal(&root)["discovery"], before["discovery"]);
+    assert_eq!(store.load().unwrap(), saved);
+    assert_eq!(other.load().unwrap(), other_saved);
+    assert_eq!(report_job_artifacts(&root), jobs);
+    if completed_page == "daily" {
+        click(&mut h, &mut studio, "studio.close");
+    } else {
+        assert_eq!(completed_page, "home", "{completed_notice}");
+    }
+    click(&mut h, &mut studio, &original_recent);
+    click(&mut h, &mut studio, "studio.reopen-discovery");
+    assert_stale_report_has_no_authority(&mut h, &mut studio);
+    assert!(
+        studio.test_discovery_report().is_none(),
+        "The committed foreign selection really replaced the old report cache"
+    );
+    assert!(!accepted && !cancel_enabled, "An already committed Recent selection cannot accept cancellation: enabled={cancel_enabled}, accepted={accepted}, notice={late_notice}");
+    assert_eq!(completed_page, "daily");
+    assert!(late_notice.contains("completion boundary"), "{late_notice}");
+    assert!(!completed_notice.to_lowercase().contains("cancelled"));
+    assert_eq!(store.load().unwrap(), saved);
+    assert_eq!(other.load().unwrap(), other_saved);
+    assert_eq!(report_job_artifacts(&root), jobs);
+}
+
+#[cfg(unix)]
 #[test]
 fn a_different_saved_tool_cannot_inherit_or_return_the_cached_report() {
     let temp = tempfile::tempdir().unwrap();
@@ -2104,4 +2448,1002 @@ fn copied_experience_return_discloses_dirty_discard_and_keeps_saved_work_unchang
             .iter()
             .any(|text| text.contains("form has changes that have not been submitted")));
     }
+}
+
+#[cfg(unix)]
+fn pause_copied_publication(
+    h: &mut egui_harness::EguiHarness,
+    studio: &mut ProductStudio,
+    pause: &product_studio::TestPause,
+    key: &str,
+) {
+    use std::sync::atomic::Ordering;
+    pause.reached.store(false, Ordering::Release);
+    pause.release.store(false, Ordering::Release);
+    let view = frame(h, studio);
+    let control = view
+        .controls
+        .get(key)
+        .unwrap_or_else(|| panic!("Missing {key}: {:?}", view.text));
+    assert!(control.enabled, "Disabled {key}: {:?}", view.text);
+    h.press_at(control.rect.center());
+    frame(h, studio);
+    h.release_at(control.rect.center());
+    frame(h, studio);
+    let start = Instant::now();
+    while !pause.reached.load(Ordering::Acquire) {
+        studio.poll();
+        assert!(
+            studio.is_busy(),
+            "The real replay ended before publication pause: {}",
+            studio.test_notice()
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(120),
+            "{}",
+            studio.test_notice()
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[cfg(unix)]
+fn replace_copied_text(
+    h: &mut egui_harness::EguiHarness,
+    studio: &mut ProductStudio,
+    key: &str,
+    text: &str,
+) {
+    click(h, studio, key);
+    h.key(
+        egui::Key::A,
+        true,
+        egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        },
+    );
+    h.key(egui::Key::A, false, egui::Modifiers::NONE);
+    h.text(text);
+    frame(h, studio);
+    settle(studio);
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelled_candidate_trial_keeps_published_work_and_can_retry_without_old_acceptance() {
+    use std::sync::{atomic::Ordering, Arc};
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let pause = Arc::new(product_studio::TestPause::default());
+    pause.release.store(true, Ordering::Release);
+    let (mut studio, store, mut h, _) = accepted_feature_case(
+        &root,
+        TestHooks {
+            before_discovery_publication: Some(pause.clone()),
+            ..Default::default()
+        },
+    );
+    let saved = store.load().unwrap();
+    click(&mut h, &mut studio, "feature-candidate.navigate.new_person");
+    replace_copied_text(
+        &mut h,
+        &mut studio,
+        "feature-candidate.field.name",
+        "Earlier copied person",
+    );
+    replace_copied_text(&mut h, &mut studio, "feature-candidate.field.area", "west");
+    click(&mut h, &mut studio, "feature-candidate.submit");
+    click(&mut h, &mut studio, "feature-candidate.navigate.people");
+    click(
+        &mut h,
+        &mut studio,
+        "feature-candidate.action.collect_new_button",
+    );
+    click(
+        &mut h,
+        &mut studio,
+        "studio.feature.accept.observed.selected_count",
+    );
+    let prior_acceptance = journal(&root)["discovery"]["accepted_case"].clone();
+    let published = studio.test_feature_run().unwrap().clone();
+    assert!(published
+        .retained_records
+        .iter()
+        .any(|r| r.values.get("name") == Some(&string("Earlier copied person"))));
+    let events = published
+        .history
+        .events
+        .iter()
+        .filter(|e| e.action == "collect_new")
+        .count();
+    assert!(events >= 2);
+    pause_copied_publication(
+        &mut h,
+        &mut studio,
+        &pause,
+        "feature-candidate.action.collect_new_button",
+    );
+    click(&mut h, &mut studio, "studio.cancel");
+    pause.release.store(true, Ordering::Release);
+    assert_eq!(studio.test_feature_run().unwrap(), &published);
+    assert!(journal(&root)["discovery"]["accepted_case"].is_null());
+    assert!(
+        !frame(&mut h, &mut studio).controls["studio.feature.accept.observed.selected_count"]
+            .enabled
+    );
+    studio.test_reissue_displayed_feature_acceptance("observed.selected_count");
+    settle(&mut studio);
+    assert!(journal(&root)["discovery"]["accepted_case"].is_null());
+    assert_eq!(store.load().unwrap(), saved);
+    click(
+        &mut h,
+        &mut studio,
+        "feature-candidate.action.collect_new_button",
+    );
+    assert!(
+        frame(&mut h, &mut studio).controls["studio.feature.accept.observed.selected_count"]
+            .enabled,
+        "The actual corrected retry must retain its prior copied scenario: {}",
+        studio.test_notice()
+    );
+    let retried = studio.test_feature_run().unwrap();
+    assert_eq!(retried.retained_records, published.retained_records);
+    assert_eq!(
+        retried
+            .history
+            .events
+            .iter()
+            .filter(|e| e.action == "collect_new")
+            .count(),
+        events + 1
+    );
+    assert!(journal(&root)["discovery"]["accepted_case"].is_null());
+    click(
+        &mut h,
+        &mut studio,
+        "studio.feature.accept.observed.selected_count",
+    );
+    assert_ne!(
+        journal(&root)["discovery"]["accepted_case"]["approval_operation"],
+        prior_acceptance["approval_operation"]
+    );
+    assert_eq!(store.load().unwrap(), saved);
+}
+
+#[cfg(unix)]
+#[test]
+fn refused_candidate_action_keeps_published_work_for_a_corrected_ui_input() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let (mut studio, store, mut h, _) =
+        accepted_feature_case_with_options(&root, TestHooks::default(), false, true);
+    let saved = store.load().unwrap();
+    replace_copied_text(
+        &mut h,
+        &mut studio,
+        "feature-candidate.control.search_input",
+        "No matching person",
+    );
+    let published = studio.test_feature_run().unwrap().clone();
+    assert!(published.observation.rows.is_empty());
+    click(
+        &mut h,
+        &mut studio,
+        "feature-candidate.action.collect_new_button",
+    );
+    // The checked-scene boundary wraps the runtime postcondition refusal; the
+    // valid, enabled UI action was executed but cannot publish a partial scene.
+    assert!(
+        studio
+            .test_notice()
+            .contains("accepted scene must execute completely with actual observations"),
+        "The real business action must be refused by checked replay: {}",
+        studio.test_notice()
+    );
+    assert_eq!(studio.test_feature_run().unwrap(), &published);
+    assert!(
+        !frame(&mut h, &mut studio).controls["studio.feature.accept.observed.selected_count"]
+            .enabled
+    );
+    studio.test_reissue_displayed_feature_acceptance("observed.selected_count");
+    settle(&mut studio);
+    assert!(journal(&root)["discovery"]["accepted_case"].is_null());
+    replace_copied_text(
+        &mut h,
+        &mut studio,
+        "feature-candidate.control.search_input",
+        "Ada",
+    );
+    assert_eq!(
+        studio
+            .test_feature_run()
+            .unwrap()
+            .observation
+            .controls
+            .get("search_input"),
+        Some(&string("Ada")),
+        "A refused business action must leave the copied scenario available for correction: {}",
+        studio.test_notice()
+    );
+    click(
+        &mut h,
+        &mut studio,
+        "feature-candidate.action.collect_new_button",
+    );
+    assert_eq!(
+        studio.test_feature_run().unwrap().retained_records,
+        published.retained_records
+    );
+    assert!(
+        frame(&mut h, &mut studio).controls["studio.feature.accept.observed.selected_count"]
+            .enabled
+    );
+    assert_eq!(store.load().unwrap(), saved);
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelled_pair_submit_retries_exactly_once_on_the_last_published_copies() {
+    use std::sync::{atomic::Ordering, Arc};
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let pause = Arc::new(product_studio::TestPause::default());
+    pause.release.store(true, Ordering::Release);
+    let (mut studio, store, mut h) = discovered_with_hooks(
+        &root,
+        TestHooks {
+            before_discovery_publication: Some(pause.clone()),
+            ..Default::default()
+        },
+    );
+    let saved = store.load().unwrap();
+    let copy = first_control(&mut h, &mut studio, "studio.discovery.copy.");
+    click(&mut h, &mut studio, &copy);
+    click(&mut h, &mut studio, "discovery-left.navigate.new_person");
+    replace_copied_text(
+        &mut h,
+        &mut studio,
+        "discovery-left.field.name",
+        "Exactly one copied submit",
+    );
+    replace_copied_text(&mut h, &mut studio, "discovery-left.field.area", "west");
+    let published = studio.test_discovery_runs().unwrap().clone();
+    assert!(published.iter().all(|r| !r
+        .retained_records
+        .iter()
+        .any(|row| row.values.get("name") == Some(&string("Exactly one copied submit")))));
+    pause_copied_publication(&mut h, &mut studio, &pause, "discovery-left.submit");
+    click(&mut h, &mut studio, "studio.cancel");
+    pause.release.store(true, Ordering::Release);
+    assert_eq!(studio.test_discovery_runs().unwrap(), &published);
+    assert_eq!(store.load().unwrap(), saved);
+    for index in 0..6 {
+        assert!(
+            !frame(&mut h, &mut studio).controls[&format!("studio.discovery.choose.{index}")]
+                .enabled
+        );
+    }
+    studio.test_reissue_displayed_discovery_choice(2);
+    settle(&mut studio);
+    assert_eq!(store.load().unwrap(), saved);
+    let retained = frame(&mut h, &mut studio);
+    assert!(retained.controls["discovery-left.submit"].enabled);
+    assert!(retained
+        .text
+        .iter()
+        .any(|t| t.contains("form has changes that have not been submitted")));
+    click(&mut h, &mut studio, "discovery-left.submit");
+    let mut ids = vec![];
+    for (old, retried) in published.iter().zip(studio.test_discovery_runs().unwrap()) {
+        let rows = retried
+            .retained_records
+            .iter()
+            .filter(|row| row.values.get("name") == Some(&string("Exactly one copied submit")))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows.len(),
+            1,
+            "An unacknowledged copied submit must not already be in the hidden replay: {:?}",
+            retried.retained_records
+        );
+        ids.push(rows[0].id.clone());
+        assert_eq!(
+            retried.retained_records.len(),
+            old.retained_records.len() + 1
+        );
+        assert_eq!(
+            retried
+                .history
+                .events
+                .iter()
+                .filter(|e| e.action == "add_person")
+                .count(),
+            old.history
+                .events
+                .iter()
+                .filter(|e| e.action == "add_person")
+                .count()
+                + 1
+        );
+    }
+    assert_eq!(ids[0], ids[1]);
+    assert_eq!(store.load().unwrap(), saved);
+}
+
+#[cfg(unix)]
+fn rule_copy_fixture(
+    root: &Path,
+    hooks: TestHooks,
+) -> (
+    ProductStudio,
+    ProductStore,
+    egui_harness::EguiHarness,
+    Digest,
+    [product_protocol::RuntimeView; 2],
+) {
+    fn with_controls(pause: bool) -> CapturedProgram {
+        let mut raw = serde_json::to_value(scope_fixture::program(pause).program).unwrap();
+        let actions = raw["actions"].as_array().unwrap().clone();
+        for action in actions.iter().filter(|a| a["id"] != "add") {
+            let row = !action["parameters"].as_object().unwrap().is_empty();
+            raw["views"][0]["actions"].as_array_mut().unwrap().push(serde_json::json!({
+                "id":action["id"],"label":action["label"],"action":action["id"],
+                "placement":if row {"row"} else {"toolbar"},
+                "arguments":if row {serde_json::json!({"row":scope_fixture::var("row")})} else {serde_json::json!({})},
+                "enabled":scope_fixture::boolean(true)
+            }));
+        }
+        scope_fixture::capture(raw)
+    }
+    let before = with_controls(false);
+    let candidate = with_controls(true);
+    let store = ProductStore::create(root.join("tool"), &before, 20000).unwrap();
+    let row = scope_fixture::add(&store, "real-existing", "Existing saved work");
+    let saved = store.load().unwrap();
+    let mut studio = ProductStudio::testing(root.into(), Some(response_transport(root)), hooks);
+    settle(&mut studio);
+    studio.test_open(root.join("tool"));
+    settle(&mut studio);
+    studio.test_modify("Change how waiting contributes to production; preserve commitments");
+    settle(&mut studio);
+    let modify = studio
+        .test_prepared_request()
+        .expect("Actual Modify disclosure")
+        .clone();
+    configure_response(
+        root,
+        &DevelopmentResponse {
+            version: 1,
+            request_digest: modify.identity().unwrap(),
+            candidates: vec![GeneratedCandidate {
+                id: "changed".into(),
+                source_json: String::from_utf8(candidate.source_bytes).unwrap(),
+            }],
+            hypotheses: vec![],
+            evolutions: vec![],
+            unsupported: vec![],
+        },
+    );
+    studio.test_consent();
+    settle(&mut studio);
+    assert_eq!(studio.test_page(), "change", "{}", studio.test_notice());
+    let mut h = egui_harness::EguiHarness::new(egui::vec2(1600.0, 6000.0));
+    let complete = format!("current.row.job.{}.complete", row.id);
+    let rendered = frame(&mut h, &mut studio);
+    assert!(
+        rendered.controls.contains_key(&complete),
+        "The real row completion binding is missing: {:?}",
+        rendered.controls.keys()
+    );
+    click(&mut h, &mut studio, &complete);
+    let rendered = frame(&mut h, &mut studio);
+    let finished = rendered
+        .controls
+        .keys()
+        .find(|k| k.starts_with("studio.finished.job.") && k.ends_with(".done"))
+        .unwrap_or_else(|| {
+            panic!(
+                "The actual completed copy must offer its checked finished outcome: {:?}",
+                rendered.text
+            )
+        })
+        .clone();
+    click(&mut h, &mut studio, &finished);
+    let old = [
+        studio.test_current_trial().unwrap().clone(),
+        studio
+            .test_alternative()
+            .expect("Prepared rule comparison")
+            .clone(),
+    ];
+    let artifact = old[1].program.identity().unwrap();
+    click(&mut h, &mut studio, "studio.discover");
+    let request = studio
+        .test_prepared_request()
+        .expect("Separate actual Discover disclosure")
+        .clone();
+    assert_eq!(request.operation, DevelopmentOperation::Discover);
+    let after = &request.sources[1];
+    let (scene, _) = wide_fixture::created_scene(&saved);
+    let response = DevelopmentResponse {
+        version: 1,
+        request_digest: request.identity().unwrap(),
+        candidates: vec![
+            GeneratedCandidate {
+                id: "before".into(),
+                source_json: String::from_utf8(request.sources[0].source_bytes.clone()).unwrap(),
+            },
+            GeneratedCandidate {
+                id: "after".into(),
+                source_json: String::from_utf8(after.source_bytes.clone()).unwrap(),
+            },
+        ],
+        hypotheses: vec![ChoiceHypothesis {
+            id: "waiting-choice".into(),
+            statement: "Waiting changes production calculations".into(),
+            kind: HypothesisKind::UnresolvedChoice,
+            action: "export".into(),
+            observable: "waiting_jobs".into(),
+            sources: vec![SourceLocus {
+                relative_path: after.binding.program_path.clone(),
+                raw_digest: after.artifact.raw_digest.clone(),
+                pointer: "/views/0/kind/columns/1/value".into(),
+            }],
+            alternatives: vec!["before".into(), "after".into()],
+            related_decisions: vec![],
+            scenario_json: serde_json::to_string(&scene).unwrap(),
+            unknowns: vec![],
+        }],
+        evolutions: vec![],
+        unsupported: vec![],
+    };
+    response.validate_for(&request).unwrap();
+    configure_response(root, &response);
+    click(&mut h, &mut studio, "studio.consent");
+    assert_eq!(studio.test_page(), "discovery", "{}", studio.test_notice());
+    let report = studio.test_discovery_report().unwrap();
+    assert!(
+        !report.questions.is_empty(),
+        "Actual fixed-rule queue refused the valid fixture: {report:?}"
+    );
+    assert_eq!(store.load().unwrap(), saved);
+    (studio, store, h, artifact, old)
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelled_rule_copy_cannot_adopt_unpublished_import_and_can_retry() {
+    use std::sync::{atomic::Ordering, Arc};
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let pause = Arc::new(product_studio::TestPause::default());
+    pause.release.store(true, Ordering::Release);
+    let (mut studio, store, mut h, artifact, old) = rule_copy_fixture(
+        &root,
+        TestHooks {
+            before_discovery_publication: Some(pause.clone()),
+            ..Default::default()
+        },
+    );
+    let saved = store.load().unwrap();
+    let copy = first_control(&mut h, &mut studio, "studio.discovery.copy.");
+    pause_copied_publication(&mut h, &mut studio, &pause, &copy);
+    click(&mut h, &mut studio, "studio.cancel");
+    pause.release.store(true, Ordering::Release);
+    assert_eq!(studio.test_page(), "change");
+    assert_no_old_change_choices(&mut h, &mut studio);
+    studio.test_decide_exact(DecisionOutcome::Accept { artifact });
+    settle(&mut studio);
+    assert_eq!(
+        store.load().unwrap(),
+        saved,
+        "Cancelled post-import work must not retain unpublished backend adoption authority"
+    );
+    assert_eq!(studio.test_current_trial().unwrap(), &old[0]);
+    assert_eq!(studio.test_alternative().unwrap(), &old[1]);
+    click(&mut h, &mut studio, "studio.return");
+    click(&mut h, &mut studio, "studio.reopen-discovery");
+    let copy = first_control(&mut h, &mut studio, "studio.discovery.copy.");
+    click(&mut h, &mut studio, &copy);
+    assert_eq!(studio.test_page(), "change");
+    assert!(
+        frame(&mut h, &mut studio).controls["studio.accept"].enabled,
+        "Fresh full rule copy must regain checked authority: {}",
+        studio.test_notice()
+    );
+    assert_eq!(store.load().unwrap(), saved);
+    click(&mut h, &mut studio, "studio.accept");
+    let adopted = store.load().unwrap();
+    assert_eq!(
+        adopted.decisions.decisions.len(),
+        saved.decisions.decisions.len() + 1
+    );
+    // Explicit scoped adoption adds only independently regenerated compiler
+    // metadata. Authenticate the exact old seed and its retained initialization
+    // receipt instead of ignoring fields with a reserved-looking name.
+    let context = product_store::scope::ScopedExecutionContext::committed(&adopted).unwrap();
+    let target = adopted.program().unwrap();
+    let mapped = product_runtime::merged_data(target, &saved.data).unwrap();
+    let (_, projected) = context
+        .project_seed(
+            saved.program().unwrap(),
+            &saved.data,
+            target,
+            &mapped,
+            saved.clock_day,
+        )
+        .unwrap();
+    assert_eq!(adopted.data, projected);
+    assert_eq!(adopted.data.events, saved.data.events);
+    assert_eq!(adopted.data.records.len(), saved.data.records.len());
+    for old in &saved.data.records {
+        let row = adopted
+            .data
+            .records
+            .iter()
+            .find(|row| row.id == old.id)
+            .unwrap();
+        let mut business = row.clone();
+        business
+            .values
+            .retain(|field, _| old.values.contains_key(field));
+        assert_eq!(&business, old);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn changed_basis_after_rule_import_keeps_published_copies_and_refuses_late_choice() {
+    use std::sync::{atomic::Ordering, Arc};
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let pause = Arc::new(product_studio::TestPause::default());
+    pause.release.store(true, Ordering::Release);
+    let (mut studio, store, mut h, artifact, old) = rule_copy_fixture(
+        &root,
+        TestHooks {
+            before_discovery_publication: Some(pause.clone()),
+            ..Default::default()
+        },
+    );
+    let copy = first_control(&mut h, &mut studio, "studio.discovery.copy.");
+    pause_copied_publication(&mut h, &mut studio, &pause, &copy);
+    scope_fixture::add(&store, "actual-concurrent-work", "Later saved work");
+    let changed = store.load().unwrap();
+    pause.release.store(true, Ordering::Release);
+    settle(&mut studio);
+    assert!(
+        studio.test_notice().to_lowercase().contains("changed")
+            || studio.test_notice().to_lowercase().contains("stale"),
+        "Actual source/Basis refusal required: {}",
+        studio.test_notice()
+    );
+    assert_no_old_change_choices(&mut h, &mut studio);
+    studio.test_decide_exact(DecisionOutcome::Accept { artifact });
+    settle(&mut studio);
+    assert_eq!(store.load().unwrap(), changed);
+    assert_eq!(studio.test_current_trial().unwrap(), &old[0]);
+    assert_eq!(studio.test_alternative().unwrap(), &old[1]);
+}
+
+#[cfg(unix)]
+fn completed_two_candidate_report(
+    root: &Path,
+    hooks: TestHooks,
+) -> (
+    ProductStudio,
+    ProductStore,
+    egui_harness::EguiHarness,
+    String,
+) {
+    let (mut studio, store, _) = modified_with_hooks(root, hooks);
+    let mut h = egui_harness::EguiHarness::new(egui::vec2(1400.0, 5000.0));
+    click(&mut h, &mut studio, "studio.discover");
+    click(&mut h, &mut studio, "studio.consent");
+    let report = format!(
+        "{:?}",
+        studio
+            .test_discovery_report()
+            .expect("Actual complete Discover report")
+    );
+    assert_eq!(journal(root)["discovery"]["selected"], "primary");
+    assert!(!journal(root)["discovery"]["discover"]["completed"].is_null());
+    click(&mut h, &mut studio, "studio.discovery.back");
+    (studio, store, h, report)
+}
+
+#[cfg(unix)]
+fn replacement_disclosure_publication(modify: bool, after_publish: bool) {
+    use std::sync::{atomic::Ordering, Arc};
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let pause = Arc::new(product_studio::TestPause::default());
+    pause.release.store(true, Ordering::Release);
+    let (mut studio, store, mut h, report) = completed_two_candidate_report(
+        &root,
+        TestHooks {
+            before_disclosure_publication: (!after_publish).then(|| pause.clone()),
+            ..Default::default()
+        },
+    );
+    let saved = store.load().unwrap();
+    let original_journal = journal(&root);
+    let original = original_journal["discovery"].clone();
+    let jobs = report_job_artifacts(&root);
+    assert_eq!(jobs.len(), 2);
+    assert!(jobs
+        .values()
+        .all(|job| job["fixture-invocation.json"].is_string()));
+    let new_need = "A separately reviewed replacement must not erase cancelled analysis";
+    if modify {
+        click(&mut h, &mut studio, "studio.return");
+        replace_copied_text(&mut h, &mut studio, "studio.change-need", new_need);
+    }
+    let observer = if after_publish {
+        Some(product_studio::journal_testing::after_publish(&root, {
+            let pause = pause.clone();
+            let original = original.clone();
+            move |bytes| {
+                let value: serde_json::Value =
+                    serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+                if value["provider"]["issued"] == false && value["discovery"] != original {
+                    // Observe the real atomic rename, without replacing its result.
+                    pause.reached.store(true, Ordering::Release);
+                    let start = Instant::now();
+                    while !pause.release.load(Ordering::Acquire) {
+                        if start.elapsed() > Duration::from_secs(120) {
+                            return Err(
+                                "Test did not release the actual disclosure publication".into()
+                            );
+                        }
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                }
+                Ok(())
+            }
+        }))
+    } else {
+        None
+    };
+    pause_copied_publication(
+        &mut h,
+        &mut studio,
+        &pause,
+        if modify {
+            "studio.modify"
+        } else {
+            "studio.discover"
+        },
+    );
+    let paused_journal = journal(&root);
+    let cancel_enabled = frame(&mut h, &mut studio).controls["studio.cancel"].enabled;
+    let (accepted, late_notice) = if after_publish {
+        let accepted = studio.test_cancel();
+        let notice = studio.test_notice().to_owned();
+        // Always release the real rename observer before a failing assertion.
+        pause.release.store(true, Ordering::Release);
+        settle(&mut studio);
+        (accepted, notice)
+    } else {
+        click(&mut h, &mut studio, "studio.cancel");
+        pause.release.store(true, Ordering::Release);
+        (true, studio.test_notice().to_owned())
+    };
+    drop(observer);
+    let after = journal(&root);
+    let prepared_jobs = report_job_artifacts(&root);
+    eprintln!("Replacement disclosure modify={modify} after_publish={after_publish} before: {original_journal}");
+    eprintln!("Replacement disclosure modify={modify} after_publish={after_publish} paused: {paused_journal}");
+    eprintln!(
+        "Replacement disclosure modify={modify} after_publish={after_publish} after: {after}"
+    );
+    eprintln!("Replacement disclosure cancel enabled={cancel_enabled} accepted={accepted} notice={late_notice}");
+    assert_eq!(store.load().unwrap(), saved);
+    assert_eq!(prepared_jobs.len(), jobs.len() + 1);
+    for (id, bytes) in &jobs {
+        assert_eq!(
+            &prepared_jobs[id], bytes,
+            "Already-consented invocation evidence must be immutable"
+        );
+    }
+    let (request_id, prepared) = prepared_jobs
+        .iter()
+        .find(|(id, _)| !jobs.contains_key(*id))
+        .unwrap();
+    let receipt: product_provider::JobReceipt =
+        serde_json::from_str(prepared["receipt.json"].as_str().unwrap()).unwrap();
+    assert_eq!(&receipt.request_id, request_id);
+    assert_eq!(receipt.state, product_provider::JobState::Prepared);
+    assert!(
+        receipt.consent.is_none()
+            && receipt.started_at_unix_ms.is_none()
+            && receipt.finished_at_unix_ms.is_none()
+            && receipt.exit_code.is_none()
+            && receipt.session_id.is_none()
+            && receipt.result_digest.is_none()
+    );
+    assert!(
+        prepared["fixture-invocation.json"].is_null()
+            && prepared["result.json"].is_null()
+            && prepared["final.json"].is_null()
+    );
+    let stdin: serde_json::Value =
+        serde_json::from_str(prepared["stdin.json"].as_str().unwrap()).unwrap();
+    let prompt: serde_json::Value =
+        serde_json::from_str(stdin["prompt"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        prompt["request"]["operation"],
+        if modify { "modify" } else { "discover" }
+    );
+    if after_publish {
+        assert_ne!(paused_journal["discovery"], original);
+        assert!(!accepted && !cancel_enabled,
+            "Published disclosure cannot accept cancellation: modify={modify}, enabled={cancel_enabled}, accepted={accepted}, notice={late_notice}");
+        assert!(late_notice.contains("completion boundary"), "{late_notice}");
+        assert_eq!(studio.test_page(), "consent", "{}", studio.test_notice());
+        assert!(!studio.test_notice().to_lowercase().contains("cancelled"));
+        assert_eq!(after["discovery"], paused_journal["discovery"]);
+        assert_eq!(after["provider"]["issued"], false);
+        let request = studio.test_prepared_request().unwrap();
+        assert_eq!(&request.id, request_id);
+        assert_eq!(
+            request.operation,
+            if modify {
+                DevelopmentOperation::Modify
+            } else {
+                DevelopmentOperation::Discover
+            }
+        );
+        if !modify {
+            assert_eq!(after["discovery"]["original"], original["original"]);
+            assert_eq!(after["discovery"]["selected"], original["selected"]);
+            assert!(after["discovery"]["discover"]["completed"].is_null());
+        }
+        click(&mut h, &mut studio, "studio.return");
+        assert!(journal(&root)["provider"].is_null());
+        assert!(studio.test_discovery_report().is_none());
+        assert_eq!(journal(&root)["discovery"], after["discovery"]);
+    } else {
+        assert!(
+            cancel_enabled && late_notice.to_lowercase().contains("cancelled"),
+            "{late_notice}"
+        );
+        assert_eq!(paused_journal["discovery"], original);
+        assert_eq!(
+            after["discovery"], original,
+            "Cancellation before disclosure publication must preserve the exact completed lineage"
+        );
+        assert!(after["provider"].is_null());
+        let mut expected = original_journal;
+        if modify {
+            expected["need"] = serde_json::json!(new_need);
+        }
+        assert_eq!(
+            after, expected,
+            "Only the explicitly typed new need may be retained before publication"
+        );
+        if modify {
+            assert_eq!(studio.test_page(), "home");
+            let recent = first_control(&mut h, &mut studio, "studio.recent.");
+            click(&mut h, &mut studio, &recent);
+        } else {
+            click(&mut h, &mut studio, "studio.return");
+        }
+        click(&mut h, &mut studio, "studio.reopen-discovery");
+        assert_eq!(
+            format!(
+                "{:?}",
+                studio
+                    .test_discovery_report()
+                    .expect("The old exact complete report must remain available")
+            ),
+            report
+        );
+        assert_eq!(journal(&root)["discovery"], original);
+    }
+    assert_eq!(
+        report_job_artifacts(&root),
+        prepared_jobs,
+        "Navigation must not invoke, resend or alter the prepared job"
+    );
+    assert_eq!(store.load().unwrap(), saved);
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelled_discover_disclosure_preserves_completed_lineage_and_report() {
+    replacement_disclosure_publication(false, false);
+}
+#[cfg(unix)]
+#[test]
+fn published_discover_disclosure_refuses_late_cancel_without_invoking() {
+    replacement_disclosure_publication(false, true);
+}
+#[cfg(unix)]
+#[test]
+fn cancelled_modify_disclosure_preserves_completed_lineage_and_report() {
+    replacement_disclosure_publication(true, false);
+}
+#[cfg(unix)]
+#[test]
+fn published_modify_disclosure_refuses_late_cancel_without_invoking() {
+    replacement_disclosure_publication(true, true);
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelled_candidate_selection_before_publication_preserves_exact_lineage_and_report() {
+    use std::sync::{atomic::Ordering, Arc};
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let pause = Arc::new(product_studio::TestPause::default());
+    pause.release.store(true, Ordering::Release);
+    let (mut studio, store, mut h, report) = completed_two_candidate_report(
+        &root,
+        TestHooks {
+            before_discovery_publication: Some(pause.clone()),
+            ..Default::default()
+        },
+    );
+    let saved = store.load().unwrap();
+    let record = journal(&root)["discovery"].clone();
+    let exact_journal = fs::read(root.join("studio/session.json")).unwrap();
+    let jobs = report_job_artifacts(&root);
+    let current = studio.test_current_trial().unwrap().clone();
+    let alternative = studio.test_alternative().cloned();
+    pause_copied_publication(
+        &mut h,
+        &mut studio,
+        &pause,
+        "studio.modified-candidate.other",
+    );
+    click(&mut h, &mut studio, "studio.cancel");
+    pause.release.store(true, Ordering::Release);
+    assert_eq!(
+        fs::read(root.join("studio/session.json")).unwrap(),
+        exact_journal,
+        "A cancellation accepted before candidate publication must keep the exact old journal"
+    );
+    assert_eq!(journal(&root)["discovery"], record);
+    assert_eq!(studio.test_current_trial().unwrap(), &current);
+    assert_eq!(studio.test_alternative(), alternative.as_ref());
+    assert_eq!(store.load().unwrap(), saved);
+    assert!(frame(&mut h, &mut studio).controls["studio.modified-candidate.other"].enabled);
+    click(&mut h, &mut studio, "studio.return");
+    click(&mut h, &mut studio, "studio.reopen-discovery");
+    assert_eq!(
+        format!(
+            "{:?}",
+            studio
+                .test_discovery_report()
+                .expect("The prior exact report must remain available")
+        ),
+        report
+    );
+    assert_eq!(journal(&root)["discovery"], record);
+    assert_eq!(report_job_artifacts(&root), jobs);
+    assert_eq!(store.load().unwrap(), saved);
+}
+
+#[cfg(unix)]
+#[test]
+fn published_candidate_selection_refuses_late_cancel_and_finishes_truthfully() {
+    use std::sync::{atomic::Ordering, Arc};
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let (mut studio, store, mut h, _) = completed_two_candidate_report(&root, TestHooks::default());
+    let saved = store.load().unwrap();
+    let original = journal(&root)["discovery"]["original"].clone();
+    let jobs = report_job_artifacts(&root);
+    let pause = Arc::new(product_studio::TestPause::default());
+    let observer = product_studio::journal_testing::after_publish(&root, {
+        let pause = pause.clone();
+        move |bytes| {
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            if value["discovery"]["selected"] == "other" {
+                // The ordinary atomic rename has already happened. This hook
+                // observes actual publication and never substitutes its result.
+                pause.reached.store(true, Ordering::Release);
+                let start = Instant::now();
+                while !pause.release.load(Ordering::Acquire) {
+                    if start.elapsed() > Duration::from_secs(120) {
+                        return Err("Test did not release the actual journal publication".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+            Ok(())
+        }
+    });
+    pause_copied_publication(
+        &mut h,
+        &mut studio,
+        &pause,
+        "studio.modified-candidate.other",
+    );
+    let cancel_enabled = frame(&mut h, &mut studio).controls["studio.cancel"].enabled;
+    let accepted = studio.test_cancel();
+    let late_notice = studio.test_notice().to_owned();
+    let published = journal(&root)["discovery"].clone();
+    // Release before asserting so a failing regression never strands the worker.
+    pause.release.store(true, Ordering::Release);
+    settle(&mut studio);
+    drop(observer);
+    assert_eq!(published["selected"], "other");
+    assert!(!accepted && !cancel_enabled,
+        "An already published selection cannot accept cancellation: enabled={cancel_enabled}, accepted={accepted}, notice={late_notice}");
+    assert!(late_notice.contains("completion boundary"), "{late_notice}");
+    assert!(!studio.test_notice().to_lowercase().contains("cancelled"));
+    assert_eq!(journal(&root)["discovery"], published);
+    assert_eq!(published["original"], original);
+    assert!(published["discover"].is_null());
+    let controls = frame(&mut h, &mut studio);
+    assert!(!controls.controls["studio.modified-candidate.other"].enabled);
+    assert!(controls.controls["studio.modified-candidate.primary"].enabled);
+    assert_eq!(store.load().unwrap(), saved);
+    click(&mut h, &mut studio, "studio.return");
+    click(&mut h, &mut studio, "studio.reopen-discovery");
+    assert_eq!(studio.test_page(), "change");
+    assert!(studio.test_discovery_report().is_none());
+    assert_eq!(report_job_artifacts(&root), jobs);
+    assert_eq!(store.load().unwrap(), saved);
+}
+
+#[cfg(unix)]
+#[test]
+fn revoked_exercised_feature_result_is_described_truthfully_without_restoring_acceptance() {
+    use std::sync::{atomic::Ordering, Arc};
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let pause = Arc::new(product_studio::TestPause::default());
+    pause.release.store(true, Ordering::Release);
+    let (mut studio, store, mut h, _) = accepted_feature_case(
+        &root,
+        TestHooks {
+            before_discovery_publication: Some(pause.clone()),
+            ..Default::default()
+        },
+    );
+    let saved = store.load().unwrap();
+    let exercised = studio.test_feature_run().unwrap().clone();
+    assert!(exercised
+        .history
+        .events
+        .iter()
+        .any(|e| e.action == "collect_new"));
+    pause_copied_publication(
+        &mut h,
+        &mut studio,
+        &pause,
+        "feature-candidate.action.collect_new_button",
+    );
+    click(&mut h, &mut studio, "studio.cancel");
+    pause.release.store(true, Ordering::Release);
+    assert_eq!(studio.test_feature_run().unwrap(), &exercised);
+    let rendered = frame(&mut h, &mut studio);
+    assert!(!rendered.controls["studio.feature.accept.observed.selected_count"].enabled);
+    assert!(journal(&root)["discovery"]["accepted_case"].is_null());
+    studio.test_reissue_displayed_feature_acceptance("observed.selected_count");
+    settle(&mut studio);
+    assert!(journal(&root)["discovery"]["accepted_case"].is_null());
+    assert_eq!(store.load().unwrap(), saved);
+    assert!(
+        !rendered
+            .text
+            .iter()
+            .any(|text| text.contains("No newly added action has been exercised")),
+        "The retained actual event cannot be described as never exercised: {:?}",
+        rendered.text
+    );
+    assert!(
+        rendered
+            .text
+            .iter()
+            .any(|text| text.contains("acceptance was revoked")),
+        "{:?}",
+        rendered.text
+    );
 }

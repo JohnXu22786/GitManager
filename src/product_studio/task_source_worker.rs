@@ -27,6 +27,16 @@ struct Completed {
 }
 impl Worker {
     #[cfg(test)]
+    fn pause_task_lineage_publication(&self, gate: &Gate) {
+        if let Some(pause) = &self.config.hooks.before_task_lineage_publish {
+            pause.reached.store(true, Ordering::Release);
+            while !pause.release.load(Ordering::Acquire) && !gate.cancelled.load(Ordering::Acquire)
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+    #[cfg(test)]
     fn pause_task_review_publication(&self, after: bool) {
         let pause = if after {
             &self.config.hooks.after_task_review_publish
@@ -297,7 +307,15 @@ impl Worker {
             .as_ref()
             .and_then(|j| j.value.discovery.as_ref())
             .is_some_and(|r| r.external.is_some());
+        let choices = task_source_flow::task_choices().map_err(error)?;
         gate.check()?;
+        #[cfg(test)]
+        self.pause_task_lineage_publication(gate);
+        self.current(key)?;
+        super::super::task_source_machine::registered_task(&link)?;
+        // The association and its old uncommitted analysis are replaced by one
+        // durable write. Cancellation cannot succeed once that write begins.
+        gate.commit()?;
         self.journal(|j| {
             j.task = Some(link);
             if supersedes_discovery {
@@ -316,7 +334,7 @@ impl Worker {
             ..Default::default()
         };
         self.task.view.linked = true;
-        self.task.view.choices = task_source_flow::task_choices().map_err(error)?;
+        self.task.view.choices = choices;
         self.poll_task(gate)
     }
     /// An explicit task entry/selection can retry interrupted copied analysis.
@@ -870,7 +888,37 @@ impl Worker {
             .as_ref()
             .and_then(|j| j.value.discovery.as_ref())
             .is_some_and(|r| r.external.is_some());
+        let root = self.task_root()?;
+        #[cfg(test)]
+        let product_executable = self
+            .config
+            .hooks
+            .task_product_executable
+            .clone()
+            .unwrap_or(std::env::current_exe().map_err(error)?);
+        #[cfg(not(test))]
+        let product_executable = std::env::current_exe().map_err(error)?;
         gate.check()?;
+        #[cfg(test)]
+        self.pause_task_lineage_publication(gate);
+        self.current(key)?;
+        self.check_task_key(key)?;
+        fresh_flow
+            .as_ref()
+            .or(self.task.flow.as_ref())
+            .ok_or("Linked source unavailable")?
+            .analyze(&disclosure.request.sources[0], &gate.cancelled, |_| Ok(()))
+            .map_err(error)?;
+        let fresh_task = super::super::task_source_machine::registered_task(&link)?;
+        if fresh_task.provider_ref != task.provider_ref
+            || fresh_task.session_ref != task.session_ref
+        {
+            return Err("The registered task provider changed before authorization; the previous request was kept".into());
+        }
+        // This commits the explicitly authorized association, before the
+        // required journal-first ticket preparation. It does not bypass any
+        // of the independent ticket/source/registry checks before launch.
+        gate.commit()?;
         self.journal(|j| {
             j.need = original_need.clone();
             if supersedes_discovery {
@@ -897,7 +945,6 @@ impl Worker {
         }
         self.task.ready = None;
         self.task.view.consent = None;
-        let root = self.task_root()?;
         crate::product_locations::Folder::ensure(&root).map_err(error)?;
         let invocation = self
             .task
@@ -915,15 +962,6 @@ impl Worker {
             .ok_or("Prepared task lost its pending ticket")?
             .clone();
         self.journal(|j| j.task.as_mut().unwrap().external.as_mut().unwrap().pending = pending)?;
-        #[cfg(test)]
-        let product_executable = self
-            .config
-            .hooks
-            .task_product_executable
-            .clone()
-            .unwrap_or(std::env::current_exe().map_err(error)?);
-        #[cfg(not(test))]
-        let product_executable = std::env::current_exe().map_err(error)?;
         let bundle = ProductTaskBundle {
             task_id: link.task_id.clone(),
             request_id: invocation.request().id.clone(),
@@ -971,6 +1009,7 @@ impl Worker {
         checked
             .reopen_external(&root, &gate.cancelled, &AtomicBool::new(false))
             .map_err(error)?;
+        self.current(key)?;
         self.task.flow = Some(checked);
         self.journal(|j| {
             j.task
@@ -981,7 +1020,6 @@ impl Worker {
                 .unwrap()
                 .launch_attempted = true
         })?;
-        gate.commit()?;
         let session = harness.start_product_task(&task, &bundle).map_err(|e| format!("Harness launch failed or its outcome is uncertain. The exact request is retained; no automatic relaunch will occur. {e}"))?;
         registry.record_provider_start(&task.id, task.provider_ref.as_deref(), task.session_ref.as_deref(), harness.provider_ref(), session.as_deref()).map_err(|e| format!("Harness launch was requested, but recording its session failed. Do not relaunch blindly: {e}"))?;
         self.task.view.source = self.task.flow.as_ref().map(TaskSourceFlow::view);
