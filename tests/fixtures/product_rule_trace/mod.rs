@@ -321,17 +321,26 @@ fn copy(
         )
         .unwrap()
 }
-fn assert_no_authority(draft: &ChangeDraft) {
+fn assert_revoked_choices(draft: &ChangeDraft) {
     assert!(
         draft.scenes.is_none(),
         "Failed or cancelled work retained accepted scenes"
     );
-    let view = draft.view().unwrap();
     assert!(
-        view.alternative.is_none(),
-        "A failed comparison still displays an alternative as usable"
+        draft.choices_revoked,
+        "The actual receiver must revoke choices"
     );
+    let view = draft.view().unwrap();
     assert!(!view.can_accept && !view.can_keep_current && !view.can_retain);
+}
+fn assert_no_authority(draft: &ChangeDraft) {
+    assert_revoked_choices(draft);
+    // A rejected import clears its speculative alternative. Trial failure has
+    // a different contract: preserve published copied models for correction.
+    assert!(
+        draft.view().unwrap().alternative.is_none(),
+        "A failed import retained its alternative model"
+    );
 }
 
 pub fn imported_trace_keeps_observations_and_created_ids() {
@@ -485,37 +494,122 @@ pub fn trial_keeps_an_existing_result_observation() {
 }
 
 pub fn failing_or_cancelled_trial_clears_old_authority() {
-    for cancelled in [false, true] {
-        let dir = tempdir();
-        let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
-        let row = add(&store, "existing", "Copied work");
-        let before = store.load().unwrap();
-        let mut draft = change(
-            &store,
-            program(true),
-            ScopePopulation::All,
-            "trial-revocation",
-        );
-        draft
-            .trial(
-                &store,
-                invoke("calculate", &[("row", reference(&row))]),
-                &Gate::default(),
-            )
-            .unwrap();
-        assert!(draft.scenes.is_some());
-        let gate = Gate::default();
-        if cancelled {
-            assert!(gate.cancel());
+    for wording_only in [false, true] {
+        for cancelled in [false, true] {
+            let dir = tempdir();
+            let store =
+                ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
+            let row = add(&store, "existing", "Copied work");
+            let before = store.load().unwrap();
+            let candidate = if wording_only {
+                let mut raw = serde_json::to_value(program(false).program).unwrap();
+                raw["label"] = serde_json::json!("A checked wording-only update");
+                let candidate = capture(raw);
+                assert_eq!(
+                    candidate.artifact.semantic_digest,
+                    before.program().unwrap().artifact.semantic_digest
+                );
+                assert_ne!(
+                    candidate.artifact.program_digest,
+                    before.program().unwrap().artifact.program_digest
+                );
+                candidate
+            } else {
+                program(true)
+            };
+            let mut draft = change(&store, candidate, ScopePopulation::All, "trial-revocation");
+            assert_eq!(draft.equivalent, wording_only);
+            draft
+                .trial(
+                    &store,
+                    invoke("calculate", &[("row", reference(&row))]),
+                    &Gate::default(),
+                )
+                .unwrap();
+            assert!(draft.scenes.is_some());
+            let ready = draft.view().unwrap();
+            if wording_only {
+                assert!(
+                    ready.wording_update && ready.can_accept,
+                    "The real wording shortcut was enabled before revocation"
+                );
+            } else {
+                assert!(
+                    ready.can_retain,
+                    "The real rule comparison could record a pending choice before revocation"
+                );
+            }
+            let original_target = ready.target_artifact;
+            let current = draft.current.clone();
+            let alternative = draft.alternative.clone();
+            assert!(alternative.is_some());
+            let scenario = draft.scenario.clone();
+            let trial_day = draft.trial_day;
+            let gate = Gate::default();
+            if cancelled {
+                assert!(gate.cancel());
+            }
+            let input = if cancelled {
+                invoke("export", &[])
+            } else {
+                invoke("missing-action", &[])
+            };
+            assert!(draft.trial(&store, input, &gate).is_err());
+            assert_revoked_choices(&draft);
+            assert_eq!(draft.current, current);
+            assert_eq!(draft.alternative, alternative);
+            assert_eq!(
+                draft.scenario, scenario,
+                "A refused input must not enter the retained trace"
+            );
+            assert_eq!(draft.trial_day, trial_day);
+            assert_eq!(draft.view().unwrap().target_artifact, original_target);
+            for outcome in [
+                DecisionOutcome::Accept {
+                    artifact: original_target.clone(),
+                },
+                DecisionOutcome::KeepCurrent,
+                DecisionOutcome::EitherAcceptable,
+                DecisionOutcome::BothNeeded,
+                DecisionOutcome::NeitherFits,
+                DecisionOutcome::Deferred,
+            ] {
+                // A fresh Gate and the original displayed target rule out a
+                // cancelled Gate or invented artifact as the reason for refusal.
+                match draft.decision(&store, outcome.clone(), "late-original-choice", &Gate::default()) {
+                    Err(message) => assert!(message.contains("Try the copied work again"), "{outcome:?}: {message}"),
+                    Ok(_) => panic!("Revoked comparison accepted a late {outcome:?}; wording={wording_only}, cancelled={cancelled}"),
+                }
+                assert_eq!(store.load().unwrap(), before);
+            }
+            let retry = invoke("export", &[]);
+            let mut expected_inputs = scenario.inputs;
+            expected_inputs.push(retry.clone());
+            draft.trial(&store, retry, &Gate::default()).unwrap();
+            assert_eq!(
+                draft.scenario.inputs, expected_inputs,
+                "Corrected retry must execute exactly once on the retained copied trace"
+            );
+            assert!(draft.scenes.is_some() && !draft.choices_revoked);
+            let fresh = draft.view().unwrap();
+            let outcome = if wording_only {
+                assert!(fresh.wording_update && fresh.can_accept);
+                DecisionOutcome::Accept {
+                    artifact: fresh.target_artifact,
+                }
+            } else {
+                assert!(fresh.can_retain);
+                DecisionOutcome::EitherAcceptable
+            };
+            draft
+                .decision(&store, outcome, "fresh-replayed-choice", &Gate::default())
+                .unwrap();
+            assert_eq!(
+                store.load().unwrap(),
+                before,
+                "Rehearsal and choice preparation must not adopt or mutate saved work"
+            );
         }
-        let input = if cancelled {
-            invoke("export", &[])
-        } else {
-            invoke("missing-action", &[])
-        };
-        assert!(draft.trial(&store, input, &gate).is_err());
-        assert_no_authority(&draft);
-        assert_eq!(store.load().unwrap(), before);
     }
 }
 
