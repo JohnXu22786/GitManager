@@ -107,7 +107,7 @@ impl RuleSelection {
 pub(super) struct RuleDiscoveryDraft {
     selection: RuleSelection,
     modify_request: DevelopmentRequest,
-    modify_result: DevelopmentResult,
+    modify_result: Option<DevelopmentResult>,
     request: DevelopmentRequest,
 }
 impl RuleDiscoveryDraft {
@@ -123,22 +123,7 @@ impl RuleDiscoveryDraft {
         need: &str,
         cancelled: Arc<AtomicBool>,
     ) -> Result<Self> {
-        selection.check(store, &selection, &cancelled)?;
-        modify_request.validate().map_err(error)?;
         modify_result.validate_for(&modify_request).map_err(error)?;
-        if &selection.basis != basis
-            || modify_request.operation != DevelopmentOperation::Modify
-            || modify_request.sources.last() != Some(basis.program().map_err(error)?)
-            || modify_request.project_id != basis.data.project_id
-            || modify_request.decisions != basis.decisions
-            || modify_request.context.data_digest.as_ref()
-                != Some(&basis.data.identity().map_err(error)?)
-            || modify_request.context.session_digest.as_ref()
-                != Some(&basis.session.identity().map_err(error)?)
-            || id == modify_request.id
-        {
-            return Err("Discovery needs the exact completed Modify request and a distinct request identity".into());
-        }
         let authored = modify_result
             .response
             .candidates
@@ -152,6 +137,68 @@ impl RuleDiscoveryDraft {
             None,
         )
         .map_err(error)?;
+        Self::from_authored(
+            store,
+            basis,
+            modify_request,
+            Some(modify_result),
+            authored,
+            selection,
+            id,
+            need,
+            cancelled,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn after_external(
+        store: &ProductStore,
+        basis: &ProjectSnapshot,
+        original: DevelopmentRequest,
+        authored: CapturedProgram,
+        selection: RuleSelection,
+        id: &str,
+        need: &str,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<Self> {
+        super::discovery_flow::check_external_origin(basis, &original, &authored)?;
+        Self::from_authored(
+            store, basis, original, None, authored, selection, id, need, cancelled,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn from_authored(
+        store: &ProductStore,
+        basis: &ProjectSnapshot,
+        modify_request: DevelopmentRequest,
+        modify_result: Option<DevelopmentResult>,
+        authored: CapturedProgram,
+        selection: RuleSelection,
+        id: &str,
+        need: &str,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<Self> {
+        selection.check(store, &selection, &cancelled)?;
+        modify_request.validate().map_err(error)?;
+        if &selection.basis != basis
+            || modify_request.operation != DevelopmentOperation::Modify
+            || !modify_request
+                .sources
+                .contains(basis.program().map_err(error)?)
+            || (modify_result.is_some()
+                && modify_request.sources.last() != Some(basis.program().map_err(error)?))
+            || modify_request.project_id != basis.data.project_id
+            || modify_request.decisions != basis.decisions
+            || modify_request.context.data_digest.as_ref()
+                != Some(&basis.data.identity().map_err(error)?)
+            || modify_request.context.session_digest.as_ref()
+                != Some(&basis.session.identity().map_err(error)?)
+            || id == modify_request.id
+            || need.trim().is_empty()
+        {
+            return Err(
+                "Discovery needs the exact original change and a distinct request identity".into(),
+            );
+        }
         if &authored != selection.prepared.candidate() {
             return Err("The prepared rule is not the actual returned Modify source".into());
         }
@@ -191,11 +238,33 @@ impl RuleDiscoveryDraft {
     pub fn request(&self) -> &DevelopmentRequest {
         &self.request
     }
+    pub fn with_selected_example(mut self, example: SelectedScenario) -> Result<Self> {
+        if example.disclosure != Disclosure::ExplicitlySelected
+            || example.scenario.validity.is_empty()
+        {
+            return Err("A feature example needs explicitly selected typed result evidence".into());
+        }
+        example
+            .scenario
+            .validate(&self.request.sources[1].program)
+            .map_err(error)?;
+        if self
+            .request
+            .examples
+            .iter()
+            .any(|e| e.scenario.id == example.scenario.id)
+        {
+            return Err("The selected feature example duplicates an inherited identity".into());
+        }
+        self.request.examples.push(example);
+        self.request.validate().map_err(error)?;
+        Ok(self)
+    }
     pub fn modify_request(&self) -> &DevelopmentRequest {
         &self.modify_request
     }
-    pub fn modify_result(&self) -> &DevelopmentResult {
-        &self.modify_result
+    pub fn modify_result(&self) -> Option<&DevelopmentResult> {
+        self.modify_result.as_ref()
     }
     pub fn selection(&self) -> &RuleSelection {
         &self.selection

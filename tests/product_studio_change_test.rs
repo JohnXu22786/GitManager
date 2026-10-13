@@ -3881,6 +3881,58 @@ fn comparison_panes_serialize_inputs_before_context_transitions() {
             studio.test_current_trial().unwrap().observation.controls["number_input"],
             DataValue::Integer { value: 3 }
         );
+        assert_eq!(
+            studio
+                .test_alternative()
+                .expect("Cancelled input keeps the alternative copy")
+                .observation
+                .controls["number_input"],
+            DataValue::Integer { value: 3 }
+        );
+        assert_eq!(store.load().unwrap(), before);
+        // Retry must apply the newer buffered value, not the cancelled value
+        // or the old observed model. Then exercise the discard path separately.
+        click(
+            &mut h,
+            &mut studio,
+            &format!("{owner}.control.number_input.retry"),
+        );
+        for model in [
+            studio.test_current_trial().unwrap(),
+            studio.test_alternative().unwrap(),
+        ] {
+            assert_eq!(
+                model.observation.controls["number_input"],
+                DataValue::Integer { value: 5 }
+            );
+        }
+        click(
+            &mut h,
+            &mut studio,
+            &format!("{owner}.control.number_input"),
+        );
+        pause.reached.store(false, Ordering::Release);
+        pause.release.store(false, Ordering::Release);
+        edit(&mut h, &mut studio, "6");
+        let start = Instant::now();
+        while !pause.reached.load(Ordering::Acquire) {
+            studio.poll();
+            assert!(start.elapsed() < Duration::from_secs(120));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        edit(&mut h, &mut studio, "7");
+        click(&mut h, &mut studio, "studio.cancel");
+        pause.release.store(true, Ordering::Release);
+        blocked(&frame(&mut h, &mut studio), owner, other);
+        for model in [
+            studio.test_current_trial().unwrap(),
+            studio.test_alternative().unwrap(),
+        ] {
+            assert_eq!(
+                model.observation.controls["number_input"],
+                DataValue::Integer { value: 5 }
+            );
+        }
         click(
             &mut h,
             &mut studio,
@@ -4683,6 +4735,22 @@ fn comparison_form_drafts_block_both_panes_and_scoped_transitions() {
         pause.release.store(true, Ordering::Release);
         assert_eq!(studio.test_current_trial().unwrap(), &current);
         assert_eq!(studio.test_alternative().unwrap(), &alternative);
+        let cancelled = frame(&mut h, &mut studio);
+        for pane in [owner, other] {
+            assert!(
+                cancelled
+                    .controls
+                    .contains_key(&format!("{pane}.field.name")),
+                "Cancellation must retain both copied forms"
+            );
+        }
+        for key in choices {
+            assert!(
+                !cancelled.controls[key].enabled,
+                "A retained form is not choice authority: {key}"
+            );
+        }
+        assert_eq!(store.load().unwrap(), before);
         assert!(!frame(&mut h, &mut studio).controls["studio.scope.future"].enabled);
         click(&mut h, &mut studio, &format!("{owner}.submit"));
         for model in [
@@ -4736,4 +4804,71 @@ fn comparison_form_drafts_block_both_panes_and_scoped_transitions() {
         click(&mut h, &mut studio, "studio.return");
         assert_eq!(store.load().unwrap(), daily_basis);
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelled_wording_trial_rejects_late_adoption_until_fresh_replay() {
+    use std::sync::{atomic::Ordering, Arc};
+    let dir = tempdir();
+    let root = dir.path();
+    let path = root.join("tool");
+    let original = other_shape::capture(other_shape::organizer());
+    let mut raw = other_shape::organizer();
+    raw["label"] = serde_json::json!("A separately checked wording update");
+    let candidate = other_shape::capture(raw);
+    assert_eq!(
+        original.artifact.semantic_digest,
+        candidate.artifact.semantic_digest
+    );
+    let store = ProductStore::create(&path, &original, 20000).unwrap();
+    let saved = store.load().unwrap();
+    let pause = Arc::new(product_studio::TestPause::default());
+    pause.release.store(true, Ordering::Release);
+    let mut studio = ProductStudio::testing(
+        root.into(),
+        Some(transport(root, &candidate)),
+        TestHooks {
+            before_preview: Some(pause.clone()),
+            ..Default::default()
+        },
+    );
+    settle(&mut studio);
+    change(&mut studio, &path);
+    let mut h = egui_harness::EguiHarness::new(egui::vec2(1600.0, 2400.0));
+    assert!(frame(&mut h, &mut studio).controls["studio.accept"].enabled);
+    let current = studio.test_current_trial().unwrap().clone();
+    let alternative = studio.test_alternative().unwrap().clone();
+    let artifact = alternative.program.identity().unwrap();
+    assert_eq!(artifact, candidate.artifact.program_digest);
+    press_until_paused(&mut h, &mut studio, &pause, "current.navigate.new_person");
+    click(&mut h, &mut studio, "studio.cancel");
+    pause.release.store(true, Ordering::Release);
+    assert!(!frame(&mut h, &mut studio).controls["studio.accept"].enabled);
+    // A late command carries the real previously displayed artifact. Disabled
+    // widgets alone cannot protect the worker's equivalent-wording shortcut.
+    studio.test_decide_exact(DecisionOutcome::Accept { artifact });
+    settle(&mut studio);
+    assert_eq!(
+        store.load().unwrap(),
+        saved,
+        "Cancelled wording work must revoke final adoption, not only the visible button"
+    );
+    assert_eq!(studio.test_page(), "change");
+    assert_eq!(studio.test_current_trial().unwrap(), &current);
+    assert_eq!(studio.test_alternative().unwrap(), &alternative);
+    let retained = frame(&mut h, &mut studio);
+    assert!(retained.controls["current.navigate.new_person"].enabled);
+    assert!(retained.controls["alternative.navigate.new_person"].enabled);
+    assert!(!retained.controls["studio.accept"].enabled);
+    click(&mut h, &mut studio, "alternative.navigate.new_person");
+    assert!(frame(&mut h, &mut studio).controls["studio.accept"].enabled);
+    click(&mut h, &mut studio, "studio.accept");
+    let after = store.load().unwrap();
+    assert_eq!(
+        after.program().unwrap().program.label,
+        "A separately checked wording update"
+    );
+    assert_eq!(after.data, saved.data);
+    assert_eq!(after.decisions, saved.decisions);
 }

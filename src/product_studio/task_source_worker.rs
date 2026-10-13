@@ -8,7 +8,7 @@ use task_source_flow::{ExternalStatus, SourceAnalysis, SourceStatus, TaskSourceF
 pub(super) struct State {
     pub flow: Option<TaskSourceFlow>,
     pub view: task_source_host::View,
-    ready: Option<(task_source_host::Disclosure, Basis, u64)>,
+    ready: Option<(task_source_host::Disclosure, Basis, u64, String)>,
     queued: Option<SourceAnalysis<ChangeDraft>>,
     completed: Option<Completed>,
     attempted: Option<(SourceBinding, Basis)>,
@@ -21,10 +21,21 @@ pub(super) struct State {
 struct Completed {
     capture: CapturedProgram,
     request: DevelopmentRequest,
+    original_need: Option<String>,
     basis: Basis,
     verified: bool,
 }
 impl Worker {
+    #[cfg(test)]
+    fn pause_task_lineage_publication(&self, gate: &Gate) {
+        if let Some(pause) = &self.config.hooks.before_task_lineage_publish {
+            pause.reached.store(true, Ordering::Release);
+            while !pause.release.load(Ordering::Acquire) && !gate.cancelled.load(Ordering::Acquire)
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
     #[cfg(test)]
     fn pause_task_review_publication(&self, after: bool) {
         let pause = if after {
@@ -60,6 +71,11 @@ impl Worker {
     }
     pub(super) fn task_view(&self) -> task_source_host::View {
         let mut view = self.task.view.clone();
+        view.relink_supersedes_discovery = self
+            .journal
+            .as_ref()
+            .and_then(|j| j.value.discovery.as_ref())
+            .is_some_and(|r| r.external.is_some());
         if self.task_matches_open() {
             view.linked = true;
             view.link = self.task_link().ok().map(task_source_host::Link::from);
@@ -138,6 +154,7 @@ impl Worker {
             self.task.completed = Some(Completed {
                 capture: completed.capture.clone(),
                 request: completed.external.pending.request().clone(),
+                original_need: completed.external.original_need.clone(),
                 basis: completed.external.basis.clone(),
                 verified: false,
             });
@@ -285,15 +302,39 @@ impl Worker {
             external: None,
             completed: None,
         };
+        let supersedes_discovery = self
+            .journal
+            .as_ref()
+            .and_then(|j| j.value.discovery.as_ref())
+            .is_some_and(|r| r.external.is_some());
+        let choices = task_source_flow::task_choices().map_err(error)?;
         gate.check()?;
-        self.journal(|j| j.task = Some(link))?;
+        #[cfg(test)]
+        self.pause_task_lineage_publication(gate);
+        self.current(key)?;
+        super::super::task_source_machine::registered_task(&link)?;
+        // The association and its old uncommitted analysis are replaced by one
+        // durable write. Cancellation cannot succeed once that write begins.
+        gate.commit()?;
+        self.journal(|j| {
+            j.task = Some(link);
+            if supersedes_discovery {
+                j.discovery = None;
+            }
+        })?;
+        if supersedes_discovery {
+            self.discovery = None;
+            self.feature = None;
+            self.change = None;
+            self.notice = "Your explicit task selection superseded the old uncommitted Discover analysis. Saved choices and business work were kept. No new author request was authorized".into();
+        }
         self.task = State {
             focused: self.task.focused.clone(),
             flow: Some(flow),
             ..Default::default()
         };
         self.task.view.linked = true;
-        self.task.view.choices = task_source_flow::task_choices().map_err(error)?;
+        self.task.view.choices = choices;
         self.poll_task(gate)
     }
     /// An explicit task entry/selection can retry interrupted copied analysis.
@@ -322,6 +363,7 @@ impl Worker {
         if saved.capture != completed.capture
             || saved.external.pending.request() != &completed.request
             || saved.external.basis != completed.basis
+            || saved.external.original_need != completed.original_need
         {
             return Err("The completed source or its original request context changed".into());
         }
@@ -349,6 +391,7 @@ impl Worker {
         self.queue_task_review(
             completed.capture,
             Some(completed.request),
+            completed.original_need,
             Some(&completed.basis),
             gate,
         )?;
@@ -363,6 +406,7 @@ impl Worker {
         &mut self,
         capture: CapturedProgram,
         request: Option<DevelopmentRequest>,
+        original_need: Option<String>,
         expected: Option<&Basis>,
         gate: &Gate,
     ) -> Result<(), String> {
@@ -377,10 +421,17 @@ impl Worker {
             self.task.queued = None;
             return Err("Saved data or intentions changed while the external task was working. Its earlier evidence is stale; return to saved work before a fresh review".into());
         }
-        let need = request
-            .as_ref()
-            .map(|r| r.request.clone())
-            .unwrap_or_else(|| "Review the actual complete edits in the linked task".into());
+        if let (Some(request), Some(need)) = (&request, &original_need) {
+            discovery_host::verify_original_need(
+                &current.store,
+                &fresh,
+                request,
+                need,
+                true,
+                gate,
+            )?;
+        }
+        let need = original_need.unwrap_or_else(|| "Original human need unavailable. Review the actual complete edits in the linked task".into());
         let flow = self.task.flow.as_ref().ok_or("Linked source unavailable")?;
         let checked = flow
             .analyze(&capture, &gate.cancelled, |capture| {
@@ -398,7 +449,7 @@ impl Worker {
                     .map_err(AdapterError::Failed)?;
                 change.request = request;
                 change
-                    .prepare(&current.store, gate)
+                    .prepare_for_discovery(&current.store, gate)
                     .map_err(AdapterError::Failed)?;
                 change
                     .checked_view(&current.store, gate)
@@ -497,17 +548,26 @@ impl Worker {
                             );
                             self.task.terminal_write_blocked = true;
                             self.task.queued = None;
+                            if self
+                                .journal
+                                .as_ref()
+                                .is_some_and(JournalFile::writes_blocked)
+                            {
+                                return Err(format!("Completed-source publication is unresolved. The exact original ticket and files were kept for a fresh checked reopen; do not repeat the author request. {e}"));
+                            }
                             return Err(format!("Completed source was not admitted; original pending request was kept. {e}"));
                         }
                         self.task.completed = Some(Completed {
                             capture: edit.capture().clone(),
                             request: edit.request().clone(),
+                            original_need: external.original_need.clone(),
                             basis: external.basis.clone(),
                             verified: true,
                         });
                         if let Err(e) = self.queue_task_review(
                             edit.capture().clone(),
                             Some(edit.request().clone()),
+                            external.original_need.clone(),
                             Some(&external.basis),
                             gate,
                         ) {
@@ -558,7 +618,7 @@ impl Worker {
                 // Unsupported unchanged input is attempted only once per basis.
                 if self.task.attempted.as_ref() != Some(&attempt) {
                     self.task.attempted = Some(attempt.clone());
-                    if let Err(e) = self.queue_task_review(capture, None, None, gate) {
+                    if let Err(e) = self.queue_task_review(capture, None, None, None, gate) {
                         if gate.cancelled.load(Ordering::Acquire)
                             && self.task.attempted.as_ref() == Some(&attempt)
                         {
@@ -610,6 +670,35 @@ impl Worker {
         self.pause_task_review_publication(false);
         if !gate.finish() {
             return Err("Task review was cancelled; the previous page was kept".into());
+        }
+        if let Some(completed) = self.task_link()?.completed.as_ref().filter(|c| {
+            c.capture == draft.candidate
+                && draft.request.as_ref() == Some(c.external.pending.request())
+        }) {
+            if let Some(need) = &completed.external.original_need {
+                let record = discovery_host::Record::external(
+                    current.association.clone(),
+                    Basis::capture(&draft.snapshot)?,
+                    need.clone(),
+                    completed,
+                    &draft,
+                )?;
+                let same_origin = self
+                    .journal
+                    .as_ref()
+                    .and_then(|j| j.value.discovery.as_ref())
+                    .is_some_and(|old| {
+                        old.tool == record.tool
+                            && old.basis == record.basis
+                            && old.need == record.need
+                            && old.original_request().ok() == record.original_request().ok()
+                            && old.candidate().ok() == record.candidate().ok()
+                    });
+                if !same_origin {
+                    self.journal(|j| j.discovery = Some(record))?;
+                    self.discovery = None;
+                }
+            }
         }
         self.task.evidence = Some((draft.operation.clone(), evidence));
         self.change = Some(draft);
@@ -708,7 +797,7 @@ impl Worker {
         if !gate.finish() {
             return Err("Task request was cancelled; the previous exact consent was kept".into());
         }
-        self.task.ready = Some((disclosure.clone(), basis, key.epoch));
+        self.task.ready = Some((disclosure.clone(), basis, key.epoch, need.into()));
         self.task.view.consent = Some(disclosure);
         self.page = Page::Tasks {
             basis: key.basis.clone().unwrap(),
@@ -737,7 +826,7 @@ impl Worker {
         }
         self.check_task_key(key)?;
         let current = self.current(key)?;
-        let (disclosure, basis, epoch) = self
+        let (disclosure, basis, epoch, original_need) = self
             .task
             .ready
             .as_ref()
@@ -769,7 +858,9 @@ impl Worker {
             return Err(availability.message);
         }
         let disclosure = disclosure.clone();
+        let original_need = original_need.clone();
         let external = ExternalAssociation {
+            original_need: Some(original_need.clone()),
             pending: task_source_flow::PendingExternal::unissued(disclosure.request.clone())
                 .map_err(error)?,
             basis: basis.clone(),
@@ -792,19 +883,68 @@ impl Worker {
         } else {
             None
         };
+        let supersedes_discovery = self
+            .journal
+            .as_ref()
+            .and_then(|j| j.value.discovery.as_ref())
+            .is_some_and(|r| r.external.is_some());
+        let root = self.task_root()?;
+        #[cfg(test)]
+        let product_executable = self
+            .config
+            .hooks
+            .task_product_executable
+            .clone()
+            .unwrap_or(std::env::current_exe().map_err(error)?);
+        #[cfg(not(test))]
+        let product_executable = std::env::current_exe().map_err(error)?;
         gate.check()?;
+        #[cfg(test)]
+        self.pause_task_lineage_publication(gate);
+        self.current(key)?;
+        self.check_task_key(key)?;
+        fresh_flow
+            .as_ref()
+            .or(self.task.flow.as_ref())
+            .ok_or("Linked source unavailable")?
+            .analyze(&disclosure.request.sources[0], &gate.cancelled, |_| Ok(()))
+            .map_err(error)?;
+        let fresh_task = super::super::task_source_machine::registered_task(&link)?;
+        if fresh_task.provider_ref != task.provider_ref
+            || fresh_task.session_ref != task.session_ref
+        {
+            return Err("The registered task provider changed before authorization; the previous request was kept".into());
+        }
+        // This commits the explicitly authorized association, before the
+        // required journal-first ticket preparation. It does not bypass any
+        // of the independent ticket/source/registry checks before launch.
+        gate.commit()?;
         self.journal(|j| {
-            j.need = disclosure.request.request.clone();
+            j.need = original_need.clone();
+            if supersedes_discovery {
+                j.discovery = None;
+            }
             let task = j.task.as_mut().unwrap();
             task.external = Some(external);
             task.completed = None;
         })?;
+        // Publication is the single replacement boundary. A refused preflight
+        // preserves all old evidence; an uncertain write fences the worker.
+        if supersedes_discovery {
+            self.discovery = None;
+            self.feature = None;
+            self.change = None;
+            self.task.evidence = None;
+            self.task.queued = None;
+            self.task.completed = None;
+            self.task.view.can_review = false;
+            self.notice = "Your explicitly authorized new task request superseded the older uncommitted Discover analysis. Saved choices and business work are unchanged".into();
+        }
         if let Some(flow) = fresh_flow {
             self.task.flow = Some(flow);
         }
         self.task.ready = None;
         self.task.view.consent = None;
-        let root = self.task_root()?;
         crate::product_locations::Folder::ensure(&root).map_err(error)?;
         let invocation = self
             .task
@@ -822,15 +962,6 @@ impl Worker {
             .ok_or("Prepared task lost its pending ticket")?
             .clone();
         self.journal(|j| j.task.as_mut().unwrap().external.as_mut().unwrap().pending = pending)?;
-        #[cfg(test)]
-        let product_executable = self
-            .config
-            .hooks
-            .task_product_executable
-            .clone()
-            .unwrap_or(std::env::current_exe().map_err(error)?);
-        #[cfg(not(test))]
-        let product_executable = std::env::current_exe().map_err(error)?;
         let bundle = ProductTaskBundle {
             task_id: link.task_id.clone(),
             request_id: invocation.request().id.clone(),
@@ -878,6 +1009,7 @@ impl Worker {
         checked
             .reopen_external(&root, &gate.cancelled, &AtomicBool::new(false))
             .map_err(error)?;
+        self.current(key)?;
         self.task.flow = Some(checked);
         self.journal(|j| {
             j.task
@@ -888,7 +1020,6 @@ impl Worker {
                 .unwrap()
                 .launch_attempted = true
         })?;
-        gate.commit()?;
         let session = harness.start_product_task(&task, &bundle).map_err(|e| format!("Harness launch failed or its outcome is uncertain. The exact request is retained; no automatic relaunch will occur. {e}"))?;
         registry.record_provider_start(&task.id, task.provider_ref.as_deref(), task.session_ref.as_deref(), harness.provider_ref(), session.as_deref()).map_err(|e| format!("Harness launch was requested, but recording its session failed. Do not relaunch blindly: {e}"))?;
         self.task.view.source = self.task.flow.as_ref().map(TaskSourceFlow::view);
@@ -958,17 +1089,39 @@ impl Worker {
         self.task.view.message = "Local intake abandoned. This did not stop an independent author or undo its source edits".into();
         Ok(())
     }
-    fn check_task_key(&self, key: &Key) -> Result<(), String> {
+    pub(super) fn check_task_key(&self, key: &Key) -> Result<(), String> {
         let link = self.task_link()?;
         super::super::task_source_machine::registered_task(link)?;
+        // Bind the queued command to the same host-owned source summary that
+        // was published to the UI. After restart that summary can be a retained
+        // completion while the watcher has not settled its first capture yet.
+        // This is only a command identity fence: actual analysis/adoption still
+        // independently checks the exact captured source against the filesystem.
+        let published = self.task_view();
+        let published_source = published
+            .source
+            .as_ref()
+            .and_then(|source| source.last_capture.as_ref())
+            .map(|capture| &capture.binding);
+        #[cfg(test)]
+        {
+            let watched = self
+                .task
+                .flow
+                .as_ref()
+                .and_then(|flow| flow.last_capture())
+                .map(|source| &source.binding);
+            if watched != published_source {
+                eprintln!(
+                    "Task command source pins: clicked={:?}; host-published={:?}; watcher={:?}",
+                    key.task_source.as_ref().map(|s| s.identity()),
+                    published_source.map(|s| s.identity()),
+                    watched.map(|s| s.identity())
+                );
+            }
+        }
         if key.task.as_ref() != Some(&task_source_host::Link::from(link))
-            || key.task_source.as_ref()
-                != self
-                    .task
-                    .flow
-                    .as_ref()
-                    .and_then(|f| f.last_capture())
-                    .map(|c| &c.binding)
+            || key.task_source.as_ref() != published_source
         {
             return Err("The linked task source changed after that command was chosen. Review the current source and choose again".into());
         }

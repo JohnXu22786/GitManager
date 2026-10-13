@@ -65,6 +65,37 @@ fn capture(
     .map_err(error)
 }
 
+/// This validates identity only. The host must additionally pin the registered
+/// task and recheck its actual source before publication and final adoption.
+pub(super) fn check_external_origin(
+    basis: &ProjectSnapshot,
+    request: &DevelopmentRequest,
+    after: &CapturedProgram,
+) -> Result<()> {
+    request.validate().map_err(error)?;
+    after.validate().map_err(error)?;
+    let before = request
+        .sources
+        .first()
+        .ok_or("Missing original task baseline")?;
+    if !matches!(before.binding.producer, Producer::ExternalAuthor { .. })
+        || !matches!(after.binding.producer, Producer::ExternalAuthor { .. })
+        || before.binding.task.as_ref().map(|t| &t.task_id)
+            != after.binding.task.as_ref().map(|t| &t.task_id)
+        || after.binding.task.is_none()
+        || before.binding.program_path != after.binding.program_path
+        || after.binding.project_id != basis.data.project_id
+        || request.project_id != basis.data.project_id
+        || !request.sources.contains(basis.program().map_err(error)?)
+    {
+        return Err(
+            "External discovery needs the actual original task baseline and captured edited source"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// The shared host must preserve the existing scoped-rule route instead of
 /// discarding a prepared layer's chosen population to fit whole-design play.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -144,7 +175,7 @@ struct Side {
 pub(super) struct DiscoveryDraft {
     basis: ProjectSnapshot,
     modify_request: DevelopmentRequest,
-    modify_result: DevelopmentResult,
+    modify_result: Option<DevelopmentResult>,
     request: DevelopmentRequest,
     primary: Side,
     need: String,
@@ -162,21 +193,68 @@ impl DiscoveryDraft {
         need: &str,
         cancelled: Arc<AtomicBool>,
     ) -> std::result::Result<Self, AdmissionError> {
+        modify_result.validate_for(&modify_request).map_err(error)?;
+        let authored = capture(&modify_request, &modify_result, candidate)?;
+        Self::from_authored(
+            store,
+            basis,
+            modify_request,
+            Some(modify_result),
+            authored,
+            prepared,
+            id,
+            need,
+            cancelled,
+        )
+    }
+    /// Actual externally captured before/after source with its original request
+    /// context. There is intentionally no provider result or Modify receipt.
+    #[allow(clippy::too_many_arguments)]
+    pub fn after_external(
+        store: &ProductStore,
+        basis: &ProjectSnapshot,
+        original: DevelopmentRequest,
+        authored: CapturedProgram,
+        prepared: Option<PreparedScopedChange>,
+        id: &str,
+        need: &str,
+        cancelled: Arc<AtomicBool>,
+    ) -> std::result::Result<Self, AdmissionError> {
+        check_external_origin(basis, &original, &authored)?;
+        Self::from_authored(
+            store, basis, original, None, authored, prepared, id, need, cancelled,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn from_authored(
+        store: &ProductStore,
+        basis: &ProjectSnapshot,
+        modify_request: DevelopmentRequest,
+        modify_result: Option<DevelopmentResult>,
+        authored: CapturedProgram,
+        prepared: Option<PreparedScopedChange>,
+        id: &str,
+        need: &str,
+        cancelled: Arc<AtomicBool>,
+    ) -> std::result::Result<Self, AdmissionError> {
         check(store, basis, &cancelled)?;
         modify_request.validate().map_err(error)?;
-        modify_result.validate_for(&modify_request).map_err(error)?;
         if modify_request.operation != DevelopmentOperation::Modify
-            || modify_request.sources.last() != Some(basis.program().map_err(error)?)
+            || !modify_request
+                .sources
+                .contains(basis.program().map_err(error)?)
+            || (modify_result.is_some()
+                && modify_request.sources.last() != Some(basis.program().map_err(error)?))
             || modify_request.decisions != basis.decisions
             || modify_request.context.data_digest.as_ref()
                 != Some(&basis.data.identity().map_err(error)?)
             || modify_request.context.session_digest.as_ref()
                 != Some(&basis.session.identity().map_err(error)?)
             || id == modify_request.id
+            || need.trim().is_empty()
         {
-            return Err("Discovery needs the exact completed change and a new request".into());
+            return Err("Discovery needs the exact original change and a new request".into());
         }
-        let authored = capture(&modify_request, &modify_result, candidate)?;
         let source = if let Some(p) = &prepared {
             if p.candidate() != &authored {
                 return Err("The prepared design differs from the returned change".into());
@@ -221,11 +299,33 @@ impl DiscoveryDraft {
     pub fn request(&self) -> &DevelopmentRequest {
         &self.request
     }
+    pub fn with_selected_example(mut self, example: SelectedScenario) -> Result<Self> {
+        if example.disclosure != Disclosure::ExplicitlySelected
+            || example.scenario.validity.is_empty()
+        {
+            return Err("A feature example needs explicitly selected typed result evidence".into());
+        }
+        example
+            .scenario
+            .validate(&self.request.sources[1].program)
+            .map_err(error)?;
+        if self
+            .request
+            .examples
+            .iter()
+            .any(|e| e.scenario.id == example.scenario.id)
+        {
+            return Err("The selected feature example duplicates an inherited identity".into());
+        }
+        self.request.examples.push(example);
+        self.request.validate().map_err(error)?;
+        Ok(self)
+    }
     pub fn modify_request(&self) -> &DevelopmentRequest {
         &self.modify_request
     }
-    pub fn modify_result(&self) -> &DevelopmentResult {
-        &self.modify_result
+    pub fn modify_result(&self) -> Option<&DevelopmentResult> {
+        self.modify_result.as_ref()
     }
     pub fn primary_preparation(&self) -> Option<&PreparedScopedChange> {
         self.primary.prepared.as_ref()
@@ -780,6 +880,30 @@ impl PairExperience {
     pub fn scenes(&self) -> Option<&[AcceptedScene; 2]> {
         self.scenes.as_ref()
     }
+    /// Revoke authority while retaining the last published copied work for retry.
+    pub fn revoke_choices(&mut self) {
+        self.scenes = None;
+        self.minimal = false;
+    }
+    /// Compiler output has its own honest producer and no task binding. The
+    /// independently checked preparation retains its exact authored source;
+    /// reopening reconstructs this from the archived rehearsal manifest.
+    /// The exact installed Current is already adopted history, not an external
+    /// edit awaiting approval. Its old task fingerprint must not prevent a later
+    /// authorized edit in that task. Exempt only that authenticated full source,
+    /// never a label, producer match, other historical source, or preparation.
+    pub fn prospective_authored_sources(&self) -> impl Iterator<Item = &CapturedProgram> {
+        let current = self.basis.program().ok();
+        self.sides
+            .iter()
+            .filter(move |side| side.prepared.is_some() || Some(&side.source) != current)
+            .map(|side| {
+                side.prepared
+                    .as_ref()
+                    .map(|prepared| prepared.candidate())
+                    .unwrap_or(&side.source)
+            })
+    }
     pub fn trial(
         &mut self,
         store: &ProductStore,
@@ -787,8 +911,7 @@ impl PairExperience {
         cancelled: Arc<AtomicBool>,
     ) -> Result<()> {
         // A failed or cancelled new input must not leave old choice authority.
-        self.scenes = None;
-        self.minimal = false;
+        self.revoke_choices();
         check(store, &self.basis, &cancelled)?;
         let mut next = self.scenario.clone();
         if let Some(point) = &self.trial_observation {

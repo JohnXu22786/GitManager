@@ -174,6 +174,9 @@ pub(super) struct CompletedTask {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ExternalAssociation {
+    /// Original unenriched UI need. Historical absence remains unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_need: Option<String>,
     pub pending: task_source_flow::PendingExternal,
     pub basis: Basis,
     pub provider: ProviderKind,
@@ -200,6 +203,8 @@ pub(super) struct Journal {
     pub recovery_handoffs: Vec<RecoveryHandoff>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskAssociation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery: Option<discovery_host::Record>,
 }
 impl Default for Journal {
     fn default() -> Self {
@@ -215,6 +220,7 @@ impl Default for Journal {
             local_file: None,
             recovery_handoffs: vec![],
             task: None,
+            discovery: None,
         }
     }
 }
@@ -225,6 +231,9 @@ impl Journal {
             || self.need.len() > MAX_TEXT_BYTES
         {
             return Err("The restart information is damaged or belongs to an unsupported version; it was kept unchanged".into());
+        }
+        if let Some(record) = &self.discovery {
+            record.validate()?;
         }
         let check = |tool: &Association| -> Result<(), String> {
             if !tool.path.is_absolute() || !valid_id(&tool.identity.project_id) {
@@ -254,7 +263,11 @@ impl Journal {
                 request.validate().map_err(error)?;
                 let disclosure =
                     task_source_host::Disclosure::new(request.clone(), external.provider)?;
-                if disclosure.digest != external.disclosure
+                if external
+                    .original_need
+                    .as_ref()
+                    .is_some_and(|need| need.trim().is_empty() || need.len() > MAX_TEXT_BYTES)
+                    || disclosure.digest != external.disclosure
                     || !valid_id(&external.approval_operation)
                     || request.operation != DevelopmentOperation::Modify
                     || request.project_id != task.tool.identity.project_id
@@ -299,6 +312,29 @@ impl Journal {
                         != Some(&completed.capture.binding.program_path)
                 {
                     return Err("Invalid consumed task source association".into());
+                }
+            }
+        }
+        if let Some(record) = &self.discovery {
+            if let Some(origin) = &record.external {
+                let task = self
+                    .task
+                    .as_ref()
+                    .ok_or("The original external Discover handoff is missing")?;
+                let completed = task
+                    .completed
+                    .as_ref()
+                    .ok_or("The original external Discover completion was superseded")?;
+                if record.tool != task.tool
+                    || record.basis != completed.external.basis
+                    || completed.external.original_need.as_ref() != Some(&record.need)
+                    || record.original_request()? != *completed.external.pending.request()
+                    || origin.provider != completed.external.provider
+                    || origin.original_disclosure != completed.external.disclosure
+                    || origin.approval_operation != completed.external.approval_operation
+                    || origin.after.source()? != completed.capture
+                {
+                    return Err("The external Discover origin differs from its actual completed task request, approval, saved work or source".into());
                 }
             }
         }
@@ -364,6 +400,17 @@ impl Journal {
         }) = &self.provider
         {
             request.validate().map_err(error)?;
+            if let Some(record) = &self.discovery {
+                if let Ok(invocation) = record.invocation(&request.id) {
+                    if invocation.request()? != *request
+                        || invocation.provider != *provider
+                        || invocation.profile != *profile
+                        || invocation.issued != self.provider.as_ref().unwrap().issued
+                    {
+                        return Err("The active provider differs from its exact same-record request or authorization".into());
+                    }
+                }
+            }
             match (request.operation, modify, reconcile) {
                 (DevelopmentOperation::Generate, None, None)
                     if request.sources.is_empty() && request.request == self.need =>
@@ -383,6 +430,18 @@ impl Journal {
                         || request.context.session_digest.as_ref() != Some(&basis.session)
                     {
                         return Err("Invalid interrupted modification association".into());
+                    }
+                }
+                (DevelopmentOperation::Discover, None, None) => {
+                    let record = self
+                        .discovery
+                        .as_ref()
+                        .ok_or("Discover lost its original lineage")?;
+                    let invocation = record.invocation(&request.id)?;
+                    if invocation.request()? != *request
+                        || invocation.issued != self.provider.as_ref().unwrap().issued
+                    {
+                        return Err("Discover differs from the exact retained invocation".into());
                     }
                 }
                 (DevelopmentOperation::Reconcile, None, Some(binding)) => {
@@ -495,6 +554,9 @@ pub(super) struct JournalFile {
     // One generated-tool host writer per profile. Release happens on the worker.
     _lock: crate::product_locations::WriteLock,
     pub value: Journal,
+    // Publication can rename before returning an error. Retain the writer lock
+    // and refuse every later write until a fresh checked host reopen.
+    unresolved_write: bool,
 }
 fn read_optional(folder: &Folder) -> Result<Option<Vec<u8>>, String> {
     folder.check().map_err(error)?;
@@ -568,6 +630,7 @@ impl JournalFile {
             folder,
             _lock: lock,
             value,
+            unresolved_write: false,
         };
         #[cfg(test)]
         upgrade::checkpoint(root, upgrade::TestPoint::Opened)?;
@@ -580,13 +643,114 @@ impl JournalFile {
         let bytes = folder.read("session.json", JOURNAL_LIMIT).map_err(error)?;
         format::decode(&bytes)
     }
+    pub fn writes_blocked(&self) -> bool {
+        self.unresolved_write
+    }
+    pub fn require_writable(&self) -> Result<(), String> {
+        if self.unresolved_write {
+            Err("Restart information publication is unresolved. Files were kept; restart GitManager for a fresh checked reopen before another write or refresh. Do not repeat an operation already reported saved".into())
+        } else {
+            Ok(())
+        }
+    }
     pub fn write(&mut self, value: Journal) -> Result<(), String> {
+        self.require_writable()?;
+        // Strict validation and the complete 1 MiB bound precede publication.
+        // A preflight refusal leaves an ordinary, usable writer.
         let bytes = format::encode(&value)?;
-        self.folder
+        let published = self
+            .folder
             .publish("session.json", &bytes, true)
-            .map_err(error)?;
-        self.folder.sync().map_err(error)?;
+            .map_err(error);
+        #[cfg(test)]
+        let published = published.and_then(|()| {
+            upgrade::checkpoint(
+                self.folder.path().parent().unwrap(),
+                upgrade::TestPoint::WriteActivated,
+            )
+        });
+        let published = published.and_then(|()| self.folder.sync().map_err(error));
+        #[cfg(test)]
+        let published = published.and_then(|()| {
+            upgrade::checkpoint(
+                self.folder.path().parent().unwrap(),
+                upgrade::TestPoint::WriteSynced,
+            )
+        });
+        if let Err(e) = published {
+            self.unresolved_write = true;
+            return Err(format!("Restart information publication is unresolved: {e}. Files were kept; restart GitManager for a fresh checked reopen before another write or refresh. Do not repeat an operation already reported saved"));
+        }
         self.value = value;
         Ok(())
+    }
+}
+
+/// Transparent read-only test observations of the ordinary atomic writer.
+#[cfg(test)]
+pub mod journal_testing {
+    use super::*;
+    pub fn observe_synced(
+        root: &Path,
+        observe: impl Fn(Vec<u8>) + Send + Sync + 'static,
+    ) -> impl Drop {
+        let path = root.join("studio/session.json");
+        upgrade::test_hook(root, move |point| {
+            if point == upgrade::TestPoint::WriteSynced {
+                observe(std::fs::read(&path).map_err(error)?);
+            }
+            Ok(())
+        })
+    }
+    pub fn after_publish(
+        root: &Path,
+        observe: impl Fn(Vec<u8>) -> Result<(), String> + Send + Sync + 'static,
+    ) -> impl Drop {
+        let path = root.join("studio/session.json");
+        upgrade::test_hook(root, move |point| {
+            if point == upgrade::TestPoint::WriteActivated {
+                observe(std::fs::read(&path).map_err(error)?)?;
+            }
+            Ok(())
+        })
+    }
+    pub fn response_field_bytes(raw: &[u8]) -> Result<usize, String> {
+        let field = response_storage::ExactStoredResponseV1::from_bytes(
+            raw,
+            crate::product_provider::MAX_RESULT_BYTES,
+        )
+        .map_err(error)?;
+        Ok(canonical_bytes(&field).map_err(error)?.len())
+    }
+    pub fn roundtrip(bytes: &[u8]) -> Result<Vec<u8>, String> {
+        format::encode(&format::decode(bytes)?)
+    }
+    pub fn invocations(
+        bytes: &[u8],
+    ) -> Result<Vec<(DevelopmentRequest, Option<(Vec<u8>, JobReceipt)>)>, String> {
+        let value = format::decode(bytes)?;
+        let Some(record) = value.discovery else {
+            return Ok(vec![]);
+        };
+        record
+            .original
+            .iter()
+            .chain(record.discover.iter())
+            .map(|invocation| {
+                Ok((
+                    invocation.request()?,
+                    invocation
+                        .completed
+                        .as_ref()
+                        .map(|c| {
+                            Ok::<_, String>((
+                                c.raw.to_bytes(invocation.result_limit).map_err(error)?,
+                                c.receipt.clone(),
+                            ))
+                        })
+                        .transpose()?,
+                ))
+            })
+            .collect()
     }
 }

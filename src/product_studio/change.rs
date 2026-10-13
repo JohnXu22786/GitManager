@@ -40,6 +40,8 @@ pub(super) struct ChangeView {
     pub need: String,
     pub origin: String,
     pub lifecycle_note: String,
+    pub candidate_choices: Vec<(Id, String)>,
+    pub selected_candidate: Option<Id>,
 }
 #[derive(Clone)]
 pub(super) struct ChangeDraft {
@@ -56,6 +58,7 @@ pub(super) struct ChangeDraft {
     pub lifecycles: Vec<LifecycleBinding>,
     pub lifecycle_note: String,
     pub prepared: Option<PreparedScopedChange>,
+    preparation_note: Option<String>,
     structural: bool,
     equivalent: bool,
     lifecycle_evidence: String,
@@ -68,6 +71,8 @@ pub(super) struct ChangeDraft {
     trial_day: i32,
     alternative: Option<RuntimeView>,
     scenes: Option<(AcceptedScene, AcceptedScene)>,
+    // Retained copied displays and edit buffers are not decision authority.
+    choices_revoked: bool,
 }
 fn engine(store: &ProductStore, gate: &Gate) -> DecisionEngine<LocalRuntime> {
     DecisionEngine::new(
@@ -75,7 +80,7 @@ fn engine(store: &ProductStore, gate: &Gate) -> DecisionEngine<LocalRuntime> {
         IntentArchive::new(store.clone()),
     )
 }
-fn operation(program: &AppDefinition, input: &SemanticInput) -> Option<Id> {
+pub(super) fn operation(program: &AppDefinition, input: &SemanticInput) -> Option<Id> {
     match input {
         SemanticInput::Invoke { action, .. } => Some(action.clone()),
         SemanticInput::Submit { view, .. } => {
@@ -206,6 +211,35 @@ fn prepared_replay(
     Ok((bound, context, actual))
 }
 
+fn prepared_candidate_replay(
+    snapshot: &ProjectSnapshot,
+    prepared: &PreparedScopedChange,
+    original: &ScenarioSpec,
+) -> Result<(PreparedScopedChange, ScopedExecutionContext, ScenarioSpec), String> {
+    // A candidate-only trace may contain genuinely new state and actions.
+    // Authenticate and project its saved seed without claiming that Current
+    // can execute that trace. The target scene is then checked independently.
+    let mut bound = prepared.clone();
+    bound.correspondences.clear();
+    let context = ScopedExecutionContext::prepared(snapshot, &bound).map_err(error)?;
+    let merged =
+        crate::product_runtime::merged_data(prepared.target(), &original.seed).map_err(error)?;
+    let (context, seed) = context
+        .project_seed(
+            snapshot.program().map_err(error)?,
+            &original.seed,
+            prepared.target(),
+            &merged,
+            original.clock_day,
+        )
+        .map_err(error)?;
+    let mut actual = original.clone();
+    actual.seed = seed;
+    actual.validate(&prepared.target().program).map_err(error)?;
+    bound.correspondences = context.correspondence_proofs();
+    Ok((bound, context, actual))
+}
+
 fn finish_trial_observation(scenario: &mut ScenarioSpec) -> Result<(), String> {
     if matches!(scenario.inputs.last(), Some(SemanticInput::Observe { .. })) {
         return Ok(());
@@ -240,6 +274,151 @@ fn finish_trial_observation(scenario: &mut ScenarioSpec) -> Result<(), String> {
 pub mod rule_trace_testing;
 
 impl ChangeDraft {
+    /// Independently replay only the actual candidate. This does not assert
+    /// that Current supports a new action and cannot issue adoption authority.
+    pub fn candidate_case(
+        &self,
+        store: &ProductStore,
+        original: Option<&ScenarioSpec>,
+        gate: &Gate,
+    ) -> Result<(ScenarioSpec, AcceptedScene, RuntimeView, i32), String> {
+        gate.check()?;
+        self.check(store)?;
+        if self.prepared.is_none()
+            && self
+                .snapshot
+                .editable_scope_context()
+                .map_err(error)?
+                .is_some()
+        {
+            return Err("The candidate needs a checked preparation against its saved rules before it can be tried".into());
+        }
+        let target = self
+            .prepared
+            .as_ref()
+            .map(|p| p.target())
+            .unwrap_or(&self.candidate);
+        let mut scenario = if let Some(scenario) = original {
+            scenario.clone()
+        } else {
+            let mut session = SessionState::initial(&target.program).map_err(error)?;
+            session.view = self.snapshot.session.view.clone();
+            session.focused_record = self.snapshot.session.focused_record.clone();
+            for (key, value) in &self.snapshot.session.values {
+                if !session.values.contains_key(key) {
+                    return Err("The candidate cannot preserve this copied working state; choose a compatible design first".into());
+                }
+                session.values.insert(key.clone(), value.clone());
+            }
+            session.validate(&target.program).map_err(error)?;
+            ScenarioSpec {
+                version: CONTRACT_VERSION,
+                id: id("feature-case"),
+                label: "Explicitly selected candidate result on copied work".into(),
+                seed: self.snapshot.data.clone(),
+                session,
+                clock_day: self.snapshot.clock_day,
+                random_seed: 0,
+                inputs: vec![],
+                validity: vec![],
+            }
+        };
+        if scenario.seed != self.snapshot.data
+            || scenario.clock_day != self.snapshot.clock_day
+            || !scenario.validity.is_empty()
+        {
+            return Err("The candidate example must start from the exact saved business frame without invented predicates".into());
+        }
+        if scenario.inputs.len() >= MAX_ITEMS {
+            return Err("The candidate example reached its bounded input limit".into());
+        }
+        let mut proof = scenario.clone();
+        proof.inputs.push(SemanticInput::Observe {
+            point: "feature-result".into(),
+        });
+        let runtime = LocalRuntime::with_cancellation(gate.cancelled.clone());
+        let (scene, view, day) = if let Some(prepared) = &self.prepared {
+            let (prepared, admission, actual) =
+                prepared_candidate_replay(&self.snapshot, prepared, &proof)?;
+            let scene = engine(store, gate)
+                .accept_scoped_scene(store, &prepared, &actual, Disclosure::ExplicitlySelected)
+                .map_err(error)?;
+            let (view, day) = replay_view(&runtime, prepared.target(), &actual, &admission)?;
+            (scene, view, day)
+        } else {
+            proof.seed = crate::product_runtime::merged_data(target, &proof.seed).map_err(error)?;
+            let scene = accept_scene(
+                &runtime,
+                target,
+                &proof,
+                Disclosure::ExplicitlySelected,
+                RuntimeLimits::default(),
+            )
+            .map_err(error)?;
+            let admission = ScopedExecutionContext::committed(&self.snapshot).map_err(error)?;
+            let (view, day) = replay_view(&runtime, target, &proof, &admission)?;
+            (scene, view, day)
+        };
+        scenario.validity.clear();
+        gate.check()?;
+        self.check(store)?;
+        Ok((scenario, scene, view, day))
+    }
+    pub fn scope_operations(&self) -> &BTreeSet<Id> {
+        &self.scope_operations
+    }
+    pub fn restore_selection(
+        &mut self,
+        operation: Id,
+        population: ScopePopulation,
+        lifecycles: Vec<LifecycleBinding>,
+        operations: BTreeSet<Id>,
+    ) {
+        self.clear_readiness();
+        self.prepared = None;
+        self.preparation_note = None;
+        self.operation = operation;
+        self.population = population;
+        self.lifecycles = lifecycles;
+        self.scope_operations = operations;
+    }
+    pub fn clear_readiness(&mut self) {
+        self.revoke_choices();
+        self.alternative = None;
+    }
+    pub fn revoke_choices(&mut self) {
+        self.scenes = None;
+        self.choices_revoked = true;
+    }
+    pub fn rule_selection(
+        &self,
+        store: &ProductStore,
+        gate: &Gate,
+    ) -> Result<Option<super::rule_discovery::RuleSelection>, String> {
+        self.check(store)?;
+        if self.structural {
+            return Ok(None);
+        }
+        let request = change_adapter::request(
+            &self.snapshot,
+            &self.candidate,
+            self.population.clone(),
+            self.lifecycles.clone(),
+            self.scope_operations.clone(),
+        )?;
+        super::rule_discovery::RuleSelection::checked(
+            store,
+            &self.snapshot,
+            self.prepared
+                .clone()
+                .ok_or("Choose the rule's finished-work meaning and try a business task first")?,
+            request,
+            &self.operation,
+            gate.cancelled.clone(),
+        )
+        .map(Some)
+    }
+
     /// Carry one checked current-business copy into the existing choice path.
     /// An exact discovery example cannot call this method in place of a copy.
     pub fn import_rule_trace(
@@ -249,8 +428,7 @@ impl ChangeDraft {
         trace: &super::rule_discovery::RuleCopyTrace,
         gate: &Gate,
     ) -> Result<(), String> {
-        self.scenes = None;
-        self.alternative = None;
+        self.clear_readiness();
         gate.check()?;
         self.check(store)?;
         if self.structural || !self.missing().is_empty() {
@@ -368,6 +546,7 @@ impl ChangeDraft {
         self.alternative = Some(views.remove(0));
         self.trial_day = days[0];
         self.scenes = Some((current_scene, alternative_scene));
+        self.choices_revoked = false;
         Ok(())
     }
 
@@ -415,6 +594,7 @@ impl ChangeDraft {
             lifecycles,
             lifecycle_note: String::new(),
             prepared: None,
+            preparation_note: None,
             structural,
             equivalent,
             lifecycle_evidence: String::new(),
@@ -425,6 +605,7 @@ impl ChangeDraft {
             trial_day,
             alternative: None,
             scenes: None,
+            choices_revoked: true,
         })
     }
     pub fn missing(&self) -> Vec<(Id, String)> {
@@ -450,6 +631,49 @@ impl ChangeDraft {
             .collect()
     }
     pub fn prepare(&mut self, store: &ProductStore, gate: &Gate) -> Result<(), String> {
+        self.clear_readiness();
+        self.prepared = None;
+        self.preparation_note = None;
+        let result = self.prepare_comparison(store, gate);
+        if let Err(note) = &result {
+            self.preparation_note = Some(note.clone());
+        }
+        result
+    }
+    /// An independently valid design can be analysed even if Current cannot
+    /// run its new state/actions. This preserves no paired scenes or choice grant.
+    /// Managed designs still require their exact independently compiled target.
+    pub fn prepare_for_discovery(
+        &mut self,
+        store: &ProductStore,
+        gate: &Gate,
+    ) -> Result<(), String> {
+        match self.prepare(store, gate) {
+            Err(note) if self.structural && self.population == ScopePopulation::All => {
+                gate.check()?;
+                self.check(store)?;
+                if let Some(prepared) = &self.prepared {
+                    ScopedExecutionContext::prepared(&self.snapshot, prepared).map_err(error)?;
+                } else if self
+                    .snapshot
+                    .editable_scope_context()
+                    .map_err(error)?
+                    .is_some()
+                {
+                    return Err(note);
+                } else {
+                    LocalRuntime::with_cancellation(gate.cancelled.clone())
+                        .validate(&self.candidate)
+                        .map_err(error)?;
+                }
+                gate.check()?;
+                self.check(store)?;
+                Ok(())
+            }
+            result => result,
+        }
+    }
+    fn prepare_comparison(&mut self, store: &ProductStore, gate: &Gate) -> Result<(), String> {
         gate.check()?;
         self.check(store)?;
         if !self.missing().is_empty()
@@ -495,6 +719,12 @@ impl ChangeDraft {
                     .map_err(error)?,
             )
         };
+        gate.check()?;
+        self.check(store)?;
+        // Compilation is independently bound to this exact source, selection
+        // and Basis. Keep that analysis target if later paired readiness fails.
+        // Only the final successful replay below can populate choice evidence.
+        self.prepared = prepared.clone();
         let mut checker = engine(store, gate);
         let report = if let Some(p) = &prepared {
             checker.check_prepared_discovery_candidate(
@@ -559,6 +789,7 @@ impl ChangeDraft {
         self.trial_day = trial_day;
         self.alternative = Some(alternative);
         self.scenes = None;
+        self.choices_revoked = false;
         Ok(())
     }
     pub fn check(&self, store: &ProductStore) -> Result<(), String> {
@@ -575,15 +806,14 @@ impl ChangeDraft {
     ) -> Result<(), String> {
         // Reconstruct on a temporary draft so a failed preparation never leaves
         // old evidence paired with a newly selected scope.
-        let old = self.population.clone();
-        let operation = self.operation.clone();
+        let old = self.clone();
         self.population = population;
         self.operation = id("change");
         match self.prepare(store, gate) {
             Ok(()) => Ok(()),
             Err(e) => {
-                self.population = old;
-                self.operation = operation;
+                *self = old;
+                self.clear_readiness();
                 Err(e)
             }
         }
@@ -683,11 +913,10 @@ impl ChangeDraft {
         input: SemanticInput,
         gate: &Gate,
     ) -> Result<(), String> {
-        // Revocation belongs to the receiver even when staging or replay fails.
-        let previous_display = self.alternative.take();
-        self.scenes = None;
+        // Revoke authority on the receiver, while retaining the previous copied
+        // models so cancelled or failed input can be corrected and tried again.
+        self.revoke_choices();
         let mut next = self.clone();
-        next.alternative = previous_display;
         #[cfg(test)]
         let started = std::time::Instant::now();
         #[cfg(test)]
@@ -697,6 +926,7 @@ impl ChangeDraft {
         eprintln!("trial_input: finished after {:?}", started.elapsed());
         gate.check()?;
         next.check(store)?;
+        next.choices_revoked = false;
         *self = next;
         Ok(())
     }
@@ -958,7 +1188,8 @@ impl ChangeDraft {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let experienced_scope = self.scenes.is_some()
+        let experienced_scope = !self.choices_revoked
+            && self.scenes.is_some()
             && !required.is_empty()
             && required.is_subset(&experienced)
             && unavailable_tasks.is_empty();
@@ -978,6 +1209,8 @@ impl ChangeDraft {
                     .artifact
                     .semantic_digest;
         Ok(ChangeView {
+            candidate_choices: vec![],
+            selected_candidate: None,
             basis: Basis::capture(&self.snapshot)?,
             current: self.current.clone(),
             trial_day: self.trial_day,
@@ -993,15 +1226,17 @@ impl ChangeDraft {
             population: self.population.clone(),
             missing,
             lifecycle_options: options,
-            can_accept: (wording_update && self.alternative.is_some()) || experienced_scope,
+            can_accept: !self.choices_revoked
+                && ((wording_update && self.alternative.is_some()) || experienced_scope),
             can_keep_current: experienced_scope && !wording_update,
-            can_retain: self.scenes.is_some()
+            can_retain: !self.choices_revoked
+                && self.scenes.is_some()
                 && !required.is_empty()
                 && !experienced.is_empty()
                 && !same_alternative
                 && !wording_update,
             same_alternative,
-            readiness_notes: vec![],
+            readiness_notes: self.preparation_note.clone().into_iter().collect(),
             whole_design: self.structural,
             wording_update,
             needs_task: !wording_update && experienced.is_empty(),
@@ -1064,6 +1299,9 @@ impl ChangeDraft {
     ) -> Result<VerifiedChange, String> {
         self.check(store)?;
         gate.check()?;
+        if self.choices_revoked {
+            return Err("Try the copied work again before recording this choice".into());
+        }
         if let (Some(request), Some(result), Some(raw), Some(receipt)) =
             (&self.request, &self.result, &self.raw, &self.receipt)
         {

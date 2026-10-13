@@ -69,6 +69,7 @@ impl LegacyJournalV1 {
             local_file: self.local_file,
             recovery_handoffs: self.recovery_handoffs,
             task: self.task,
+            discovery: None,
         };
         // The exact pre-upgrade semantics, including purpose, source, disclosure,
         // task and legacy wire digest checks, are shared with the domain writer.
@@ -179,6 +180,17 @@ fn run_locked(root: &Path, report: &mut impl FnMut(u8)) -> Result<Outcome, Strin
         _ => return Err("The restart information is damaged or belongs to an unsupported version; it was kept unchanged".into()),
     }
     progress(root, report, 6)?;
+    // The frozen v1 task envelope did not contain original UI needs. Do not
+    // let a new optional v2 field retroactively invent migrated evidence.
+    for path in ["/task/external", "/task/completed/external"] {
+        if json
+            .pointer(path)
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|v| v.contains_key("original_need"))
+        {
+            return Err("Unknown field in the frozen v1 task association".into());
+        }
+    }
     let legacy: LegacyJournalV1 = serde_json::from_value(json).map_err(error)?;
     let value = legacy.into_domain()?;
     let current = format::encode(&value)?;
@@ -227,6 +239,8 @@ pub(super) enum TestPoint {
     Released,
     BeforeOpen,
     Opened,
+    WriteActivated,
+    WriteSynced,
 }
 #[cfg(test)]
 type Hook = Arc<dyn Fn(TestPoint) -> Result<(), String> + Send + Sync>;

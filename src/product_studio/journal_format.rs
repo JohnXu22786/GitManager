@@ -19,11 +19,16 @@ pub(super) struct StoredJournalV2 {
     recovery_handoffs: Vec<RecoveryHandoff>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     task: Option<TaskAssociation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    discovery: Option<discovery_host::Record>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StoredProviderV2 {
-    request: ExactUtf8DevelopmentRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request: Option<ExactUtf8DevelopmentRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lineage_request: Option<Id>,
     provider: ProviderKind,
     profile: CapabilityProfile,
     wire_request: String,
@@ -42,8 +47,25 @@ impl StoredJournalV2 {
             .as_ref()
             .map(|provider| {
                 Ok::<_, String>(StoredProviderV2 {
-                    request: ExactUtf8DevelopmentRequest::from_request(&provider.request)
-                        .map_err(error)?,
+                    request: if value.discovery.as_ref().is_some_and(|d| {
+                        d.invocation(&provider.request.id)
+                            .is_ok_and(|i| i.request().as_ref() == Ok(&provider.request))
+                    }) {
+                        None
+                    } else {
+                        Some(
+                            ExactUtf8DevelopmentRequest::from_request(&provider.request)
+                                .map_err(error)?,
+                        )
+                    },
+                    lineage_request: value
+                        .discovery
+                        .as_ref()
+                        .filter(|d| {
+                            d.invocation(&provider.request.id)
+                                .is_ok_and(|i| i.request().as_ref() == Ok(&provider.request))
+                        })
+                        .map(|_| provider.request.id.clone()),
                     provider: provider.provider,
                     profile: provider.profile,
                     wire_request: provider.wire_request.clone(),
@@ -66,6 +88,7 @@ impl StoredJournalV2 {
             local_file: value.local_file.clone(),
             recovery_handoffs: value.recovery_handoffs.clone(),
             task: value.task.clone(),
+            discovery: value.discovery.clone(),
         })
     }
     fn into_domain(self) -> Result<Journal, String> {
@@ -73,7 +96,20 @@ impl StoredJournalV2 {
             .provider
             .map(|provider| {
                 Ok::<_, String>(ProviderAssociation {
-                    request: provider.request.to_request().map_err(error)?,
+                    request: match (provider.request, provider.lineage_request) {
+                        (Some(request), None) => request.to_request().map_err(error)?,
+                        (None, Some(id)) => self
+                            .discovery
+                            .as_ref()
+                            .ok_or("Missing same-record provider lineage")?
+                            .invocation(&id)?
+                            .request()?,
+                        _ => {
+                            return Err(
+                                "An active provider must name exactly one complete request".into()
+                            )
+                        }
+                    },
                     provider: provider.provider,
                     profile: provider.profile,
                     wire_request: provider.wire_request,
@@ -96,6 +132,7 @@ impl StoredJournalV2 {
             local_file: self.local_file,
             recovery_handoffs: self.recovery_handoffs,
             task: self.task,
+            discovery: self.discovery,
         };
         value.validate()?;
         Ok(value)
@@ -114,7 +151,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Journal, String> {
 pub(super) fn encode(value: &Journal) -> Result<Vec<u8>, String> {
     let bytes = canonical_bytes(&StoredJournalV2::from_domain(value)?).map_err(error)?;
     if bytes.len() > JOURNAL_LIMIT {
-        return Err("This input exceeds the bounded restart record; nothing was submitted".into());
+        return Err("The complete input exceeds the bounded restart record; the prior restart information was kept unchanged".into());
     }
     // Check the complete containing record, including the envelope's extra depth.
     crate::tool_proposal_input::parse_json_bytes(&bytes).map_err(error)?;

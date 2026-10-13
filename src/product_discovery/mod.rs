@@ -171,10 +171,20 @@ fn input_operations<'a>(
                 .iter()
                 .find(|v| &v.id == view)
                 .and_then(|v| match &v.kind {
-                    ViewKind::List { controls, .. } => controls
+                    ViewKind::List {
+                        controls,
+                        selection,
+                        ..
+                    } => controls
                         .iter()
                         .find(|c| &c.id == control)
-                        .and_then(|c| c.on_change.clone()),
+                        .and_then(|c| c.on_change.clone())
+                        .or_else(|| {
+                            selection
+                                .as_ref()
+                                .filter(|selection| &selection.id == control)
+                                .and_then(|selection| selection.on_change.clone())
+                        }),
                     _ => None,
                 }),
             _ => None,
@@ -234,6 +244,10 @@ fn required_feature_absence(
                     .actions
                     .iter()
                     .any(|action| &action.id == *id)
+                && policy.requirements.iter().any(|case| {
+                    !case.properties.is_empty()
+                        && scenario_operations(&case.scenario, &candidate.program).contains(*id)
+                })
         })
         .collect();
     if missing.is_empty() {
@@ -242,8 +256,12 @@ fn required_feature_absence(
     let mut projected = scene.clone();
     let mut removed = false;
     projected.inputs.retain(|input| {
-        let absent =
-            matches!(input, SemanticInput::Invoke { action, .. } if missing.contains(action));
+        // Resolve the actual typed UI binding on the already validated
+        // candidate. Only its independently required absent action is removed;
+        // this projection classifies an error and is never executed as Current.
+        let absent = input_operations(std::iter::once(input), &candidate.program)
+            .iter()
+            .any(|action| missing.contains(action));
         removed |= absent;
         !absent
     });
@@ -2971,3 +2989,7 @@ fn retained_profile(
     }
     Some(RetainedProfile { matches, novel })
 }
+
+#[cfg(test)]
+#[path = "required_feature_tests.rs"]
+mod required_feature_tests;
