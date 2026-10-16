@@ -3409,3 +3409,282 @@ fn current_workflow_constraints_apply_to_requirement_and_intention_prechecks() {
         );
     }
 }
+
+/// A new, independently required export makes both implementations prospective.
+/// Early observations and columns in a view never visited are deliberately inert.
+fn prospective_observation_case() -> (DevelopmentRequest, DevelopmentResult, DiscoveryPolicy) {
+    let (mut request, mut result) = input();
+    for index in 0..2 {
+        let mut program: Value =
+            serde_json::from_slice(&request.sources[index].source_bytes).unwrap();
+        program["views"][0]["kind"]["selection"] = Value::Null;
+        let mut hidden = program["views"][0].clone();
+        hidden["id"] = json!("unvisited");
+        hidden["kind"]["columns"] = (0..70)
+            .map(|i| json!({"id":format!("hidden_{i:02}"),"label":"Unvisited column","value":field(var("row"),"name")}))
+            .collect();
+        program["views"].as_array_mut().unwrap().push(hidden);
+        request.sources[index] = capture(program);
+        result.response.candidates[index].source_json =
+            String::from_utf8(request.sources[index].source_bytes.clone()).unwrap();
+    }
+    let mut old: Value = serde_json::from_slice(&request.sources[0].source_bytes).unwrap();
+    old["actions"].as_array_mut().unwrap().remove(2);
+    for view in old["views"].as_array_mut().unwrap() {
+        view["actions"] = json!([]);
+        view["keys"] = json!([]);
+    }
+    request.sources[0] = capture(old);
+    let mut scene = result.response.hypotheses[0].scenario().unwrap();
+    for i in (0..6).rev() {
+        scene.inputs.insert(
+            0,
+            SemanticInput::Observe {
+                point: format!("early_{i}"),
+            },
+        );
+    }
+    result.response.hypotheses[0].scenario_json = serde_json::to_string(&scene).unwrap();
+    result.response.hypotheses[0].sources[0].raw_digest =
+        request.sources[1].artifact.raw_digest.clone();
+    refresh(&request, &mut result);
+    let policy = DiscoveryPolicy {
+        required_actions: ["export_people".into()].into(),
+        requirements: vec![export_requirement(&result)],
+        ..DiscoveryPolicy::default()
+    };
+    (request, result, policy)
+}
+
+#[test]
+fn prospective_discovery_reaches_late_differences_without_absent_view_comparisons() {
+    let (request, result, policy) = prospective_observation_case();
+    let report = run(&request, &result, policy);
+    assert_eq!(report.questions.len(), 1, "{:?}", report.unverified);
+    assert!(report.unverified.is_empty(), "{:?}", report.unverified);
+    assert!(report.questions[0].witnesses.iter().all(|witness| {
+        !serde_json::to_string(&witness.witness().distinguishing_properties)
+            .unwrap()
+            .contains("hidden_")
+    }));
+    assert!(
+        report
+            .runs
+            .iter()
+            .filter(|run| run.id == "before-run")
+            .count()
+            <= 4
+    );
+    assert!(report
+        .coverage
+        .iter()
+        .any(|message| message
+            .contains("Output roster was absent on both completed prospective runs")));
+}
+
+#[test]
+fn prospective_discovery_shares_budget_across_points_deterministically() {
+    let (request, mut result, mut policy) = prospective_observation_case();
+    let mut scene = result.response.hypotheses[0].scenario().unwrap();
+    scene.inputs.push(SemanticInput::Observe {
+        point: "later".into(),
+    });
+    result.response.hypotheses[0].scenario_json = serde_json::to_string(&scene).unwrap();
+    policy.max_comparisons = 2;
+    let report = run(&request, &result, policy.clone());
+    assert_eq!(report.questions.len(), 1, "{:?}", report.unverified);
+    let properties: Vec<_> = report.questions[0]
+        .witnesses
+        .iter()
+        .map(|w| w.witness().distinguishing_properties.clone())
+        .collect();
+    let encoded = serde_json::to_string(&properties).unwrap();
+    assert!(encoded.contains("done"), "{encoded}");
+    assert!(encoded.contains("later"), "{encoded}");
+    assert!(report
+        .unverified
+        .iter()
+        .any(|message| message.contains("comparison budget")));
+    let repeated = run(&request, &result, policy);
+    assert_eq!(
+        properties,
+        repeated.questions[0]
+            .witnesses
+            .iter()
+            .map(|w| w.witness().distinguishing_properties.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn prospective_discovery_equal_scenes_do_not_invent_preference_or_missing_columns() {
+    let (request, mut result, policy) = prospective_observation_case();
+    let mut equivalent = request.sources[1].program.clone();
+    equivalent.label = "Equivalent prospective implementation".into();
+    result.response.candidates[0].source_json = serde_json::to_string(&equivalent).unwrap();
+    let report = run(&request, &result, policy);
+    assert!(report.questions.is_empty());
+    assert!(report.unverified.is_empty(), "{:?}", report.unverified);
+    assert_eq!(report.log[0].disposition, Disposition::NoWitness);
+    assert_eq!(report.log[0].state, EvidenceState::NoDifferenceFound);
+    assert!(!report.runs.iter().any(|run| run.id == "before-run"));
+}
+
+#[test]
+fn prospective_discovery_reports_unavailable_channels_without_spending_witness_budget() {
+    let (request, mut result, mut policy) = prospective_observation_case();
+    let mut alternative: Value =
+        serde_json::from_str(&result.response.candidates[0].source_json).unwrap();
+    alternative["observables"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"id":"alternative_only","label":"Alternative only","value":text("present")}));
+    result.response.candidates[0].source_json = serde_json::to_string(&alternative).unwrap();
+    policy.max_comparisons = 1;
+    let report = run(&request, &result, policy);
+    assert_eq!(report.questions.len(), 1, "{:?}", report.unverified);
+    assert!(report
+        .unverified
+        .iter()
+        .any(|message| message.contains("alternative_only")));
+    assert!(!report
+        .unverified
+        .iter()
+        .any(|message| message.contains("hidden_")));
+    assert_eq!(report.log[0].state, EvidenceState::Inconclusive);
+}
+
+#[test]
+fn prospective_discovery_preflight_honors_replay_budget_and_cancellation() {
+    let (request, result, mut policy) = prospective_observation_case();
+    policy.max_precheck_replays = 4;
+    let report = run(&request, &result, policy.clone());
+    assert!(report.questions.is_empty());
+    assert!(report
+        .unverified
+        .iter()
+        .any(|message| message.contains("precheck replay budget")));
+    assert!(report.runs.len() <= 4);
+    let report = discover(&request, &result, &policy, Arc::new(AtomicBool::new(true))).unwrap();
+    assert!(report.questions.is_empty());
+    assert!(report.runs.is_empty());
+    assert!(!report.unverified.is_empty());
+}
+
+#[test]
+fn prospective_discovery_shares_first_attempts_across_alternatives() {
+    let (request, mut result, mut policy) = prospective_observation_case();
+    let mut third: Value =
+        serde_json::from_str(&result.response.candidates[0].source_json).unwrap();
+    third["actions"][1]["steps"][0] = json!({"kind":"set_state","state":"selected","value":{"kind":"literal","value_type":{"kind":"list","item":{"kind":"reference","entity":"person"}},"value":empty("person")}});
+    result.response.candidates.push(GeneratedCandidate {
+        id: "third".into(),
+        source_json: serde_json::to_string(&third).unwrap(),
+    });
+    result.response.hypotheses[0]
+        .alternatives
+        .push("third".into());
+    let mut scene = result.response.hypotheses[0].scenario().unwrap();
+    scene.inputs.push(SemanticInput::Observe {
+        point: "later".into(),
+    });
+    result.response.hypotheses[0].scenario_json = serde_json::to_string(&scene).unwrap();
+    policy.max_comparisons = 2;
+    let report = run(&request, &result, policy);
+    assert_eq!(report.questions.len(), 1, "{:?}", report.unverified);
+    let values: BTreeSet<_> = report.questions[0]
+        .witnesses
+        .iter()
+        .map(|witness| {
+            let observations = &witness.initial_runs().0.observations;
+            let observation = observations
+                .iter()
+                .find(|observation| observation.point == "done")
+                .unwrap();
+            match observation.values["selected_count"] {
+                DataValue::Integer { value } => value,
+                _ => panic!("expected measured integer"),
+            }
+        })
+        .collect();
+    assert_eq!(values, [0, 2].into());
+    assert!(report
+        .unverified
+        .iter()
+        .any(|message| message.contains("comparison budget")));
+}
+
+#[test]
+fn prospective_discovery_retains_missing_declared_scalar_and_emitted_column_signals() {
+    for kind in ["scalar", "output_column"] {
+        let (mut request, mut result, policy) = prospective_observation_case();
+        let mut old: Value = serde_json::from_slice(&request.sources[0].source_bytes).unwrap();
+        if kind == "scalar" {
+            old["observables"].as_array_mut().unwrap().push(json!({"id":"legacy_channel","label":"Legacy channel","value":text("previously present")}));
+        } else {
+            old["outputs"][0]["columns"].as_array_mut().unwrap().push(json!({"id":"legacy_channel","label":"Legacy channel","value_type":{"kind":"text"}}));
+        }
+        request.sources[0] = capture(old);
+        refresh(&request, &mut result);
+        let report = run(&request, &result, policy);
+        assert_eq!(report.questions.len(), 1, "{kind}: {:?}", report.unverified);
+        assert!(
+            report
+                .unverified
+                .iter()
+                .any(|message| message.contains("legacy_channel")),
+            "{kind}: {:?}",
+            report.unverified
+        );
+        assert_eq!(report.log[0].state, EvidenceState::Inconclusive);
+    }
+}
+
+#[test]
+fn discovery_multiple_scenes_cannot_starve_another_alternative() {
+    let (mut request, mut result) = input();
+    let prior = saved_decision(&mut request, &result, DecisionOutcome::Deferred, vec![]);
+    let mut proposed = result.response.hypotheses[0].scenario().unwrap();
+    proposed.inputs.push(SemanticInput::Observe {
+        point: "later".into(),
+    });
+    result.response.hypotheses[0].scenario_json = serde_json::to_string(&proposed).unwrap();
+    let mut third = filtered();
+    third["actions"][1]["steps"][0] = json!({"kind":"set_state","state":"selected","value":{"kind":"literal","value_type":{"kind":"list","item":{"kind":"reference","entity":"person"}},"value":empty("person")}});
+    let third_program = capture(third.clone());
+    result.response.candidates.push(GeneratedCandidate {
+        id: "third".into(),
+        source_json: serde_json::to_string(&third).unwrap(),
+    });
+    result.response.hypotheses[0]
+        .alternatives
+        .push("third".into());
+    refresh(&request, &mut result);
+    let mut policy = DiscoveryPolicy {
+        max_comparisons: 2,
+        retained_witnesses: vec![prior],
+        ..DiscoveryPolicy::default()
+    };
+    // Inspect the two initial comparison attempts without reduction replays.
+    policy.search.max_trials = 0;
+    let report = run(&request, &result, policy);
+    assert!(report
+        .runs
+        .iter()
+        .any(|run| run.id == "captured-retained-candidate"));
+    let attempted: BTreeSet<_> = report
+        .runs
+        .iter()
+        .filter(|run| run.id == "before-run")
+        .take(2)
+        .map(|run| run.binding.artifact.program_digest.clone())
+        .collect();
+    assert_eq!(
+        attempted,
+        [
+            request.sources[0].artifact.program_digest.clone(),
+            third_program.artifact.program_digest
+        ]
+        .into()
+    );
+}

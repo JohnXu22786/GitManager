@@ -277,53 +277,19 @@ fn required_feature_absence(
     Some(AdapterError::Invalid(error))
 }
 
-/// Declared output channels can be absent in a real new-feature scene. This
-/// applies only to two complete, exact prospective runs with an actual matching
-/// observation and no artifact of that output on either side. Missing points,
-/// missing columns in an emitted artifact and failed/partial runs stay unknown.
-fn completed_output_absence(
-    comparison: &ComparisonReport,
-    before: &CapturedProgram,
-    after: &CapturedProgram,
-    scene: &ScenarioSpec,
+/// Absence is meaningful only at an actual completed observation point.
+/// A missing point or an unavailable typed sample is not channel absence.
+fn absent_on_both(
     target: &ObservationTarget,
+    before: &[Observation],
+    after: &[Observation],
 ) -> bool {
-    let (point, output) = match target {
-        ObservationTarget::OutputCount { point, output }
-        | ObservationTarget::OutputColumn { point, output, .. } => (point, output),
-        _ => return false,
-    };
-    if comparison.state != EvidenceState::Inconclusive
-        || comparison.witness.is_some()
-        || comparison.runs.len() != 2
-    {
-        return false;
-    }
-    comparison
-        .runs
-        .iter()
-        .zip([(before, "before-run"), (after, "after-run")])
-        .all(|(run, (source, id))| {
-            run.id == id
-                && run.state == EvidenceState::Observed
-                && run.errors.is_empty()
-                && run.uncovered.is_empty()
-                && run.validate().is_ok()
-                && run.binding.source == source.binding
-                && run.binding.artifact == source.artifact
-                && scene.identity().ok().as_ref() == Some(&run.binding.scenario_digest)
-                && scene.input_identity().ok().as_ref() == Some(&run.binding.input_digest)
-                && run
-                    .observations
-                    .iter()
-                    .find(|observation| &observation.point == point)
-                    .is_some_and(|observation| {
-                        !observation
-                            .outputs
-                            .iter()
-                            .any(|artifact| &artifact.output == output)
-                    })
-        })
+    [before, after].into_iter().all(|observations| {
+        observations
+            .iter()
+            .any(|observation| observation.point == target.point())
+            && target.channel_presence(observations) == Some(false)
+    })
 }
 
 struct ReplayBudget {
@@ -1327,6 +1293,8 @@ pub fn discover(
         let comparisons_before_hypothesis = comparisons;
         let mut witnesses = vec![];
         let mut exhausted = false;
+        let mut checked_alternatives = false;
+        let mut scheduled_alternatives = vec![];
         for id in hypothesis.alternatives.iter().filter(|id| *id != exact) {
             if let Err(error) = replay_budget.check() {
                 entry.explanation = format!("Alternative validation incomplete: {error:?}");
@@ -1519,149 +1487,237 @@ pub fn discover(
                 }
                 continue;
             }
-            'scenes: for (scene, new_feature, captured_observations) in &captured_scenes {
+            let mut scheduled_scenes = vec![];
+            for (scene, new_feature, captured_observations) in &captured_scenes {
                 let scene = checked_scene(scene, true, &[alternative, candidate], policy);
-                let mut channels_checked = false;
-                let points: Vec<_> = scene
-                    .inputs
-                    .iter()
-                    .filter_map(|input| match input {
-                        SemanticInput::Observe { point } => Some(point.clone()),
-                        _ => None,
-                    })
-                    .collect();
-                for point in &points {
-                    // Only actual captured changes may generate new choice witnesses.
-                    for target in comparison_targets(&[before, candidate], point, policy)? {
-                        if !*new_feature {
-                            match captured_observations
+                // Measure each complete prospective pair before allocating the
+                // expensive witness budget. A required new action may have no
+                // executable current side, so captured observations alone cannot
+                // tell which prospective channels actually differ.
+                let mut runs = vec![];
+                for (program, run_id) in [
+                    (alternative, "alternative-observations"),
+                    (candidate, "candidate-observations"),
+                ] {
+                    match replay_budget.replay(
+                        &runtime,
+                        program,
+                        &scene,
+                        &request.decisions,
+                        policy.search.runtime.clone(),
+                        run_id,
+                    ) {
+                        Ok(run) => {
+                            if run.state != EvidenceState::Observed {
+                                report.unverified.push(format!(
+                                    "Alternative {id} observation replay is unverified: {:?}",
+                                    run.state
+                                ));
+                                report
+                                    .unverified
+                                    .extend(run.errors.iter().chain(&run.uncovered).cloned());
+                            }
+                            runs.push(run);
+                        }
+                        Err(error) => report.unverified.push(format!(
+                            "Alternative {id} observation replay unavailable: {error:?}"
+                        )),
+                    }
+                }
+                let complete =
+                    runs.len() == 2 && runs.iter().all(|run| run.state == EvidenceState::Observed);
+                if !complete {
+                    report.runs.extend(runs);
+                    continue;
+                }
+                checked_alternatives = true;
+                entry.state = EvidenceState::NoDifferenceFound;
+                let a = history::comparison_observations(policy, alternative, &runs[0])?;
+                let b = history::comparison_observations(policy, candidate, &runs[1])?;
+                let channels = unrepresented_differences(&a, &b);
+                if !channels.is_empty() {
+                    material_unknowns.insert((alternative.binding.identity()?, candidate.binding.identity()?, scene_equivalence_key(&scene)?), format!("Alternative {id} executions differ in material channels without executable property terms: {}", channels.join(", ")));
+                }
+                let mut observed = vec![a.as_slice(), b.as_slice()];
+                if let Some((before, after)) = captured_observations {
+                    observed.extend([before.as_slice(), after.as_slice()]);
+                }
+                let mut point_targets = vec![];
+                for point in scene.inputs.iter().filter_map(|input| match input {
+                    SemanticInput::Observe { point } => Some(point),
+                    _ => None,
+                }) {
+                    if cancelled.load(Ordering::Acquire) {
+                        report
+                            .unverified
+                            .push("Discovery observation scheduling cancelled".into());
+                        break;
+                    }
+                    let mut differing = vec![];
+                    for target in comparison_targets(
+                        &[before, alternative, candidate],
+                        point,
+                        policy,
+                        &observed,
+                    )? {
+                        // Existing behavior still needs a captured-source anchor.
+                        // Diagnose missing/type-incompatible channels separately
+                        // from scheduling; unsupported evidence is never equality.
+                        let anchored = *new_feature
+                            || match captured_observations
                                 .as_ref()
                                 .and_then(|(a, b)| target.differs(a, b))
                             {
-                                Some(true) => {}
-                                Some(false) => continue,
+                                Some(changed) => changed,
                                 None => {
-                                    // Both absent means no channel was emitted at this
-                                    // point. Failed/over-limit samples or one-sided and
-                                    // incompatible evidence are unavailable, never equal.
-                                    if !captured_observations.as_ref().is_some_and(|(a, b)| {
-                                        target.channel_presence(a) == Some(false)
-                                            && target.channel_presence(b) == Some(false)
-                                    }) {
+                                    if !captured_observations
+                                        .as_ref()
+                                        .is_some_and(|(a, b)| absent_on_both(&target, a, b))
+                                    {
                                         report.unverified.push(format!("Captured target {target:?} is unavailable or has incompatible types"));
                                     }
-                                    continue;
+                                    false
                                 }
-                            }
-                        }
-                        if comparisons >= policy.max_comparisons {
-                            exhausted = true;
-                            break 'scenes;
-                        }
-                        comparisons += 1;
-                        let comparison = engine.minimize(
-                            alternative,
-                            candidate,
-                            &scene,
-                            &request.decisions,
-                            target.clone(),
-                            hypothesis_search.clone(),
-                        )?;
-                        if !channels_checked {
-                            let original = comparison
-                                .witness
-                                .as_ref()
-                                .map(|w| w.initial_runs())
-                                .or_else(|| {
-                                    Some((
-                                        comparison.runs.iter().find(|r| r.id == "before-run")?,
-                                        comparison.runs.iter().find(|r| r.id == "after-run")?,
-                                    ))
-                                });
-                            if let Some((a, b)) = original.filter(|(a, b)| {
-                                a.state == EvidenceState::Observed
-                                    && b.state == EvidenceState::Observed
-                            }) {
-                                channels_checked = true;
-                                for point in &points {
-                                    for channel in comparison_targets(
-                                        &[before, alternative, candidate],
-                                        point,
-                                        policy,
-                                    )? {
-                                        if channel
-                                            .differs(&a.observations, &b.observations)
-                                            .is_none()
-                                            && !(channel.channel_presence(&a.observations)
-                                                == Some(false)
-                                                && channel.channel_presence(&b.observations)
-                                                    == Some(false))
+                            };
+                        match target.differs(&a, &b) {
+                            Some(true) if anchored => differing.push(target),
+                            Some(_) => {}
+                            None => {
+                                let absent = if *new_feature {
+                                    // A declared scalar or a column of an emitted
+                                    // artifact cannot disappear from both options
+                                    // without leaving an unavailable-channel signal.
+                                    match &target {
+                                        ObservationTarget::OutputCount { .. } => {
+                                            absent_on_both(&target, &a, &b)
+                                        }
+                                        ObservationTarget::OutputColumn {
+                                            point, output, ..
+                                        } => absent_on_both(
+                                            &ObservationTarget::OutputCount {
+                                                point: point.clone(),
+                                                output: output.clone(),
+                                            },
+                                            &a,
+                                            &b,
+                                        ),
+                                        _ => false,
+                                    }
+                                } else {
+                                    absent_on_both(&target, &a, &b)
+                                };
+                                if absent {
+                                    if *new_feature {
+                                        if let ObservationTarget::OutputCount { point, output } =
+                                            &target
                                         {
-                                            report.unverified.push(format!("Alternative {id} target {channel:?} is unavailable or has incompatible types"));
+                                            report.coverage.push(format!("Output {output} was absent on both completed prospective runs at {point}; no output-value comparison or witness is claimed"));
                                         }
                                     }
-                                }
-                                let channels = unrepresented_differences(
-                                    &history::comparison_observations(policy, alternative, a)?,
-                                    &history::comparison_observations(policy, candidate, b)?,
-                                );
-                                if !channels.is_empty() {
-                                    material_unknowns.insert((alternative.binding.identity()?, candidate.binding.identity()?, scene_equivalence_key(&scene)?), format!("Alternative {id} executions differ in material channels without executable property terms: {}", channels.join(", ")));
+                                } else {
+                                    report.unverified.push(format!("Alternative {id} target {target:?} is unavailable or has incompatible types"));
                                 }
                             }
                         }
-                        if *new_feature
-                            && completed_output_absence(
-                                &comparison,
-                                alternative,
-                                candidate,
-                                &scene,
-                                &target,
-                            )
-                        {
-                            let output = match &target {
-                                ObservationTarget::OutputCount { output, .. }
-                                | ObservationTarget::OutputColumn { output, .. } => output,
-                                _ => unreachable!("checked output target"),
-                            };
-                            report.coverage.push(format!("Output {output} was absent on both completed prospective runs at {}; no output-value comparison or witness is claimed", target.point()));
-                            report.runs.extend(comparison.runs);
-                            continue;
-                        }
-                        entry.state = comparison.state;
-                        if !matches!(
-                            comparison.state,
-                            EvidenceState::Observed | EvidenceState::NoDifferenceFound
-                        ) {
-                            report.unverified.push(format!(
-                                "Alternative {id} comparison is unverified: {:?}",
-                                comparison.state
-                            ));
-                            report
-                                .unverified
-                                .extend(comparison.diagnostics.iter().cloned());
-                        }
-                        report.runs.extend(comparison.runs);
-                        if let Some(witness) = comparison.witness {
-                            if witness
-                                .witness()
-                                .minimization
-                                .as_ref()
-                                .is_some_and(|m| !m.complete)
-                            {
-                                report.unverified.extend(
-                                    comparison
-                                        .diagnostics
-                                        .iter()
-                                        .filter(|s| s.contains("incomplete"))
-                                        .cloned(),
-                                );
-                            }
-                            witnesses.push(witness);
-                        }
-                        entry.explanation = comparison.diagnostics.join("; ");
                     }
+                    point_targets.push(differing);
                 }
+                report.runs.extend(runs);
+                scheduled_scenes.push((scene, point_targets));
+            }
+            scheduled_alternatives.push((id, scheduled_scenes));
+        }
+        // Round-robin the measured differences across points, scenes and
+        // alternatives. A wide early point cannot consume every comparison
+        // before a later point receives its first independent witness attempt.
+        let mut schedules: Vec<_> = scheduled_alternatives
+            .iter()
+            .map(|(id, scenes)| {
+                let point_count = scenes
+                    .iter()
+                    .map(|(_, points)| points.len())
+                    .max()
+                    .unwrap_or(0);
+                let target_count = scenes
+                    .iter()
+                    .flat_map(|(_, points)| points.iter())
+                    .map(Vec::len)
+                    .max()
+                    .unwrap_or(0);
+                let targets = (0..target_count).flat_map(move |target_index| {
+                    (0..point_count).flat_map(move |point_index| {
+                        scenes.iter().filter_map(move |(scene, points)| {
+                            points
+                                .get(point_index)
+                                .and_then(|targets| targets.get(target_index))
+                                .map(|target| (scene, target))
+                        })
+                    })
+                });
+                (*id, targets)
+            })
+            .collect();
+        'schedule: loop {
+            let mut pending = false;
+            for (id, targets) in &mut schedules {
+                let Some((scene, target)) = targets.next() else {
+                    continue;
+                };
+                pending = true;
+                if cancelled.load(Ordering::Acquire) {
+                    report
+                        .unverified
+                        .push("Discovery comparison scheduling cancelled".into());
+                    break 'schedule;
+                }
+                if comparisons >= policy.max_comparisons {
+                    exhausted = true;
+                    break 'schedule;
+                }
+                comparisons += 1;
+                let comparison = engine.minimize(
+                    &candidates[*id],
+                    candidate,
+                    scene,
+                    &request.decisions,
+                    target.clone(),
+                    hypothesis_search.clone(),
+                )?;
+                entry.state = comparison.state;
+                if !matches!(
+                    comparison.state,
+                    EvidenceState::Observed | EvidenceState::NoDifferenceFound
+                ) {
+                    report.unverified.push(format!(
+                        "Alternative {id} comparison is unverified: {:?}",
+                        comparison.state
+                    ));
+                    report
+                        .unverified
+                        .extend(comparison.diagnostics.iter().cloned());
+                }
+                report.runs.extend(comparison.runs);
+                if let Some(witness) = comparison.witness {
+                    if witness
+                        .witness()
+                        .minimization
+                        .as_ref()
+                        .is_some_and(|m| !m.complete)
+                    {
+                        report.unverified.extend(
+                            comparison
+                                .diagnostics
+                                .iter()
+                                .filter(|s| s.contains("incomplete"))
+                                .cloned(),
+                        );
+                    }
+                    witnesses.push(witness);
+                }
+                entry.explanation = comparison.diagnostics.join("; ");
+            }
+            if !pending {
+                break;
             }
         }
         if exhausted {
@@ -2090,6 +2146,7 @@ pub fn discover(
         report.unverified.extend(material_unknowns.into_values());
         if witnesses.is_empty() {
             if comparisons == comparisons_before_hypothesis
+                && !checked_alternatives
                 && entry.disposition != Disposition::Settled
                 && report.unverified.len() == unverified_before
                 && !exhausted
@@ -2247,12 +2304,14 @@ pub fn discover(
     Ok(report)
 }
 
-/// Enumerate declared channels independently of whether one source changed them.
-/// Alternative-only declarations still create coverage obligations.
+/// Scalars and outputs retain declaration-based coverage obligations, including
+/// alternative-only channels. View columns belong only to views actually
+/// presented at this point; declarations in unvisited views are not samples.
 fn comparison_targets(
     programs: &[&CapturedProgram],
     point: &str,
     policy: &DiscoveryPolicy,
+    observations: &[&[Observation]],
 ) -> Result<Vec<ObservationTarget>, AdapterError> {
     let observables: BTreeSet<_> = programs
         .iter()
@@ -2267,6 +2326,13 @@ fn comparison_targets(
         .collect();
     let mut outputs = BTreeMap::<Id, BTreeSet<Id>>::new();
     let mut columns = BTreeSet::new();
+    let mut has_view_rows = false;
+    let views: BTreeSet<_> = observations
+        .iter()
+        .flat_map(|observations| observations.iter())
+        .filter(|observation| observation.point == point)
+        .map(|observation| &observation.view.view)
+        .collect();
     for program in programs {
         let provenance = history::comparison_columns(policy, program)?;
         for output in &program.program.outputs {
@@ -2278,8 +2344,14 @@ fn comparison_targets(
                     .map(|c| c.id.clone()),
             );
         }
-        for view in &program.program.views {
+        for view in program
+            .program
+            .views
+            .iter()
+            .filter(|view| views.contains(&view.id))
+        {
             if let Some(schema) = program.program.view_schema(&view.id)? {
+                has_view_rows = true;
                 columns.extend(
                     schema
                         .columns
@@ -2303,9 +2375,11 @@ fn comparison_targets(
             });
         }
     }
-    targets.push(ObservationTarget::ViewRows {
-        point: point.into(),
-    });
+    if has_view_rows {
+        targets.push(ObservationTarget::ViewRows {
+            point: point.into(),
+        });
+    }
     for column in columns {
         targets.push(ObservationTarget::ViewColumn {
             point: point.into(),
