@@ -801,6 +801,7 @@ impl ProductStore {
     /// changes need the controller's own plan and executable implementation.
     pub fn prepare_switch(&self, target: &CapturedProgram, id: &str) -> Result<PreparedAdoption> {
         let snapshot = self.load()?;
+        scope::reject_unmanaged_target(&snapshot, target)?;
         let compatibility =
             LocalRuntime::default().compatibility_at(target, &snapshot.data, snapshot.clock_day)?;
         if compatibility.state != CompatibilityState::Compatible {
@@ -848,6 +849,7 @@ impl ProductStore {
         target: &CapturedProgram,
     ) -> Result<PreparedAdoption> {
         let current = self.load()?;
+        scope::reject_unmanaged_target(&current, target)?;
         self.check_plan(&current, &plan, target)?;
         Ok(PreparedAdoption {
             plan,

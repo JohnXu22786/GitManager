@@ -2,6 +2,9 @@
 mod common_fact_admission;
 mod common_fact_rules;
 mod owned_lifecycle;
+mod owned_lowering;
+mod owned_preview;
+pub use owned_preview::{OwnedPreviewReceipt, OwnedPreviewSession, PreparedOwnedPreview};
 pub use common_fact_admission::{
     CommonFactAdmissionReport, CommonFactCertificate, OwnedPreviewAvailability,
     OwnedPreviewRequest, OwnedProjectionDestination, OwnedProjectionRecipe, ProofBudget,

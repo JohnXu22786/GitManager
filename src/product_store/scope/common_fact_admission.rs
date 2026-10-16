@@ -250,7 +250,7 @@ pub(super) fn authenticate(
     }
     super::common_fact_inventory::derive(snapshot, candidate, &request.inventory)
 }
-fn derive(
+pub(super) fn derive(
     snapshot: &ProjectSnapshot,
     candidate: &CapturedProgram,
     request: &OwnedPreviewRequest,
