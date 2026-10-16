@@ -219,15 +219,67 @@ fn checked_scene(
     checked
 }
 
+/// Private, source-bound associations from successful independent requirements.
+/// This is classification evidence only, never a projected executable scene.
+struct RequiredFeatureEvidence {
+    source: SourceBinding,
+    artifact: ArtifactRef,
+    views_by_action: BTreeMap<Id, BTreeSet<Id>>,
+}
+
+fn required_view_points(predicate: &PropertyPredicate, points: &mut BTreeSet<Id>) {
+    fn term_points(term: &PropertyTerm, points: &mut BTreeSet<Id>) {
+        match term {
+            PropertyTerm::ViewRows { point, .. } | PropertyTerm::ViewColumn { point, .. } => {
+                points.insert(point.clone());
+            }
+            PropertyTerm::Count { value } => term_points(value, points),
+            _ => {}
+        }
+    }
+    match predicate {
+        PropertyPredicate::Equal { left, right } | PropertyPredicate::Less { left, right } => {
+            term_points(left, points);
+            term_points(right, points);
+        }
+        PropertyPredicate::And { values } => {
+            for value in values {
+                required_view_points(value, points);
+            }
+        }
+        PropertyPredicate::Or { values } => {
+            // A successful alternative may differ in ordering or values, but
+            // every branch must independently require this observation point.
+            let mut branches = values.iter();
+            if let Some(first) = branches.next() {
+                let mut common = BTreeSet::new();
+                required_view_points(first, &mut common);
+                for value in branches {
+                    let mut branch = BTreeSet::new();
+                    required_view_points(value, &mut branch);
+                    common.retain(|point| branch.contains(point));
+                }
+                points.extend(common);
+            }
+        }
+        // A false child can short-circuit before checking any view term.
+        PropertyPredicate::Not { .. } => {}
+    }
+}
+
 /// Identify only a type-level absence of an independently required new
-/// action and its added session state. The projected value is used solely to
-/// classify the validation error; it is never executed or called current proof.
+/// action, its added session state, and its independently checked new views.
+/// The projection classifies an error; it is never executed as current proof.
 fn required_feature_absence(
     before: &CapturedProgram,
     candidate: &CapturedProgram,
     scene: &ScenarioSpec,
     policy: &DiscoveryPolicy,
+    evidence: &RequiredFeatureEvidence,
 ) -> Option<AdapterError> {
+    if evidence.source != candidate.binding || evidence.artifact != candidate.artifact {
+        return None;
+    }
     let error = scene.validate(&before.program).err()?;
     scene.validate(&candidate.program).ok()?;
     let missing: BTreeSet<_> = policy
@@ -244,10 +296,8 @@ fn required_feature_absence(
                     .actions
                     .iter()
                     .any(|action| &action.id == *id)
-                && policy.requirements.iter().any(|case| {
-                    !case.properties.is_empty()
-                        && scenario_operations(&case.scenario, &candidate.program).contains(*id)
-                })
+                && evidence.views_by_action.contains_key(*id)
+                && scenario_operations(scene, &candidate.program).contains(*id)
         })
         .collect();
     if missing.is_empty() {
@@ -263,7 +313,10 @@ fn required_feature_absence(
             .iter()
             .any(|action| missing.contains(action));
         removed |= absent;
-        !absent
+        let required_view = matches!(input, SemanticInput::Navigate { view }
+            if !before.program.views.iter().any(|v| &v.id == view)
+                && missing.iter().any(|action| evidence.views_by_action[*action].contains(view)));
+        !absent && !required_view
     });
     if !removed {
         return None;
@@ -340,7 +393,20 @@ fn check_requirements(
     policy: &DiscoveryPolicy,
     runtime: &LocalRuntime,
     budget: &ReplayBudget,
-) -> Result<(Vec<String>, Vec<String>, Vec<RunEvidence>), AdapterError> {
+) -> Result<
+    (
+        Vec<String>,
+        Vec<String>,
+        Vec<RunEvidence>,
+        RequiredFeatureEvidence,
+    ),
+    AdapterError,
+> {
+    let mut features = RequiredFeatureEvidence {
+        source: program.binding.clone(),
+        artifact: program.artifact.clone(),
+        views_by_action: BTreeMap::new(),
+    };
     let mut defects = vec![];
     let mut unknown = vec![];
     let mut runs = vec![];
@@ -377,17 +443,45 @@ fn check_requirements(
                         requirement.id, run.state
                     ));
                 } else {
+                    let mut passed = true;
                     for p in &requirement.properties {
                         match p.evaluate(&run.observations) {
                             Some(true) => {}
-                            Some(false) => defects.push(format!(
-                                "Requirement {} / {} is violated",
-                                requirement.id, p.id
-                            )),
-                            None => unknown.push(format!(
-                                "Requirement {} / {} is unverified",
-                                requirement.id, p.id
-                            )),
+                            Some(false) => {
+                                passed = false;
+                                defects.push(format!(
+                                    "Requirement {} / {} is violated",
+                                    requirement.id, p.id
+                                ));
+                            }
+                            None => {
+                                passed = false;
+                                unknown.push(format!(
+                                    "Requirement {} / {} is unverified",
+                                    requirement.id, p.id
+                                ));
+                            }
+                        }
+                    }
+                    if passed {
+                        let mut points = BTreeSet::new();
+                        for property in &requirement.properties {
+                            required_view_points(&property.predicate, &mut points);
+                        }
+                        let views: BTreeSet<_> = run
+                            .observations
+                            .iter()
+                            .filter(|observation| points.contains(&observation.point))
+                            .map(|observation| observation.view.view.clone())
+                            .collect();
+                        for action in scenario_operations(&requirement.scenario, &program.program)
+                            .intersection(&policy.required_actions)
+                        {
+                            features
+                                .views_by_action
+                                .entry(action.clone())
+                                .or_default()
+                                .extend(views.iter().cloned());
                         }
                     }
                 }
@@ -399,7 +493,7 @@ fn check_requirements(
             )),
         }
     }
-    Ok((defects, unknown, runs))
+    Ok((defects, unknown, runs, features))
 }
 
 fn is_chosen(decision: &ScopedDecision) -> bool {
@@ -766,7 +860,7 @@ pub fn discover(
             }
         }
     }
-    let (defects, unknown, runs) =
+    let (defects, unknown, runs, required_features) =
         check_requirements(candidate, request, policy, &runtime, &replay_budget)?;
     let missing_feature_coverage: Vec<_> = policy
         .required_actions
@@ -1251,7 +1345,7 @@ pub fn discover(
                 }
             }
             let expected_absence = if new_feature && current_ran {
-                required_feature_absence(before, candidate, &scene, policy)
+                required_feature_absence(before, candidate, &scene, policy, &required_features)
             } else {
                 None
             };
@@ -1259,7 +1353,7 @@ pub fn discover(
                 match result {
                     Ok(run) => report.runs.push(run),
                     Err(error) if side == 0 && expected_absence.as_ref() == Some(&error) => {
-                        report.coverage.push("Current cannot execute this independently required new action/state; compare the two verified prospective implementations. No current-side experience is claimed".into());
+                        report.coverage.push("Current cannot execute this independently required new action/state/view; compare the two verified prospective implementations. No current-side experience is claimed".into());
                     }
                     Err(error) => report
                         .unverified
@@ -1333,7 +1427,7 @@ pub fn discover(
                     continue;
                 }
             }
-            let (defects, unknown, runs) =
+            let (defects, unknown, runs, _) =
                 check_requirements(alternative, request, policy, &runtime, &replay_budget)?;
             report.runs.extend(runs);
             if !defects.is_empty() || !unknown.is_empty() {

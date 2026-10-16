@@ -106,7 +106,13 @@ program, or call a provider automatically when an app opens.
   A comparison first checks the actual
   baseline/candidate outcomes on the same observation target; hypothetical third
   programs cannot invent behavior changes for equivalent edits. Newly required
-  features have a separate path with two complete implementations. It ignores only declared display
+  features have a separate path with two complete implementations. Missing new
+  views qualify only when a successful independent requirement exercises the
+  same missing required action and checks that actually presented view through
+  typed rows or columns. Disjunctions must require that view on every branch;
+  unrelated navigation and new initial session views remain unverified. The
+  validation-only projection never runs or represents a current-side experience.
+  It ignores only declared display
   labels, not arbitrary data fields with matching names. No domain-name or
   request-keyword router selects scenes or outcomes.
 - Model alternatives must include the exact captured candidate. Every candidate
