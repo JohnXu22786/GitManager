@@ -27,6 +27,13 @@ pub enum ObservationTarget {
     ViewRows {
         point: Id,
     },
+    RowActionRows {
+        point: Id,
+        view: Id,
+        entity: Id,
+        binding: Id,
+        action: Id,
+    },
     ViewColumn {
         point: Id,
         column: Id,
@@ -43,6 +50,7 @@ impl ObservationTarget {
             | Self::OutputCount { point, .. }
             | Self::OutputColumn { point, .. }
             | Self::ViewRows { point }
+            | Self::RowActionRows { point, .. }
             | Self::ViewColumn { point, .. } => point,
             Self::Property { .. } => "",
         }
@@ -97,6 +105,24 @@ impl ObservationTarget {
                 .any(|a| &a.output == output && a.columns.iter().any(|c| &c.id == column)),
             Self::ViewRows { .. } => {
                 observation.view_schema.is_some() || !observation.view.rows.is_empty()
+            }
+            Self::RowActionRows {
+                view,
+                entity,
+                binding,
+                action,
+                ..
+            } => {
+                let schema = observation.view_schema.as_ref()?;
+                let actions = schema.row_actions.as_ref()?;
+                if &observation.view.view != view || &schema.entity != entity {
+                    return None;
+                }
+                match actions.get(binding) {
+                    Some(declared) if declared == action => true,
+                    Some(_) => return None,
+                    None => false,
+                }
             }
             Self::ViewColumn { column, .. } => {
                 observation
@@ -255,6 +281,23 @@ impl ObservationTarget {
                     },
                 )
             }
+            Self::RowActionRows {
+                point,
+                view,
+                entity,
+                binding,
+                action,
+            } => (
+                PropertyTerm::RowActionRows {
+                    point: point.clone(),
+                    view: view.clone(),
+                    entity: entity.clone(),
+                    binding: binding.clone(),
+                    action: action.clone(),
+                },
+                Type::list(Type::reference(entity)),
+                o.row_action_rows(view, entity, binding, action)?,
+            ),
             Self::ViewColumn { point, column } => {
                 let typ = o.view_schema.as_ref()?.columns.get(column)?.clone();
                 let items = o
@@ -307,6 +350,19 @@ fn term_channel_presence(term: &PropertyTerm, observations: &[Observation]) -> O
         },
         PropertyTerm::ViewRows { point, .. } => ObservationTarget::ViewRows {
             point: point.clone(),
+        },
+        PropertyTerm::RowActionRows {
+            point,
+            view,
+            entity,
+            binding,
+            action,
+        } => ObservationTarget::RowActionRows {
+            point: point.clone(),
+            view: view.clone(),
+            entity: entity.clone(),
+            binding: binding.clone(),
+            action: action.clone(),
         },
         PropertyTerm::ViewColumn { point, column, .. } => ObservationTarget::ViewColumn {
             point: point.clone(),

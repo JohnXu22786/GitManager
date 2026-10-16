@@ -462,7 +462,7 @@ fn reduction_audit_is_reconstructible_and_runtime_version_invalidates_old_proof(
         }
     }
     let current = &verified.witness().after.binding;
-    assert_eq!(current.runtime_version, "local-interpreter/3");
+    assert_eq!(current.runtime_version, "local-interpreter/4");
     let mut old = verified.witness().after.clone();
     old.binding.runtime_version = "local-interpreter/1".into();
     assert!(!old.is_current(current));

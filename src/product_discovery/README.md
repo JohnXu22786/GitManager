@@ -123,7 +123,7 @@ program, or call a provider automatically when an app opens.
   independently active invariants without repeating the settled question. Violations go to
   repair; unknown applicability/execution does not become an approved option.
 - Distinctions are sampled from real declared observables, actual local outputs,
-  or typed view rows/cells. Identity/provenance-only data-digest changes are not
+  or typed view rows/cells and row-action availability. Identity/provenance-only data-digest changes are not
   business differences. One-sided missing or incompatible typed channels remain
   explicitly unverified rather than silently equal. Channel presence is checked
   separately from sample construction, including cumulative export-size limits;
@@ -190,7 +190,15 @@ program, or call a provider automatically when an app opens.
   checks, including unchanged captured channels and alternative-only
   declarations. The captured-change filter limits choice generation, not this
   independent coverage check.
-- Unsupported material view/action/selection or output-layout contrasts remain
+- Row-action targets name the exact observation point, view, entity, binding,
+  and underlying action. Their values are sorted displayed record references
+  whose completed rendering enabled that binding, including action guards.
+  Disabled declared bindings have typed empty values; absent bindings, retargeted
+  actions, and missing provenance remain unknown. Targets cover the union of
+  actually presented bindings on the captured and offered implementations.
+  Unanchored alternative-only availability changes remain unverified. Row order
+  is a separate view-row property, not a difference in the action's record set.
+- Unsupported material view/toolbar-action/selection or output-layout contrasts remain
   explicit in coverage even when a supported contrast also yields a witness,
   or comparisons run without a witness. This check uses original executed
   source and alternative observations, independently of saved decisions; it

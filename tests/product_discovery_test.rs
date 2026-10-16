@@ -2991,14 +2991,38 @@ fn supported_comparisons_do_not_hide_unrepresented_material_without_history() {
                 "row_action" => "done/row_actions",
                 _ => "done/output/0/format",
             };
-            assert!(
-                report
+            if change == "row_action" && side == "candidate" {
+                assert!(
+                    report.questions.iter().flat_map(|q| &q.witnesses).any(|w| {
+                        matches!(
+                            &w.witness().distinguishing_properties[0].predicate,
+                            PropertyPredicate::Equal {
+                                left: PropertyTerm::RowActionRows { .. },
+                                ..
+                            }
+                        )
+                    }),
+                    "{change}/{side}"
+                );
+                assert!(!report
                     .unverified
                     .iter()
-                    .any(|message| message.contains(channel)),
-                "{change}/{side}: {:?}",
-                report.unverified
-            );
+                    .any(|message| message.contains(channel)));
+            } else {
+                let channel = if change == "row_action" {
+                    "row-action contrast"
+                } else {
+                    channel
+                };
+                assert!(
+                    report
+                        .unverified
+                        .iter()
+                        .any(|message| message.contains(channel)),
+                    "{change}/{side}: {:?}",
+                    report.unverified
+                );
+            }
             assert_eq!(
                 report.log[0].state,
                 EvidenceState::Inconclusive,
@@ -3024,7 +3048,7 @@ fn supported_comparisons_do_not_hide_unrepresented_material_without_history() {
 }
 
 #[test]
-fn familiar_contrasts_do_not_settle_new_unrepresented_material_changes() {
+fn familiar_contrasts_cover_row_actions_but_not_opaque_material_changes() {
     for change in ["toolbar_action", "row_action", "output_format"] {
         let (mut request, mut result) = input();
         if change == "row_action" {
@@ -3083,16 +3107,46 @@ fn familiar_contrasts_do_not_settle_new_unrepresented_material_changes() {
                     .any(|(a, b)| a.view != b.view || a.outputs != b.outputs)),
             "{change}"
         );
-        assert!(
-            report.questions.is_empty(),
-            "unrepresented change cannot become an invented choice: {change}"
-        );
-        assert!(!report.unverified.is_empty(), "{change}");
-        assert_eq!(
-            report.log[0].disposition,
-            Disposition::Unverified,
-            "{change}"
-        );
+        if change == "row_action" {
+            fn has_row_action(predicate: &PropertyPredicate) -> bool {
+                match predicate {
+                    PropertyPredicate::Equal { left, right }
+                    | PropertyPredicate::Less { left, right } => {
+                        matches!(left, PropertyTerm::RowActionRows { .. })
+                            || matches!(right, PropertyTerm::RowActionRows { .. })
+                    }
+                    PropertyPredicate::And { values } | PropertyPredicate::Or { values } => {
+                        values.iter().any(has_row_action)
+                    }
+                    PropertyPredicate::Not { value } => has_row_action(value),
+                }
+            }
+            assert!(!report.questions.is_empty());
+            assert!(report
+                .questions
+                .iter()
+                .flat_map(|question| &question.witnesses)
+                .any(|witness| witness
+                    .witness()
+                    .distinguishing_properties
+                    .iter()
+                    .any(|property| has_row_action(&property.predicate))));
+            assert!(report
+                .log
+                .iter()
+                .all(|entry| entry.disposition != Disposition::Settled));
+        } else {
+            assert!(
+                report.questions.is_empty(),
+                "unrepresented change cannot become an invented choice: {change}"
+            );
+            assert!(!report.unverified.is_empty(), "{change}");
+            assert_eq!(
+                report.log[0].disposition,
+                Disposition::Unverified,
+                "{change}"
+            );
+        }
     }
 }
 

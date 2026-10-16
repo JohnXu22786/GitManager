@@ -52,7 +52,7 @@ pub fn has_protected_fields(program: &CapturedProgram) -> bool {
             .any(|f| f.id.starts_with(PROTECTED_FIELD_PREFIX))
     })
 }
-pub const RUNTIME_VERSION: &str = "local-interpreter/3";
+pub const RUNTIME_VERSION: &str = "local-interpreter/4";
 pub const DRIVER_VERSION: &str = "semantic-input/3";
 type Result<T> = std::result::Result<T, AdapterError>;
 

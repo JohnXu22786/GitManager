@@ -139,6 +139,17 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                     }
                     ScopeMatch::Applies => {}
                 }
+                let candidates: Vec<_> = mappings
+                    .iter()
+                    .filter(|m| {
+                        m.source_program == scene.program.artifact.program_digest
+                            && m.source_program != target.artifact.program_digest
+                    })
+                    .collect();
+                if candidates.len() > 1 {
+                    return Err(invalid("ambiguous pending source mapping"));
+                }
+                let bound = candidates.first().copied();
                 // A retained two-prospective design may introduce an action
                 // absent from live current. Preserve its actual replay source;
                 // it is not an observation of current or an equivalence claim.
@@ -154,7 +165,10 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 let managed_pair = paired.len() == 2
                     && paired[0].recorded_by == paired[1].recorded_by
                     && paired[0].manifest.basis == paired[1].manifest.basis;
-                if (managed_pair || ordinary_pair)
+                // An explicit source-qualified recipe takes precedence over
+                // prospective-source fallback, including a renamed session view.
+                if bound.is_none()
+                    && (managed_pair || ordinary_pair)
                     && scene.scenario.validate(&target.program).is_err()
                 {
                     let operations = contexts
@@ -176,17 +190,6 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                     });
                     continue;
                 }
-                let candidates: Vec<_> = mappings
-                    .iter()
-                    .filter(|m| {
-                        m.source_program == scene.program.artifact.program_digest
-                            && m.source_program != target.artifact.program_digest
-                    })
-                    .collect();
-                if candidates.len() > 1 {
-                    return Err(invalid("ambiguous pending source mapping"));
-                }
-                let bound = candidates.first().copied();
                 if let Some(bound) = bound {
                     let mut originals = BTreeSet::new();
                     if bound.scenarios.iter().any(|replacement| {

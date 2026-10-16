@@ -166,3 +166,20 @@ binding for two proofs sharing one recording birth; immutable scene-package
 validation independently refuses to downgrade a damaged prospective pair into
 a legacy current-plus-one scene package. Legacy single-target ID ordering and
 resupplied already-retained correspondences keep their established semantics.
+
+## Typed row-action promises
+
+`RowActionRows` retains the identities of displayed records permitting one exact
+UI binding and action in one exact view. Both binding conditions and action
+guards come from completed runtime rendering. Complete optional binding/action
+provenance distinguishes a disabled binding from a deleted or renamed binding;
+legacy observations without it cannot prove this property. Explicit exercised,
+source-qualified view/action mappings carry the promise across renames. Binding
+IDs stay exact; a unique matching action does not authorize a binding rename.
+
+The runtime evidence version is `local-interpreter/4`; semantic input execution
+remains `semantic-input/3`. Missing optional provenance serializes exactly as
+before. Existing scene receipts and their canonical identities are never
+backfilled or rewritten. If exact-source replay now produces different metadata,
+old scene checks remain stale/unverified and cannot authorize adoption. This
+change adds no storage migration or application/provider language operation.

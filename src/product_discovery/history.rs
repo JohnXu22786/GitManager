@@ -1243,6 +1243,10 @@ impl RetainedRun {
             | ObservationTarget::OutputColumn { output, .. } => {
                 reverse(SemanticKind::Output, output)
             }
+            ObservationTarget::RowActionRows { view, action, .. } => {
+                reverse(SemanticKind::View, view);
+                reverse(SemanticKind::Action, action);
+            }
             _ => {}
         }
         Some(old)

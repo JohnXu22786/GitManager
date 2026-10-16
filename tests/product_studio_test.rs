@@ -678,7 +678,7 @@ fn format_one_open_requires_confirmation_then_reopens_with_records_receipts_and_
             .snapshot(),
         &upgraded
     );
-    assert_eq!(product_runtime::RUNTIME_VERSION, "local-interpreter/3");
+    assert_eq!(product_runtime::RUNTIME_VERSION, "local-interpreter/4");
     assert_eq!(product_runtime::DRIVER_VERSION, "semantic-input/3");
     stop(studio, &stopped);
     let mut restarted = ProductStudio::testing(root, None, TestHooks::default());
