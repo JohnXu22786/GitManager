@@ -1,4 +1,11 @@
 //! Host-owned scoped executable composition and protected completion history.
+mod common_fact_inventory;
+mod common_fact_uses;
+pub use common_fact_inventory::{
+    CommonFactAction, CommonFactIdentityHazard, CommonFactInventory, CommonFactInventoryRequest,
+    CommonFactLifecycleSuggestion, CommonFactObligation, CommonFactPhase, CommonFactPhaseKind,
+    CommonFactReference, CommonFactResources, CommonFactSpan, CommonFactUse,
+};
 mod compiler;
 mod contract;
 mod correspondence;
