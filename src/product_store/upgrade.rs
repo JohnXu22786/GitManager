@@ -4,6 +4,9 @@ use super::*;
 mod legacy;
 pub(crate) use legacy::VerifiedContainerUpgrade;
 const MIGRATION: &str = "generated-project-container/3";
+const PENDING: &str = "UPGRADE-PENDING";
+const COMPLETE: &str = "UPGRADE-COMPLETE";
+const MAX_JOURNAL_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpgradeProgress {
@@ -51,6 +54,13 @@ struct UpgradeJournal {
     artifacts: usize,
     programs: usize,
     decisions: usize,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivationRecord {
+    version: u32,
+    journal: UpgradeJournal,
+    inbox: Option<UpgradeInbox>,
 }
 impl VerifiedContainerUpgrade {
     fn pointer(&self, current: bool) -> Pointer {
@@ -124,6 +134,131 @@ fn unscoped_packages(snapshot: &ProjectSnapshot) -> Result<()> {
     }
 }
 impl ProductStore {
+    // The pending record is durable before CURRENT. A matching receipt is
+    // published only after every business-state barrier has completed. Losing
+    // its acknowledgement is safe; losing the receipt requires explicit retry.
+    fn activation_record(
+        &self,
+        current: &ProjectSnapshot,
+    ) -> Result<Option<(ActivationRecord, bool)>> {
+        let bytes = match self.root.read(PENDING, MAX_JOURNAL_BYTES) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return match self.root.read(COMPLETE, MAX_JOURNAL_BYTES) {
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+                    Err(e) => Err(e.into()),
+                    Ok(_) => Err(StoreError::Corrupt(
+                        "orphan upgrade completion receipt".into(),
+                    )),
+                };
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let record: ActivationRecord = json::parse(&bytes)?;
+        let journal = &record.journal;
+        if canonical_bytes(&record)? != bytes
+            || record.version != 1
+            || journal.version != 2
+            || journal.migration != MIGRATION
+            || !matches!(journal.from.version, 1 | 2)
+            || journal.from.magic != MAGIC
+            || journal.to.magic != MAGIC
+            || journal.to.version != FORMAT
+            || journal.from.project_id != journal.to.project_id
+            || journal.from.revision != journal.to.revision
+            || journal.to.project_id != current.data.project_id
+            || journal.to.revision > current.revision
+            || (journal.to.revision == current.revision
+                && journal.to.object != canonical_digest(IdentityDomain::Data, current)?)
+        {
+            return Err(StoreError::Corrupt(
+                "invalid upgrade activation record".into(),
+            ));
+        }
+        let journal_name = format!(
+            "upgrade-{}-3-{}.json",
+            journal.from.version,
+            journal.from.object.as_str()
+        );
+        if self.root.read(&journal_name, MAX_JOURNAL_BYTES)? != canonical_bytes(journal)? {
+            return Err(StoreError::Corrupt(
+                "upgrade activation journal changed".into(),
+            ));
+        }
+        if let Some(inbox) = &record.inbox {
+            if inbox.version != 2
+                || inbox.migration != MIGRATION
+                || inbox.original != journal.from.object
+                || inbox.target != journal.to.object
+                || self.root.read("UPGRADE-INBOX", MAX_JOURNAL_BYTES)? != canonical_bytes(inbox)?
+            {
+                return Err(StoreError::Corrupt(
+                    "upgrade recovery provenance changed".into(),
+                ));
+            }
+        }
+        let complete = match self.root.read(COMPLETE, MAX_JOURNAL_BYTES) {
+            Ok(receipt) if receipt == bytes => true,
+            Ok(_) => {
+                return Err(StoreError::Corrupt(
+                    "upgrade completion receipt changed".into(),
+                ))
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e.into()),
+        };
+        if !complete && journal.to.revision != current.revision {
+            return Err(StoreError::Conflict(
+                "later work cannot complete an unresolved upgrade".into(),
+            ));
+        }
+        Ok(Some((record, complete)))
+    }
+    pub(super) fn require_upgrade_complete(&self, current: &ProjectSnapshot) -> Result<()> {
+        if self
+            .activation_record(current)?
+            .is_some_and(|(_, complete)| !complete)
+        {
+            return Err(StoreError::UpgradeRequired);
+        }
+        Ok(())
+    }
+    pub(super) fn require_unsealed_upgrade(&self) -> Result<()> {
+        for name in [PENDING, COMPLETE] {
+            match self.root.read(name, MAX_JOURNAL_BYTES) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+                Err(e) => return Err(e.into()),
+                Ok(_) => return Err(StoreError::UpgradeRequired),
+            }
+        }
+        match self.root.read("UPGRADE-INBOX", MAX_JOURNAL_BYTES) {
+            Ok(bytes) => {
+                let inbox: UpgradeInbox = json::parse(&bytes)?;
+                if inbox.version != 2
+                    || inbox.migration != MIGRATION
+                    || canonical_bytes(&inbox)? != bytes
+                {
+                    return Err(StoreError::UpgradeRequired);
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e.into()),
+        }
+        Ok(())
+    }
+    fn recorded_conversion(&self, journal: &UpgradeJournal) -> Result<VerifiedContainerUpgrade> {
+        let original = self.root.read(
+            &format!("object-{}.json", journal.from.object.as_str()),
+            MAX_STORE_BYTES,
+        )?;
+        let conversion = VerifiedContainerUpgrade::from_pointer(&original, &journal.from)?;
+        if conversion.journal() != *journal {
+            return Err(StoreError::Corrupt(
+                "upgrade record does not match preserved source".into(),
+            ));
+        }
+        Ok(conversion)
+    }
     pub fn inspect_upgrade(&self) -> Result<UpgradeSummary> {
         self.pinned()?;
         let pointer: Pointer = json::parse(&self.root.read("CURRENT", 16 * 1024)?)?;
@@ -131,7 +266,15 @@ impl ProductStore {
             return Err(StoreError::Corrupt("not a generated-tool project".into()));
         }
         match pointer.version {
-            FORMAT => summary(&self.load()?, FORMAT),
+            FORMAT => {
+                let current = self.load_current()?;
+                if let Some((record, false)) = self.activation_record(&current)? {
+                    let conversion = self.recorded_conversion(&record.journal)?;
+                    summary(conversion.snapshot(), conversion.source_version())
+                } else {
+                    summary(&current, FORMAT)
+                }
+            }
             1 | 2 => {
                 let bytes = self.root.read(
                     &format!("object-{}.json", pointer.object.as_str()),
@@ -247,6 +390,40 @@ impl ProductStore {
         self.parent.sync()?;
         self.pinned()
     }
+    fn complete_recorded_durability(
+        &self,
+        conversion: &VerifiedContainerUpgrade,
+        record: &ActivationRecord,
+        current: &ProjectSnapshot,
+        pointer_bytes: &[u8],
+        packages: &BTreeMap<Digest, Vec<u8>>,
+    ) -> Result<()> {
+        let journal_bytes = canonical_bytes(&conversion.journal())?;
+        if record.journal != conversion.journal() {
+            return Err(StoreError::Corrupt(
+                "upgrade completion record changed".into(),
+            ));
+        }
+        let record_bytes = canonical_bytes(record)?;
+        self.require_synced_bytes(&conversion.journal_name(), &journal_bytes)?;
+        self.require_synced_bytes(PENDING, &record_bytes)?;
+        if let Some(inbox) = &record.inbox {
+            self.require_synced_bytes("UPGRADE-INBOX", &canonical_bytes(inbox)?)?;
+        }
+        self.require_synced_bytes(
+            &format!("object-{}.json", conversion.original_digest().as_str()),
+            conversion.original(),
+        )?;
+        self.require_synced_bytes(
+            &format!("object-{}.json", conversion.target_digest().as_str()),
+            &canonical_bytes(conversion.snapshot())?,
+        )?;
+        self.complete_current_durability(current, pointer_bytes, packages)?;
+        self.publish_upgrade_object(COMPLETE, &record_bytes)?;
+        self.require_synced_bytes(COMPLETE, &record_bytes)?;
+        self.parent.sync()?;
+        self.pinned()
+    }
     fn upgrade_inner<F, V>(
         &self,
         mut progress: F,
@@ -273,12 +450,27 @@ impl ProductStore {
             return Err(StoreError::Corrupt("not a generated-tool project".into()));
         }
         if pointer.version == FORMAT {
-            let current = self.load()?;
+            let current = self.load_current()?;
+            let record = self.activation_record(&current)?;
+            let conversion = record
+                .as_ref()
+                .map(|(record, _)| {
+                    self.recorded_conversion(&record.journal)
+                        .map(|conversion| (record, conversion))
+                })
+                .transpose()?;
             let packages = self.upgrade_packages(&current)?;
             verify(&current)?;
             resume(&current)?;
-            self.complete_current_durability(&current, &pointer_bytes, &packages)
+            if let Some((record, conversion)) = conversion {
+                self.complete_recorded_durability(
+                    &conversion, record, &current, &pointer_bytes, &packages,
+                )
                 .map_err(uncertain)?;
+            } else {
+                self.complete_current_durability(&current, &pointer_bytes, &packages)
+                    .map_err(uncertain)?;
+            }
             return summary(&current, FORMAT);
         }
         if !matches!(pointer.version, 1 | 2) {
@@ -301,6 +493,12 @@ impl ProductStore {
         }
         let journal_name = conversion.journal_name();
         let journal_bytes = canonical_bytes(&conversion.journal())?;
+        let record = ActivationRecord {
+            version: 1,
+            journal: conversion.journal(),
+            inbox: None,
+        };
+        let record_bytes = canonical_bytes(&record)?;
         self.publish_upgrade_object(&journal_name, &journal_bytes)?;
         #[cfg(test)]
         if fault == Some(FaultPoint::AfterUpgradeJournal) {
@@ -309,6 +507,7 @@ impl ProductStore {
         self.require_synced_bytes(&target_name, &target_bytes)?;
         self.require_synced_bytes(&journal_name, &journal_bytes)?;
         self.require_synced_bytes(&old_name, &old_bytes)?;
+        self.publish_upgrade_object(PENDING, &record_bytes)?;
         progress(UpgradeProgress::Verified);
         progress(UpgradeProgress::Activating);
         self.pinned()?;
@@ -316,6 +515,7 @@ impl ProductStore {
         self.require_synced_bytes(&target_name, &target_bytes)?;
         self.require_synced_bytes(&journal_name, &journal_bytes)?;
         self.require_synced_bytes(&old_name, &old_bytes)?;
+        self.require_synced_bytes(PENDING, &record_bytes)?;
         self.require_synced_bytes("CURRENT", &pointer_bytes)?;
         self.root.sync()?;
         // Once activation is attempted, this handle cannot edit or retry.
@@ -334,6 +534,14 @@ impl ProductStore {
             .sync()
             .map_err(StoreError::from)
             .map_err(uncertain)?;
+        self.complete_recorded_durability(
+            &conversion,
+            &record,
+            target,
+            &canonical_bytes(&conversion.pointer(true))?,
+            &packages,
+        )
+        .map_err(uncertain)?;
         progress(UpgradeProgress::RestartRequired);
         summary(target, pointer.version)
     }
@@ -373,7 +581,7 @@ impl ProductStore {
         #[cfg(test)] fault: Option<FaultPoint>,
     ) -> Result<UpgradeSummary>
     where
-        F: FnOnce(&ProductStore, &ProjectSnapshot) -> Result<()>,
+        F: FnOnce(&ProductStore, &ProjectSnapshot, bool) -> Result<()>,
         P: FnMut(UpgradeProgress),
     {
         Self::recover_upgraded_at(
@@ -400,7 +608,7 @@ impl ProductStore {
         #[cfg(test)] fault: Option<FaultPoint>,
     ) -> Result<UpgradeSummary>
     where
-        F: FnOnce(&ProductStore, &ProjectSnapshot) -> Result<()>,
+        F: FnOnce(&ProductStore, &ProjectSnapshot, bool) -> Result<()>,
         P: FnMut(UpgradeProgress),
     {
         Self::recover_upgraded_at(
@@ -429,7 +637,7 @@ impl ProductStore {
         #[cfg(test)] fault: Option<FaultPoint>,
     ) -> Result<UpgradeSummary>
     where
-        F: FnOnce(&ProductStore, &ProjectSnapshot) -> Result<()>,
+        F: FnOnce(&ProductStore, &ProjectSnapshot, bool) -> Result<()>,
         P: FnMut(UpgradeProgress),
     {
         progress(UpgradeProgress::Validating);
@@ -441,14 +649,21 @@ impl ProductStore {
         }
         let snapshot = verified.snapshot();
         resume(snapshot)?;
-        let marker = canonical_bytes(&UpgradeInbox {
+        let inbox = UpgradeInbox {
             version: 2,
             migration: MIGRATION.into(),
             backup: backup.clone(),
             original: verified.original_digest().clone(),
             target: verified.target_digest().clone(),
             bundle: bundle.clone(),
-        })?;
+        };
+        let marker = canonical_bytes(&inbox)?;
+        let record = ActivationRecord {
+            version: 1,
+            journal: verified.journal(),
+            inbox: Some(inbox),
+        };
+        let record_bytes = canonical_bytes(&record)?;
         let (parent, name) = match selected {
             Some(selected) => selected.checked_parts()?,
             None => {
@@ -488,13 +703,16 @@ impl ProductStore {
         let journal_bytes = canonical_bytes(&verified.journal())?;
         match store.root.read("CURRENT", 16 * 1024) {
             Ok(pointer_bytes) => {
-                if store.load()? != *snapshot {
+                if store.load_current()? != *snapshot {
                     return Err(StoreError::Conflict("upgrade destination has different or later work; keep that work and reopen it".into()));
                 }
                 // Activated retries never repair missing preserved inputs.
                 store.require_synced_bytes(&original_name, verified.original())?;
                 store.require_synced_bytes(&journal_name, &journal_bytes)?;
-                before_activate(&store, snapshot)?;
+                store.activation_record(snapshot)?.ok_or_else(|| {
+                    StoreError::Corrupt("upgrade activation record missing".into())
+                })?;
+                before_activate(&store, snapshot, true)?;
                 let packages = store.upgrade_packages(snapshot)?;
                 progress(UpgradeProgress::Verified);
                 // Verified is a pre-completion notification. Retained inputs
@@ -503,7 +721,9 @@ impl ProductStore {
                 store.require_synced_bytes(&journal_name, &journal_bytes)?;
                 store.require_synced_bytes("UPGRADE-INBOX", &marker)?;
                 store
-                    .complete_current_durability(snapshot, &pointer_bytes, &packages)
+                    .complete_recorded_durability(
+                        &verified, &record, snapshot, &pointer_bytes, &packages,
+                    )
                     .map_err(uncertain)?;
                 progress(UpgradeProgress::RestartRequired);
                 return summary(snapshot, verified.source_version());
@@ -512,6 +732,23 @@ impl ProductStore {
             Err(e) => return Err(e.into()),
         }
         store.require_unactivated()?;
+        match store.root.read(COMPLETE, MAX_JOURNAL_BYTES) {
+            Ok(_) => return Err(StoreError::Conflict("completed upgrade lost CURRENT; preserve the folder and recover separately".into())),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e.into()),
+        }
+        let sealed = match store.root.read(PENDING, MAX_JOURNAL_BYTES) {
+            Ok(bytes) if bytes == record_bytes => {
+                store.require_synced_bytes(PENDING, &record_bytes)?;
+                store.require_synced_bytes(&original_name, verified.original())?;
+                store.require_synced_bytes(&object_name, &object_bytes)?;
+                store.require_synced_bytes(&journal_name, &journal_bytes)?;
+                true
+            }
+            Ok(_) => return Err(StoreError::Corrupt("upgrade activation record changed".into())),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e.into()),
+        };
         store.publish_upgrade_object(&original_name, verified.original())?;
         store.publish_upgrade_object(&object_name, &object_bytes)?;
         progress(UpgradeProgress::Staged);
@@ -524,8 +761,9 @@ impl ProductStore {
         if fault == Some(FaultPoint::AfterUpgradeJournal) {
             return Err(StoreError::Interrupted(FaultPoint::AfterUpgradeJournal));
         }
-        before_activate(&store, snapshot)?;
+        before_activate(&store, snapshot, sealed)?;
         let packages = store.upgrade_packages(snapshot)?;
+        store.publish_upgrade_object(PENDING, &record_bytes)?;
         progress(UpgradeProgress::Verified);
         progress(UpgradeProgress::Activating);
         if let Some(selected) = selected {
@@ -536,6 +774,7 @@ impl ProductStore {
         store.require_synced_bytes(&journal_name, &journal_bytes)?;
         store.require_synced_bytes(&original_name, verified.original())?;
         store.require_synced_bytes("UPGRADE-INBOX", &marker)?;
+        store.require_synced_bytes(PENDING, &record_bytes)?;
         store.sync_upgrade_packages(&packages)?;
         store.root.sync()?;
         store
@@ -554,6 +793,14 @@ impl ProductStore {
             .sync()
             .map_err(StoreError::from)
             .map_err(uncertain)?;
+        store.complete_recorded_durability(
+            &verified,
+            &record,
+            snapshot,
+            &canonical_bytes(&verified.pointer(true))?,
+            &packages,
+        )
+        .map_err(uncertain)?;
         progress(UpgradeProgress::RestartRequired);
         summary(snapshot, verified.source_version())
     }

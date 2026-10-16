@@ -474,8 +474,10 @@ impl ProductStore {
             Ok(_) => {
                 self.load()?;
             }
-            // Fresh recovery must stage its packages before publishing CURRENT.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            // Fresh recovery may stage until its activation inputs are sealed.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                self.require_unsealed_upgrade()?;
+            }
             Err(e) => return Err(e.into()),
         }
         let digest = Self::extension_digest(bytes)?;
@@ -551,7 +553,10 @@ impl ProductStore {
         Ok(())
     }
     pub fn load(&self) -> Result<ProjectSnapshot> {
-        let result = self.load_current();
+        let result = self.load_current().and_then(|snapshot| {
+            self.require_upgrade_complete(&snapshot)?;
+            Ok(snapshot)
+        });
         if result.is_err() {
             self.clear_validation_cache();
         }
