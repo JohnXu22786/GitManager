@@ -230,7 +230,9 @@ struct RequiredFeatureEvidence {
 fn required_view_points(predicate: &PropertyPredicate, points: &mut BTreeSet<Id>) {
     fn term_points(term: &PropertyTerm, points: &mut BTreeSet<Id>) {
         match term {
-            PropertyTerm::ViewRows { point, .. } | PropertyTerm::ViewColumn { point, .. } => {
+            PropertyTerm::ViewRows { point, .. }
+            | PropertyTerm::ViewColumn { point, .. }
+            | PropertyTerm::RowActionRows { point, .. } => {
                 points.insert(point.clone());
             }
             PropertyTerm::Count { value } => term_points(value, points),
@@ -1675,6 +1677,11 @@ pub fn discover(
                             };
                         match target.differs(&a, &b) {
                             Some(true) if anchored => differing.push(target),
+                            Some(true)
+                                if matches!(target, ObservationTarget::RowActionRows { .. }) =>
+                            {
+                                report.unverified.push(format!("Alternative {id} row-action contrast {target:?} is not anchored to the captured change"));
+                            }
                             Some(_) => {}
                             None => {
                                 let absent = if *new_feature {
@@ -2054,6 +2061,7 @@ pub fn discover(
                                                     prior_target,
                                                     ObservationTarget::ViewRows { .. }
                                                         | ObservationTarget::ViewColumn { .. }
+                                                        | ObservationTarget::RowActionRows { .. }
                                                 ) && expected_before
                                                     .original
                                                     .observations
@@ -2061,7 +2069,9 @@ pub fn discover(
                                                     .chain(&expected_after.original.observations)
                                                     .any(|o| {
                                                         o.point == prior_target.point()
-                                                            && o.view_schema.is_none()
+                                                            && (o.view_schema.is_none()
+                                                                || matches!(prior_target, ObservationTarget::RowActionRows { .. })
+                                                                    && o.view_schema.as_ref().is_some_and(|schema| schema.row_actions.is_none()))
                                                     })
                                                 {
                                                     unavailable = true;
@@ -2480,7 +2490,42 @@ fn comparison_targets(
             column,
         });
     }
+    let row_actions: BTreeSet<_> = observations
+        .iter()
+        .flat_map(|observations| observations.iter())
+        .filter(|observation| observation.point == point)
+        .flat_map(row_action_channels)
+        .collect();
+    targets.extend(
+        row_actions
+            .into_iter()
+            .map(
+                |(view, entity, binding, action)| ObservationTarget::RowActionRows {
+                    point: point.into(),
+                    view,
+                    entity,
+                    binding,
+                    action,
+                },
+            ),
+    );
     Ok(targets)
+}
+
+/// Declarations from actual rendered observations, never unvisited view guesses.
+fn row_action_channels(observation: &Observation) -> impl Iterator<Item = (Id, Id, Id, Id)> + '_ {
+    observation.view_schema.iter().flat_map(move |schema| {
+        schema.row_actions.iter().flat_map(move |actions| {
+            actions.iter().map(move |(binding, action)| {
+                (
+                    observation.view.view.clone(),
+                    schema.entity.clone(),
+                    binding.clone(),
+                    action.clone(),
+                )
+            })
+        })
+    })
 }
 
 fn verified_scene_key(
@@ -2559,6 +2604,17 @@ fn comparable_outcomes(actual: &RunEvidence, prior: &RunEvidence) -> bool {
                         });
                     }
                 }
+                targets.extend(
+                    row_action_channels(a).map(|(view, entity, binding, action)| {
+                        ObservationTarget::RowActionRows {
+                            point: a.point.clone(),
+                            view,
+                            entity,
+                            binding,
+                            action,
+                        }
+                    }),
+                );
                 targets.iter().all(|target| {
                     target
                         .differs(std::slice::from_ref(a), std::slice::from_ref(b))
@@ -2609,6 +2665,9 @@ fn observed_statement(witness: &VerifiedWitness) -> String {
             format!("Local output values differ in {output}, column {column}")
         }
         PropertyTerm::ViewRows { .. } => "The displayed records or their order differ".into(),
+        PropertyTerm::RowActionRows { view, binding, .. } => {
+            format!("The displayed records permitting {binding} in {view} differ")
+        }
         PropertyTerm::ViewColumn { column, .. } => {
             format!("Displayed values differ in column {column}")
         }
@@ -2644,6 +2703,19 @@ fn witness_target(witness: &DifferentialWitness) -> Option<ObservationTarget> {
             },
             PropertyTerm::ViewRows { point, .. } => ObservationTarget::ViewRows {
                 point: point.clone(),
+            },
+            PropertyTerm::RowActionRows {
+                point,
+                view,
+                entity,
+                binding,
+                action,
+            } => ObservationTarget::RowActionRows {
+                point: point.clone(),
+                view: view.clone(),
+                entity: entity.clone(),
+                binding: binding.clone(),
+                action: action.clone(),
             },
             PropertyTerm::ViewColumn { point, column, .. } => ObservationTarget::ViewColumn {
                 point: point.clone(),
@@ -2713,6 +2785,7 @@ fn retained_target(
         | ObservationTarget::OutputCount { point: p, .. }
         | ObservationTarget::OutputColumn { point: p, .. }
         | ObservationTarget::ViewRows { point: p }
+        | ObservationTarget::RowActionRows { point: p, .. }
         | ObservationTarget::ViewColumn { point: p, .. } => *p = point.into(),
         ObservationTarget::Property { .. } => return None,
     };
@@ -2839,6 +2912,7 @@ fn unrepresented_material(observation: &Observation) -> Option<BTreeMap<String, 
         );
         Some(())
     }
+    observation.validate().ok()?;
     let mut values = BTreeMap::new();
     add(&mut values, "view".into(), &observation.view.view)?;
     add(&mut values, "selection".into(), &observation.view.selected)?;
@@ -2853,15 +2927,23 @@ fn unrepresented_material(observation: &Observation) -> Option<BTreeMap<String, 
     for (id, value) in &observation.view.form_values {
         add(&mut values, format!("form/{id}"), value)?;
     }
-    let mut row_actions: Vec<_> = observation
-        .view
-        .rows
-        .iter()
-        .filter(|row| !row.enabled_actions.is_empty())
-        .map(|row| (&row.record.entity, &row.record.record, &row.enabled_actions))
-        .collect();
-    row_actions.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
-    add(&mut values, "row_actions".into(), &row_actions)?;
+    // Complete provenance makes every binding a typed coordinate scheduled by
+    // the union comparison. Legacy/partial evidence retains its opaque guard.
+    if !observation
+        .view_schema
+        .as_ref()
+        .is_some_and(|schema| schema.row_actions.is_some())
+    {
+        let mut row_actions: Vec<_> = observation
+            .view
+            .rows
+            .iter()
+            .filter(|row| !row.enabled_actions.is_empty())
+            .map(|row| (&row.record.entity, &row.record.record, &row.enabled_actions))
+            .collect();
+        row_actions.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        add(&mut values, "row_actions".into(), &row_actions)?;
+    }
     for (index, artifact) in observation.outputs.iter().enumerate() {
         add(&mut values, format!("output/{index}/id"), &artifact.output)?;
         add(
@@ -2959,8 +3041,22 @@ fn retained_profile(
         .iter()
         .flat_map(|o| o.view_schema.iter().flat_map(|s| s.columns.keys().cloned()))
         .collect();
+    let mut row_actions: BTreeSet<_> = observations
+        .iter()
+        .flat_map(|o| row_action_channels(o))
+        .collect();
     for historical in [expected_before, expected_after] {
         for observation in &historical.comparison {
+            row_actions.extend(row_action_channels(observation).map(
+                |(view, entity, binding, action)| {
+                    (
+                        historical.forward(SemanticKind::View, &view),
+                        entity,
+                        binding,
+                        historical.forward(SemanticKind::Action, &action),
+                    )
+                },
+            ));
             for id in observation.value_types.keys() {
                 observables.insert(historical.forward(SemanticKind::Observable, id));
             }
@@ -3058,6 +3154,15 @@ fn retained_profile(
                     column: column.clone(),
                 }),
         );
+        targets.extend(row_actions.iter().map(|(view, entity, binding, action)| {
+            ObservationTarget::RowActionRows {
+                point: point.clone(),
+                view: view.clone(),
+                entity: entity.clone(),
+                binding: binding.clone(),
+                action: action.clone(),
+            }
+        }));
         for target in targets {
             let current_before = target.sample_term(compared_before);
             let current_after = target.sample_term(compared_after);

@@ -240,6 +240,11 @@ impl Mapping {
             | PropertyTerm::OutputColumn { output, .. } => {
                 *output = self.id(SemanticKind::Output, output)
             }
+            PropertyTerm::RowActionRows { view, action, .. } => {
+                *view = self.id(SemanticKind::View, view);
+                *action = self.id(SemanticKind::Action, action);
+                // UI binding IDs stay exact; action-only guesses cannot rename them.
+            }
             PropertyTerm::Count { value } => self.term(value),
             _ => {}
         }

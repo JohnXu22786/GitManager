@@ -2042,6 +2042,14 @@ pub enum PropertyTerm {
         point: Id,
         entity: Id,
     },
+    /// Canonical references of displayed rows with this exact binding enabled.
+    RowActionRows {
+        point: Id,
+        view: Id,
+        entity: Id,
+        binding: Id,
+        action: Id,
+    },
     ViewColumn {
         point: Id,
         column: Id,
@@ -2123,6 +2131,18 @@ impl PropertyTerm {
             Self::ViewRows { point, entity } => {
                 check_id(point)?;
                 check_id(entity)?;
+                Type::list(Type::reference(entity))
+            }
+            Self::RowActionRows {
+                point,
+                view,
+                entity,
+                binding,
+                action,
+            } => {
+                for id in [point, view, entity, binding, action] {
+                    check_id(id)?;
+                }
                 Type::list(Type::reference(entity))
             }
             Self::ViewColumn {
@@ -2334,6 +2354,10 @@ pub struct ViewObservation {
 pub struct ViewSchema {
     pub entity: Id,
     pub columns: BTreeMap<Id, Type>,
+    /// Complete declarations for row bindings in the actually presented view.
+    /// None is historical/untyped evidence, never an empty declaration map.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_actions: Option<BTreeMap<Id, Id>>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3590,8 +3614,16 @@ impl DevelopmentRequest {
                 )?;
                 let expected_view = source.program.view_schema(&observation.view.view)?;
                 if let Some(schema) = &observation.view_schema {
+                    // Validate only supplied provenance here. Old metadata is
+                    // never backfilled; exact replay still compares full receipts.
                     require(
-                        expected_view.as_ref() == Some(schema),
+                        expected_view.as_ref().is_some_and(|expected| {
+                            expected.entity == schema.entity
+                                && expected.columns == schema.columns
+                                && schema.row_actions.as_ref().is_none_or(|actions| {
+                                    expected.row_actions.as_ref() == Some(actions)
+                                })
+                        }),
                         "accepted view schema does not belong to its source",
                     )?;
                 }
@@ -4193,6 +4225,13 @@ impl PropertyTerm {
                         .collect(),
                 })
             }
+            Self::RowActionRows {
+                point: id,
+                view,
+                entity,
+                binding,
+                action,
+            } => point(id)?.row_action_rows(view, entity, binding, action),
             Self::ViewColumn {
                 point: id,
                 column,
@@ -4856,6 +4895,13 @@ impl AppDefinition {
         Ok(Some(ViewSchema {
             entity: entity.clone(),
             columns,
+            row_actions: Some(
+                view.actions
+                    .iter()
+                    .filter(|binding| binding.placement == ActionPlacement::Row)
+                    .map(|binding| (binding.id.clone(), binding.action.clone()))
+                    .collect(),
+            ),
         }))
     }
     /// Static declared types for host observations, including null/empty results.
@@ -4901,6 +4947,21 @@ impl Observation {
                 check_id(column)?;
                 standalone_type(typ, 0)?;
             }
+            if let Some(actions) = &schema.row_actions {
+                bounded(actions.len())?;
+                for (binding, action) in actions {
+                    check_id(binding)?;
+                    check_id(action)?;
+                }
+                require(
+                    self.view.rows.iter().all(|row| {
+                        row.enabled_actions
+                            .iter()
+                            .all(|binding| actions.contains_key(binding))
+                    }),
+                    "enabled row binding lacks declared provenance",
+                )?;
+            }
             for row in &self.view.rows {
                 require(
                     row.record.entity == schema.entity && row.cells.len() == schema.columns.len(),
@@ -4920,5 +4981,44 @@ impl Observation {
             output.validate()?;
         }
         Ok(())
+    }
+}
+
+impl Observation {
+    /// Shared typed sampler for comparisons and saved-property replay. Runtime
+    /// rendering has already evaluated both binding conditions and action guards.
+    pub(crate) fn row_action_rows(
+        &self,
+        view: &str,
+        entity: &str,
+        binding: &str,
+        action: &str,
+    ) -> Option<DataValue> {
+        self.validate().ok()?;
+        let schema = self.view_schema.as_ref()?;
+        if self.view.view != view
+            || schema.entity != entity
+            || schema.row_actions.as_ref()?.get(binding)? != action
+        {
+            return None;
+        }
+        let mut rows: Vec<_> = self
+            .view
+            .rows
+            .iter()
+            .filter(|row| row.enabled_actions.contains(binding))
+            .map(|row| &row.record)
+            .collect();
+        rows.sort_by(|a, b| (&a.entity, &a.record).cmp(&(&b.entity, &b.record)));
+        Some(DataValue::List {
+            item_type: Type::reference(entity),
+            items: rows
+                .into_iter()
+                .map(|row| DataValue::Reference {
+                    entity: row.entity.clone(),
+                    record: row.record.clone(),
+                })
+                .collect(),
+        })
     }
 }

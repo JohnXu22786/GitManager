@@ -832,7 +832,7 @@ fn legacy_observation_shape_is_preserved_and_old_execution_versions_are_stale() 
             "current",
         )
         .unwrap();
-    assert_eq!(run.binding.runtime_version, "local-interpreter/3");
+    assert_eq!(run.binding.runtime_version, "local-interpreter/4");
     assert_eq!(run.binding.driver_version, "semantic-input/3");
     let mut old = run.clone();
     old.binding.runtime_version = "local-interpreter/1".into();
@@ -953,4 +953,40 @@ fn withdrawn_history_is_terminal_receipt_bound_and_not_a_retirement_proposal() {
     assert!(result.validate_for(&request).is_err());
     result.response.evolutions[0].proposed_retirement = vec!["older".into()];
     assert!(result.validate_for(&request).is_err());
+}
+
+#[test]
+fn accepted_row_action_provenance_is_source_checked_without_backfilling_legacy() {
+    let (request, _) = accepted_scene_request();
+    let mut legacy = request.clone();
+    for context in &mut legacy.accepted_scenes {
+        for observation in &mut context.observations {
+            if let Some(schema) = &mut observation.view_schema {
+                schema.row_actions = None;
+            }
+        }
+    }
+    legacy.validate().unwrap();
+    let bytes = canonical_bytes(&legacy).unwrap();
+    let decoded: DevelopmentRequest = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(canonical_bytes(&decoded).unwrap(), bytes);
+    assert!(decoded
+        .accepted_scenes
+        .iter()
+        .flat_map(|scene| &scene.observations)
+        .all(|o| o
+            .view_schema
+            .as_ref()
+            .is_none_or(|s| s.row_actions.is_none())));
+    let mut forged = request;
+    let schema = forged.accepted_scenes[0].observations[0]
+        .view_schema
+        .as_mut()
+        .unwrap();
+    schema
+        .row_actions
+        .as_mut()
+        .unwrap()
+        .insert("forged".into(), "collect".into());
+    assert!(forged.validate().is_err());
 }
