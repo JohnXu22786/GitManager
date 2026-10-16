@@ -4962,6 +4962,21 @@ fn validate_output_columns(columns: &[FieldDefinition]) -> Result<()> {
 }
 
 impl AppDefinition {
+    /// Internal structural analysis uses the same expression typing as complete
+    /// program validation. Callers must first validate the captured program and
+    /// derive these lexical bindings from its parameters and statements.
+    pub(crate) fn expression_type_in(
+        &self,
+        expression: &Expr,
+        bindings: &BTreeMap<Id, Type>,
+    ) -> Result<Type> {
+        Validator {
+            app: self,
+            nodes: 0,
+        }
+        .expr(expression, bindings, 0, true)
+    }
+
     /// Derive row/cell types from validated executable view expressions.
     pub fn view_schema(&self, view: &str) -> Result<Option<ViewSchema>> {
         self.validate()?;

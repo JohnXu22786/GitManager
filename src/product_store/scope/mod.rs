@@ -1,10 +1,27 @@
 //! Host-owned scoped executable composition and protected completion history.
+mod common_fact_inventory;
+mod common_fact_uses;
+pub use common_fact_inventory::{
+    CommonFactAction, CommonFactIdentityHazard, CommonFactInventory, CommonFactInventoryRequest,
+    CommonFactLifecycleSuggestion, CommonFactObligation, CommonFactPhase, CommonFactPhaseKind,
+    CommonFactReference, CommonFactResources, CommonFactSpan, CommonFactUse,
+};
 mod compiler;
 mod contract;
 mod correspondence;
 mod family;
 pub use family::ScopeEnvelope;
 mod history;
+mod owned_analysis;
+mod owned_bindings;
+mod owned_common;
+mod owned_contract;
+pub use owned_common::{OwnedCommonOperation, OwnedCommonUse};
+mod owned_effects;
+pub use owned_effects::{OwnedAuxiliary, OwnedEffectReport, OwnedEffectRequest, OwnedRead};
+mod owned_resolve;
+pub use owned_contract::*;
+pub use owned_resolve::analyze_owned_sources;
 mod rehearsal;
 mod replay;
 pub(super) use correspondence::install as retain_correspondences;
