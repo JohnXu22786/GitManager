@@ -88,6 +88,7 @@ struct Analyzer<'a> {
     app: &'a AppDefinition,
     structure: &'a OwnedStructuralReport,
     auxiliary: &'a BTreeMap<Id, Id>,
+    common: &'a super::owned_common::VerifiedCommonOperations,
     side: OwnedSourceSide,
     protected: &'a Fields,
     discovered: Fields,
@@ -607,7 +608,21 @@ impl Analyzer<'_> {
                         deps.merge(&value.scalar_dependencies());
                         evaluated.insert(field, value);
                     }
-                    let origin = if let Some(field) = self.auxiliary.get(entity) {
+                    let certified = self.common.append(action, &path);
+                    let origin = if let Some((parameter, field)) = certified {
+                        let Some(Value {
+                            origin: Origin::Root(root),
+                            ..
+                        }) = env.get(parameter)
+                        else {
+                            return Err(error(&at, "certified append root provenance changed"));
+                        };
+                        Origin::Related {
+                            root: root.clone(),
+                            owner: field.into(),
+                            writable: false,
+                        }
+                    } else if let Some(field) = self.auxiliary.get(entity) {
                         let Some(Value {
                             origin: Origin::Root(root),
                             ..
@@ -632,7 +647,8 @@ impl Analyzer<'_> {
                         Origin::Shared
                     };
                     if variant || deps.any() {
-                        if !origin.writable() || !deps.local(origin.root()) {
+                        if (!origin.writable() && certified.is_none()) || !deps.local(origin.root())
+                        {
                             return Err(error(
                                 &at,
                                 "shared/global dependent create is unsupported",
@@ -694,7 +710,16 @@ impl Analyzer<'_> {
                 Statement::SetState { value, .. } => {
                     let value =
                         self.expression(value, env, owner, false, false, &format!("{at}.value"))?;
-                    if variant || controls.any() || value.deps.any() {
+                    let certified_root = self
+                        .common
+                        .reset(action, &path)
+                        .and_then(|name| env.get(name))
+                        .and_then(|v| v.origin.root());
+                    if variant
+                        || value.deps.any()
+                        || (controls.any()
+                            && (certified_root.is_none() || !controls.local(certified_root)))
+                    {
                         return Err(error(&at, "dependent session write is unsupported"));
                     }
                 }
@@ -836,6 +861,10 @@ impl Analyzer<'_> {
             }
         }
         for view in &self.app.views {
+            if let Some(reads) = self.common.history_reads(view, self.side) {
+                self.reads.extend(reads);
+                continue;
+            }
             let mut row_env = Env::new();
             match &view.kind {
                 ViewKind::List {
@@ -1023,6 +1052,7 @@ pub(super) fn analyze(
     after: &AppDefinition,
     structure: &OwnedStructuralReport,
     auxiliary: &[OwnedAuxiliary],
+    common: &super::owned_common::VerifiedCommonOperations,
 ) -> Result<Vec<OwnedRead>> {
     let owners: BTreeMap<_, _> = auxiliary
         .iter()
@@ -1068,6 +1098,7 @@ pub(super) fn analyze(
                 app,
                 structure,
                 auxiliary: &owners,
+                common,
                 side,
                 protected: &protected,
                 discovered: Fields::new(),
