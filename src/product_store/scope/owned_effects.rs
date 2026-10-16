@@ -32,6 +32,8 @@ pub struct OwnedEffectReport {
     pub structure: OwnedStructuralReport,
     pub auxiliary: Vec<OwnedAuxiliary>,
     pub reads: Vec<OwnedRead>,
+    /// Closed-use diagnostics; no lifecycle or executable proof is conveyed.
+    pub common_operations: Vec<super::OwnedCommonOperation>,
 }
 // Span resolution has already authenticated every path before this helper runs.
 // Preserve existing iterator headers even when an entire loop lies in a span.
@@ -166,11 +168,18 @@ impl VerifiedOwnedAnalysis {
                     .into(),
             ));
         }
+        let common = super::owned_common::VerifiedCommonOperations::derive(
+            snapshot,
+            &candidate.program,
+            &structure,
+            &basis,
+        )?;
         let reads = super::owned_analysis::analyze(
             &snapshot.program()?.program,
             &candidate.program,
             &structure,
             &request.auxiliary,
+            &common,
         )?;
         Ok(Self {
             report: OwnedEffectReport {
@@ -178,6 +187,7 @@ impl VerifiedOwnedAnalysis {
                 structure,
                 auxiliary: request.auxiliary.clone(),
                 reads,
+                common_operations: common.reports(),
             },
         })
     }
