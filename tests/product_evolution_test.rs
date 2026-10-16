@@ -4,10 +4,16 @@ mod fixture;
 mod product_contract;
 #[path = "../src/product_decisions/mod.rs"]
 mod product_decisions;
+#[path = "../src/product_discovery/mod.rs"]
+mod product_discovery;
 #[path = "../src/product_protocol.rs"]
 mod product_protocol;
+#[path = "../src/product_provider/mod.rs"]
+mod product_provider;
 #[path = "../src/product_runtime/mod.rs"]
 mod product_runtime;
+#[path = "../src/product_scenarios/mod.rs"]
+mod product_scenarios;
 #[path = "../src/product_store/mod.rs"]
 mod product_store;
 use fixture::*;
@@ -173,6 +179,18 @@ fn provider_produced_new_design_replays_both_needs_and_retires_only_named_defaul
     design["views"][0]["actions"].as_array_mut().unwrap().push(json!({"id":"one_off_button","label":"One-off dispatch","placement":"toolbar","action":"dispatch_one_off","arguments":{},"enabled":yes()}));
     let mut mapped = b.scenario().clone();
     mapped.inputs[2] = invoke("dispatch_one_off", Values::new());
+    // Author the references using only the released prompt, not a private
+    // identity rule or the fixture's property implementation.
+    let wire = product_discovery::encode_request(&request, &Default::default()).unwrap();
+    let prompt: serde_json::Value = serde_json::from_slice(&wire.prompt).unwrap();
+    let preserved: std::collections::BTreeSet<Digest> = prompt["reconciliation_obligations"]
+        ["active_obligations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|reference| serde_json::from_value(reference["digest"].clone()).unwrap())
+        .collect();
+    assert_eq!(preserved, [invariant().identity().unwrap()].into());
     let response = DevelopmentResponse {
         version: 1,
         request_digest: request.identity().unwrap(),
@@ -186,7 +204,7 @@ fn provider_produced_new_design_replays_both_needs_and_retires_only_named_defaul
             candidate: "new-design".into(),
             needs: vec!["old-default".into(), "second-need".into()],
             proposed_retirement: vec!["old-default".into()],
-            preserved_obligations: vec![invariant().identity().unwrap()],
+            preserved_obligations: preserved.into_iter().collect(),
             mappings: vec![SemanticMapping {
                 from: SemanticKey {
                     kind: SemanticKind::Action,
@@ -208,6 +226,33 @@ fn provider_produced_new_design_replays_both_needs_and_retires_only_named_defaul
         }],
         unsupported: vec![],
     };
+    // Exposing the correct references must not authorize omissions or inventions.
+    let mut missing = response.clone();
+    missing.evolutions[0].preserved_obligations.clear();
+    let error = engine
+        .develop_evolution(
+            &FixtureProvider { response: missing },
+            &request,
+            "split-design",
+            &|| false,
+        )
+        .err()
+        .expect("all Active independent properties remain mandatory");
+    assert!(error
+        .to_string()
+        .contains("retain all active independent properties"));
+    let mut forged = response.clone();
+    forged.evolutions[0].preserved_obligations =
+        vec![canonical_digest(IdentityDomain::Decision, &"invented").unwrap()];
+    assert!(forged
+        .validate_for(&request)
+        .unwrap_err()
+        .to_string()
+        .contains("unknown active obligation"));
+    let mut stale = response.clone();
+    stale.request_digest = canonical_digest(IdentityDomain::Request, &"stale").unwrap();
+    assert!(stale.validate_for(&request).is_err());
+    assert_eq!(store.load().unwrap(), before);
     let provider = FixtureProvider {
         response: response.clone(),
     };

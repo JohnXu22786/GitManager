@@ -954,3 +954,237 @@ fn still_oversized_selected_context_refuses_before_preparation_and_keeps_work() 
     }
     assert_eq!(store.load().unwrap(), current);
 }
+
+fn reconciliation_property() -> AcceptedProperty {
+    AcceptedProperty {
+        id: "one-person".into(),
+        description: "This public work retains one person".into(),
+        predicate: PropertyPredicate::Equal {
+            left: PropertyTerm::Observed {
+                point: "done".into(),
+                observable: "count".into(),
+                value_type: Type::Integer,
+            },
+            right: PropertyTerm::Literal {
+                value_type: Type::Integer,
+                value: DataValue::Integer { value: 1 },
+            },
+        },
+    }
+}
+fn reconciliation_request() -> DevelopmentRequest {
+    let mut request = simple_request();
+    request.operation = DevelopmentOperation::Reconcile;
+    request.request = "Reconcile the requested need; retain independent promises".into();
+    request.sources.truncate(1);
+    let witness = canonical_digest(IdentityDomain::Decision, &"synthetic witness").unwrap();
+    for (id, status) in [
+        ("requested", DecisionStatus::Active),
+        ("independent", DecisionStatus::Active),
+        ("duplicate", DecisionStatus::Active),
+        ("pending", DecisionStatus::Pending),
+        (
+            "withdrawn",
+            DecisionStatus::Withdrawn {
+                adoption: "removed".into(),
+            },
+        ),
+        (
+            "superseded",
+            DecisionStatus::Superseded {
+                by: "independent".into(),
+            },
+        ),
+    ] {
+        let mut property = reconciliation_property();
+        if id != "requested" && id != "duplicate" {
+            property.description = format!("Retain the {id} promise: Café 中文");
+        }
+        request.decisions.decisions.push(ScopedDecision {
+            id: id.into(),
+            revision: 1,
+            request: format!("Preserve {id} work"),
+            rationale: None,
+            scope: DecisionScope {
+                operations: ["calculate".into()].into(),
+                population: Population::All,
+                conditions: Values::new(),
+                excluded_records: vec![],
+                unknowns: vec![],
+            },
+            outcome: DecisionOutcome::KeepCurrent,
+            status,
+            obligations: if id == "independent" {
+                let mut second = property.clone();
+                second.id = "another-property".into();
+                vec![property, second]
+            } else {
+                vec![property]
+            },
+            scenarios: vec![witness.clone()],
+            witness: witness.clone(),
+            supersedes: if id == "independent" {
+                vec!["superseded".into()]
+            } else {
+                vec![]
+            },
+        });
+    }
+    request.validate().unwrap();
+    request
+}
+fn reconciliation_prompt(request: &DevelopmentRequest) -> serde_json::Value {
+    let wire = encode_request(request, &ProviderOptions::default()).unwrap();
+    serde_json::from_slice(&wire.prompt).unwrap()
+}
+
+#[test]
+fn reconcile_context_exposes_all_active_property_identities() {
+    use serde_json::json;
+    let request = reconciliation_request();
+    let original = serde_json::to_vec(&request).unwrap();
+    let prompt = reconciliation_prompt(&request);
+    let refs = prompt["reconciliation_obligations"]["active_obligations"]
+        .as_array()
+        .expect(
+            "released Reconcile author context must supply host-computed obligation identities",
+        );
+    assert_eq!(prompt["reconciliation_obligations"]["version"], 1);
+    assert_eq!(
+        refs.len(),
+        4,
+        "include every Active decision, not only the requested need"
+    );
+    let expected: Vec<_> = request.decisions.decisions[..3]
+        .iter()
+        .flat_map(|decision| {
+            decision.obligations.iter().map(|property| {
+                json!({
+                    "decision_id": decision.id,
+                    "property_id": property.id,
+                    "digest": property.identity().unwrap(),
+                })
+            })
+        })
+        .collect();
+    assert_eq!(refs, &expected);
+    // Public canonical vector also catches accidental property-ID-only hashes,
+    // a different identity domain, or hashing the serialized reference itself.
+    assert_eq!(
+        refs[0]["digest"],
+        "1e5638c7959e8af7247d62185a13e9a324afb927f278a15dc51c3841c574b81c"
+    );
+    assert_eq!(refs[0]["digest"], refs[3]["digest"]);
+    assert_ne!(refs[0]["digest"], refs[1]["digest"]);
+    let instructions = prompt["instructions"].as_str().unwrap();
+    assert!(instructions.contains("preserved_obligations"));
+    assert!(instructions.contains("distinct digest"));
+    assert_eq!(prompt["request"], serde_json::to_value(&request).unwrap());
+    assert_eq!(prompt["request_digest"], json!(request.identity().unwrap()));
+    assert_eq!(serde_json::to_vec(&request).unwrap(), original);
+    let wire = encode_request(&request, &ProviderOptions::default()).unwrap();
+    assert_eq!(wire.schema, RESPONSE_SCHEMA.as_bytes());
+    assert_eq!(
+        wire.source_digest,
+        request.sources[0].binding.identity().unwrap().as_str()
+    );
+}
+
+#[test]
+fn reconcile_context_handles_empty_and_binds_property_content() {
+    use serde_json::json;
+    let mut request = reconciliation_request();
+    let old = encode_request(&request, &ProviderOptions::default()).unwrap();
+    let old_prompt: serde_json::Value = serde_json::from_slice(&old.prompt).unwrap();
+    request.decisions.decisions[1].obligations[0]
+        .description
+        .push('!');
+    let changed = encode_request(&request, &ProviderOptions::default()).unwrap();
+    let changed_prompt: serde_json::Value = serde_json::from_slice(&changed.prompt).unwrap();
+    assert_ne!(
+        old_prompt["request_digest"],
+        changed_prompt["request_digest"]
+    );
+    assert_ne!(old.digest().unwrap(), changed.digest().unwrap());
+    assert_ne!(
+        old_prompt["reconciliation_obligations"]["active_obligations"][1]["digest"],
+        changed_prompt["reconciliation_obligations"]["active_obligations"][1]["digest"]
+    );
+    assert_eq!(
+        old_prompt["reconciliation_obligations"]["active_obligations"][0],
+        changed_prompt["reconciliation_obligations"]["active_obligations"][0]
+    );
+    for decision in &mut request.decisions.decisions {
+        if decision.status == DecisionStatus::Active {
+            decision.obligations.clear();
+        }
+    }
+    assert_eq!(
+        reconciliation_prompt(&request)["reconciliation_obligations"],
+        json!({"version":1,"active_obligations":[]})
+    );
+    request.decisions.decisions.clear();
+    assert_eq!(
+        reconciliation_prompt(&request)["reconciliation_obligations"],
+        json!({"version":1,"active_obligations":[]})
+    );
+    request.operation = DevelopmentOperation::Modify;
+    assert!(reconciliation_prompt(&request)
+        .get("reconciliation_obligations")
+        .is_none());
+    // Invalid property content must still fail before projection/preparation.
+    request = reconciliation_request();
+    request.decisions.decisions[0].obligations[0].id.clear();
+    assert!(encode_request(&request, &ProviderOptions::default()).is_err());
+}
+
+#[test]
+fn reconcile_context_survives_compaction_and_counts_toward_prompt_cap() {
+    let mut request = reconciliation_request();
+    let options = ProviderOptions::default();
+    let original = encode_request(&request, &options).unwrap();
+    let original_value: serde_json::Value = serde_json::from_slice(&original.prompt).unwrap();
+    let references = original_value["reconciliation_obligations"].clone();
+    assert!(references["active_obligations"].is_array());
+    let gap = product_provider::MAX_PROMPT_BYTES - original.prompt.len();
+    pad_source(&mut request, &vec![b' '; gap / 3]);
+    request.request.push_str(&"x".repeat(gap % 3));
+    let at_limit = encode_request(&request, &options).unwrap();
+    assert_eq!(at_limit.prompt.len(), product_provider::MAX_PROMPT_BYTES);
+    let value: serde_json::Value = serde_json::from_slice(&at_limit.prompt).unwrap();
+    assert_eq!(value["request"], serde_json::to_value(&request).unwrap());
+    assert_eq!(value["reconciliation_obligations"], references);
+    request.request.push('x');
+    let compact = encode_request(&request, &options).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&compact.prompt).unwrap();
+    assert_eq!(
+        parse_codec(&value["request"])
+            .unwrap()
+            .to_request()
+            .unwrap(),
+        request
+    );
+    assert_eq!(value["reconciliation_obligations"], references);
+    assert!(value["instructions"]
+        .as_str()
+        .unwrap()
+        .contains("preserved_obligations"));
+    let gap = product_provider::MAX_PROMPT_BYTES - compact.prompt.len();
+    pad_source(&mut request, &vec![b' '; gap]);
+    let at_limit = encode_request(&request, &options).unwrap();
+    assert_eq!(at_limit.prompt.len(), product_provider::MAX_PROMPT_BYTES);
+    let value: serde_json::Value = serde_json::from_slice(&at_limit.prompt).unwrap();
+    assert_eq!(value["reconciliation_obligations"], references);
+    assert_eq!(
+        parse_codec(&value["request"])
+            .unwrap()
+            .to_request()
+            .unwrap(),
+        request
+    );
+    pad_source(&mut request, b" ");
+    assert!(
+        format!("{:?}", encode_request(&request, &options).unwrap_err())
+            .contains("prompt must be bounded")
+    );
+}
