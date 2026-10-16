@@ -112,6 +112,162 @@ fn comparison() -> ComparisonEngine {
     ComparisonEngine::new(Arc::new(AtomicBool::new(false)))
 }
 
+fn navigation_pair() -> (CapturedProgram, CapturedProgram, ScenarioSpec) {
+    let mut value = equipment();
+    value["views"].as_array_mut().unwrap().push(json!({
+        "id":"loans", "label":"Loans",
+        "kind":{"kind":"list", "entity":"loan", "rows":query("loan"),
+            "columns":[{"id":"returned", "label":"Returned", "value":field(var("row"), "returned")}],
+            "controls":[], "selection":null},
+        "actions":[], "keys":[]
+    }));
+    value["initial_view"] = json!("loans");
+    let a = capture(value.clone());
+    value["actions"][0]["guards"] = json!([]);
+    let b = capture(value);
+    let mut s = workflow(&a);
+    s.inputs.insert(
+        0,
+        SemanticInput::Navigate {
+            view: "assets".into(),
+        },
+    );
+    (a, b, s)
+}
+
+#[test]
+fn row_action_navigation_deletion_has_a_complete_replayed_minimality_certificate() {
+    let (a, b, s) = navigation_pair();
+    let engine = comparison();
+    let report = engine
+        .minimize(&a, &b, &s, &decisions(), target(), SearchBudget::default())
+        .unwrap();
+    assert_eq!(report.state, EvidenceState::Observed);
+    let verified = report.witness.unwrap();
+    let w = verified.witness();
+    let certificate = w.minimization.as_ref().unwrap();
+    assert!(
+        certificate.complete,
+        "{:?}",
+        certificate.final_single_deletions
+    );
+    assert_eq!(w.scenario.inputs, s.inputs);
+    let reductions = engine.single_reductions(&a, &b, &w.scenario).unwrap();
+    assert_eq!(reductions.len(), certificate.final_single_deletions.len());
+    for ((operation, reduced), trial) in reductions.iter().zip(&certificate.final_single_deletions)
+    {
+        assert_eq!(&trial.operation, operation);
+        assert_eq!(trial.from, w.scenario.identity().unwrap());
+        assert_eq!(trial.reduced, reduced.identity().unwrap());
+        assert!(matches!(
+            trial.outcome,
+            ReductionOutcome::DifferenceLost | ReductionOutcome::InvalidScenario
+        ));
+    }
+    let (_, without_navigation) = reductions
+        .iter()
+        .find(|(_, reduced)| reduced.inputs == s.inputs[1..])
+        .unwrap();
+    let trial = certificate
+        .final_single_deletions
+        .iter()
+        .find(|trial| trial.reduced == without_navigation.identity().unwrap())
+        .unwrap();
+    assert_eq!(trial.outcome, ReductionOutcome::InvalidScenario);
+    let audit = verified
+        .reduction_audit()
+        .iter()
+        .find(|audit| audit.trial == *trial)
+        .unwrap();
+    assert!(!audit.evidence_omitted);
+    assert_eq!(audit.comparison_state, EvidenceState::Inconclusive);
+    let rerun = engine
+        .compare(
+            &a,
+            &b,
+            without_navigation,
+            &decisions(),
+            target(),
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(rerun.state, EvidenceState::Inconclusive);
+    assert!(rerun.witness.is_none());
+    assert_eq!(rerun.runs, audit.runs);
+    assert_eq!(trial.before_run, Some(rerun.runs[0].identity().unwrap()));
+    assert_eq!(trial.after_run, Some(rerun.runs[1].identity().unwrap()));
+    for run in &rerun.runs {
+        assert_eq!(run.state, EvidenceState::Observed);
+        assert_eq!(run.trace.len(), without_navigation.inputs.len());
+        assert_eq!(run.observations[0].view.view, "loans");
+        assert_eq!(target().channel_presence(&run.observations), Some(false));
+        assert!(target().sample(&run.observations).is_none());
+    }
+}
+
+#[test]
+fn row_action_other_typed_view_is_absent_without_an_accepted_empty_value() {
+    let (a, _, mut s) = navigation_pair();
+    s.inputs.remove(0);
+    for empty in [false, true] {
+        if empty {
+            s.seed.records.clear();
+        }
+        let run = replay(&a, &s);
+        assert_eq!(run.state, EvidenceState::Observed);
+        run.observations[0].validate().unwrap();
+        assert_eq!(target().channel_presence(&run.observations), Some(false));
+        assert!(target().sample(&run.observations).is_none());
+        assert_eq!(property(&[]).evaluate(&run.observations), None);
+        let conjunction = ObservationTarget::Property {
+            property: AcceptedProperty {
+                id: "required-row-channel".into(),
+                description: "Require the original row-action coordinate".into(),
+                predicate: PropertyPredicate::And {
+                    values: vec![property(&[]).predicate],
+                },
+            },
+        };
+        assert_eq!(conjunction.channel_presence(&run.observations), Some(false));
+        assert!(conjunction.sample(&run.observations).is_none());
+    }
+}
+
+#[test]
+fn row_action_deletion_presence_keeps_missing_invalid_and_mismatched_metadata_unknown() {
+    let (a, _, mut s) = navigation_pair();
+    s.seed.records.clear();
+    let original = replay(&a, &s).observations;
+    for mutation in ["no_schema", "legacy", "invalid", "entity", "action"] {
+        let mut observations = original.clone();
+        let o = &mut observations[0];
+        match mutation {
+            "no_schema" => {
+                o.view.view = "loans".into();
+                o.view_schema = None;
+            }
+            "legacy" => {
+                o.view.view = "loans".into();
+                o.view_schema.as_mut().unwrap().row_actions = None;
+            }
+            "invalid" => o.view.view = "invalid view".into(),
+            "entity" => o.view_schema.as_mut().unwrap().entity = "loan".into(),
+            _ => {
+                o.view_schema
+                    .as_mut()
+                    .unwrap()
+                    .row_actions
+                    .as_mut()
+                    .unwrap()
+                    .insert("borrow_asset".into(), "return_loan".into());
+            }
+        }
+        assert_eq!(target().channel_presence(&observations), None, "{mutation}");
+        assert!(target().sample(&observations).is_none(), "{mutation}");
+        assert_eq!(property(&[]).evaluate(&observations), None, "{mutation}");
+    }
+}
+
 #[test]
 fn row_action_terms_use_completed_guards_and_canonical_record_sets() {
     let (a, b, s) = pair();

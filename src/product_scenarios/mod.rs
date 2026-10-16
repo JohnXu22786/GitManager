@@ -115,7 +115,13 @@ impl ObservationTarget {
             } => {
                 let schema = observation.view_schema.as_ref()?;
                 let actions = schema.row_actions.as_ref()?;
-                if &observation.view.view != view || &schema.entity != entity {
+                // A completed typed observation on another view lacks this
+                // view-specific channel. This is deletion evidence only;
+                // sample() still cannot supply an empty row-action value.
+                if &observation.view.view != view {
+                    return Some(false);
+                }
+                if &schema.entity != entity {
                     return None;
                 }
                 match actions.get(binding) {
