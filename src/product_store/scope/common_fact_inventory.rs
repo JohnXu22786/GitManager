@@ -355,7 +355,7 @@ fn identity_hazards(structure: &OwnedStructuralReport) -> Vec<CommonFactIdentity
     }
     output
 }
-fn derive(
+pub(super) fn derive(
     snapshot: &ProjectSnapshot,
     candidate: &CapturedProgram,
     request: &CommonFactInventoryRequest,

@@ -1,4 +1,13 @@
 //! Host-owned scoped executable composition and protected completion history.
+mod common_fact_admission;
+mod common_fact_rules;
+mod owned_lifecycle;
+pub use common_fact_admission::{
+    CommonFactAdmissionReport, CommonFactCertificate, OwnedPreviewAvailability,
+    OwnedPreviewRequest, OwnedProjectionDestination, OwnedProjectionRecipe, ProofBudget,
+    VerifiedOwnedPreviewPlan,
+};
+pub use owned_lifecycle::{AcceptedPreviewLifecycle, LifecycleAcceptanceHost, LifecycleWitness};
 mod common_fact_inventory;
 mod common_fact_uses;
 pub use common_fact_inventory::{
