@@ -118,6 +118,81 @@ fn diagnostic(error: &AdapterError) -> String {
     message
 }
 
+/// The prepared branch owns its validation capability; it cannot be paired
+/// with another caller-supplied AST or binding. Ordinary public entry points
+/// keep the original full-validation path.
+#[derive(Clone)]
+pub(crate) struct ProgramSource<'a>(SourceKind<'a>);
+#[derive(Clone)]
+enum SourceKind<'a> {
+    Ordinary(std::borrow::Cow<'a, CapturedProgram>),
+    Prepared(PreparedProgram),
+}
+impl<'a> ProgramSource<'a> {
+    pub(crate) fn ordinary(program: &'a CapturedProgram) -> Self {
+        Self(SourceKind::Ordinary(std::borrow::Cow::Borrowed(program)))
+    }
+    pub(crate) fn prepare(program: &CapturedProgram) -> Result<Self> {
+        Ok(Self(SourceKind::Prepared(PreparedProgram::new(program)?)))
+    }
+    fn owned(&self) -> ProgramSource<'static> {
+        ProgramSource(match &self.0 {
+            SourceKind::Ordinary(program) => {
+                SourceKind::Ordinary(std::borrow::Cow::Owned(program.as_ref().clone()))
+            }
+            SourceKind::Prepared(program) => SourceKind::Prepared(program.clone()),
+        })
+    }
+    pub(crate) fn capture(&self) -> &CapturedProgram {
+        match &self.0 {
+            SourceKind::Ordinary(program) => program,
+            SourceKind::Prepared(program) => program.capture(),
+        }
+    }
+    pub(crate) fn validate(&self) -> Result<()> {
+        match &self.0 {
+            SourceKind::Ordinary(program) => Ok(program.validate()?),
+            SourceKind::Prepared(_) => Ok(()),
+        }
+    }
+    fn validate_session(&self, session: &SessionState) -> Result<()> {
+        match &self.0 {
+            SourceKind::Ordinary(program) => Ok(session.validate(&program.program)?),
+            SourceKind::Prepared(program) => Ok(program.validate_session(session)?),
+        }
+    }
+    fn validate_scenario(&self, scenario: &ScenarioSpec) -> Result<()> {
+        match &self.0 {
+            SourceKind::Ordinary(program) => Ok(scenario.validate(&program.program)?),
+            SourceKind::Prepared(program) => Ok(program.validate_scenario(scenario)?),
+        }
+    }
+    fn initial_session(&self) -> Result<SessionState> {
+        match &self.0 {
+            SourceKind::Ordinary(program) => Ok(SessionState::initial(&program.program)?),
+            SourceKind::Prepared(program) => Ok(program.initial_session()),
+        }
+    }
+    fn observable_types(&self) -> Result<BTreeMap<Id, Type>> {
+        match &self.0 {
+            SourceKind::Ordinary(program) => Ok(program.program.observable_types()?),
+            SourceKind::Prepared(program) => Ok(program.observable_types().clone()),
+        }
+    }
+    fn view_schema(&self, view: &str) -> Result<Option<ViewSchema>> {
+        match &self.0 {
+            SourceKind::Ordinary(program) => Ok(program.program.view_schema(view)?),
+            SourceKind::Prepared(program) => Ok(program.view_schema(view)?.clone()),
+        }
+    }
+}
+impl std::ops::Deref for ProgramSource<'_> {
+    type Target = CapturedProgram;
+    fn deref(&self) -> &Self::Target {
+        self.capture()
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct LocalRuntime {
     cancelled: Arc<AtomicBool>,
@@ -134,7 +209,7 @@ struct State {
 }
 /// An isolated execution copy. Accessors deliberately do not expose mutation.
 pub struct ProductRun {
-    program: CapturedProgram,
+    program: ProgramSource<'static>,
     state: State,
     seed: u64,
     limits: RuntimeLimits,
@@ -474,7 +549,7 @@ impl LocalRuntime {
         day: i32,
     ) -> Result<CompatibilityReport> {
         validate_day(day)?;
-        compatibility::check(program, current, Some(day))
+        compatibility::check(&ProgramSource::ordinary(program), current, Some(day))
     }
     /// Resume daily work with its actual committed artifact receipts. Scenario
     /// replay intentionally starts with no new emissions; it uses `start`.
@@ -560,6 +635,43 @@ impl LocalRuntime {
         id: &str,
         admission: Option<&dyn ReplayAdmission>,
     ) -> Result<RunEvidence> {
+        self.replay_source(
+            &ProgramSource::ordinary(program),
+            scenario,
+            decisions,
+            limits,
+            id,
+            admission,
+        )
+    }
+    #[cfg(test)]
+    pub(crate) fn replay_prepared(
+        &self,
+        program: &PreparedProgram,
+        scenario: &ScenarioSpec,
+        decisions: &DecisionGraph,
+        limits: RuntimeLimits,
+        id: &str,
+        admission: Option<&dyn ReplayAdmission>,
+    ) -> Result<RunEvidence> {
+        self.replay_source(
+            &ProgramSource(SourceKind::Prepared(program.clone())),
+            scenario,
+            decisions,
+            limits,
+            id,
+            admission,
+        )
+    }
+    pub(crate) fn replay_source(
+        &self,
+        program: &ProgramSource,
+        scenario: &ScenarioSpec,
+        decisions: &DecisionGraph,
+        limits: RuntimeLimits,
+        id: &str,
+        admission: Option<&dyn ReplayAdmission>,
+    ) -> Result<RunEvidence> {
         if has_protected_fields(program) && admission.is_none() {
             return Err(AdapterError::Unsupported(
                 "Protected scope history needs a verified host admission context".into(),
@@ -571,7 +683,7 @@ impl LocalRuntime {
         if !valid_id(id) {
             return Err(invalid("invalid run ID"));
         }
-        scenario.validate(&program.program)?;
+        program.validate_scenario(scenario)?;
         decisions.validate()?;
         let binding = RunBinding {
             source: program.binding.clone(),
@@ -584,7 +696,7 @@ impl LocalRuntime {
             runtime_version: RUNTIME_VERSION.into(),
             driver_version: DRIVER_VERSION.into(),
         };
-        let mut run = self.start(
+        let mut run = self.start_source(
             program,
             &scenario.seed,
             &scenario.session,
@@ -658,33 +770,25 @@ impl LocalRuntime {
         Ok(result)
     }
 }
-impl RuntimeAdapter for LocalRuntime {
-    type Run = ProductRun;
-    fn capabilities(&self) -> RuntimeCapabilities {
-        RuntimeCapabilities {adapter:"local-app".into(),version:RUNTIME_VERSION.into(),artifact_kinds:vec![ArtifactKind::GeneratedApp],features:["relations","queries","transactions","session-state","typed-local-output","generated-views","current-data-recovery","data-inspector"].into_iter().map(String::from).collect(),unavailable:vec!["External effects, arbitrary native code and network access are not language operations".into()]}
-    }
-    fn validate(&self, program: &CapturedProgram) -> Result<()> {
-        program.validate()?;
-        Ok(())
-    }
-    fn start(
+impl LocalRuntime {
+    fn start_source(
         &self,
-        program: &CapturedProgram,
+        program: &ProgramSource,
         data: &DataSnapshot,
         session: &SessionState,
         clock_day: i32,
         random_seed: u64,
         limits: RuntimeLimits,
     ) -> Result<ProductRun> {
-        self.validate(program)?;
+        program.validate()?;
         data.validate()?;
-        session.validate(&program.program)?;
+        program.validate_session(session)?;
         validate_day(clock_day)?;
         limits.validate()?;
         if data.project_id != program.binding.project_id {
             return Err(invalid("program and data belong to different projects"));
         }
-        let report = self.compatibility_at(program, data, clock_day)?;
+        let report = compatibility::check(program, data, Some(clock_day))?;
         if report.state != CompatibilityState::Compatible {
             return Err(AdapterError::Unsupported(report.issues.join("; ")));
         }
@@ -711,7 +815,7 @@ impl RuntimeAdapter for LocalRuntime {
         // Validation is bounded separately, preserving the requested execution
         // fuel for input evaluation (including deliberately tiny test budgets).
         Ok(ProductRun {
-            program: program.clone(),
+            program: program.owned(),
             state: State {
                 data: data.clone(),
                 session: session.clone(),
@@ -727,6 +831,34 @@ impl RuntimeAdapter for LocalRuntime {
             observations: vec![],
             receipts: BTreeMap::new(),
         })
+    }
+}
+impl RuntimeAdapter for LocalRuntime {
+    type Run = ProductRun;
+    fn capabilities(&self) -> RuntimeCapabilities {
+        RuntimeCapabilities {adapter:"local-app".into(),version:RUNTIME_VERSION.into(),artifact_kinds:vec![ArtifactKind::GeneratedApp],features:["relations","queries","transactions","session-state","typed-local-output","generated-views","current-data-recovery","data-inspector"].into_iter().map(String::from).collect(),unavailable:vec!["External effects, arbitrary native code and network access are not language operations".into()]}
+    }
+    fn validate(&self, program: &CapturedProgram) -> Result<()> {
+        program.validate()?;
+        Ok(())
+    }
+    fn start(
+        &self,
+        program: &CapturedProgram,
+        data: &DataSnapshot,
+        session: &SessionState,
+        clock_day: i32,
+        random_seed: u64,
+        limits: RuntimeLimits,
+    ) -> Result<ProductRun> {
+        self.start_source(
+            &ProgramSource::ordinary(program),
+            data,
+            session,
+            clock_day,
+            random_seed,
+            limits,
+        )
     }
     fn apply(
         &self,
@@ -775,12 +907,7 @@ impl RuntimeAdapter for LocalRuntime {
                 if run.observations.iter().any(|o| &o.point == point) {
                     return Err(invalid("observation point already used"));
                 }
-                observation = Some(view::observe(
-                    &run.program.program,
-                    &next,
-                    point,
-                    &mut meter,
-                )?);
+                observation = Some(view::observe(&run.program, &next, point, &mut meter)?);
             } else {
                 execute::input(
                     &run.program,
@@ -846,7 +973,7 @@ impl RuntimeAdapter for LocalRuntime {
     }
     fn observe(&self, run: &ProductRun, point: &str) -> Result<Observation> {
         let mut meter = Meter::new(run.limits.clone(), run.fuel.get(), self.cancelled.clone());
-        let result = view::observe(&run.program.program, &run.state, point, &mut meter);
+        let result = view::observe(&run.program, &run.state, point, &mut meter);
         run.fuel.set(meter.fuel);
         result
     }
@@ -875,7 +1002,7 @@ impl RuntimeAdapter for LocalRuntime {
         program: &CapturedProgram,
         current: &DataSnapshot,
     ) -> Result<CompatibilityReport> {
-        compatibility::check(program, current, None)
+        compatibility::check(&ProgramSource::ordinary(program), current, None)
     }
     fn prepare_adoption(&self, plan: AdoptionPlan, current: &DataSnapshot) -> Result<AdoptionPlan> {
         plan.validate()?;

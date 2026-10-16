@@ -12,6 +12,36 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::sync::Arc;
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ValidationCounts {
+    pub captures: usize,
+    pub apps: usize,
+    pub observables: usize,
+    pub views: usize,
+}
+#[cfg(test)]
+thread_local! {
+    static VALIDATION_COUNTS: std::cell::Cell<ValidationCounts> = std::cell::Cell::new(ValidationCounts::default());
+}
+#[cfg(test)]
+pub(crate) fn reset_validation_counts() {
+    VALIDATION_COUNTS.with(|counts| counts.set(ValidationCounts::default()));
+}
+#[cfg(test)]
+pub(crate) fn validation_counts() -> ValidationCounts {
+    VALIDATION_COUNTS.with(std::cell::Cell::get)
+}
+#[cfg(test)]
+fn count_validation(update: impl FnOnce(&mut ValidationCounts)) {
+    VALIDATION_COUNTS.with(|counts| {
+        let mut value = counts.get();
+        update(&mut value);
+        counts.set(value);
+    });
+}
 
 pub const CONTRACT_VERSION: u32 = 1;
 pub const LANGUAGE_VERSION: &str = "gitmanager.local-app/1";
@@ -1169,6 +1199,8 @@ impl AppDefinition {
         Ok(app)
     }
     pub fn validate(&self) -> Result<()> {
+        #[cfg(test)]
+        count_validation(|counts| counts.apps += 1);
         version(self.version)?;
         check_id(&self.id)?;
         nonempty(&self.label)?;
@@ -1408,6 +1440,61 @@ pub struct CapturedProgram {
     pub source_bytes: Vec<u8>,
     pub program: AppDefinition,
 }
+/// An exact, owned immutable capture plus pure static observation metadata.
+/// Only successful full capture validation can mint this capability. It is
+/// deliberately neither serializable nor mutable, and never stores run state.
+#[derive(Clone)]
+pub(crate) struct PreparedProgram(Arc<PreparedProgramInner>);
+struct PreparedProgramInner {
+    capture: CapturedProgram,
+    observable_types: BTreeMap<Id, Type>,
+    view_schemas: BTreeMap<Id, Option<ViewSchema>>,
+}
+impl PreparedProgram {
+    pub(crate) fn new(capture: &CapturedProgram) -> Result<Self> {
+        capture.validate()?;
+        let observable_types = capture.program.observable_types_validated()?;
+        let view_schemas = capture
+            .program
+            .views
+            .iter()
+            .map(|view| {
+                Ok((
+                    view.id.clone(),
+                    capture.program.view_schema_validated(&view.id)?,
+                ))
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self(Arc::new(PreparedProgramInner {
+            capture: capture.clone(),
+            observable_types,
+            view_schemas,
+        })))
+    }
+    pub(crate) fn capture(&self) -> &CapturedProgram {
+        &self.0.capture
+    }
+    pub(crate) fn initial_session(&self) -> SessionState {
+        SessionState::initial_validated(&self.0.capture.program)
+    }
+    pub(crate) fn validate_session(&self, session: &SessionState) -> Result<()> {
+        session.validate_for_app(&self.0.capture.program)
+    }
+    pub(crate) fn validate_scenario(&self, scenario: &ScenarioSpec) -> Result<()> {
+        scenario.validate_prefix()?;
+        self.validate_session(&scenario.session)?;
+        scenario.validate_suffix(&self.0.capture.program)
+    }
+    pub(crate) fn observable_types(&self) -> &BTreeMap<Id, Type> {
+        &self.0.observable_types
+    }
+    pub(crate) fn view_schema(&self, view: &str) -> Result<&Option<ViewSchema>> {
+        self.0
+            .view_schemas
+            .get(view)
+            .ok_or_else(|| ContractError("unknown view".into()))
+    }
+}
 impl CapturedProgram {
     pub fn capture(
         bytes: &[u8],
@@ -1446,6 +1533,8 @@ impl CapturedProgram {
         Ok(self)
     }
     pub fn validate(&self) -> Result<()> {
+        #[cfg(test)]
+        count_validation(|counts| counts.captures += 1);
         self.binding.validate()?;
         version(self.artifact.version)?;
         require(
@@ -1747,7 +1836,10 @@ pub struct RecordRef {
 impl SessionState {
     pub fn initial(app: &AppDefinition) -> Result<Self> {
         app.validate()?;
-        Ok(Self {
+        Ok(Self::initial_validated(app))
+    }
+    fn initial_validated(app: &AppDefinition) -> Self {
+        Self {
             view: app.initial_view.clone(),
             values: app
                 .state
@@ -1755,10 +1847,13 @@ impl SessionState {
                 .map(|s| (s.id.clone(), s.initial.clone()))
                 .collect(),
             focused_record: None,
-        })
+        }
     }
     pub fn validate(&self, app: &AppDefinition) -> Result<()> {
         app.validate()?;
+        self.validate_for_app(app)
+    }
+    fn validate_for_app(&self, app: &AppDefinition) -> Result<()> {
         require(
             app.views.iter().any(|v| v.id == self.view),
             "unknown session view",
@@ -1903,11 +1998,17 @@ impl ScenarioSpec {
             .collect()
     }
     pub fn validate(&self, app: &AppDefinition) -> Result<()> {
+        self.validate_prefix()?;
+        self.session.validate(app)?;
+        self.validate_suffix(app)
+    }
+    fn validate_prefix(&self) -> Result<()> {
         version(self.version)?;
         check_id(&self.id)?;
         nonempty(&self.label)?;
-        self.seed.validate()?;
-        self.session.validate(app)?;
+        self.seed.validate()
+    }
+    fn validate_suffix(&self, app: &AppDefinition) -> Result<()> {
         validate_day(self.clock_day)?;
         bounded(self.inputs.len())?;
         bounded(self.validity.len())?;
@@ -4864,6 +4965,11 @@ impl AppDefinition {
     /// Derive row/cell types from validated executable view expressions.
     pub fn view_schema(&self, view: &str) -> Result<Option<ViewSchema>> {
         self.validate()?;
+        self.view_schema_validated(view)
+    }
+    fn view_schema_validated(&self, view: &str) -> Result<Option<ViewSchema>> {
+        #[cfg(test)]
+        count_validation(|counts| counts.views += 1);
         let view = self
             .views
             .iter()
@@ -4907,6 +5013,11 @@ impl AppDefinition {
     /// Static declared types for host observations, including null/empty results.
     pub fn observable_types(&self) -> Result<BTreeMap<Id, Type>> {
         self.validate()?;
+        self.observable_types_validated()
+    }
+    fn observable_types_validated(&self) -> Result<BTreeMap<Id, Type>> {
+        #[cfg(test)]
+        count_validation(|counts| counts.observables += 1);
         let mut validator = Validator {
             app: self,
             nodes: 0,

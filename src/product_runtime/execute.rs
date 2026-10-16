@@ -321,11 +321,7 @@ impl Transaction<'_> {
         Ok(())
     }
 }
-pub(super) fn constraints(
-    program: &CapturedProgram,
-    state: &State,
-    meter: &mut Meter,
-) -> Result<()> {
+pub(super) fn constraints(program: &ProgramSource, state: &State, meter: &mut Meter) -> Result<()> {
     let app = &program.program;
     meter.collection(state.data.records.len())?;
     for row in &state.data.records {
@@ -350,7 +346,7 @@ pub(super) fn constraints(
         }
     }
     state.data.validate()?;
-    state.session.validate(app)?;
+    program.validate_session(&state.session)?;
     for value in state.session.values.values() {
         meter.value(value)?;
         check_references(value, &state.data)?;
@@ -359,7 +355,7 @@ pub(super) fn constraints(
     Ok(())
 }
 fn action(
-    program: &CapturedProgram,
+    program: &ProgramSource,
     state: &mut State,
     id: &str,
     arguments: &Values,
@@ -451,7 +447,7 @@ fn action(
     constraints(program, state, meter)
 }
 pub(super) fn input(
-    program: &CapturedProgram,
+    program: &ProgramSource,
     state: &mut State,
     input: &SemanticInput,
     operation: &str,
@@ -546,7 +542,7 @@ pub(super) fn input(
                     meter,
                 )?;
             }
-            state.session.validate(app)?;
+            program.validate_session(&state.session)?;
             Ok(())
         }
         SemanticInput::Activate { view, binding, row } => {

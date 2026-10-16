@@ -26,7 +26,7 @@ pub(super) fn merge(program: &AppDefinition, current: &DataSnapshot) -> Result<D
     Ok(next)
 }
 pub(super) fn check(
-    program: &CapturedProgram,
+    program: &ProgramSource,
     current: &DataSnapshot,
     day: Option<i32>,
 ) -> Result<CompatibilityReport> {
@@ -78,7 +78,7 @@ pub(super) fn check(
     if let Ok(data) = merge(&program.program, current) {
         let state = State {
             data,
-            session: SessionState::initial(&program.program)?,
+            session: program.initial_session()?,
             day: day.unwrap_or(0),
             outputs: vec![],
             output_participants: vec![],
