@@ -105,7 +105,7 @@ impl VerifiedOwnedAnalysis {
         let structure =
             super::analyze_owned_sources(snapshot.program()?, candidate, &request.sources)?;
         preserve_selections(&snapshot.program()?.program, &candidate.program, &structure)?;
-        if snapshot.scope != super::ScopeState::default() {
+        if snapshot.scalar_scope()? != &super::ScopeState::default() {
             return Err(StoreError::Invalid(
                 "Owned effect safety: existing scope lineage is unsupported".into(),
             ));
