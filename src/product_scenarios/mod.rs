@@ -1,7 +1,7 @@
 //! Independent, copied production-runtime comparisons and structural reduction.
 //! Provider completion and predicted outputs are never execution evidence.
 use crate::product_contract::*;
-use crate::product_runtime::LocalRuntime;
+use crate::product_runtime::{LocalRuntime, ProgramSource};
 use serde::{Deserialize, Serialize};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -575,6 +575,24 @@ impl ComparisonEngine {
         target: ObservationTarget,
         limits: RuntimeLimits,
     ) -> Result<ComparisonReport, AdapterError> {
+        self.compare_sources(
+            &ProgramSource::ordinary(before),
+            &ProgramSource::ordinary(after),
+            scenario,
+            decisions,
+            target,
+            limits,
+        )
+    }
+    fn compare_sources(
+        &self,
+        before: &ProgramSource,
+        after: &ProgramSource,
+        scenario: &ScenarioSpec,
+        decisions: &DecisionGraph,
+        target: ObservationTarget,
+        limits: RuntimeLimits,
+    ) -> Result<ComparisonReport, AdapterError> {
         before.validate()?;
         after.validate()?;
         decisions.validate()?;
@@ -600,7 +618,7 @@ impl ComparisonEngine {
             return Ok(report);
         }
         for (source, id) in [(before, "before-run"), (after, "after-run")] {
-            match runtime.replay_admitted(
+            match runtime.replay_source(
                 source,
                 scenario,
                 decisions,
@@ -677,8 +695,8 @@ impl ComparisonEngine {
         report.state = EvidenceState::Observed;
         report.witness = Some(VerifiedWitness {
             witness,
-            before: before.clone(),
-            after: after.clone(),
+            before: before.capture().clone(),
+            after: after.capture().clone(),
             initial: scenario.clone(),
             initial_before: a.clone(),
             initial_after: b.clone(),
@@ -694,11 +712,15 @@ impl ComparisonEngine {
         after: &CapturedProgram,
         scenario: &ScenarioSpec,
     ) -> Result<Vec<(String, ScenarioSpec)>, AdapterError> {
-        Ok(deletions(before, after, scenario)?
-            .into_iter()
-            .take(MAX_ITEMS)
-            .map(|d| (d.name(scenario), d.apply(scenario)))
-            .collect())
+        Ok(deletions(
+            &ProgramSource::ordinary(before),
+            &ProgramSource::ordinary(after),
+            scenario,
+        )?
+        .into_iter()
+        .take(MAX_ITEMS)
+        .map(|d| (d.name(scenario), d.apply(scenario)))
+        .collect())
     }
     pub fn minimize(
         &self,
@@ -717,7 +739,41 @@ impl ComparisonEngine {
         if budget.max_trials > MAX_ITEMS {
             return Err(invalid("reduction trial budget exceeds evidence contract"));
         }
-        let mut best = self.compare(
+        let before = ProgramSource::prepare(before)?;
+        let after = ProgramSource::prepare(after)?;
+        self.minimize_sources(&before, &after, scenario, decisions, target, budget)
+    }
+    /// Differential regression seam: execute the same exhaustive reduction
+    /// algorithm with the ordinary full-validation path for every trial.
+    #[cfg(test)]
+    pub(crate) fn test_minimize_unprepared(
+        &self,
+        before: &CapturedProgram,
+        after: &CapturedProgram,
+        scenario: &ScenarioSpec,
+        decisions: &DecisionGraph,
+        target: ObservationTarget,
+        budget: SearchBudget,
+    ) -> Result<ComparisonReport, AdapterError> {
+        self.minimize_sources(
+            &ProgramSource::ordinary(before),
+            &ProgramSource::ordinary(after),
+            scenario,
+            decisions,
+            target,
+            budget,
+        )
+    }
+    fn minimize_sources(
+        &self,
+        before: &ProgramSource,
+        after: &ProgramSource,
+        scenario: &ScenarioSpec,
+        decisions: &DecisionGraph,
+        target: ObservationTarget,
+        budget: SearchBudget,
+    ) -> Result<ComparisonReport, AdapterError> {
+        let mut best = self.compare_sources(
             before,
             after,
             scenario,
@@ -774,7 +830,7 @@ impl ComparisonEngine {
                 {
                     break 'search;
                 }
-                let trial = self.compare(
+                let trial = self.compare_sources(
                     before,
                     after,
                     &reduced,
@@ -979,8 +1035,8 @@ impl Deletion {
     }
 }
 fn deletions(
-    before: &CapturedProgram,
-    after: &CapturedProgram,
+    before: &ProgramSource,
+    after: &ProgramSource,
     scenario: &ScenarioSpec,
 ) -> Result<Vec<Deletion>, AdapterError> {
     before.validate()?;

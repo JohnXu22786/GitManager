@@ -174,11 +174,12 @@ pub(super) fn render(
     Ok(result)
 }
 pub(super) fn observe(
-    app: &AppDefinition,
+    program: &ProgramSource,
     state: &State,
     point: &str,
     meter: &mut Meter,
 ) -> Result<Observation> {
+    let app = &program.program;
     if !valid_id(point) {
         return Err(invalid("invalid observation point"));
     }
@@ -202,8 +203,8 @@ pub(super) fn observe(
         data_digest: state.data.identity()?,
         session_digest: state.session.identity()?,
         values,
-        value_types: app.observable_types()?,
-        view_schema: app.view_schema(&view.view)?,
+        value_types: program.observable_types()?,
+        view_schema: program.view_schema(&view.view)?,
         view,
         outputs: state.outputs.clone(),
     };
