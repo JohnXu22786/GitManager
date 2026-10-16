@@ -175,6 +175,22 @@ must enforce the user's actual provider/data/tool/usage authorization before
 external submission. The opaque transport is defined elsewhere; this module does
 not duplicate provider transport types or launch processes.
 
+For Reconcile, the released provider prompt adds `reconciliation_obligations`
+version 1 beside the unchanged domain request. Its `active_obligations` array has
+one `{decision_id, property_id, digest}` reference per obligation on every Active
+decision, including independent decisions outside the requested needs. The host
+computes each digest with `AcceptedProperty::identity`; identical properties in
+multiple decisions can have the same digest. Each evolution's
+`preserved_obligations` must contain every distinct listed digest (or `[]` when
+there are none). These are references, not evidence that preservation succeeded.
+Pending, superseded and withdrawn obligations are not in this projection.
+
+The references and instructions survive the exact-UTF-8 source fallback and count
+against the complete prompt byte cap. They are bound by normal transport/disclosure
+identities; the domain request and its digest are unchanged. New Reconcile prompts
+require normal preparation and disclosure. Other operations retain their existing
+wire representation. Response validation and independent replay remain mandatory.
+
 `DevelopmentResponse` accepts executable candidate source strings, source-bound
 hypotheses, encoded scenarios, untrusted evolution suggestions and unsupported
 explanations. Evolution suggestions reference candidate IDs and known intentions,
