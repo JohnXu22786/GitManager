@@ -45,3 +45,47 @@ The original structural resolver still enforces exact span coverage, ordered
 common statements, lexical binder correspondence, and nonescaping bindings. All
 scalar-v1 serialization, compiler versions, preparation/adoption APIs, and stored
 formats are unchanged.
+
+## Common factual phase inventory
+
+`ProductStore::inventory_common_fact_phases` is a separate, opt-in diagnostic.
+Its `CommonFactInventoryRequest` binds the exact source correspondence and
+validated current snapshot, plus an explicitly untrusted lifecycle suggestion.
+A correctly typed own-row predicate does not authenticate its business meaning:
+calling an active-status predicate “completed” grants no exemption. The before
+and after interpretations, meaning text, and every lifecycle-field writer remain
+in the report for review.
+
+The inventory covers both complete programs, including unchanged and Invoke-only
+actions. Ordered action frames distinguish complete identical subtrees, common
+loop headers with variant descendants, and declared variant spans. They retain
+exact subtree digests, paths, adjacent statements, entering typed environments,
+and enclosing controls. A matching loop header is never promoted to a common
+subtree. These are potential factual phases, not verified common effects.
+
+Typed expression and ingress inventories retain field/reference provenance,
+queries and membership, implicit reference validation, order and sort limits,
+state keys, inputs/arguments, controls/callbacks, selection, keys, constraints,
+uniqueness, observables, and emitted output expressions. Required reference
+fields are only immutable-owner candidates: all producers and mutations are
+listed, and following a shared reference confers no write authority. The full
+cumulative retained schema and stored-row count are bound to the snapshot,
+rather than inferred from equal source definitions.
+
+Unmet obligations identify concrete sites for ordinary admission and phase
+reachability, shared writes, root/lifecycle coupling, owned-span lifecycle
+preservation, retained owner proof, input/reset closure, global constraints,
+resource atomicity, and fresh-identity/order dependencies. A preceding variant
+Create can shift later common IDs. A repeated loop can carry that dependency
+across iterations. Untruncated queries still use ID order and tie-breaking;
+`MAX_COLLECTION` does not establish order independence. The record cap is global
+and includes archived and auxiliary records. Runtime fuel, collection, statement,
+write, output, elapsed, and cancellation limits remain real. Failed inputs do not
+commit business/session/output changes, but can update fuel and trace/outcome.
+
+The serializable inventory is not deserializable proof authority and is never
+accepted by preparation or adoption. Every invocation re-derives it from current
+sources and basis. It does not relax the existing effect analyzer, recognize a
+new certificate, alter scalar-v1, lower or execute a program, or change persisted
+state. An inventory may succeed while listing unsupported obligations and while
+`analyze_owned_effects` continues to refuse the exact same shared effect.
