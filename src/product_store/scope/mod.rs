@@ -2,6 +2,7 @@
 mod compiler;
 mod contract;
 mod correspondence;
+mod family;
 mod history;
 mod rehearsal;
 mod replay;
@@ -79,7 +80,7 @@ fn request_valid(snapshot: &ProjectSnapshot, request: &ScopeRequest) -> Result<(
             return Err(compiler::error("stale or duplicate completion binding"));
         }
         if snapshot
-            .scope
+            .scalar_scope()?
             .layers
             .values()
             .flat_map(|layer| &layer.request.lifecycles)
@@ -173,7 +174,7 @@ fn prepare(
     compiler::reject_reserved(&candidate.program)?;
     if !valid_id(id)
         || candidate.binding.project_id != snapshot.data.project_id
-        || snapshot.scope.layers.len() >= MAX_LAYERS
+        || snapshot.scalar_scope()?.layers.len() >= MAX_LAYERS
         || snapshot.operations.contains_key(id)
     {
         return Err(compiler::error(
@@ -194,8 +195,14 @@ fn prepare(
     let layer_id = layer.identity()?;
     let mut working = snapshot.clone();
     retain(&mut working, candidate)?;
-    working.scope.layers.insert(layer_id.clone(), layer.clone());
-    let prior = snapshot.scope.compositions.get(&snapshot.active_revision);
+    working
+        .scalar_scope_mut()?
+        .layers
+        .insert(layer_id.clone(), layer.clone());
+    let prior = snapshot
+        .scalar_scope()?
+        .compositions
+        .get(&snapshot.active_revision);
     let mut layers = prior.map(|m| m.layers.clone()).unwrap_or_default();
     layers.push(layer_id.clone());
     let mut active = prior.map(|m| m.active.clone()).unwrap_or_default();
@@ -246,7 +253,7 @@ fn prepare_withdrawal(
 ) -> Result<PreparedScopedChange> {
     snapshot.validate()?;
     let previous = snapshot
-        .scope
+        .scalar_scope()?
         .compositions
         .get(&snapshot.active_revision)
         .ok_or_else(|| compiler::error("there is no managed scope to withdraw"))?;
@@ -279,10 +286,11 @@ fn prepare_withdrawal(
         return Err(StoreError::Incompatible(compatibility));
     }
     validate_initial_runtime(&target, &initialized, snapshot.clock_day)?;
+    let state = snapshot.scalar_scope()?;
     let scope = DecisionScope {
         operations: layers
             .iter()
-            .flat_map(|id| snapshot.scope.layers[id].request.operations.iter().cloned())
+            .flat_map(|id| state.layers[id].request.operations.iter().cloned())
             .collect(),
         population: Population::All,
         conditions: Values::new(),
@@ -322,7 +330,7 @@ fn prepare_evolution(
         return Err(compiler::error("invalid managed evolution identity"));
     }
     let previous = snapshot
-        .scope
+        .scalar_scope()?
         .compositions
         .get(&snapshot.active_revision)
         .ok_or_else(|| compiler::error("unmanaged projects use ordinary adoption"))?;
@@ -579,7 +587,7 @@ impl ProductStore {
             )?
         } else {
             let prior = current
-                .scope
+                .scalar_scope()?
                 .compositions
                 .get(&current.active_revision)
                 .ok_or_else(|| compiler::error("withdrawal source is not managed"))?;
@@ -609,16 +617,19 @@ impl ProductStore {
         retain(&mut current, &prepared.target)?;
         if let Some(layer) = &prepared.layer {
             current
-                .scope
+                .scalar_scope_mut()?
                 .layers
                 .insert(layer.identity()?, layer.clone());
         }
         current
-            .scope
+            .scalar_scope_mut()?
             .compositions
             .insert(prepared.manifest.output.clone(), prepared.manifest.clone());
         if let Some(receipt) = &prepared.receipt {
-            current.scope.initializations.push(receipt.clone());
+            current
+                .scalar_scope_mut()?
+                .initializations
+                .push(receipt.clone());
         }
         current.data = prepared.initialized.clone();
         current.active_revision = prepared.manifest.output.clone();
@@ -644,7 +655,7 @@ impl ProductStore {
             active: current.active_revision.clone(),
             revision: current.revision,
         });
-        current.scope.adoptions.push(ScopedAdoptionReceipt {
+        let receipt = ScopedAdoptionReceipt {
             decisions: activated_decisions,
             plan: adoption.plan.identity()?,
             composition: canonical_digest(IdentityDomain::Adoption, &prepared.manifest)?,
@@ -655,7 +666,8 @@ impl ProductStore {
                 .transpose()?,
             initialized_compatibility: prepared.compatibility.clone(),
             revision: current.revision,
-        });
+        };
+        current.scalar_scope_mut()?.adoptions.push(receipt);
         current.operations.insert(
             adoption.plan.id.clone(),
             OperationReceipt {
@@ -690,7 +702,9 @@ impl ProductStore {
 }
 
 pub(super) fn verify_snapshot(snapshot: &ProjectSnapshot) -> Result<()> {
-    verify::validate(snapshot)
+    match snapshot.current_scope()? {
+        family::CurrentScope::ScalarV1(_) => verify::validate(snapshot),
+    }
 }
 pub(super) fn verify_transition(before: &ProjectSnapshot, after: &ProjectSnapshot) -> Result<()> {
     verify::preserve(before, after)
@@ -699,7 +713,11 @@ pub(super) fn reject_unmanaged_target(
     snapshot: &ProjectSnapshot,
     target: &CapturedProgram,
 ) -> Result<()> {
-    if snapshot.scope.compositions.contains_key(&revision(target)?) {
+    if snapshot
+        .scalar_scope()?
+        .compositions
+        .contains_key(&revision(target)?)
+    {
         Ok(())
     } else {
         compiler::reject_reserved(&target.program)
@@ -732,7 +750,7 @@ impl ProjectSnapshot {
     /// slot coordinates, without exposing frozen data or authoring authority.
     pub fn editable_scope_context(&self) -> Result<Option<ScopeEditableContext>> {
         self.validate()?;
-        let Some(manifest) = self.scope.compositions.get(&self.active_revision) else {
+        let Some(manifest) = self.scalar_scope()?.compositions.get(&self.active_revision) else {
             return Ok(None);
         };
         let app = compiler::business_program(self)?;
@@ -750,7 +768,7 @@ impl ProjectSnapshot {
         )?;
         let mut slots = vec![];
         for id in &manifest.layers {
-            for index in 0..self.scope.layers[id].patches.len() {
+            for index in 0..self.scalar_scope()?.layers[id].patches.len() {
                 let patch = compiler::effective_patch(self, manifest, id, index)?;
                 slots.push(ScopeEditableSlot {
                     layer: id.clone(),

@@ -1032,10 +1032,11 @@ impl ProductStore {
                 ))
             };
         }
+        let state = current.scalar_scope()?;
         if rehearsal.is_some_and(|(proofs, _)| proofs.len() == 2)
             && correspondences
                 .keys()
-                .any(|id| current.scope.correspondences.contains_key(id))
+                .any(|id| state.correspondences.contains_key(id))
         {
             return Err(StoreError::Invalid(
                 "paired recording must name only newly recorded correspondence proofs".into(),
@@ -1049,7 +1050,9 @@ impl ProductStore {
                 "project changed after adoption rehearsal".into(),
             ));
         }
-        if !current.scope.layers.is_empty() && revision(target)? != current.active_revision {
+        if !current.scalar_scope()?.layers.is_empty()
+            && revision(target)? != current.active_revision
+        {
             return Err(StoreError::Invalid(
                 "Managed history requires a verified scoped or managed-evolution preparation"
                     .into(),

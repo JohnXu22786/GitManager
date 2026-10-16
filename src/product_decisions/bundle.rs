@@ -269,7 +269,7 @@ pub fn upgrade_bundle_binding(
     snapshot: &ProjectSnapshot,
     bundle: &IntentionBundle,
 ) -> Result<IntentionBundle> {
-    if bundle.snapshot != *original || !snapshot.scope.layers.is_empty() {
+    if bundle.snapshot != *original || !snapshot.scalar_scope()?.layers.is_empty() {
         return Err(invalid(
             "legacy intention bundle does not bind the original unscoped snapshot",
         ));

@@ -104,7 +104,7 @@ fn decision_births(snapshot: &ProjectSnapshot) -> Result<BTreeMap<u64, DecisionB
 /// scoped receipts, decision births and the live tail. Local digests do not
 /// attest approval against wholesale replacement of the store and its evidence.
 fn adoption_history(snapshot: &ProjectSnapshot) -> Result<AdoptionHistory<'_>> {
-    let state = &snapshot.scope;
+    let state = snapshot.scalar_scope()?;
     let mut history = AdoptionHistory {
         links: BTreeMap::new(),
     };
@@ -273,9 +273,8 @@ fn adoption_history(snapshot: &ProjectSnapshot) -> Result<AdoptionHistory<'_>> {
 }
 
 pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
-    let state = &snapshot.scope;
-    if state.version != COMPILER_VERSION
-        || state.layers.len() > MAX_LAYERS
+    let state = snapshot.scalar_scope()?;
+    if state.layers.len() > MAX_LAYERS
         || state.compositions.len() > MAX_ITEMS
         || state.initializations.len() != state.layers.len()
         || state.adoptions.len() != state.compositions.len()
@@ -579,7 +578,7 @@ pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
 }
 
 pub(super) fn preserve(before: &ProjectSnapshot, after: &ProjectSnapshot) -> Result<()> {
-    if before.scope != after.scope {
+    if before.scalar_scope()? != after.scalar_scope()? {
         return Err(error(
             "ordinary action changed protected composition history",
         ));

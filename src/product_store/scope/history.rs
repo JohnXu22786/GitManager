@@ -141,7 +141,8 @@ pub(super) fn initialize_frame(
 ) -> Result<(DataSnapshot, Vec<MetadataAddition>)> {
     let mut after = merged_data(target, before)?;
     let baseline = program(snapshot, source)?;
-    let mut baseline_app = if let Some(manifest) = snapshot.scope.compositions.get(source) {
+    let mut baseline_app = if let Some(manifest) = snapshot.scalar_scope()?.compositions.get(source)
+    {
         envelope_app(snapshot, manifest)?
     } else {
         baseline.program.clone()
@@ -262,13 +263,14 @@ fn metadata(values: &Values, keys: &[Id]) -> Values {
 fn producer_manifest<'a>(
     snapshot: &'a ProjectSnapshot,
     digest: &Digest,
-) -> Option<&'a CompositionManifest> {
-    snapshot
+) -> Result<Option<&'a CompositionManifest>> {
+    let state = snapshot.scalar_scope()?;
+    Ok(snapshot
         .programs
         .iter()
         .filter(|p| &p.artifact.program_digest == digest)
         .filter_map(|p| super::super::revision(p).ok())
-        .find_map(|id| snapshot.scope.compositions.get(&id))
+        .find_map(|id| state.compositions.get(&id)))
 }
 /// Reconstruct every protected cell from its initialization or real creation
 /// event, then enforce monotonic seals against the actual append-only events.
@@ -276,7 +278,12 @@ fn producer_manifest<'a>(
 pub(super) fn verify_history(snapshot: &ProjectSnapshot) -> Result<()> {
     verify_history_layers(
         snapshot,
-        &snapshot.scope.layers.keys().cloned().collect::<Vec<_>>(),
+        &snapshot
+            .scalar_scope()?
+            .layers
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
     )
 }
 pub(super) fn verify_history_layers(snapshot: &ProjectSnapshot, layers: &[Digest]) -> Result<()> {
@@ -292,12 +299,12 @@ pub(super) fn verify_history_frames(
     let mut checks = ProjectionValidation::default();
     for id in layers {
         let layer = snapshot
-            .scope
+            .scalar_scope()?
             .layers
             .get(id)
             .ok_or_else(|| error("history layer proof missing"))?;
         let receipt = snapshot
-            .scope
+            .scalar_scope()?
             .initializations
             .iter()
             .find(|r| &r.layer == id)
@@ -386,7 +393,7 @@ pub(super) fn verify_history_frames(
                         if before_row.is_some() || births != 1 {
                             return Err(error("duplicate or postdated creation provenance"));
                         }
-                        let source = producer_manifest(snapshot, &event.program)
+                        let source = producer_manifest(snapshot, &event.program)?
                             .ok_or_else(|| error("creation has no verified composition"))?;
                         let stamped = source.active.contains(id)
                             && matches!(
@@ -408,7 +415,7 @@ pub(super) fn verify_history_frames(
                     }
                     // Terminal facts require a seal independently of whether
                     // the event claims to have produced one.
-                    let source = producer_manifest(snapshot, &event.program)
+                    let source = producer_manifest(snapshot, &event.program)?
                         .ok_or_else(|| error("business event source is not verified"))?;
                     let producer = program(snapshot, &source.output)?;
                     if (change.archived
@@ -451,7 +458,7 @@ pub(super) fn verify_history_frames(
                             }
                         }
                     } else if value_bool(&after, &sealed)? {
-                        let source = producer_manifest(snapshot, &event.program)
+                        let source = producer_manifest(snapshot, &event.program)?
                             .ok_or_else(|| error("seal source is not verified"))?;
                         if !source.layers.contains(id) {
                             return Err(error("seal source omitted its history envelope"));
@@ -496,7 +503,7 @@ pub(super) fn verify_history_frames(
                         // with every seal born in this event unset. Resetting only
                         // one would let two forged saved values justify each other.
                         for other in &source.layers {
-                            let other_layer = &snapshot.scope.layers[other];
+                            let other_layer = &snapshot.scalar_scope()?.layers[other];
                             if !other_layer
                                 .request
                                 .lifecycles
@@ -643,7 +650,7 @@ pub(super) fn presentation(
         results: vec![],
         events: snapshot.data.events.clone(),
     };
-    for (id, layer) in &snapshot.scope.layers {
+    for (id, layer) in &snapshot.scalar_scope()?.layers {
         for row in &snapshot.data.records {
             if !layer
                 .request

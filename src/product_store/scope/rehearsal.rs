@@ -132,7 +132,7 @@ pub(in crate::product_store) fn retain_rehearsals(
         ));
     }
     if current
-        .scope
+        .scalar_scope()?
         .rehearsals
         .len()
         .saturating_add(prepared.len())
@@ -155,13 +155,13 @@ fn retain_rehearsal(
     eligible(prepared)?;
     if plan.target != current.program()?.artifact
         || plan.current_source != current.program()?.binding
-        || current.scope.rehearsals.len() >= MAX_ITEMS
+        || current.scalar_scope()?.rehearsals.len() >= MAX_ITEMS
         || current
-            .scope
+            .scalar_scope()?
             .rehearsals
             .contains_key(&prepared.manifest.output)
         || current
-            .scope
+            .scalar_scope()?
             .compositions
             .contains_key(&prepared.manifest.output)
         || decisions.is_empty()
@@ -205,7 +205,7 @@ fn retain_rehearsal(
     retain(current, &prepared.candidate)?;
     retain(current, &prepared.target)?;
     current
-        .scope
+        .scalar_scope_mut()?
         .rehearsals
         .insert(prepared.manifest.output.clone(), proof);
     Ok(())
@@ -219,7 +219,7 @@ pub(super) fn verify_recording_request(
     graph: &DecisionGraph,
 ) -> Result<()> {
     let proofs: Vec<_> = snapshot
-        .scope
+        .scalar_scope()?
         .rehearsals
         .values()
         .filter(|proof| proof.recorded_by == receipt.plan.id)
@@ -299,7 +299,7 @@ pub(super) fn verify_recording_request(
         ),
     )?;
     let correspondences: BTreeMap<_, _> = snapshot
-        .scope
+        .scalar_scope()?
         .correspondences
         .iter()
         .filter(|(_, proof)| proof.operation == receipt.plan.id)
@@ -324,10 +324,10 @@ pub(super) fn verify_recording_request(
     Ok(())
 }
 pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
-    if snapshot.scope.rehearsals.len() > MAX_ITEMS {
+    if snapshot.scalar_scope()?.rehearsals.len() > MAX_ITEMS {
         return Err(error("rehearsal inventory exceeds bounds"));
     }
-    for (output, proof) in &snapshot.scope.rehearsals {
+    for (output, proof) in &snapshot.scalar_scope()?.rehearsals {
         let manifest = &proof.manifest;
         if proof.version != COMPILER_VERSION
             || manifest.version != COMPILER_VERSION
@@ -343,7 +343,10 @@ pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
         {
             return Err(error("invalid retained rehearsal identity or transition"));
         }
-        let previous = snapshot.scope.compositions.get(&manifest.basis.active);
+        let previous = snapshot
+            .scalar_scope()?
+            .compositions
+            .get(&manifest.basis.active);
         if manifest.previous.as_ref() != previous.map(|_| &manifest.basis.active) {
             return Err(error(
                 "rehearsal predecessor differs from its adopted basis",
@@ -394,7 +397,7 @@ pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
                     || manifest.layers.len() > MAX_LAYERS
                     || manifest.active != active
                     || manifest.rewrites != previous.map(|p| p.rewrites.clone()).unwrap_or_default()
-                    || snapshot.scope.layers.contains_key(&id)
+                    || snapshot.scalar_scope()?.layers.contains_key(&id)
                 {
                     return Err(error(
                         "prospective layer differs from its exact prepared envelope",
@@ -406,7 +409,7 @@ pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
                 working.clock_day = manifest.basis.day;
                 working.revision = manifest.basis.revision;
                 // Reconstruct the adopted layer inventory at this frozen basis.
-                working.scope.layers.retain(|id, _| {
+                working.scalar_scope_mut()?.layers.retain(|id, _| {
                     previous.is_some_and(|predecessor| predecessor.layers.contains(id))
                 });
                 request_valid(&working, &layer.request)?;
@@ -418,7 +421,7 @@ pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
                         "prospective layer patches do not independently regenerate",
                     ));
                 }
-                working.scope.layers.insert(id, layer.clone());
+                working.scalar_scope_mut()?.layers.insert(id, layer.clone());
                 let (seed, receipt) = history::initialize(&working, layer, target)?;
                 if proof.initialization.as_ref() != Some(&receipt) {
                     return Err(error(
@@ -494,24 +497,27 @@ pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
     Ok(())
 }
 /// Build an isolated replay registry only after the snapshot proof gate passed.
-pub(super) fn replay_snapshot(snapshot: &ProjectSnapshot) -> ProjectSnapshot {
+pub(super) fn replay_snapshot(snapshot: &ProjectSnapshot) -> Result<ProjectSnapshot> {
     let mut replay = snapshot.clone();
-    for (id, proof) in &snapshot.scope.rehearsals {
+    for (id, proof) in &snapshot.scalar_scope()?.rehearsals {
         if let Some(layer) = &proof.layer {
             // validate() proved the identity and absence from active layers.
-            replay.scope.layers.insert(
+            replay.scalar_scope_mut()?.layers.insert(
                 layer.identity().expect("verified rehearsal layer"),
                 layer.clone(),
             );
         }
         if let Some(receipt) = &proof.initialization {
-            replay.scope.initializations.push(receipt.clone());
+            replay
+                .scalar_scope_mut()?
+                .initializations
+                .push(receipt.clone());
         }
         replay
-            .scope
+            .scalar_scope_mut()?
             .compositions
             .entry(id.clone())
             .or_insert_with(|| proof.manifest.clone());
     }
-    replay
+    Ok(replay)
 }

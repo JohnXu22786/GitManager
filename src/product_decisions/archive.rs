@@ -150,7 +150,7 @@ pub(super) fn validate_rehearsal_scenes(
     scenes: &[AcceptedScene],
 ) -> Result<()> {
     let proofs: Vec<_> = snapshot
-        .scope
+        .scalar_scope()?
         .rehearsals
         .values()
         .filter(|proof| proof.witnesses.values().any(|digest| digest == witness))

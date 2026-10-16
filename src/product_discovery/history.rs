@@ -775,13 +775,14 @@ impl VerifiedRetainedHistory {
         if let Some(prepared) = self.prepared_targets.get(&id) {
             return Ok(prepared.candidate().program.entities.clone());
         }
-        let manifest = self.current.scope.compositions.get(&id).or_else(|| {
-            self.current
-                .scope
-                .rehearsals
-                .get(&id)
-                .map(|proof| &proof.manifest)
-        });
+        let state = self
+            .current
+            .scalar_scope()
+            .map_err(|e| unavailable(&e.to_string()))?;
+        let manifest = state
+            .compositions
+            .get(&id)
+            .or_else(|| state.rehearsals.get(&id).map(|proof| &proof.manifest));
         if let Some(manifest) = manifest {
             let business = self
                 .current

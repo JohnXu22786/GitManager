@@ -753,12 +753,15 @@ impl Worker {
         let ready = self.ready.take().unwrap();
         let provider = ready.prepared.authorize(consent.clone());
         let ordinary = ready.reconciliation.is_some()
-            && self.opened.as_ref().is_some_and(|o| {
-                !o.snapshot
-                    .scope
+            && match &self.opened {
+                Some(opened) => !opened
+                    .snapshot
+                    .scalar_scope()
+                    .map_err(error)?
                     .compositions
-                    .contains_key(&o.snapshot.active_revision)
-            });
+                    .contains_key(&opened.snapshot.active_revision),
+                None => false,
+            };
         let (developed, result) = if ordinary {
             let current = self.opened.as_ref().unwrap();
             let engine = DecisionEngine::new(
@@ -2298,7 +2301,8 @@ impl Worker {
             .ok_or("This choice is no longer pending")?
             .clone();
         let matches: Vec<_> = snapshot
-            .scope
+            .scalar_scope()
+            .map_err(error)?
             .rehearsals
             .values()
             .filter(|p| p.witnesses.get(decision) == Some(&choice.witness))

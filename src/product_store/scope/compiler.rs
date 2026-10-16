@@ -892,7 +892,7 @@ pub(super) fn effective_patch(
     index: usize,
 ) -> Result<EffectPatch> {
     let original = snapshot
-        .scope
+        .scalar_scope()?
         .layers
         .get(id)
         .and_then(|l| l.patches.get(index))
@@ -936,6 +936,7 @@ pub(super) fn validate_mappings(
     candidate: &CapturedProgram,
     mappings: &[ScopeSlotMapping],
 ) -> Result<()> {
+    let state = snapshot.scalar_scope()?;
     let mut seen = BTreeSet::new();
     let mut destinations = BTreeSet::new();
     for mapping in mappings {
@@ -1003,7 +1004,7 @@ pub(super) fn validate_mappings(
     if previous
         .layers
         .iter()
-        .any(|id| !snapshot.scope.layers[id].request.lifecycles.is_empty())
+        .any(|id| !state.layers[id].request.lifecycles.is_empty())
     {
         check_completion_order(&candidate.program)?;
     }
@@ -1012,7 +1013,7 @@ pub(super) fn validate_mappings(
             .iter()
             .filter(|m| &m.layer == id)
             .map(|m| {
-                let mut p = snapshot.scope.layers[id].patches[m.patch].request.clone();
+                let mut p = state.layers[id].patches[m.patch].request.clone();
                 p.destination = m.to.clone();
                 p.subject = m.subject.clone();
                 p
@@ -1031,7 +1032,7 @@ pub(super) fn validate_mappings(
     let expected: usize = previous
         .layers
         .iter()
-        .map(|id| snapshot.scope.layers[id].patches.len())
+        .map(|id| state.layers[id].patches.len())
         .sum();
     if mappings.len() != expected {
         return Err(error(
@@ -1042,11 +1043,15 @@ pub(super) fn validate_mappings(
 }
 
 pub(super) fn business_program(snapshot: &ProjectSnapshot) -> Result<AppDefinition> {
-    if let Some(manifest) = snapshot.scope.compositions.get(&snapshot.active_revision) {
+    if let Some(manifest) = snapshot
+        .scalar_scope()?
+        .compositions
+        .get(&snapshot.active_revision)
+    {
         let mut app = program(snapshot, &manifest.business)?.program.clone();
         let mut seen = BTreeSet::new();
         for id in &manifest.layers {
-            let layer = &snapshot.scope.layers[id];
+            let layer = &snapshot.scalar_scope()?.layers[id];
             for index in 0..layer.patches.len() {
                 let patch = effective_patch(snapshot, manifest, id, index)?;
                 let key = canonical_bytes(&patch.request.destination)?;
@@ -1075,7 +1080,7 @@ pub(super) fn envelope_app(
     // Reset a shared destination exactly once to its earliest retained meaning.
     for id in &manifest.layers {
         let layer = snapshot
-            .scope
+            .scalar_scope()?
             .layers
             .get(id)
             .ok_or_else(|| error("missing layer"))?;
@@ -1087,7 +1092,7 @@ pub(super) fn envelope_app(
         }
     }
     for id in &manifest.layers {
-        let layer = &snapshot.scope.layers[id];
+        let layer = &snapshot.scalar_scope()?.layers[id];
         let active = manifest.active.contains(id);
         for lifecycle in &layer.request.lifecycles {
             let entity = app
@@ -1252,7 +1257,7 @@ fn instrument(
         match &mut s {
             Statement::Create { entity, values, .. } => {
                 for id in &manifest.layers {
-                    let layer = &snapshot.scope.layers[id];
+                    let layer = &snapshot.scalar_scope()?.layers[id];
                     if layer.request.lifecycles.iter().any(|l| &l.entity == entity) {
                         values.insert(
                             key(id, entity, "member"),
@@ -1312,7 +1317,7 @@ fn sealing_passes(
 ) -> Result<Vec<Statement>> {
     let mut result = vec![];
     for id in &manifest.layers {
-        let layer = &snapshot.scope.layers[id];
+        let layer = &snapshot.scalar_scope()?.layers[id];
         for lifecycle in &layer.request.lifecycles {
             let binding = key(id, &lifecycle.entity, "seal_row");
             // Archive supports the same explicit own-row reference grammar. Cross-
@@ -1394,7 +1399,7 @@ fn add_provenance(
     // Schema-carried provenance survives exported bytes, including mixed live
     // and saved rows; it is not merely a transient host caption.
     for id in &manifest.layers {
-        let layer = &snapshot.scope.layers[id];
+        let layer = &snapshot.scalar_scope()?.layers[id];
         for index in 0..layer.patches.len() {
             let patch = effective_patch(snapshot, manifest, id, index)?;
             let p = &patch.request;

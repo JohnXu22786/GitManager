@@ -164,6 +164,7 @@ impl HistoryView {
             LocalRuntime::with_cancellation(cancel.clone()),
             archive.clone(),
         );
+        let state = basis.scalar_scope().map_err(error)?;
         let mut decisions = vec![];
         for decision in &basis.decisions.decisions {
             cancelled(&cancel)?;
@@ -193,7 +194,7 @@ impl HistoryView {
                 .filter(|receipt| {
                     receipt.plan.required_decisions.contains(&decision.id)
                         || receipt.plan.retire_decisions.contains(&decision.id)
-                        || basis.scope.adoptions.iter().any(|scope| {
+                        || state.adoptions.iter().any(|scope| {
                             scope.revision == receipt.revision
                                 && scope.decisions.contains(&decision.id)
                         })
@@ -210,19 +211,21 @@ impl HistoryView {
             });
         }
         let active = basis
-            .scope
+            .scalar_scope()
+            .map_err(error)?
             .compositions
             .get(&basis.active_revision)
             .map(|m| &m.active);
         let mut layers = vec![];
-        for (id, layer) in &basis.scope.layers {
+        for (id, layer) in &basis.scalar_scope().map_err(error)?.layers {
             let receipt = basis
                 .adoptions
                 .iter()
                 .find(|r| r.plan.id == layer.operation)
                 .ok_or("The behavior layer has no saved adoption receipt")?;
             let scoped = basis
-                .scope
+                .scalar_scope()
+                .map_err(error)?
                 .adoptions
                 .iter()
                 .find(|r| r.revision == receipt.revision)
@@ -314,7 +317,8 @@ impl Reconciliation {
         fresh(store, &self.basis, &cancel)?;
         if self
             .basis
-            .scope
+            .scalar_scope()
+            .map_err(error)?
             .compositions
             .contains_key(&self.basis.active_revision)
         {
