@@ -659,7 +659,7 @@ fn format_upgrade_controls_require_explicit_confirmation_and_reopen_fresh_daily_
             .load()
             .unwrap()
             .version,
-        2
+        3
     );
 }
 

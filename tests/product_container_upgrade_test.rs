@@ -315,6 +315,63 @@ fn old_inbox_is_preserved_and_activated_old_destination_uses_in_place_gate() {
     assert_eq!(fs::read(path.join("UPGRADE-INBOX")).unwrap(), b"old marker");
 }
 #[test]
+fn old_and_unknown_inboxes_reject_ordinary_extension_staging() {
+    let dir = tempdir();
+    let bytes = golden("legacy-v1");
+    let envelope: Value = serde_json::from_slice(&bytes).unwrap();
+    let object = &envelope["payload"]["intentions"]["objects"][0];
+    let reused: Vec<u8> = serde_json::from_value(object["bytes"].clone()).unwrap();
+    let extension = format!("extension-{}.json", object["digest"].as_str().unwrap());
+    let new = canonical_bytes(&json!({"unrelated": true})).unwrap();
+    let BackupIntake::UpgradeRequired(backup) = inspect_backup(&bytes).unwrap() else {
+        panic!()
+    };
+    let current = dir.path().join("current-inbox");
+    assert!(backup
+        .upgrade_recover_with_fault(&current, |_| {}, FaultPoint::AfterUpgradeJournal)
+        .is_err());
+    assert!(!current.join("CURRENT").exists());
+    assert!(!current.join("UPGRADE-PENDING").exists());
+    let marker = fs::read(current.join("UPGRADE-INBOX")).unwrap();
+    let mut invalid = vec![
+        b"[\"old-source\",\"old-target\"]".to_vec(),
+        b"not json".to_vec(),
+        [marker.as_slice(), b" "].concat(),
+        [b"{\"version\":2,".as_slice(), &marker[1..]].concat(),
+    ];
+    for (field, value) in [
+        ("version", json!(1)),
+        ("migration", json!("generated-project-container/2")),
+        ("unknown", json!(true)),
+    ] {
+        let mut value_marker: Value = serde_json::from_slice(&marker).unwrap();
+        value_marker[field] = value;
+        invalid.push(canonical_bytes(&value_marker).unwrap());
+    }
+    for (index, marker) in invalid.iter().enumerate() {
+        let path = dir.path().join(format!("old-inbox-{index}"));
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("UPGRADE-INBOX"), marker).unwrap();
+        fs::write(path.join(&extension), &reused).unwrap();
+        fs::write(path.join("retained"), b"old staged bytes").unwrap();
+        let before = tree(&path);
+        let store = ProductStore::open(&path).unwrap();
+        for bytes in [&new, &reused] {
+            assert!(store.stage_extension(bytes).is_err(), "marker {index}");
+            assert_eq!(tree(&path), before, "marker {index}");
+        }
+    }
+    // Only a recognized current inbox may stage before it is sealed. The
+    // explicit retry still rederives and verifies all marker bindings.
+    let store = ProductStore::open(&current).unwrap();
+    for bytes in [&new, &reused] {
+        let digest = store.stage_extension(bytes).unwrap();
+        assert_eq!(store.read_extension(&digest).unwrap(), *bytes);
+    }
+    backup.upgrade_recover_new(&current, |_| {}).unwrap();
+    assert!(open_verified(&current, None).is_ok());
+}
+#[test]
 fn activated_recovery_retry_requires_original_and_journal() {
     for remove in ["original", "journal"] {
         let dir = tempdir();
@@ -339,7 +396,7 @@ fn activated_recovery_retry_requires_original_and_journal() {
 }
 #[test]
 fn activated_retry_rechecks_retained_inputs_after_verified_progress() {
-    for kind in ["original", "journal", "marker", "extension"] {
+    for kind in ["original", "journal", "marker", "extension", "pending"] {
         for remove in [false, true] {
             let dir = tempdir();
             let path = dir.path().join("copy");
@@ -355,6 +412,7 @@ fn activated_retry_rechecks_retained_inputs_after_verified_progress() {
                 "original" => format!("object-{}.json", marker["original"].as_str().unwrap()),
                 "journal" => format!("upgrade-1-3-{}.json", marker["original"].as_str().unwrap()),
                 "marker" => "UPGRADE-INBOX".into(),
+                "pending" => "UPGRADE-PENDING".into(),
                 "extension" => tree(&path)
                     .keys()
                     .find(|name| name.starts_with("extension-"))
@@ -829,6 +887,7 @@ fn reused_upgrade_files_require_content_sync_before_activation_or_success() {
         "extension",
         "original",
         "current",
+        "pending",
     ] {
         let dir = tempdir();
         let path = dir.path().join("copy");
@@ -846,6 +905,7 @@ fn reused_upgrade_files_require_content_sync_before_activation_or_success() {
             "journal" => format!("upgrade-2-3-{}.json", marker["original"].as_str().unwrap()),
             "original" => format!("object-{}.json", marker["original"].as_str().unwrap()),
             "marker" => "UPGRADE-INBOX".into(),
+            "pending" => "UPGRADE-PENDING".into(),
             "extension" => fs::read_dir(&path)
                 .unwrap()
                 .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -896,13 +956,358 @@ fn post_pointer_directory_barrier_failure_requires_reopen_and_explicit_completio
     let pointer: Value = serde_json::from_slice(&fs::read(path.join("CURRENT")).unwrap()).unwrap();
     assert_eq!(pointer["version"], 3);
     let reopened = ProductStore::open(&path).unwrap();
-    assert!(reopened.load().is_ok());
+    assert!(matches!(reopened.load(), Err(StoreError::UpgradeRequired)));
+    assert!(matches!(inspect_open(&path, None).unwrap(), OpenGate::UpgradeRequired(_)));
     assert!(upgrade(&reopened).is_err());
     drop(fault);
     let before = tree(&path);
     upgrade(&reopened).unwrap();
+    let mut expected = before;
+    expected.insert("UPGRADE-COMPLETE".into(), expected["UPGRADE-PENDING"].clone());
+    assert_eq!(tree(&path), expected);
+    assert!(reopened.load().is_ok());
+}
+
+fn assert_pending_activation_gates(path: &Path) {
+    let before = tree(path);
+    let store = ProductStore::open(path).unwrap();
+    assert!(matches!(store.load(), Err(StoreError::UpgradeRequired)));
+    let OpenGate::UpgradeRequired(summary) = inspect_open(path, None).unwrap() else {
+        panic!("visible CURRENT bypassed explicit durability completion")
+    };
+    assert!(summary.restart_required);
+    assert!(matches!(summary.from_version, 1 | 2));
+    assert!(open_verified(path, None).is_err());
+    assert!(matches!(
+        store.stage_extension(&canonical_bytes(&json!({"pending": true})).unwrap()),
+        Err(StoreError::UpgradeRequired)
+    ));
+    assert!(matches!(
+        store.apply(
+            0,
+            "pending-edit",
+            &invoke("export", &[]),
+            RuntimeLimits::default()
+        ),
+        Err(StoreError::UpgradeRequired)
+    ));
+    assert_eq!(
+        tree(path),
+        before,
+        "ordinary open/edit changed pending work"
+    );
+}
+
+fn verify_upgrade_packages(
+    store: &ProductStore,
+    snapshot: &ProjectSnapshot,
+) -> Result<(), StoreError> {
+    IntentArchive::new(store.clone())
+        .export_for(snapshot)
+        .map(|_| ())
+        .map_err(|e| StoreError::Corrupt(e.to_string()))
+}
+
+#[test]
+fn pending_activation_is_gated_after_reopen_and_fresh_process() {
+    const CHILD_PATH: &str = "GITMANAGER_PENDING_UPGRADE_TEST_PATH";
+    if let Some(path) = std::env::var_os(CHILD_PATH) {
+        assert_pending_activation_gates(Path::new(&path));
+        return;
+    }
+    for name in ["legacy-v1", "prospective"] {
+        for recovery in [false, true] {
+            let dir = tempdir();
+            let path = dir.path().join("pending");
+            if recovery {
+                let BackupIntake::UpgradeRequired(backup) = inspect_backup(&golden(name)).unwrap()
+                else {
+                    panic!()
+                };
+                assert!(backup
+                    .upgrade_recover_with_fault(&path, |_| {}, FaultPoint::AfterPointer)
+                    .is_err());
+            } else {
+                let (store, _, _) = install(&path, name, false);
+                let archive = IntentArchive::new(store.clone());
+                assert!(store
+                    .upgrade_verified_with_fault(
+                        |_| {},
+                        |snapshot| archive
+                            .export_for(snapshot)
+                            .map(|_| ())
+                            .map_err(|e| StoreError::Corrupt(e.to_string())),
+                        FaultPoint::AfterPointer,
+                    )
+                    .is_err());
+            }
+            let pointer: Value =
+                serde_json::from_slice(&fs::read(path.join("CURRENT")).unwrap()).unwrap();
+            assert_eq!(pointer["version"], 3);
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "pending_activation_is_gated_after_reopen_and_fresh_process",
+                    "--exact",
+                ])
+                .env(CHILD_PATH, &path)
+                .output()
+                .unwrap();
+            assert!(
+                child.status.success(),
+                "fresh process failed: {}{}",
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr)
+            );
+            assert_pending_activation_gates(&path);
+            let before = tree(&path);
+            upgrade_open_verified(&path, None, |_| {}).unwrap();
+            assert!(matches!(
+                inspect_open(&path, None).unwrap(),
+                OpenGate::Ready(_)
+            ));
+            let completed = tree(&path);
+            let mut expected = before;
+            expected.insert("UPGRADE-COMPLETE".into(), expected["UPGRADE-PENDING"].clone());
+            assert_eq!(completed, expected);
+            upgrade_open_verified(&path, None, |_| {}).unwrap();
+            assert_eq!(tree(&path), completed, "completed retry was not idempotent");
+        }
+    }
+}
+
+#[test]
+fn pending_activation_records_fail_closed_on_corruption_or_later_work() {
+    for kind in [
+        "duplicate",
+        "trailing",
+        "unknown",
+        "project",
+        "revision",
+        "target",
+        "journal",
+        "receipt",
+        "later",
+    ] {
+        let dir = tempdir();
+        let path = dir.path().join("pending");
+        let (store, _, _) = install(&path, "legacy-v1", false);
+        assert!(matches!(
+            store.upgrade_verified_with_fault(
+                |_| {},
+                |snapshot| verify_upgrade_packages(&store, snapshot),
+                FaultPoint::AfterPointer,
+            ),
+            Err(StoreError::ActivationUnconfirmed(_))
+        ));
+        let pending = fs::read(path.join("UPGRADE-PENDING")).unwrap();
+        let mut value: Value = serde_json::from_slice(&pending).unwrap();
+        let mut bytes = pending.clone();
+        match kind {
+            "duplicate" => {
+                bytes = b"{\"version\":2,".to_vec();
+                bytes.extend_from_slice(&pending[1..]);
+            }
+            "trailing" => bytes.extend_from_slice(b" {}"),
+            "unknown" => value["unknown"] = json!(true),
+            "project" => value["journal"]["to"]["project_id"] = json!("other"),
+            "revision" => value["journal"]["to"]["revision"] = json!(999),
+            "target" => value["journal"]["to"]["object"] = json!("0".repeat(64)),
+            "journal" => value["journal"]["records"] = json!(999),
+            "receipt" => fs::write(path.join("UPGRADE-COMPLETE"), b"{}").unwrap(),
+            "later" => {
+                let mut pointer: Value =
+                    serde_json::from_slice(&fs::read(path.join("CURRENT")).unwrap()).unwrap();
+                let mut current: Value = serde_json::from_slice(
+                    &fs::read(path.join(format!(
+                        "object-{}.json",
+                        pointer["object"].as_str().unwrap()
+                    )))
+                    .unwrap(),
+                )
+                .unwrap();
+                current["revision"] = json!(current["revision"].as_u64().unwrap() + 1);
+                let digest = canonical_digest(IdentityDomain::Data, &current).unwrap();
+                fs::write(
+                    path.join(format!("object-{}.json", digest.as_str())),
+                    canonical_bytes(&current).unwrap(),
+                )
+                .unwrap();
+                pointer["revision"] = current["revision"].clone();
+                pointer["object"] = serde_json::to_value(digest).unwrap();
+                fs::write(path.join("CURRENT"), canonical_bytes(&pointer).unwrap()).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        if !matches!(kind, "duplicate" | "trailing" | "receipt" | "later") {
+            bytes = canonical_bytes(&value).unwrap();
+        }
+        fs::write(path.join("UPGRADE-PENDING"), bytes).unwrap();
+        let before = tree(&path);
+        assert!(open_verified(&path, None).is_err(), "{kind}");
+        assert!(
+            upgrade_open_verified(&path, None, |_| {}).is_err(),
+            "{kind}"
+        );
+        assert_eq!(tree(&path), before, "{kind} overwrote retained evidence");
+    }
+}
+
+#[test]
+fn pending_recovery_reopen_keeps_the_exact_inbox_provenance() {
+    let dir = tempdir();
+    let path = dir.path().join("copy");
+    let BackupIntake::UpgradeRequired(backup) = inspect_backup(&golden("legacy-v1")).unwrap()
+    else {
+        panic!()
+    };
+    assert!(backup
+        .upgrade_recover_with_fault(&path, |_| {}, FaultPoint::AfterPointer)
+        .is_err());
+    fs::write(path.join("UPGRADE-INBOX"), b"{}").unwrap();
+    let before = tree(&path);
+    assert!(inspect_open(&path, None).is_err());
+    assert!(upgrade_open_verified(&path, None, |_| {}).is_err());
     assert_eq!(tree(&path), before);
 }
+
+#[test]
+fn ordinary_staging_cannot_extend_an_unactivated_pending_upgrade() {
+    let dir = tempdir();
+    let path = dir.path().join("copy");
+    let BackupIntake::UpgradeRequired(backup) = inspect_backup(&golden("legacy-v1")).unwrap()
+    else {
+        panic!()
+    };
+    assert!(backup
+        .upgrade_recover_with_fault(&path, |_| {}, FaultPoint::BeforePointer)
+        .is_err());
+    assert!(!path.join("CURRENT").exists());
+    assert!(path.join("UPGRADE-PENDING").exists());
+    let before = tree(&path);
+    let store = ProductStore::open(&path).unwrap();
+    let reused = before
+        .iter()
+        .find(|(name, _)| name.starts_with("extension-"))
+        .unwrap()
+        .1;
+    for bytes in [
+        canonical_bytes(&json!({"unrelated": true})).unwrap(),
+        reused.clone(),
+    ] {
+        assert!(matches!(
+            store.stage_extension(&bytes),
+            Err(StoreError::UpgradeRequired)
+        ));
+        assert_eq!(tree(&path), before);
+    }
+    backup.upgrade_recover_new(&path, |_| {}).unwrap();
+    assert!(open_verified(&path, None).is_ok());
+    // A retained completion receipt is evidence that this was activated, not
+    // an unactivated inbox that may be restored after CURRENT disappears.
+    fs::remove_file(path.join("CURRENT")).unwrap();
+    let before = tree(&path);
+    assert!(backup.upgrade_recover_new(&path, |_| {}).is_err());
+    assert_eq!(tree(&path), before);
+}
+
+#[test]
+#[cfg(unix)]
+fn parent_directory_barrier_failure_keeps_reopened_upgrades_gated() {
+    for recovery in [false, true] {
+        let dir = tempdir();
+        let path = dir.path().join("pending");
+        let mut fault = None;
+        let mut progress = |stage| {
+            if stage == UpgradeProgress::Activating {
+                fault = Some(product_store::file_sync_testing::fail(
+                    dir.path().to_path_buf(),
+                ));
+            }
+        };
+        if recovery {
+            let BackupIntake::UpgradeRequired(backup) =
+                inspect_backup(&golden("legacy-v1")).unwrap()
+            else {
+                panic!()
+            };
+            assert!(backup.upgrade_recover_new(&path, &mut progress).is_err());
+        } else {
+            let (store, _, _) = install(&path, "legacy-v1", false);
+            assert!(matches!(
+                store.upgrade_generated_project_verified(&mut progress, |snapshot| {
+                    verify_upgrade_packages(&store, snapshot)
+                },),
+                Err(StoreError::ActivationUnconfirmed(_))
+            ));
+        }
+        assert!(fault.as_ref().unwrap().attempts() > 0);
+        assert_pending_activation_gates(&path);
+        assert!(!path.join("UPGRADE-COMPLETE").exists());
+        drop(fault);
+        upgrade_open_verified(&path, None, |_| {}).unwrap();
+        assert!(open_verified(&path, None).is_ok());
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn activation_record_visibility_failures_retain_safe_explicit_retries() {
+    for completion in [false, true] {
+        let dir = tempdir();
+        let path = dir.path().join("old");
+        let (store, _, _) = install(&path, "legacy-v1", false);
+        let original = tree(&path);
+        let mut fault = None;
+        assert!(store
+            .upgrade_generated_project_verified(
+                |stage| {
+                    if stage
+                        == if completion {
+                            UpgradeProgress::Activating
+                        } else {
+                            UpgradeProgress::Staged
+                        }
+                    {
+                        fault = Some(product_store::file_sync_testing::fail_after(
+                            path.clone(),
+                            if completion { 3 } else { 1 },
+                        ));
+                    }
+                },
+                |snapshot| verify_upgrade_packages(&store, snapshot)
+            )
+            .is_err());
+        assert!(path.join("UPGRADE-PENDING").exists());
+        assert_eq!(path.join("UPGRADE-COMPLETE").exists(), completion);
+        if completion {
+            // The completion receipt is published only after all business-state
+            // barriers. Its lost acknowledgement cannot undo durable work.
+            assert!(open_verified(&path, None).is_ok());
+        } else {
+            assert_eq!(fs::read(path.join("CURRENT")).unwrap(), original["CURRENT"]);
+            assert!(matches!(
+                inspect_open(&path, None).unwrap(),
+                OpenGate::UpgradeRequired(_)
+            ));
+        }
+        drop(fault);
+        upgrade_open_verified(&path, None, |_| {}).unwrap();
+        for (name, bytes) in original {
+            if name != "CURRENT" {
+                assert_eq!(fs::read(path.join(name)).unwrap(), bytes);
+            }
+        }
+        let before = tree(&path);
+        let sync_fault = product_store::file_sync_testing::fail(path.join("UPGRADE-COMPLETE"));
+        assert!(upgrade_open_verified(&path, None, |_| {}).is_err());
+        assert!(sync_fault.attempts() > 0);
+        assert_eq!(tree(&path), before);
+        drop(sync_fault);
+        upgrade_open_verified(&path, None, |_| {}).unwrap();
+        assert_eq!(tree(&path), before);
+    }
+}
+
 #[test]
 fn conflicting_upgrade_target_journal_or_marker_never_overwrites_evidence() {
     for kind in ["target", "journal", "marker"] {

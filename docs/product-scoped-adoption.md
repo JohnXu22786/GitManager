@@ -51,7 +51,9 @@ not arbitrary application composition.
 
 1. Open through product_backup::inspect_open. A format-1 or format-2 store must pass the
    explicit offline upgrade gate before editing. Display UpgradeProgress,
-   retain original files, and restart/reopen when requested
+   retain original files, and restart/reopen when requested. If activation is
+   visible but durability is unconfirmed, reopen still presents the explicit
+   verification gate; daily editing resumes only after completion succeeds
 2. Call ProductStore::prepare_scoped_change with the exact candidate and
    ScopeRequest. The opaque PreparedScopedChange exposes its compiled target,
    initialized copied seed and actual frozen scope

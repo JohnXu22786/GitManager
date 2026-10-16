@@ -1315,7 +1315,7 @@ impl Worker {
                 }
                 Ok(())
             }
-            OpenGate::UpgradeRequired(_) => Err(format!("The upgrade did not activate. Original saved work is kept; review and retry the upgrade. {:?}", result.err())),
+            OpenGate::UpgradeRequired(_) => Err(format!("The upgrade has not completed verification. Original saved work is kept; reopen this folder and explicitly retry the upgrade before continuing. {:?}", result.err())),
         }
     }
     fn post_save(&mut self, tool: &Association) {

@@ -911,14 +911,32 @@ impl LegacyBackup {
         P: FnMut(crate::product_store::UpgradeProgress),
     {
         let verified = Self::from_bytes(&self.original)?;
-        let before_activate = |store: &ProductStore, snapshot: &ProjectSnapshot| {
+        let before_activate = |store: &ProductStore, snapshot: &ProjectSnapshot, sealed: bool| {
             if let Some(selected) = selected {
                 selected.check()?;
             }
             verify_instance().map_err(|e| StoreError::Conflict(e.to_string()))?;
-            IntentArchive::new(store.clone())
-                .restore_for(snapshot, &verified.intentions)
-                .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+            let archive = IntentArchive::new(store.clone());
+            if sealed {
+                // A pending/activated recovery has already sealed its inputs;
+                // verify exact retained objects without an ordinary write.
+                archive
+                    .export_for(snapshot)
+                    .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+                if !verified
+                    .intentions
+                    .matches_store_objects(store)
+                    .map_err(|e| StoreError::Corrupt(e.to_string()))?
+                {
+                    return Err(StoreError::Corrupt(
+                        "activated upgrade intention bytes changed".into(),
+                    ));
+                }
+            } else {
+                archive
+                    .restore_for(snapshot, &verified.intentions)
+                    .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+            }
             verify_instance().map_err(|e| StoreError::Conflict(e.to_string()))
         };
         Ok(match selected {

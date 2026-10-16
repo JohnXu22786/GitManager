@@ -926,27 +926,50 @@ fn upgrade_visible_pointer_does_not_hide_an_unfinished_durability_barrier() {
     let (_temp, root) = root();
     let path = saved(&root);
     legacy_copy(&path);
-    let mut studio = ProductStudio::testing(root, None, TestHooks::default());
+    let hooks = TestHooks::default();
+    let stopped = hooks.stopped.clone();
+    let mut studio = ProductStudio::testing(root.clone(), None, hooks);
     settle(&mut studio);
     studio.test_open(path.clone());
     settle(&mut studio);
     assert_eq!(studio.test_page(), "upgrade");
-    // Target, journal and final pre-activation directory barriers succeed;
+    // Target, journal, pending record and pre-activation barriers succeed;
     // CURRENT becomes visible before its own directory barrier fails.
-    let fault = product_store::file_sync_testing::fail_after(path.clone(), 3);
+    let fault = product_store::file_sync_testing::fail_after(path.clone(), 4);
     studio.test_upgrade();
     settle(&mut studio);
-    assert_eq!(
-        ProductStore::open(&path).unwrap().load().unwrap().version,
-        3
-    );
+    let pointer: serde_json::Value =
+        serde_json::from_slice(&fs::read(path.join("CURRENT")).unwrap()).unwrap();
+    assert_eq!(pointer["version"], 3);
+    assert!(matches!(
+        ProductStore::open(&path).unwrap().load(),
+        Err(product_store::StoreError::UpgradeRequired)
+    ));
     assert!(!studio
         .test_notice()
         .contains("Local format upgrade verified"));
     assert_ne!(studio.test_page(), "daily");
-    assert!(
-        fault.attempts() >= 5,
-        "reconciliation must attempt a real durability barrier"
+    studio.test_open(path.clone());
+    settle(&mut studio);
+    assert_eq!(
+        studio.test_page(),
+        "upgrade",
+        "reopen bypassed verification"
+    );
+    stop(studio, &stopped);
+    let mut studio = ProductStudio::testing(root, None, TestHooks::default());
+    settle(&mut studio);
+    assert_eq!(
+        studio.test_page(),
+        "upgrade",
+        "restart bypassed verification"
+    );
+    studio.test_upgrade();
+    settle(&mut studio);
+    assert_eq!(
+        studio.test_page(),
+        "upgrade",
+        "failed retry enabled daily editing"
     );
     drop(fault);
     studio.test_upgrade();
