@@ -126,6 +126,14 @@ bytes and visible provenance remain retained. Intention replay reads emitted
 provenance from immutable output receipts; it does not insert additional view
 or observable evaluations between the explicit workflow observations.
 
+Discovery measures complete prospective executions before allocating its bounded
+witness comparisons. Only differing, supported channels are minimized; view
+columns come from views actually presented at each observation point. The
+scheduler rotates across points and eligible scene/alternative pairs rather than
+spending the budget on unchanged early observations. Missing channels, incompatible
+types, failed executions, unsupported material differences and unfinished work
+remain explicitly unverified. The comparison and replay limits are unchanged.
+
 The initialized seed of a managed evolution remains authenticated
 through its exact retained basis and source after later edits and restart.
 
