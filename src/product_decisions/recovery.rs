@@ -180,7 +180,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         let mut retire = BTreeSet::new();
         for layer in layers {
             let manifest = current
-                .scope
+                .scalar_scope()?
                 .layers
                 .get(layer)
                 .ok_or_else(|| invalid("unknown scope layer"))?;
@@ -190,7 +190,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 .find(|a| a.plan.id == manifest.operation)
                 .ok_or_else(|| invalid("scope layer adoption missing"))?;
             let receipt = current
-                .scope
+                .scalar_scope()?
                 .adoptions
                 .iter()
                 .find(|r| r.revision == adoption.revision)

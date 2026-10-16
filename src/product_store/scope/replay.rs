@@ -31,27 +31,27 @@ pub struct ScopedExecutionContext {
 impl ScopedExecutionContext {
     pub fn committed(snapshot: &ProjectSnapshot) -> Result<Self> {
         snapshot.validate()?;
-        Self::registry(snapshot).with_correspondences(
+        Self::registry(snapshot)?.with_correspondences(
             &snapshot
-                .scope
+                .scalar_scope()?
                 .correspondences
                 .iter()
                 .map(|(id, receipt)| (id.clone(), receipt.proof.clone()))
                 .collect(),
         )
     }
-    pub(super) fn registry(snapshot: &ProjectSnapshot) -> Self {
-        Self {
-            snapshot: rehearsal::replay_snapshot(snapshot),
+    pub(super) fn registry(snapshot: &ProjectSnapshot) -> Result<Self> {
+        Ok(Self {
+            snapshot: rehearsal::replay_snapshot(snapshot)?,
             adoption_target: snapshot.active_revision.clone(),
             projected_seeds: snapshot
-                .scope
+                .scalar_scope()?
                 .rehearsals
                 .values()
                 .map(|proof| proof.seed.clone())
                 .collect(),
             correspondences: BTreeMap::new(),
-        }
+        })
     }
     pub(crate) fn with_correspondences(
         mut self,
@@ -273,7 +273,7 @@ impl ScopedExecutionContext {
             )?
         } else {
             let previous = snapshot
-                .scope
+                .scalar_scope()?
                 .compositions
                 .get(&snapshot.active_revision)
                 .ok_or_else(|| compiler::error("scope predecessor missing"))?;
@@ -293,32 +293,35 @@ impl ScopedExecutionContext {
                 "scope preparation does not independently regenerate",
             ));
         }
-        let mut working = rehearsal::replay_snapshot(snapshot);
+        let mut working = rehearsal::replay_snapshot(snapshot)?;
         retain(&mut working, &prepared.candidate)?;
         retain(&mut working, &prepared.target)?;
         if let Some(layer) = &prepared.layer {
             working
-                .scope
+                .scalar_scope_mut()?
                 .layers
                 .insert(layer.identity()?, layer.clone());
         }
         if let Some(receipt) = &prepared.receipt {
-            working.scope.initializations.push(receipt.clone());
+            working
+                .scalar_scope_mut()?
+                .initializations
+                .push(receipt.clone());
         }
         working
-            .scope
+            .scalar_scope_mut()?
             .compositions
             .insert(prepared.manifest.output.clone(), prepared.manifest.clone());
         // No adoption/decision receipt is invented for this isolated context.
         let mut seeds: BTreeSet<_> = snapshot
-            .scope
+            .scalar_scope()?
             .rehearsals
             .values()
             .map(|proof| proof.seed.clone())
             .collect();
         seeds.insert(checked.initialized.identity()?);
         let mut proofs: BTreeMap<_, _> = snapshot
-            .scope
+            .scalar_scope()?
             .correspondences
             .iter()
             .map(|(id, receipt)| (id.clone(), receipt.proof.clone()))
@@ -378,7 +381,7 @@ impl ScopedExecutionContext {
         retain(&mut context.snapshot, second.target())?;
         context
             .snapshot
-            .scope
+            .scalar_scope_mut()?
             .compositions
             .insert(second.manifest.output.clone(), second.manifest.clone());
         context
@@ -417,7 +420,7 @@ impl ScopedExecutionContext {
     pub(crate) fn provenance_columns(&self, source: &CapturedProgram) -> Result<ProvenanceColumns> {
         source.validate()?;
         let id = revision(source)?;
-        let Some(manifest) = self.snapshot.scope.compositions.get(&id) else {
+        let Some(manifest) = self.snapshot.scalar_scope()?.compositions.get(&id) else {
             compiler::reject_reserved(&source.program)?;
             return Ok(ProvenanceColumns::default());
         };
@@ -473,25 +476,27 @@ impl ScopedExecutionContext {
         Ok(result)
     }
     pub fn contains_managed_source(&self, source: &CapturedProgram) -> bool {
-        revision(source).ok().is_some_and(|id| {
-            self.snapshot.scope.compositions.contains_key(&id)
-                && program(&self.snapshot, &id).is_ok_and(|p| p == source)
+        self.snapshot.scalar_scope().is_ok_and(|state| {
+            revision(source).ok().is_some_and(|id| {
+                state.compositions.contains_key(&id)
+                    && program(&self.snapshot, &id).is_ok_and(|p| p == source)
+            })
         })
     }
     pub fn admit_target(&self, target: &CapturedProgram) -> Result<()> {
         target.validate()?;
         let id = revision(target)?;
-        if self.snapshot.scope.compositions.is_empty() {
+        if self.snapshot.scalar_scope()?.compositions.is_empty() {
             return compiler::reject_reserved(&target.program);
         }
         if id == self.adoption_target
-            && !self.snapshot.scope.compositions.contains_key(&id)
+            && !self.snapshot.scalar_scope()?.compositions.contains_key(&id)
             && program(&self.snapshot, &id)? == target
         {
             return compiler::reject_reserved(&target.program);
         }
         if id != self.adoption_target
-            || !self.snapshot.scope.compositions.contains_key(&id)
+            || !self.snapshot.scalar_scope()?.compositions.contains_key(&id)
             || program(&self.snapshot, &id)? != target
         {
             return Err(compiler::error(
@@ -535,7 +540,7 @@ impl ScopedExecutionContext {
             if !seen.insert(id.clone()) {
                 return Err(compiler::error("cyclic scope projection lineage"));
             }
-            let Some(manifest) = self.snapshot.scope.compositions.get(&id) else {
+            let Some(manifest) = self.snapshot.scalar_scope()?.compositions.get(&id) else {
                 break;
             };
             lineage.push(manifest);
@@ -553,9 +558,14 @@ impl ScopedExecutionContext {
                     .layers
                     .last()
                     .ok_or_else(|| compiler::error("initialization layer missing"))?;
-                let layer = &self.snapshot.scope.layers[id];
+                let layer = &self.snapshot.scalar_scope()?.layers[id];
                 let (data, receipt) = history::initialize(&self.snapshot, layer, target)?;
-                if !self.snapshot.scope.initializations.contains(&receipt) {
+                if !self
+                    .snapshot
+                    .scalar_scope()?
+                    .initializations
+                    .contains(&receipt)
+                {
                     return Err(compiler::error(
                         "initialization projection differs from retained receipt",
                     ));
@@ -620,7 +630,7 @@ impl ScopedExecutionContext {
         // Evolution and withdrawal add no layer initialization receipt. Their
         // exact initialized seeds remain reproducible from verified immutable
         // basis/source pairs after restart and subsequent business writes.
-        for manifest in self.snapshot.scope.compositions.values() {
+        for manifest in self.snapshot.scalar_scope()?.compositions.values() {
             if matches!(
                 manifest.transition,
                 ScopeTransition::Evolution | ScopeTransition::Withdrawal
@@ -638,13 +648,13 @@ impl ScopedExecutionContext {
             || self.snapshot.data.identity()? == *digest
             || self
                 .snapshot
-                .scope
+                .scalar_scope()?
                 .initializations
                 .iter()
                 .any(|r| r.after_data == *digest)
             || self
                 .snapshot
-                .scope
+                .scalar_scope()?
                 .compositions
                 .values()
                 .any(|m| m.basis.data.identity().ok().as_ref() == Some(digest))
@@ -664,7 +674,7 @@ impl ScopedExecutionContext {
         {
             return Err(compiler::error("scope replay belongs to another project"));
         }
-        let Some(manifest) = self.snapshot.scope.compositions.get(&id) else {
+        let Some(manifest) = self.snapshot.scalar_scope()?.compositions.get(&id) else {
             return compiler::reject_reserved(&target.program);
         };
         if program(&self.snapshot, &id)? != target

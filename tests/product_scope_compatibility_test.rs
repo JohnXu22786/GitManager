@@ -388,3 +388,46 @@ fn rehashed_frozen_proofs_and_packages_reject_tampering() {
         assert_eq!(frozen_bytes(name), original);
     }
 }
+
+#[test]
+fn scalar_adapters_reject_unsupported_versions_without_mutating_history() {
+    for name in ["active", "withdrawn", "prospective"] {
+        // Decode literal pre-refactor bytes, not a new family serializer.
+        let raw: Value = serde_json::from_slice(&frozen_bytes(name)).unwrap();
+        let original: product_store::ProjectSnapshot =
+            serde_json::from_value(raw["payload"]["snapshot"].clone()).unwrap();
+        for empty in [false, true] {
+            let mut snapshot = original.clone();
+            if empty {
+                snapshot.scope = ScopeState::default();
+            }
+            let bytes = canonical_bytes(&snapshot).unwrap();
+            assert_eq!(snapshot.scalar_scope().unwrap(), &snapshot.scope);
+            let expected = snapshot.scope.clone();
+            assert_eq!(snapshot.scalar_scope_mut().unwrap(), &expected);
+            assert_eq!(canonical_bytes(&snapshot).unwrap(), bytes);
+            for version in [0, 2, 99] {
+                let mut unsupported = snapshot.clone();
+                unsupported.scope.version = version;
+                let bytes = canonical_bytes(&unsupported).unwrap();
+                assert!(unsupported.scalar_scope().is_err(), "{name}: {version}");
+                assert!(unsupported.scalar_scope_mut().is_err(), "{name}: {version}");
+                assert_eq!(canonical_bytes(&unsupported).unwrap(), bytes);
+            }
+            for version in [1, 3, 99] {
+                let mut unsupported = snapshot.clone();
+                unsupported.version = version;
+                let bytes = canonical_bytes(&unsupported).unwrap();
+                assert!(
+                    unsupported.scalar_scope().is_err(),
+                    "{name}: format {version}"
+                );
+                assert!(
+                    unsupported.scalar_scope_mut().is_err(),
+                    "{name}: format {version}"
+                );
+                assert_eq!(canonical_bytes(&unsupported).unwrap(), bytes);
+            }
+        }
+    }
+}

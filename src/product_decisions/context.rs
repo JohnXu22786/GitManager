@@ -157,7 +157,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 // pairs passed the bounded source/input checks above. Both
                 // routes still independently replay originals and assess scope.
                 let paired: Vec<_> = current
-                    .scope
+                    .scalar_scope()?
                     .rehearsals
                     .values()
                     .filter(|proof| proof.witnesses.get(&decision.id) == Some(&decision.witness))

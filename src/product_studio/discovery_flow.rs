@@ -956,7 +956,8 @@ impl PairExperience {
                 canonical_digest(IdentityDomain::Source, scene.program()).map_err(error)?;
             if scene.program() != basis.program().map_err(error)?
                 && basis
-                    .scope
+                    .scalar_scope()
+                    .map_err(error)?
                     .rehearsals
                     .get(&source_id)
                     .is_some_and(|proof| proof.manifest.transition == ScopeTransition::Adoption)
@@ -985,7 +986,12 @@ impl PairExperience {
                 continue;
             }
             let source_id = canonical_digest(IdentityDomain::Source, source).map_err(error)?;
-            if let Some(proof) = basis.scope.rehearsals.get(&source_id) {
+            if let Some(proof) = basis
+                .scalar_scope()
+                .map_err(error)?
+                .rehearsals
+                .get(&source_id)
+            {
                 if proof.manifest.transition != ScopeTransition::Evolution {
                     return Err("This saved rule needs its original comparison".into());
                 }

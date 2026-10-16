@@ -482,7 +482,7 @@ pub(super) fn analyze(snapshot: &ProjectSnapshot, candidate: &CapturedProgram) -
 }
 pub(super) fn retained_lifecycles(snapshot: &ProjectSnapshot) -> Result<Vec<LifecycleBinding>> {
     let mut result: BTreeMap<Id, LifecycleBinding> = BTreeMap::new();
-    for layer in snapshot.scope.layers.values() {
+    for layer in snapshot.scalar_scope().map_err(err)?.layers.values() {
         for lifecycle in &layer.request.lifecycles {
             let mut lifecycle = lifecycle.clone();
             lifecycle.source = snapshot.active_revision.clone();

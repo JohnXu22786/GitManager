@@ -24,7 +24,7 @@ pub(super) fn derive(
     let snapshot = &working;
     let target_id = revision(target)?;
     let manifest = snapshot
-        .scope
+        .scalar_scope()?
         .compositions
         .get(&target_id)
         .ok_or_else(|| error("historical correspondence target is not managed"))?;
@@ -35,7 +35,7 @@ pub(super) fn derive(
         if frames.iter().any(|frame| &frame.layer == id) {
             continue;
         }
-        let layer = &snapshot.scope.layers[id];
+        let layer = &snapshot.scalar_scope()?.layers[id];
         let declared = layer.request.lifecycles.iter().all(|l| {
             data.schema
                 .iter()
@@ -93,7 +93,7 @@ pub(super) fn derive(
                     error("historical record is absent from the actual frozen cohort")
                 })?;
             let mut system_keys = BTreeSet::new();
-            for (id, proof) in &snapshot.scope.layers {
+            for (id, proof) in &snapshot.scalar_scope()?.layers {
                 if proof
                     .request
                     .lifecycles
@@ -159,11 +159,11 @@ pub(super) fn derive(
 }
 
 pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
-    if snapshot.scope.correspondences.len() > MAX_ITEMS {
+    if snapshot.scalar_scope()?.correspondences.len() > MAX_ITEMS {
         return Err(error("historical correspondence inventory exceeds bounds"));
     }
     let mut proofs = BTreeMap::new();
-    for (id, receipt) in &snapshot.scope.correspondences {
+    for (id, receipt) in &snapshot.scalar_scope()?.correspondences {
         let proof = &receipt.proof;
         if &proof.identity()? != id
             || !valid_id(&receipt.operation)
@@ -179,7 +179,7 @@ pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
         let target = program(snapshot, &proof.target)?;
         if recorded.revision != receipt.revision
             || ((recorded.active != proof.target || recorded.plan.target != target.artifact)
-                && !snapshot.scope.rehearsals.values().any(|p| {
+                && !snapshot.scalar_scope()?.rehearsals.values().any(|p| {
                     p.recorded_by == receipt.operation && p.manifest.output == proof.target
                 }))
         {
@@ -189,7 +189,7 @@ pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
         }
         proofs.insert(id.clone(), proof.clone());
     }
-    ScopedExecutionContext::registry(snapshot).with_correspondences(&proofs)?;
+    ScopedExecutionContext::registry(snapshot)?.with_correspondences(&proofs)?;
     Ok(())
 }
 
@@ -203,17 +203,17 @@ pub(in crate::product_store) fn install(
         if &proof.identity()? != id {
             return Err(error("correspondence identity changed"));
         }
-        if let Some(existing) = snapshot.scope.correspondences.get(id) {
+        if let Some(existing) = snapshot.scalar_scope()?.correspondences.get(id) {
             if existing.proof != *proof {
                 return Err(error("correspondence collision"));
             }
             continue;
         }
-        if snapshot.scope.correspondences.len() >= MAX_ITEMS {
+        if snapshot.scalar_scope()?.correspondences.len() >= MAX_ITEMS {
             return Err(error("historical correspondence inventory exceeds bounds"));
         }
         retain(snapshot, &proof.source)?;
-        snapshot.scope.correspondences.insert(
+        snapshot.scalar_scope_mut()?.correspondences.insert(
             id.clone(),
             ScopeCorrespondenceReceipt {
                 proof: proof.clone(),
