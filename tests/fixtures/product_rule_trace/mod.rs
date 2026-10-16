@@ -830,17 +830,32 @@ fn choose(outcome: DecisionOutcome) {
     assert_eq!(ProductStore::open(&path).unwrap().load().unwrap(), saved);
     if matches!(outcome, DecisionOutcome::Accept { .. }) {
         assert_ne!(saved.active_revision, before.active_revision);
-        assert_eq!(saved.scope.layers.len(), before.scope.layers.len() + 1);
+        assert_eq!(
+            saved.scalar_scope().unwrap().layers.len(),
+            before.scalar_scope().unwrap().layers.len() + 1
+        );
         assert_eq!(decision.status, DecisionStatus::Active);
         return;
     }
     assert_eq!(saved.data, before.data);
     assert_eq!(saved.active_revision, before.active_revision);
     assert_eq!(saved.artifacts, before.artifacts);
-    assert_eq!(saved.scope.layers, before.scope.layers);
-    assert_eq!(saved.scope.initializations, before.scope.initializations);
-    assert_eq!(saved.scope.compositions, before.scope.compositions);
-    assert_eq!(saved.scope.adoptions, before.scope.adoptions);
+    assert_eq!(
+        saved.scalar_scope().unwrap().layers,
+        before.scalar_scope().unwrap().layers
+    );
+    assert_eq!(
+        saved.scalar_scope().unwrap().initializations,
+        before.scalar_scope().unwrap().initializations
+    );
+    assert_eq!(
+        saved.scalar_scope().unwrap().compositions,
+        before.scalar_scope().unwrap().compositions
+    );
+    assert_eq!(
+        saved.scalar_scope().unwrap().adoptions,
+        before.scalar_scope().unwrap().adoptions
+    );
     if outcome == DecisionOutcome::KeepCurrent {
         assert_eq!(decision.status, DecisionStatus::Active);
         let inherited = decision_engine(&store)
@@ -904,7 +919,8 @@ fn choose(outcome: DecisionOutcome) {
     }
     assert_eq!(
         saved
-            .scope
+            .scalar_scope()
+            .unwrap()
             .rehearsals
             .values()
             .filter(|p| p.witnesses.contains_key(&pending))

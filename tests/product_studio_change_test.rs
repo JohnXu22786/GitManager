@@ -406,7 +406,7 @@ fn scoped_host_choices_preserve_mixed_completed_work_and_rehearse_after_scope_ch
                 .collect::<Vec<_>>()
         );
         assert_eq!(saved.data.events, before.data.events);
-        assert_eq!(saved.scope.adoptions.len(), 1);
+        assert_eq!(saved.scalar_scope().unwrap().adoptions.len(), 1);
         assert!(studio
             .test_runtime()
             .unwrap()
@@ -1255,7 +1255,7 @@ fn ordinary_structural_design_uses_checked_whole_design_and_preserves_data() {
     assert_eq!(studio.test_page(), "daily", "{}", studio.test_notice());
     let saved = store.load().unwrap();
     assert_eq!(saved.data, before.data);
-    assert!(saved.scope.layers.is_empty());
+    assert!(saved.scalar_scope().unwrap().layers.is_empty());
     assert_eq!(
         saved.program().unwrap().program.views[0].kind,
         candidate.program.views[0].kind
@@ -1417,7 +1417,10 @@ fn projection_only_change_learns_scope_from_actual_copied_task() {
     });
     settle(&mut studio);
     assert_eq!(studio.test_page(), "daily", "{}", studio.test_notice());
-    assert_eq!(store.load().unwrap().scope.layers.len(), 1);
+    assert_eq!(
+        store.load().unwrap().scalar_scope().unwrap().layers.len(),
+        1
+    );
 }
 
 #[cfg(unix)]
@@ -1451,7 +1454,13 @@ fn ordinary_structural_pending_choice_reopens_and_resolves_exactly() {
     studio.test_decide(DecisionOutcome::BothNeeded);
     settle(&mut studio);
     let pending = store.load().unwrap().decisions.decisions[0].id.clone();
-    assert!(store.load().unwrap().scope.rehearsals.is_empty());
+    assert!(store
+        .load()
+        .unwrap()
+        .scalar_scope()
+        .unwrap()
+        .rehearsals
+        .is_empty());
     studio.test_daily(other_shape::add("Later work"));
     settle(&mut studio);
     studio.test_resume_choice(&pending);
@@ -1511,7 +1520,10 @@ fn keep_managed_current_replays_committed_seed_and_preserves_the_experienced_res
     let saved = store.load().unwrap();
     assert_eq!(saved.active_revision, current.active_revision);
     assert_eq!(saved.data, current.data);
-    assert_eq!(saved.scope.layers.len(), current.scope.layers.len());
+    assert_eq!(
+        saved.scalar_scope().unwrap().layers.len(),
+        current.scalar_scope().unwrap().layers.len()
+    );
     assert_eq!(
         saved.decisions.decisions[0].outcome,
         DecisionOutcome::KeepCurrent
@@ -1627,7 +1639,16 @@ fn restart_verifies_exact_change_receipt_and_refuses_a_conflicting_plan() {
             settle(&mut studio);
             assert_eq!(store.load().unwrap(), saved);
         } else {
-            assert_eq!(store.load().unwrap().scope.adoptions.len(), 1);
+            assert_eq!(
+                store
+                    .load()
+                    .unwrap()
+                    .scalar_scope()
+                    .unwrap()
+                    .adoptions
+                    .len(),
+                1
+            );
         }
     }
 }
@@ -3002,7 +3023,10 @@ fn uncommitted_change_recovery_keeps_backup_warning_and_current_work() {
     assert_eq!(after.data.records.len(), before.data.records.len() + 1);
     assert_eq!(after.active_revision, before.active_revision);
     assert_eq!(after.decisions, before.decisions);
-    assert_eq!(after.scope.adoptions, before.scope.adoptions);
+    assert_eq!(
+        after.scalar_scope().unwrap().adoptions,
+        before.scalar_scope().unwrap().adoptions
+    );
     studio.test_reconcile();
     settle(&mut studio);
     assert_eq!(store.load().unwrap(), after);

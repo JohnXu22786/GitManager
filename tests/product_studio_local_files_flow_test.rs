@@ -870,3 +870,65 @@ fn legacy_fresh_recovery_refuses_a_target_claimed_during_validation() {
     );
     assert_eq!(f.recent.list().unwrap().len(), 1);
 }
+
+#[test]
+fn old_format_two_import_preview_uses_verified_target_and_flags_upgrade() {
+    let f = Fixture::new();
+    let before = f.snapshot();
+    let mut wire: serde_json::Value = serde_json::from_slice(
+        &VerifiedBackup::capture(&f.store)
+            .unwrap()
+            .to_bytes()
+            .unwrap(),
+    )
+    .unwrap();
+    wire["payload"]["snapshot"]["version"] = json!(2);
+    wire["payload"]["snapshot"]["scope"] =
+        serde_json::to_value(before.scalar_scope().unwrap()).unwrap();
+    wire["payload"]["intentions"]["snapshot"] = serde_json::to_value(
+        canonical_digest(IdentityDomain::Data, &wire["payload"]["snapshot"]).unwrap(),
+    )
+    .unwrap();
+    wire["digest"] =
+        serde_json::to_value(canonical_digest(IdentityDomain::Evidence, &wire["payload"]).unwrap())
+            .unwrap();
+    let bytes = canonical_bytes(&wire).unwrap();
+    let file = f.root.join("old-v2.gmbak");
+    fs::write(&file, &bytes).unwrap();
+    let draft = RecoveryDraft::read(&file, "upgrade-v2").unwrap();
+    assert!(draft.preview().requires_upgrade);
+    assert_eq!(
+        draft.preview().summary.as_ref().unwrap().revision,
+        before.revision
+    );
+    let shelf = f.shelf();
+    let checkpoint = shelf.path().join(format!(
+        "checkpoint-{:020}-{}.gmbak",
+        before.revision,
+        wire["digest"].as_str().unwrap()
+    ));
+    fs::write(&checkpoint, &bytes).unwrap();
+    let identity = ToolIdentity::from_snapshot(&before).unwrap();
+    let mut diagnosis = diagnose(&f.root.join("missing"), &identity, &shelf, "upgrade-v2");
+    assert!(diagnosis.view.recovery.as_ref().unwrap().requires_upgrade);
+    assert_eq!(
+        diagnosis.view.recovery.as_ref().unwrap().backup.as_str(),
+        wire["digest"].as_str().unwrap()
+    );
+    let outcome = diagnosis.recovery.take().unwrap().recover(
+        f.reply("upgrade-v2", "v2-copy"),
+        "upgrade-v2",
+        &AtomicBool::new(false),
+        &f.recent,
+        &f.locations,
+        3,
+        |_| {},
+    );
+    let RecoveryOutcome::Recovered(result) = outcome else {
+        panic!("V2 recovery did not reopen")
+    };
+    assert_eq!(result.opened.snapshot, before);
+    assert_eq!(fs::read(checkpoint).unwrap(), bytes);
+    assert_eq!(fs::read(file).unwrap(), bytes);
+    assert_eq!(f.snapshot(), before);
+}

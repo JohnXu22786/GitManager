@@ -107,7 +107,7 @@ fn scoped_choice_replays_after_restart_backup_and_current_data_withdrawal() {
     assert_eq!(change.report().disposition, CheckDisposition::Ready);
     let adopted = engine.adopt(&store, &change).unwrap();
     assert_eq!(
-        adopted.scope.adoptions[0].decisions,
+        adopted.scalar_scope().unwrap().adoptions[0].decisions,
         vec!["pause-production"]
     );
     let late = add(&store, "late", "Later independent work");
@@ -324,7 +324,7 @@ fn concrete_scoped_intention_survives_a_mapped_new_implementation() {
     let target = capture(source);
     let current = store.load().unwrap();
     let source_id = canonical_digest(IdentityDomain::Source, &target).unwrap();
-    let mappings: Vec<_> = current.scope.layers[&layer]
+    let mappings: Vec<_> = current.scalar_scope().unwrap().layers[&layer]
         .patches
         .iter()
         .enumerate()
@@ -695,9 +695,11 @@ fn a_retired_intention_does_not_trap_its_remaining_behavior_layer() {
     let withdrawn = engine.adopt(&store, &withdrawal).unwrap();
     assert_eq!(withdrawn.decisions.decisions[0], old_decision);
     assert_eq!(withdrawn.data, retired.data);
-    assert!(withdrawn.scope.compositions[&withdrawn.active_revision]
-        .active
-        .is_empty());
+    assert!(
+        withdrawn.scalar_scope().unwrap().compositions[&withdrawn.active_revision]
+            .active
+            .is_empty()
+    );
 }
 
 #[test]
@@ -728,7 +730,7 @@ fn fresh_development_receives_honest_editable_source_and_exact_slots() {
         assert_eq!(slot.patch, index);
         assert_eq!(
             slot.destination,
-            current.scope.layers[&layer].patches[index]
+            current.scalar_scope().unwrap().layers[&layer].patches[index]
                 .request
                 .destination
         );
@@ -1914,17 +1916,20 @@ fn retained_rehearsals_bind_recording_births_and_exact_experienced_sources() {
         assert_eq!(retained.active_revision, current.active_revision);
     }
     let healthy = store.load().unwrap();
-    assert_eq!(healthy.scope.rehearsals.len(), 2);
-    assert!(healthy.scope.layers.is_empty());
+    assert_eq!(healthy.scalar_scope().unwrap().rehearsals.len(), 2);
+    assert!(healthy.scalar_scope().unwrap().layers.is_empty());
     assert!(healthy
         .decisions
         .decisions
         .iter()
         .all(|d| d.status == DecisionStatus::Pending));
-    let earlier = healthy.scope.rehearsals[&outputs[0]].witnesses.clone();
+    let earlier = healthy.scalar_scope().unwrap().rehearsals[&outputs[0]]
+        .witnesses
+        .clone();
     let mut borrowed = healthy.clone();
     borrowed
-        .scope
+        .scalar_scope_mut()
+        .unwrap()
         .rehearsals
         .get_mut(&outputs[1])
         .unwrap()
@@ -1943,7 +1948,8 @@ fn retained_rehearsals_bind_recording_births_and_exact_experienced_sources() {
     later.witness = earlier.witness.clone();
     later.scenarios = earlier.scenarios;
     substituted
-        .scope
+        .scalar_scope_mut()
+        .unwrap()
         .rehearsals
         .get_mut(&outputs[1])
         .unwrap()
@@ -1985,7 +1991,13 @@ fn retained_rehearsals_bind_recording_births_and_exact_experienced_sources() {
         "later-work",
         "Continued without activating either alternative",
     );
-    assert!(restored.load().unwrap().scope.layers.is_empty());
+    assert!(restored
+        .load()
+        .unwrap()
+        .scalar_scope()
+        .unwrap()
+        .layers
+        .is_empty());
     assert_eq!(store.load().unwrap(), healthy);
 }
 
@@ -2112,14 +2124,23 @@ fn all_nonbinary_managed_rehearsals_survive_restart_recovery_without_activation(
         assert_eq!(retained.session, current.session);
         assert_eq!(retained.clock_day, current.clock_day);
         assert_eq!(retained.artifacts, current.artifacts);
-        assert_eq!(retained.scope.layers, current.scope.layers);
-        assert_eq!(retained.scope.compositions, current.scope.compositions);
         assert_eq!(
-            retained.scope.initializations,
-            current.scope.initializations
+            retained.scalar_scope().unwrap().layers,
+            current.scalar_scope().unwrap().layers
         );
-        assert_eq!(retained.scope.adoptions, current.scope.adoptions);
-        assert_eq!(retained.scope.rehearsals.len(), 1);
+        assert_eq!(
+            retained.scalar_scope().unwrap().compositions,
+            current.scalar_scope().unwrap().compositions
+        );
+        assert_eq!(
+            retained.scalar_scope().unwrap().initializations,
+            current.scalar_scope().unwrap().initializations
+        );
+        assert_eq!(
+            retained.scalar_scope().unwrap().adoptions,
+            current.scalar_scope().unwrap().adoptions
+        );
+        assert_eq!(retained.scalar_scope().unwrap().rehearsals.len(), 1);
         assert_eq!(retained.decisions.decisions[0].outcome, outcome);
         assert_eq!(
             retained.decisions.decisions[0].status,
@@ -2167,7 +2188,13 @@ fn all_nonbinary_managed_rehearsals_survive_restart_recovery_without_activation(
             2
         );
         let mut corrupt = recovered_snapshot.clone();
-        let proof = corrupt.scope.rehearsals.values_mut().next().unwrap();
+        let proof = corrupt
+            .scalar_scope_mut()
+            .unwrap()
+            .rehearsals
+            .values_mut()
+            .next()
+            .unwrap();
         proof.seed = canonical_digest(IdentityDomain::Data, &"invented-seed").unwrap();
         assert!(corrupt.validate().is_err());
         assert!(
@@ -2203,7 +2230,8 @@ fn all_nonbinary_managed_rehearsals_survive_restart_recovery_without_activation(
             assert_eq!(
                 prepared.target().artifact,
                 retained
-                    .scope
+                    .scalar_scope()
+                    .unwrap()
                     .rehearsals
                     .values()
                     .next()
@@ -2523,10 +2551,22 @@ fn future_rehearsals_preserve_selected_promises_without_activating_cohorts() {
         assert_eq!(saved.clock_day, current.clock_day);
         assert_eq!(saved.artifacts, current.artifacts);
         assert_eq!(saved.active_revision, current.active_revision);
-        assert_eq!(saved.scope.layers, current.scope.layers);
-        assert_eq!(saved.scope.initializations, current.scope.initializations);
-        assert_eq!(saved.scope.compositions, current.scope.compositions);
-        assert_eq!(saved.scope.adoptions, current.scope.adoptions);
+        assert_eq!(
+            saved.scalar_scope().unwrap().layers,
+            current.scalar_scope().unwrap().layers
+        );
+        assert_eq!(
+            saved.scalar_scope().unwrap().initializations,
+            current.scalar_scope().unwrap().initializations
+        );
+        assert_eq!(
+            saved.scalar_scope().unwrap().compositions,
+            current.scalar_scope().unwrap().compositions
+        );
+        assert_eq!(
+            saved.scalar_scope().unwrap().adoptions,
+            current.scalar_scope().unwrap().adoptions
+        );
         assert_eq!(saved.decisions.decisions[1].scope, pending_scope);
         assert_eq!(saved.decisions.decisions[1].status, DecisionStatus::Pending);
         assert_eq!(engine.adopt(&store, &change).unwrap(), saved);
@@ -2593,10 +2633,11 @@ fn future_rehearsals_preserve_selected_promises_without_activating_cohorts() {
         let adopted = engine.adopt(&recovered, &change).unwrap();
         assert_eq!(adopted.data.events, facts.data.events);
         assert!(adopted.data.records.iter().any(|r| r.id == intervening.id));
-        assert!(!adopted.scope.correspondences.is_empty());
+        assert!(!adopted.scalar_scope().unwrap().correspondences.is_empty());
         let mut forged = adopted.clone();
         forged
-            .scope
+            .scalar_scope_mut()
+            .unwrap()
             .correspondences
             .values_mut()
             .next()
@@ -2615,7 +2656,8 @@ fn future_rehearsals_preserve_selected_promises_without_activating_cohorts() {
         .is_err());
         let mut ambiguous = adopted.clone();
         let mut receipt = ambiguous
-            .scope
+            .scalar_scope()
+            .unwrap()
             .correspondences
             .values()
             .find(|r| r.proof.scenario.is_some())
@@ -2624,7 +2666,8 @@ fn future_rehearsals_preserve_selected_promises_without_activating_cohorts() {
         receipt.proof.operation_seed =
             canonical_digest(IdentityDomain::Data, &"forged-operation-origin").unwrap();
         ambiguous
-            .scope
+            .scalar_scope_mut()
+            .unwrap()
             .correspondences
             .insert(receipt.proof.identity().unwrap(), receipt);
         assert!(ambiguous.validate().is_err());
@@ -2789,8 +2832,8 @@ fn first_scope_can_be_rehearsed_and_retained_before_any_live_layer_exists() {
         )
         .unwrap();
     let retained = engine.adopt(&store, &change).unwrap();
-    assert!(retained.scope.layers.is_empty());
-    assert!(retained.scope.compositions.is_empty());
+    assert!(retained.scalar_scope().unwrap().layers.is_empty());
+    assert!(retained.scalar_scope().unwrap().compositions.is_empty());
     assert_eq!(retained.data, before.data);
     assert_eq!(retained.session, before.session);
     assert_eq!(retained.active_revision, before.active_revision);
@@ -2819,7 +2862,13 @@ fn first_scope_can_be_rehearsed_and_retained_before_any_live_layer_exists() {
         )
         .is_err());
     let mut corrupt = retained.clone();
-    let proof = corrupt.scope.rehearsals.values_mut().next().unwrap();
+    let proof = corrupt
+        .scalar_scope_mut()
+        .unwrap()
+        .rehearsals
+        .values_mut()
+        .next()
+        .unwrap();
     proof.initialization.as_mut().unwrap().additions[0]
         .values
         .clear();
@@ -2834,7 +2883,7 @@ fn first_scope_can_be_rehearsed_and_retained_before_any_live_layer_exists() {
         row(&actual, &later).values["production"],
         DataValue::Integer { value: 2 }
     );
-    assert!(actual.scope.layers.is_empty());
+    assert!(actual.scalar_scope().unwrap().layers.is_empty());
     product_backup::VerifiedBackup::capture(&recovered).unwrap();
 }
 
@@ -2884,7 +2933,7 @@ fn unaccepted_rehearsal_does_not_restrict_a_later_first_lifecycle() {
             )
             .unwrap();
         let retained = engine.adopt(&store, &change).unwrap();
-        assert!(retained.scope.layers.is_empty());
+        assert!(retained.scalar_scope().unwrap().layers.is_empty());
         assert_eq!(retained.data, before.data);
         let mut fresh_request = request(&retained, ScopePopulation::All);
         let original = fresh_request.lifecycles[0].completed.clone();
@@ -2913,8 +2962,11 @@ fn unaccepted_rehearsal_does_not_restrict_a_later_first_lifecycle() {
             .prepare_scoped_choice(&store, fresh, choice, vec![accepted], "accept-fresh")
             .unwrap();
         let adopted = engine.adopt(&store, &change).unwrap();
-        assert_eq!(adopted.scope.layers.len(), 1);
-        assert_eq!(adopted.scope.rehearsals, retained.scope.rehearsals);
+        assert_eq!(adopted.scalar_scope().unwrap().layers.len(), 1);
+        assert_eq!(
+            adopted.scalar_scope().unwrap().rehearsals,
+            retained.scalar_scope().unwrap().rehearsals
+        );
         assert_eq!(adopted.data.events, retained.data.events);
         assert_eq!(
             adopted.decisions.decisions[0].status,
@@ -2922,7 +2974,8 @@ fn unaccepted_rehearsal_does_not_restrict_a_later_first_lifecycle() {
         );
         assert_eq!(
             adopted
-                .scope
+                .scalar_scope()
+                .unwrap()
                 .layers
                 .values()
                 .next()
@@ -3550,7 +3603,7 @@ fn clock_only_scope_adoption_preserves_original_day_completed_scene() {
         .prepare_managed_change(&store, prepared, &[], "future-rule")
         .unwrap();
     let adopted = engine.adopt(&store, &change).unwrap();
-    assert!(!adopted.scope.correspondences.is_empty());
+    assert!(!adopted.scalar_scope().unwrap().correspondences.is_empty());
     assert_eq!(
         row(&adopted, &job).values["production"],
         DataValue::Integer { value: 0 }
@@ -3913,7 +3966,10 @@ fn scoped_receipts_cannot_claim_later_independent_intentions() {
         )
         .unwrap();
     let healthy = engine.adopt(&store, &later).unwrap();
-    assert_eq!(healthy.scope.adoptions[0].decisions, vec!["original"]);
+    assert_eq!(
+        healthy.scalar_scope().unwrap().adoptions[0].decisions,
+        vec!["original"]
+    );
     assert!(!healthy.adoptions[0]
         .plan
         .required_decisions
@@ -3927,11 +3983,13 @@ fn scoped_receipts_cannot_claim_later_independent_intentions() {
         .contains(&"independent".into()));
 
     let mut claims_later = healthy.clone();
-    claims_later.scope.adoptions[0]
+    claims_later.scalar_scope_mut().unwrap().adoptions[0]
         .decisions
         .push("independent".into());
     let mut loses_original = healthy.clone();
-    loses_original.scope.adoptions[0].decisions.clear();
+    loses_original.scalar_scope_mut().unwrap().adoptions[0]
+        .decisions
+        .clear();
     let mut rewrites_activation = claims_later.clone();
     let later_plan = rewrites_activation.adoptions.last().unwrap().plan.clone();
     let earlier = &mut rewrites_activation.adoptions[0].plan;
@@ -3944,7 +4002,7 @@ fn scoped_receipts_cannot_claim_later_independent_intentions() {
             .cloned(),
     );
     earlier.evidence.extend(later_plan.evidence);
-    rewrites_activation.scope.adoptions[0].plan = earlier.identity().unwrap();
+    rewrites_activation.scalar_scope_mut().unwrap().adoptions[0].plan = earlier.identity().unwrap();
     // The later plan's exact prior graph still records only the original
     // promise, even when the older required-ID list and receipt are resealed.
     assert_eq!(

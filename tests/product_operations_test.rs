@@ -544,7 +544,9 @@ fn doctor_offers_only_verified_instance_checkpoints_and_preserves_corruption() {
     let report = doctor(&root.join("source"), &identity, &shelf);
     assert!(report.current.is_none());
     assert!(report.issue.is_some());
-    let recovered = report.recovery.unwrap();
+    let product_backup::BackupIntake::Current(recovered) = report.recovery.unwrap() else {
+        panic!("a current checkpoint must not require upgrade");
+    };
     assert_eq!(recovered.snapshot(), &saved);
     assert!(!report.checkpoint_issues.is_empty());
     recovered.recover_new(&root.join("recovered")).unwrap();

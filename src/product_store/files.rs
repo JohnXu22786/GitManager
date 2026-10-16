@@ -16,8 +16,9 @@ pub(crate) mod file_sync_testing {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
 
-    fn faults() -> &'static Mutex<BTreeMap<PathBuf, Arc<AtomicUsize>>> {
-        static FAULTS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<AtomicUsize>>>> = OnceLock::new();
+    fn faults() -> &'static Mutex<BTreeMap<PathBuf, (Arc<AtomicUsize>, usize)>> {
+        static FAULTS: OnceLock<Mutex<BTreeMap<PathBuf, (Arc<AtomicUsize>, usize)>>> =
+            OnceLock::new();
         FAULTS.get_or_init(|| Mutex::new(BTreeMap::new()))
     }
     pub(crate) struct FileSyncFault {
@@ -38,18 +39,24 @@ pub(crate) mod file_sync_testing {
         }
     }
     pub(crate) fn fail(path: PathBuf) -> FileSyncFault {
+        fail_after(path, 0)
+    }
+    pub(crate) fn fail_after(path: PathBuf, successful: usize) -> FileSyncFault {
         let attempts = Arc::new(AtomicUsize::new(0));
         assert!(faults()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(path.clone(), attempts.clone())
+            .insert(path.clone(), (attempts.clone(), successful))
             .is_none());
         FileSyncFault { path, attempts }
     }
     pub(super) fn before_sync(path: &Path) -> io::Result<()> {
-        if let Some(attempts) = faults().lock().unwrap_or_else(|e| e.into_inner()).get(path) {
-            attempts.fetch_add(1, Ordering::Release);
-            return Err(io::Error::other("injected file-content sync failure"));
+        if let Some((attempts, successful)) =
+            faults().lock().unwrap_or_else(|e| e.into_inner()).get(path)
+        {
+            if attempts.fetch_add(1, Ordering::AcqRel) >= *successful {
+                return Err(io::Error::other("injected durability barrier failure"));
+            }
         }
         Ok(())
     }
@@ -365,6 +372,8 @@ impl Directory {
     pub fn sync(&self) -> io::Result<()> {
         #[cfg(unix)]
         {
+            #[cfg(test)]
+            file_sync_testing::before_sync(&self.path)?;
             self.file.sync_all()
         }
         #[cfg(not(unix))]
@@ -628,7 +637,9 @@ mod tests {
     }
 
     fn assert_busy<T>(result: io::Result<T>) {
-        let error = result.err().expect("a live owner must exclude other writers");
+        let error = result
+            .err()
+            .expect("a live owner must exclude other writers");
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
         assert!(matches!(
             error

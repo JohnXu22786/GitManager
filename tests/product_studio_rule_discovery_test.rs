@@ -816,10 +816,22 @@ fn pending_future_outcome(outcome: DecisionOutcome) {
     assert_eq!(saved.clock_day, current.clock_day);
     assert_eq!(saved.active_revision, current.active_revision);
     assert_eq!(saved.artifacts, current.artifacts);
-    assert_eq!(saved.scope.layers, current.scope.layers);
-    assert_eq!(saved.scope.initializations, current.scope.initializations);
-    assert_eq!(saved.scope.compositions, current.scope.compositions);
-    assert_eq!(saved.scope.adoptions, current.scope.adoptions);
+    assert_eq!(
+        saved.scalar_scope().unwrap().layers,
+        current.scalar_scope().unwrap().layers
+    );
+    assert_eq!(
+        saved.scalar_scope().unwrap().initializations,
+        current.scalar_scope().unwrap().initializations
+    );
+    assert_eq!(
+        saved.scalar_scope().unwrap().compositions,
+        current.scalar_scope().unwrap().compositions
+    );
+    assert_eq!(
+        saved.scalar_scope().unwrap().adoptions,
+        current.scalar_scope().unwrap().adoptions
+    );
     assert_eq!(saved.decisions.decisions[0], current.decisions.decisions[0]);
     let pending = saved
         .decisions
@@ -833,7 +845,8 @@ fn pending_future_outcome(outcome: DecisionOutcome) {
     assert_eq!(reopened.load().unwrap(), saved);
     assert_eq!(
         saved
-            .scope
+            .scalar_scope()
+            .unwrap()
             .rehearsals
             .values()
             .filter(|r| r.witnesses.contains_key("pending-rule"))
@@ -906,7 +919,8 @@ fn pending_future_outcome(outcome: DecisionOutcome) {
     // Reopen through the retained one-layer proof, exactly as the host
     // does, and freshly prepare against the later saved work.
     let proof = facts
-        .scope
+        .scalar_scope()
+        .unwrap()
         .rehearsals
         .values()
         .find(|p| p.witnesses.contains_key("pending-rule"))

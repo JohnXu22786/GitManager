@@ -3,6 +3,7 @@ mod compiler;
 mod contract;
 mod correspondence;
 mod family;
+pub use family::ScopeEnvelope;
 mod history;
 mod rehearsal;
 mod replay;

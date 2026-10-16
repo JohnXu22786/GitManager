@@ -605,7 +605,7 @@ fn legacy_copy(
     path: &std::path::Path,
 ) -> (product_store::ProjectSnapshot, Vec<u8>, PathBuf, Vec<u8>) {
     let snapshot = ProductStore::open(path).unwrap().load().unwrap();
-    assert!(snapshot.scope.layers.is_empty());
+    assert!(snapshot.scalar_scope().unwrap().layers.is_empty());
     let mut wire = serde_json::to_value(&snapshot).unwrap();
     wire.as_object_mut().unwrap().remove("scope");
     wire["version"] = serde_json::json!(1);
@@ -653,7 +653,7 @@ fn format_one_open_requires_confirmation_then_reopens_with_records_receipts_and_
     settle(&mut studio);
     assert_eq!(studio.test_page(), "daily", "{}", studio.test_notice());
     let upgraded = ProductStore::open(&path).unwrap().load().unwrap();
-    assert_eq!(upgraded.version, 2);
+    assert_eq!(upgraded.version, 3);
     assert_eq!(upgraded.data, before.data);
     assert_eq!(upgraded.operations, before.operations);
     assert_eq!(upgraded.session, before.session);
@@ -755,7 +755,7 @@ fn committed_upgrade_lost_ack_and_close_reconcile_without_repeating_creation() {
     settle(&mut studio);
     assert_eq!(studio.test_page(), "home");
     let current = ProductStore::open(&path).unwrap().load().unwrap();
-    assert_eq!(current.version, 2);
+    assert_eq!(current.version, 3);
     assert_eq!(current.data, before.data);
     assert_eq!(fs::read(object).unwrap(), bytes);
     let pointer = fs::read(path.join("CURRENT")).unwrap();
@@ -918,4 +918,38 @@ fn daily_store_view_preserves_completed_history_after_reopen_and_further_work() 
         restarted.test_runtime().unwrap().history,
         store.runtime_view().unwrap().history
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn upgrade_visible_pointer_does_not_hide_an_unfinished_durability_barrier() {
+    let (_temp, root) = root();
+    let path = saved(&root);
+    legacy_copy(&path);
+    let mut studio = ProductStudio::testing(root, None, TestHooks::default());
+    settle(&mut studio);
+    studio.test_open(path.clone());
+    settle(&mut studio);
+    assert_eq!(studio.test_page(), "upgrade");
+    // Target, journal and final pre-activation directory barriers succeed;
+    // CURRENT becomes visible before its own directory barrier fails.
+    let fault = product_store::file_sync_testing::fail_after(path.clone(), 3);
+    studio.test_upgrade();
+    settle(&mut studio);
+    assert_eq!(
+        ProductStore::open(&path).unwrap().load().unwrap().version,
+        3
+    );
+    assert!(!studio
+        .test_notice()
+        .contains("Local format upgrade verified"));
+    assert_ne!(studio.test_page(), "daily");
+    assert!(
+        fault.attempts() >= 5,
+        "reconciliation must attempt a real durability barrier"
+    );
+    drop(fault);
+    studio.test_upgrade();
+    settle(&mut studio);
+    assert_eq!(studio.test_page(), "daily", "{}", studio.test_notice());
 }
