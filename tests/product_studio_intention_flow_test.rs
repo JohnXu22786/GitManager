@@ -551,7 +551,10 @@ fn managed_reconciliation_binds_actual_result_target_and_final_operation() {
     let ready = design.decision(&store, &e, cancellation()).unwrap();
     assert_eq!(ready.plan().id, "exact-operation");
     let saved = e.adopt(&store, &ready).unwrap();
-    assert_eq!(saved.scope.layers, s.scope.layers);
+    assert_eq!(
+        saved.scalar_scope().unwrap().layers,
+        s.scalar_scope().unwrap().layers
+    );
     assert_eq!(
         ProductStore::open(dir.path().join("tool"))
             .unwrap()

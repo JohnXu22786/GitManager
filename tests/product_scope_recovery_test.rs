@@ -78,8 +78,8 @@ fn scoped_adoption_retry_is_atomic_and_initialization_is_not_repeated() {
             .is_err());
         let reopened = ProductStore::open(&path).unwrap();
         let result = reopened.adopt_scoped(before.revision, &prepared).unwrap();
-        assert_eq!(result.scope.layers.len(), 1);
-        assert_eq!(result.scope.initializations.len(), 1);
+        assert_eq!(result.scalar_scope().unwrap().layers.len(), 1);
+        assert_eq!(result.scalar_scope().unwrap().initializations.len(), 1);
         assert_eq!(result.data.events, before.data.events);
         assert_eq!(
             reopened.adopt_scoped(before.revision, &prepared).unwrap(),
@@ -139,7 +139,7 @@ fn mapped_new_expression_and_structural_evolution_keep_history_usable() {
     let candidate = capture(candidate);
     let current = store.load().unwrap();
     let target = canonical_digest(IdentityDomain::Source, &candidate).unwrap();
-    let mappings: Vec<_> = current.scope.layers[&layer]
+    let mappings: Vec<_> = current.scalar_scope().unwrap().layers[&layer]
         .patches
         .iter()
         .enumerate()
@@ -227,7 +227,7 @@ fn durable_slot_retargeting_cannot_unprotect_completed_original_fields() {
     raw["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"reset_original","label":"Reset original","parameters":{"row":{"kind":"reference","entity":"job"}},"guards":[],"steps":[{"kind":"update","record":var("row"),"values":{"production":int(99)}}],"ensures":[]}));
     let candidate = capture(raw);
     let source = canonical_digest(IdentityDomain::Source, &candidate).unwrap();
-    let mappings: Vec<_> = current.scope.layers[&layer]
+    let mappings: Vec<_> = current.scalar_scope().unwrap().layers[&layer]
         .patches
         .iter()
         .enumerate()
@@ -309,9 +309,14 @@ fn corrupted_earlier_composition_references_fail_before_recovery_activation() {
     let healthy = store.adopt_scoped(before.revision, &second).unwrap();
     let mut corrupted = healthy.clone();
     let absent = canonical_digest(IdentityDomain::Adoption, &"absent-layer-proof").unwrap();
-    assert!(!corrupted.scope.layers.contains_key(&absent));
+    assert!(!corrupted
+        .scalar_scope()
+        .unwrap()
+        .layers
+        .contains_key(&absent));
     corrupted
-        .scope
+        .scalar_scope_mut()
+        .unwrap()
         .compositions
         .get_mut(&first.active_revision)
         .unwrap()
@@ -345,21 +350,27 @@ fn unmatched_and_ambiguous_scope_receipts_cannot_enter_recovery() {
     let healthy = store
         .adopt_scoped(store.load().unwrap().revision, &withdrawal)
         .unwrap();
-    assert_eq!(healthy.scope.adoptions.len(), 2);
+    assert_eq!(healthy.scalar_scope().unwrap().adoptions.len(), 2);
     let unknown = canonical_digest(IdentityDomain::Adoption, &"unknown-composition").unwrap();
     let mut extra = healthy.clone();
-    let mut forged = extra.scope.adoptions[0].clone();
+    let mut forged = extra.scalar_scope().unwrap().adoptions[0].clone();
     forged.composition = unknown.clone();
     forged.decisions = vec!["unrelated-intention".into()];
     // It shadows the real receipt in a revision-only consumer unless the
     // authoritative inventory rejects every unmatched entry first.
-    extra.scope.adoptions.insert(0, forged);
+    extra
+        .scalar_scope_mut()
+        .unwrap()
+        .adoptions
+        .insert(0, forged);
     let mut replaced = healthy.clone();
-    replaced.scope.adoptions[0].composition = unknown;
+    replaced.scalar_scope_mut().unwrap().adoptions[0].composition = unknown;
     let mut duplicate_revision = healthy.clone();
-    duplicate_revision.scope.adoptions[1].revision = duplicate_revision.scope.adoptions[0].revision;
+    duplicate_revision.scalar_scope_mut().unwrap().adoptions[1].revision =
+        duplicate_revision.scalar_scope().unwrap().adoptions[0].revision;
     let mut duplicate_composition = healthy.clone();
-    duplicate_composition.scope.adoptions[1] = duplicate_composition.scope.adoptions[0].clone();
+    duplicate_composition.scalar_scope_mut().unwrap().adoptions[1] =
+        duplicate_composition.scalar_scope().unwrap().adoptions[0].clone();
     for (index, corrupted) in [extra, replaced, duplicate_revision, duplicate_composition]
         .iter()
         .enumerate()
@@ -414,21 +425,32 @@ fn rehashed_compositions_require_exact_predecessor_business_and_basis() {
         adoption.active = output.clone();
         adoption.plan.target = target.artifact.clone();
         adoption.plan.compatibility = compatibility;
+        let adoption_revision = adoption.revision;
+        let adoption_plan = adoption.plan.identity().unwrap();
         let receipt = snapshot
-            .scope
+            .scalar_scope_mut()
+            .unwrap()
             .adoptions
             .iter_mut()
-            .find(|r| r.revision == adoption.revision)
+            .find(|r| r.revision == adoption_revision)
             .unwrap();
-        receipt.plan = adoption.plan.identity().unwrap();
+        receipt.plan = adoption_plan;
         receipt.composition = canonical_digest(IdentityDomain::Adoption, &manifest).unwrap();
         receipt.initialized_compatibility = initialized;
         snapshot
             .programs
             .retain(|p| canonical_digest(IdentityDomain::Source, p).unwrap() != old);
         snapshot.programs.push(target);
-        snapshot.scope.compositions.remove(&old);
-        snapshot.scope.compositions.insert(output.clone(), manifest);
+        snapshot
+            .scalar_scope_mut()
+            .unwrap()
+            .compositions
+            .remove(&old);
+        snapshot
+            .scalar_scope_mut()
+            .unwrap()
+            .compositions
+            .insert(output.clone(), manifest);
         snapshot.active_revision = output;
     }
     fn reminder(snapshot: &ProjectSnapshot, record: &Record) -> DataValue {
@@ -518,9 +540,10 @@ fn rehashed_compositions_require_exact_predecessor_business_and_basis() {
     );
 
     let mut older_predecessor = healthy.clone();
-    let mut manifest =
-        older_predecessor.scope.compositions[&older_predecessor.active_revision].clone();
-    let prior = &first.scope.compositions[&first.active_revision];
+    let mut manifest = older_predecessor.scalar_scope().unwrap().compositions
+        [&older_predecessor.active_revision]
+        .clone();
+    let prior = &first.scalar_scope().unwrap().compositions[&first.active_revision];
     manifest.previous = Some(first.active_revision.clone());
     manifest.business = prior.business.clone();
     manifest.layers = prior.layers.clone();
@@ -537,8 +560,9 @@ fn rehashed_compositions_require_exact_predecessor_business_and_basis() {
     );
 
     let mut joint_predecessor = older_predecessor.clone();
-    let mut manifest =
-        joint_predecessor.scope.compositions[&joint_predecessor.active_revision].clone();
+    let mut manifest = joint_predecessor.scalar_scope().unwrap().compositions
+        [&joint_predecessor.active_revision]
+        .clone();
     manifest.basis.active = first.active_revision.clone();
     let linked = joint_predecessor.adoptions.last_mut().unwrap();
     linked.previous = first.active_revision.clone();
@@ -592,20 +616,30 @@ fn rehashed_compositions_require_exact_predecessor_business_and_basis() {
     );
 
     let mut wrong_plan_target = healthy.clone();
-    let basis = &wrong_plan_target.scope.compositions[&wrong_plan_target.active_revision].basis;
+    let basis = &wrong_plan_target.scalar_scope().unwrap().compositions
+        [&wrong_plan_target.active_revision]
+        .basis;
     let compatibility = LocalRuntime::default()
         .compatibility_at(first.program().unwrap(), &basis.data, basis.day)
         .unwrap();
     let linked = wrong_plan_target.adoptions.last_mut().unwrap();
     linked.plan.target = first.program().unwrap().artifact.clone();
     linked.plan.compatibility = compatibility;
-    wrong_plan_target.scope.adoptions.last_mut().unwrap().plan = linked.plan.identity().unwrap();
+    wrong_plan_target
+        .scalar_scope_mut()
+        .unwrap()
+        .adoptions
+        .last_mut()
+        .unwrap()
+        .plan = linked.plan.identity().unwrap();
 
     let mut other_business = second.clone();
     raw["actions"][0]["steps"][0]["values"]["promised"] =
         serde_json::to_value(lit(DataValue::Date { days: 20050 }, Type::Date)).unwrap();
     let unrelated = capture(raw);
-    let mut manifest = other_business.scope.compositions[&other_business.active_revision].clone();
+    let mut manifest = other_business.scalar_scope().unwrap().compositions
+        [&other_business.active_revision]
+        .clone();
     manifest.business = canonical_digest(IdentityDomain::Source, &unrelated).unwrap();
     other_business.programs.push(unrelated);
     reseal(&mut other_business, manifest);
@@ -647,7 +681,8 @@ fn rehashed_compositions_require_exact_predecessor_business_and_basis() {
     );
 
     let mut other_basis = second.clone();
-    let mut manifest = other_basis.scope.compositions[&other_basis.active_revision].clone();
+    let mut manifest =
+        other_basis.scalar_scope().unwrap().compositions[&other_basis.active_revision].clone();
     manifest.basis.snapshot =
         canonical_digest(IdentityDomain::Data, &"another frozen basis").unwrap();
     reseal(&mut other_basis, manifest);

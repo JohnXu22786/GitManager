@@ -4911,7 +4911,8 @@ fn managed_external_pair_retains_origin(mode: &str) {
     );
     assert!(
         saved
-            .scope
+            .scalar_scope()
+            .unwrap()
             .rehearsals
             .values()
             .any(

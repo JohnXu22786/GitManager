@@ -49,9 +49,11 @@ not arbitrary application composition.
 
 ## Host integration
 
-1. Open through product_backup::inspect_open. A format-1 store must pass the
+1. Open through product_backup::inspect_open. A format-1 or format-2 store must pass the
    explicit offline upgrade gate before editing. Display UpgradeProgress,
-   retain original files, and restart/reopen when requested
+   retain original files, and restart/reopen when requested. If activation is
+   visible but durability is unconfirmed, reopen still presents the explicit
+   verification gate; daily editing resumes only after completion succeeds
 2. Call ProductStore::prepare_scoped_change with the exact candidate and
    ScopeRequest. The opaque PreparedScopedChange exposes its compiled target,
    initialized copied seed and actual frozen scope
@@ -139,10 +141,11 @@ through its exact retained basis and source after later edits and restart.
 
 ## Persistence, upgrades and recovery
 
-Generated-project format 2 embeds typed layers, compositions, initialization
+Generated-project format 3 wraps the exact scalar-v1 state in a closed
+`{"family":"scalar_v1","state":...}` envelope. It retains typed layers, compositions, initialization
 receipts, scoped adoption links, retained rehearsals and historical replay
 correspondences. Ordinary reads accept only this current
-format. The format-1 decoder is confined to explicit upgrade gates. Journals,
+format. The exact format-1 and format-2 decoders are confined to explicit upgrade gates. Journals,
 old snapshot bytes and checkpoints are retained. Legacy order-tool formats are
 not changed.
 
@@ -191,3 +194,35 @@ fixed customer commitments, reminders, mixed output, completion history,
 current-data withdrawal, structural evolution, guarded discovery and fault
 injection. They are engineering tests, not evidence of live-provider generation,
 native desktop usability, end-user success or unrestricted composition.
+
+### Container-3 upgrade and recovery
+
+Normal load, edit and current-backup import accept only format 3. Explicit
+launch/open upgrades convert format 1 or 2 directly to 3 without advancing the
+revision, adopting behavior, or modifying source captures or scalar proofs.
+Owned-family tags remain unsupported. Scalar compiler version 1, proof identity
+inputs, runtime identities, archive objects and backup-envelope versions stay
+unchanged.
+
+The converter verifies a complete inverse projection and retains the original
+snapshot bytes. New `upgrade-1-3-*` or `upgrade-2-3-*` journals bind both pointers
+and a preservation digest. Existing same-byte immutable files are content-synced;
+reachable intention packages are rechecked before atomic activation. A pointer
+visible after an error is not durable-success evidence: reopen the exact folder
+and explicitly retry verification to finish file and directory barriers. The
+old handle cannot be reused after attempted activation.
+
+Backup intake validates the complete original envelope, then rebinds only the
+bundle's outer snapshot link through private verified conversion authority.
+Normal recovery claims a fresh destination. The explicit resumable API accepts
+only an exact new versioned marker binding the original backup, original
+snapshot, target snapshot and rebound bundle. Activated retries also require the
+retained original and journal; later work is never overwritten. An old-release
+unactivated inbox is preserved and requires the original verified backup plus a
+fresh destination. Activated old destinations instead use in-place upgrade.
+
+Checkpoint discovery and recovery previews retain valid old backups as flagged
+upgrade candidates in the same revision ordering, preserving their original
+names, checksums and shelf identity. No original backup or historical proof is
+rewritten or deleted. Durability uses the existing checked platform primitives;
+Linux tests do not establish stronger Windows or macOS power-loss guarantees.

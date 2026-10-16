@@ -86,9 +86,21 @@ const CURRENT_CASES: [&str; 5] = ["active", "evolved", "paired", "withdrawn", "p
 fn frozen_bytes(name: &str) -> Vec<u8> {
     fs::read(fixture_dir().join(format!("{name}.gmbak"))).unwrap()
 }
-fn frozen(name: &str) -> VerifiedBackup {
-    VerifiedBackup::from_bytes(&frozen_bytes(name)).unwrap()
+fn converted(bytes: &[u8]) -> VerifiedBackup {
+    let BackupIntake::UpgradeRequired(old) = inspect_backup(bytes).unwrap() else {
+        panic!("expected frozen old backup")
+    };
+    // Expectations remain literal pre-change bytes. Use only the verified
+    // conversion's immutable target; fresh recovery is exercised below.
+    let mut envelope: Value = serde_json::from_slice(bytes).unwrap();
+    envelope["payload"]["snapshot"] = serde_json::to_value(old.snapshot()).unwrap();
+    VerifiedBackup::from_bytes(&rebind_backup(&mut envelope)).unwrap()
 }
+
+fn frozen(name: &str) -> VerifiedBackup {
+    converted(&frozen_bytes(name))
+}
+
 fn bundle_from(bytes: &[u8]) -> IntentionBundle {
     let envelope: Value = serde_json::from_slice(bytes).unwrap();
     serde_json::from_value(envelope["payload"]["intentions"].clone()).unwrap()
@@ -100,14 +112,14 @@ fn frozen_scalar_histories_reconstruct_reopen_replay_and_recover() {
     let mut snapshots = std::collections::BTreeMap::new();
     for name in CURRENT_CASES {
         let bytes = frozen_bytes(name);
-        let backup = VerifiedBackup::from_bytes(&bytes).unwrap();
-        assert_eq!(backup.to_bytes().unwrap(), bytes);
+        let backup = converted(&bytes);
+        assert_eq!(inspect_backup(&bytes).unwrap().to_bytes().unwrap(), bytes);
         let snapshot = backup.snapshot();
-        assert_eq!(snapshot.version, 2);
-        assert_eq!(snapshot.scope.version, 1);
-        let bundle = bundle_from(&bytes);
+        assert_eq!(snapshot.version, 3);
+        assert_eq!(snapshot.scalar_scope().unwrap().version, 1);
+        let bundle = bundle_from(&backup.to_bytes().unwrap());
         validate_bundle(snapshot, &bundle).unwrap();
-        for manifest in snapshot.scope.compositions.values() {
+        for manifest in snapshot.scalar_scope().unwrap().compositions.values() {
             let reconstructed = compile_test_manifest(snapshot, manifest).unwrap();
             let retained = snapshot
                 .programs
@@ -165,7 +177,7 @@ fn frozen_scalar_histories_reconstruct_reopen_replay_and_recover() {
             );
         }
         let recaptured = VerifiedBackup::capture(&reopened.store).unwrap();
-        assert_eq!(recaptured.to_bytes().unwrap(), bytes);
+        assert_eq!(recaptured.to_bytes().unwrap(), backup.to_bytes().unwrap());
         // A normal operation remains available after verified reopen. The old
         // immutable object and original fixture must remain byte-identical.
         apply(&reopened.store, "continued-export", invoke("export", &[]));
@@ -182,8 +194,8 @@ fn frozen_scalar_histories_reconstruct_reopen_replay_and_recover() {
     let paired = &snapshots["paired"];
     let withdrawn = &snapshots["withdrawn"];
     let prospective = &snapshots["prospective"];
-    assert_eq!(active.scope.layers.len(), 1);
-    assert_eq!(active.scope.initializations.len(), 1);
+    assert_eq!(active.scalar_scope().unwrap().layers.len(), 1);
+    assert_eq!(active.scalar_scope().unwrap().initializations.len(), 1);
     assert!(active
         .data
         .records
@@ -196,27 +208,44 @@ fn frozen_scalar_histories_reconstruct_reopen_replay_and_recover() {
         .any(|row| row.values.keys().any(|key| key.starts_with("gm_scope_"))));
     assert!(!active.data.events.is_empty());
     assert!(!active.artifacts.is_empty());
-    assert!(!active.scope.correspondences.is_empty());
+    assert!(!active.scalar_scope().unwrap().correspondences.is_empty());
     assert!(active
         .decisions
         .decisions
         .iter()
         .any(|d| d.id == "ordinary-promise" && d.status == DecisionStatus::Active));
-    assert_eq!(active.scope.layers, evolved.scope.layers);
+    assert_eq!(
+        active.scalar_scope().unwrap().layers,
+        evolved.scalar_scope().unwrap().layers
+    );
     assert_eq!(active.data, evolved.data);
     assert_eq!(active.data, withdrawn.data);
     assert_eq!(active.artifacts, withdrawn.artifacts);
-    assert_eq!(paired.scope.rehearsals.len(), 2);
-    assert_eq!(active.scope.layers, withdrawn.scope.layers);
-    assert!(paired.scope.rehearsals.values().all(|r| r.layer.is_none()));
-    assert!(withdrawn.scope.compositions[&withdrawn.active_revision]
-        .active
-        .is_empty());
+    assert_eq!(paired.scalar_scope().unwrap().rehearsals.len(), 2);
+    assert_eq!(
+        active.scalar_scope().unwrap().layers,
+        withdrawn.scalar_scope().unwrap().layers
+    );
+    assert!(paired
+        .scalar_scope()
+        .unwrap()
+        .rehearsals
+        .values()
+        .all(|r| r.layer.is_none()));
+    assert!(
+        withdrawn.scalar_scope().unwrap().compositions[&withdrawn.active_revision]
+            .active
+            .is_empty()
+    );
     assert_eq!(withdrawn.decisions.decisions, evolved.decisions.decisions);
-    assert!(prospective.scope.layers.is_empty());
-    assert!(prospective.scope.compositions.is_empty());
-    assert!(prospective.scope.initializations.is_empty());
-    assert_eq!(prospective.scope.rehearsals.len(), 1);
+    assert!(prospective.scalar_scope().unwrap().layers.is_empty());
+    assert!(prospective.scalar_scope().unwrap().compositions.is_empty());
+    assert!(prospective
+        .scalar_scope()
+        .unwrap()
+        .initializations
+        .is_empty());
+    assert_eq!(prospective.scalar_scope().unwrap().rehearsals.len(), 1);
     assert_eq!(
         prospective.decisions.decisions[0].status,
         DecisionStatus::Pending
@@ -231,7 +260,7 @@ fn frozen_scalar_histories_reconstruct_reopen_replay_and_recover() {
 fn frozen_checkpoint_keeps_its_original_name_bytes_and_discovery_identity() {
     let dir = tempdir();
     let bytes = frozen_bytes("withdrawn");
-    let backup = VerifiedBackup::from_bytes(&bytes).unwrap();
+    let backup = converted(&bytes);
     let store = backup.recover_new(&dir.path().join("tool")).unwrap();
     fs::create_dir(dir.path().join("shelf")).unwrap();
     let locations = product_locations::ToolLocations::chosen(dir.path().join("shelf")).unwrap();
@@ -253,9 +282,10 @@ fn frozen_checkpoint_keeps_its_original_name_bytes_and_discovery_identity() {
     assert!(found.issues.is_empty());
     assert_eq!(found.recovery.unwrap().to_bytes().unwrap(), bytes);
     let receipt = shelf.capture(&store).unwrap();
-    assert_eq!(receipt.path.file_name().unwrap().to_str().unwrap(), name);
+    assert_ne!(receipt.path.file_name().unwrap().to_str().unwrap(), name);
+    assert_eq!(fs::read(shelf.path().join(name)).unwrap(), bytes);
     assert_eq!(receipt.digest, *backup.digest());
-    assert_eq!(fs::read(receipt.path).unwrap(), bytes);
+    assert_eq!(fs::read(receipt.path).unwrap(), backup.to_bytes().unwrap());
 }
 
 #[test]
@@ -278,7 +308,10 @@ fn frozen_format_one_requires_explicit_preserving_upgrade() {
     assert_eq!(legacy.original_bytes(), bytes);
     let opened = open_verified(&path, None).unwrap();
     let mut projected = serde_json::to_value(&opened.snapshot).unwrap();
-    assert_eq!(opened.snapshot.scope, ScopeState::default());
+    assert_eq!(
+        opened.snapshot.scalar_scope().unwrap(),
+        &ScopeState::default()
+    );
     projected.as_object_mut().unwrap().remove("scope");
     projected["version"] = json!(1);
     assert_eq!(projected, raw["payload"]["snapshot"]);
@@ -325,7 +358,8 @@ fn rehashed_frozen_proofs_and_packages_reject_tampering() {
         let mut altered = snapshot.clone();
         if name == "prospective" {
             altered
-                .scope
+                .scalar_scope_mut()
+                .unwrap()
                 .rehearsals
                 .values_mut()
                 .next()
@@ -333,7 +367,8 @@ fn rehashed_frozen_proofs_and_packages_reject_tampering() {
                 .recorded_revision += 1;
         } else if name == "paired" {
             altered
-                .scope
+                .scalar_scope_mut()
+                .unwrap()
                 .rehearsals
                 .values_mut()
                 .next()
@@ -342,31 +377,54 @@ fn rehashed_frozen_proofs_and_packages_reject_tampering() {
                 .clear();
         } else if name == "withdrawn" {
             // Inactive scalar proof is still validated.
-            altered.scope.layers.values_mut().next().unwrap().version = 99;
+            altered
+                .scalar_scope_mut()
+                .unwrap()
+                .layers
+                .values_mut()
+                .next()
+                .unwrap()
+                .version = 99;
         } else if name == "evolved" {
-            let key = altered.scope.correspondences.keys().next().unwrap().clone();
-            let mut receipt = altered.scope.correspondences.remove(&key).unwrap();
+            let key = altered
+                .scalar_scope()
+                .unwrap()
+                .correspondences
+                .keys()
+                .next()
+                .unwrap()
+                .clone();
+            let mut receipt = altered
+                .scalar_scope_mut()
+                .unwrap()
+                .correspondences
+                .remove(&key)
+                .unwrap();
             receipt.proof.original.records[0]
                 .values
                 .insert("name".into(), text("Altered historical work"));
             altered
-                .scope
+                .scalar_scope_mut()
+                .unwrap()
                 .correspondences
                 .insert(receipt.proof.identity().unwrap(), receipt);
         } else {
-            altered.scope.initializations[0].capture_day += 1;
+            altered.scalar_scope_mut().unwrap().initializations[0].capture_day += 1;
             // Rehash the nested initialization link as well as the outer backup;
             // the retained basis must still prove this claimed historical day.
-            altered.scope.adoptions[0].initialization = Some(
-                canonical_digest(IdentityDomain::Adoption, &altered.scope.initializations[0])
-                    .unwrap(),
+            altered.scalar_scope_mut().unwrap().adoptions[0].initialization = Some(
+                canonical_digest(
+                    IdentityDomain::Adoption,
+                    &altered.scalar_scope().unwrap().initializations[0],
+                )
+                .unwrap(),
             );
         }
         assert!(altered.validate().is_err(), "{name}");
         let mut raw: Value = serde_json::from_slice(&original).unwrap();
         raw["payload"]["snapshot"] = serde_json::to_value(altered).unwrap();
         assert!(
-            VerifiedBackup::from_bytes(&rebind_backup(&mut raw)).is_err(),
+            inspect_backup(&rebind_backup(&mut raw)).is_err(),
             "{name}: resealed proof forgery"
         );
         let mut raw: Value = serde_json::from_slice(&original).unwrap();
@@ -376,13 +434,13 @@ fn rehashed_frozen_proofs_and_packages_reject_tampering() {
         assert!(!objects.is_empty());
         objects.pop();
         assert!(
-            VerifiedBackup::from_bytes(&rebind_backup(&mut raw)).is_err(),
+            inspect_backup(&rebind_backup(&mut raw)).is_err(),
             "{name}: missing reachable package"
         );
         let mut raw: Value = serde_json::from_slice(&original).unwrap();
         raw["payload"]["intentions"]["objects"][0]["bytes"][0] = json!(b' ');
         assert!(
-            VerifiedBackup::from_bytes(&rebind_backup(&mut raw)).is_err(),
+            inspect_backup(&rebind_backup(&mut raw)).is_err(),
             "{name}: altered package bytes"
         );
         assert_eq!(frozen_bytes(name), original);
@@ -394,27 +452,33 @@ fn scalar_adapters_reject_unsupported_versions_without_mutating_history() {
     for name in ["active", "withdrawn", "prospective"] {
         // Decode literal pre-refactor bytes, not a new family serializer.
         let raw: Value = serde_json::from_slice(&frozen_bytes(name)).unwrap();
-        let original: product_store::ProjectSnapshot =
-            serde_json::from_value(raw["payload"]["snapshot"].clone()).unwrap();
+        let original = frozen(name).snapshot().clone();
         for empty in [false, true] {
             let mut snapshot = original.clone();
             if empty {
-                snapshot.scope = ScopeState::default();
+                snapshot.scope = ScopeEnvelope::ScalarV1(ScopeState::default());
             }
             let bytes = canonical_bytes(&snapshot).unwrap();
-            assert_eq!(snapshot.scalar_scope().unwrap(), &snapshot.scope);
-            let expected = snapshot.scope.clone();
+            assert_eq!(
+                serde_json::to_value(snapshot.scalar_scope().unwrap()).unwrap(),
+                if empty {
+                    serde_json::to_value(ScopeState::default()).unwrap()
+                } else {
+                    raw["payload"]["snapshot"]["scope"].clone()
+                }
+            );
+            let expected = snapshot.scalar_scope().unwrap().clone();
             assert_eq!(snapshot.scalar_scope_mut().unwrap(), &expected);
             assert_eq!(canonical_bytes(&snapshot).unwrap(), bytes);
             for version in [0, 2, 99] {
                 let mut unsupported = snapshot.clone();
-                unsupported.scope.version = version;
+                unsupported.scalar_scope_mut().unwrap().version = version;
                 let bytes = canonical_bytes(&unsupported).unwrap();
                 assert!(unsupported.scalar_scope().is_err(), "{name}: {version}");
                 assert!(unsupported.scalar_scope_mut().is_err(), "{name}: {version}");
                 assert_eq!(canonical_bytes(&unsupported).unwrap(), bytes);
             }
-            for version in [1, 3, 99] {
+            for version in [1, 2, 99] {
                 let mut unsupported = snapshot.clone();
                 unsupported.version = version;
                 let bytes = canonical_bytes(&unsupported).unwrap();

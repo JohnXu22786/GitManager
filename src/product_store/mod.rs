@@ -1,6 +1,8 @@
 //! Separate generated-project format with immutable snapshots and one atomic
 //! activation pointer. Legacy order projects are never read or rewritten here.
 mod files;
+#[cfg(test)]
+pub(crate) use files::file_sync_testing;
 mod json;
 mod recovery_destination;
 pub(crate) use recovery_destination::RecoveryDestination;
@@ -15,11 +17,12 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path};
 use std::sync::{Arc, Mutex, MutexGuard};
-pub(crate) use upgrade::LegacyUpgrade;
+pub(crate) use upgrade::VerifiedContainerUpgrade;
 pub use upgrade::{UpgradeProgress, UpgradeSummary};
 
 const MAGIC: &str = "gitmanager.generated-project";
-const FORMAT: u32 = 2;
+pub const GENERATED_PROJECT_FORMAT: u32 = 3;
+const FORMAT: u32 = GENERATED_PROJECT_FORMAT;
 const MAX_STORE_BYTES: usize = 16 * 1024 * 1024;
 /// Local envelopes retain multiple full captures and execution receipts. Each
 /// individual source/provider document still has its separate 1 MiB cap.
@@ -32,6 +35,7 @@ pub enum StoreError {
     UnsupportedFormat(u32),
     UpgradeRequired,
     RestartRequired,
+    ActivationUnconfirmed(String),
     Conflict(String),
     Incompatible(CompatibilityReport),
     Runtime(AdapterError),
@@ -105,7 +109,7 @@ pub struct ProjectSnapshot {
     pub adoptions: Vec<AdoptionReceipt>,
     pub operations: BTreeMap<Id, OperationReceipt>,
     pub artifacts: Vec<LocalArtifact>,
-    pub scope: scope::ScopeState,
+    pub scope: scope::ScopeEnvelope,
 }
 fn revision(program: &CapturedProgram) -> std::result::Result<Digest, ContractError> {
     canonical_digest(IdentityDomain::Source, program)
@@ -120,6 +124,9 @@ impl ProjectSnapshot {
     pub fn validate(&self) -> Result<()> {
         if self.magic != MAGIC {
             return Err(StoreError::Corrupt("not a generated-tool project".into()));
+        }
+        if matches!(self.version, 1 | 2) {
+            return Err(StoreError::UpgradeRequired);
         }
         if self.version != FORMAT {
             return Err(StoreError::UnsupportedFormat(self.version));
@@ -242,7 +249,10 @@ pub struct ProductStore {
 struct ValidationIdentity {
     runtime: RuntimeCapabilities,
     driver: &'static str,
+    container: u32,
+    family: &'static str,
     compiler: u32,
+    verifier: u32,
     limits: RuntimeLimits,
 }
 struct ValidatedSnapshot {
@@ -332,7 +342,7 @@ impl ProductStore {
             adoptions: vec![],
             operations: BTreeMap::new(),
             artifacts: vec![],
-            scope: scope::ScopeState::default(),
+            scope: scope::ScopeEnvelope::ScalarV1(scope::ScopeState::default()),
         };
         // Ordinary creation and recovery share the same fresh-only activation.
         Self::create_recovered(path, &snapshot)
@@ -453,13 +463,29 @@ impl ProductStore {
     /// This is content storage only: the intention layer validates the object
     /// type, references and provenance; CURRENT remains activation authority.
     pub fn stage_extension(&self, bytes: &[u8]) -> Result<Digest> {
+        if self
+            .upgrade_requires_reopen
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(StoreError::RestartRequired);
+        }
         self.pinned()?;
+        match self.root.read("CURRENT", 16 * 1024) {
+            Ok(_) => {
+                self.load()?;
+            }
+            // Fresh recovery may stage until its activation inputs are sealed.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                self.require_unsealed_upgrade()?;
+            }
+            Err(e) => return Err(e.into()),
+        }
         let digest = Self::extension_digest(bytes)?;
         let name = format!("extension-{}.json", digest.as_str());
         match self.root.publish(&name, bytes, false) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                if self.read_extension(&digest)? != bytes {
+                if self.root.read_and_sync(&name, MAX_INTENTION_OBJECT_BYTES)? != bytes {
                     return Err(StoreError::Corrupt(
                         "immutable intention object collision".into(),
                     ));
@@ -527,7 +553,10 @@ impl ProductStore {
         Ok(())
     }
     pub fn load(&self) -> Result<ProjectSnapshot> {
-        let result = self.load_current();
+        let result = self.load_current().and_then(|snapshot| {
+            self.require_upgrade_complete(&snapshot)?;
+            Ok(snapshot)
+        });
         if result.is_err() {
             self.clear_validation_cache();
         }
@@ -545,7 +574,7 @@ impl ProductStore {
         if pointer.magic != MAGIC {
             return Err(StoreError::Corrupt("not a generated-tool project".into()));
         }
-        if pointer.version == 1 {
+        if matches!(pointer.version, 1 | 2) {
             return Err(StoreError::UpgradeRequired);
         }
         if pointer.version != FORMAT {
@@ -571,7 +600,10 @@ impl ProductStore {
         let identity = ValidationIdentity {
             runtime: runtime.capabilities(),
             driver: DRIVER_VERSION,
+            container: FORMAT,
+            family: "scalar_v1",
             compiler: scope::COMPILER_VERSION,
+            verifier: 1,
             limits: RuntimeLimits::default(),
         };
         let reused = {
@@ -639,7 +671,7 @@ impl ProductStore {
         match self.root.publish(&name, &bytes, false) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                if self.root.read(&name, MAX_STORE_BYTES)? != bytes {
+                if self.root.read_and_sync(&name, MAX_STORE_BYTES)? != bytes {
                     return Err(StoreError::Corrupt("immutable snapshot collision".into()));
                 }
             }

@@ -89,6 +89,12 @@ impl From<StoreError> for OperationIssue {
     fn from(error: StoreError) -> Self {
         let kind = match &error {
             StoreError::Io(e) => return Self::from(io::Error::new(e.kind(), error.to_string())),
+            StoreError::ActivationUnconfirmed(_) => return Self {
+                kind: IssueKind::Unavailable,
+                message: "The upgrade may be active, but durable completion could not be confirmed.".into(),
+                next_step: "Keep this folder and all originals. Reopen this exact folder and explicitly retry upgrade verification before continuing.".into(),
+                detail: error.to_string(),
+            },
             StoreError::UnsupportedFormat(_) => IssueKind::Unsupported,
             StoreError::UpgradeRequired => IssueKind::UpgradeRequired,
             StoreError::RestartRequired => IssueKind::RestartRequired,

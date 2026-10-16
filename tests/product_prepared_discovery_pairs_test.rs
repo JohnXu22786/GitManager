@@ -97,7 +97,16 @@ fn authored_result_resolves_to_host_lowered_execution_without_rewriting_provenan
     assert_eq!(witness.before.state, EvidenceState::Observed);
     assert_eq!(witness.after.state, EvidenceState::Observed);
     assert!(witness.minimization.as_ref().unwrap().complete);
-    assert_eq!(store.load().unwrap().scope.rehearsals.len(), 0);
+    assert_eq!(
+        store
+            .load()
+            .unwrap()
+            .scalar_scope()
+            .unwrap()
+            .rehearsals
+            .len(),
+        0
+    );
 }
 
 #[test]
@@ -253,17 +262,29 @@ fn two_prospective_evolutions_retain_all_four_outcomes_without_live_activation()
         assert_eq!(retained.session, before.session);
         assert_eq!(retained.clock_day, before.clock_day);
         assert_eq!(retained.artifacts, before.artifacts);
-        assert_eq!(retained.scope.layers, before.scope.layers);
-        assert_eq!(retained.scope.compositions, before.scope.compositions);
-        assert_eq!(retained.scope.initializations, before.scope.initializations);
-        assert_eq!(retained.scope.adoptions, before.scope.adoptions);
-        assert_eq!(retained.scope.rehearsals.len(), 2);
+        assert_eq!(
+            retained.scalar_scope().unwrap().layers,
+            before.scalar_scope().unwrap().layers
+        );
+        assert_eq!(
+            retained.scalar_scope().unwrap().compositions,
+            before.scalar_scope().unwrap().compositions
+        );
+        assert_eq!(
+            retained.scalar_scope().unwrap().initializations,
+            before.scalar_scope().unwrap().initializations
+        );
+        assert_eq!(
+            retained.scalar_scope().unwrap().adoptions,
+            before.scalar_scope().unwrap().adoptions
+        );
+        assert_eq!(retained.scalar_scope().unwrap().rehearsals.len(), 2);
         assert_eq!(retained.decisions.decisions[0].outcome, outcome);
         assert_eq!(
             retained.decisions.decisions[0].status,
             DecisionStatus::Pending
         );
-        for proof in retained.scope.rehearsals.values() {
+        for proof in retained.scalar_scope().unwrap().rehearsals.values() {
             assert_eq!(proof.recorded_by, "record-pair");
             assert_eq!(
                 proof.witnesses["pending-designs"],
@@ -452,26 +473,42 @@ fn pair_recording_refuses_missing_replaced_proofs_and_mixed_recording_births() {
         engine.adopt(&store, &change).unwrap();
     }
     let healthy = store.load().unwrap();
-    let ids: Vec<_> = healthy.scope.rehearsals.keys().cloned().collect();
+    let ids: Vec<_> = healthy
+        .scalar_scope()
+        .unwrap()
+        .rehearsals
+        .keys()
+        .cloned()
+        .collect();
     let mut missing = healthy.clone();
-    missing.scope.rehearsals.remove(&ids[0]);
+    missing
+        .scalar_scope_mut()
+        .unwrap()
+        .rehearsals
+        .remove(&ids[0]);
     missing
         .programs
         .retain(|source| canonical_digest(IdentityDomain::Source, source).unwrap() != ids[0]);
     assert!(missing.validate().is_err());
     let mut absent = healthy.clone();
-    absent.scope.rehearsals.clear();
+    absent.scalar_scope_mut().unwrap().rehearsals.clear();
     absent
         .programs
         .retain(|source| !ids.contains(&canonical_digest(IdentityDomain::Source, source).unwrap()));
     assert!(absent.validate().is_err());
     let mut changed = healthy.clone();
-    changed.scope.rehearsals.get_mut(&ids[0]).unwrap().seed =
-        canonical_digest(IdentityDomain::Data, &"substituted input").unwrap();
+    changed
+        .scalar_scope_mut()
+        .unwrap()
+        .rehearsals
+        .get_mut(&ids[0])
+        .unwrap()
+        .seed = canonical_digest(IdentityDomain::Data, &"substituted input").unwrap();
     assert!(changed.validate().is_err());
     let mut mixed = healthy.clone();
     let newer = mixed
-        .scope
+        .scalar_scope_mut()
+        .unwrap()
         .rehearsals
         .values_mut()
         .find(|proof| proof.recorded_by == "record-1")
@@ -480,14 +517,16 @@ fn pair_recording_refuses_missing_replaced_proofs_and_mixed_recording_births() {
     assert!(mixed.validate().is_err());
     let mut wrong_birth = healthy.clone();
     let prior = healthy
-        .scope
+        .scalar_scope()
+        .unwrap()
         .rehearsals
         .values()
         .find(|proof| proof.recorded_by == "record-0")
         .unwrap()
         .clone();
     let later = wrong_birth
-        .scope
+        .scalar_scope_mut()
+        .unwrap()
         .rehearsals
         .values_mut()
         .find(|proof| proof.recorded_by == "record-1")
@@ -779,7 +818,7 @@ fn legacy_single_rehearsal_can_resupply_an_already_retained_correspondence() {
     let path = dir.path().join("tool");
     let store = managed_store(&path);
     let current = store.load().unwrap();
-    let manifest = &current.scope.compositions[&current.active_revision];
+    let manifest = &current.scalar_scope().unwrap().compositions[&current.active_revision];
     let original = &current.programs[0];
     let mapped =
         product_runtime::merged_data(current.program().unwrap(), &manifest.basis.data).unwrap();
@@ -809,7 +848,10 @@ fn legacy_single_rehearsal_can_resupply_an_already_retained_correspondence() {
         )
         .unwrap();
     let current = store.load().unwrap();
-    assert_eq!(current.scope.correspondences.len(), proofs.len());
+    assert_eq!(
+        current.scalar_scope().unwrap().correspondences.len(),
+        proofs.len()
+    );
     let mut raw = serde_json::to_value(program(true).program).unwrap();
     raw["observables"][0]["value"] = serde_json::to_value(int(1)).unwrap();
     let prospective = prepare(&store, &capture(raw), "prospective");
@@ -878,8 +920,8 @@ fn legacy_single_rehearsal_can_resupply_an_already_retained_correspondence() {
         )
         .unwrap();
     assert_eq!(
-        retained.scope.correspondences,
-        current.scope.correspondences
+        retained.scalar_scope().unwrap().correspondences,
+        current.scalar_scope().unwrap().correspondences
     );
     assert_eq!(ProductStore::open(&path).unwrap().load().unwrap(), retained);
     let bytes = product_backup::VerifiedBackup::capture(&store)
@@ -963,8 +1005,15 @@ fn pair_receipt_tag_mutations_and_half_pair_cannot_downgrade_to_legacy() {
         assert!(corrupt.validate().is_err(), "mutation {mutation}");
     }
     let mut half = healthy.clone();
-    let missing = half.scope.rehearsals.keys().next().unwrap().clone();
-    half.scope.rehearsals.remove(&missing);
+    let missing = half
+        .scalar_scope()
+        .unwrap()
+        .rehearsals
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    half.scalar_scope_mut().unwrap().rehearsals.remove(&missing);
     half.programs
         .retain(|source| canonical_digest(IdentityDomain::Source, source).unwrap() != missing);
     assert!(half.validate().is_err());

@@ -99,9 +99,9 @@ fn explicit_upgrade_preserves_format_one_bytes_and_requires_reopen() {
     );
     let reopened = ProductStore::open(&path).unwrap();
     let current = reopened.load().unwrap();
-    assert_eq!(current.version, 2);
-    assert!(current.scope.rehearsals.is_empty());
-    assert!(current.scope.correspondences.is_empty());
+    assert_eq!(current.version, 3);
+    assert!(current.scalar_scope().unwrap().rehearsals.is_empty());
+    assert!(current.scalar_scope().unwrap().correspondences.is_empty());
     assert_eq!(current.data.records.len(), 1);
     let current_pointer = fs::read(path.join("CURRENT")).unwrap();
     reopened.upgrade_generated_project(|_| {}).unwrap();
@@ -118,14 +118,53 @@ fn upgrade_faults_are_idempotent_without_ordinary_edit_migration() {
     ] {
         let dir = tempdir();
         let path = dir.path().join("old");
-        let (store, _, _) = make_legacy(&path);
+        let (store, pointer, original) = make_legacy(&path);
+        let pointer: serde_json::Value = serde_json::from_slice(&pointer).unwrap();
+        let object = path.join(format!(
+            "object-{}.json",
+            pointer["object"].as_str().unwrap()
+        ));
+        let files = |path: &std::path::Path| {
+            fs::read_dir(path)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .filter(|entry| entry.file_name() != ".write.lock")
+                .map(|entry| (entry.file_name(), fs::read(entry.path()).unwrap()))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
         assert!(store.upgrade_with_fault(|_| {}, fault).is_err());
+        let interrupted = files(&path);
+        for _ in 0..2 {
+            let reopened = ProductStore::open(&path).unwrap();
+            assert!(matches!(reopened.load(), Err(StoreError::UpgradeRequired)));
+            assert!(matches!(
+                product_backup::inspect_open(&path, None).unwrap(),
+                product_backup::OpenGate::UpgradeRequired(_)
+            ));
+            assert!(matches!(
+                reopened.apply(
+                    0,
+                    "no-auto-completion",
+                    &invoke("export", &[]),
+                    RuntimeLimits::default()
+                ),
+                Err(StoreError::UpgradeRequired)
+            ));
+            assert_eq!(files(&path), interrupted);
+        }
         let reopened = ProductStore::open(&path).unwrap();
         reopened.upgrade_generated_project(|_| {}).unwrap();
         let reloaded = ProductStore::open(&path).unwrap();
-        assert_eq!(reloaded.load().unwrap().data.records.len(), 1);
+        let completed = files(&path);
+        let snapshot = reloaded.load().unwrap();
+        assert_eq!(snapshot.data.records.len(), 1);
+        reloaded.upgrade_generated_project(|_| {}).unwrap();
+        assert_eq!(files(&path), completed);
+        assert_eq!(reloaded.load().unwrap(), snapshot);
+        assert_eq!(fs::read(&object).unwrap(), original);
         add(&reloaded, "later", "Continued work");
         assert_eq!(reloaded.load().unwrap().data.records.len(), 2);
+        assert_eq!(fs::read(&object).unwrap(), original);
     }
 }
 

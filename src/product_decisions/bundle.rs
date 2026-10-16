@@ -264,18 +264,23 @@ impl IntentArchive {
 
 /// Explicit format-upgrade rebinding of the outer snapshot link only. Exact
 /// scene/mapping object bytes and their content identities never change.
-pub fn upgrade_bundle_binding(
-    original: &Digest,
-    snapshot: &ProjectSnapshot,
+pub(crate) fn upgrade_bundle_binding(
+    conversion: &crate::product_store::VerifiedContainerUpgrade,
     bundle: &IntentionBundle,
 ) -> Result<IntentionBundle> {
-    if bundle.snapshot != *original || !snapshot.scalar_scope()?.layers.is_empty() {
+    if bundle.snapshot != *conversion.original_digest() || bundle.version != 1 {
         return Err(invalid(
-            "legacy intention bundle does not bind the original unscoped snapshot",
+            "old intention bundle does not bind this verified conversion",
         ));
     }
     let mut upgraded = bundle.clone();
-    upgraded.snapshot = canonical_digest(IdentityDomain::Data, snapshot)?;
-    validate_bundle(snapshot, &upgraded)?;
+    upgraded.snapshot = canonical_digest(IdentityDomain::Data, conversion.snapshot())?;
+    validate_bundle(conversion.snapshot(), &upgraded)?;
+    // Cloning changes no object, order, payload or nested source/proof link.
+    let mut projected = upgraded.clone();
+    projected.snapshot = bundle.snapshot.clone();
+    if canonical_bytes(&projected)? != canonical_bytes(bundle)? {
+        return Err(invalid("conversion changed retained intention bytes"));
+    }
     Ok(upgraded)
 }

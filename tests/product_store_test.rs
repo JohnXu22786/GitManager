@@ -252,7 +252,7 @@ fn corrupted_immutable_object_and_duplicate_pointer_keys_are_rejected() {
     assert!(matches!(store.load(), Err(StoreError::Corrupt(_))));
     fs::write(&object, original_object).unwrap();
     let original_pointer = String::from_utf8(pointer).unwrap();
-    let pointer = original_pointer.replacen("\"version\":2", "\"version\":2,\"version\":2", 1);
+    let pointer = original_pointer.replacen("\"version\":3", "\"version\":3,\"version\":3", 1);
     assert_ne!(pointer, original_pointer);
     fs::write(path.join("CURRENT"), pointer).unwrap();
     assert!(store.load().is_err());

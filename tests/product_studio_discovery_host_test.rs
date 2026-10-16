@@ -1959,7 +1959,7 @@ fn report_cache_selection_route(route: usize) {
     let legacy = if route == 0 {
         let other = ProductStore::create(other_path.clone(), &capture(organizer()), 20000).unwrap();
         let snapshot = other.load().unwrap();
-        assert!(snapshot.scope.layers.is_empty());
+        assert!(snapshot.scalar_scope().unwrap().layers.is_empty());
         // The same complete, checksummed format-one fixture used by the
         // existing Studio upgrade tests. Opening must not migrate it.
         let mut wire = serde_json::to_value(&snapshot).unwrap();

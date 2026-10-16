@@ -762,7 +762,8 @@ fn missing_birth_and_damaged_completed_values_fail_without_live_fallback() {
     assert!(wrong_producer.validate().is_err());
     let mut forged = complete.clone();
     forged
-        .scope
+        .scalar_scope_mut()
+        .unwrap()
         .compositions
         .values_mut()
         .next()
@@ -1318,7 +1319,7 @@ fn preserved_projections_reject_parameters_in_prior_and_mapped_expressions() {
     let current = store.adopt_scoped(before.revision, &scoped).unwrap();
     let candidate = parameterized(true, true);
     let target = canonical_digest(IdentityDomain::Source, &candidate).unwrap();
-    let mappings: Vec<_> = current.scope.layers[&layer]
+    let mappings: Vec<_> = current.scalar_scope().unwrap().layers[&layer]
         .patches
         .iter()
         .enumerate()

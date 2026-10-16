@@ -2,16 +2,13 @@
 use super::{fresh, DestinationChoice, Event};
 use crate::product_backup::{
     doctor, inspect_backup, open_verified, BackupIntake, BackupSummary, CheckpointReceipt,
-    CheckpointShelf, OpenedTool, VerifiedBackup, MAX_BACKUP_BYTES,
+    CheckpointShelf, OpenedTool, MAX_BACKUP_BYTES,
 };
-use crate::product_contract::{canonical_bytes, Digest};
-use crate::product_decisions::IntentionBundle;
+use crate::product_contract::Digest;
 use crate::product_locations::{
     CreatedTool, IssueKind, OperationIssue, RecentTools, SelectedFile, ToolIdentity, ToolLocations,
 };
-use crate::product_store::{
-    LegacyUpgrade, ProductStore, ProjectSnapshot, RecoveryDestination, UpgradeProgress,
-};
+use crate::product_store::{ProductStore, ProjectSnapshot, RecoveryDestination, UpgradeProgress};
 use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
@@ -36,32 +33,9 @@ impl RecoveryDraft {
     pub fn read(path: &Path, operation: &str) -> Result<Self> {
         let bytes = SelectedFile::new(path)?.read(MAX_BACKUP_BYTES)?;
         let intake = inspect_backup(&bytes)?;
-        let (summary, expected, requires_upgrade) = match &intake {
-            BackupIntake::Current(backup) => (backup.summary()?, backup.snapshot().clone(), false),
-            BackupIntake::UpgradeRequired(legacy) => {
-                // Intake already verified the entire canonical envelope and
-                // intention reachability. Reuse the existing read-only upgrade
-                // decoder for preview; do not introduce a second migration.
-                let value: serde_json::Value = serde_json::from_slice(legacy.original_bytes())?;
-                let upgraded =
-                    LegacyUpgrade::decode(&canonical_bytes(&value["payload"]["snapshot"])?)?;
-                let snapshot = upgraded.snapshot;
-                let intentions: IntentionBundle =
-                    serde_json::from_value(value["payload"]["intentions"].clone())?;
-                let summary = BackupSummary {
-                    digest: serde_json::from_value(value["digest"].clone())?,
-                    identity: ToolIdentity::from_snapshot(&snapshot)?,
-                    label: snapshot.program()?.program.label.clone(),
-                    revision: snapshot.revision,
-                    records: snapshot.data.records.len(),
-                    events: snapshot.data.events.len(),
-                    outputs: snapshot.artifacts.len(),
-                    decisions: snapshot.decisions.decisions.len(),
-                    intention_objects: intentions.object_count(),
-                };
-                (summary, snapshot, true)
-            }
-        };
+        let summary = intake.summary()?;
+        let expected = intake.snapshot().clone();
+        let requires_upgrade = intake.requires_upgrade();
         let preview = ImportPreview {
             operation: operation.into(),
             source: path.display().to_string(),
@@ -75,7 +49,7 @@ impl RecoveryDraft {
             expected,
         })
     }
-    fn checkpoint(backup: VerifiedBackup, operation: &str) -> Result<Self> {
+    fn checkpoint(backup: BackupIntake, operation: &str) -> Result<Self> {
         let summary = backup.summary()?;
         let expected = backup.snapshot().clone();
         Ok(Self {
@@ -83,10 +57,10 @@ impl RecoveryDraft {
                 operation: operation.into(),
                 source: "Verified automatic backup".into(),
                 backup: summary.digest.clone(),
-                requires_upgrade: false,
+                requires_upgrade: backup.requires_upgrade(),
                 summary: Some(summary),
             },
-            intake: BackupIntake::Current(backup),
+            intake: backup,
             expected,
         })
     }

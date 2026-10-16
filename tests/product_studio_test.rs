@@ -605,7 +605,7 @@ fn legacy_copy(
     path: &std::path::Path,
 ) -> (product_store::ProjectSnapshot, Vec<u8>, PathBuf, Vec<u8>) {
     let snapshot = ProductStore::open(path).unwrap().load().unwrap();
-    assert!(snapshot.scope.layers.is_empty());
+    assert!(snapshot.scalar_scope().unwrap().layers.is_empty());
     let mut wire = serde_json::to_value(&snapshot).unwrap();
     wire.as_object_mut().unwrap().remove("scope");
     wire["version"] = serde_json::json!(1);
@@ -653,7 +653,7 @@ fn format_one_open_requires_confirmation_then_reopens_with_records_receipts_and_
     settle(&mut studio);
     assert_eq!(studio.test_page(), "daily", "{}", studio.test_notice());
     let upgraded = ProductStore::open(&path).unwrap().load().unwrap();
-    assert_eq!(upgraded.version, 2);
+    assert_eq!(upgraded.version, 3);
     assert_eq!(upgraded.data, before.data);
     assert_eq!(upgraded.operations, before.operations);
     assert_eq!(upgraded.session, before.session);
@@ -755,7 +755,7 @@ fn committed_upgrade_lost_ack_and_close_reconcile_without_repeating_creation() {
     settle(&mut studio);
     assert_eq!(studio.test_page(), "home");
     let current = ProductStore::open(&path).unwrap().load().unwrap();
-    assert_eq!(current.version, 2);
+    assert_eq!(current.version, 3);
     assert_eq!(current.data, before.data);
     assert_eq!(fs::read(object).unwrap(), bytes);
     let pointer = fs::read(path.join("CURRENT")).unwrap();
@@ -791,20 +791,97 @@ fn interrupted_upgrade_uses_only_verified_activation_and_never_auto_migrates() {
         let version = serde_json::from_slice::<serde_json::Value>(&pointer).unwrap()["version"]
             .as_u64()
             .unwrap();
+        assert_eq!(
+            version,
+            if fault == FaultPoint::AfterPointer {
+                3
+            } else {
+                1
+            }
+        );
+        let project_files = || {
+            fs::read_dir(&path)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .filter(|entry| entry.file_name() != ".write.lock")
+                .map(|entry| (entry.file_name(), fs::read(entry.path()).unwrap()))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let interrupted_files = project_files();
+        let hooks = TestHooks::default();
+        let stopped = hooks.stopped.clone();
+        let mut studio = ProductStudio::testing(root.clone(), None, hooks);
+        settle(&mut studio);
+        // A visible format-3 pointer is still unfinished after AfterPointer.
+        // Reopening or attempting daily work must never complete it implicitly.
+        for _ in 0..2 {
+            assert_eq!(
+                studio.test_page(),
+                "upgrade",
+                "{fault:?}: {}",
+                studio.test_notice()
+            );
+            assert!(studio.test_runtime().is_none());
+            assert!(matches!(
+                ProductStore::open(&path).unwrap().load(),
+                Err(product_store::StoreError::UpgradeRequired)
+            ));
+            studio.test_daily(add("Must not complete an interrupted upgrade"));
+            settle(&mut studio);
+            studio.test_close();
+            settle(&mut studio);
+            studio.test_open(path.clone());
+            settle(&mut studio);
+            assert_eq!(project_files(), interrupted_files);
+        }
+        stop(studio, &stopped);
+        let hooks = TestHooks::default();
+        let stopped = hooks.stopped.clone();
+        let mut studio = ProductStudio::testing(root.clone(), None, hooks);
+        settle(&mut studio);
+        assert_eq!(
+            studio.test_page(),
+            "upgrade",
+            "{fault:?}: {}",
+            studio.test_notice()
+        );
+        assert!(studio.test_runtime().is_none());
+        assert_eq!(project_files(), interrupted_files);
+        studio.test_upgrade();
+        studio.test_upgrade(); // A repeated click cannot submit a second upgrade.
+        settle(&mut studio);
+        assert_eq!(
+            studio.test_page(),
+            "daily",
+            "{fault:?}: {}",
+            studio.test_notice()
+        );
+        let upgraded = ProductStore::open(&path).unwrap().load().unwrap();
+        assert_eq!(upgraded.version, 3);
+        assert_eq!(upgraded.data, before.data);
+        assert_eq!(upgraded.operations, before.operations);
+        assert_eq!(upgraded.session, before.session);
+        assert_eq!(upgraded.artifacts, before.artifacts);
+        assert_eq!(upgraded.programs, before.programs);
+        assert_eq!(fs::read(&object).unwrap(), bytes);
+        assert_eq!(
+            fs::read(path.join("UPGRADE-COMPLETE")).unwrap(),
+            fs::read(path.join("UPGRADE-PENDING")).unwrap()
+        );
+        let completed_files = project_files();
+        studio.test_upgrade();
+        settle(&mut studio);
+        assert_eq!(project_files(), completed_files);
+        stop(studio, &stopped);
         let mut studio = ProductStudio::testing(root, None, TestHooks::default());
         settle(&mut studio);
-        assert_eq!(fs::read(path.join("CURRENT")).unwrap(), pointer);
-        if version == 1 {
-            assert_eq!(studio.test_page(), "upgrade", "{}", studio.test_notice());
-            studio.test_upgrade();
-            settle(&mut studio);
-        }
-        assert_eq!(studio.test_page(), "daily", "{}", studio.test_notice());
         assert_eq!(
-            ProductStore::open(&path).unwrap().load().unwrap().data,
-            before.data
+            studio.test_page(),
+            "daily",
+            "{fault:?}: {}",
+            studio.test_notice()
         );
-        assert_eq!(fs::read(object).unwrap(), bytes);
+        assert_eq!(project_files(), completed_files);
         studio.test_daily(add("Continued"));
         settle(&mut studio);
         assert_eq!(
@@ -817,6 +894,7 @@ fn interrupted_upgrade_uses_only_verified_activation_and_never_auto_migrates() {
                 .len(),
             2
         );
+        assert_eq!(fs::read(&object).unwrap(), bytes);
     }
 }
 
@@ -918,4 +996,61 @@ fn daily_store_view_preserves_completed_history_after_reopen_and_further_work() 
         restarted.test_runtime().unwrap().history,
         store.runtime_view().unwrap().history
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn upgrade_visible_pointer_does_not_hide_an_unfinished_durability_barrier() {
+    let (_temp, root) = root();
+    let path = saved(&root);
+    legacy_copy(&path);
+    let hooks = TestHooks::default();
+    let stopped = hooks.stopped.clone();
+    let mut studio = ProductStudio::testing(root.clone(), None, hooks);
+    settle(&mut studio);
+    studio.test_open(path.clone());
+    settle(&mut studio);
+    assert_eq!(studio.test_page(), "upgrade");
+    // Target, journal, pending record and pre-activation barriers succeed;
+    // CURRENT becomes visible before its own directory barrier fails.
+    let fault = product_store::file_sync_testing::fail_after(path.clone(), 4);
+    studio.test_upgrade();
+    settle(&mut studio);
+    let pointer: serde_json::Value =
+        serde_json::from_slice(&fs::read(path.join("CURRENT")).unwrap()).unwrap();
+    assert_eq!(pointer["version"], 3);
+    assert!(matches!(
+        ProductStore::open(&path).unwrap().load(),
+        Err(product_store::StoreError::UpgradeRequired)
+    ));
+    assert!(!studio
+        .test_notice()
+        .contains("Local format upgrade verified"));
+    assert_ne!(studio.test_page(), "daily");
+    studio.test_open(path.clone());
+    settle(&mut studio);
+    assert_eq!(
+        studio.test_page(),
+        "upgrade",
+        "reopen bypassed verification"
+    );
+    stop(studio, &stopped);
+    let mut studio = ProductStudio::testing(root, None, TestHooks::default());
+    settle(&mut studio);
+    assert_eq!(
+        studio.test_page(),
+        "upgrade",
+        "restart bypassed verification"
+    );
+    studio.test_upgrade();
+    settle(&mut studio);
+    assert_eq!(
+        studio.test_page(),
+        "upgrade",
+        "failed retry enabled daily editing"
+    );
+    drop(fault);
+    studio.test_upgrade();
+    settle(&mut studio);
+    assert_eq!(studio.test_page(), "daily", "{}", studio.test_notice());
 }

@@ -1261,6 +1261,10 @@ impl Worker {
         match inspect_open(&tool.path, Some(&tool.identity)).map_err(error)? {
             OpenGate::UpgradeRequired(current) if current == *summary => (),
             OpenGate::Ready(_) => {
+                // A visible pointer after an earlier failed barrier is not a
+                // durable-success certificate. This explicit retry completes
+                // checked file and directory barriers before opening work.
+                upgrade_open_verified(&tool.path, Some(&tool.identity), |_| {}).map_err(error)?;
                 self.notice = "This tool is already upgraded; reopening its verified current work".into();
                 return self.open(tool.path.clone(), Some(tool.identity.clone()));
             }
@@ -1297,6 +1301,9 @@ impl Worker {
         // Reconcile the same path/identity, never create or overwrite a copy.
         match inspect_open(&tool.path, Some(&tool.identity)).map_err(error)? {
             OpenGate::Ready(_) => {
+                if result.is_err() {
+                    upgrade_open_verified(&tool.path, Some(&tool.identity), |_| {}).map_err(error)?;
+                }
                 self.committed = Some(tool.path.clone());
                 self.after_commit();
                 self.notice = "Local format upgrade verified. The tool was restarted and reopened with its saved work; original snapshots and backups were kept".into();
@@ -1308,7 +1315,7 @@ impl Worker {
                 }
                 Ok(())
             }
-            OpenGate::UpgradeRequired(_) => Err(format!("The upgrade did not activate. Original saved work is kept; review and retry the upgrade. {:?}", result.err())),
+            OpenGate::UpgradeRequired(_) => Err(format!("The upgrade has not completed verification. Original saved work is kept; reopen this folder and explicitly retry the upgrade before continuing. {:?}", result.err())),
         }
     }
     fn post_save(&mut self, tool: &Association) {

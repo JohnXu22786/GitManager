@@ -19,6 +19,33 @@ const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SCAN_FILES: usize = 4096;
 const MAX_AUTOMATIC_CHECKS: usize = 64;
 const MAGIC: &str = "gitmanager.generated-tool-backup";
+#[path = "tool_proposal_input.rs"]
+mod bounded_input;
+fn backup_header(bytes: &[u8]) -> Result<serde_json::Value> {
+    bounded_input::parse_json_bytes_with_limit(bytes, MAX_BACKUP_BYTES)
+        .map_err(|e| OperationIssue::new(IssueKind::Corrupt, e))
+}
+fn snapshot_version(header: &serde_json::Value) -> Result<u32> {
+    if header.get("magic").and_then(|v| v.as_str()) != Some(MAGIC) {
+        return Err(OperationIssue::new(
+            IssueKind::Corrupt,
+            "not a generated-tool backup",
+        ));
+    }
+    if header.get("version").and_then(|v| v.as_u64()) != Some(1) {
+        return Err(OperationIssue::new(
+            IssueKind::Unsupported,
+            "backup envelope version",
+        ));
+    }
+    header
+        .get("payload")
+        .and_then(|p| p.get("snapshot"))
+        .and_then(|s| s.get("version"))
+        .and_then(|v| v.as_u64())
+        .and_then(|v| u32::try_from(v).ok())
+        .ok_or_else(|| OperationIssue::new(IssueKind::Corrupt, "invalid snapshot version"))
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -143,34 +170,24 @@ impl VerifiedBackup {
                 "backup intake byte limit",
             ));
         }
-        let header: serde_json::Value = serde_json::from_slice(bytes)?;
-        if header
-            .get("payload")
-            .and_then(|p| p.get("snapshot"))
-            .and_then(|s| s.get("version"))
-            .and_then(|v| v.as_u64())
-            .is_some_and(|version| version != 1 && version != 2)
-        {
-            return Err(OperationIssue::new(
-                IssueKind::Unsupported,
-                "unsupported generated-project snapshot version",
-            ));
-        }
-        if header
-            .get("payload")
-            .and_then(|p| p.get("snapshot"))
-            .and_then(|s| s.get("version"))
-            .and_then(|v| v.as_u64())
-            == Some(1)
-        {
-            LegacyBackup::from_bytes(bytes)?;
-            return Err(OperationIssue::new(
-                IssueKind::UpgradeRequired,
-                "legacy backup requires explicit fresh-destination upgrade",
-            ));
+        let header = backup_header(bytes)?;
+        match snapshot_version(&header)? {
+            1 | 2 => {
+                return Err(OperationIssue::new(
+                    IssueKind::UpgradeRequired,
+                    "old backup requires explicit fresh-destination upgrade",
+                ))
+            }
+            crate::product_store::GENERATED_PROJECT_FORMAT => (),
+            _ => {
+                return Err(OperationIssue::new(
+                    IssueKind::Unsupported,
+                    "unsupported generated-project snapshot version",
+                ))
+            }
         }
         let backup = Self {
-            envelope: serde_json::from_slice(bytes)?,
+            envelope: serde_json::from_value(header)?,
         };
         backup.validate()?;
         // Exact canonical equality also rejects duplicate map members, even
@@ -424,7 +441,7 @@ pub struct CheckpointReceipt {
     pub summary: BackupSummary,
 }
 pub struct CheckpointSearch {
-    pub recovery: Option<VerifiedBackup>,
+    pub recovery: Option<BackupIntake>,
     pub issues: Vec<OperationIssue>,
 }
 impl CheckpointShelf {
@@ -448,11 +465,11 @@ impl CheckpointShelf {
     pub fn path(&self) -> &Path {
         self.folder.path()
     }
-    fn name(backup: &VerifiedBackup) -> String {
+    fn name(summary: &BackupSummary) -> String {
         format!(
             "checkpoint-{:020}-{}.gmbak",
-            backup.snapshot().revision,
-            backup.digest().as_str()
+            summary.revision,
+            summary.digest.as_str()
         )
     }
     /// Call after opening and after each successful committed save/adoption,
@@ -470,7 +487,7 @@ impl CheckpointShelf {
                 "checkpoint tool identity mismatch",
             ));
         }
-        let name = Self::name(backup);
+        let name = Self::name(&summary);
         let bytes = backup.to_bytes()?;
         match self.folder.publish(&name, &bytes, false) {
             Ok(()) => (),
@@ -517,10 +534,10 @@ impl CheckpointShelf {
             let candidate = self
                 .folder
                 .read(&name, MAX_BACKUP_BYTES)
-                .and_then(|bytes| VerifiedBackup::from_bytes(&bytes));
+                .and_then(|bytes| inspect_backup(&bytes));
             match candidate {
                 Ok(backup)
-                    if Self::name(&backup) == name
+                    if Self::name(&backup.summary()?) == name
                         && backup.summary()?.identity == self.identity =>
                 {
                     return Ok(CheckpointSearch {
@@ -551,7 +568,7 @@ impl CheckpointShelf {
 pub struct DoctorReport {
     pub current: Option<BackupSummary>,
     pub issue: Option<OperationIssue>,
-    pub recovery: Option<VerifiedBackup>,
+    pub recovery: Option<BackupIntake>,
     pub checkpoint_issues: Vec<OperationIssue>,
 }
 /// Read-only diagnosis. A corrupt CURRENT/object is never silently repaired.
@@ -667,7 +684,8 @@ struct LegacyEnvelope {
 /// the original backup is never rewritten or used as an ordinary writable store.
 pub struct LegacyBackup {
     original: Vec<u8>,
-    upgrade: crate::product_store::LegacyUpgrade,
+    upgrade: crate::product_store::VerifiedContainerUpgrade,
+    digest: Digest,
     intentions: IntentionBundle,
 }
 pub enum BackupIntake {
@@ -678,21 +696,50 @@ pub fn inspect_backup(bytes: &[u8]) -> Result<BackupIntake> {
     if bytes.len() > MAX_BACKUP_BYTES {
         return Err(OperationIssue::new(IssueKind::Limit, "backup intake limit"));
     }
-    let header: serde_json::Value = serde_json::from_slice(bytes)?;
-    if header
-        .get("payload")
-        .and_then(|p| p.get("snapshot"))
-        .and_then(|s| s.get("version"))
-        .and_then(|v| v.as_u64())
-        == Some(1)
-    {
-        Ok(BackupIntake::UpgradeRequired(LegacyBackup::from_bytes(
+    let header = backup_header(bytes)?;
+    match snapshot_version(&header)? {
+        1 | 2 => Ok(BackupIntake::UpgradeRequired(LegacyBackup::from_bytes(
             bytes,
-        )?))
-    } else {
-        Ok(BackupIntake::Current(VerifiedBackup::from_bytes(bytes)?))
+        )?)),
+        crate::product_store::GENERATED_PROJECT_FORMAT => {
+            Ok(BackupIntake::Current(VerifiedBackup::from_bytes(bytes)?))
+        }
+        _ => Err(OperationIssue::new(
+            IssueKind::Unsupported,
+            "unsupported generated-project snapshot version",
+        )),
     }
 }
+impl BackupIntake {
+    pub fn summary(&self) -> Result<BackupSummary> {
+        match self {
+            Self::Current(b) => b.summary(),
+            Self::UpgradeRequired(b) => b.summary(),
+        }
+    }
+    pub fn digest(&self) -> &Digest {
+        match self {
+            Self::Current(b) => b.digest(),
+            Self::UpgradeRequired(b) => b.digest(),
+        }
+    }
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        match self {
+            Self::Current(b) => b.to_bytes(),
+            Self::UpgradeRequired(b) => Ok(b.original_bytes().to_vec()),
+        }
+    }
+    pub(crate) fn snapshot(&self) -> &ProjectSnapshot {
+        match self {
+            Self::Current(b) => b.snapshot(),
+            Self::UpgradeRequired(b) => b.snapshot(),
+        }
+    }
+    pub fn requires_upgrade(&self) -> bool {
+        matches!(self, Self::UpgradeRequired(_))
+    }
+}
+
 impl LegacyBackup {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.len() > MAX_BACKUP_BYTES {
@@ -701,7 +748,7 @@ impl LegacyBackup {
                 "legacy backup intake limit",
             ));
         }
-        let envelope: LegacyEnvelope = serde_json::from_slice(bytes)?;
+        let envelope: LegacyEnvelope = serde_json::from_value(backup_header(bytes)?)?;
         if envelope.magic != MAGIC || envelope.version != 1 {
             return Err(OperationIssue::new(
                 IssueKind::Unsupported,
@@ -716,19 +763,50 @@ impl LegacyBackup {
                 "legacy backup checksum/canonical content mismatch",
             ));
         }
-        let upgrade = crate::product_store::LegacyUpgrade::decode(&canonical_bytes(
+        let upgrade = crate::product_store::VerifiedContainerUpgrade::decode(&canonical_bytes(
             &envelope.payload.snapshot,
         )?)?;
         let intentions = crate::product_decisions::upgrade_bundle_binding(
-            &upgrade.original_digest,
-            &upgrade.snapshot,
+            &upgrade,
             &envelope.payload.intentions,
         )
         .map_err(|e| OperationIssue::new(IssueKind::Corrupt, e))?;
+        LocalRuntime::default()
+            .resume(
+                upgrade.snapshot().program()?,
+                &upgrade.snapshot().data,
+                &upgrade.snapshot().session,
+                upgrade.snapshot().clock_day,
+                0,
+                RuntimeLimits::default(),
+                &upgrade.snapshot().artifacts,
+            )
+            .map_err(|e| OperationIssue::new(IssueKind::Incompatible, format!("{e:?}")))?;
         Ok(Self {
             original: bytes.to_vec(),
+            digest: envelope.digest,
             upgrade,
             intentions,
+        })
+    }
+    pub fn digest(&self) -> &Digest {
+        &self.digest
+    }
+    pub(crate) fn snapshot(&self) -> &ProjectSnapshot {
+        self.upgrade.snapshot()
+    }
+    pub fn summary(&self) -> Result<BackupSummary> {
+        let snapshot = self.snapshot();
+        Ok(BackupSummary {
+            digest: self.digest.clone(),
+            identity: ToolIdentity::from_snapshot(snapshot)?,
+            label: snapshot.program()?.program.label.clone(),
+            revision: snapshot.revision,
+            records: snapshot.data.records.len(),
+            events: snapshot.data.events.len(),
+            outputs: snapshot.artifacts.len(),
+            decisions: snapshot.decisions.decisions.len(),
+            intention_objects: self.intentions.object_count(),
         })
     }
     pub fn original_bytes(&self) -> &[u8] {
@@ -833,20 +911,40 @@ impl LegacyBackup {
         P: FnMut(crate::product_store::UpgradeProgress),
     {
         let verified = Self::from_bytes(&self.original)?;
-        let before_activate = |store: &ProductStore, snapshot: &ProjectSnapshot| {
+        let before_activate = |store: &ProductStore, snapshot: &ProjectSnapshot, sealed: bool| {
             if let Some(selected) = selected {
                 selected.check()?;
             }
             verify_instance().map_err(|e| StoreError::Conflict(e.to_string()))?;
-            IntentArchive::new(store.clone())
-                .restore_for(snapshot, &verified.intentions)
-                .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+            let archive = IntentArchive::new(store.clone());
+            if sealed {
+                // A pending/activated recovery has already sealed its inputs;
+                // verify exact retained objects without an ordinary write.
+                archive
+                    .export_for(snapshot)
+                    .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+                if !verified
+                    .intentions
+                    .matches_store_objects(store)
+                    .map_err(|e| StoreError::Corrupt(e.to_string()))?
+                {
+                    return Err(StoreError::Corrupt(
+                        "activated upgrade intention bytes changed".into(),
+                    ));
+                }
+            } else {
+                archive
+                    .restore_for(snapshot, &verified.intentions)
+                    .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+            }
             verify_instance().map_err(|e| StoreError::Conflict(e.to_string()))
         };
         Ok(match selected {
             Some(selected) => ProductStore::recover_upgraded_selected(
                 selected,
                 &verified.upgrade,
+                &verified.digest,
+                &canonical_digest(IdentityDomain::Evidence, &verified.intentions)?,
                 before_activate,
                 progress,
                 #[cfg(test)]
@@ -855,6 +953,8 @@ impl LegacyBackup {
             None => ProductStore::recover_upgraded_with(
                 path,
                 &verified.upgrade,
+                &verified.digest,
+                &canonical_digest(IdentityDomain::Evidence, &verified.intentions)?,
                 fresh_only,
                 before_activate,
                 progress,
