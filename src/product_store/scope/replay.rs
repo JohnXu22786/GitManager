@@ -106,6 +106,25 @@ impl ScopedExecutionContext {
                 .collect(),
         )
     }
+    pub(crate) fn owned_prepared(
+        snapshot: &ProjectSnapshot,
+        prepared: &PreparedOwnedScopedChangeV2,
+        graph: Option<&DecisionGraph>,
+        mode: &OwnedChoiceMode,
+    ) -> Result<Self> {
+        Ok(Self {
+            snapshot: snapshot.clone(),
+            owned: Some(owned_replay::OwnedExecutionContext::for_prepared(
+                snapshot, prepared, graph,
+            )?),
+            adoption_target: match mode {
+                OwnedChoiceMode::Activate => revision(prepared.target())?,
+                OwnedChoiceMode::Record(_) => snapshot.active_revision.clone(),
+            },
+            projected_seeds: BTreeSet::new(),
+            correspondences: BTreeMap::new(),
+        })
+    }
     pub(super) fn registry(snapshot: &ProjectSnapshot) -> Result<Self> {
         Ok(Self {
             snapshot: rehearsal::replay_snapshot(snapshot)?,
@@ -612,7 +631,13 @@ impl ScopedExecutionContext {
     pub fn admit_target(&self, target: &CapturedProgram) -> Result<()> {
         if self.owned.is_some() {
             target.validate()?;
-            if target == self.snapshot.program()? {
+            if revision(target)? == self.adoption_target
+                && self
+                    .owned
+                    .as_ref()
+                    .expect("owned context")
+                    .permits_target(target)?
+            {
                 return Ok(());
             }
             return Err(compiler::error(

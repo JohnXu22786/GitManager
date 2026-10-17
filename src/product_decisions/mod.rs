@@ -5,12 +5,15 @@ mod bundle;
 mod context;
 mod evolution;
 mod mapping;
+mod owned;
+use owned::{ChangeAuthority, OwnedDecisionContext};
 mod recovery;
 mod replay;
 use crate::product_contract::*;
 use crate::product_runtime::{LocalRuntime, DRIVER_VERSION};
 use crate::product_store::scope::{
-    PreparedScopedChange, RetainedScene, ScopeCorrespondence, ScopedExecutionContext,
+    OwnedChoiceMode, PreparedOwnedScopedChangeV2, PreparedScopedChange, RetainedScene,
+    ScopeCorrespondence, ScopedExecutionContext,
 };
 use crate::product_store::{PreparedAdoption, ProductStore, ProjectSnapshot, StoreError};
 pub use archive::IntentArchive;
@@ -116,8 +119,7 @@ impl CheckReport {
 }
 /// Kept opaque: only this host can prepare it, and commit repeats the checks.
 pub struct VerifiedChange {
-    scoped: Option<PreparedScopedChange>,
-    rehearsal: Option<(Vec<PreparedScopedChange>, Vec<Id>)>,
+    authority: ChangeAuthority,
     correspondences: BTreeMap<Digest, ScopeCorrespondence>,
     prepared: PreparedAdoption,
     revision: u64,
@@ -126,7 +128,8 @@ pub struct VerifiedChange {
     mappings: Vec<ImplementationMapping>,
     report: CheckReport,
     expected_snapshot: Digest,
-    runtime: String,
+    runtime: RuntimeCapabilities,
+    limits: RuntimeLimits,
 }
 impl VerifiedChange {
     pub fn report(&self) -> &CheckReport {
@@ -145,6 +148,8 @@ struct AdmissionKey {
     prepared: Option<PreparedScopedChange>,
     rehearsal: Option<(Vec<PreparedScopedChange>, Vec<Id>)>,
     correspondences: BTreeMap<Digest, ScopeCorrespondence>,
+    owned: Option<OwnedDecisionContext>,
+    limits: RuntimeLimits,
     runtime: RuntimeCapabilities,
     driver: &'static str,
 }
@@ -157,6 +162,7 @@ pub struct DecisionEngine<R: RuntimeAdapter> {
     archive: IntentArchive,
     limits: RuntimeLimits,
     pending_scope: RefCell<Option<PreparedScopedChange>>,
+    pending_owned: RefCell<Option<OwnedDecisionContext>>,
     pending_rehearsal: RefCell<Option<(Vec<PreparedScopedChange>, Vec<Id>)>>,
     pending_correspondences: RefCell<BTreeMap<Digest, ScopeCorrespondence>>,
     // One immutable admission result; every lookup still freshly loads and
@@ -174,6 +180,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             archive,
             limits: RuntimeLimits::default(),
             pending_scope: RefCell::new(None),
+            pending_owned: RefCell::new(None),
             pending_rehearsal: RefCell::new(None),
             pending_correspondences: RefCell::new(BTreeMap::new()),
             admission_cache: RefCell::new(None),
@@ -223,9 +230,20 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             prepared: self.pending_scope.borrow().clone(),
             rehearsal: self.pending_rehearsal.borrow().clone(),
             correspondences: self.pending_correspondences.borrow().clone(),
+            owned: self.pending_owned.borrow().clone(),
+            limits: self.limits.clone(),
             runtime: self.runtime.capabilities(),
             driver: DRIVER_VERSION,
         };
+        if let Some(owned) = &key.owned {
+            owned.prepared.check_basis(&key.current)?;
+            if key.prepared.is_some() || key.rehearsal.is_some() || !key.correspondences.is_empty()
+            {
+                return Err(invalid(
+                    "owned and scalar decision authority cannot coexist",
+                ));
+            }
+        }
         if let Some(cached) = self.admission_cache.borrow().as_ref() {
             if cached.key == key {
                 #[cfg(test)]
@@ -236,7 +254,14 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         self.clear_admission_cache();
         #[cfg(test)]
         self.admission_builds.set(self.admission_builds.get() + 1);
-        let context = if let Some(prepared) = &key.prepared {
+        let context = if let Some(owned) = &key.owned {
+            ScopedExecutionContext::owned_prepared(
+                &key.current,
+                &owned.prepared,
+                owned.next.as_ref(),
+                &owned.mode,
+            )?
+        } else if let Some(prepared) = &key.prepared {
             if key.rehearsal.is_some() {
                 return Err(invalid(
                     "rehearsal retention and activation cannot share an authority context",
@@ -267,6 +292,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         current: &ProjectSnapshot,
     ) -> Result<ScopedExecutionContext> {
         if self.pending_scope.borrow().is_some()
+            || self.pending_owned.borrow().is_some()
             || self.pending_rehearsal.borrow().is_some()
             || self.archive.snapshot()? != *current
         {
@@ -1243,15 +1269,31 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             .revision
             .checked_add(1)
             .ok_or_else(|| invalid("decision revision overflow"))?;
-        self.prepare(
-            store,
-            &current,
-            target,
-            next,
-            self.current_mappings(&current)?,
-            resolves.to_vec(),
-            id,
-        )
+        let owned = self.pending_owned.borrow().clone();
+        if let Some(mut owned) = owned {
+            owned.next = Some(next.clone());
+            self.with_owned(owned, || {
+                self.prepare(
+                    store,
+                    &current,
+                    target,
+                    next,
+                    self.current_mappings(&current)?,
+                    resolves.to_vec(),
+                    id,
+                )
+            })
+        } else {
+            self.prepare(
+                store,
+                &current,
+                target,
+                next,
+                self.current_mappings(&current)?,
+                resolves.to_vec(),
+                id,
+            )
+        }
     }
     pub fn prepare_change(
         &self,
@@ -1536,6 +1578,12 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 .borrow()
                 .as_ref()
                 .map(|p| p.scope().clone())
+                .or_else(|| {
+                    self.pending_owned
+                        .borrow()
+                        .as_ref()
+                        .map(|o| o.prepared.scope())
+                })
                 .unwrap_or_else(|| DecisionScope {
                     operations: target
                         .program
@@ -1572,16 +1620,21 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         }
         validate_withdrawal_delta(current, &next, &plan)?;
         self.verify_destination_packages(store, current, &next, &plan)?;
-        let prepared = match self.pending_scope.borrow().as_ref() {
-            Some(scoped) => store.prepare_scoped_adoption(plan, target, scoped)?,
-            None => store.prepare_adoption(plan, target)?,
+        let owned = self.pending_owned.borrow().clone();
+        let prepared = if let Some(owned) = &owned {
+            store.prepare_owned_adoption(plan, &owned.prepared, &owned.mode)?
+        } else {
+            match self.pending_scope.borrow().as_ref() {
+                Some(scoped) => store.prepare_scoped_adoption(plan, target, scoped)?,
+                None => store.prepare_adoption(plan, target)?,
+            }
         };
-        let state = current.scalar_scope()?;
+        let state = current.scalar_scope().ok();
         let correspondences: BTreeMap<_, _> = self
             .pending_correspondences
             .borrow()
             .iter()
-            .filter(|(id, _)| !state.correspondences.contains_key(*id))
+            .filter(|(id, _)| !state.is_some_and(|s| s.correspondences.contains_key(*id)))
             .map(|(id, proof)| (id.clone(), proof.clone()))
             .collect();
         let mut scoped = self.pending_scope.borrow().clone();
@@ -1589,9 +1642,16 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             scoped.correspondences = correspondences.clone();
         }
         Ok(VerifiedChange {
-            scoped,
+            authority: if let Some(owned) = owned {
+                ChangeAuthority::Owned(owned)
+            } else if let Some(scoped) = scoped {
+                ChangeAuthority::ScalarActivation(scoped)
+            } else if let Some((prepared, ids)) = self.pending_rehearsal.borrow().clone() {
+                ChangeAuthority::ScalarRecording(prepared, ids)
+            } else {
+                ChangeAuthority::Ordinary
+            },
             correspondences,
-            rehearsal: self.pending_rehearsal.borrow().clone(),
             prepared,
             revision: current.revision,
             target: target.clone(),
@@ -1599,12 +1659,30 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             mappings,
             report,
             expected_snapshot: canonical_digest(IdentityDomain::Data, current)?,
-            runtime: self.runtime.capabilities().version,
+            runtime: self.runtime.capabilities(),
+            limits: self.limits.clone(),
         })
     }
     pub fn adopt(&self, store: &ProductStore, change: &VerifiedChange) -> Result<ProjectSnapshot> {
-        self.with_scoped(change.scoped.clone(), || {
-            self.with_rehearsal(change.rehearsal.clone(), || {
+        if let ChangeAuthority::Owned(owned) = &change.authority {
+            return self.adopt_owned(
+                store,
+                change,
+                owned,
+                #[cfg(test)]
+                None,
+            );
+        }
+        let scoped = match &change.authority {
+            ChangeAuthority::ScalarActivation(p) => Some(p.clone()),
+            _ => None,
+        };
+        let rehearsal = match &change.authority {
+            ChangeAuthority::ScalarRecording(p, ids) => Some((p.clone(), ids.clone())),
+            _ => None,
+        };
+        self.with_scoped(scoped.clone(), || {
+            self.with_rehearsal(rehearsal.clone(), || {
                 self.with_correspondences(change.correspondences.clone(), || {
                     let verify =
                         |current: &ProjectSnapshot,
@@ -1613,7 +1691,8 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                          plan: &AdoptionPlan| {
                             if canonical_digest(IdentityDomain::Data, current)?
                                 != change.expected_snapshot
-                                || self.runtime.capabilities().version != change.runtime
+                                || self.runtime.capabilities() != change.runtime
+                                || self.limits != change.limits
                                 || next != &change.decisions
                                 || target != &change.target
                                 || plan != change.prepared.plan()
@@ -1653,7 +1732,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                             }
                             Ok(())
                         };
-                    Ok(if let Some(scoped) = &change.scoped {
+                    Ok(if let Some(scoped) = &scoped {
                         store.adopt_scoped_verified(
                             change.revision,
                             scoped,
@@ -1661,7 +1740,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                             &change.decisions,
                             verify,
                         )?
-                    } else if let Some((proof, ids)) = &change.rehearsal {
+                    } else if let Some((proof, ids)) = &rehearsal {
                         store.adopt_rehearsals_verified(
                             change.revision,
                             &change.prepared,

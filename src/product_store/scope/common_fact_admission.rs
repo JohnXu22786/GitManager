@@ -49,6 +49,7 @@ pub(super) struct ProofMeter {
     started: Instant,
     millis: u64,
     cancelled: Arc<AtomicBool>,
+    additional_cancelled: Option<Arc<AtomicBool>>,
 }
 impl ProofMeter {
     pub(super) fn new(budget: ProofBudget, cancelled: Arc<AtomicBool>) -> AdmissionResult<Self> {
@@ -64,12 +65,20 @@ impl ProofMeter {
             started: Instant::now(),
             millis: budget.elapsed_millis,
             cancelled,
+            additional_cancelled: None,
         };
         result.charge(1)?;
         Ok(result)
     }
+    pub(super) fn watch_cancellation(&mut self, token: &Arc<AtomicBool>) {
+        self.additional_cancelled = Some(token.clone());
+    }
     pub(super) fn charge(&mut self, units: u64) -> AdmissionResult<()> {
         if self.cancelled.load(Ordering::Relaxed)
+            || self
+                .additional_cancelled
+                .as_ref()
+                .is_some_and(|c| c.load(Ordering::Relaxed))
             || self.started.elapsed().as_millis() >= u128::from(self.millis)
         {
             return Err(refuse(
@@ -265,6 +274,18 @@ pub(super) fn authenticate(
     meter: &mut ProofMeter,
 ) -> AdmissionResult<CommonFactInventory> {
     authenticate_inner(snapshot, candidate, request, meter, true)
+}
+// This internal decision route authenticates the live snapshot, but does not
+// settle intentions. DecisionEngine independently checks the selected target.
+pub(super) fn derive_for_decision(
+    snapshot: &ProjectSnapshot,
+    candidate: &CapturedProgram,
+    request: &OwnedPreviewRequest,
+    accepted: &super::owned_lifecycle::AcceptedPreviewLifecycle,
+    meter: &mut ProofMeter,
+) -> AdmissionResult<VerifiedOwnedPreviewPlan> {
+    snapshot.validate()?;
+    derive_inner(snapshot, candidate, request, accepted, meter, false)
 }
 pub(super) fn derive_retained(
     snapshot: &ProjectSnapshot,
