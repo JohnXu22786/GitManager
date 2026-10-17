@@ -75,7 +75,14 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         let scenes = self.pending_scene_package(current, decision)?;
         for scene in &scenes {
             let (_, contexts) = self.reproduce_scene(scene, &current.decisions)?;
-            if assess_scope(&decision.scope, &contexts) != ScopeMatch::Applies {
+            let applicability = self.scope_context()?.applicability(
+                &scene.program,
+                &scene.program,
+                &decision.scope,
+                Some(decision),
+                false,
+            )?;
+            if assess_scope(&decision.scope, &contexts, &applicability) != ScopeMatch::Applies {
                 return Err(DecisionError::Unverified(
                     "The original scene does not establish the pending decision's applicability"
                         .into(),
@@ -130,7 +137,14 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 });
             for scene in scenes {
                 let (original, contexts) = self.reproduce_scene(&scene, &current.decisions)?;
-                match assess_scope(&decision.scope, &contexts) {
+                let applicability = self.scope_context()?.applicability(
+                    &scene.program,
+                    &scene.program,
+                    &decision.scope,
+                    Some(decision),
+                    false,
+                )?;
+                match assess_scope(&decision.scope, &contexts, &applicability) {
                     ScopeMatch::Outside => continue,
                     ScopeMatch::Unknown => {
                         return Err(DecisionError::Unverified(
@@ -174,7 +188,8 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                     let operations = contexts
                         .iter()
                         .filter(|context| {
-                            scope_match(&decision.scope, context).state == ScopeMatch::Applies
+                            bound_scope_match(&decision.scope, context, &applicability).state
+                                == ScopeMatch::Applies
                         })
                         .map(|context| context.operation.clone())
                         .collect();
@@ -233,7 +248,10 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 }
                 let exercised = contexts
                     .iter()
-                    .filter(|c| scope_match(&decision.scope, c).state == ScopeMatch::Applies)
+                    .filter(|c| {
+                        bound_scope_match(&decision.scope, c, &applicability).state
+                            == ScopeMatch::Applies
+                    })
                     .map(|c| c.operation.clone())
                     .collect();
                 let operations = evolution::mapped_operations(
@@ -244,7 +262,20 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                     &scene.program.program,
                     &target.program,
                 )?;
-                verify_target_scope(&decision.scope, &operations, &mapping, &target_contexts)?;
+                let target_applicability = self.scope_context()?.applicability(
+                    &scene.program,
+                    target,
+                    &decision.scope,
+                    Some(decision),
+                    false,
+                )?;
+                verify_target_scope(
+                    &decision.scope,
+                    &operations,
+                    &mapping,
+                    &target_contexts,
+                    &target_applicability,
+                )?;
                 result.push(VerifiedDiscoveryScene {
                     decision: decision.id.clone(),
                     package: decision.witness.clone(),

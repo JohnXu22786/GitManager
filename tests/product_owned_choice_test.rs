@@ -1648,3 +1648,1057 @@ fn replaced_store_path_cannot_receive_an_old_verified_choice() {
         before
     );
 }
+
+#[test]
+fn selected_owned_choice_covers_create_and_existing_record_actions() {
+    let (_dir, store, a, b) = setup_operable();
+    apply_store(
+        &store,
+        "add-unselected",
+        invoke("add", [("title".into(), text_value("unselected"))].into()),
+    );
+    let before = store.load().unwrap();
+    let mut request = operable_request(&store, &a, &b);
+    request.population = ScopePopulation::SelectedUnfinished {
+        records: vec![row(&before.data, "live"), row(&before.data, "complete-me")],
+    };
+    let e = engine(&store);
+    let (prepared, report) = e
+        .prepare_owned_change(
+            &store,
+            &b,
+            &request,
+            &lifecycle(&store, &b, &request),
+            "selected-owned",
+            ProofBudget::default(),
+            cancel(),
+        )
+        .unwrap();
+    assert_eq!(report.disposition, CheckDisposition::Ready);
+    let scenes = action_scenes(&store, &prepared);
+    let chosen = choice(
+        &prepared,
+        "selected-choice",
+        DecisionOutcome::Accept {
+            artifact: prepared.target().artifact.program_digest.clone(),
+        },
+    );
+    let verified = e
+        .prepare_owned_choice(
+            &store,
+            prepared.clone(),
+            chosen,
+            scenes,
+            prepared.operation_id(),
+        )
+        .expect("all actually exercised owned actions must support the selected-existing cohort");
+    let outside = verified
+        .report()
+        .checks
+        .iter()
+        .find(|c| c.scope == ScopeMatch::Outside)
+        .expect("pure create stays Outside");
+    assert_eq!(outside.state, CheckState::Outside);
+    let evidence = outside
+        .evidence
+        .as_ref()
+        .expect("boundary coverage retains actual replay evidence");
+    assert!(verified
+        .report()
+        .runs
+        .iter()
+        .any(|run| run.identity().as_ref() == Ok(evidence) && run.binding == outside.binding));
+    let adopted = e.adopt(&store, &verified).unwrap();
+    assert_eq!(
+        e.check_current(&adopted).unwrap().disposition,
+        CheckDisposition::Ready
+    );
+    assert_eq!(
+        adopted.decisions.decisions.last().unwrap().scope,
+        prepared.scope()
+    );
+    assert_live_population_behavior(&store, true, false);
+    let (_dir, restored) = recover(&store);
+    assert_eq!(
+        engine(&restored)
+            .check_current(&restored.load().unwrap())
+            .unwrap()
+            .disposition,
+        CheckDisposition::Ready
+    );
+}
+
+fn prepare_population(
+    store: &ProductStore,
+    a: &CapturedProgram,
+    b: &CapturedProgram,
+    population: ScopePopulation,
+    excluded_records: Vec<RecordRef>,
+    operation: &str,
+) -> PreparedOwnedScopedChangeV2 {
+    let mut request = operable_request(store, a, b);
+    request.population = population;
+    request.excluded_records = excluded_records;
+    engine(store)
+        .prepare_owned_change(
+            store,
+            b,
+            &request,
+            &lifecycle(store, b, &request),
+            operation,
+            ProofBudget::default(),
+            cancel(),
+        )
+        .unwrap()
+        .0
+}
+
+// Discover generated references by actually executing the common factual prefix.
+// This is only test input construction. Each final scene is independently
+// accepted and replayed through the production owned preparation afterward.
+fn prefix_data(store: &ProductStore, inputs: &[SemanticInput]) -> DataSnapshot {
+    let current = store.load().unwrap();
+    let original = scenario(store, "discover-prefix-references", inputs.to_vec());
+    let runtime = product_runtime::LocalRuntime::default();
+    let mut run = runtime
+        .start(
+            current.program().unwrap(),
+            &original.seed,
+            &original.session,
+            original.clock_day,
+            original.random_seed,
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    for (input, operation) in inputs.iter().zip(original.replay_operation_ids().unwrap()) {
+        runtime.apply(&mut run, input, &operation).unwrap();
+    }
+    runtime.data(&run).clone()
+}
+
+fn future_action_scenes(
+    store: &ProductStore,
+    prepared: &PreparedOwnedScopedChangeV2,
+) -> Vec<AcceptedScene> {
+    let add = invoke("add", [("title".into(), text_value("future"))].into());
+    let created = prefix_data(store, std::slice::from_ref(&add));
+    let future = row(&created, "future");
+    let register = invoke(
+        "register",
+        [
+            ("owner".into(), reference(&future)),
+            ("name".into(), text_value("material")),
+        ]
+        .into(),
+    );
+    let registered = prefix_data(store, &[add.clone(), register.clone()]);
+    let material = registered
+        .records
+        .iter()
+        .find(|r| r.entity == "material")
+        .unwrap();
+    let material = reference(&RecordRef {
+        entity: material.entity.clone(),
+        record: material.id.clone(),
+    });
+    let link = registered
+        .records
+        .iter()
+        .find(|r| r.entity == "requirement" && r.values.get("job") == Some(&reference(&future)))
+        .unwrap();
+    let link = reference(&RecordRef {
+        entity: link.entity.clone(),
+        record: link.id.clone(),
+    });
+    let begin = invoke("begin", [("job".into(), reference(&future))].into());
+    let withdraw = invoke(
+        "withdraw",
+        [
+            ("material".into(), material.clone()),
+            ("note".into(), text_value("future departure")),
+        ]
+        .into(),
+    );
+    let arrive = invoke(
+        "arrive",
+        [
+            ("material".into(), material),
+            ("note".into(), text_value("future arrival")),
+        ]
+        .into(),
+    );
+    [
+        ("add", vec![add.clone()]),
+        (
+            "complete",
+            vec![
+                add.clone(),
+                invoke("complete", [("job".into(), reference(&future))].into()),
+            ],
+        ),
+        ("begin", vec![add.clone(), begin.clone()]),
+        ("register", vec![add.clone(), register.clone()]),
+        (
+            "remove",
+            vec![
+                add.clone(),
+                register.clone(),
+                invoke("remove", [("link".into(), link)].into()),
+            ],
+        ),
+        (
+            "withdraw",
+            vec![
+                add.clone(),
+                register.clone(),
+                begin.clone(),
+                withdraw.clone(),
+            ],
+        ),
+        ("arrive", vec![add, register, begin, withdraw, arrive]),
+    ]
+    .into_iter()
+    .map(|(action, mut inputs)| {
+        inputs.push(SemanticInput::Observe {
+            point: "result".into(),
+        });
+        engine(store)
+            .accept_owned_scene(
+                store,
+                prepared,
+                &scenario(store, &format!("future-{action}"), inputs),
+                Disclosure::Synthetic,
+            )
+            .unwrap()
+    })
+    .collect()
+}
+fn text_value(value: &str) -> DataValue {
+    DataValue::Text {
+        value: value.into(),
+    }
+}
+fn adopt_scenes(
+    store: &ProductStore,
+    prepared: &PreparedOwnedScopedChangeV2,
+    scenes: Vec<AcceptedScene>,
+) -> product_store::ProjectSnapshot {
+    let selected = choice(
+        prepared,
+        "population-choice",
+        DecisionOutcome::Accept {
+            artifact: prepared.target().artifact.program_digest.clone(),
+        },
+    );
+    let e = engine(store);
+    let change = e
+        .prepare_owned_choice(
+            store,
+            prepared.clone(),
+            selected,
+            scenes,
+            prepared.operation_id(),
+        )
+        .unwrap();
+    e.adopt(store, &change).unwrap()
+}
+
+#[test]
+fn future_owned_choice_covers_actions_on_actually_created_roots() {
+    let (_dir, store, a, b) = setup_operable();
+    let before = store.load().unwrap();
+    let prepared = prepare_population(
+        &store,
+        &a,
+        &b,
+        ScopePopulation::FutureWork,
+        vec![],
+        "future-owned",
+    );
+    let scenes = future_action_scenes(&store, &prepared);
+    assert_eq!(store.load().unwrap(), before);
+    let adopted = adopt_scenes(&store, &prepared, scenes);
+    assert_eq!(
+        adopted.decisions.decisions.last().unwrap().scope,
+        prepared.scope()
+    );
+    assert_eq!(
+        engine(&store).check_current(&adopted).unwrap().disposition,
+        CheckDisposition::Ready
+    );
+    assert_live_population_behavior(&store, false, true);
+    let (_dir, restored) = recover(&store);
+    assert_eq!(
+        engine(&restored)
+            .check_current(&restored.load().unwrap())
+            .unwrap()
+            .disposition,
+        CheckDisposition::Ready
+    );
+}
+
+#[test]
+fn future_and_selected_owned_choice_preserves_frozen_exclusions() {
+    let (_dir, store, a, b) = setup_operable();
+    apply_store(
+        &store,
+        "add-excluded",
+        invoke("add", [("title".into(), text_value("unselected"))].into()),
+    );
+    let before = store.load().unwrap();
+    let excluded = vec![
+        row(&before.data, "unselected"),
+        row(&before.data, "finished"),
+    ];
+    let prepared = prepare_population(
+        &store,
+        &a,
+        &b,
+        ScopePopulation::All,
+        excluded.clone(),
+        "combined-owned",
+    );
+    let adopted = adopt_scenes(&store, &prepared, action_scenes(&store, &prepared));
+    assert_eq!(
+        adopted.decisions.decisions.last().unwrap().scope,
+        prepared.scope()
+    );
+    assert_eq!(prepared.scope().excluded_records, excluded);
+    assert_eq!(prepared.scope().population, Population::All);
+    assert_eq!(
+        engine(&store).check_current(&adopted).unwrap().disposition,
+        CheckDisposition::Ready
+    );
+    assert_eq!(adopted.data.events, before.data.events);
+    for old in &before.data.records {
+        let actual = adopted
+            .data
+            .records
+            .iter()
+            .find(|r| r.entity == old.entity && r.id == old.id)
+            .unwrap();
+        assert_eq!(actual.revision, old.revision);
+        for (key, value) in &old.values {
+            assert_eq!(actual.values.get(key), Some(value));
+        }
+    }
+    assert_live_population_behavior(&store, true, true);
+    let (_dir, restored) = recover(&store);
+    assert_eq!(
+        engine(&restored)
+            .check_current(&restored.load().unwrap())
+            .unwrap()
+            .disposition,
+        CheckDisposition::Ready
+    );
+}
+
+#[test]
+fn selected_owned_choice_refuses_unexecuted_and_new_record_only_actions() {
+    let (_dir, store, a, b) = setup_operable();
+    let before = store.load().unwrap();
+    let prepared = prepare_population(
+        &store,
+        &a,
+        &b,
+        ScopePopulation::SelectedUnfinished {
+            records: vec![row(&before.data, "live"), row(&before.data, "complete-me")],
+        },
+        vec![],
+        "selected-coverage-negatives",
+    );
+    let selected = choice(
+        &prepared,
+        "selected-negatives",
+        DecisionOutcome::Accept {
+            artifact: prepared.target().artifact.program_digest.clone(),
+        },
+    );
+    for missing in ["add", "begin"] {
+        let scenes: Vec<_> = action_scenes(&store, &prepared)
+            .into_iter()
+            .filter(|scene| scene.scenario().id != missing)
+            .collect();
+        let error = engine(&store)
+            .prepare_owned_choice(
+                &store,
+                prepared.clone(),
+                selected.clone(),
+                scenes,
+                prepared.operation_id(),
+            )
+            .err()
+            .expect("an unexecuted action cannot gain boundary coverage")
+            .to_string();
+        let coverage = error
+            .split("No applicable independently replayed accepted scene covers operation(s): ")
+            .nth(1)
+            .expect("failure must be the real coverage gate");
+        assert!(
+            coverage.split('"').next().unwrap().contains(missing),
+            "{error}"
+        );
+        assert_eq!(store.load().unwrap(), before);
+    }
+    let mut scenes: Vec<_> = action_scenes(&store, &prepared)
+        .into_iter()
+        .filter(|scene| scene.scenario().id != "complete")
+        .collect();
+    let outside_complete = future_action_scenes(&store, &prepared)
+        .into_iter()
+        .find(|scene| scene.scenario().id == "future-complete")
+        .unwrap();
+    scenes.push(outside_complete);
+    let error = engine(&store)
+        .prepare_owned_choice(
+            &store,
+            prepared.clone(),
+            selected,
+            scenes,
+            prepared.operation_id(),
+        )
+        .err()
+        .expect("completing a newly created root is not coverage for the existing selection")
+        .to_string();
+    let coverage = error
+        .split("No applicable independently replayed accepted scene covers operation(s): ")
+        .nth(1)
+        .unwrap();
+    assert!(
+        coverage.split('"').next().unwrap().contains("complete"),
+        "{error}"
+    );
+    assert_eq!(store.load().unwrap(), before);
+}
+
+#[test]
+fn selected_owned_boundary_evidence_cannot_outlive_its_exact_basis() {
+    let (_dir, store, a, b) = setup_operable();
+    let before = store.load().unwrap();
+    let prepared = prepare_population(
+        &store,
+        &a,
+        &b,
+        ScopePopulation::SelectedUnfinished {
+            records: vec![row(&before.data, "live"), row(&before.data, "complete-me")],
+        },
+        vec![],
+        "selected-stale",
+    );
+    let scenes = action_scenes(&store, &prepared);
+    apply_store(
+        &store,
+        "intervening-work",
+        invoke("add", [("title".into(), text_value("intervening"))].into()),
+    );
+    let current = store.load().unwrap();
+    let selected = choice(
+        &prepared,
+        "stale-choice",
+        DecisionOutcome::Accept {
+            artifact: prepared.target().artifact.program_digest.clone(),
+        },
+    );
+    let error = engine(&store)
+        .prepare_owned_choice(
+            &store,
+            prepared.clone(),
+            selected,
+            scenes,
+            prepared.operation_id(),
+        )
+        .err()
+        .expect("stale private preparation must refuse")
+        .to_string();
+    assert!(error.contains("stale"), "{error}");
+    assert_eq!(store.load().unwrap(), current);
+}
+
+#[test]
+fn ordinary_selected_scope_cannot_claim_owned_boundary_coverage() {
+    let (_dir, store, a, _b) = setup_operable();
+    let before = store.load().unwrap();
+    let original = scenario(
+        &store,
+        "ordinary-outside-create",
+        vec![
+            invoke("add", [("title".into(), text_value("outside"))].into()),
+            SemanticInput::Observe {
+                point: "result".into(),
+            },
+        ],
+    );
+    let accepted = accept_scene(
+        &product_runtime::LocalRuntime::default(),
+        &a,
+        &original,
+        Disclosure::Synthetic,
+        RuntimeLimits::default(),
+    )
+    .unwrap();
+    let selected = Choice {
+        id: "ordinary-record-selection".into(),
+        request: "This ordinary selection has no owned creation proof".into(),
+        rationale: None,
+        scope: DecisionScope {
+            operations: ["add".into()].into(),
+            population: Population::Records {
+                records: vec![row(&before.data, "live")],
+            },
+            conditions: Values::new(),
+            excluded_records: vec![],
+            unknowns: vec![],
+        },
+        outcome: DecisionOutcome::KeepCurrent,
+        obligations: vec![],
+        binding: IntentionBinding::ObservedOutcome,
+    };
+    let error = engine(&store)
+        .prepare_choice(&store, &a, selected, vec![accepted], "ordinary-outside")
+        .err()
+        .expect("ordinary coverage must remain conservative")
+        .to_string();
+    assert!(
+        error.contains(
+            "No applicable independently replayed accepted scene covers operation(s): add"
+        ),
+        "{error}"
+    );
+    assert_eq!(store.load().unwrap(), before);
+}
+
+// Real post-adoption work distinguishes selected/future behavior from ordinary
+// behavior, while one shared factual event is retained for each material action.
+fn assert_live_population_behavior(
+    store: &ProductStore,
+    existing_selected: bool,
+    future_selected: bool,
+) {
+    let before = store.load().unwrap();
+    let finished = before
+        .data
+        .records
+        .iter()
+        .find(|r| r.entity == "job" && r.values.get("title") == Some(&text_value("finished")))
+        .unwrap()
+        .clone();
+    apply_store(
+        store,
+        "population-add-future",
+        invoke("add", [("title".into(), text_value("later-future"))].into()),
+    );
+    let mut roots = vec![(row(&before.data, "live"), existing_selected)];
+    let current = store.load().unwrap();
+    let future = row(&current.data, "later-future");
+    let unselected = current
+        .data
+        .records
+        .iter()
+        .find(|r| r.entity == "job" && r.values.get("title") == Some(&text_value("unselected")))
+        .map(|r| RecordRef {
+            entity: r.entity.clone(),
+            record: r.id.clone(),
+        });
+    let mut register = vec![future.clone()];
+    if let Some(unselected) = unselected {
+        roots.push((unselected.clone(), false));
+        register.push(unselected);
+    }
+    roots.push((future, future_selected));
+    for (index, root) in register.iter().enumerate() {
+        apply_store(
+            store,
+            &format!("population-register-{index}"),
+            invoke(
+                "register",
+                [
+                    ("owner".into(), reference(root)),
+                    ("name".into(), text_value("material")),
+                ]
+                .into(),
+            ),
+        );
+    }
+    for (index, (root, _)) in roots.iter().enumerate() {
+        apply_store(
+            store,
+            &format!("population-begin-{index}"),
+            invoke("begin", [("job".into(), reference(root))].into()),
+        );
+    }
+    let current = store.load().unwrap();
+    let material = current
+        .data
+        .records
+        .iter()
+        .find(|r| r.entity == "material")
+        .unwrap();
+    let material = reference(&RecordRef {
+        entity: material.entity.clone(),
+        record: material.id.clone(),
+    });
+    let event_count = current
+        .data
+        .records
+        .iter()
+        .filter(|r| r.entity == "event")
+        .count();
+    for action in ["withdraw", "arrive"] {
+        apply_store(
+            store,
+            &format!("population-{action}"),
+            invoke(
+                action,
+                [
+                    ("material".into(), material.clone()),
+                    ("note".into(), text_value(action)),
+                ]
+                .into(),
+            ),
+        );
+    }
+    let after = store.load().unwrap();
+    for (root, selected) in &roots {
+        let actual = after
+            .data
+            .records
+            .iter()
+            .find(|r| r.entity == root.entity && r.id == root.record)
+            .unwrap();
+        assert_eq!(
+            actual.values.get("status"),
+            Some(&text_value(if *selected { "active" } else { "ready" })),
+            "wrong behavior for {root:?}, selected={selected}"
+        );
+        assert_eq!(
+            after
+                .data
+                .records
+                .iter()
+                .filter(|r| r.entity == "pause" && r.values.get("job") == Some(&reference(root)))
+                .count(),
+            usize::from(*selected),
+            "auxiliary memory must match the exact cohort"
+        );
+    }
+    assert_eq!(
+        after
+            .data
+            .records
+            .iter()
+            .find(|r| r.entity == finished.entity && r.id == finished.id),
+        Some(&finished)
+    );
+    assert_eq!(
+        after
+            .data
+            .records
+            .iter()
+            .filter(|r| r.entity == "event")
+            .count(),
+        event_count + 2,
+        "shared factual event is neither dropped nor duplicated across cohorts"
+    );
+    assert_eq!(
+        engine(store).check_current(&after).unwrap().disposition,
+        CheckDisposition::Ready
+    );
+}
+
+#[test]
+fn future_owned_choice_rejects_shared_events_as_root_coverage() {
+    let (_dir, store, a, b) = setup_operable();
+    let before = store.load().unwrap();
+    let prepared = prepare_population(
+        &store,
+        &a,
+        &b,
+        ScopePopulation::FutureWork,
+        vec![],
+        "future-shared-only",
+    );
+    // Other actions really exercise future roots. The two material actions below
+    // exercise existing roots only and append ordinary shared factual events.
+    let mut scenes: Vec<_> = future_action_scenes(&store, &prepared)
+        .into_iter()
+        .filter(|scene| {
+            !matches!(
+                scene.scenario().id.as_str(),
+                "future-withdraw" | "future-arrive"
+            )
+        })
+        .collect();
+    scenes.extend(
+        action_scenes(&store, &prepared)
+            .into_iter()
+            .filter(|scene| matches!(scene.scenario().id.as_str(), "withdraw" | "arrive")),
+    );
+    let selected = choice(
+        &prepared,
+        "future-shared-only-choice",
+        DecisionOutcome::Accept {
+            artifact: prepared.target().artifact.program_digest.clone(),
+        },
+    );
+    let result = engine(&store).prepare_owned_choice(
+        &store,
+        prepared.clone(),
+        selected,
+        scenes,
+        prepared.operation_id(),
+    );
+    let error = result
+        .err()
+        .expect("new shared events cannot cover future-root actions")
+        .to_string();
+    assert!(error.contains("operation(s): arrive, withdraw"), "{error}");
+    assert_eq!(store.load().unwrap(), before);
+}
+
+#[test]
+fn all_excluded_owned_choice_rejects_shared_events_as_root_coverage() {
+    let (_dir, store, a, b) = setup_operable();
+    let before = store.load().unwrap();
+    let excluded = before
+        .data
+        .records
+        .iter()
+        .filter(|r| r.entity == "job")
+        .map(|r| RecordRef {
+            entity: r.entity.clone(),
+            record: r.id.clone(),
+        })
+        .collect();
+    let p = prepare_population(
+        &store,
+        &a,
+        &b,
+        ScopePopulation::All,
+        excluded,
+        "excluded-shared",
+    );
+    let mut scenes: Vec<_> = future_action_scenes(&store, &p)
+        .into_iter()
+        .filter(|s| {
+            !matches!(
+                s.scenario().id.as_str(),
+                "future-withdraw" | "future-arrive"
+            )
+        })
+        .collect();
+    scenes.extend(
+        action_scenes(&store, &p)
+            .into_iter()
+            .filter(|s| matches!(s.scenario().id.as_str(), "withdraw" | "arrive")),
+    );
+    let result = engine(&store).prepare_owned_choice(
+        &store,
+        p.clone(),
+        choice(
+            &p,
+            "excluded-choice",
+            DecisionOutcome::Accept {
+                artifact: p.target().artifact.program_digest.clone(),
+            },
+        ),
+        scenes,
+        p.operation_id(),
+    );
+    let error = result
+        .err()
+        .expect("shared events cannot cover actions on excluded roots")
+        .to_string();
+    assert!(error.contains("operation(s): arrive, withdraw"), "{error}");
+    assert_eq!(store.load().unwrap(), before);
+}
+
+#[test]
+fn owned_property_witness_needs_an_actual_root_participant() {
+    for action in ["register", "withdraw", "observe"] {
+        for recording in [false, true] {
+            let (_dir, store, a, b) = setup_operable();
+            let before = store.load().unwrap();
+            let p = prepare_population(
+                &store,
+                &a,
+                &b,
+                ScopePopulation::FutureWork,
+                vec![],
+                "property-root",
+            );
+            let e = engine(&store);
+            let accepted = if action == "observe" {
+                e.accept_owned_scene(
+                    &store,
+                    &p,
+                    &scenario(
+                        &store,
+                        "observe-only",
+                        vec![SemanticInput::Observe {
+                            point: "result".into(),
+                        }],
+                    ),
+                    Disclosure::Synthetic,
+                )
+                .unwrap()
+            } else {
+                action_scenes(&store, &p)
+                    .into_iter()
+                    .find(|s| s.scenario().id == action)
+                    .unwrap()
+            };
+            let expected = accepted
+                .observations()
+                .iter()
+                .find(|o| o.point == "result")
+                .unwrap()
+                .values["ready_count"]
+                .clone();
+            let mut c = choice(
+                &p,
+                "property-root-choice",
+                if recording {
+                    DecisionOutcome::Deferred
+                } else {
+                    DecisionOutcome::Accept {
+                        artifact: p.target().artifact.program_digest.clone(),
+                    }
+                },
+            );
+            c.binding = IntentionBinding::PropertiesOnly;
+            c.obligations = vec![AcceptedProperty {
+                id: "count".into(),
+                description: "A true count is not population evidence".into(),
+                predicate: PropertyPredicate::Equal {
+                    left: PropertyTerm::Observed {
+                        point: "result".into(),
+                        observable: "ready_count".into(),
+                        value_type: Type::Integer,
+                    },
+                    right: PropertyTerm::Literal {
+                        value_type: Type::Integer,
+                        value: expected,
+                    },
+                },
+            }];
+            let result = if recording {
+                let mut original = accepted.scenario().clone();
+                original.seed = before.data.clone();
+                let current = e
+                    .accept_owned_current_scene(&store, &p, &original, Disclosure::Synthetic)
+                    .unwrap();
+                e.prepare_owned_rehearsed_choice(
+                    &store,
+                    p.clone(),
+                    c,
+                    vec![current, accepted],
+                    &[],
+                    "record-property-root",
+                )
+            } else {
+                e.prepare_owned_choice(&store, p.clone(), c, vec![accepted], p.operation_id())
+            };
+            let error = result
+                .err()
+                .expect("nonroot and observe-only scenes cannot verify an owned property")
+                .to_string();
+            assert!(
+                error.contains("No applicable scene verifies the property-only intention"),
+                "{action}/{recording}: {error}"
+            );
+            assert_eq!(store.load().unwrap(), before);
+        }
+    }
+}
+
+#[test]
+fn owned_coverage_authority_binds_exact_source_target_recipe_and_scope() {
+    let (_dir, store, a, b) = setup_operable();
+    let before = store.load().unwrap();
+    let p = prepare_population(
+        &store,
+        &a,
+        &b,
+        ScopePopulation::SelectedUnfinished {
+            records: vec![row(&before.data, "live"), row(&before.data, "complete-me")],
+        },
+        vec![],
+        "bound-coverage",
+    );
+    let context =
+        ScopedExecutionContext::owned_prepared(&before, &p, None, &OwnedChoiceMode::Activate)
+            .unwrap();
+    let accepted = action_scenes(&store, &p)
+        .into_iter()
+        .find(|s| s.scenario().id == "add")
+        .unwrap();
+    let (evidence, contexts) = product_decisions::execute_admitted(
+        &product_runtime::LocalRuntime::default(),
+        p.target(),
+        accepted.scenario(),
+        &before.decisions,
+        RuntimeLimits::default(),
+        "coverage-proof",
+        Some(&context),
+    )
+    .unwrap();
+    assert_eq!(evidence.state, EvidenceState::Observed);
+    assert_eq!(evidence.observations, accepted.observations());
+    let scope = p.scope();
+    assert_eq!(
+        context
+            .owned_boundary_coverage(p.target(), p.target(), &scope, &contexts, cancel())
+            .unwrap()
+            .operations(),
+        &["add".into()].into()
+    );
+    assert!(context
+        .owned_boundary_coverage(p.target(), &a, &scope, &contexts, cancel())
+        .unwrap()
+        .operations()
+        .is_empty());
+    assert!(context
+        .owned_boundary_coverage(&a, p.target(), &scope, &contexts, cancel())
+        .unwrap()
+        .operations()
+        .is_empty());
+    for changed in [
+        DecisionScope {
+            population: Population::All,
+            ..scope.clone()
+        },
+        DecisionScope {
+            conditions: [("invented".into(), text_value("x"))].into(),
+            ..scope.clone()
+        },
+        DecisionScope {
+            operations: ["add".into()].into(),
+            ..scope.clone()
+        },
+    ] {
+        assert!(context
+            .owned_boundary_coverage(p.target(), p.target(), &changed, &contexts, cancel())
+            .unwrap()
+            .operations()
+            .is_empty());
+        let binding = context
+            .applicability(p.target(), p.target(), &changed, None, false)
+            .unwrap();
+        assert_eq!(binding.matches(&changed, &contexts[0]), ScopeMatch::Unknown);
+    }
+    let unsupported = context
+        .applicability(p.target(), &a, &scope, None, false)
+        .unwrap();
+    assert_eq!(
+        unsupported.matches(&scope, &contexts[0]),
+        ScopeMatch::Unknown
+    );
+    let current_in_owned_claim = context.applicability(&a, &a, &scope, None, true).unwrap();
+    assert_eq!(
+        current_in_owned_claim.matches(&scope, &contexts[0]),
+        ScopeMatch::Unknown
+    );
+    let ordinary = context.applicability(&a, &a, &scope, None, false).unwrap();
+    assert_eq!(ordinary.matches(&scope, &contexts[0]), ScopeMatch::Outside);
+    let other = prepare_population(
+        &store,
+        &a,
+        &b,
+        ScopePopulation::FutureWork,
+        vec![],
+        "other-coverage",
+    );
+    let other_context =
+        ScopedExecutionContext::owned_prepared(&before, &other, None, &OwnedChoiceMode::Activate)
+            .unwrap();
+    assert!(other_context
+        .owned_boundary_coverage(p.target(), p.target(), &scope, &contexts, cancel())
+        .unwrap()
+        .operations()
+        .is_empty());
+    assert_eq!(store.load().unwrap(), before);
+}
+
+#[test]
+fn selected_owned_mixed_trace_preserves_applicable_checks_and_full_facts() {
+    let (_dir, store, a, b) = setup_operable();
+    let before = store.load().unwrap();
+    let live = row(&before.data, "live");
+    let p = prepare_population(
+        &store,
+        &a,
+        &b,
+        ScopePopulation::SelectedUnfinished {
+            records: vec![live.clone(), row(&before.data, "complete-me")],
+        },
+        vec![],
+        "mixed-coverage",
+    );
+    let e = engine(&store);
+    let mixed = e
+        .accept_owned_scene(
+            &store,
+            &p,
+            &scenario(
+                &store,
+                "arbitrary-name",
+                vec![
+                    invoke("add", [("title".into(), text_value("mixed-new"))].into()),
+                    invoke("begin", [("job".into(), reference(&live))].into()),
+                    SemanticInput::Observe {
+                        point: "result".into(),
+                    },
+                ],
+            ),
+            Disclosure::Synthetic,
+        )
+        .unwrap();
+    let mut scenes: Vec<_> = action_scenes(&store, &p)
+        .into_iter()
+        .filter(|s| !matches!(s.scenario().id.as_str(), "add" | "begin"))
+        .collect();
+    scenes.push(mixed.clone());
+    let selected = choice(
+        &p,
+        "mixed-choice",
+        DecisionOutcome::Accept {
+            artifact: p.target().artifact.program_digest.clone(),
+        },
+    );
+    let good = e
+        .prepare_owned_choice(
+            &store,
+            p.clone(),
+            selected.clone(),
+            scenes.clone(),
+            p.operation_id(),
+        )
+        .unwrap();
+    assert_eq!(good.report().disposition, CheckDisposition::Ready);
+    assert!(good
+        .report()
+        .runs
+        .iter()
+        .any(|run| run.observations == mixed.observations()));
+    let mut false_property = selected;
+    false_property.obligations = vec![AcceptedProperty {
+        id: "false-count".into(),
+        description: "A boundary cannot excuse a violated property".into(),
+        predicate: PropertyPredicate::Equal {
+            left: PropertyTerm::Observed {
+                point: "result".into(),
+                observable: "ready_count".into(),
+                value_type: Type::Integer,
+            },
+            right: PropertyTerm::Literal {
+                value_type: Type::Integer,
+                value: DataValue::Integer { value: -1 },
+            },
+        },
+    }];
+    assert!(e
+        .prepare_owned_choice(&store, p.clone(), false_property, scenes, p.operation_id())
+        .is_err());
+    assert_eq!(store.load().unwrap(), before);
+    e.adopt(&store, &good).unwrap();
+}

@@ -86,6 +86,45 @@ pub struct ScopedExecutionContext {
     correspondences: BTreeMap<Digest, correspondence::VerifiedCorrespondence>,
 }
 impl ScopedExecutionContext {
+    pub(crate) fn applicability(
+        &self,
+        source: &CapturedProgram,
+        target: &CapturedProgram,
+        scope: &DecisionScope,
+        decision: Option<&ScopedDecision>,
+        require_owned: bool,
+    ) -> Result<ScopeApplicability> {
+        match &self.owned {
+            Some(owned) => owned.applicability(
+                source,
+                target,
+                scope,
+                require_owned || decision.is_some_and(|d| owned.owns_decision(d)),
+            ),
+            None => Ok(if require_owned {
+                ScopeApplicability::UnverifiedOwned
+            } else {
+                ScopeApplicability::Ordinary
+            }),
+        }
+    }
+    pub(crate) fn owned_boundary_coverage(
+        &self,
+        source: &CapturedProgram,
+        target: &CapturedProgram,
+        scope: &DecisionScope,
+        contexts: &[ScopeContext],
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<OwnedBoundaryCoverage> {
+        // A historical pure-create source cannot authorize a different target.
+        if source != target {
+            return Ok(OwnedBoundaryCoverage::default());
+        }
+        match &self.owned {
+            Some(owned) => owned.boundary_coverage(target, scope, contexts, cancelled),
+            None => Ok(OwnedBoundaryCoverage::default()),
+        }
+    }
     pub fn committed(snapshot: &ProjectSnapshot) -> Result<Self> {
         snapshot.validate()?;
         if matches!(&snapshot.scope, ScopeEnvelope::OwnedV2(_)) {

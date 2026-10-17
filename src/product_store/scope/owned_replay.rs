@@ -501,6 +501,57 @@ impl OwnedExecutionContext {
             Ok(None)
         }
     }
+    pub(super) fn applicability(
+        &self,
+        source: &CapturedProgram,
+        target: &CapturedProgram,
+        scope: &DecisionScope,
+        require_owned: bool,
+    ) -> Result<ScopeApplicability> {
+        let Some(prepared) = self.prepared(source)? else {
+            return Ok(if require_owned {
+                ScopeApplicability::UnverifiedOwned
+            } else {
+                ScopeApplicability::Ordinary
+            });
+        };
+        if source != target
+            || !self.permits_target(target)?
+            || scope != &owned_coverage::expected_scope(prepared)
+        {
+            return Ok(ScopeApplicability::UnverifiedOwned);
+        }
+        Ok(ScopeApplicability::OwnedRoot(
+            prepared.proof.request.inventory.sources.root_entity.clone(),
+        ))
+    }
+    pub(super) fn owns_decision(&self, decision: &ScopedDecision) -> bool {
+        self.snapshot.decisions.decisions.contains(decision)
+            && self.snapshot.owned_scope().is_ok_and(|scope| {
+                scope
+                    .rehearsals
+                    .values()
+                    .any(|receipt| receipt.witnesses.get(&decision.id) == Some(&decision.witness))
+            })
+    }
+    pub(super) fn boundary_coverage(
+        &self,
+        target: &CapturedProgram,
+        scope: &DecisionScope,
+        contexts: &[ScopeContext],
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<OwnedBoundaryCoverage> {
+        if !self.permits_target(target)? {
+            return Ok(OwnedBoundaryCoverage::default());
+        }
+        let Some(prepared) = self.prepared(target)? else {
+            return Ok(OwnedBoundaryCoverage::default());
+        };
+        // One live-cancellable host meter covers the entire additional source
+        // proof. It does not replace or replenish any replay/runtime meter.
+        let mut meter = self.meter(cancelled)?;
+        owned_coverage::derive(prepared, scope, contexts, &mut meter)
+    }
     pub fn contains(&self, source: &CapturedProgram) -> bool {
         self.prepared(source).is_ok_and(|p| p.is_some())
     }

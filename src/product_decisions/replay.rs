@@ -33,6 +33,23 @@ pub fn scope_match(scope: &DecisionScope, context: &ScopeContext) -> ScopeAssess
     };
     ScopeAssessment { state, reason }
 }
+pub(super) fn bound_scope_match(
+    scope: &DecisionScope,
+    context: &ScopeContext,
+    applicability: &crate::product_store::scope::ScopeApplicability,
+) -> ScopeAssessment {
+    let mut assessment = scope_match(scope, context);
+    let state = applicability.matches(scope, context);
+    if state != assessment.state {
+        assessment.reason = match state {
+            ScopeMatch::Outside => "Actual participant is outside the authenticated owned-root population".into(),
+            ScopeMatch::Unknown => "Owned applicability lacks exact source/target/recipe/scope or root participant provenance".into(),
+            ScopeMatch::Applies => unreachable!("owned matching cannot broaden ordinary scope"),
+        };
+        assessment.state = state;
+    }
+    assessment
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcceptedScene {
@@ -70,6 +87,7 @@ pub(super) fn verify_target_scope(
     operations: &BTreeSet<Id>,
     mapping: &Mapping,
     contexts: &[ScopeContext],
+    applicability: &crate::product_store::scope::ScopeApplicability,
 ) -> Result<()> {
     if operations.is_empty() {
         return Err(DecisionError::Unverified(
@@ -89,7 +107,7 @@ pub(super) fn verify_target_scope(
     mapped.unknowns.retain(|u| !u.operations.is_empty());
     let mut covered = BTreeSet::new();
     for context in contexts {
-        let assessment = scope_match(&mapped, context);
+        let assessment = bound_scope_match(&mapped, context, applicability);
         match assessment.state {
             ScopeMatch::Unknown => return Err(DecisionError::Unverified(assessment.reason)),
             ScopeMatch::Applies => {
@@ -516,10 +534,14 @@ pub(crate) fn execute_admitted<R: RuntimeAdapter>(
     evidence.validate()?;
     Ok((evidence, contexts))
 }
-pub(super) fn assess_scope(scope: &DecisionScope, contexts: &[ScopeContext]) -> ScopeMatch {
+pub(super) fn assess_scope(
+    scope: &DecisionScope,
+    contexts: &[ScopeContext],
+    applicability: &crate::product_store::scope::ScopeApplicability,
+) -> ScopeMatch {
     let mut applies = false;
     for c in contexts {
-        match scope_match(scope, c).state {
+        match bound_scope_match(scope, c, applicability).state {
             ScopeMatch::Unknown => return ScopeMatch::Unknown,
             ScopeMatch::Applies => applies = true,
             ScopeMatch::Outside => {}
@@ -718,5 +740,55 @@ fn input_references(value: &DataValue, refs: &mut Vec<RecordRef>) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod owned_scope_tests {
+    use super::*;
+    use crate::product_store::scope::ScopeApplicability;
+
+    #[test]
+    fn owned_scene_keeps_unknown_participants_blocking() {
+        let scope = DecisionScope {
+            operations: ["act".into()].into(),
+            population: Population::All,
+            conditions: Values::new(),
+            excluded_records: vec![],
+            unknowns: vec![],
+        };
+        let root = ScopeContext {
+            operation: "act".into(),
+            record: Some(RecordRef {
+                entity: "root".into(),
+                record: "one".into(),
+            }),
+            is_new: None,
+            created_generation: None,
+            attributes: Values::new(),
+            predicate_result: None,
+        };
+        let mut missing = root.clone();
+        missing.record = None;
+        let bound = ScopeApplicability::OwnedRoot("root".into());
+        assert_eq!(
+            assess_scope(&scope, &[root.clone()], &bound),
+            ScopeMatch::Applies
+        );
+        assert_eq!(
+            assess_scope(&scope, &[root.clone(), missing.clone()], &bound),
+            ScopeMatch::Unknown
+        );
+        assert_eq!(
+            assess_scope(&scope, &[missing, root.clone()], &bound),
+            ScopeMatch::Unknown
+        );
+        let mut shared = root.clone();
+        shared.record.as_mut().unwrap().entity = "shared".into();
+        assert_eq!(
+            assess_scope(&scope, &[root, shared.clone()], &bound),
+            ScopeMatch::Applies
+        );
+        assert_eq!(assess_scope(&scope, &[shared], &bound), ScopeMatch::Outside);
     }
 }
