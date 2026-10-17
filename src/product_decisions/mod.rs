@@ -10,7 +10,7 @@ mod replay;
 use crate::product_contract::*;
 use crate::product_runtime::{LocalRuntime, DRIVER_VERSION};
 use crate::product_store::scope::{
-    PreparedScopedChange, ScopeCorrespondence, ScopedExecutionContext,
+    PreparedScopedChange, RetainedScene, ScopeCorrespondence, ScopedExecutionContext,
 };
 use crate::product_store::{PreparedAdoption, ProductStore, ProjectSnapshot, StoreError};
 pub use archive::IntentArchive;
@@ -21,6 +21,8 @@ pub use evolution::{EvolutionDraft, ReconciliationRequest};
 pub use mapping::ImplementationMapping;
 use mapping::Mapping;
 use recovery::{validate_withdrawal_delta, validate_withdrawal_history};
+#[cfg(test)]
+pub(crate) use replay::execute_admitted;
 use replay::*;
 pub use replay::{accept_scene, scope_match, AcceptedScene, ScopeAssessment};
 use serde::{Deserialize, Serialize};
@@ -334,6 +336,37 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             id,
             Some(&context),
         )?;
+        Ok((run, contexts, actual))
+    }
+    fn execute_retained_owned_scene(
+        &self,
+        decision: &ScopedDecision,
+        scene: &AcceptedScene,
+        target: &CapturedProgram,
+        graph: &DecisionGraph,
+        id: &str,
+    ) -> Result<(RunEvidence, Vec<ScopeContext>, ScenarioSpec)> {
+        let current = self.archive.snapshot()?;
+        let token = self.archive.retained_scene(&current, decision, scene)?;
+        let cancelled = self
+            .runtime
+            .cancellation_token()
+            .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let (actual, admission) = self
+            .scope_context()?
+            .project_retained_scene(&token, target, graph, cancelled)?;
+        let (run, contexts) = execute_admitted(
+            &self.runtime,
+            target,
+            &actual,
+            graph,
+            self.limits.clone(),
+            id,
+            Some(admission.as_ref()),
+        )?;
+        if self.archive.snapshot()? != current {
+            return Err(invalid("saved work changed during retained scene replay"));
+        }
         Ok((run, contexts, actual))
     }
     fn capture_mapped_scene(
@@ -934,12 +967,24 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 .iter()
                 .find(|s| s.original == scene.scenario.identity().expect("validated scene"))
         });
-        let mapped = match explicit.map_or_else(
-            || mapping.scenario(&scene.scenario, &target.program),
-            |replacement| {
-                mapping.replacement(&scene.scenario, &target.program, &replacement.replacement)
-            },
-        ) {
+        let mapped = match if self.scope_context()?.uses_owned_initializer(target) {
+            // Required owned cells must come from the verified isolated recipe,
+            // before ordinary target-schema mapping can validate this old seed.
+            if !relevant.is_empty() || explicit.is_some() {
+                Err(invalid(
+                    "owned replay does not support altered semantic/input mappings",
+                ))
+            } else {
+                Ok(scene.scenario.clone())
+            }
+        } else {
+            explicit.map_or_else(
+                || mapping.scenario(&scene.scenario, &target.program),
+                |replacement| {
+                    mapping.replacement(&scene.scenario, &target.program, &replacement.replacement)
+                },
+            )
+        } {
             Ok(s) => s,
             Err(e) => {
                 check.state = CheckState::Unsupported;
@@ -949,18 +994,25 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 return Ok(exercised);
             }
         };
-        let (run, target_contexts, mapped) = match self.execute_mapped_scene(
-            &scene.program,
-            &scene.scenario,
-            target,
-            &mapped,
-            graph,
-            self.limits.clone(),
-            &format!(
-                "check-{}",
-                &canonical_digest(IdentityDomain::Decision, &(&decision.id, index))?.as_str()[..32]
-            ),
-        ) {
+        let run_id = format!(
+            "check-{}",
+            &canonical_digest(IdentityDomain::Decision, &(&decision.id, index))?.as_str()[..32]
+        );
+        let execution =
+            if self.scope_context()?.uses_owned_initializer(target) && scene.program != *target {
+                self.execute_retained_owned_scene(decision, scene, target, graph, &run_id)
+            } else {
+                self.execute_mapped_scene(
+                    &scene.program,
+                    &scene.scenario,
+                    target,
+                    &mapped,
+                    graph,
+                    self.limits.clone(),
+                    &run_id,
+                )
+            };
+        let (run, target_contexts, mapped) = match execution {
             Ok(r) => r,
             Err(e) => {
                 check.state = CheckState::Unsupported;

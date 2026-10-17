@@ -34,14 +34,15 @@ pub struct CommonFactLifecycleSuggestion {
     pub after: Expr,
     pub meaning: String,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommonFactPhaseKind {
     CommonSubtree,
     CommonHeader,
     Variant,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommonFactSpan {
     /// Last index is the start of this slice; len=0 denotes an explicit gap.
     pub path: Vec<usize>,
@@ -53,14 +54,16 @@ pub struct CommonFactSpan {
     pub previous: Option<Digest>,
     pub next: Option<Digest>,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommonFactPhase {
     pub kind: CommonFactPhaseKind,
     pub edit: Option<Id>,
     pub before: CommonFactSpan,
     pub after: CommonFactSpan,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommonFactAction {
     pub action: Id,
     pub parameters: Env,
@@ -74,7 +77,8 @@ pub struct CommonFactAction {
 }
 /// Exhaustive typed use sites, including non-expression ingress. The expression
 /// and environment preserve exact reference chains, not just the target type.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommonFactUse {
     pub side: OwnedSourceSide,
     pub source: Digest,
@@ -89,7 +93,8 @@ pub struct CommonFactUse {
     /// Exact non-expression descriptor (parameter, control, key, schema, etc.).
     pub details: serde_json::Value,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommonFactReference {
     pub side: OwnedSourceSide,
     pub entity: Id,
@@ -102,7 +107,8 @@ pub struct CommonFactReference {
     /// Empty means no mutation route observed, never verified ownership.
     pub mutations: Vec<OwnedWriter>,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommonFactIdentityHazard {
     pub side: OwnedSourceSide,
     pub action: Id,
@@ -111,14 +117,16 @@ pub struct CommonFactIdentityHazard {
     pub relation: Id,
     pub reason: String,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommonFactObligation {
     pub side: Option<OwnedSourceSide>,
     pub location: String,
     pub code: String,
     pub reason: String,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommonFactResources {
     pub total_record_cap: usize,
     pub stored_records: usize,
@@ -129,7 +137,8 @@ pub struct CommonFactResources {
 }
 /// Diagnostic output only. None of the report types implement Deserialize, and
 /// no preparation/adoption code consumes them. Success means inventory obtained.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommonFactInventory {
     pub snapshot: Digest,
     pub retained_data: Digest,

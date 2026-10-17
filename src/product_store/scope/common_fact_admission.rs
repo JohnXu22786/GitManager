@@ -101,15 +101,16 @@ impl ProofMeter {
         self.cancelled.clone()
     }
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommonFactCertificate {
     pub side: OwnedSourceSide,
     pub site: String,
     pub rule: String,
     pub identity: Digest,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OwnedProjectionDestination {
     ViewColumn {
         view: Id,
@@ -120,7 +121,8 @@ pub enum OwnedProjectionDestination {
         include_archived: bool,
     },
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OwnedProjectionRecipe {
     pub location: String,
     pub destination: OwnedProjectionDestination,
@@ -136,7 +138,8 @@ pub struct OwnedProjectionRecipe {
     /// when the saved value is Null. Missing storage is never captured absence.
     pub capture_required: bool,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommonFactAdmissionReport {
     pub version: u32,
     pub snapshot: Digest,
@@ -172,16 +175,21 @@ pub(super) fn request_identity(request: &OwnedPreviewRequest) -> AdmissionResult
         &("owned-preview-request/1", request),
     )?)
 }
-pub(super) fn authenticate(
+fn authenticate_inner(
     snapshot: &ProjectSnapshot,
     candidate: &CapturedProgram,
     request: &OwnedPreviewRequest,
     meter: &mut ProofMeter,
+    verify_snapshot: bool,
 ) -> AdmissionResult<CommonFactInventory> {
     meter.charge((candidate.source_bytes.len() + snapshot.program()?.source_bytes.len()) as u64)?;
-    snapshot.validate()?;
+    if verify_snapshot {
+        snapshot.validate()?;
+    }
     candidate.validate()?;
-    if !matches!(snapshot.scope,ScopeEnvelope::ScalarV1(ref s) if *s==ScopeState::default()) {
+    if !matches!(snapshot.scope,ScopeEnvelope::ScalarV1(ref s) if *s==ScopeState::default())
+        && !matches!(snapshot.scope, ScopeEnvelope::OwnedV2(ref s) if s.layers.is_empty() && !s.rehearsals.is_empty())
+    {
         return Err(refuse("basis", "existing scoped lineage is unsupported"));
     }
     super::compiler::reject_reserved(&candidate.program)?;
@@ -250,6 +258,23 @@ pub(super) fn authenticate(
     }
     super::common_fact_inventory::derive(snapshot, candidate, &request.inventory)
 }
+pub(super) fn authenticate(
+    snapshot: &ProjectSnapshot,
+    candidate: &CapturedProgram,
+    request: &OwnedPreviewRequest,
+    meter: &mut ProofMeter,
+) -> AdmissionResult<CommonFactInventory> {
+    authenticate_inner(snapshot, candidate, request, meter, true)
+}
+pub(super) fn derive_retained(
+    snapshot: &ProjectSnapshot,
+    candidate: &CapturedProgram,
+    request: &OwnedPreviewRequest,
+    accepted: &super::owned_lifecycle::AcceptedPreviewLifecycle,
+    meter: &mut ProofMeter,
+) -> AdmissionResult<VerifiedOwnedPreviewPlan> {
+    derive_inner(snapshot, candidate, request, accepted, meter, false)
+}
 pub(super) fn derive(
     snapshot: &ProjectSnapshot,
     candidate: &CapturedProgram,
@@ -257,73 +282,40 @@ pub(super) fn derive(
     accepted: &super::owned_lifecycle::AcceptedPreviewLifecycle,
     meter: &mut ProofMeter,
 ) -> AdmissionResult<VerifiedOwnedPreviewPlan> {
-    let inventory = authenticate(snapshot, candidate, request, meter)?;
+    derive_inner(snapshot, candidate, request, accepted, meter, true)
+}
+fn derive_inner(
+    snapshot: &ProjectSnapshot,
+    candidate: &CapturedProgram,
+    request: &OwnedPreviewRequest,
+    accepted: &super::owned_lifecycle::AcceptedPreviewLifecycle,
+    meter: &mut ProofMeter,
+    verify_snapshot: bool,
+) -> AdmissionResult<VerifiedOwnedPreviewPlan> {
+    let inventory = authenticate_inner(snapshot, candidate, request, meter, verify_snapshot)?;
     accepted.verify(snapshot, candidate, request, meter)?;
+    // Structural regeneration of retained recipes never settles independent
+    // intentions. Their archive scenes are checked by the decision replay path.
+    // Public preview still cannot make that comparison or issue write authority.
+    if verify_snapshot
+        && snapshot
+            .decisions
+            .decisions
+            .iter()
+            .any(|d| d.status == DecisionStatus::Active)
+    {
+        return Err(refuse("accepted decisions", "active retained outcome/property comparison is unsupported by this preview proof; no obligation is silently passed"));
+    }
     let (certificates, projections, comparison) =
         super::common_fact_rules::verify(snapshot, candidate, request, &inventory, meter)?;
-    let mut captured = BTreeMap::new();
-    let runtime = LocalRuntime::with_cancellation(meter.cancelled());
-    let mut checks = ProjectionValidation::default();
-    let baseline = snapshot.program()?;
-    for row in snapshot
-        .data
-        .records
-        .iter()
-        .filter(|r| r.entity == request.inventory.sources.root_entity)
-    {
-        meter.charge(1)?;
-        let reference = RecordRef {
-            entity: row.entity.clone(),
-            record: row.id.clone(),
-        };
-        let completed = runtime.evaluate_record_projection_with(
-            &mut checks,
-            meter.runtime()?,
-            baseline,
-            &snapshot.data,
-            &reference,
-            "record",
-            &request.inventory.lifecycle.before,
-            &Type::Boolean,
-            snapshot.clock_day,
-        )?;
-        let is_completed = completed == DataValue::Boolean { value: true };
-        if matches!(&request.population,ScopePopulation::SelectedUnfinished{records} if records.contains(&reference))
-            && is_completed
-        {
-            return Err(refuse("scope", "selected root is already completed"));
-        }
-        if !row.archived && !is_completed {
-            continue;
-        }
-        let mut values = Values::new();
-        for projection in &projections {
-            let value = if let Some(expr) = &projection.baseline {
-                runtime.evaluate_record_projection_with(
-                    &mut checks,
-                    meter.runtime()?,
-                    baseline,
-                    &snapshot.data,
-                    &reference,
-                    &projection.binding,
-                    expr,
-                    &projection.value_type,
-                    snapshot.clock_day,
-                )?
-            } else {
-                projection.absent_value.clone().ok_or_else(|| {
-                    refuse(
-                        &projection.location,
-                        "absent baseline has no explicit availability rule",
-                    )
-                })?
-            };
-            // Inserting even Null is intentional; presence is part of the capture receipt.
-            values.insert(projection.location.clone(), value);
-            meter.charge(1)?;
-        }
-        captured.insert(row.id.clone(), values);
-    }
+    let captured = capture_frame(
+        snapshot.program()?,
+        &snapshot.data,
+        snapshot.clock_day,
+        request,
+        &projections,
+        meter,
+    )?;
     let report = CommonFactAdmissionReport {
         version: 1,
         snapshot: request.inventory.snapshot.clone(),
@@ -409,4 +401,77 @@ mod budget_tests {
         .unwrap();
         assert!(meter.runtime().unwrap().elapsed_millis <= 100);
     }
+}
+
+/// Evaluate sealed-row captures against an explicit authenticated scene frame.
+pub(super) fn capture_frame(
+    baseline: &CapturedProgram,
+    data: &DataSnapshot,
+    day: i32,
+    request: &OwnedPreviewRequest,
+    projections: &[OwnedProjectionRecipe],
+    meter: &mut ProofMeter,
+) -> AdmissionResult<BTreeMap<String, Values>> {
+    let mut captured = BTreeMap::new();
+    let runtime = LocalRuntime::with_cancellation(meter.cancelled());
+    let mut checks = ProjectionValidation::default();
+    for row in data
+        .records
+        .iter()
+        .filter(|r| r.entity == request.inventory.sources.root_entity)
+    {
+        meter.charge(1)?;
+        let reference = RecordRef {
+            entity: row.entity.clone(),
+            record: row.id.clone(),
+        };
+        let completed = runtime.evaluate_record_projection_with(
+            &mut checks,
+            meter.runtime()?,
+            baseline,
+            data,
+            &reference,
+            "record",
+            &request.inventory.lifecycle.before,
+            &Type::Boolean,
+            day,
+        )?;
+        let is_completed = completed == DataValue::Boolean { value: true };
+        if matches!(&request.population,ScopePopulation::SelectedUnfinished{records} if records.contains(&reference))
+            && is_completed
+        {
+            return Err(refuse("scope", "selected root is already completed"));
+        }
+        if !row.archived && !is_completed {
+            continue;
+        }
+        let mut values = Values::new();
+        for projection in projections {
+            let value = if let Some(expr) = &projection.baseline {
+                runtime.evaluate_record_projection_with(
+                    &mut checks,
+                    meter.runtime()?,
+                    baseline,
+                    data,
+                    &reference,
+                    &projection.binding,
+                    expr,
+                    &projection.value_type,
+                    day,
+                )?
+            } else {
+                projection.absent_value.clone().ok_or_else(|| {
+                    refuse(
+                        &projection.location,
+                        "absent baseline has no explicit availability rule",
+                    )
+                })?
+            };
+            // Inserting even Null is intentional; presence is part of the capture receipt.
+            values.insert(projection.location.clone(), value);
+            meter.charge(1)?;
+        }
+        captured.insert(row.id.clone(), values);
+    }
+    Ok(captured)
 }

@@ -1,16 +1,25 @@
 //! Host-owned scoped executable composition and protected completion history.
+mod owned_wire;
+pub use owned_wire::*;
+mod owned_persist;
+mod owned_replay;
+mod revision_history;
+#[cfg(test)]
+pub(crate) use owned_persist::{
+    owned_historical_basis_for_test, owned_retained_preview_for_test, owned_snapshot_for_test,
+};
 mod common_fact_admission;
 mod common_fact_rules;
 mod owned_lifecycle;
 mod owned_lowering;
 mod owned_preview;
-pub use owned_preview::{OwnedPreviewReceipt, OwnedPreviewSession, PreparedOwnedPreview};
 pub use common_fact_admission::{
     CommonFactAdmissionReport, CommonFactCertificate, OwnedPreviewAvailability,
     OwnedPreviewRequest, OwnedProjectionDestination, OwnedProjectionRecipe, ProofBudget,
     VerifiedOwnedPreviewPlan,
 };
 pub use owned_lifecycle::{AcceptedPreviewLifecycle, LifecycleAcceptanceHost, LifecycleWitness};
+pub use owned_preview::{OwnedPreviewReceipt, OwnedPreviewSession, PreparedOwnedPreview};
 mod common_fact_inventory;
 mod common_fact_uses;
 pub use common_fact_inventory::{
@@ -39,8 +48,8 @@ mod replay;
 pub(super) use correspondence::install as retain_correspondences;
 pub(crate) use rehearsal::pair_recording_evidence;
 pub(super) use rehearsal::{rehearsals_request, retain_rehearsals};
-pub(crate) use replay::ProvenanceColumns;
 pub use replay::ScopedExecutionContext;
+pub(crate) use replay::{ProvenanceColumns, RetainedScene};
 mod verify;
 use super::*;
 use crate::product_runtime::{DRIVER_VERSION, RUNTIME_VERSION};
@@ -759,15 +768,29 @@ impl ProductStore {
 pub(super) fn verify_snapshot(snapshot: &ProjectSnapshot) -> Result<()> {
     match snapshot.current_scope()? {
         family::CurrentScope::ScalarV1(_) => verify::validate(snapshot),
+        family::CurrentScope::OwnedV2(_) => owned_persist::validate(snapshot),
     }
 }
 pub(super) fn verify_transition(before: &ProjectSnapshot, after: &ProjectSnapshot) -> Result<()> {
+    if matches!(&before.scope, ScopeEnvelope::OwnedV2(_)) {
+        if before.scope != after.scope {
+            return Err(compiler::error(
+                "ordinary action changed owned proof history",
+            ));
+        }
+        return owned_persist::validate(after);
+    }
     verify::preserve(before, after)
 }
 pub(super) fn reject_unmanaged_target(
     snapshot: &ProjectSnapshot,
     target: &CapturedProgram,
 ) -> Result<()> {
+    if matches!(&snapshot.scope, ScopeEnvelope::OwnedV2(_)) {
+        return Err(compiler::error(
+            "owned adoption/evolution requires the separate locked owned writer",
+        ));
+    }
     if snapshot
         .scalar_scope()?
         .compositions
@@ -795,7 +818,12 @@ impl ProductStore {
             &snapshot.artifacts,
         )?;
         let mut view = runtime.view_model(&run)?;
-        view.history = history::presentation(&snapshot)?;
+        view.history = match &snapshot.scope {
+            ScopeEnvelope::ScalarV1(_) => history::presentation(&snapshot)?,
+            ScopeEnvelope::OwnedV2(_) => {
+                owned_replay::OwnedExecutionContext::new(&snapshot)?.presentation()?
+            }
+        };
         Ok(view)
     }
 }
@@ -805,6 +833,11 @@ impl ProjectSnapshot {
     /// slot coordinates, without exposing frozen data or authoring authority.
     pub fn editable_scope_context(&self) -> Result<Option<ScopeEditableContext>> {
         self.validate()?;
+        if matches!(&self.scope, ScopeEnvelope::OwnedV2(_)) {
+            return Err(compiler::error(
+                "owned editable evolution context is not yet supported",
+            ));
+        }
         let Some(manifest) = self.scalar_scope()?.compositions.get(&self.active_revision) else {
             return Ok(None);
         };

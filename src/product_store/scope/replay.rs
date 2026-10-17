@@ -21,9 +21,66 @@ impl ProvenanceColumns {
     }
 }
 
+/// Nonserializable retained-scene capability. The checked archive is its only
+/// production mint; the constructor also binds the entire witness package and
+/// exact source/input fields, so arbitrary scenarios cannot supply this token.
+pub(crate) struct RetainedScene {
+    snapshot: Digest,
+    decision: ScopedDecision,
+    program: CapturedProgram,
+    scenario: ScenarioSpec,
+}
+impl RetainedScene {
+    pub(crate) fn from_verified_archive(
+        current: &ProjectSnapshot,
+        decision: &ScopedDecision,
+        program: &CapturedProgram,
+        scenario: &ScenarioSpec,
+        scene: &serde_json::Value,
+        package: &serde_json::Value,
+    ) -> Result<Self> {
+        if !current.decisions.decisions.contains(decision)
+            || canonical_digest(IdentityDomain::Evidence, package)? != decision.witness
+            || package["version"] != 1
+            || package["content"]["kind"] != "scenes"
+            || !package["content"]["scenes"]
+                .as_array()
+                .is_some_and(|scenes| scenes.contains(scene))
+            || scene["program"]
+                != serde_json::to_value(program).map_err(|e| compiler::error(&e.to_string()))?
+            || scene["scenario"]
+                != serde_json::to_value(scenario).map_err(|e| compiler::error(&e.to_string()))?
+            || !decision.scenarios.contains(&scenario.identity()?)
+        {
+            return Err(compiler::error(
+                "retained scene differs from its exact witness/source/frame",
+            ));
+        }
+        Ok(Self {
+            snapshot: canonical_digest(IdentityDomain::Data, current)?,
+            decision: decision.clone(),
+            program: program.clone(),
+            scenario: scenario.clone(),
+        })
+    }
+    pub(super) fn snapshot(&self) -> &Digest {
+        &self.snapshot
+    }
+    pub(super) fn decision(&self) -> &ScopedDecision {
+        &self.decision
+    }
+    pub(super) fn program(&self) -> &CapturedProgram {
+        &self.program
+    }
+    pub(super) fn scenario(&self) -> &ScenarioSpec {
+        &self.scenario
+    }
+}
+
 #[derive(Clone)]
 pub struct ScopedExecutionContext {
     pub(super) snapshot: ProjectSnapshot,
+    owned: Option<owned_replay::OwnedExecutionContext>,
     adoption_target: Digest,
     projected_seeds: BTreeSet<Digest>,
     correspondences: BTreeMap<Digest, correspondence::VerifiedCorrespondence>,
@@ -31,6 +88,15 @@ pub struct ScopedExecutionContext {
 impl ScopedExecutionContext {
     pub fn committed(snapshot: &ProjectSnapshot) -> Result<Self> {
         snapshot.validate()?;
+        if matches!(&snapshot.scope, ScopeEnvelope::OwnedV2(_)) {
+            return Ok(Self {
+                snapshot: snapshot.clone(),
+                owned: Some(owned_replay::OwnedExecutionContext::new(snapshot)?),
+                adoption_target: snapshot.active_revision.clone(),
+                projected_seeds: BTreeSet::new(),
+                correspondences: BTreeMap::new(),
+            });
+        }
         Self::registry(snapshot)?.with_correspondences(
             &snapshot
                 .scalar_scope()?
@@ -43,6 +109,7 @@ impl ScopedExecutionContext {
     pub(super) fn registry(snapshot: &ProjectSnapshot) -> Result<Self> {
         Ok(Self {
             snapshot: rehearsal::replay_snapshot(snapshot)?,
+            owned: None,
             adoption_target: snapshot.active_revision.clone(),
             projected_seeds: snapshot
                 .scalar_scope()?
@@ -57,6 +124,14 @@ impl ScopedExecutionContext {
         mut self,
         proofs: &BTreeMap<Digest, ScopeCorrespondence>,
     ) -> Result<Self> {
+        if self.owned.is_some() {
+            if proofs.is_empty() {
+                return Ok(self);
+            }
+            return Err(compiler::error(
+                "scalar correspondence cannot enter owned family",
+            ));
+        }
         if proofs.len() > MAX_ITEMS {
             return Err(compiler::error("correspondence inventory exceeds bounds"));
         }
@@ -192,6 +267,35 @@ impl ScopedExecutionContext {
         }
         Ok(&scenario.seed)
     }
+    /// Owned initializers add required protected cells that ordinary schema
+    /// merging cannot supply. The original scenario remains the replay namespace.
+    pub fn project_owned_scenario(
+        &self,
+        source: &CapturedProgram,
+        original: &ScenarioSpec,
+        target: &CapturedProgram,
+    ) -> Result<(Self, ScenarioSpec)> {
+        let owned = self
+            .owned
+            .as_ref()
+            .ok_or_else(|| compiler::error("owned scenario projection requires owned family"))?;
+        Ok((
+            self.clone(),
+            owned.project_scenario(source, original, target, original)?,
+        ))
+    }
+    pub(crate) fn project_retained_scene(
+        &self,
+        token: &RetainedScene,
+        target: &CapturedProgram,
+        graph: &DecisionGraph,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<(ScenarioSpec, Box<dyn ReplayAdmission>)> {
+        self.owned
+            .as_ref()
+            .ok_or_else(|| compiler::error("retained owned scene requires owned family"))?
+            .project_retained_scene(token, target, graph, cancelled)
+    }
     pub(crate) fn project_scenario(
         &self,
         source: &CapturedProgram,
@@ -199,6 +303,12 @@ impl ScopedExecutionContext {
         target: &CapturedProgram,
         mapped: &ScenarioSpec,
     ) -> Result<(Self, ScenarioSpec)> {
+        if let Some(owned) = &self.owned {
+            return Ok((
+                self.clone(),
+                owned.project_scenario(source, original, target, mapped)?,
+            ));
+        }
         original.validate(&source.program)?;
         mapped.validate(&target.program)?;
         if original.clock_day != mapped.clock_day || original.random_seed != mapped.random_seed {
@@ -328,6 +438,7 @@ impl ScopedExecutionContext {
             .collect();
         proofs.extend(prepared.correspondences.clone());
         Self {
+            owned: None,
             snapshot: working,
             adoption_target: prepared.manifest.output.clone(),
             projected_seeds: seeds,
@@ -418,6 +529,13 @@ impl ScopedExecutionContext {
         }
     }
     pub(crate) fn provenance_columns(&self, source: &CapturedProgram) -> Result<ProvenanceColumns> {
+        if let Some(owned) = &self.owned {
+            if owned.contains(source) {
+                return Ok(ProvenanceColumns::default());
+            }
+            compiler::reject_reserved(&source.program)?;
+            return Ok(ProvenanceColumns::default());
+        }
         source.validate()?;
         let id = revision(source)?;
         let Some(manifest) = self.snapshot.scalar_scope()?.compositions.get(&id) else {
@@ -476,6 +594,9 @@ impl ScopedExecutionContext {
         Ok(result)
     }
     pub fn contains_managed_source(&self, source: &CapturedProgram) -> bool {
+        if let Some(owned) = &self.owned {
+            return owned.contains(source);
+        }
         self.snapshot.scalar_scope().is_ok_and(|state| {
             revision(source).ok().is_some_and(|id| {
                 state.compositions.contains_key(&id)
@@ -483,7 +604,21 @@ impl ScopedExecutionContext {
             })
         })
     }
+    pub(crate) fn uses_owned_initializer(&self, target: &CapturedProgram) -> bool {
+        self.owned
+            .as_ref()
+            .is_some_and(|owned| owned.contains(target))
+    }
     pub fn admit_target(&self, target: &CapturedProgram) -> Result<()> {
+        if self.owned.is_some() {
+            target.validate()?;
+            if target == self.snapshot.program()? {
+                return Ok(());
+            }
+            return Err(compiler::error(
+                "owned read checks require the exact current executable",
+            ));
+        }
         target.validate()?;
         let id = revision(target)?;
         if self.snapshot.scalar_scope()?.compositions.is_empty() {
@@ -517,6 +652,12 @@ impl ScopedExecutionContext {
         mapped: &DataSnapshot,
         day: i32,
     ) -> Result<(Self, DataSnapshot)> {
+        if let Some(owned) = &self.owned {
+            return Ok((
+                self.clone(),
+                owned.project_seed(source, original, target, mapped, day)?,
+            ));
+        }
         self.verify_seed(source, original, day)?;
         let authenticated = self.known_seed(&original.identity()?)?;
         if crate::product_runtime::has_protected_fields(target) && !authenticated {
@@ -617,6 +758,9 @@ impl ScopedExecutionContext {
         data: &DataSnapshot,
         day: i32,
     ) -> Result<()> {
+        if let Some(owned) = &self.owned {
+            return owned.verify_seed(target, data, day);
+        }
         if crate::product_runtime::has_protected_fields(target) {
             let digest = data.identity()?;
             let known = self.known_seed(&digest)?;
@@ -665,6 +809,9 @@ impl ScopedExecutionContext {
                 .any(|a| a.plan.expected_data == *digest))
     }
     fn verify_state(&self, target: &CapturedProgram, data: &DataSnapshot, day: i32) -> Result<()> {
+        if let Some(owned) = &self.owned {
+            return owned.verify_state(target, data, day);
+        }
         target.validate()?;
         data.validate()?;
         validate_day(day)?;
@@ -710,11 +857,30 @@ impl ScopedExecutionContext {
     }
 }
 impl ReplayAdmission for ScopedExecutionContext {
+    fn begin_replay(
+        &self,
+        target: &CapturedProgram,
+        scenario: &ScenarioSpec,
+        graph: &DecisionGraph,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::result::Result<Option<Box<dyn ReplayAdmission>>, AdapterError> {
+        self.owned
+            .as_ref()
+            .map(|owned| owned.begin_replay(target, scenario, graph, cancelled))
+            .transpose()
+            .map_err(|e| AdapterError::Unsupported(e.to_string()))
+    }
+
     fn replay_operation_ids(
         &self,
         target: &CapturedProgram,
         scenario: &ScenarioSpec,
     ) -> std::result::Result<Vec<Id>, AdapterError> {
+        if let Some(owned) = &self.owned {
+            return owned
+                .operation_ids(target, scenario)
+                .map_err(|e| AdapterError::Unsupported(e.to_string()));
+        }
         self.verify_seed(target, &scenario.seed, scenario.clock_day)
             .map_err(|e| AdapterError::Unsupported(e.to_string()))?;
         let mut original = scenario.clone();
@@ -742,5 +908,13 @@ impl ReplayAdmission for ScopedExecutionContext {
     ) -> std::result::Result<(), AdapterError> {
         self.verify_state(target, data, day)
             .map_err(|e| AdapterError::Unsupported(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+impl ScopedExecutionContext {
+    pub(crate) fn owned_replay_budget_for_test(mut self, budget: ProofBudget) -> Self {
+        self.owned.as_mut().expect("owned fixture").budget = budget;
+        self
     }
 }
