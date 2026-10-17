@@ -1520,7 +1520,10 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         }
         validate_withdrawal_delta(current, &next, &plan)?;
         self.verify_destination_packages(store, current, &next, &plan)?;
-        let prepared = store.prepare_adoption(plan, target)?;
+        let prepared = match self.pending_scope.borrow().as_ref() {
+            Some(scoped) => store.prepare_scoped_adoption(plan, target, scoped)?,
+            None => store.prepare_adoption(plan, target)?,
+        };
         let state = current.scalar_scope()?;
         let correspondences: BTreeMap<_, _> = self
             .pending_correspondences

@@ -515,6 +515,31 @@ impl ProductStore {
     pub fn scoped_plan(&self, prepared: &PreparedScopedChange) -> Result<PreparedAdoption> {
         Ok(prepared.adoption.clone())
     }
+    /// Trusted scalar preparations carry reconstruction authority that a raw
+    /// compiled capture cannot supply to ordinary adoption preparation.
+    pub(crate) fn prepare_scoped_adoption(
+        &self,
+        plan: AdoptionPlan,
+        target: &CapturedProgram,
+        prepared: &PreparedScopedChange,
+    ) -> Result<PreparedAdoption> {
+        if target != &prepared.target
+            || plan.id != prepared.operation_id()
+            || plan.scope != prepared.scope
+        {
+            return Err(compiler::error(
+                "scoped adoption must match the prepared target, operation and scope",
+            ));
+        }
+        let current = self.load()?;
+        ScopedExecutionContext::prepared(&current, prepared)?;
+        self.check_plan(&current, &plan, target)?;
+        Ok(PreparedAdoption {
+            plan,
+            expected_revision: current.revision,
+            target: revision(target)?,
+        })
+    }
     pub fn adopt_scoped_verified<F>(
         &self,
         expected_revision: u64,

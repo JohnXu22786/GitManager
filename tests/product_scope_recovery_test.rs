@@ -711,3 +711,143 @@ fn rehashed_compositions_require_exact_predecessor_business_and_basis() {
         DataValue::Boolean { value: false }
     );
 }
+
+#[test]
+fn verified_scalar_preparation_keeps_ordinary_targets_untrusted() {
+    let dir = tempdir();
+    let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
+    add(&store, "existing", "Existing work");
+    let before = store.load().unwrap();
+    let prepared = store
+        .prepare_scoped_change(
+            &program(true),
+            &request(&before, ScopePopulation::FutureWork),
+            "scope",
+        )
+        .unwrap();
+    let plan = store.scoped_plan(&prepared).unwrap().plan().clone();
+    assert!(store.prepare_switch(prepared.target(), "ordinary").is_err());
+    assert!(store
+        .prepare_adoption(plan.clone(), prepared.target())
+        .is_err());
+    let verified = store
+        .prepare_scoped_adoption(plan.clone(), prepared.target(), &prepared)
+        .unwrap();
+    assert_eq!(verified.plan(), &plan);
+    assert_eq!(store.load().unwrap(), before);
+    let adopted = store.adopt_scoped(before.revision, &prepared).unwrap();
+
+    let mut evolved = serde_json::to_value(program(true).program).unwrap();
+    evolved["label"] = serde_json::json!("Updated ordinary business label");
+    let evolved = capture(evolved);
+    let layer = prepared.layer_id().unwrap().unwrap();
+    let target = canonical_digest(IdentityDomain::Source, &evolved).unwrap();
+    let mappings: Vec<_> = adopted.scalar_scope().unwrap().layers[&layer]
+        .patches
+        .iter()
+        .enumerate()
+        .map(|(patch, p)| ScopeSlotMapping {
+            layer: layer.clone(),
+            patch,
+            from_source: adopted.active_revision.clone(),
+            from: p.request.destination.clone(),
+            to_source: target.clone(),
+            to: p.request.destination.clone(),
+            subject: p.request.subject.clone(),
+        })
+        .collect();
+    let evolution = store
+        .prepare_managed_evolution(&evolved, &mappings, "evolve")
+        .unwrap();
+    let evolved_plan = store.scoped_plan(&evolution).unwrap().plan().clone();
+    assert!(store
+        .prepare_adoption(evolved_plan.clone(), evolution.target())
+        .is_err());
+    store
+        .prepare_scoped_adoption(evolved_plan, evolution.target(), &evolution)
+        .unwrap();
+    let evolved = store.adopt_scoped(adopted.revision, &evolution).unwrap();
+
+    let withdrawal = store
+        .prepare_scoped_withdrawal(&[prepared.layer_id().unwrap().unwrap()], "withdraw")
+        .unwrap();
+    let withdrawal_plan = store.scoped_plan(&withdrawal).unwrap().plan().clone();
+    assert!(store
+        .prepare_adoption(withdrawal_plan.clone(), withdrawal.target())
+        .is_err());
+    store
+        .prepare_scoped_adoption(withdrawal_plan, withdrawal.target(), &withdrawal)
+        .unwrap();
+    let withdrawn = store.adopt_scoped(evolved.revision, &withdrawal).unwrap();
+    assert_eq!(withdrawn.data, evolved.data);
+    assert_eq!(store.load().unwrap(), withdrawn);
+}
+
+#[test]
+fn scoped_adoption_preparation_rejects_mismatched_and_stale_proofs() {
+    let dir = tempdir();
+    let store = ProductStore::create(dir.path().join("tool"), &program(false), 20000).unwrap();
+    add(&store, "existing", "Existing work");
+    let before = store.load().unwrap();
+    let prepared = store
+        .prepare_scoped_change(
+            &program(true),
+            &request(&before, ScopePopulation::FutureWork),
+            "scope",
+        )
+        .unwrap();
+    let plan = store.scoped_plan(&prepared).unwrap().plan().clone();
+    for variant in 0..2 {
+        let mut wrong = plan.clone();
+        if variant == 0 {
+            wrong.id = "different-operation".into();
+        } else {
+            wrong.scope.population = Population::All;
+        }
+        assert!(store
+            .prepare_scoped_adoption(wrong, prepared.target(), &prepared)
+            .is_err());
+    }
+    let mut forged = serde_json::to_value(prepared.target().program.clone()).unwrap();
+    forged["label"] = serde_json::json!("Unregistered protected source");
+    let forged = capture(forged);
+    let mut forged_plan = plan.clone();
+    forged_plan.target = forged.artifact.clone();
+    forged_plan.compatibility = product_runtime::LocalRuntime::default()
+        .compatibility_at(&forged, &before.data, before.clock_day)
+        .unwrap();
+    assert_eq!(
+        forged_plan.compatibility.state,
+        CompatibilityState::Compatible
+    );
+    assert!(store
+        .prepare_adoption(forged_plan.clone(), &forged)
+        .is_err());
+    assert!(store
+        .prepare_scoped_adoption(forged_plan, &forged, &prepared)
+        .is_err());
+    let mut rebound = prepared.target().clone();
+    rebound.binding.producer = Producer::ExternalAuthor {
+        description: "Copied compiled bytes without preparation provenance".into(),
+    };
+    rebound.validate().unwrap();
+    assert_eq!(rebound.artifact, prepared.target().artifact);
+    assert!(store
+        .prepare_scoped_adoption(plan.clone(), &rebound, &prepared)
+        .is_err());
+    assert_eq!(store.load().unwrap(), before);
+
+    tick(&store, "later-day", 20001);
+    let changed = store.load().unwrap();
+    let mut refreshed = plan;
+    refreshed.expected_data = changed.data.identity().unwrap();
+    refreshed.expected_session = changed.session.identity().unwrap();
+    refreshed.expected_generation = changed.data.generation;
+    refreshed.compatibility = product_runtime::LocalRuntime::default()
+        .compatibility_at(prepared.target(), &changed.data, changed.clock_day)
+        .unwrap();
+    assert!(store
+        .prepare_scoped_adoption(refreshed, prepared.target(), &prepared)
+        .is_err());
+    assert_eq!(store.load().unwrap(), changed);
+}
