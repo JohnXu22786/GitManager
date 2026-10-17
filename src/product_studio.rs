@@ -1,5 +1,7 @@
 //! Generated-tool host. One worker owns blocking generation, copied changes,
 //! verification, adoption and job cleanup; egui only renders bounded models.
+#[path = "product_studio/owned_authoring.rs"]
+pub mod owned_authoring;
 #[path = "product_studio/change.rs"]
 mod change;
 #[path = "product_studio/change_adapter.rs"]
