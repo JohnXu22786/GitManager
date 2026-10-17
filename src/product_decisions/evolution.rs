@@ -326,7 +326,14 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                         "Accepted need no longer reproduces or its scope is unverified".into(),
                     ));
                 }
-                match assess_scope(&decision.scope, &contexts) {
+                let applicability = self.scope_context()?.applicability(
+                    &original.program,
+                    &candidate,
+                    &decision.scope,
+                    Some(decision),
+                    false,
+                )?;
+                match assess_scope(&decision.scope, &contexts, &applicability) {
                     ScopeMatch::Outside => continue,
                     ScopeMatch::Unknown => {
                         return Err(DecisionError::Unverified(
@@ -383,7 +390,8 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 let applicable: BTreeSet<_> = contexts
                     .iter()
                     .filter(|context| {
-                        scope_match(&decision.scope, context).state == ScopeMatch::Applies
+                        bound_scope_match(&decision.scope, context, &applicability).state
+                            == ScopeMatch::Applies
                     })
                     .map(|context| context.operation.clone())
                     .collect();
@@ -396,7 +404,13 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                     &original.program.program,
                     &candidate.program,
                 )?;
-                verify_target_scope(&decision.scope, &operations, &mapping, &target_contexts)?;
+                verify_target_scope(
+                    &decision.scope,
+                    &operations,
+                    &mapping,
+                    &target_contexts,
+                    &applicability,
+                )?;
                 scope.operations.extend(operations);
                 for p in &decision.obligations {
                     let mapped = mapping.property(p);

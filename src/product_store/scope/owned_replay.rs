@@ -185,9 +185,8 @@ fn validate_history_from(
         ));
     }
     let mut frame = seed.clone();
-    let mut revisions = revision_history::RevisionHistory::new(seed, |r| {
-        !owned_entity(prepared, &r.entity)
-    });
+    let mut revisions =
+        revision_history::RevisionHistory::new(seed, |r| !owned_entity(prepared, &r.entity));
     let mut prior_day = seed_day;
     for event in &data.events[seed.events.len()..] {
         meter.charge(1)?;
@@ -403,6 +402,9 @@ pub(super) struct OwnedExecutionContext {
     pub snapshot: ProjectSnapshot,
     pub registry: Arc<owned_persist::ReconstructedOwned>,
     pub budget: ProofBudget,
+    prepared_target: Option<Digest>,
+    proposed_graph: Option<DecisionGraph>,
+    preparation_cancelled: Option<Arc<AtomicBool>>,
 }
 impl OwnedExecutionContext {
     pub fn new(snapshot: &ProjectSnapshot) -> Result<Self> {
@@ -411,7 +413,78 @@ impl OwnedExecutionContext {
             snapshot: snapshot.clone(),
             registry: Arc::new(owned_persist::reconstruct(snapshot, &mut meter)?),
             budget: ProofBudget::default(),
+            prepared_target: None,
+            proposed_graph: None,
+            preparation_cancelled: None,
         })
+    }
+    pub(super) fn for_prepared(
+        snapshot: &ProjectSnapshot,
+        prepared: &PreparedOwnedScopedChangeV2,
+        graph: Option<&DecisionGraph>,
+    ) -> Result<Self> {
+        snapshot.validate()?;
+        prepared.check_basis(snapshot)?;
+        let mut registry = match &snapshot.scope {
+            ScopeEnvelope::ScalarV1(s) if *s == ScopeState::default() => {
+                owned_persist::ReconstructedOwned {
+                    proofs: BTreeMap::new(),
+                    manifests: BTreeMap::new(),
+                    initializations: BTreeMap::new(),
+                }
+            }
+            ScopeEnvelope::OwnedV2(_) => {
+                let mut meter = ProofMeter::new(prepared.budget, prepared.cancelled.clone())?;
+                owned_persist::reconstruct(snapshot, &mut meter)?
+            }
+            _ => return Err(err("owned preparation cannot enter scalar history")),
+        };
+        let id = revision(prepared.target())?;
+        registry
+            .proofs
+            .insert(id.clone(), prepared.execution.clone());
+        registry
+            .manifests
+            .insert(id.clone(), prepared.manifest.clone());
+        registry
+            .initializations
+            .insert(id.clone(), prepared.initialization.clone());
+        if let Some(next) = graph {
+            next.validate()?;
+            if snapshot
+                .decisions
+                .decisions
+                .iter()
+                .filter(|d| d.status == DecisionStatus::Active)
+                .any(|d| !next.decisions.contains(d))
+            {
+                return Err(err("owned choice changed an independent active intention"));
+            }
+        }
+        Ok(Self {
+            snapshot: snapshot.clone(),
+            registry: Arc::new(registry),
+            budget: prepared.budget,
+            prepared_target: Some(id),
+            proposed_graph: graph.cloned(),
+            preparation_cancelled: Some(prepared.cancelled.clone()),
+        })
+    }
+    fn meter(&self, cancelled: Arc<AtomicBool>) -> Result<ProofMeter> {
+        let mut meter = ProofMeter::new(self.budget, cancelled)?;
+        if let Some(token) = &self.preparation_cancelled {
+            meter.watch_cancellation(token);
+        }
+        meter.charge(1)?;
+        Ok(meter)
+    }
+    fn permits_graph(&self, graph: &DecisionGraph) -> bool {
+        graph == &self.snapshot.decisions || self.proposed_graph.as_ref() == Some(graph)
+    }
+    pub(super) fn permits_target(&self, target: &CapturedProgram) -> Result<bool> {
+        Ok(target == self.snapshot.program()?
+            || self.prepared_target.as_ref() == Some(&revision(target)?)
+                && self.prepared(target)?.is_some())
     }
     fn prepared(&self, target: &CapturedProgram) -> Result<Option<&PreparedOwnedPreview>> {
         target.validate()?;
@@ -427,6 +500,57 @@ impl OwnedExecutionContext {
             compiler::reject_reserved(&target.program)?;
             Ok(None)
         }
+    }
+    pub(super) fn applicability(
+        &self,
+        source: &CapturedProgram,
+        target: &CapturedProgram,
+        scope: &DecisionScope,
+        require_owned: bool,
+    ) -> Result<ScopeApplicability> {
+        let Some(prepared) = self.prepared(source)? else {
+            return Ok(if require_owned {
+                ScopeApplicability::UnverifiedOwned
+            } else {
+                ScopeApplicability::Ordinary
+            });
+        };
+        if source != target
+            || !self.permits_target(target)?
+            || scope != &owned_coverage::expected_scope(prepared)
+        {
+            return Ok(ScopeApplicability::UnverifiedOwned);
+        }
+        Ok(ScopeApplicability::OwnedRoot(
+            prepared.proof.request.inventory.sources.root_entity.clone(),
+        ))
+    }
+    pub(super) fn owns_decision(&self, decision: &ScopedDecision) -> bool {
+        self.snapshot.decisions.decisions.contains(decision)
+            && self.snapshot.owned_scope().is_ok_and(|scope| {
+                scope
+                    .rehearsals
+                    .values()
+                    .any(|receipt| receipt.witnesses.get(&decision.id) == Some(&decision.witness))
+            })
+    }
+    pub(super) fn boundary_coverage(
+        &self,
+        target: &CapturedProgram,
+        scope: &DecisionScope,
+        contexts: &[ScopeContext],
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<OwnedBoundaryCoverage> {
+        if !self.permits_target(target)? {
+            return Ok(OwnedBoundaryCoverage::default());
+        }
+        let Some(prepared) = self.prepared(target)? else {
+            return Ok(OwnedBoundaryCoverage::default());
+        };
+        // One live-cancellable host meter covers the entire additional source
+        // proof. It does not replace or replenish any replay/runtime meter.
+        let mut meter = self.meter(cancelled)?;
+        owned_coverage::derive(prepared, scope, contexts, &mut meter)
     }
     pub fn contains(&self, source: &CapturedProgram) -> bool {
         self.prepared(source).is_ok_and(|p| p.is_some())
@@ -573,9 +697,10 @@ impl OwnedExecutionContext {
         let target_identity = revision(target)?;
         for receipt in self
             .snapshot
-            .owned_scope()?
-            .correspondences
-            .values()
+            .owned_scope()
+            .ok()
+            .into_iter()
+            .flat_map(|s| s.correspondences.values())
             .filter(|r| r.proof.target == target_identity)
         {
             if let Some(pair) = &receipt.proof.scenario {
@@ -687,12 +812,12 @@ impl OwnedExecutionContext {
                     || (basis.program().is_ok_and(|before| before == target)
                         && scenario.seed == basis.data))
         });
-        if graph != &self.snapshot.decisions && !historical_frame {
+        if !self.permits_graph(graph) && !historical_frame {
             return Err(err(
                 "replay decision graph differs from authenticated context",
             ));
         }
-        let mut meter = ProofMeter::new(self.budget, cancelled)?;
+        let mut meter = self.meter(cancelled)?;
         meter.charge(canonical_bytes(&(scenario, graph))?.len() as u64)?;
         let operations = self.operation_ids(target, scenario)?;
         if operations.len() != scenario.inputs.len() {
@@ -796,10 +921,10 @@ impl OwnedExecutionContext {
         ScenarioSpec,
         Box<dyn crate::product_runtime::ReplayAdmission>,
     )> {
-        let mut meter = ProofMeter::new(self.budget, cancelled)?;
+        let mut meter = self.meter(cancelled)?;
         if token.snapshot() != &canonical_digest(IdentityDomain::Data, &self.snapshot)?
-            || graph != &self.snapshot.decisions
-            || target != self.snapshot.program()?
+            || !self.permits_graph(graph)
+            || !self.permits_target(target)?
         {
             return Err(err("retained scene snapshot/graph/current target changed"));
         }

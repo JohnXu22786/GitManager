@@ -5,12 +5,15 @@ mod bundle;
 mod context;
 mod evolution;
 mod mapping;
+mod owned;
+use owned::{ChangeAuthority, OwnedDecisionContext};
 mod recovery;
 mod replay;
 use crate::product_contract::*;
 use crate::product_runtime::{LocalRuntime, DRIVER_VERSION};
 use crate::product_store::scope::{
-    PreparedScopedChange, RetainedScene, ScopeCorrespondence, ScopedExecutionContext,
+    OwnedChoiceMode, PreparedOwnedScopedChangeV2, PreparedScopedChange, RetainedScene,
+    ScopeCorrespondence, ScopedExecutionContext,
 };
 use crate::product_store::{PreparedAdoption, ProductStore, ProjectSnapshot, StoreError};
 pub use archive::IntentArchive;
@@ -114,10 +117,14 @@ impl CheckReport {
         self.checks.push(check);
     }
 }
+#[derive(Default)]
+struct SceneCoverage {
+    applicable: BTreeSet<Id>,
+    boundary: crate::product_store::scope::OwnedBoundaryCoverage,
+}
 /// Kept opaque: only this host can prepare it, and commit repeats the checks.
 pub struct VerifiedChange {
-    scoped: Option<PreparedScopedChange>,
-    rehearsal: Option<(Vec<PreparedScopedChange>, Vec<Id>)>,
+    authority: ChangeAuthority,
     correspondences: BTreeMap<Digest, ScopeCorrespondence>,
     prepared: PreparedAdoption,
     revision: u64,
@@ -126,7 +133,8 @@ pub struct VerifiedChange {
     mappings: Vec<ImplementationMapping>,
     report: CheckReport,
     expected_snapshot: Digest,
-    runtime: String,
+    runtime: RuntimeCapabilities,
+    limits: RuntimeLimits,
 }
 impl VerifiedChange {
     pub fn report(&self) -> &CheckReport {
@@ -145,6 +153,8 @@ struct AdmissionKey {
     prepared: Option<PreparedScopedChange>,
     rehearsal: Option<(Vec<PreparedScopedChange>, Vec<Id>)>,
     correspondences: BTreeMap<Digest, ScopeCorrespondence>,
+    owned: Option<OwnedDecisionContext>,
+    limits: RuntimeLimits,
     runtime: RuntimeCapabilities,
     driver: &'static str,
 }
@@ -157,6 +167,7 @@ pub struct DecisionEngine<R: RuntimeAdapter> {
     archive: IntentArchive,
     limits: RuntimeLimits,
     pending_scope: RefCell<Option<PreparedScopedChange>>,
+    pending_owned: RefCell<Option<OwnedDecisionContext>>,
     pending_rehearsal: RefCell<Option<(Vec<PreparedScopedChange>, Vec<Id>)>>,
     pending_correspondences: RefCell<BTreeMap<Digest, ScopeCorrespondence>>,
     // One immutable admission result; every lookup still freshly loads and
@@ -174,6 +185,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             archive,
             limits: RuntimeLimits::default(),
             pending_scope: RefCell::new(None),
+            pending_owned: RefCell::new(None),
             pending_rehearsal: RefCell::new(None),
             pending_correspondences: RefCell::new(BTreeMap::new()),
             admission_cache: RefCell::new(None),
@@ -223,9 +235,20 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             prepared: self.pending_scope.borrow().clone(),
             rehearsal: self.pending_rehearsal.borrow().clone(),
             correspondences: self.pending_correspondences.borrow().clone(),
+            owned: self.pending_owned.borrow().clone(),
+            limits: self.limits.clone(),
             runtime: self.runtime.capabilities(),
             driver: DRIVER_VERSION,
         };
+        if let Some(owned) = &key.owned {
+            owned.prepared.check_basis(&key.current)?;
+            if key.prepared.is_some() || key.rehearsal.is_some() || !key.correspondences.is_empty()
+            {
+                return Err(invalid(
+                    "owned and scalar decision authority cannot coexist",
+                ));
+            }
+        }
         if let Some(cached) = self.admission_cache.borrow().as_ref() {
             if cached.key == key {
                 #[cfg(test)]
@@ -236,7 +259,14 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         self.clear_admission_cache();
         #[cfg(test)]
         self.admission_builds.set(self.admission_builds.get() + 1);
-        let context = if let Some(prepared) = &key.prepared {
+        let context = if let Some(owned) = &key.owned {
+            ScopedExecutionContext::owned_prepared(
+                &key.current,
+                &owned.prepared,
+                owned.next.as_ref(),
+                &owned.mode,
+            )?
+        } else if let Some(prepared) = &key.prepared {
             if key.rehearsal.is_some() {
                 return Err(invalid(
                     "rehearsal retention and activation cannot share an authority context",
@@ -267,6 +297,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         current: &ProjectSnapshot,
     ) -> Result<ScopedExecutionContext> {
         if self.pending_scope.borrow().is_some()
+            || self.pending_owned.borrow().is_some()
             || self.pending_rehearsal.borrow().is_some()
             || self.archive.snapshot()? != *current
         {
@@ -843,25 +874,22 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             }
             let start = report.checks.len();
             let mut exercised = BTreeSet::new();
+            let mut boundaries = BTreeSet::new();
             for (index, scene) in scenes.iter().enumerate() {
                 let relevant = mappings.iter().find(|m| {
                     m.source_program == scene.program.artifact.program_digest
                         && m.source_program != target.artifact.program_digest
                 });
-                exercised.extend(self.check_scene(
-                    graph,
-                    decision,
-                    scene,
-                    target,
-                    relevant,
-                    index,
-                    &mut report,
-                )?);
+                let coverage =
+                    self.check_scene(graph, decision, scene, target, relevant, index, &mut report)?;
+                exercised.extend(coverage.applicable);
+                boundaries.extend(coverage.boundary.operations().iter().cloned());
             }
+            let demonstrated: BTreeSet<_> = exercised.union(&boundaries).cloned().collect();
             let missing: Vec<_> = decision
                 .scope
                 .operations
-                .difference(&exercised)
+                .difference(&demonstrated)
                 .cloned()
                 .collect();
             if !missing.is_empty() {
@@ -891,7 +919,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         bound: Option<&ImplementationMapping>,
         index: usize,
         report: &mut CheckReport,
-    ) -> Result<BTreeSet<Id>> {
+    ) -> Result<SceneCoverage> {
         let relevant: Vec<_> = bound
             .map(|m| m.mappings.as_slice())
             .unwrap_or(&[])
@@ -910,7 +938,14 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 &canonical_digest(IdentityDomain::Decision, &(&decision.id, index))?.as_str()[..32]
             ),
         )?;
-        let scope = assess_scope(&decision.scope, &contexts);
+        let applicability = self.scope_context()?.applicability(
+            &scene.program,
+            target,
+            &decision.scope,
+            Some(decision),
+            false,
+        )?;
+        let scope = assess_scope(&decision.scope, &contexts, &applicability);
         let mut check = DecisionCheck {
             decision: decision.id.clone(),
             decision_digest: decision.identity()?,
@@ -935,13 +970,28 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             check.state = CheckState::Stale;
             check.explanation="Accepted scene no longer reproduces in the current runtime; review its execution, not the settled preference".into();
             report.add(check);
-            return Ok(BTreeSet::new());
+            return Ok(SceneCoverage::default());
         }
-        let exercised = contexts
+        let exercised: BTreeSet<_> = contexts
             .iter()
-            .filter(|c| scope_match(&decision.scope, c).state == ScopeMatch::Applies)
+            .filter(|c| {
+                bound_scope_match(&decision.scope, c, &applicability).state == ScopeMatch::Applies
+            })
             .map(|c| c.operation.clone())
             .collect();
+        let boundary = self.scope_context()?.owned_boundary_coverage(
+            &scene.program,
+            target,
+            &decision.scope,
+            &contexts,
+            self.runtime
+                .cancellation_token()
+                .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))),
+        )?;
+        let coverage = SceneCoverage {
+            applicable: exercised.clone(),
+            boundary,
+        };
         if scope != ScopeMatch::Applies {
             check.state = if scope == ScopeMatch::Outside {
                 CheckState::Outside
@@ -953,14 +1003,22 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             } else {
                 contexts
                     .iter()
-                    .map(|c| scope_match(&decision.scope, c))
+                    .map(|c| bound_scope_match(&decision.scope, c, &applicability))
                     .filter(|a| a.state == ScopeMatch::Unknown)
                     .map(|a| a.reason)
                     .collect::<Vec<_>>()
                     .join("; ")
             };
+            if !coverage.boundary.operations().is_empty() {
+                check.binding = prior.binding.clone();
+                check.evidence = Some(prior.identity()?);
+                if scope == ScopeMatch::Outside {
+                    check.explanation = "Independently replayed an unchanged pure creation outside the exact selected-existing population".into();
+                }
+                report.runs.push(prior);
+            }
             report.add(check);
-            return Ok(exercised);
+            return Ok(coverage);
         }
         let explicit = bound.and_then(|b| {
             b.scenarios
@@ -991,7 +1049,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 check.explanation =
                     format!("Accepted scene cannot be mapped to this implementation: {e}");
                 report.add(check);
-                return Ok(exercised);
+                return Ok(coverage);
             }
         };
         let run_id = format!(
@@ -1019,7 +1077,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 check.explanation =
                     format!("Actual implementation cannot execute the mapped requirement: {e}");
                 report.add(check);
-                return Ok(exercised);
+                return Ok(coverage);
             }
         };
         if run.state == EvidenceState::Observed {
@@ -1032,7 +1090,13 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 &target.program,
             )
             .and_then(|operations| {
-                verify_target_scope(&decision.scope, &operations, &mapping, &target_contexts)
+                verify_target_scope(
+                    &decision.scope,
+                    &operations,
+                    &mapping,
+                    &target_contexts,
+                    &applicability,
+                )
             });
             if let Err(error) = scope_check {
                 check.binding = run.binding.clone();
@@ -1042,7 +1106,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                     format!("Mapped target operation or scope is unverified: {error}");
                 report.runs.push(run);
                 report.add(check);
-                return Ok(exercised);
+                return Ok(coverage);
             }
         }
         check.binding = run.binding.clone();
@@ -1083,7 +1147,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         }
         report.runs.push(run);
         report.add(check);
-        Ok(exercised)
+        Ok(coverage)
     }
     fn reproduce_scene(
         &self,
@@ -1176,7 +1240,16 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 return Err(invalid("chosen scene belongs to another project"));
             }
             let (actual, contexts) = self.reproduce_scene(scene, &current.decisions)?;
-            if assess_scope(&choice.scope, &contexts) != ScopeMatch::Applies {
+            // The property witness is the source actually reproduced, including
+            // candidate scenes in a nonbinary recording whose save target is Current.
+            let applicability = self.scope_context()?.applicability(
+                &scene.program,
+                &scene.program,
+                &choice.scope,
+                None,
+                self.pending_owned.borrow().is_some(),
+            )?;
+            if assess_scope(&choice.scope, &contexts, &applicability) != ScopeMatch::Applies {
                 continue;
             }
             verified_properties = true;
@@ -1243,15 +1316,31 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             .revision
             .checked_add(1)
             .ok_or_else(|| invalid("decision revision overflow"))?;
-        self.prepare(
-            store,
-            &current,
-            target,
-            next,
-            self.current_mappings(&current)?,
-            resolves.to_vec(),
-            id,
-        )
+        let owned = self.pending_owned.borrow().clone();
+        if let Some(mut owned) = owned {
+            owned.next = Some(next.clone());
+            self.with_owned(owned, || {
+                self.prepare(
+                    store,
+                    &current,
+                    target,
+                    next,
+                    self.current_mappings(&current)?,
+                    resolves.to_vec(),
+                    id,
+                )
+            })
+        } else {
+            self.prepare(
+                store,
+                &current,
+                target,
+                next,
+                self.current_mappings(&current)?,
+                resolves.to_vec(),
+                id,
+            )
+        }
     }
     pub fn prepare_change(
         &self,
@@ -1306,7 +1395,14 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         }) {
             for scene in self.archive.load(&decision.witness)? {
                 let (_, contexts) = self.reproduce_scene(&scene, graph)?;
-                if assess_scope(&decision.scope, &contexts) == ScopeMatch::Applies {
+                let applicability = self.scope_context()?.applicability(
+                    &scene.program,
+                    &scene.program,
+                    &decision.scope,
+                    Some(decision),
+                    false,
+                )?;
+                if assess_scope(&decision.scope, &contexts, &applicability) == ScopeMatch::Applies {
                     required_scenes.insert((
                         scene.program.artifact.program_digest,
                         scene.scenario.identity()?,
@@ -1536,6 +1632,12 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 .borrow()
                 .as_ref()
                 .map(|p| p.scope().clone())
+                .or_else(|| {
+                    self.pending_owned
+                        .borrow()
+                        .as_ref()
+                        .map(|o| o.prepared.scope())
+                })
                 .unwrap_or_else(|| DecisionScope {
                     operations: target
                         .program
@@ -1572,16 +1674,21 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         }
         validate_withdrawal_delta(current, &next, &plan)?;
         self.verify_destination_packages(store, current, &next, &plan)?;
-        let prepared = match self.pending_scope.borrow().as_ref() {
-            Some(scoped) => store.prepare_scoped_adoption(plan, target, scoped)?,
-            None => store.prepare_adoption(plan, target)?,
+        let owned = self.pending_owned.borrow().clone();
+        let prepared = if let Some(owned) = &owned {
+            store.prepare_owned_adoption(plan, &owned.prepared, &owned.mode)?
+        } else {
+            match self.pending_scope.borrow().as_ref() {
+                Some(scoped) => store.prepare_scoped_adoption(plan, target, scoped)?,
+                None => store.prepare_adoption(plan, target)?,
+            }
         };
-        let state = current.scalar_scope()?;
+        let state = current.scalar_scope().ok();
         let correspondences: BTreeMap<_, _> = self
             .pending_correspondences
             .borrow()
             .iter()
-            .filter(|(id, _)| !state.correspondences.contains_key(*id))
+            .filter(|(id, _)| !state.is_some_and(|s| s.correspondences.contains_key(*id)))
             .map(|(id, proof)| (id.clone(), proof.clone()))
             .collect();
         let mut scoped = self.pending_scope.borrow().clone();
@@ -1589,9 +1696,16 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             scoped.correspondences = correspondences.clone();
         }
         Ok(VerifiedChange {
-            scoped,
+            authority: if let Some(owned) = owned {
+                ChangeAuthority::Owned(owned)
+            } else if let Some(scoped) = scoped {
+                ChangeAuthority::ScalarActivation(scoped)
+            } else if let Some((prepared, ids)) = self.pending_rehearsal.borrow().clone() {
+                ChangeAuthority::ScalarRecording(prepared, ids)
+            } else {
+                ChangeAuthority::Ordinary
+            },
             correspondences,
-            rehearsal: self.pending_rehearsal.borrow().clone(),
             prepared,
             revision: current.revision,
             target: target.clone(),
@@ -1599,12 +1713,30 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             mappings,
             report,
             expected_snapshot: canonical_digest(IdentityDomain::Data, current)?,
-            runtime: self.runtime.capabilities().version,
+            runtime: self.runtime.capabilities(),
+            limits: self.limits.clone(),
         })
     }
     pub fn adopt(&self, store: &ProductStore, change: &VerifiedChange) -> Result<ProjectSnapshot> {
-        self.with_scoped(change.scoped.clone(), || {
-            self.with_rehearsal(change.rehearsal.clone(), || {
+        if let ChangeAuthority::Owned(owned) = &change.authority {
+            return self.adopt_owned(
+                store,
+                change,
+                owned,
+                #[cfg(test)]
+                None,
+            );
+        }
+        let scoped = match &change.authority {
+            ChangeAuthority::ScalarActivation(p) => Some(p.clone()),
+            _ => None,
+        };
+        let rehearsal = match &change.authority {
+            ChangeAuthority::ScalarRecording(p, ids) => Some((p.clone(), ids.clone())),
+            _ => None,
+        };
+        self.with_scoped(scoped.clone(), || {
+            self.with_rehearsal(rehearsal.clone(), || {
                 self.with_correspondences(change.correspondences.clone(), || {
                     let verify =
                         |current: &ProjectSnapshot,
@@ -1613,7 +1745,8 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                          plan: &AdoptionPlan| {
                             if canonical_digest(IdentityDomain::Data, current)?
                                 != change.expected_snapshot
-                                || self.runtime.capabilities().version != change.runtime
+                                || self.runtime.capabilities() != change.runtime
+                                || self.limits != change.limits
                                 || next != &change.decisions
                                 || target != &change.target
                                 || plan != change.prepared.plan()
@@ -1653,7 +1786,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                             }
                             Ok(())
                         };
-                    Ok(if let Some(scoped) = &change.scoped {
+                    Ok(if let Some(scoped) = &scoped {
                         store.adopt_scoped_verified(
                             change.revision,
                             scoped,
@@ -1661,7 +1794,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                             &change.decisions,
                             verify,
                         )?
-                    } else if let Some((proof, ids)) = &change.rehearsal {
+                    } else if let Some((proof, ids)) = &rehearsal {
                         store.adopt_rehearsals_verified(
                             change.revision,
                             &change.prepared,

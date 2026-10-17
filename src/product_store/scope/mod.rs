@@ -1,8 +1,13 @@
 //! Host-owned scoped executable composition and protected completion history.
 mod owned_wire;
 pub use owned_wire::*;
+mod owned_choice;
 mod owned_persist;
+pub use owned_choice::PreparedOwnedScopedChangeV2;
+pub(crate) use owned_choice::{prepare_owned, OwnedChoiceMode};
+mod owned_coverage;
 mod owned_replay;
+pub(crate) use owned_coverage::{OwnedBoundaryCoverage, ScopeApplicability};
 mod revision_history;
 #[cfg(test)]
 pub(crate) use owned_persist::{

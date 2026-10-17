@@ -154,7 +154,7 @@ pub(super) fn initialize_frame(
     }
     Ok(data)
 }
-fn build(
+pub(super) fn build(
     proof: VerifiedOwnedPreviewPlan,
     meter: &mut ProofMeter,
 ) -> AdmissionResult<PreparedOwnedPreview> {
