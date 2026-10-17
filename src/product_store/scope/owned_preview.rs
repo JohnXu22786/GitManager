@@ -26,10 +26,10 @@ pub struct OwnedPreviewReceipt {
 /// Read-only diagnostic access does not confer durable admission. There is no
 /// Deserialize, mutable frame access, scalar preparation or final-data resume.
 pub struct PreparedOwnedPreview {
-    proof: Arc<VerifiedOwnedPreviewPlan>,
-    target: CapturedProgram,
-    metadata: Metadata,
-    initialized: DataSnapshot,
+    pub(super) proof: Arc<VerifiedOwnedPreviewPlan>,
+    pub(super) target: CapturedProgram,
+    pub(super) metadata: Metadata,
+    pub(super) initialized: DataSnapshot,
     receipt: OwnedPreviewReceipt,
 }
 fn member(proof: &VerifiedOwnedPreviewPlan, row: &Record, existing: bool) -> bool {
@@ -52,13 +52,32 @@ fn flag(row: &Record, key: &str) -> AdmissionResult<bool> {
         _ => Err(refuse(key, "missing or non-Boolean protected cell")),
     }
 }
-fn initialize(
+pub(super) fn initialize(
     proof: &VerifiedOwnedPreviewPlan,
     target: &CapturedProgram,
     metadata: &Metadata,
     meter: &mut ProofMeter,
 ) -> AdmissionResult<DataSnapshot> {
-    let mut data = proof.snapshot.data.clone();
+    initialize_frame(
+        proof,
+        target,
+        metadata,
+        &proof.snapshot.data,
+        proof.snapshot.clock_day,
+        &proof.captured,
+        meter,
+    )
+}
+pub(super) fn initialize_frame(
+    proof: &VerifiedOwnedPreviewPlan,
+    target: &CapturedProgram,
+    metadata: &Metadata,
+    original: &DataSnapshot,
+    day: i32,
+    captures: &BTreeMap<String, Values>,
+    meter: &mut ProofMeter,
+) -> AdmissionResult<DataSnapshot> {
+    let mut data = original.clone();
     for entity in &target.program.entities {
         if let Some(prior) = data.schema.iter_mut().find(|e| e.id == entity.id) {
             // Proof has already authenticated compatible additive schemas. Do
@@ -80,9 +99,18 @@ fn initialize(
         meter.charge(1)?;
         row.values
             .extend(metadata.defaults(proof, member(proof, row, true))?);
+        if let Some(revision) = &metadata.revision {
+            row.values.insert(
+                revision.clone(),
+                DataValue::Integer {
+                    value: i64::try_from(row.revision).map_err(|_| {
+                        refuse("initialization", "root revision exceeds exact counter")
+                    })?,
+                },
+            );
+        }
         if row.archived || lowering::completed(proof, row)? {
-            let captured = proof
-                .captured
+            let captured = captures
                 .get(&row.id)
                 .ok_or_else(|| refuse(&row.id, "missing authenticated initial capture"))?;
             if captured.len() != proof.report.projections.len() {
@@ -101,12 +129,8 @@ fn initialize(
             }
             row.values
                 .insert(metadata.sealed.clone(), DataValue::Boolean { value: true });
-            row.values.insert(
-                metadata.day.clone(),
-                DataValue::Date {
-                    days: proof.snapshot.clock_day,
-                },
-            );
+            row.values
+                .insert(metadata.day.clone(), DataValue::Date { days: day });
             row.values.insert(
                 metadata.origin.clone(),
                 DataValue::Text {
@@ -118,14 +142,14 @@ fn initialize(
     meter.charge(canonical_bytes(&data)?.len() as u64)?;
     data.validate()?;
     let mut stripped = data.clone();
-    stripped.schema = proof.snapshot.data.schema.clone();
+    stripped.schema = original.schema.clone();
     let fields: BTreeSet<_> = metadata.fields(proof).into_iter().map(|f| f.id).collect();
     for row in &mut stripped.records {
         if row.entity == metadata.root {
             row.values.retain(|id, _| !fields.contains(id));
         }
     }
-    if stripped != proof.snapshot.data {
+    if stripped != *original {
         return Err(refuse("initialization", "business frame changed"));
     }
     Ok(data)
@@ -344,7 +368,7 @@ struct Continuation {
 /// This capability is never exposed, shared across runs, serialized, or minted
 /// from an exported seed. ReplayAdmission is necessary but the controller also
 /// authenticates session, clock, graph, random seed, source and input frame.
-struct OwnedPreviewAdmission {
+pub(super) struct OwnedPreviewAdmission {
     proof: Arc<VerifiedOwnedPreviewPlan>,
     target: CapturedProgram,
     metadata: Metadata,
@@ -358,7 +382,7 @@ fn adapter(error: StoreError) -> AdapterError {
     AdapterError::Failed(format!("{error:?}"))
 }
 impl OwnedPreviewAdmission {
-    fn new(
+    pub(super) fn new(
         prepared: &PreparedOwnedPreview,
         frame: Option<(ScenarioSpec, ScenarioSpec)>,
         meter: ProofMeter,
@@ -424,7 +448,7 @@ impl OwnedPreviewAdmission {
         session.validate(&program.program)?;
         Ok(())
     }
-    fn transition(
+    pub(super) fn transition(
         &self,
         program: &CapturedProgram,
         data: &DataSnapshot,
@@ -769,5 +793,37 @@ impl OwnedPreviewSession {
     #[cfg(test)]
     pub(crate) fn fail_next_validation_for_test(&mut self) {
         self.fail_next = true;
+    }
+}
+
+impl PreparedOwnedPreview {
+    pub(super) fn from_retained(
+        proof: VerifiedOwnedPreviewPlan,
+        target: CapturedProgram,
+        metadata: Metadata,
+        initialized: DataSnapshot,
+    ) -> Result<Self> {
+        let receipt = OwnedPreviewReceipt {
+            basis: proof.report.snapshot.clone(),
+            compiler: metadata.identity.clone(),
+            target: revision(&target)?,
+            original_data: proof.snapshot.data.identity()?,
+            initialized_data: initialized.identity()?,
+            session: proof.snapshot.session.identity()?,
+            decisions: proof.snapshot.decisions.identity()?,
+            day: proof.snapshot.clock_day,
+            random_seed: 0,
+            runtime: RUNTIME_VERSION.into(),
+            driver: DRIVER_VERSION.into(),
+            availability: proof.request.availability.clone(),
+            outcome_comparison: proof.report.outcome_comparison.clone(),
+        };
+        Ok(Self {
+            proof: Arc::new(proof),
+            target,
+            metadata,
+            initialized,
+            receipt,
+        })
     }
 }

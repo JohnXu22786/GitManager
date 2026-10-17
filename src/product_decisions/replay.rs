@@ -207,7 +207,7 @@ pub(super) fn execute<R: RuntimeAdapter>(
 ) -> Result<(RunEvidence, Vec<ScopeContext>)> {
     execute_admitted(runtime, program, scenario, graph, limits, id, None)
 }
-pub(super) fn execute_admitted<R: RuntimeAdapter>(
+pub(crate) fn execute_admitted<R: RuntimeAdapter>(
     runtime: &R,
     program: &CapturedProgram,
     scenario: &ScenarioSpec,
@@ -216,6 +216,14 @@ pub(super) fn execute_admitted<R: RuntimeAdapter>(
     id: &str,
     admission: Option<&dyn crate::product_runtime::ReplayAdmission>,
 ) -> Result<(RunEvidence, Vec<ScopeContext>)> {
+    let cancelled = runtime
+        .cancellation_token()
+        .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    let per_run = admission
+        .map(|context| context.begin_replay(program, scenario, graph, cancelled))
+        .transpose()?
+        .flatten();
+    let admission = per_run.as_deref().or(admission);
     if crate::product_runtime::has_protected_fields(program) && admission.is_none() {
         return Err(DecisionError::Unverified(
             "Scoped scenes require verified source, cohort and completed-result provenance".into(),

@@ -26,6 +26,37 @@ pub struct IntentArchive {
     store: ProductStore,
 }
 impl IntentArchive {
+    pub(crate) fn retained_scene(
+        &self,
+        current: &ProjectSnapshot,
+        decision: &ScopedDecision,
+        scene: &AcceptedScene,
+    ) -> Result<RetainedScene> {
+        if self.snapshot()? != *current {
+            return Err(invalid("retained scene snapshot changed"));
+        }
+        let scenes = self.accepted_scenes(decision)?;
+        if !scenes.contains(scene) || self.snapshot()? != *current {
+            return Err(invalid(
+                "scene differs from its exact retained witness package",
+            ));
+        }
+        let package = serde_json::to_value(Object {
+            version: 1,
+            content: Content::Scenes { scenes },
+        })
+        .map_err(|e| invalid(&e.to_string()))?;
+        let archived = serde_json::to_value(scene).map_err(|e| invalid(&e.to_string()))?;
+        Ok(RetainedScene::from_verified_archive(
+            current,
+            decision,
+            scene.program(),
+            scene.scenario(),
+            &archived,
+            &package,
+        )?)
+    }
+
     pub(super) fn snapshot(&self) -> Result<ProjectSnapshot> {
         Ok(self.store.load()?)
     }
@@ -149,6 +180,9 @@ pub(super) fn validate_rehearsal_scenes(
     witness: &Digest,
     scenes: &[AcceptedScene],
 ) -> Result<()> {
+    if let crate::product_store::scope::ScopeEnvelope::OwnedV2(state) = &snapshot.scope {
+        return validate_owned_rehearsal_scenes(snapshot, state, witness, scenes);
+    }
     let proofs: Vec<_> = snapshot
         .scalar_scope()?
         .rehearsals
@@ -254,4 +288,83 @@ pub(super) fn decode(bytes: &[u8], digest: &Digest) -> Result<Content> {
         return Err(invalid("intention object version or identity mismatch"));
     }
     Ok(object.content)
+}
+
+fn validate_owned_rehearsal_scenes(
+    snapshot: &ProjectSnapshot,
+    state: &crate::product_store::scope::OwnedScopeStateV2,
+    witness: &Digest,
+    scenes: &[AcceptedScene],
+) -> Result<()> {
+    let identities = scenes
+        .iter()
+        .map(|s| s.scenario.identity())
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for proof in state
+        .rehearsals
+        .values()
+        .filter(|p| p.witnesses.values().any(|w| w == witness))
+    {
+        let basis = &proof.manifest.basis.frozen;
+        let source = |id: &Digest| {
+            snapshot
+                .programs
+                .iter()
+                .find(|p| canonical_digest(IdentityDomain::Source, *p).ok().as_ref() == Some(id))
+                .ok_or_else(|| invalid("owned rehearsal source missing"))
+        };
+        let before = source(&basis.active)?;
+        let after = source(&proof.manifest.output)?;
+        if scenes.len() < 2
+            || !scenes.iter().any(|s| &s.program == before)
+            || !scenes.iter().any(|s| &s.program == after)
+            || scenes
+                .iter()
+                .any(|s| &s.program != before && &s.program != after)
+        {
+            return Err(invalid(
+                "owned witness does not cover its exact experienced source pair",
+            ));
+        }
+        for scene in scenes {
+            let expected_seed = if &scene.program == before {
+                basis.data.identity()?
+            } else {
+                proof.seed.clone()
+            };
+            if scene.scenario.seed.identity()? != expected_seed
+                || scene.scenario.session != basis.session
+                || scene.scenario.clock_day != basis.day
+                || scene.scenario.random_seed != 0
+            {
+                return Err(invalid(
+                    "owned witness changed its original/initialized frame",
+                ));
+            }
+            if !scenes.iter().any(|other| {
+                let mut frame = other.scenario.clone();
+                frame.seed = scene.scenario.seed.clone();
+                other.program != scene.program && frame == scene.scenario
+            }) {
+                return Err(invalid("owned witness lacks its exact paired input frame"));
+            }
+        }
+        for (id, digest) in &proof.witnesses {
+            if digest != witness {
+                continue;
+            }
+            let decision = snapshot
+                .decisions
+                .decisions
+                .iter()
+                .find(|d| &d.id == id)
+                .ok_or_else(|| invalid("owned witness decision missing"))?;
+            if decision.witness != *witness || decision.scenarios != identities {
+                return Err(invalid(
+                    "owned witness scenario inventory differs from recorded decision",
+                ));
+            }
+        }
+    }
+    Ok(())
 }

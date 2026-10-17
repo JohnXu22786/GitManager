@@ -20,6 +20,18 @@ pub const PROTECTED_FIELD_PREFIX: &str = "gm_scope_";
 /// Host admission is separate from executable semantics. The interpreter still
 /// executes one ordinary program; this hook validates retained scope provenance.
 pub trait ReplayAdmission: Send + Sync {
+    /// A family may allocate a private full-frame controller for this one run.
+    /// The default preserves existing scalar admission behavior and identities.
+    fn begin_replay(
+        &self,
+        _program: &CapturedProgram,
+        _scenario: &ScenarioSpec,
+        _decisions: &DecisionGraph,
+        _cancelled: Arc<AtomicBool>,
+    ) -> Result<Option<Box<dyn ReplayAdmission>>> {
+        Ok(None)
+    }
+
     /// Keep synthetic record allocation tied to the authenticated original
     /// business input when host-only metadata is added to a replay seed.
     fn replay_operation_ids(
@@ -672,6 +684,13 @@ impl LocalRuntime {
         id: &str,
         admission: Option<&dyn ReplayAdmission>,
     ) -> Result<RunEvidence> {
+        let per_run = admission
+            .map(|context| {
+                context.begin_replay(program, scenario, decisions, self.cancelled.clone())
+            })
+            .transpose()?
+            .flatten();
+        let admission = per_run.as_deref().or(admission);
         if has_protected_fields(program) && admission.is_none() {
             return Err(AdapterError::Unsupported(
                 "Protected scope history needs a verified host admission context".into(),
@@ -834,6 +853,9 @@ impl LocalRuntime {
     }
 }
 impl RuntimeAdapter for LocalRuntime {
+    fn cancellation_token(&self) -> Option<Arc<AtomicBool>> {
+        Some(self.cancelled.clone())
+    }
     type Run = ProductRun;
     fn capabilities(&self) -> RuntimeCapabilities {
         RuntimeCapabilities {adapter:"local-app".into(),version:RUNTIME_VERSION.into(),artifact_kinds:vec![ArtifactKind::GeneratedApp],features:["relations","queries","transactions","session-state","typed-local-output","generated-views","current-data-recovery","data-inspector"].into_iter().map(String::from).collect(),unavailable:vec!["External effects, arbitrary native code and network access are not language operations".into()]}

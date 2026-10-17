@@ -1,4 +1,4 @@
-//! Deterministic, preview-only compilation. The opaque proof is the sole input;
+//! Deterministic compilation. The opaque reconstructed proof is the sole input;
 //! no serialized phase inventory or caller-authored target can enter this path.
 use super::common_fact_admission::{refuse, AdmissionResult, ProofMeter};
 use super::*;
@@ -14,6 +14,8 @@ pub(super) struct Metadata {
     pub day: Id,
     pub origin: Id,
     pub saved: Vec<Id>,
+    /// Owned-v2 authenticates exact root revisions despite event coalescing.
+    pub revision: Option<Id>,
 }
 pub(super) fn literal(value: DataValue, value_type: Type) -> Expr {
     Expr::Literal { value, value_type }
@@ -167,8 +169,8 @@ pub(super) fn rebind(expr: &Expr, from: &str, to: &str) -> Expr {
     result
 }
 impl Metadata {
-    fn new(proof: &VerifiedOwnedPreviewPlan) -> AdmissionResult<Self> {
-        let identity = canonical_digest(
+    fn new(proof: &VerifiedOwnedPreviewPlan, owned: Option<&Digest>) -> AdmissionResult<Self> {
+        let preview_identity = canonical_digest(
             IdentityDomain::Evidence,
             &(
                 "owned-preview-compiler/1",
@@ -182,6 +184,18 @@ impl Metadata {
                 &proof.captured,
             ),
         )?;
+        let identity = match owned {
+            Some(layer) => canonical_digest(
+                IdentityDomain::Evidence,
+                &(
+                    "owned-scope-compiler/2",
+                    OWNED_LOWERING_VERSION,
+                    layer,
+                    &preview_identity,
+                ),
+            )?,
+            None => preview_identity,
+        };
         let prefix = format!("gm_scope_op_{}", identity.as_str());
         // Identical typed expressions at the same capture boundary share one
         // physical cell. This is compiler common-expression elimination, never
@@ -208,6 +222,7 @@ impl Metadata {
             day: format!("{prefix}_day"),
             origin: format!("{prefix}_origin"),
             saved,
+            revision: owned.map(|_| format!("{prefix}_revision")),
         })
     }
     pub(super) fn fields(&self, proof: &VerifiedOwnedPreviewPlan) -> Vec<FieldDefinition> {
@@ -227,6 +242,9 @@ impl Metadata {
                 },
             ),
         ];
+        if let Some(revision) = &self.revision {
+            fields.push((revision.clone(), Type::Integer));
+        }
         fields.extend(
             self.saved
                 .iter()
@@ -255,6 +273,9 @@ impl Metadata {
             (self.day.clone(), DataValue::Null),
             (self.origin.clone(), DataValue::Null),
         ]);
+        if let Some(revision) = &self.revision {
+            values.insert(revision.clone(), DataValue::Integer { value: 1 });
+        }
         for (key, p) in self.saved.iter().zip(&proof.report.projections) {
             values.insert(key.clone(), empty(&p.host_value_type)?);
         }
@@ -302,6 +323,12 @@ impl Metadata {
             after,
             before,
         ))
+    }
+    fn next_revision(&self, record: Expr, key: &str) -> Expr {
+        Expr::Add {
+            left: Box::new(field(record, key)),
+            right: Box::new(literal(DataValue::Integer { value: 1 }, Type::Integer)),
+        }
     }
     fn projection(&self, recipe: &OwnedProjectionRecipe, index: usize) -> AdmissionResult<Expr> {
         Ok(condition(
@@ -509,6 +536,12 @@ impl Compiler<'_> {
                 self.metadata.live(p, &binding)?,
             );
         }
+        if let Some(revision) = &self.metadata.revision {
+            values.insert(
+                revision.clone(),
+                self.metadata.next_revision(variable(&binding), revision),
+            );
+        }
         values.insert(self.metadata.sealed.clone(), boolean(true));
         values.insert(self.metadata.day.clone(), Expr::Today);
         values.insert(
@@ -569,6 +602,20 @@ impl Compiler<'_> {
                             );
                         }
                     }
+                    if self
+                        .proof
+                        .request
+                        .auxiliary
+                        .iter()
+                        .any(|a| &a.entity == entity)
+                    {
+                        if let Some(revision) = &self.metadata.revision {
+                            values.insert(
+                                revision.clone(),
+                                literal(DataValue::Integer { value: 1 }, Type::Integer),
+                            );
+                        }
+                    }
                     env.insert(bind.clone(), Type::reference(entity.clone()));
                 }
                 Statement::ForEach {
@@ -587,6 +634,12 @@ impl Compiler<'_> {
                     if app.expression_type_in(record, &env)?
                         == Type::reference(&self.metadata.root) =>
                 {
+                    if let Some(revision) = &self.metadata.revision {
+                        values.insert(
+                            revision.clone(),
+                            self.metadata.next_revision(record.clone(), revision),
+                        );
+                    }
                     // Only the separately certified isolated transition needs a
                     // capture; preserving writers cannot complete a root.
                     let (field, completed) =
@@ -594,6 +647,23 @@ impl Compiler<'_> {
                     if matches!(values.get(field), Some(Expr::Literal{value,..}) if value==completed)
                     {
                         seal = Some(record.clone());
+                    }
+                }
+                Statement::Update { record, values } => {
+                    let typ = app.expression_type_in(record, &env)?;
+                    if self
+                        .proof
+                        .request
+                        .auxiliary
+                        .iter()
+                        .any(|a| typ == Type::reference(&a.entity))
+                    {
+                        if let Some(revision) = &self.metadata.revision {
+                            values.insert(
+                                revision.clone(),
+                                self.metadata.next_revision(record.clone(), revision),
+                            );
+                        }
                     }
                 }
                 _ => {}
@@ -624,8 +694,35 @@ pub(super) fn compile(
     proof: &VerifiedOwnedPreviewPlan,
     meter: &mut ProofMeter,
 ) -> AdmissionResult<(CapturedProgram, Metadata)> {
+    compile_inner(proof, meter, None)
+}
+pub(super) fn compile_owned(
+    proof: &VerifiedOwnedPreviewPlan,
+    layer: &Digest,
+    meter: &mut ProofMeter,
+) -> AdmissionResult<(CapturedProgram, Metadata)> {
+    if proof
+        .snapshot
+        .data
+        .records
+        .iter()
+        .filter(|r| r.entity == proof.request.inventory.sources.root_entity)
+        .any(|r| r.revision > (i64::MAX as u64).saturating_sub(10_000_000))
+    {
+        return Err(refuse(
+            "owned root revision",
+            "insufficient exact-counter range for bounded execution",
+        ));
+    }
+    compile_inner(proof, meter, Some(layer))
+}
+fn compile_inner(
+    proof: &VerifiedOwnedPreviewPlan,
+    meter: &mut ProofMeter,
+    owned: Option<&Digest>,
+) -> AdmissionResult<(CapturedProgram, Metadata)> {
     meter.charge(1)?;
-    let metadata = Metadata::new(proof)?;
+    let metadata = Metadata::new(proof, owned)?;
     // String collection is conservative: it includes every lexical name plus
     // all other authored strings, so an internal binder cannot capture one.
     fn names(value: serde_json::Value, set: &mut BTreeSet<String>) {
@@ -667,6 +764,20 @@ pub(super) fn compile(
         .find(|e| e.id == compiler.metadata.root)
         .ok_or_else(|| refuse("schema", "root missing"))?;
     root.fields.extend(compiler.metadata.fields(proof));
+    if let Some(revision) = &compiler.metadata.revision {
+        for auxiliary in &proof.request.auxiliary {
+            app.entities
+                .iter_mut()
+                .find(|e| e.id == auxiliary.entity)
+                .ok_or_else(|| refuse("schema", "auxiliary entity missing"))?
+                .fields
+                .push(FieldDefinition {
+                    id: revision.clone(),
+                    value_type: Type::Integer,
+                    label: "Protected owned revision".into(),
+                });
+        }
+    }
     for (index, recipe) in proof.report.projections.iter().enumerate() {
         let expr = compiler.metadata.projection(recipe, index)?;
         match &recipe.destination {
@@ -725,10 +836,16 @@ pub(super) fn compile(
         &canonical_bytes(&app)?,
         &proof.snapshot.data.project_id,
         Producer::ExternalAuthor {
-            description: format!(
-                "Verified host owned preview compiler v{LOWERING_VERSION}: {}",
-                compiler.metadata.identity.as_str()
-            ),
+            description: match owned {
+                Some(_) => format!(
+                    "Verified host owned scope composition v{OWNED_LOWERING_VERSION}: {}",
+                    compiler.metadata.identity.as_str()
+                ),
+                None => format!(
+                    "Verified host owned preview compiler v{LOWERING_VERSION}: {}",
+                    compiler.metadata.identity.as_str()
+                ),
+            },
         },
         None,
     )?;

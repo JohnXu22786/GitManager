@@ -5,9 +5,10 @@ use super::common_fact_admission::{
 };
 use super::*;
 use crate::product_runtime::{LocalRuntime, ProjectionValidation};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::{atomic::AtomicBool, Arc};
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LifecycleWitness {
     pub side: OwnedSourceSide,
     pub scenario: ScenarioSpec,
@@ -28,6 +29,7 @@ struct Disclosure {
 pub struct AcceptedPreviewLifecycle {
     disclosure: Disclosure,
     event: Digest,
+    origin: OwnedAcceptanceOriginV2,
 }
 impl AcceptedPreviewLifecycle {
     pub(super) fn identity(&self) -> &Digest {
@@ -37,6 +39,7 @@ impl AcceptedPreviewLifecycle {
         Self {
             disclosure: self.disclosure.clone(),
             event: self.event.clone(),
+            origin: self.origin.clone(),
         }
     }
     pub(super) fn verify(
@@ -291,6 +294,10 @@ impl LifecycleAcceptanceHost {
         Ok(AcceptedPreviewLifecycle {
             disclosure: self.disclosure.take().unwrap(),
             event,
+            origin: match origin {
+                "explicit-host-ui" => OwnedAcceptanceOriginV2::ExplicitHostUi,
+                _ => OwnedAcceptanceOriginV2::SyntheticOperatorFixture,
+            },
         })
     }
     /// Tests exercise the same private controller event boundary with explicit
@@ -301,5 +308,71 @@ impl LifecycleAcceptanceHost {
         store: &ProductStore,
     ) -> AdmissionResult<AcceptedPreviewLifecycle> {
         self.record_event(store, "synthetic-operator-fixture")
+    }
+}
+
+impl AcceptedPreviewLifecycle {
+    pub(super) fn recipe(&self) -> OwnedLifecycleV2 {
+        OwnedLifecycleV2 {
+            version: OWNED_SCOPE_VERSION,
+            witnesses: self.disclosure.witnesses.clone(),
+            evidence: self.disclosure.evidence.clone(),
+            disclosure: self.disclosure.identity.clone(),
+            event: self.event.clone(),
+            origin: self.origin.clone(),
+        }
+    }
+    /// Only called after the owning retained receipt and historical frame have
+    /// been linked. Disk hashes describe history; they do not mint a new UI event.
+    pub(super) fn reconstruct(
+        snapshot: &ProjectSnapshot,
+        candidate: &CapturedProgram,
+        request: &OwnedPreviewRequest,
+        recipe: &OwnedLifecycleV2,
+        meter: &mut ProofMeter,
+    ) -> AdmissionResult<Self> {
+        if recipe.version != OWNED_SCOPE_VERSION {
+            return Err(refuse(
+                "lifecycle",
+                "unsupported retained acceptance version",
+            ));
+        }
+        let origin = match recipe.origin {
+            OwnedAcceptanceOriginV2::ExplicitHostUi => "explicit-host-ui",
+            OwnedAcceptanceOriginV2::SyntheticOperatorFixture => "synthetic-operator-fixture",
+        };
+        let identity = disclosure_id(
+            snapshot,
+            candidate,
+            request,
+            &recipe.witnesses,
+            &recipe.evidence,
+        )?;
+        if identity != recipe.disclosure
+            || canonical_digest(
+                IdentityDomain::Evidence,
+                &("host-lifecycle-acceptance/1", &identity, origin),
+            )? != recipe.event
+        {
+            return Err(refuse(
+                "lifecycle",
+                "retained disclosure/event binding differs",
+            ));
+        }
+        let result = Self {
+            disclosure: Disclosure {
+                snapshot: canonical_digest(IdentityDomain::Data, snapshot)?,
+                request: request_identity(request)?,
+                before: snapshot.program()?.clone(),
+                after: candidate.clone(),
+                witnesses: recipe.witnesses.clone(),
+                evidence: recipe.evidence.clone(),
+                identity,
+            },
+            event: recipe.event.clone(),
+            origin: recipe.origin.clone(),
+        };
+        result.verify(snapshot, candidate, request, meter)?;
+        Ok(result)
     }
 }

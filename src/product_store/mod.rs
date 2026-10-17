@@ -122,6 +122,12 @@ impl ProjectSnapshot {
             .ok_or_else(|| StoreError::Corrupt("active program revision missing".into()))
     }
     pub fn validate(&self) -> Result<()> {
+        self.validate_container()?;
+        scope::verify_snapshot(self)
+    }
+    // Historical owned bases must satisfy every ordinary container invariant
+    // without recursively re-entering reconstruction of the same proof family.
+    fn validate_container(&self) -> Result<()> {
         if self.magic != MAGIC {
             return Err(StoreError::Corrupt("not a generated-tool project".into()));
         }
@@ -211,7 +217,6 @@ impl ProjectSnapshot {
         if self.artifacts.iter().map(|a| a.bytes.len()).sum::<usize>() > MAX_OUTPUT_BYTES {
             return Err(StoreError::Invalid("retained output byte limit".into()));
         }
-        scope::verify_snapshot(self)?;
         Ok(())
     }
 }
@@ -601,9 +606,15 @@ impl ProductStore {
             runtime: runtime.capabilities(),
             driver: DRIVER_VERSION,
             container: FORMAT,
-            family: "scalar_v1",
-            compiler: scope::COMPILER_VERSION,
-            verifier: 1,
+            family: match &snapshot.scope {
+                scope::ScopeEnvelope::ScalarV1(_) => "scalar_v1",
+                scope::ScopeEnvelope::OwnedV2(_) => "owned_v2",
+            },
+            compiler: match &snapshot.scope {
+                scope::ScopeEnvelope::ScalarV1(_) => scope::COMPILER_VERSION,
+                scope::ScopeEnvelope::OwnedV2(_) => scope::OWNED_LOWERING_VERSION,
+            },
+            verifier: scope::SCOPE_VERIFIER_REVISION,
             limits: RuntimeLimits::default(),
         };
         let reused = {

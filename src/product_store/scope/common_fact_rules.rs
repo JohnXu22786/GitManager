@@ -160,14 +160,14 @@ fn all_statements<'a>(steps: &'a [Statement], out: &mut Vec<&'a Statement>) {
     }
 }
 fn schemas(
-    snapshot: &ProjectSnapshot,
+    before: &AppDefinition,
+    data: &DataSnapshot,
     after: &AppDefinition,
     request: &OwnedPreviewRequest,
     inventory: &CommonFactInventory,
 ) -> AdmissionResult<BTreeMap<Id, Kind>> {
-    let before = &snapshot.program()?.program;
     let root = &request.inventory.sources.root_entity;
-    for e in &snapshot.data.schema {
+    for e in &data.schema {
         if before.entities.iter().find(|x| x.id == e.id) != Some(e)
             || after.entities.iter().find(|x| x.id == e.id) != Some(e)
         {
@@ -219,7 +219,7 @@ fn schemas(
             Kind::Root
         } else if let Some(aux) = request.auxiliary.iter().find(|a| a.entity == entity.id) {
             if before.entities.iter().any(|e| e.id == entity.id)
-                || snapshot.data.schema.iter().any(|e| e.id == entity.id)
+                || data.schema.iter().any(|e| e.id == entity.id)
                 || owner.as_ref() != Some(&aux.owner_field)
                 || refs.len() != 1
                 || entity.unique != vec![vec![aux.owner_field.clone()]]
@@ -366,8 +366,7 @@ fn schemas(
         } = kind
         {
             if !archived
-                && snapshot
-                    .data
+                && data
                     .records
                     .iter()
                     .any(|r| r.entity == *entity && r.archived)
@@ -377,8 +376,7 @@ fn schemas(
                     "active-only sequence producer has retained archived identity/order ambiguity",
                 ));
             }
-            let rows: Vec<_> = snapshot
-                .data
+            let rows: Vec<_> = data
                 .records
                 .iter()
                 .filter(|r| r.entity == *entity && (*archived || !r.archived))
@@ -1866,6 +1864,27 @@ pub(super) fn verify(
     Vec<OwnedProjectionRecipe>,
     Vec<String>,
 )> {
+    verify_frame(
+        snapshot,
+        candidate,
+        request,
+        inventory,
+        &snapshot.data,
+        meter,
+    )
+}
+pub(super) fn verify_frame(
+    snapshot: &ProjectSnapshot,
+    candidate: &CapturedProgram,
+    request: &OwnedPreviewRequest,
+    inventory: &CommonFactInventory,
+    data: &DataSnapshot,
+    meter: &mut ProofMeter,
+) -> AdmissionResult<(
+    Vec<CommonFactCertificate>,
+    Vec<OwnedProjectionRecipe>,
+    Vec<String>,
+)> {
     let before = &snapshot.program()?.program;
     let after = &candidate.program;
     let first = lifecycle(&request.inventory.lifecycle.before)?;
@@ -1882,12 +1901,11 @@ pub(super) fn verify(
                 "paired variant lacks an exact single-root correspondence; split at a proved root frontier"));
         }
     }
-    let kinds = schemas(snapshot, after, request, inventory)?;
+    let kinds = schemas(before, data, after, request, inventory)?;
     // Every allowed LocalRuntime run has <= 10,000,000 cumulative fuel. Each
     // business write consumes fuel, so this exact retained-data margin rules out
     // policy-selected revision overflow throughout that entire isolated run.
-    if snapshot
-        .data
+    if data
         .records
         .iter()
         .filter(|r| !r.archived)
@@ -1898,8 +1916,7 @@ pub(super) fn verify(
             "insufficient revision range for the bounded runtime run",
         ));
     }
-    let all_roots_active = !snapshot
-        .data
+    let all_roots_active = !data
         .records
         .iter()
         .any(|r| r.entity == inventory.structure.root_entity && r.archived);
@@ -1974,14 +1991,6 @@ pub(super) fn verify(
                 "fresh identity shift reaches a business-consumed relation",
             ));
         }
-    }
-    if snapshot
-        .decisions
-        .decisions
-        .iter()
-        .any(|d| d.status == DecisionStatus::Active)
-    {
-        return Err(refuse("accepted decisions","active retained outcome/property comparison is unsupported by this preview proof; no obligation is silently passed"));
     }
     let projections = projections(before, after, &inventory.structure.root_entity)?;
     // Exhaustive correspondence coverage is independent of policy taint. Equal

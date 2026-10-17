@@ -73,13 +73,13 @@ impl OwnedStatementKind {
         }
     }
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OwnedSourceSide {
     Before,
     After,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OwnedStructuralChangeKind {
     ApplicationLabelChanged,
@@ -89,7 +89,8 @@ pub enum OwnedStructuralChangeKind {
     ObservableAdded,
     ObservableChanged,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OwnedStructuralChange {
     pub kind: OwnedStructuralChangeKind,
     pub container: Option<Id>,
@@ -102,7 +103,8 @@ pub struct OwnedStructuralChange {
 }
 /// An ordered common statement header. ForEach bodies are compared recursively
 /// and may contain variant slots; this does not mark their whole subtree common.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OwnedCommonStatement {
     pub action: Id,
     pub before: Vec<usize>,
@@ -111,7 +113,8 @@ pub struct OwnedCommonStatement {
 }
 /// Derived across both complete programs, including unchanged writers. This is
 /// inventory for later seal/ownership analysis; it does not enforce any seal.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OwnedWriter {
     pub side: OwnedSourceSide,
     pub source: Digest,
@@ -126,7 +129,8 @@ pub struct OwnedWriter {
 /// Read-only structural analysis, never a safety certificate or preparation.
 /// Passive additions may require ownership, data-freshness, read-surface, and
 /// lifecycle proofs that this analyzer deliberately does not attempt.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OwnedStructuralReport {
     pub before: Digest,
     pub after: Digest,

@@ -4102,6 +4102,11 @@ impl EmittedRecordParticipants {
 /// views/artifacts used by daily work. Adapters cannot commit live project data.
 pub trait RuntimeAdapter {
     type Run;
+    /// Share cancellation with host proof checks in the same replay. Legacy
+    /// adapters still enforce their own cancellation during execution.
+    fn cancellation_token(&self) -> Option<Arc<std::sync::atomic::AtomicBool>> {
+        None
+    }
     fn capabilities(&self) -> RuntimeCapabilities;
     fn validate(&self, program: &CapturedProgram) -> std::result::Result<(), AdapterError>;
     fn start(
