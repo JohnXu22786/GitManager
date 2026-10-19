@@ -120,7 +120,7 @@ impl ProductStore {
         assert_eq!(actual, old, "old capture parity: {case}");
         assert_eq!(actual, expected, "literal capture values/presence: {case}");
         assert_eq!(old_counts.captures, 1); assert_eq!(new_counts.captures, 1);
-        assert_eq!(new_counts.apps, 3, "all three real external-source validators: {case}");
+        assert_eq!(new_counts.apps, 1, "one real paid external-source validation: {case}");
         if case == "full" {
             // Two lifecycle calls, three present projections, four inserts, two old row visits.
             assert_eq!(old_start - old_meter.remaining_units_for_test(), 500_006);

@@ -70,7 +70,7 @@ fn ints()->Value { json!({"kind":"literal","value_type":{"kind":"list","item":{"
 fn query()->Value { json!({"kind":"query","entity":"row","binding":"item","predicate":yes(),"sort":[],"limit":2,"include_archived":false}) }
 
 #[test]
-fn closed_capture_keeps_actual_three_validations_and_four_literal_facts() {
+fn closed_capture_keeps_one_paid_validation_and_four_literal_facts() {
     for value in [fixture::minimal(),rich::organizer(),rich::equipment(),rich::new_composition()] {
         for bytes in [serde_json::to_vec(&value).unwrap(),serde_json::to_vec_pretty(&value).unwrap()] {
             let c=CapturedProgram::capture(&bytes,"project",Producer::UserAuthored,None).unwrap();
@@ -78,6 +78,16 @@ fn closed_capture_keeps_actual_three_validations_and_four_literal_facts() {
             let oc=old_capture(&c);
             let native_len=old::canonical_bytes(&oc.program).unwrap().len();
             let expected_session=old::SessionState::initial(&oc.program).unwrap();
+            let before=serde_json::to_vec(&c).unwrap();
+            reset_validation_counts();
+            c.validate().unwrap();
+            assert_eq!(validation_counts(),ValidationCounts {captures:1,apps:3,observables:0,views:0});
+            assert_eq!(serde_json::to_vec(&c).unwrap(),before);
+            old::reset_validation_counts();
+            oc.validate().unwrap();
+            let ordinary=old::validation_counts();
+            assert_eq!((ordinary.captures,ordinary.apps,ordinary.observables,ordinary.views),(1,3,0,0));
+            assert_eq!(serde_json::to_vec(&c).unwrap(),before);
             reset_validation_counts();
             with_capture_validation(&c,&d,&mut Work::default(),|ctx|->ContractWorkResult<()> {
                 ctx.ensure_source_and_data()?;
@@ -92,9 +102,10 @@ fn closed_capture_keeps_actual_three_validations_and_four_literal_facts() {
                 ctx.ensure_source_and_data()?;
                 let actual=ctx.initial_session(&mut Work::default())?;
                 assert_eq!(serde_json::to_value(actual).unwrap(),serde_json::to_value(&expected_session).unwrap());
-                assert_eq!(validation_counts(),ValidationCounts {captures:1,apps:3,observables:0,views:0});
+                assert_eq!(validation_counts(),ValidationCounts {captures:1,apps:1,observables:0,views:0});
                 Ok(())
             }).unwrap();
+            assert_eq!(serde_json::to_vec(&c).unwrap(),before);
         }
     }
 }
@@ -104,10 +115,15 @@ fn complete_external_error_prefixes_match_the_frozen_native_capture() {
     let good=capture(fixture::minimal());
     let data=DataSnapshot::empty("project",&good.program).unwrap();
     let other=capture(rich::organizer());
-    let mut cases:Vec<(&str,CapturedProgram)>=vec![];
-    for (name,bytes) in fixture::malformed_sources(MAX_WIRE_BYTES).into_iter().chain(
-        fixture::semantic_negatives().into_iter().map(|(name,v)|(name,serde_json::to_vec(&v).unwrap()))
-    ) { let mut c=good.clone();c.source_bytes=bytes;cases.push((name,c)); }
+    let mut cases:Vec<(&str,CapturedProgram,usize,usize)>=vec![];
+    for (name,bytes) in fixture::malformed_sources(MAX_WIRE_BYTES) {
+        let mut c=good.clone();c.source_bytes=bytes;cases.push((name,c,0,0));
+    }
+    for (name,value) in fixture::semantic_negatives() {
+        let mut c=good.clone();c.source_bytes=serde_json::to_vec(&value).unwrap();
+        let apps=if matches!(name,"unknown_typed_field"|"unknown_typed_variant") {0} else {1};
+        cases.push((name,c,apps,apps));
+    }
     for prefix in 0..9 {
         let mut c=good.clone();
         match prefix {
@@ -121,17 +137,73 @@ fn complete_external_error_prefixes_match_the_frozen_native_capture() {
             7=>c.artifact.program_digest=other.artifact.program_digest.clone(),
             _=>c.artifact.semantic_digest=other.artifact.semantic_digest.clone(),
         }
-        cases.push(("suffix/preference",c));
+        cases.push(("suffix/preference",c,[0,0,0,0,0,1,1,2,3][prefix],[0,0,0,0,0,1,1,1,1][prefix]));
     }
-    for (name,c) in cases {
+    // Finite multiple-fault prefixes: the earlier real check must win even when
+    // the retained App and all later identities are independently wrong.
+    for prefix in 0..12 {
+        let mut c=good.clone();
+        c.program.label.push('!');
+        c.artifact.raw_digest=other.artifact.raw_digest.clone();
+        c.binding.source_digest=other.binding.source_digest.clone();
+        c.artifact.program_digest=other.artifact.program_digest.clone();
+        c.artifact.semantic_digest=other.artifact.semantic_digest.clone();
+        let (name,ordinary_apps,paid_apps)=match prefix {
+            0|1=>{
+                if prefix==0 {c.binding.project_id="BAD".into();} else {c.binding.program_path="../bad".into();}
+                c.artifact.version=2;c.artifact.kind=ArtifactKind::ExternalWeb;c.artifact.language.push('!');
+                c.source_bytes=b"?".to_vec();
+                (if prefix==0 {"binding project before artifact/parser"} else {"binding path before artifact/parser"},0,0)
+            },
+            2=>{
+                c.artifact.version=2;c.artifact.kind=ArtifactKind::ExternalWeb;c.artifact.language.push('!');
+                c.source_bytes=vec![b'!';MAX_WIRE_BYTES+1];
+                ("version before kind/language/source cap",0,0)
+            },
+            3=>{
+                c.artifact.kind=ArtifactKind::ExternalWeb;c.artifact.language.push('!');
+                c.source_bytes=vec![b'!';MAX_WIRE_BYTES+1];
+                ("kind/language before source cap",0,0)
+            },
+            4=>{c.source_bytes=vec![b'!';MAX_WIRE_BYTES+1];("source cap before parser/retained/digests",0,0)},
+            5=>{c.source_bytes=b"?".to_vec();("parser before retained/digests",0,0)},
+            6=>{c.source_bytes=b"{}".to_vec();("typed conversion before retained/digests",0,0)},
+            7=>{
+                let mut value=fixture::minimal();value["label"]=json!(" ");
+                c.source_bytes=serde_json::to_vec(&value).unwrap();
+                ("V1 semantic before retained/digests",1,1)
+            },
+            8=>("retained App before all digests",1,1),
+            9=>{c.program=good.program.clone();("raw before Program/semantic",1,1)},
+            10=>{
+                c.program=good.program.clone();c.artifact.raw_digest=good.artifact.raw_digest.clone();
+                c.binding.source_digest=good.binding.source_digest.clone();
+                ("Program before semantic",2,1)
+            },
+            _=>{
+                c.program=good.program.clone();c.artifact.raw_digest=good.artifact.raw_digest.clone();
+                c.binding.source_digest=good.binding.source_digest.clone();c.artifact.program_digest=good.artifact.program_digest.clone();
+                ("semantic after Program",3,1)
+            },
+        };
+        cases.push((name,c,ordinary_apps,paid_apps));
+    }
+    for (name,c,ordinary_apps,paid_apps) in cases {
+        let before=serde_json::to_vec(&c).unwrap();
         let oc=old_capture(&c);
         old::reset_validation_counts();
         let error=oc.validate().unwrap_err().0;
         let counts=old::validation_counts();
+        assert_eq!((counts.captures,counts.apps),(1,ordinary_apps),"frozen: {name}");
         reset_validation_counts();
-        assert_eq!(result_text(checked(&c,&data)),Err(error),"{name}");
+        assert_eq!(c.validate().unwrap_err().0,error,"ordinary: {name}");
+        assert_eq!((validation_counts().captures,validation_counts().apps),(1,ordinary_apps),"ordinary: {name}");
+        assert_eq!(serde_json::to_vec(&c).unwrap(),before,"ordinary input: {name}");
+        reset_validation_counts();
+        assert_eq!(result_text(checked(&c,&data)),Err(error),"paid: {name}");
         let actual=validation_counts();
-        assert_eq!((actual.captures,actual.apps),(counts.captures,counts.apps),"{name}");
+        assert_eq!((actual.captures,actual.apps),(1,paid_apps),"paid: {name}");
+        assert_eq!(serde_json::to_vec(&c).unwrap(),before,"paid input: {name}");
     }
 }
 
@@ -296,7 +368,7 @@ fn first_cause_is_typed_sticky_and_empty_capture_does_not_validate() {
     }
     // Refuse in the reached native-validation prefix, using the existing actual
     // validation reader, not a fabricated paid-operation counter or expected sum.
-    for apps in [1,2,3] {
+    for apps in [1] {
         reset_validation_counts();
         let mut work=Work {fail_after_apps:Some(apps),..Work::default()};
         let result=with_capture_validation(&c,&d,&mut work,|ctx|->ContractWorkResult<()> {

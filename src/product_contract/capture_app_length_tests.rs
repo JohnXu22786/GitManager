@@ -513,22 +513,57 @@ fn capture_minimal() -> CapturedProgram {
 }
 #[test]
 #[cfg(target_pointer_width = "64")]
-fn app_length_three_source_counts_and_publication_fail_closed() {
+fn app_length_single_source_count_and_publication_fail_closed() {
     let capture = capture_minimal();
     let data = DataSnapshot::empty("project",&capture.program).unwrap();
+    let before = (serde_json::to_vec(&capture).unwrap(),serde_json::to_vec(&data).unwrap());
+    assert_eq!(std::mem::size_of::<Audit<'_>>(),8);
+    assert_eq!(std::mem::size_of::<bool>(),1);
+    assert_eq!(8+2*std::mem::size_of::<Audit<'_>>()+4*std::mem::size_of::<bool>(),28);
     let mut direct = Work::default();
     reset_validation_counts();
     source_result(&capture,&mut direct).unwrap();
     assert_eq!(validation_counts().captures,1);
-    assert_eq!(validation_counts().apps,3);
+    assert_eq!(validation_counts().apps,1);
     let starts: Vec<usize> = direct.calls.windows(5).enumerate().filter_map(|(i,w)| {
         (w==[0,96,170496,68,1]).then_some(i)
     }).collect();
-    assert_eq!(starts.len(),3);
-    let count_ends: Vec<usize> = starts.iter().map(|&start| {
-        let offset = direct.calls[start..].windows(8).position(|w|w==[320,1855,8,260,5,101,50671,0]).unwrap();
-        start+offset+6 // Actual last pre-native payment, reached through existing carrier.
-    }).collect();
+    assert_eq!(starts.len(),1);
+    // Local trace locators reject missing/ambiguous signatures. They do not
+    // calculate semantic bytes, native amounts or a whole-route cost oracle.
+    let unique = |calls: &[u64], start: usize, end: usize, signature: &[u64]| {
+        let hits: Vec<usize> = calls[start..end].windows(signature.len()).enumerate()
+            .filter_map(|(i,w)|(w==signature).then_some(start+i)).collect();
+        assert_eq!(hits.len(),1,"signature {signature:?} in source segment {start}..{end}");
+        hits[0]
+    };
+    let source_hash = unique(&direct.calls,0,direct.calls.len(),&[0,96,248]);
+    let program_hash = unique(&direct.calls,0,direct.calls.len(),&[0,96,253]);
+    let semantic_hash = unique(&direct.calls,0,direct.calls.len(),&[0,96,298]);
+    assert!(starts[0]<source_hash && source_hash<program_hash && program_hash<semantic_hash);
+    let count_tail = unique(&direct.calls,starts[0],source_hash,&[96,320,1855,8,260,5,101,50671,0]);
+    let count_native = count_tail+7;
+    assert_eq!(&direct.calls[count_native..count_native+2],&[50671,0]);
+    // Domain framing is8/9/18 bytes; each complete hash ends at its real native
+    // handoff412 and success0, after FMT(2)*32=2144. No native observer is added.
+    let source_end = unique(&direct.calls,source_hash,program_hash,&[320,2144,12,412,0])+4;
+    let program_end = unique(&direct.calls,program_hash,semantic_hash,&[320,2144,12,412,0])+4;
+    let semantic_end = unique(&direct.calls,semantic_hash,direct.calls.len(),&[320,2144,12,412,0])+4;
+    assert_eq!(&direct.calls[source_end+1..source_end+11],&[3,5,128,3,5,128,1,28,0,68]);
+    assert_eq!(&direct.calls[program_end+1..program_end+6],&[3,5,128,28,1]);
+    assert_eq!(&direct.calls[semantic_end+1..],&[3,5,128,1]);
+    let first_select = source_end+8;
+    let second_select = program_end+4;
+    assert_eq!((direct.calls[first_select],direct.calls[second_select]),(28,28));
+    // Canonical helpers retain their unchanged error-owner tail, actual final
+    // native reserve and success poll immediately before the next domain hash.
+    // The observed reserve is only a locator; its quantity is not an oracle here.
+    for (start,hash) in [(first_select+1,program_hash),(second_select+1,semantic_hash)] {
+        unique(&direct.calls,start,hash,&[0,68]);
+        assert_eq!(unique(&direct.calls,start,hash,&[320,1855,8,260,5,85]),hash-8);
+        assert!(direct.calls[hash-2]>0);
+        assert_eq!(direct.calls[hash-1],0);
+    }
     let mut all = Work::default();
     with_capture_validation(&capture,&data,&mut all,|ctx|->ContractWorkResult<()> {
         ctx.ensure_source_and_data()?;
@@ -539,19 +574,51 @@ fn app_length_three_source_counts_and_publication_fail_closed() {
     assert_eq!(&all.calls[4..4+direct.calls.len()],direct.calls.as_slice());
     let publication = 4+direct.calls.len();
     assert_eq!(all.calls[publication],5);
-    for index in count_ends.into_iter().flat_map(|i|[i+4,i+5]).chain([publication]) {
+    for (name,index) in [
+        ("V1 count native",4+count_native),("V1 count success",4+count_native+1),
+        ("Source hash native",4+source_end-1),("Source hash success",4+source_end),
+        ("first selection",4+first_select),
+        ("Program canonical native",4+program_hash-2),("Program canonical success",4+program_hash-1),
+        ("Program hash native",4+program_end-1),("Program hash success",4+program_end),
+        ("second selection",4+second_select),
+        ("semantic canonical native",4+semantic_hash-2),("semantic canonical success",4+semantic_hash-1),
+        ("SemanticProgram hash native",4+semantic_end-1),("SemanticProgram hash success",4+semantic_end),
+        ("facts publication",publication),
+    ] {
         let mut work = Work {refuse:Some(index+1),..Work::default()};
         let result = with_capture_validation(&capture,&data,&mut work,|ctx|->ContractWorkResult<()> {
-            assert_eq!(ctx.ensure_source_and_data(),Err(ContractWorkError::Resource(WorkFailure::Cancelled)));
-            assert!(ctx.facts.is_none());
+            assert_eq!(ctx.ensure_source_and_data(),Err(ContractWorkError::Resource(WorkFailure::Cancelled)),"{name}");
+            assert!(ctx.facts.is_none(),"{name}");
             Ok(()) // Swallow only to test the existing final first-cause barrier.
         });
-        assert_eq!(result,Err(ContractWorkError::Resource(WorkFailure::Cancelled)));
-        assert_eq!(work.calls.as_slice(),&all.calls[..=index]);
+        assert_eq!(result,Err(ContractWorkError::Resource(WorkFailure::Cancelled)),"{name}");
+        assert_eq!(work.calls.as_slice(),&all.calls[..=index],"{name}");
     }
-    // Source suffix failures keep exact native errors and counts; Program mismatch
-    // skips V3 and the semantic clone/encoding. Counts/native entry are source-
-    // assisted via these unchanged counters/call sites, not a new native observer.
+    for (name,index,next_failure) in [
+        ("first selection",4+first_select,4+first_select+2),
+        ("second selection",4+second_select,4+second_select+1),
+    ] {
+        // Fund only the observed already-executed prefix. Literal27 refuses28;
+        // literal28 admits selection, then the original68/1 header refuses.
+        let prefix = all.calls[..index].iter().try_fold(0u64,|n,&x|n.checked_add(x)).unwrap();
+        for (allowance,refused) in [(27u64,index),(28u64,next_failure)] {
+            let mut work = Work {left:Some(prefix.checked_add(allowance).unwrap()),..Work::default()};
+            let expected = ContractWorkError::Resource(WorkFailure::BudgetExhausted("app length test fuel"));
+            let result = with_capture_validation(&capture,&data,&mut work,|ctx|->ContractWorkResult<()> {
+                assert_eq!(ctx.ensure_source_and_data(),Err(expected.clone()),"{name}/{allowance}");
+                assert!(ctx.facts.is_none(),"{name}/{allowance}");
+                Ok(())
+            });
+            assert_eq!(result,Err(expected),"{name}/{allowance}");
+            assert_eq!(work.calls.as_slice(),&all.calls[..=refused],"{name}/{allowance}");
+            assert_eq!(work.calls[index],28);
+            assert_eq!(work.left,Some(if allowance==27 {27} else {0}));
+        }
+    }
+    assert_eq!((serde_json::to_vec(&capture).unwrap(),serde_json::to_vec(&data).unwrap()),before);
+    // Source suffix failures keep exact native errors and independent ordinary,
+    // frozen and paid counts. Program mismatch skips selection2 and all semantic
+    // work; source inspection supplies native-entry attribution for these traces.
     let other = CapturedProgram::capture(&serde_json::to_vec(&rich::organizer()).unwrap(),"project",Producer::UserAuthored,None).unwrap();
     for fault in 0..5 {
         let mut bad = capture.clone();
@@ -562,10 +629,16 @@ fn app_length_three_source_counts_and_publication_fail_closed() {
             3 => bad.artifact.semantic_digest=other.artifact.semantic_digest.clone(),
             _ => {bad.source_bytes=vec![b'!';MAX_WIRE_BYTES+1];bad.artifact.program_digest=other.artifact.program_digest.clone();},
         }
+        let bad_before = serde_json::to_vec(&bad).unwrap();
         let old: old::CapturedProgram = serde_json::from_slice(&serde_json::to_vec(&bad).unwrap()).unwrap();
         old::reset_validation_counts();
         let expected = old.validate().unwrap_err().0;
         let old_counts = old::validation_counts();
+        assert_eq!((old_counts.captures,old_counts.apps),(1,[1,1,2,3,0][fault]));
+        reset_validation_counts();
+        assert_eq!(bad.validate().unwrap_err().0,expected);
+        assert_eq!((validation_counts().captures,validation_counts().apps),(1,[1,1,2,3,0][fault]));
+        assert_eq!(serde_json::to_vec(&bad).unwrap(),bad_before);
         reset_validation_counts();
         let mut work = Work::default();
         let result = with_capture_validation(&bad,&data,&mut work,|ctx|->ContractWorkResult<()> {
@@ -574,9 +647,17 @@ fn app_length_three_source_counts_and_publication_fail_closed() {
             Err(error)
         });
         assert_eq!(result,Err(ContractWorkError::Contract(ContractError(expected))));
-        assert_eq!((validation_counts().captures,validation_counts().apps),(old_counts.captures,old_counts.apps));
-        assert_eq!(validation_counts().apps,[1,1,2,3,0][fault]);
-        assert_eq!(work.calls.windows(5).filter(|w|*w==[0,96,170496,68,1]).count(),[1,1,2,3,0][fault]);
+        assert_eq!((validation_counts().captures,validation_counts().apps),(1,[1,1,1,1,0][fault]));
+        assert_eq!(work.calls.windows(5).filter(|w|*w==[0,96,170496,68,1]).count(),[1,1,1,1,0][fault]);
+        assert_eq!(work.calls.windows(3).filter(|w|*w==[0,96,248]).count(),[0,1,1,1,0][fault]);
+        assert_eq!(work.calls.windows(3).filter(|w|*w==[0,96,253]).count(),[0,0,1,1,0][fault]);
+        assert_eq!(work.calls.windows(3).filter(|w|*w==[0,96,298]).count(),[0,0,0,1,0][fault]);
+        if fault==2 {
+            let hash = unique(&work.calls,4,work.calls.len(),&[0,96,253]);
+            let end = unique(&work.calls,hash,work.calls.len(),&[320,2144,12,412,0])+4;
+            assert_eq!(&work.calls[end+1..end+6],&[3,5,128,1,2]);
+        }
+        assert_eq!(serde_json::to_vec(&bad).unwrap(),bad_before);
     }
     // Complete source counts do not grant frame success. The existing source-facts
     // gate may remain published when the later independent Data validator fails.
@@ -588,12 +669,21 @@ fn app_length_three_source_counts_and_publication_fail_closed() {
         Err(error)
     });
     assert_eq!(result,Err(ContractWorkError::Contract(ContractError("unsupported contract version".into()))));
-    // A separately copied capture re-enters all existing validations, even after a
-    // prior context succeeded. No successful-count/source capability is reused.
+    // Copied and fresh captures each parse and complete their own V1. Prior
+    // source success never supplies the next context's initially empty facts.
     for next in [capture.clone(),capture_minimal()] {
+        let next_before = serde_json::to_vec(&next).unwrap();
+        let mut work = Work::default();
         reset_validation_counts();
-        with_capture_validation(&next,&data,&mut Work::default(),|ctx|->ContractWorkResult<()> {ctx.ensure_source_and_data()}).unwrap();
-        assert_eq!(validation_counts().apps,3);
+        with_capture_validation(&next,&data,&mut work,|ctx|->ContractWorkResult<()> {
+            assert!(ctx.facts.is_none());
+            ctx.ensure_source_and_data()
+        }).unwrap();
+        assert_eq!(validation_counts().apps,1);
         assert_eq!(validation_counts().captures,1);
+        assert_eq!(work.calls.windows(5).filter(|w|*w==[0,96,170496,68,1]).count(),1);
+        assert_eq!(&work.calls[4..4+direct.calls.len()],direct.calls.as_slice());
+        assert_eq!(serde_json::to_vec(&next).unwrap(),next_before);
     }
+    assert_eq!((serde_json::to_vec(&capture).unwrap(),serde_json::to_vec(&data).unwrap()),before);
 }

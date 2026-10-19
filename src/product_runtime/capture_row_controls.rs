@@ -174,7 +174,7 @@ fn capture_row_semantics_one_actual_evaluator_and_fresh_results() {
         });
     assert_eq!(result, Ok(()));
     assert_eq!(validation_counts().captures,1);
-    assert_eq!(validation_counts().apps,3);
+    assert_eq!(validation_counts().apps,1);
 }
 
 #[test]
@@ -443,7 +443,7 @@ fn capture_row_source_session_checks_are_once_per_capture_and_never_reused_next_
             });
         assert_eq!(result,Ok(()));
         assert_eq!(validation_counts().captures,1);
-        assert_eq!(validation_counts().apps,3);
+        assert_eq!(validation_counts().apps,1);
         assert!(host.left < 9_700_000);
     }
 }
