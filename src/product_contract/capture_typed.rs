@@ -30,7 +30,7 @@ impl Conversion {
             a,
         )
     }
-    fn vector(&mut self, len: usize, slot: usize, weight: u64, a: Audit<'_>) -> Result<()> {
+    fn vector(len: usize, slot: usize, a: Audit<'_>) -> Result<(u64, u64)> {
         a.pay(64 + 4 * usize::BITS as u64)?;
         let initial = len.min(MAX_WIRE_BYTES / slot.max(1));
         let capacity = len
@@ -50,10 +50,26 @@ impl Conversion {
             .and_then(|n| n.checked_mul(slot))
             .ok_or_else(|| a.overflow())?;
         let growth = native::growth_count(len).ok_or_else(|| a.overflow())?;
+        a.pay(8)?;
+        let fixed = growth
+            .checked_mul(9)
+            .and_then(|n| n.checked_add((len as u64).checked_mul(3)?))
+            .and_then(|n| n.checked_add(4))
+            .ok_or_else(|| a.overflow())?;
         let amount = (requests as u64)
-            .checked_add(growth.checked_mul(9).ok_or_else(|| a.overflow())?)
-            .and_then(|n| n.checked_add(4 + len as u64 * 3))
-            .and_then(|n| n.checked_mul(weight))
+            .checked_add(fixed)
+            .ok_or_else(|| a.overflow())?;
+        Ok((amount, fixed))
+    }
+    fn content(&mut self, len: usize, slot: usize, depth: usize, a: Audit<'_>) -> Result<()> {
+        let (vector, fixed) = Self::vector(len, slot, a)?;
+        a.pay(16)?;
+        let excess = depth.checked_sub(1).unwrap_or(0) as u64;
+        // Owned Content moves descendants: at most two temporary containers.
+        // Keep the old ancestry-weighted fixed controls at depth >= 1.
+        let amount = vector
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(fixed.checked_mul(excess)?))
             .ok_or_else(|| a.overflow())?;
         self.add(amount, a)
     }
@@ -68,12 +84,13 @@ impl Conversion {
             JsonValue::String(value) => self.string(value, a)?,
             JsonValue::Array(values) => {
                 a.slice(values.len())?;
-                self.vector(
+                self.content(
                     values.len(),
                     size_of::<JsonValue>() + 4 * size_of::<usize>(),
-                    weight,
+                    depth,
                     a,
                 )?;
+                a.pay(16)?;
                 // Final typed Vec candidates are closed: Expr, Statement, DataValue,
                 // schema/view structs. Inline width is independent of payload bytes.
                 let slot = size_of::<Expr>()
@@ -82,23 +99,26 @@ impl Conversion {
                     .max(size_of::<EntityDefinition>())
                     .max(size_of::<ViewDefinition>())
                     .max(size_of::<ActionDefinition>());
-                self.vector(values.len(), slot, 1, a)?;
+                let vector = Self::vector(values.len(), slot, a)?.0;
+                let mut set = 0u64;
                 for (index, value) in values.iter().enumerate() {
                     a.pay(native::INSERT_DESCRIPTOR)?;
-                    self.add(
-                        native::btree_insert::<KeyModifier, ()>(index.min(4), 1)
-                            .ok_or_else(|| a.overflow())?,
-                        a,
-                    )?;
+                    let insertion = native::btree_insert::<KeyModifier, ()>(index.min(4), 1)
+                        .ok_or_else(|| a.overflow())?;
+                    a.pay(3)?;
+                    set = set.checked_add(insertion).ok_or_else(|| a.overflow())?;
                     self.value(value, depth + 1, a)?;
                 }
+                // One owned array selects a final Vec or modifier set, not both.
+                a.pay(2)?;
+                self.add(vector.max(set), a)?;
             }
             JsonValue::Object(map) => {
                 a.map_iter(map.len())?;
-                self.vector(
+                self.content(
                     map.len(),
                     2 * (size_of::<JsonValue>() + 4 * size_of::<usize>()),
-                    weight,
+                    depth,
                     a,
                 )?;
                 self.add(
@@ -113,13 +133,18 @@ impl Conversion {
                     self.add(32 * (2 + 2 * key.len().min(32) as u64), a)?;
                     let c = a.comparator(key.len())?;
                     a.pay(3 * native::INSERT_DESCRIPTOR)?;
-                    for native in [
+                    let candidates = [
                         native::btree_insert::<Id, Type>(index, c),
                         native::btree_insert::<Id, Expr>(index, c),
                         native::btree_insert::<Id, DataValue>(index, c),
-                    ] {
-                        self.add(native.ok_or_else(|| a.overflow())?, a)?;
-                    }
+                    ];
+                    // One final map type owns the complete insertion/cleanup.
+                    a.pay(12)?;
+                    let insertion = candidates[0]
+                        .ok_or_else(|| a.overflow())?
+                        .max(candidates[1].ok_or_else(|| a.overflow())?)
+                        .max(candidates[2].ok_or_else(|| a.overflow())?);
+                    self.add(insertion, a)?;
                     self.value(value, depth + 1, a)?;
                 }
             }
@@ -164,3 +189,7 @@ pub(super) fn parse_app(bytes: &[u8], a: Audit<'_>) -> Result<AppDefinition> {
     a.pay(0)?;
     Ok(app)
 }
+
+#[cfg(test)]
+#[path = "capture_typed_bound_tests.rs"]
+mod bound_tests;
