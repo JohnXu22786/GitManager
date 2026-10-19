@@ -128,7 +128,12 @@ impl Conversion {
         Ok(())
     }
 }
+#[cfg_attr(test, track_caller)]
 pub(super) fn parse_app(bytes: &[u8], a: Audit<'_>) -> Result<AppDefinition> {
+    #[cfg(test)]
+    let _diagnostic = super::capture_work::diagnostic::enter(
+        super::capture_work::diagnostic::Phase::Conversion,
+    );
     a.format(107)?;
     let value = match bounded_input::parse_json_bytes_with_work(bytes, &mut |n| a.pay(n)) {
         Ok(value) => value,

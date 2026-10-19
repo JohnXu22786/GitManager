@@ -1310,7 +1310,10 @@ fn retained_lifecycle_reconstruct_derive_enforces_real_resource_boundaries() {
 #[test]
 fn capture_row_batch_preserves_actual_frame_values_and_presence() {
     let (a, b) = pair(); let (_d, store) = setup(&a);
-    let r = request(&store, &a, &b); let proof = verify(&store, &b, &r).unwrap();
+    let r = request(&store, &a, &b); let proof = {
+        let _diagnostic = product_store::scope::adoption_diagnostic::start();
+        verify(&store, &b, &r).unwrap()
+    };
     for case in ["full", "selected-live", "excluded-live", "future", "archived-unfinished",
         "zero-projections", "nullable-absence", "duplicate-location", "actual-day",
         "distinct-source", "unfinished-skips-poison"] {
@@ -1329,6 +1332,9 @@ fn capture_row_batch_preserves_first_errors_and_lazy_boundaries() {
 #[test]
 fn capture_row_batch_uses_actual_host_reservation_and_refusals() {
     let (a, b) = pair(); let (_d, store) = setup(&a);
-    let r = request(&store, &a, &b); let proof = verify(&store, &b, &r).unwrap();
+    let r = request(&store, &a, &b); let proof = {
+        let _diagnostic = product_store::scope::adoption_diagnostic::start();
+        verify(&store, &b, &r).unwrap()
+    };
     store.assert_capture_row_host_for_test(&proof);
 }

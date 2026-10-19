@@ -52,6 +52,7 @@ impl<'a> Audit<'a> {
     pub(super) fn enabled(self) -> bool {
         self.0.is_some()
     }
+    #[cfg_attr(test, track_caller)]
     pub(super) fn pay(self, units: u64) -> Result<()> {
         if let Some(state) = self.0 {
             if state.first.borrow().is_some() {
@@ -59,6 +60,8 @@ impl<'a> Audit<'a> {
             }
             if let Err(error) = state.work.borrow_mut().charge(units) {
                 *state.first.borrow_mut() = Some(error);
+                #[cfg(test)]
+                diagnostic::refusal(units);
                 // Empty transport owner: the typed first cause is retained separately.
                 return Err(ContractError(String::new()));
             }
@@ -76,6 +79,7 @@ impl<'a> Audit<'a> {
         }
         ContractError(String::new())
     }
+    #[cfg_attr(test, track_caller)]
     pub(super) fn amount(self, n: Option<u64>) -> Result<()> {
         if !self.enabled() {
             return Ok(());
@@ -375,5 +379,45 @@ impl<'a> Audit<'a> {
             .and_then(|n| n.checked_add((key.modifiers.len() as u64).checked_mul(4)?))
             .and_then(|n| n.checked_add(1))
             .ok_or_else(|| self.overflow())
+    }
+}
+
+// Diagnostic-only source phase. No work, budget or semantic state is observed
+// or changed by the guard; actual charge failure remains owned by WorkState.
+#[cfg(test)]
+pub(super) mod diagnostic {
+    use std::cell::Cell;
+    use std::panic::Location;
+
+    #[derive(Clone, Copy)]
+    #[repr(u8)]
+    pub(in crate::product_contract) enum Phase {
+        Conversion = 1,
+        Canonical = 2,
+        DataWriter = 3,
+    }
+    type Origin = (u8, &'static str, u32);
+    thread_local! {
+        static PHASE: Cell<Origin> = const { Cell::new((0, "", 0)) };
+    }
+    pub(in crate::product_contract) struct Guard(Origin);
+    #[track_caller]
+    pub(in crate::product_contract) fn enter(phase: Phase) -> Guard {
+        let at = Location::caller();
+        Guard(PHASE.with(|state| state.replace((phase as u8, at.file(), at.line()))))
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            PHASE.with(|state| state.set(self.0));
+        }
+    }
+    #[track_caller]
+    pub(super) fn refusal(requested: u64) {
+        let at = Location::caller();
+        PHASE.with(|state| {
+            let (phase, origin_file, origin_line) = state.get();
+            eprintln!("P5_CAPTURE_BRIDGE_FIRST_REFUSAL requested={} phase={} origin_file={} origin_line={} charge_file={} charge_line={}",
+                requested, phase, origin_file, origin_line, at.file(), at.line());
+        });
     }
 }

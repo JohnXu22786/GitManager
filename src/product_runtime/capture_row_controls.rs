@@ -27,13 +27,14 @@ pub(super) struct TestHost {
     cancelled: Arc<AtomicBool>,
     additional: Option<Arc<AtomicBool>>,
     pub(super) output_limit: usize,
+    diagnostic_fuel_refusal: bool,
 }
 impl TestHost {
     pub(super) fn new() -> Self {
         Self { left: 10_000_000, started: Instant::now(), millis: 60_000,
             cancelled: Arc::new(AtomicBool::new(false)),
             additional: Some(Arc::new(AtomicBool::new(false))),
-            output_limit: MAX_OUTPUT_BYTES }
+            output_limit: MAX_OUTPUT_BYTES, diagnostic_fuel_refusal: false }
     }
 }
 impl ContractWork for TestHost {
@@ -46,7 +47,13 @@ impl ContractWork for TestHost {
             return Err(WorkFailure::BudgetExhausted("cumulative elapsed budget exhausted"));
         }
         self.left = self.left.checked_sub(units)
-            .ok_or(WorkFailure::BudgetExhausted("cumulative proof/initialization budget exhausted"))?;
+            .ok_or(WorkFailure::BudgetExhausted("cumulative proof/initialization budget exhausted"))
+            .inspect_err(|_| {
+                if !self.diagnostic_fuel_refusal {
+                    self.diagnostic_fuel_refusal = true;
+                    eprintln!("P5_TEST_HOST_FIRST_FUEL_REFUSAL left={} requested={}", self.left, units);
+                }
+            })?;
         Ok(())
     }
 }

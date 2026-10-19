@@ -766,10 +766,15 @@ pub(crate) fn canonical_bytes_with_work<T: Serialize + ?Sized>(
     let audit = Audit(Some(&state));
     state.finish(canonical_bytes_audited(value, audit))
 }
+#[cfg_attr(test, track_caller)]
 pub(super) fn canonical_bytes_audited<T: Serialize + ?Sized>(
     value: &T,
     a: Audit<'_>,
 ) -> Result<Vec<u8>> {
+    #[cfg(test)]
+    let _diagnostic = super::capture_work::diagnostic::enter(
+        super::capture_work::diagnostic::Phase::Canonical,
+    );
     if !a.enabled() {
         return canonical_bytes(&value);
     }
@@ -851,7 +856,12 @@ impl<T: ManualShape> ManualShape for BTreeMap<String, T> {
     }
 }
 
+#[cfg_attr(test, track_caller)]
 pub(super) fn data_serialized_bound_audited(data: &DataSnapshot, a: Audit<'_>) -> Result<()> {
+    #[cfg(test)]
+    let _diagnostic = super::capture_work::diagnostic::enter(
+        super::capture_work::diagnostic::Phase::DataWriter,
+    );
     if !a.enabled() {
         return serialized_bound(data, MAX_WIRE_BYTES);
     }
