@@ -135,15 +135,40 @@ fn typed_bounds_match_literal_native_and_descriptor_controls() {
         (json!([null]), 0, 1754 + 4*h + 13*t, 1105, 0),
         (json!([null,null,null,null,null]), 0, 4714 + 12*h + 35*t, 2641, 0),
         (json!([null,null,null,null,null,null,null,null,null]), 3, 8927 + 20*h + 63*t, 4177, 0),
-        (json!({"a":null}), 0, 3917 + 4*h + 12*p, 1563, 1),
-        (json!({"a":null,"b":null}), 3, 4883 + 6*h + 14*p, 2742, 2),
+        (json!({"a":null}), 0, 3917 + 4*h + 12*p, 1569, 1),
+        (json!({"a":null,"b":null}), 3, 4883 + 6*h + 14*p, 2754, 2),
     ] {
-        let mut descriptor = Conversion { bytes: 0, native: 0 };
+        let mut descriptor = Conversion { bytes: 0, max_bytes: 0, native: 0 };
         let mut work = Work::new(fuel);
         let state = WorkState::new(&mut work);
         state.finish(descriptor.value(&value, depth, Audit(Some(&state)))).unwrap();
         assert_eq!((descriptor.bytes, descriptor.native), (bytes, expected), "{value} at {depth}");
         assert_eq!(work.left, 0);
+    }
+    // The added scalar is paid separately from the old descriptor/frame reserve.
+    assert_eq!((size_of::<Conversion>(), align_of::<Conversion>()), (24, 8));
+    // Independent literal string controls retain the aggregate sum and native
+    // allowance while the maximum grows once and never shrinks for shorter inputs.
+    let mut descriptor = Conversion { bytes: 0, max_bytes: 0, native: 0 };
+    let mut work = Work::new(77);
+    let state = WorkState::new(&mut work);
+    for text in ["abc", "é", ""] {
+        state.finish(descriptor.string(text, Audit(Some(&state)))).unwrap();
+    }
+    assert_eq!((descriptor.bytes, descriptor.max_bytes, descriptor.native), (5, 3, 534));
+    assert_eq!(work.calls, [6,5,13,3,6,5,12,3,6,5,10,3]);
+    assert_eq!(work.left, 0);
+    // Refusing the new maximum prepayment leaves every field unchanged. With
+    // exactly six units it can update the max, then the old scaled debit fails.
+    for (fuel, maximum, calls) in [(5, 5, vec![6]), (6, 8, vec![6,5])] {
+        let mut descriptor = Conversion { bytes: 11, max_bytes: 5, native: 17 };
+        let mut work = Work::new(fuel);
+        let state = WorkState::new(&mut work);
+        assert_eq!(state.finish(descriptor.string("abcdefgh", Audit(Some(&state)))),
+            Err(ContractWorkError::Resource(WorkFailure::BudgetExhausted("typed test fuel"))));
+        assert_eq!((descriptor.bytes, descriptor.max_bytes, descriptor.native), (11, maximum, 17));
+        assert_eq!(work.calls, calls);
+        assert_eq!(work.left, if fuel == 5 { 5 } else { 0 });
     }
     // One below each new operation's literal prepayment: V fixed split, U,
     // array maximum/final addition, checked modifier sum and map maximum.
@@ -153,9 +178,9 @@ fn typed_bounds_match_literal_native_and_descriptor_controls() {
         (json!([]), 717, 13, 2, 1),
         (json!([]), 720, 14, 3, 2),
         (json!([null]), 1081, 14, 3, 2),
-        (json!({"a":null}), 1541, 19, 12, 11),
+        (json!({"a":null}), 1547, 20, 12, 11),
     ] {
-        let mut descriptor = Conversion { bytes: 0, native: 0 };
+        let mut descriptor = Conversion { bytes: 0, max_bytes: 0, native: 0 };
         let mut work = Work::new(fuel);
         let state = WorkState::new(&mut work);
         assert_eq!(state.finish(descriptor.value(&value, 0, Audit(Some(&state)))),
@@ -173,18 +198,28 @@ fn typed_bounds_keep_native_refusal_and_success_only_poll_order() {
     let prefix = [
         320,1561,8,218, // Existing FMT(107), retained string owner.
         0,2,10,18,18,9,352,3197,2,9,1,0, // Paid parser for {}.
-        4168,12,3,3,8,8,320,8,16,3,3, // Descriptor.
+        4185,12,3,3,8,8,320,8,16,3,3, // Descriptor plus new scalar owner/init.
         320,41082,320,14426,8,2052,5,101, // D=1024 and both error owners.
     ];
-    assert_eq!(prefix.iter().sum::<u64>(), 68591);
-    let mut refused = Work::new(68591 + reserve - 1);
+    assert_eq!(prefix.iter().sum::<u64>(), 68608);
+    // New scalar storage/init and the retained checked D arithmetic must be
+    // funded before either operation; no later callback is reached on refusal.
+    for (fuel, count, left) in [(9909, 17, 4184), (10613, 28, 319)] {
+        let mut refused = Work::new(fuel);
+        assert_eq!(paid(b"{}", &mut refused),
+            Err(ContractWorkError::Resource(WorkFailure::BudgetExhausted("typed test fuel"))));
+        assert_eq!(refused.calls, prefix[..count]);
+        assert_eq!(refused.left, left);
+        assert_eq!(refused.zeroes, 2);
+    }
+    let mut refused = Work::new(68608 + reserve - 1);
     assert_eq!(paid(b"{}", &mut refused),
         Err(ContractWorkError::Resource(WorkFailure::BudgetExhausted("typed test fuel"))));
     assert_eq!(&refused.calls[..prefix.len()], &prefix);
     assert_eq!(&refused.calls[prefix.len()..], &[reserve]);
     assert_eq!(refused.left, reserve - 1);
 
-    let mut exact = Work::new(68591 + reserve);
+    let mut exact = Work::new(68608 + reserve);
     let expected = serde_json::from_value::<AppDefinition>(json!({})).unwrap_err().to_string();
     assert_eq!(paid(b"{}", &mut exact), Err(ContractWorkError::Contract(ContractError(expected))));
     assert_eq!(exact.calls, refused.calls); // Native Err has no completion poll.
@@ -201,4 +236,95 @@ fn typed_bounds_keep_native_refusal_and_success_only_poll_order() {
     let mut success = Work::new(u64::MAX);
     assert_eq!(paid(good, &mut success).unwrap(), serde_json::from_slice::<AppDefinition>(good).unwrap());
     assert_eq!(success.calls, cancelled.calls);
+}
+
+
+#[test]
+fn typed_error_bound_describes_complete_keys_and_values() {
+    let mut key_only = serde_json::Map::new();
+    key_only.insert("k".repeat(257), JsonValue::Null);
+    let mut nested_key = serde_json::Map::new();
+    nested_key.insert("k".repeat(97), json!("v".repeat(64)));
+    let mut nested_value = serde_json::Map::new();
+    nested_value.insert("k".repeat(80), json!("v".repeat(96)));
+    let mut short_strings = vec![json!("x"); 128];
+    short_strings.push(json!("q".repeat(32)));
+    for (label, value, bytes, maximum) in [
+        ("no strings", json!([null, false, 7]), 0, 0),
+        ("keys without string leaves", JsonValue::Object(key_only), 257, 257),
+        ("UTF-8 bytes, not characters", json!(["a", "bb", "é", "🙂"]), 9, 4),
+        // Native App decoding would fail at the first unknown key `a`; the
+        // descriptor must still include both keys and values in the later tail.
+        ("long nested key after failed prefix", json!({"a":null,"z":[nested_key]}), 163, 97),
+        ("long nested value after failed prefix", json!({"a":false,"z":["short",nested_value,"tail"]}), 187, 96),
+        ("many short unrelated strings", JsonValue::Array(short_strings), 160, 32),
+        ("same aggregate, one long string", json!(["x".repeat(160)]), 160, 160),
+    ] {
+        let mut descriptor = Conversion { bytes: 0, max_bytes: 0, native: 0 };
+        let mut work = Work::new(u64::MAX);
+        let state = WorkState::new(&mut work);
+        state.finish(descriptor.value(&value, 0, Audit(Some(&state)))).unwrap();
+        assert_eq!((descriptor.bytes, descriptor.max_bytes), (bytes, maximum), "{label}");
+    }
+}
+
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn typed_error_bound_preserves_exact_native_errors() {
+    // These messages name the intended originating error, independently of the
+    // paid path. A different native error cannot make a negative fixture pass.
+    let app_fields = "one of `version`, `id`, `label`, `entities`, `state`, `actions`, `outputs`, `observables`, `views`, `initial_view`";
+    let expr_variants = "one of `literal`, `variable`, `field`, `state`, `today`, `query`, `filter`, `map`, `count`, `any`, `all`, `sum`, `contains`, `equal`, `less`, `add`, `subtract`, `concat`, `text_contains`, `lower`, `and`, `or`, `not`, `if`, `coalesce`, `date_add`, `date_difference`";
+    let type_variants = "one of `boolean`, `integer`, `text`, `date`, `reference`, `list`, `optional`";
+    let empty = json!([1,"","",[],[],[],[],[],[],""]);
+    let long = "x".repeat(2048);
+    let mut unknown_key = serde_json::Map::new();
+    unknown_key.insert(long.clone(), JsonValue::Null);
+    let mut unknown_expr = empty.clone();
+    unknown_expr[7] = json!([["","",{"kind":long}]]);
+    let mut escaped_scalar = empty.clone();
+    escaped_scalar[0] = json!("\u{1b}".repeat(256));
+    let mut external_payload = empty.clone();
+    external_payload[6] = json!([["","",{"csv":"\u{1b}".repeat(80)},[]]]);
+    let mut partial_map = empty.clone();
+    partial_map[5] = json!([["","",{
+        "a":["text"],"z":["list",["optional",["missing"]]],"zz":["text"]
+    },[],[],[]]]);
+    let mut partial_exprs = empty.clone();
+    partial_exprs[7] = json!([["","",["and",[["today"],["not",["missing"]],["today"]]]]]);
+    let mut partial_values = empty.clone();
+    partial_values[4] = json!([["","",["boolean"],["list",["text"],[["text","first"],["text",false],["text","tail"]]]]]);
+    let mut unrelated = empty;
+    unrelated[0] = json!("bad");
+    unrelated[3] = json!(vec!["x"; 128]);
+    // The D/custom/format/copy columns are literal reductions of the retained
+    // native primitives, not values obtained from the descriptor or its helpers.
+    for (label, value, intended, maximum, diagnostic, custom, formatted, copy) in [
+        ("long unknown key", JsonValue::Object(unknown_key), format!("unknown field `{long}`, expected {app_fields}"), 2048, 13312, 532638, 186494, 26628),
+        ("long Expr tag and complete static list", unknown_expr, format!("unknown variant `{long}`, expected {expr_variants}"), 2048, 13312, 532638, 186494, 26628),
+        ("escaped wrong scalar", escaped_scalar, format!("invalid type: string \"{}\", expected u32", "\\u{1b}".repeat(256)), 256, 2560, 102540, 35948, 5124),
+        ("recognized external unit key, wrong payload", external_payload, format!("invalid type: string \"{}\", expected unit", "\\u{1b}".repeat(80)), 80, 1504, 60291, 21155, 3012),
+        ("typed map prefix and nested tagged sequences", partial_map, format!("unknown variant `missing`, expected {type_variants}"), 8, 1072, 43011, 15107, 2148),
+        ("Expr sequence prefix and unconsumed tail", partial_exprs, format!("unknown variant `missing`, expected {expr_variants}"), 7, 1066, 42771, 15023, 2136),
+        ("DataValue sequence partial prefix", partial_values, "invalid type: boolean `false`, expected a string".into(), 7, 1066, 42771, 15023, 2136),
+        ("no-string null", json!(null), "invalid type: null, expected struct AppDefinition".into(), 0, 1024, 41082, 14426, 2052),
+        ("no-string number", json!(0), "invalid type: integer `0`, expected struct AppDefinition".into(), 0, 1024, 41082, 14426, 2052),
+        ("no-string short sequence", json!([]), "invalid length 0, expected struct AppDefinition with 10 elements".into(), 0, 1024, 41082, 14426, 2052),
+        ("no-string missing field", json!({}), "missing field `version`".into(), 0, 1024, 41082, 14426, 2052),
+        ("unrelated strings after early wrong scalar", unrelated, "invalid type: string \"bad\", expected u32".into(), 3, 1042, 41811, 14687, 2088),
+    ] {
+        let expected = serde_json::from_value::<AppDefinition>(value.clone()).unwrap_err().to_string();
+        assert_eq!(expected, intended, "{label}: wrong originating error");
+        assert!(expected.len() <= diagnostic, "{label}: diagnostic bound");
+        let mut descriptor = Conversion { bytes: 0, max_bytes: 0, native: 0 };
+        let mut scan = Work::new(u64::MAX);
+        let state = WorkState::new(&mut scan);
+        state.finish(descriptor.value(&value, 0, Audit(Some(&state)))).unwrap();
+        assert_eq!(descriptor.max_bytes, maximum, "{label}");
+        let mut work = Work::new(u64::MAX);
+        assert_eq!(paid(&serde_json::to_vec(&value).unwrap(), &mut work),
+            Err(ContractWorkError::Contract(ContractError(expected))), "{label}");
+        assert_eq!(work.zeroes, 2, "{label}: native Err has no success poll");
+        assert!(work.calls.ends_with(&[320,custom,320,formatted,8,copy,5,101,descriptor.native]), "{label}: distinct error owners and native debit");
+    }
 }

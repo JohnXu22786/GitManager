@@ -6,6 +6,7 @@ use std::mem::size_of;
 
 struct Conversion {
     bytes: usize,
+    max_bytes: usize,
     native: u64,
 }
 impl Conversion {
@@ -15,6 +16,8 @@ impl Conversion {
         Ok(())
     }
     fn string(&mut self, value: &str, a: Audit<'_>) -> Result<()> {
+        a.pay(6)?;
+        self.max_bytes = self.max_bytes.max(value.len());
         a.scaled(value.len(), 1, 10)?;
         self.bytes = self
             .bytes
@@ -168,15 +171,16 @@ pub(super) fn parse_app(bytes: &[u8], a: Audit<'_>) -> Result<AppDefinition> {
         Err(bounded_input::InputWorkError::Resource(error)) => return Err(error),
         Err(bounded_input::InputWorkError::ArithmeticOverflow) => return Err(a.overflow()),
     };
-    a.pay(8 + 65 * (8 * size_of::<usize>() as u64))?;
+    a.pay(9 + 65 * (8 * size_of::<usize>() as u64) + 2 * size_of::<usize>() as u64)?;
     let mut descriptor = Conversion {
         bytes: 0,
+        max_bytes: 0,
         native: 0,
     };
     descriptor.value(&value, 0, a)?;
     a.pay(64 + 4 * usize::BITS as u64)?;
     let diagnostic = descriptor
-        .bytes
+        .max_bytes
         .checked_mul(6)
         .and_then(|n| n.checked_add(1024))
         .ok_or_else(|| a.overflow())?;
