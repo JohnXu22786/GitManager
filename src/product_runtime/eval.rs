@@ -102,6 +102,7 @@ impl Eval<'_> {
 
     /// Static result types are needed even when map/filter receives no values.
     pub(super) fn typ(&mut self, expr: &Expr, env: &Env) -> Result<Type> {
+        if self.meter.row.is_some() { return self.typ_paid(expr, env); }
         self.meter.tick(1)?;
         Ok(match expr {
             Expr::Literal { value_type, .. } => value_type.clone(),
@@ -158,6 +159,7 @@ impl Eval<'_> {
         })
     }
     pub fn eval(&mut self, expr: &Expr, env: &Env) -> Result<DataValue> {
+        if self.meter.row.is_some() { return self.eval_paid(expr, env); }
         self.meter.tick(1)?;
         let value = match expr {
             Expr::Literal { value, .. } => {

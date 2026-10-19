@@ -6,6 +6,23 @@
 
 #[path = "tool_proposal_input.rs"]
 mod bounded_input;
+#[path = "product_contract/capture_work.rs"]
+mod capture_work;
+#[path = "product_contract/capture_owned.rs"]
+mod capture_owned;
+#[path = "product_contract/capture_payment.rs"]
+pub(crate) mod capture_payment;
+#[path = "product_contract/capture_canonical.rs"]
+mod capture_canonical;
+#[path = "product_contract/capture_typed.rs"]
+mod capture_typed;
+#[path = "product_contract/capture_validation.rs"]
+mod capture_validation;
+use capture_work::Audit;
+use capture_owned::OwnedWork;
+pub(crate) use capture_work::{ContractWork, WorkFailure, ContractWorkError, ContractWorkResult};
+pub(crate) use capture_canonical::canonical_bytes_with_work;
+pub(crate) use capture_validation::{with_capture_validation, CaptureValidation, validate_value_with_work};
 
 use ring::digest::{digest, SHA256};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -579,56 +596,64 @@ pub struct AppDefinition {
     pub initial_view: Id,
 }
 
-struct Validator<'a> {
-    app: &'a AppDefinition,
+struct Validator<'a, 'w> {
+    entities: &'a [EntityDefinition],
+    state: &'a [StateDefinition],
+    actions: &'a [ActionDefinition],
+    outputs: &'a [OutputDefinition],
     nodes: usize,
+    audit: Audit<'w>,
 }
 type Environment = BTreeMap<Id, Type>;
-impl<'a> Validator<'a> {
+impl<'a, 'w> Validator<'a, 'w> {
+    fn new(app: &'a AppDefinition, audit: Audit<'w>) -> Self {
+        Self { entities: &app.entities, state: &app.state, actions: &app.actions,
+            outputs: &app.outputs, nodes: 0, audit }
+    }
     fn node(&mut self, depth: usize) -> Result<()> {
-        self.nodes += 1;
-        require(
+        let a = self.audit;
+        a.pay(8)?;
+        self.nodes = self.nodes.checked_add(1).ok_or_else(|| a.overflow())?;
+        a.require(
             depth <= MAX_EXPR_DEPTH && self.nodes <= MAX_AST_NODES,
             "AST depth or node budget exceeded",
         )
     }
     fn entity(&self, id: &str) -> Result<&'a EntityDefinition> {
-        self.app
-            .entities
-            .iter()
-            .find(|e| e.id == id)
-            .ok_or_else(|| ContractError(format!("unknown entity: {id}")))
+        let a=self.audit;
+        if let Some(value)=a.find(self.entities,id,|v|&v.id)? { return Ok(value); }
+        a.pay(2)?;a.format(id.len().checked_add(16).ok_or_else(||a.overflow())?)?;
+        Err(ContractError(format!("unknown entity: {id}")))
     }
     fn state(&self, id: &str) -> Result<&'a StateDefinition> {
-        self.app
-            .state
-            .iter()
-            .find(|s| s.id == id)
-            .ok_or_else(|| ContractError(format!("unknown state: {id}")))
+        let a=self.audit;
+        if let Some(value)=a.find(self.state,id,|v|&v.id)? { return Ok(value); }
+        a.pay(2)?;a.format(id.len().checked_add(15).ok_or_else(||a.overflow())?)?;
+        Err(ContractError(format!("unknown state: {id}")))
     }
     fn action(&self, id: &str) -> Result<&'a ActionDefinition> {
-        self.app
-            .actions
-            .iter()
-            .find(|a| a.id == id)
-            .ok_or_else(|| ContractError(format!("unknown action: {id}")))
+        let a=self.audit;
+        if let Some(value)=a.find(self.actions,id,|v|&v.id)? { return Ok(value); }
+        a.pay(2)?;a.format(id.len().checked_add(16).ok_or_else(||a.overflow())?)?;
+        Err(ContractError(format!("unknown action: {id}")))
     }
     fn field(&self, entity: &str, field: &str) -> Result<&'a FieldDefinition> {
-        self.entity(entity)?
-            .fields
-            .iter()
-            .find(|f| f.id == field)
-            .ok_or_else(|| ContractError(format!("unknown field: {entity}.{field}")))
+        let a=self.audit;
+        if let Some(value)=a.find(&self.entity(entity)?.fields,field,|v|&v.id)? {return Ok(value);}
+        a.pay(3)?;a.format(entity.len().checked_add(field.len()).and_then(|n|n.checked_add(16)).ok_or_else(||a.overflow())?)?;
+        Err(ContractError(format!("unknown field: {entity}.{field}")))
     }
     fn typ(&self, typ: &Type, depth: usize) -> Result<()> {
-        require(depth <= MAX_TYPE_DEPTH, "type nesting budget exceeded")?;
+        let a = self.audit;
+        a.pay(8)?;
+        a.require(depth <= MAX_TYPE_DEPTH, "type nesting budget exceeded")?;
         match typ {
             Type::Reference { entity } => {
                 self.entity(entity)?;
             }
             Type::List { item } => self.typ(item, depth + 1)?,
             Type::Optional { item } => {
-                require(
+                a.require(
                     !matches!(item.as_ref(), Type::Optional { .. }),
                     "nested optional type",
                 )?;
@@ -638,14 +663,15 @@ impl<'a> Validator<'a> {
         }
         Ok(())
     }
-    fn bound(env: &Environment, name: &str, typ: Type) -> Result<Environment> {
-        check_id(name)?;
-        require(
-            !env.contains_key(name),
-            format!("binding shadows existing variable: {name}"),
-        )?;
-        let mut env = env.clone();
-        env.insert(name.into(), typ);
+    fn bound(&self, env: &Environment, name: &str, typ: Type) -> Result<Environment> {
+        let a = self.audit;
+        a.pay(8)?;
+        a.check_id(name)?;
+        let available = !a.has(env, name)?;
+        a.pay(2)?;a.format(name.len().checked_add(35).ok_or_else(|| a.overflow())?)?;
+        a.require_owned(available, format!("binding shadows existing variable: {name}"))?;
+        let mut env = a.clone_owned(env)?;
+        a.insert_string(&mut env, name, typ)?;
         Ok(env)
     }
     fn expect(
@@ -656,11 +682,12 @@ impl<'a> Validator<'a> {
         depth: usize,
         state: bool,
     ) -> Result<()> {
+        let a = self.audit;
+        a.pay(8)?;
         let actual = self.expr(expr, env, depth, state)?;
-        require(
-            &actual == expected,
-            format!("expression type mismatch: expected {expected:?}, found {actual:?}"),
-        )
+        let equal = a.type_equal(&actual, expected)?;
+        a.type_message(44, expected, &actual)?;
+        a.require_owned(equal, format!("expression type mismatch: expected {expected:?}, found {actual:?}"))
     }
     fn list_item(
         &mut self,
@@ -669,9 +696,11 @@ impl<'a> Validator<'a> {
         depth: usize,
         state: bool,
     ) -> Result<Type> {
+        let a = self.audit;
+        a.pay(8)?;
         match self.expr(expr, env, depth, state)? {
             Type::List { item } => Ok(*item),
-            _ => Err(ContractError("expected collection".into())),
+            _ => Err(a.error("expected collection")?),
         }
     }
     fn record_entity(
@@ -681,36 +710,42 @@ impl<'a> Validator<'a> {
         depth: usize,
         state: bool,
     ) -> Result<Id> {
+        let a = self.audit;
+        a.pay(8)?;
         match self.expr(expr, env, depth, state)? {
             Type::Reference { entity } => Ok(entity),
-            _ => Err(ContractError(
-                "expected nonoptional record reference".into(),
-            )),
+            _ => Err(a.error("expected nonoptional record reference")?),
         }
     }
     fn expr(&mut self, expr: &Expr, env: &Environment, depth: usize, state: bool) -> Result<Type> {
+        let a = self.audit;
+        a.pay(8)?;
         self.node(depth)?;
         let next = depth + 1;
+        a.pay(12)?;
         Ok(match expr {
             Expr::Literal { value_type, value } => {
                 self.typ(value_type, 0)?;
-                validate_value(value, value_type, 0)?;
-                value_type.clone()
+                validate_value_audited(value, value_type, 0, a)?;
+                a.clone_owned(value_type)?
             }
-            Expr::Variable { name } => env
-                .get(name)
-                .cloned()
-                .ok_or_else(|| ContractError(format!("unbound variable: {name}")))?,
+            Expr::Variable { name } => {
+                match a.get(env, name)? {
+                    Some(value) => a.clone_owned(value)?,
+                    None => {a.pay(2)?;a.format(name.len().checked_add(18).ok_or_else(||a.overflow())?)?;
+                        return Err(ContractError(format!("unbound variable: {name}")));}
+                }
+            },
             Expr::Field { record, field } => {
                 let entity = self.record_entity(record, env, next, state)?;
-                self.field(&entity, field)?.value_type.clone()
+                a.clone_owned(&self.field(&entity, field)?.value_type)?
             }
             Expr::State { state: id } => {
-                require(
+                a.require(
                     state,
                     "durable constraints cannot reference transient state",
                 )?;
-                self.state(id)?.value_type.clone()
+                a.clone_owned(&self.state(id)?.value_type)?
             }
             Expr::Today => Type::Date,
             Expr::Query {
@@ -722,20 +757,22 @@ impl<'a> Validator<'a> {
                 ..
             } => {
                 self.entity(entity)?;
-                require(
+                a.require(
                     *limit > 0 && *limit <= MAX_COLLECTION,
                     "query limit out of bounds",
                 )?;
-                bounded(sort.len())?;
-                let env = Self::bound(env, binding, Type::reference(entity))?;
+                a.bounded(sort.len())?;
+                let env = self.bound(env, binding, a.reference_type(entity)?)?;
                 self.expect(predicate, &env, &Type::Boolean, next, state)?;
-                for key in sort {
-                    require(
+                a.slice(sort.len())?;
+        for key in sort {
+            a.pay(8)?;
+                    a.require(
                         self.expr(&key.value, &env, next, state)?.is_scalar(),
                         "sort key must be scalar",
                     )?;
                 }
-                Type::list(Type::reference(entity))
+                a.list_type(a.reference_type(entity)?)?
             }
             Expr::Filter {
                 items,
@@ -753,10 +790,10 @@ impl<'a> Validator<'a> {
                 predicate,
             } => {
                 let item = self.list_item(items, env, next, state)?;
-                let env = Self::bound(env, binding, item.clone())?;
+                let env = self.bound(env, binding, a.clone_owned(&item)?)?;
                 self.expect(predicate, &env, &Type::Boolean, next, state)?;
                 if matches!(expr, Expr::Filter { .. }) {
-                    Type::list(item)
+                    a.list_type(item)?
                 } else {
                     Type::Boolean
                 }
@@ -767,8 +804,8 @@ impl<'a> Validator<'a> {
                 value,
             } => {
                 let item = self.list_item(items, env, next, state)?;
-                let env = Self::bound(env, binding, item)?;
-                let result = Type::list(self.expr(value, &env, next, state)?);
+                let env = self.bound(env, binding, item)?;
+                let result = a.list_type(self.expr(value, &env, next, state)?)?;
                 self.typ(&result, 0)?;
                 result
             }
@@ -777,7 +814,7 @@ impl<'a> Validator<'a> {
                 Type::Integer
             }
             Expr::Sum { items } => {
-                self.expect(items, env, &Type::list(Type::Integer), next, state)?;
+                self.expect(items, env, &a.list_type(Type::Integer)?, next, state)?;
                 Type::Integer
             }
             Expr::Contains { items, value } => {
@@ -786,12 +823,7 @@ impl<'a> Validator<'a> {
                 Type::Boolean
             }
             Expr::Equal { left, right } | Expr::Less { left, right } => {
-                let typ = self.expr(left, env, next, state)?;
-                if matches!(expr, Expr::Less { .. }) {
-                    require(typ.is_scalar(), "ordered comparison requires scalar")?;
-                }
-                self.expect(right, env, &typ, next, state)?;
-                Type::Boolean
+                self.comparison_operands(left, right, env, next, state, matches!(expr, Expr::Less { .. }))?
             }
             Expr::Add { left, right } | Expr::Subtract { left, right } => {
                 self.expect(left, env, &Type::Integer, next, state)?;
@@ -813,9 +845,11 @@ impl<'a> Validator<'a> {
                 Type::Text
             }
             Expr::And { values } | Expr::Or { values } => {
-                bounded(values.len())?;
-                require(!values.is_empty(), "empty boolean connective")?;
-                for value in values {
+                a.bounded(values.len())?;
+                a.require(!values.is_empty(), "empty boolean connective")?;
+                a.slice(values.len())?;
+        for value in values {
+            a.pay(8)?;
                     self.expect(value, env, &Type::Boolean, next, state)?;
                 }
                 Type::Boolean
@@ -836,7 +870,7 @@ impl<'a> Validator<'a> {
             }
             Expr::Coalesce { value, fallback } => {
                 let Type::Optional { item } = self.expr(value, env, next, state)? else {
-                    return Err(ContractError("coalesce requires optional value".into()));
+                    return Err(a.error("coalesce requires optional value")?);
                 };
                 self.expect(fallback, env, &item, next, state)?;
                 *item
@@ -853,6 +887,15 @@ impl<'a> Validator<'a> {
             }
         })
     }
+    fn comparison_operands(&mut self, left: &Expr, right: &Expr, env: &Environment,
+        depth: usize, state: bool, ordered: bool) -> Result<Type> {
+        let a=self.audit;
+        a.pay(6)?;
+        let typ=self.expr(left, env, depth, state)?;
+        if ordered {a.require(typ.is_scalar(), "ordered comparison requires scalar")?;}
+        self.expect(right, env, &typ, depth, state)?;
+        Ok(Type::Boolean)
+    }
     fn assignment(
         &mut self,
         value: &Expr,
@@ -860,6 +903,8 @@ impl<'a> Validator<'a> {
         expected: &Type,
         depth: usize,
     ) -> Result<()> {
+        let a = self.audit;
+        a.pay(8)?;
         // Storage supplies the expected optional type to each conditional
         // branch. A sealed value may be Null while the live branch computes T.
         // This does not widen If expressions outside an optional assignment.
@@ -878,11 +923,11 @@ impl<'a> Validator<'a> {
             return self.assignment(else_value, env, expected, depth + 1);
         }
         let actual = self.expr(value, env, depth, true)?;
-        require(
-            &actual == expected
-                || matches!(expected, Type::Optional { item } if item.as_ref() == &actual),
-            format!("assignment type mismatch: expected {expected:?}, found {actual:?}"),
-        )
+        let compatible = a.type_equal(&actual, expected)? || match expected {
+            Type::Optional { item } => a.type_equal(item, &actual)?, _ => false,
+        };
+        a.type_message(44, expected, &actual)?;
+        a.require_owned(compatible, format!("assignment type mismatch: expected {expected:?}, found {actual:?}"))
     }
     fn assignments(
         &mut self,
@@ -892,8 +937,12 @@ impl<'a> Validator<'a> {
         depth: usize,
         create: bool,
     ) -> Result<()> {
-        bounded(values.len())?;
+        let a = self.audit;
+        a.pay(8)?;
+        a.bounded(values.len())?;
+        a.map_iter(values.len())?;
         for (field, value) in values {
+            a.pay(8)?;
             let typ = &self.field(entity, field)?.value_type;
             // Optional storage accepts a computed non-null inner value as well
             // as an explicitly optional expression, without splitting an atomic
@@ -901,12 +950,13 @@ impl<'a> Validator<'a> {
             self.assignment(value, env, typ, depth)?;
         }
         if create {
-            for field in &self.entity(entity)?.fields {
-                require(
-                    values.contains_key(&field.id)
-                        || matches!(field.value_type, Type::Optional { .. }),
-                    format!("missing required field: {}", field.id),
-                )?;
+            let fields = &self.entity(entity)?.fields;
+            a.slice(fields.len())?;
+            for field in fields {
+            a.pay(8)?;
+                let present = a.has(values, &field.id)? || matches!(field.value_type, Type::Optional { .. });
+                a.pay(2)?;a.format(field.id.len().checked_add(24).ok_or_else(||a.overflow())?)?;
+                a.require_owned(present, format!("missing required field: {}", field.id))?;
             }
         }
         Ok(())
@@ -917,8 +967,13 @@ impl<'a> Validator<'a> {
         env: &mut Environment,
         depth: usize,
     ) -> Result<()> {
-        bounded(steps.len())?;
+        let a = self.audit;
+        a.pay(8)?;
+        a.bounded(steps.len())?;
+        a.slice(steps.len())?;
         for step in steps {
+            a.pay(8)?;
+            a.pay(12)?;
             self.node(depth)?;
             match step {
                 Statement::Create {
@@ -928,11 +983,11 @@ impl<'a> Validator<'a> {
                 } => {
                     self.entity(entity)?;
                     self.assignments(entity, values, env, depth + 1, true)?;
-                    *env = Self::bound(env, bind, Type::reference(entity))?;
+                    *env = self.bound(env, bind, a.reference_type(entity)?)?;
                 }
                 Statement::Update { record, values } => {
                     let entity = self.record_entity(record, env, depth + 1, true)?;
-                    require(!values.is_empty(), "empty update")?;
+                    a.require(!values.is_empty(), "empty update")?;
                     self.assignments(&entity, values, env, depth + 1, false)?;
                 }
                 Statement::Archive { record } => {
@@ -943,13 +998,13 @@ impl<'a> Validator<'a> {
                 }
                 Statement::Collection { target, items, .. } => {
                     let typ = match target {
-                        CollectionTarget::State { state } => self.state(state)?.value_type.clone(),
+                        CollectionTarget::State { state } => a.clone_owned(&self.state(state)?.value_type)?,
                         CollectionTarget::Field { record, field } => {
                             let entity = self.record_entity(record, env, depth + 1, true)?;
-                            self.field(&entity, field)?.value_type.clone()
+                            a.clone_owned(&self.field(&entity, field)?.value_type)?
                         }
                     };
-                    require(
+                    a.require(
                         matches!(typ, Type::List { .. }),
                         "collection mutation requires list target",
                     )?;
@@ -961,11 +1016,11 @@ impl<'a> Validator<'a> {
                     steps,
                 } => {
                     let item = self.list_item(items, env, depth + 1, true)?;
-                    let mut local = Self::bound(env, binding, item)?;
+                    let mut local = self.bound(env, binding, item)?;
                     self.statements(steps, &mut local, depth + 1)?;
                 }
                 Statement::Assert { condition, message } => {
-                    nonempty(message)?;
+                    a.nonempty(message)?;
                     self.expect(condition, env, &Type::Boolean, depth + 1, true)?;
                 }
                 Statement::Emit {
@@ -974,22 +1029,21 @@ impl<'a> Validator<'a> {
                     binding,
                     columns,
                 } => {
-                    let output = self
-                        .app
-                        .outputs
-                        .iter()
-                        .find(|o| &o.id == output)
-                        .ok_or_else(|| ContractError("unknown output".into()))?;
+                    let output = match a.find(self.outputs, output, |o| &o.id)? {
+                        Some(value) => value, None => return Err(a.error("unknown output")?),
+                    };
                     let item = self.list_item(items, env, depth + 1, true)?;
-                    let env = Self::bound(env, binding, item)?;
-                    require(
+                    let env = self.bound(env, binding, item)?;
+                    a.require(
                         columns.len() == output.columns.len(),
                         "output columns differ from definition",
                     )?;
-                    for column in &output.columns {
-                        let value = columns
-                            .get(&column.id)
-                            .ok_or_else(|| ContractError("missing output column".into()))?;
+                    a.slice(output.columns.len())?;
+        for column in &output.columns {
+            a.pay(8)?;
+                        let value = match a.get(columns, &column.id)? {
+                            Some(value) => value, None => return Err(a.error("missing output column")?),
+                        };
                         self.expect(value, &env, &column.value_type, depth + 1, true)?;
                     }
                 }
@@ -998,24 +1052,38 @@ impl<'a> Validator<'a> {
         Ok(())
     }
     fn columns(&mut self, columns: &[Column], env: &Environment) -> Result<()> {
-        unique(columns.iter().map(|c| c.id.as_str()))?;
+        let a = self.audit;
+        a.pay(8)?;
+        a.unique(columns.iter().map(|c| c.id.as_str()))?;
+        a.slice(columns.len())?;
         for column in columns {
-            nonempty(&column.label)?;
+            a.pay(8)?;
+            a.nonempty(&column.label)?;
             self.expr(&column.value, env, 0, true)?;
         }
         Ok(())
     }
     fn on_change(&self, action: Option<&str>, typ: &Type) -> Result<()> {
+        let a = self.audit;
+        a.pay(8)?;
         if let Some(action) = action {
-            require(
-                self.action(action)?.parameters == BTreeMap::from([("value".into(), typ.clone())]),
+            let parameters = &self.action(action)?.parameters;
+            a.string(5)?;
+            if a.enabled() {typ.pay_owned(a)?;}
+            capture_canonical::reserve_from_iter::<String,Type>(1, a.comparator(5)?, a)?;
+            let expected = BTreeMap::from([("value".into(), typ.clone())]);
+            a.require(
+                a.equal_owned(parameters, &expected)?,
                 "on-change action must take exactly one value parameter of the control type",
             )?;
         }
         Ok(())
     }
     fn view(&mut self, view: &ViewDefinition) -> Result<()> {
-        nonempty(&view.label)?;
+        let a = self.audit;
+        a.pay(8)?;
+        a.nonempty(&view.label)?;
+        a.pay(8)?;
         let mut env = Environment::new();
         match &view.kind {
             ViewKind::List {
@@ -1026,19 +1094,21 @@ impl<'a> Validator<'a> {
                 selection,
             } => {
                 self.entity(entity)?;
-                self.expect(rows, &env, &Type::list(Type::reference(entity)), 0, true)?;
-                env.insert("row".into(), Type::reference(entity));
+                self.expect(rows, &env, &a.list_type(a.reference_type(entity)?)?, 0, true)?;
+                a.insert_string(&mut env, "row", a.reference_type(entity)?)?;
                 self.columns(columns, &env)?;
-                unique(
+                a.unique(
                     controls
                         .iter()
                         .map(|c| c.id.as_str())
                         .chain(selection.iter().map(|s| s.id.as_str())),
                 )?;
-                for control in controls {
-                    nonempty(&control.label)?;
+                a.slice(controls.len())?;
+        for control in controls {
+            a.pay(8)?;
+                    a.nonempty(&control.label)?;
                     let typ = &self.state(&control.state)?.value_type;
-                    require(
+                    a.require(
                         typ.is_scalar()
                             || matches!(typ, Type::Optional { item } if item.is_scalar()),
                         "control must edit a scalar",
@@ -1047,8 +1117,8 @@ impl<'a> Validator<'a> {
                 }
                 if let Some(selection) = selection {
                     let typ = &self.state(&selection.state)?.value_type;
-                    require(
-                        *typ == Type::list(Type::reference(entity)),
+                    a.require(
+                        a.type_equal(typ, &a.list_type(a.reference_type(entity)?)?)?,
                         "selection state has wrong entity/type",
                     )?;
                     self.on_change(selection.on_change.as_deref(), typ)?;
@@ -1060,8 +1130,8 @@ impl<'a> Validator<'a> {
                 columns,
             } => {
                 self.entity(entity)?;
-                self.expect(record, &env, &Type::reference(entity), 0, true)?;
-                env.insert("row".into(), Type::reference(entity));
+                self.expect(record, &env, &a.reference_type(entity)?, 0, true)?;
+                a.insert_string(&mut env, "row", a.reference_type(entity)?)?;
                 self.columns(columns, &env)?;
             }
             ViewKind::Form {
@@ -1070,65 +1140,78 @@ impl<'a> Validator<'a> {
                 defaults,
             } => {
                 let action = self.action(action)?;
-                unique(fields.iter().map(|f| f.parameter.as_str()))?;
-                for field in fields {
-                    nonempty(&field.label)?;
-                    require(
-                        action.parameters.contains_key(&field.parameter),
+                a.unique(fields.iter().map(|f| f.parameter.as_str()))?;
+                a.slice(fields.len())?;
+        for field in fields {
+            a.pay(8)?;
+                    a.nonempty(&field.label)?;
+                    a.require(
+                        a.has(&action.parameters, &field.parameter)?,
                         "unknown form parameter",
                     )?;
                 }
-                for (id, value) in defaults {
-                    let typ = action
-                        .parameters
-                        .get(id)
-                        .ok_or_else(|| ContractError("unknown default parameter".into()))?;
-                    validate_value(value, typ, 0)?;
+                a.map_iter(defaults.len())?;
+        for (id, value) in defaults {
+            a.pay(8)?;
+                    let typ = match a.get(&action.parameters, id)? {
+                        Some(value) => value, None => return Err(a.error("unknown default parameter")?),
+                    };
+                    validate_value_audited(value, typ, 0, a)?;
                 }
-                for id in action.parameters.keys() {
-                    require(
-                        defaults.contains_key(id) || fields.iter().any(|f| &f.parameter == id),
+                a.map_iter(action.parameters.len())?;
+        for id in action.parameters.keys() {
+            a.pay(8)?;
+                    a.require(
+                        a.has(defaults, id)? || a.find(fields, id, |f| &f.parameter)?.is_some(),
                         "form omits required action parameter",
                     )?;
                 }
             }
         }
-        unique(view.actions.iter().map(|a| a.id.as_str()))?;
+        a.unique(view.actions.iter().map(|a| a.id.as_str()))?;
+        a.slice(view.actions.len())?;
         for binding in &view.actions {
+            a.pay(8)?;
             let env = if binding.placement == ActionPlacement::Row {
-                require(
-                    env.contains_key("row"),
+                a.require(
+                    a.has(&env, "row")?,
                     "row action requires a list or detail view",
                 )?;
-                env.clone()
+                a.clone_owned(&env)?
             } else {
-                Environment::new()
+                { a.pay(8)?; Environment::new() }
             };
-            nonempty(&binding.label)?;
+            a.nonempty(&binding.label)?;
             let action = self.action(&binding.action)?;
-            require(
+            a.require(
                 binding.arguments.len() == action.parameters.len(),
                 "action argument count mismatch",
             )?;
-            for (name, typ) in &action.parameters {
-                let value = binding
-                    .arguments
-                    .get(name)
-                    .ok_or_else(|| ContractError("missing action argument".into()))?;
+            a.map_iter(action.parameters.len())?;
+        for (name, typ) in &action.parameters {
+            a.pay(8)?;
+                let value = match a.get(&binding.arguments, name)? {
+                    Some(value) => value, None => return Err(a.error("missing action argument")?),
+                };
                 self.expect(value, &env, typ, 0, true)?;
             }
             self.expect(&binding.enabled, &env, &Type::Boolean, 0, true)?;
         }
-        bounded(view.keys.len())?;
+        a.bounded(view.keys.len())?;
+        a.pay(8)?;
         let mut seen = BTreeSet::new();
+        a.slice(view.keys.len())?;
         for key in &view.keys {
-            require(valid_key(&key.key), "unsupported keyboard key")?;
-            require(
+            a.pay(8)?;
+            a.scaled(key.key.len(), 4, 40)?;
+            a.require(valid_key(&key.key), "unsupported keyboard key")?;
+            a.insert::<(&String, &BTreeSet<KeyModifier>), ()>(seen.len(), a.key_comparator(key)?)?;
+            a.require(
                 seen.insert((&key.key, &key.modifiers)),
                 "duplicate keyboard chord",
             )?;
-            require(
-                view.actions.iter().any(|a| a.id == key.binding),
+            a.require(
+                a.find(&view.actions, &key.binding, |v| &v.id)?.is_some(),
                 "unknown keyboard action binding",
             )?;
         }
@@ -1155,35 +1238,40 @@ pub fn valid_key(key: &str) -> bool {
         )
 }
 pub fn validate_value(value: &DataValue, typ: &Type, depth: usize) -> Result<()> {
-    require(depth <= MAX_TYPE_DEPTH, "value nesting budget exceeded")?;
+    validate_value_audited(value, typ, depth, Audit::none())
+}
+fn validate_value_audited(value: &DataValue, typ: &Type, depth: usize, a: Audit<'_>) -> Result<()> {
+    a.pay(8)?;
+    a.require(depth <= MAX_TYPE_DEPTH, "value nesting budget exceeded")?;
     if let Type::Optional { item } = typ {
         if matches!(value, DataValue::Null) {
             return Ok(());
         }
-        return validate_value(value, item, depth + 1);
+        return validate_value_audited(value, item, depth + 1, a);
     }
     match (value, typ) {
         (DataValue::Boolean { .. }, Type::Boolean) | (DataValue::Integer { .. }, Type::Integer) => {
             Ok(())
         }
-        (DataValue::Text { value }, Type::Text) => text(value),
-        (DataValue::Date { days }, Type::Date) => validate_day(*days),
+        (DataValue::Text { value }, Type::Text) => a.text(value),
+        (DataValue::Date { days }, Type::Date) => a.day(*days),
         (DataValue::Reference { entity, record }, Type::Reference { entity: expected }) => {
-            check_id(entity)?;
-            check_id(record)?;
-            require(entity == expected, "reference entity type mismatch")
+            a.check_id(entity)?;
+            a.check_id(record)?;
+            a.require(a.eq_str(entity, expected)?, "reference entity type mismatch")
         }
         (DataValue::List { items, item_type }, Type::List { item }) => {
-            require(
-                items.len() <= MAX_COLLECTION && item_type == item.as_ref(),
+            a.require(
+                items.len() <= MAX_COLLECTION && a.type_equal(item_type, item)?,
                 "collection bound or element type mismatch",
             )?;
+            a.slice(items.len())?;
             for value in items {
-                validate_value(value, item, depth + 1)?;
+                validate_value_audited(value, item, depth + 1, a)?;
             }
             Ok(())
         }
-        _ => Err(ContractError("value does not match declared type".into())),
+        _ => Err(a.error("value does not match declared type")?),
     }
 }
 pub fn validate_day(day: i32) -> Result<()> {
@@ -1199,77 +1287,103 @@ impl AppDefinition {
         Ok(app)
     }
     pub fn validate(&self) -> Result<()> {
+        self.validate_audited(Audit::none()).map(|_| ())
+    }
+    fn validate_audited(&self, a: Audit<'_>) -> Result<capture_validation::CaptureFacts> {
+        a.pay(12)?;
         #[cfg(test)]
         count_validation(|counts| counts.apps += 1);
-        version(self.version)?;
-        check_id(&self.id)?;
-        nonempty(&self.label)?;
-        require(
+        a.version(self.version)?;
+        a.check_id(&self.id)?;
+        a.nonempty(&self.label)?;
+        a.require(
             !self.entities.is_empty() && !self.views.is_empty(),
             "application needs entities and views",
         )?;
-        unique(self.entities.iter().map(|e| e.id.as_str()))?;
-        unique(self.state.iter().map(|s| s.id.as_str()))?;
-        unique(self.actions.iter().map(|a| a.id.as_str()))?;
-        unique(self.outputs.iter().map(|o| o.id.as_str()))?;
-        unique(self.observables.iter().map(|o| o.id.as_str()))?;
-        unique(self.views.iter().map(|v| v.id.as_str()))?;
-        require(
-            self.views.iter().any(|v| v.id == self.initial_view),
+        a.unique(self.entities.iter().map(|e| e.id.as_str()))?;
+        a.unique(self.state.iter().map(|s| s.id.as_str()))?;
+        a.unique(self.actions.iter().map(|a| a.id.as_str()))?;
+        a.unique(self.outputs.iter().map(|o| o.id.as_str()))?;
+        a.unique(self.observables.iter().map(|o| o.id.as_str()))?;
+        a.unique(self.views.iter().map(|v| v.id.as_str()))?;
+        a.require(
+            a.find(&self.views, &self.initial_view, |v| &v.id)?.is_some(),
             "unknown initial view",
         )?;
-        let mut validator = Validator {
-            app: self,
-            nodes: 0,
-        };
+        a.pay(8)?;
+        let mut validator = Validator::new(self, a);
         validate_entities(&self.entities, &mut validator)?;
+        a.slice(self.state.len())?;
         for state in &self.state {
-            nonempty(&state.label)?;
+            a.pay(12)?;
+            a.nonempty(&state.label)?;
             validator.typ(&state.value_type, 0)?;
-            validate_value(&state.initial, &state.value_type, 0)?;
+            validate_value_audited(&state.initial, &state.value_type, 0, a)?;
         }
+        a.slice(self.outputs.len())?;
         for output in &self.outputs {
-            nonempty(&output.label)?;
-            require(!output.columns.is_empty(), "output needs columns")?;
-            unique(output.columns.iter().map(|c| c.id.as_str()))?;
-            for column in &output.columns {
-                nonempty(&column.label)?;
+            a.pay(12)?;
+            a.nonempty(&output.label)?;
+            a.require(!output.columns.is_empty(), "output needs columns")?;
+            a.unique(output.columns.iter().map(|c| c.id.as_str()))?;
+            a.slice(output.columns.len())?;
+        for column in &output.columns {
+            a.pay(12)?;
+                a.nonempty(&column.label)?;
                 validator.typ(&column.value_type, 0)?;
-                require(
+                a.require(
                     column.value_type.is_scalar(),
                     "output columns must be scalar",
                 )?;
             }
         }
+        a.slice(self.actions.len())?;
         for action in &self.actions {
-            nonempty(&action.label)?;
-            require(!action.steps.is_empty(), "action needs steps")?;
-            unique(action.parameters.keys().map(String::as_str))?;
-            for typ in action.parameters.values() {
+            a.pay(12)?;
+            a.nonempty(&action.label)?;
+            a.require(!action.steps.is_empty(), "action needs steps")?;
+            a.map_iter(action.parameters.len())?;
+            a.unique(action.parameters.keys().map(String::as_str))?;
+            a.map_iter(action.parameters.len())?;
+        for typ in action.parameters.values() {
+            a.pay(12)?;
                 validator.typ(typ, 0)?;
             }
-            let mut env = action.parameters.clone();
-            bounded(action.guards.len())?;
-            bounded(action.ensures.len())?;
-            for guard in &action.guards {
+            let mut env = a.clone_owned(&action.parameters)?;
+            a.bounded(action.guards.len())?;
+            a.bounded(action.ensures.len())?;
+            a.slice(action.guards.len())?;
+        for guard in &action.guards {
+            a.pay(12)?;
                 validator.expect(guard, &env, &Type::Boolean, 0, true)?;
             }
             validator.statements(&action.steps, &mut env, 0)?;
-            for condition in &action.ensures {
+            a.slice(action.ensures.len())?;
+        for condition in &action.ensures {
+            a.pay(12)?;
                 validator.expect(condition, &env, &Type::Boolean, 0, true)?;
             }
         }
+        a.pay(1)?;
+        let action_prefix_nodes = validator.nodes;
+        a.slice(self.observables.len())?;
         for observable in &self.observables {
-            nonempty(&observable.label)?;
+            a.pay(12)?;
+            a.nonempty(&observable.label)?;
+            a.pay(8)?;
             validator.expr(&observable.value, &Environment::new(), 0, true)?;
         }
+        a.slice(self.views.len())?;
         for view in &self.views {
+            a.pay(12)?;
             validator.view(view)?;
         }
-        require(
-            canonical_bytes(self)?.len() <= MAX_WIRE_BYTES,
-            "program exceeds byte budget",
-        )
+        let bytes = capture_canonical::canonical_bytes_audited(self, a)?;
+        a.pay(3)?;
+        a.require(bytes.len() <= MAX_WIRE_BYTES, "program exceeds byte budget")?;
+        a.pay(5)?;
+        Ok(capture_validation::CaptureFacts { total_nodes: validator.nodes,
+            action_prefix_nodes, canonical_len: bytes.len(), action_count: self.actions.len() })
     }
     pub fn identity(&self) -> Result<Digest> {
         self.validate()?;
@@ -1278,86 +1392,138 @@ impl AppDefinition {
     pub fn semantic_identity(&self) -> Result<Digest> {
         self.validate()?;
         let mut app = self.clone();
-        app.label.clear();
-        for entity in &mut app.entities {
+        app.clear_display_labels_audited(Audit::none())?;
+        canonical_digest(IdentityDomain::SemanticProgram, &app)
+    }
+}
+impl AppDefinition {
+    fn clear_display_labels_audited(&mut self,a:Audit<'_>)->Result<()> {
+        a.pay(1)?;
+        a.pay(1)?;
+        self.label.clear();
+        a.slice(self.entities.len())?;
+        for entity in &mut self.entities {
+            a.pay(1)?;
             entity.label.clear();
-            for field in &mut entity.fields {
+            a.slice(entity.fields.len())?;
+        for field in &mut entity.fields {
+                a.pay(1)?;
                 field.label.clear();
             }
         }
-        for state in &mut app.state {
+        a.slice(self.state.len())?;
+        for state in &mut self.state {
+            a.pay(1)?;
             state.label.clear();
         }
-        for action in &mut app.actions {
+        a.slice(self.actions.len())?;
+        for action in &mut self.actions {
+            a.pay(1)?;
             action.label.clear();
         }
-        for output in &mut app.outputs {
+        a.slice(self.outputs.len())?;
+        for output in &mut self.outputs {
+            a.pay(1)?;
             output.label.clear();
-            for column in &mut output.columns {
+            a.slice(output.columns.len())?;
+        for column in &mut output.columns {
+                a.pay(1)?;
                 column.label.clear();
             }
         }
-        for observable in &mut app.observables {
+        a.slice(self.observables.len())?;
+        for observable in &mut self.observables {
+            a.pay(1)?;
             observable.label.clear();
         }
-        for view in &mut app.views {
+        a.slice(self.views.len())?;
+        for view in &mut self.views {
+            a.pay(1)?;
             view.label.clear();
-            for action in &mut view.actions {
+            a.slice(view.actions.len())?;
+        for action in &mut view.actions {
+                a.pay(1)?;
                 action.label.clear();
             }
             match &mut view.kind {
                 ViewKind::List {
                     columns, controls, ..
                 } => {
+                    a.slice(columns.len())?;
                     for column in columns {
+                        a.pay(1)?;
                         column.label.clear();
                     }
+                    a.slice(controls.len())?;
                     for control in controls {
+                        a.pay(1)?;
                         control.label.clear();
                     }
                 }
                 ViewKind::Detail { columns, .. } => {
+                    a.slice(columns.len())?;
                     for column in columns {
+                        a.pay(1)?;
                         column.label.clear();
                     }
                 }
                 ViewKind::Form { fields, .. } => {
+                    a.slice(fields.len())?;
                     for field in fields {
+                        a.pay(1)?;
                         field.label.clear();
                     }
                 }
             }
         }
-        canonical_digest(IdentityDomain::SemanticProgram, &app)
+        Ok(())
     }
 }
-fn validate_entities(entities: &[EntityDefinition], validator: &mut Validator<'_>) -> Result<()> {
-    unique(entities.iter().map(|e| e.id.as_str()))?;
+
+fn validate_entities(entities: &[EntityDefinition], validator: &mut Validator<'_, '_>) -> Result<()> {
+    let a = validator.audit;
+    a.pay(1)?;
+    a.unique(entities.iter().map(|e| e.id.as_str()))?;
+    a.slice(entities.len())?;
     for entity in entities {
-        nonempty(&entity.label)?;
-        require(!entity.fields.is_empty(), "entity needs fields")?;
-        unique(entity.fields.iter().map(|f| f.id.as_str()))?;
-        for field in &entity.fields {
-            nonempty(&field.label)?;
+            a.pay(12)?;
+        a.nonempty(&entity.label)?;
+        a.require(!entity.fields.is_empty(), "entity needs fields")?;
+        a.unique(entity.fields.iter().map(|f| f.id.as_str()))?;
+        a.slice(entity.fields.len())?;
+    for field in &entity.fields {
+            a.pay(12)?;
+            a.nonempty(&field.label)?;
             validator.typ(&field.value_type, 0)?;
         }
-        bounded(entity.unique.len())?;
+        a.bounded(entity.unique.len())?;
+        a.pay(8)?;
         let mut tuples = BTreeSet::new();
-        for tuple in &entity.unique {
-            require(!tuple.is_empty(), "empty unique constraint")?;
-            unique(tuple.iter().map(String::as_str))?;
-            require(tuples.insert(tuple), "duplicate unique constraint")?;
-            for field in tuple {
+        a.slice(entity.unique.len())?;
+    for tuple in &entity.unique {
+            a.pay(12)?;
+            a.require(!tuple.is_empty(), "empty unique constraint")?;
+            a.unique(tuple.iter().map(String::as_str))?;
+            a.insert::<&Vec<Id>, ()>(tuples.len(), a.tuple_comparator(tuple)?)?;
+            a.require(tuples.insert(tuple), "duplicate unique constraint")?;
+            a.slice(tuple.len())?;
+    for field in tuple {
+            a.pay(12)?;
                 let typ = &validator.field(&entity.id, field)?.value_type;
-                require(
+                a.require(
                     typ.is_scalar() || matches!(typ,Type::Optional { item } if item.is_scalar()),
                     "unique constraint needs scalar fields",
                 )?;
             }
         }
-        bounded(entity.constraints.len())?;
-        let env = BTreeMap::from([("record".into(), Type::reference(&entity.id))]);
-        for constraint in &entity.constraints {
+        a.bounded(entity.constraints.len())?;
+        a.string(6)?;
+        a.string(entity.id.len())?;
+        capture_canonical::reserve_from_iter::<String,Type>(1,a.comparator(6)?,a)?;
+        let env=BTreeMap::from([("record".into(),Type::reference(&entity.id))]);
+        a.slice(entity.constraints.len())?;
+    for constraint in &entity.constraints {
+            a.pay(12)?;
             validator.expect(constraint, &env, &Type::Boolean, 0, false)?;
         }
     }
@@ -1417,14 +1583,16 @@ pub struct SourceBinding {
     pub source_digest: Digest,
 }
 impl SourceBinding {
-    pub fn validate(&self) -> Result<()> {
-        check_id(&self.project_id)?;
-        validate_relative_path(&self.program_path)?;
+    pub fn validate(&self) -> Result<()> {self.validate_audited(Audit::none())}
+    fn validate_audited(&self,a:Audit<'_>)->Result<()> {
+        a.pay(6)?;
+        a.check_id(&self.project_id)?;
+        validate_relative_path_audited(&self.program_path,a)?;
         if let Some(task) = &self.task {
-            check_id(&task.task_id)?;
-            nonempty(&task.source_fingerprint)?;
+            a.check_id(&task.task_id)?;
+            a.nonempty(&task.source_fingerprint)?;
         }
-        self.producer.validate()?;
+        self.producer.validate_audited(a)?;
         Ok(())
     }
     pub fn identity(&self) -> Result<Digest> {
@@ -1532,48 +1700,65 @@ impl CapturedProgram {
         self.binding.program_path = path.into();
         Ok(self)
     }
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {self.validate_audited(Audit::none()).map(|_|())}
+    fn validate_audited(&self,a:Audit<'_>)->Result<capture_validation::CaptureFacts> {
+        a.pay(8)?;
         #[cfg(test)]
         count_validation(|counts| counts.captures += 1);
-        self.binding.validate()?;
-        version(self.artifact.version)?;
-        require(
-            self.artifact.kind == ArtifactKind::GeneratedApp
-                && self.artifact.language == LANGUAGE_VERSION,
-            "unsupported executable artifact",
-        )?;
-        require(
-            self.source_bytes.len() <= MAX_WIRE_BYTES,
-            "source exceeds byte limit",
-        )?;
-        let actual = AppDefinition::parse(&self.source_bytes)?;
-        require(
-            actual == self.program,
-            "source bytes do not represent captured program",
-        )?;
-        require(
-            self.artifact.raw_digest == bytes_digest(IdentityDomain::Source, &self.source_bytes)
-                && self.binding.source_digest == self.artifact.raw_digest,
-            "raw source digest mismatch",
-        )?;
-        require(
-            self.artifact.program_digest == actual.identity()?
-                && self.artifact.semantic_digest == actual.semantic_identity()?,
-            "program digest mismatch",
-        )
+        self.binding.validate_audited(a)?;
+        a.version(self.artifact.version)?;
+        a.require(self.artifact.kind == ArtifactKind::GeneratedApp
+            && a.eq_str(&self.artifact.language, LANGUAGE_VERSION)?, "unsupported executable artifact")?;
+        a.require(self.source_bytes.len() <= MAX_WIRE_BYTES, "source exceeds byte limit")?;
+        let actual: AppDefinition = if a.enabled() {capture_typed::parse_app(&self.source_bytes,a)?} else {parse(&self.source_bytes)?};
+        let facts=actual.validate_audited(a)?;
+        a.require(a.equal_owned(&actual,&self.program)?, "source bytes do not represent captured program")?;
+        let raw=capture_validation::bytes_digest_audited(IdentityDomain::Source,&self.source_bytes,a)?;
+        a.require(a.eq_str(self.artifact.raw_digest.as_str(),raw.as_str())?
+            && a.eq_str(self.binding.source_digest.as_str(),self.artifact.raw_digest.as_str())?, "raw source digest mismatch")?;
+        actual.validate_audited(a)?;
+        let bytes=capture_canonical::canonical_bytes_audited(&actual,a)?;
+        let program=capture_validation::bytes_digest_audited(IdentityDomain::Program,&bytes,a)?;
+        let equal=a.eq_str(self.artifact.program_digest.as_str(),program.as_str())?;
+        let equal=if equal {
+            actual.validate_audited(a)?;
+            let mut semantic=a.clone_owned(&actual)?;
+            semantic.clear_display_labels_audited(a)?;
+            let bytes=capture_canonical::canonical_bytes_audited(&semantic,a)?;
+            let digest=capture_validation::bytes_digest_audited(IdentityDomain::SemanticProgram,&bytes,a)?;
+            a.eq_str(self.artifact.semantic_digest.as_str(),digest.as_str())?
+        } else {false};
+        a.require(equal,"program digest mismatch")?;
+        Ok(facts)
     }
 }
-pub fn validate_relative_path(path: &str) -> Result<()> {
-    require(
-        !path.is_empty()
-            && path.len() <= 1024
-            && !path.contains(['\\', ':', '\0'])
-            && !path.chars().any(char::is_control)
-            && path
-                .split('/')
-                .all(|p| !p.is_empty() && p != "." && p != ".."),
-        "unsafe relative source path",
-    )
+pub fn validate_relative_path(path: &str) -> Result<()> {validate_relative_path_audited(path,Audit::none())}
+fn validate_relative_path_audited(path: &str,a:Audit<'_>)->Result<()> {
+    if !a.enabled() {
+        return require(!path.is_empty() && path.len() <= 1024
+            && !path.contains(['\\', ':', '\0']) && !path.chars().any(char::is_control)
+            && path.split('/').all(|p| !p.is_empty() && p != "." && p != ".."),
+            "unsafe relative source path");
+    }
+    a.pay(8)?;
+    let valid=if path.is_empty() || path.len()>1024 {false} else {
+        // Native three-character search: UTF-8 decode + three candidate tests.
+        a.scaled(path.len(),7,4)?;
+        if path.contains(['\\', ':', '\0']) {false} else {
+            // Native control predicate: decode + finite C0/C1 range checks.
+            a.scaled(path.len(),6,4)?;
+            if path.chars().any(char::is_control) {false} else {
+                a.scaled(path.len(),1,2)?; // Original slash search bytes.
+                let mut valid=true;
+                for part in path.split('/') {
+                    a.pay(6)?;
+                    if part.is_empty() || a.eq_str(part,".")? || a.eq_str(part,"..")? {valid=false;break;}
+                }
+                a.pay(1)?;valid
+            }
+        }
+    };
+    a.require(valid,"unsafe relative source path")
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1675,110 +1860,144 @@ impl DataSnapshot {
         data.validate()?;
         Ok(data)
     }
-    pub fn validate(&self) -> Result<()> {
-        version(self.version)?;
-        check_id(&self.project_id)?;
-        require(
+    pub fn validate(&self) -> Result<()> { self.validate_audited(Audit::none()) }
+    fn validate_audited(&self, a: Audit<'_>) -> Result<()> {
+        a.pay(8)?;
+        a.version(self.version)?;
+        a.check_id(&self.project_id)?;
+        a.require(
             self.records.len() <= MAX_COLLECTION && self.events.len() <= MAX_EVENTS,
             "data record/event budget exceeded",
         )?;
-        let schema_app = AppDefinition {
-            version: CONTRACT_VERSION,
-            id: "schema".into(),
-            label: "Schema".into(),
-            entities: self.schema.clone(),
-            state: vec![],
-            actions: vec![],
-            outputs: vec![],
-            observables: vec![],
-            views: vec![],
-            initial_view: String::new(),
-        };
-        let mut validator = Validator {
-            app: &schema_app,
-            nodes: 0,
-        };
+        a.pay(8)?;
+        let mut validator = Validator { entities: &self.schema, state: &[], actions: &[],
+            outputs: &[], nodes: 0, audit: a };
         validate_entities(&self.schema, &mut validator)?;
+        a.pay(8)?;
         let mut records = BTreeSet::new();
+        a.slice(self.records.len())?;
         for record in &self.records {
-            check_id(&record.id)?;
-            require(record.revision > 0, "record revision must be positive")?;
-            require(
+            a.pay(12)?;
+            a.check_id(&record.id)?;
+            a.require(record.revision > 0, "record revision must be positive")?;
+            a.insert::<(&str, &str), ()>(records.len(), a.pair_comparator(&record.entity, &record.id)?)?;
+            a.require(
                 records.insert((record.entity.as_str(), record.id.as_str())),
                 "duplicate record identity",
             )?;
             validate_record_values(&validator, &record.entity, &record.values)?;
         }
+        a.slice(self.records.len())?;
         for record in &self.records {
-            for value in record.values.values() {
-                validate_references(value, &records)?;
+            a.pay(12)?;
+            a.map_iter(record.values.len())?;
+        for value in record.values.values() {
+            a.pay(12)?;
+                validate_references_audited(value, &records, a)?;
             }
         }
+        a.slice(self.schema.len())?;
         for entity in &self.schema {
-            for fields in &entity.unique {
+            a.pay(12)?;
+            a.slice(entity.unique.len())?;
+        for fields in &entity.unique {
+            a.pay(12)?;
+                a.pay(8)?;
                 let mut tuples = BTreeSet::new();
-                for record in self
-                    .records
-                    .iter()
-                    .filter(|r| r.entity == entity.id && !r.archived)
-                {
-                    let tuple: Vec<_> = fields
-                        .iter()
-                        .map(|f| record.values.get(f).unwrap_or(&DataValue::Null))
-                        .collect();
-                    if tuple.iter().any(|v| matches!(v, DataValue::Null)) {
-                        continue;
+                a.slice(self.records.len())?;
+        for record in &self.records {
+            a.pay(12)?;
+                    if !(a.eq_str(&record.entity, &entity.id)? && !record.archived) { continue; }
+                    a.pay(12)?;
+                    a.scaled(fields.len(), (2 * std::mem::size_of::<&DataValue>()) as u64, 4)?;
+                    if a.enabled() {
+                        a.slice(fields.len())?;
+                        for field in fields {
+                            a.pay(5)?; // Native collect element dispatch/transfer/cleanup.
+                            a.map_search(record.values.len(),field.len())?;
+                        }
                     }
-                    require(
-                        tuples.insert(canonical_bytes(&tuple)?),
-                        "duplicate unique field tuple",
-                    )?;
+                    let tuple: Vec<_> = fields.iter()
+                        .map(|field|record.values.get(field).unwrap_or(&DataValue::Null)).collect();
+                    let mut has_null = false;
+                    a.pay(1)?;
+                    for value in &tuple {
+            a.pay(12)?;
+                        a.pay(4)?;
+                        if matches!(value, DataValue::Null) { has_null = true; break; }
+                    }
+                    a.pay(1)?;
+                    if has_null { continue; }
+                    let bytes = capture_canonical::canonical_bytes_audited(&tuple, a)?;
+                    a.insert::<Vec<u8>, ()>(tuples.len(), a.comparator(bytes.len())?)?;
+                    a.require(tuples.insert(bytes), "duplicate unique field tuple")?;
                 }
             }
         }
+        a.pay(17)?;
         let mut events = BTreeSet::new();
         let mut operations = BTreeSet::new();
         let mut previous = 0;
+        a.slice(self.events.len())?;
         for event in &self.events {
-            check_id(&event.id)?;
-            check_id(&event.operation_id)?;
-            check_id(&event.action)?;
-            validate_day(event.day)?;
-            require(
-                events.insert(&event.id) && operations.insert(&event.operation_id),
+            a.pay(12)?;
+            a.check_id(&event.id)?;
+            a.check_id(&event.operation_id)?;
+            a.check_id(&event.action)?;
+            a.day(event.day)?;
+            a.insert::<&String, ()>(events.len(), a.comparator(event.id.len())?)?;
+            let new_event = events.insert(&event.id);
+            let distinct = if new_event {
+                a.insert::<&String, ()>(operations.len(), a.comparator(event.operation_id.len())?)?;
+                operations.insert(&event.operation_id)
+            } else { false };
+            a.require(
+                distinct,
                 "duplicate event or operation receipt",
             )?;
-            require(
+            a.require(
                 event.sequence > previous && event.sequence <= self.generation,
                 "event sequence is not ordered within generation",
             )?;
             previous = event.sequence;
-            bounded(event.changes.len())?;
-            bounded(event.outputs.len())?;
+            a.bounded(event.changes.len())?;
+            a.bounded(event.outputs.len())?;
+            a.pay(8)?;
             let mut changed = BTreeSet::new();
-            for change in &event.changes {
-                check_id(&change.record)?;
-                require(
+            a.slice(event.changes.len())?;
+        for change in &event.changes {
+            a.pay(12)?;
+                a.check_id(&change.record)?;
+                a.insert::<(&String, &String), ()>(changed.len(), a.pair_comparator(&change.entity, &change.record)?)?;
+                a.require(
                     changed.insert((&change.entity, &change.record)),
                     "duplicate event record change",
                 )?;
                 validator.entity(&change.entity)?;
-                require(
+                if a.enabled() {
+                    a.pay(bounded_input::capture_payment_core::SEARCH_DESCRIPTOR)?;
+                    a.amount(bounded_input::capture_payment_core::btree_search(records.len(), a.pair_comparator(&change.entity, &change.record)?))?;
+                }
+                a.require(
                     records.contains(&(change.entity.as_str(), change.record.as_str())),
                     "event record is missing",
                 )?;
                 // Historical maps may omit later-added fields, but never change
                 // the meaning/type of values that were actually recorded.
-                for values in change.before.iter().chain(std::iter::once(&change.after)) {
-                    bounded(values.len())?;
-                    for (id, value) in values {
-                        validate_value(value, &validator.field(&change.entity, id)?.value_type, 0)?;
-                        validate_references(value, &records)?;
+                a.pay(8)?;
+        for values in change.before.iter().chain(std::iter::once(&change.after)) {
+            a.pay(12)?;
+                    a.bounded(values.len())?;
+                    a.map_iter(values.len())?;
+        for (id, value) in values {
+            a.pay(12)?;
+                        validate_value_audited(value, &validator.field(&change.entity, id)?.value_type, 0, a)?;
+                        validate_references_audited(value, &records, a)?;
                     }
                 }
             }
         }
-        serialized_bound(self, MAX_WIRE_BYTES)?;
+        capture_canonical::data_serialized_bound_audited(self, a)?;
         Ok(())
     }
     pub fn identity(&self) -> Result<Digest> {
@@ -1790,29 +2009,41 @@ impl DataSnapshot {
         canonical_digest(IdentityDomain::Schema, &self.schema)
     }
 }
-fn validate_record_values(validator: &Validator<'_>, entity: &str, values: &Values) -> Result<()> {
+fn validate_record_values(validator: &Validator<'_, '_>, entity: &str, values: &Values) -> Result<()> {
+    let a = validator.audit;
+    a.pay(4)?;
     let entity = validator.entity(entity)?;
-    bounded(values.len())?;
+    a.bounded(values.len())?;
+    a.map_iter(values.len())?;
     for (id, value) in values {
-        validate_value(value, &validator.field(&entity.id, id)?.value_type, 0)?;
+        validate_value_audited(value, &validator.field(&entity.id, id)?.value_type, 0, a)?;
     }
+    a.slice(entity.fields.len())?;
     for field in &entity.fields {
-        require(
-            values.contains_key(&field.id) || matches!(field.value_type, Type::Optional { .. }),
+        a.require(
+            a.has(values, &field.id)? || matches!(field.value_type, Type::Optional { .. }),
             "record lacks required field",
         )?;
     }
     Ok(())
 }
 fn validate_references(value: &DataValue, records: &BTreeSet<(&str, &str)>) -> Result<()> {
+    validate_references_audited(value, records, Audit::none())
+}
+fn validate_references_audited(value: &DataValue, records: &BTreeSet<(&str, &str)>, a: Audit<'_>) -> Result<()> {
+    a.pay(4)?;
     match value {
-        DataValue::Reference { entity, record } => require(
-            records.contains(&(entity.as_str(), record.as_str())),
-            "dangling record reference",
-        ),
+        DataValue::Reference { entity, record } => {
+            if a.enabled() {
+                a.pay(bounded_input::capture_payment_core::SEARCH_DESCRIPTOR)?;
+                a.amount(bounded_input::capture_payment_core::btree_search(records.len(), a.pair_comparator(entity, record)?))?;
+            }
+            a.require(records.contains(&(entity.as_str(), record.as_str())), "dangling record reference")
+        },
         DataValue::List { items, .. } => {
+            a.slice(items.len())?;
             for item in items {
-                validate_references(item, records)?;
+                validate_references_audited(item, records, a)?;
             }
             Ok(())
         }
@@ -2026,7 +2257,7 @@ impl ScenarioSpec {
     }
 }
 pub fn validate_input(input: &SemanticInput, app: &AppDefinition) -> Result<()> {
-    let validator = Validator { app, nodes: 0 };
+    let validator = Validator::new(app, Audit::none());
     let view = |id: &str| {
         app.views
             .iter()
@@ -4543,7 +4774,7 @@ impl DecisionScope {
     pub fn validate_for(&self, app: &AppDefinition) -> Result<()> {
         self.validate()?;
         app.validate()?;
-        let mut validator = Validator { app, nodes: 0 };
+        let mut validator = Validator::new(app, Audit::none());
         for operation in &self.operations {
             validator.action(operation)?;
         }
@@ -4634,7 +4865,9 @@ impl CompatibilityReport {
 }
 
 impl Producer {
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {self.validate_audited(Audit::none())}
+    fn validate_audited(&self,a:Audit<'_>)->Result<()> {
+        a.pay(8)?;
         match self {
             Producer::LiveAgent {
                 provider,
@@ -4642,14 +4875,14 @@ impl Producer {
                 session_id,
                 ..
             } => {
-                nonempty(provider)?;
-                nonempty(invocation_id)?;
+                a.nonempty(provider)?;
+                a.nonempty(invocation_id)?;
                 if let Some(session) = session_id {
-                    nonempty(session)?;
+                    a.nonempty(session)?;
                 }
             }
-            Producer::ExternalAuthor { description } => nonempty(description)?,
-            Producer::Fixture { name } => nonempty(name)?,
+            Producer::ExternalAuthor { description } => a.nonempty(description)?,
+            Producer::Fixture { name } => a.nonempty(name)?,
             Producer::UserAuthored => {}
         }
         Ok(())
@@ -4975,10 +5208,7 @@ impl AppDefinition {
         expression: &Expr,
         bindings: &BTreeMap<Id, Type>,
     ) -> Result<Type> {
-        Validator {
-            app: self,
-            nodes: 0,
-        }
+        Validator::new(self, Audit::none())
         .expr(expression, bindings, 0, true)
     }
 
@@ -5004,10 +5234,7 @@ impl AppDefinition {
             } => (entity, columns),
             ViewKind::Form { .. } => return Ok(None),
         };
-        let mut validator = Validator {
-            app: self,
-            nodes: 0,
-        };
+        let mut validator = Validator::new(self, Audit::none());
         let env = BTreeMap::from([("row".into(), Type::reference(entity))]);
         let columns = columns
             .iter()
@@ -5038,10 +5265,7 @@ impl AppDefinition {
     fn observable_types_validated(&self) -> Result<BTreeMap<Id, Type>> {
         #[cfg(test)]
         count_validation(|counts| counts.observables += 1);
-        let mut validator = Validator {
-            app: self,
-            nodes: 0,
-        };
+        let mut validator = Validator::new(self, Audit::none());
         self.observables
             .iter()
             .map(|observable| {

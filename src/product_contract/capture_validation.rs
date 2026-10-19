@@ -1,0 +1,397 @@
+//! Closed capture-local validation owner. It cannot detach from its actual host.
+use super::bounded_input::capture_payment_core as native;
+use super::capture_work::{Audit, WorkState};
+use super::*;
+use serde::ser::SerializeMap;
+use std::mem::size_of;
+
+pub(super) struct CaptureFacts {
+    pub(super) total_nodes: usize,
+    pub(super) action_prefix_nodes: usize,
+    pub(super) canonical_len: usize,
+    pub(super) action_count: usize,
+}
+pub(crate) struct CaptureValidation<'h, 's, H: ContractWork + ?Sized> {
+    pub(super) program: &'s CapturedProgram,
+    pub(super) data: &'s DataSnapshot,
+    host: &'h mut H,
+    pub(super) facts: Option<CaptureFacts>,
+    frame_valid: bool,
+    first_failure: Option<ContractWorkError>,
+}
+pub(crate) fn with_capture_validation<'s, H, R, E>(
+    program: &'s CapturedProgram,
+    data: &'s DataSnapshot,
+    host: &mut H,
+    body: impl for<'h> FnOnce(&mut CaptureValidation<'h, 's, H>) -> std::result::Result<R, E>,
+) -> std::result::Result<R, E>
+where
+    H: ContractWork + ?Sized,
+    E: From<ContractWorkError>,
+{
+    host.charge(0)
+        .map_err(|e| E::from(ContractWorkError::Resource(e)))?;
+    host.charge(10 + size_of::<CaptureValidation<'_, '_, H>>() as u64)
+        .map_err(|e| E::from(ContractWorkError::Resource(e)))?;
+    let mut context = CaptureValidation {
+        program,
+        data,
+        host,
+        facts: None,
+        frame_valid: false,
+        first_failure: None,
+    };
+    let result = body(&mut context);
+    if let Some(error) = context.first_failure.take() {
+        return Err(E::from(error));
+    }
+    // Caller Err is not a successful native/callback region and receives no poll.
+    let value = result?;
+    context
+        .host
+        .charge(0)
+        .map_err(|e| E::from(ContractWorkError::Resource(e)))?;
+    Ok(value)
+}
+struct Forward<'h, H: ?Sized>(&'h mut H);
+impl<H: ContractWork + ?Sized> ContractWork for Forward<'_, H> {
+    fn charge(&mut self, n: u64) -> std::result::Result<(), WorkFailure> {
+        self.0.charge(n)
+    }
+}
+impl<H: ContractWork + ?Sized> CaptureValidation<'_, '_, H> {
+    fn retain<T>(&mut self, result: ContractWorkResult<T>) -> ContractWorkResult<T> {
+        if let Err(error) = &result {
+            // Semantic A+B was reserved at its origin; fixed Resource needs no String.
+            if self.first_failure.is_none() {
+                self.first_failure = Some(error.clone());
+            }
+        }
+        result
+    }
+    fn run_host<T>(&mut self, body: impl FnOnce(Audit<'_>) -> Result<T>) -> ContractWorkResult<T> {
+        let header = self
+            .host
+            .charge(8 + size_of::<Forward<'_, H>>() as u64 + size_of::<WorkState<'_>>() as u64)
+            .map_err(ContractWorkError::Resource);
+        if let Err(error) = header {
+            return self.retain(Err(error));
+        }
+        let result = {
+            let mut forward = Forward(&mut *self.host);
+            let state = WorkState::new(&mut forward);
+            state.finish(body(Audit(Some(&state))))
+        };
+        self.retain(result)
+    }
+    pub(crate) fn with_host<R>(&mut self, body: impl FnOnce(&mut H) -> R) -> R {
+        body(self.host)
+    }
+    pub(crate) fn ensure_source_and_data(&mut self) -> ContractWorkResult<()> {
+        // Production propagates immediately; only one swallow + finalization is supported.
+        let program = self.program;
+        let data = self.data;
+        let result = self.host.charge(4).map_err(ContractWorkError::Resource);
+        self.retain(result)?;
+        if self.facts.is_none() {
+            let facts = self.run_host(|a| program.validate_audited(a))?;
+            let result = self.host.charge(5).map_err(ContractWorkError::Resource);
+            self.retain(result)?;
+            self.facts = Some(facts);
+        }
+        if !self.frame_valid {
+            self.run_host(|a| data.validate_audited(a))?;
+            let result = self.host.charge(1).map_err(ContractWorkError::Resource);
+            self.retain(result)?;
+            self.frame_valid = true;
+        }
+        Ok(())
+    }
+    pub(crate) fn initial_session(
+        &mut self,
+        row_work: &mut dyn ContractWork,
+    ) -> ContractWorkResult<SessionState> {
+        self.ensure_source_and_data()?;
+        let header = row_work
+            .charge(0)
+            .and_then(|()| row_work.charge(8 + size_of::<WorkState<'_>>() as u64))
+            .map_err(ContractWorkError::Resource);
+        self.retain(header)?;
+        let state = WorkState::new(row_work);
+        let a = Audit(Some(&state));
+        let result = (|| {
+            a.pay(0)?;
+            a.pay(8 + size_of::<SessionState>() as u64)?;
+            a.string(self.program.program.initial_view.len())?;
+            let items = &self.program.program.state;
+            a.slice(items.len())?;
+            let mut max_key = 0usize;
+            for item in items {
+                a.pay(3)?;
+                a.string(item.id.len())?;
+                item.initial.pay_owned(a)?;
+                max_key = max_key.max(item.id.len());
+            }
+            capture_canonical::reserve_from_iter::<String, DataValue>(
+                items.len(),
+                a.comparator(max_key)?,
+                a,
+            )?;
+            let session = SessionState::initial_validated(&self.program.program);
+            a.pay(0)?;
+            Ok(session)
+        })();
+        let result = state.finish(result);
+        self.retain(result)
+    }
+    pub(crate) fn validate_extension(
+        &mut self,
+        entity: &str,
+        binding: &str,
+        expr: &Expr,
+    ) -> ContractWorkResult<()> {
+        self.ensure_source_and_data()?;
+        let program = &self.program.program;
+        let facts = self
+            .facts
+            .as_ref()
+            .expect("successful source before static extension");
+        // Copy only scalar measurements into this local call; no escaping proof/token.
+        let (total, prefix, len, count) = (
+            facts.total_nodes,
+            facts.action_prefix_nodes,
+            facts.canonical_len,
+            facts.action_count,
+        );
+        self.run_host(|a| {
+            extension(
+                program,
+                (total, prefix, len, count),
+                entity,
+                binding,
+                expr,
+                a,
+            )
+        })
+    }
+}
+pub(crate) fn validate_value_with_work(
+    value: &DataValue,
+    expected: &Type,
+    depth: usize,
+    work: &mut dyn ContractWork,
+) -> ContractWorkResult<()> {
+    work.charge(0).map_err(ContractWorkError::Resource)?;
+    work.charge(8 + size_of::<WorkState<'_>>() as u64)
+        .map_err(ContractWorkError::Resource)?;
+    let state = WorkState::new(work);
+    let a = Audit(Some(&state));
+    let result = (|| {
+        a.pay(0)?;
+        validate_value_audited(value, expected, depth, a)?;
+        a.pay(0)
+    })();
+    state.finish(result)
+}
+
+pub(super) fn bytes_digest_audited(
+    domain: IdentityDomain,
+    bytes: &[u8],
+    a: Audit<'_>,
+) -> Result<Digest> {
+    if !a.enabled() {
+        return Ok(bytes_digest(domain, bytes));
+    }
+    a.pay(0)?;
+    a.pay(96)?;
+    let domain_bytes = match domain {
+        IdentityDomain::Source => 8,
+        IdentityDomain::Program => 9,
+        IdentityDomain::SemanticProgram => 18,
+        _ => return Err(a.error("unsupported capture digest domain")?),
+    };
+    let framed = 22usize
+        .checked_add(domain_bytes)
+        .and_then(|n| n.checked_add(1))
+        .and_then(|n| n.checked_add(bytes.len()))
+        .ok_or_else(|| a.overflow())?;
+    // Original initial22 Vec, domain serializer128, and the three original extends.
+    a.pay(4 + 44 + 128 + 5 * domain_bytes as u64 + 32)?;
+    let mut len = 22usize;
+    let mut capacity = 22usize;
+    for amount in [domain_bytes, 1, bytes.len()] {
+        a.pay(16)?;
+        let needed = len.checked_add(amount).ok_or_else(|| a.overflow())?;
+        if needed > capacity {
+            let next = capacity
+                .checked_mul(2)
+                .map(|n| n.max(needed).max(8))
+                .ok_or_else(|| a.overflow())?;
+            a.scaled(capacity, 1, 1)?;
+            a.scaled(next, 1, 1)?;
+            capacity = next;
+        }
+        a.scaled(amount, 1, 4)?;
+        len = needed;
+    }
+    let blocks = framed
+        .checked_add(9)
+        .and_then(|n| n.checked_add(63))
+        .map(|n| n / 64)
+        .ok_or_else(|| a.overflow())?;
+    // Hash input, state, remainder, padding and one bounded compression interface per block.
+    a.scaled(framed, 1, 8 * 4 + 128 + 63 + 16 + 64)?;
+    a.scaled(blocks, 1, 0)?;
+    // Original 32 per-byte native format! strings, then native String collection.
+    a.pay(64 + 4 * usize::BITS as u64)?;
+    let format = native::format_bytes(2).ok_or_else(|| a.overflow())?;
+    a.amount(format.checked_mul(32))?;
+    a.pay(12)?;
+    // String FromIterator grows byte capacity8,16,32,64: requested120, relocation56.
+    a.pay(64 + 120 + 56 + 4 * 9 + 32 * 4 + 8)?;
+    let result = bytes_digest(domain, bytes);
+    a.pay(0)?;
+    Ok(result)
+}
+
+#[derive(Serialize)]
+struct SyntheticAction<'a> {
+    id: &'a str,
+    label: &'static str,
+    parameters: Parameters<'a>,
+    guards: [(); 0],
+    steps: [SyntheticAssert<'a>; 1],
+    ensures: [(); 0],
+}
+struct Parameters<'a> {
+    binding: &'a str,
+    entity: &'a str,
+}
+impl Serialize for Parameters<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Reference<'a> {
+            kind: &'static str,
+            entity: &'a str,
+        }
+        let mut map = s.serialize_map(Some(1))?;
+        map.serialize_entry(
+            self.binding,
+            &Reference {
+                kind: "reference",
+                entity: self.entity,
+            },
+        )?;
+        map.end()
+    }
+}
+#[derive(Serialize)]
+struct SyntheticAssert<'a> {
+    kind: &'static str,
+    condition: SyntheticEqual<'a>,
+    message: &'static str,
+}
+#[derive(Serialize)]
+struct SyntheticEqual<'a> {
+    kind: &'static str,
+    left: &'a Expr,
+    right: &'a Expr,
+}
+fn extension(
+    app: &AppDefinition,
+    facts: (usize, usize, usize, usize),
+    entity: &str,
+    binding: &str,
+    expr: &Expr,
+    a: Audit<'_>,
+) -> Result<()> {
+    a.pay(0)?;
+    a.pay(16)?;
+    let (total, prefix, wire, actions) = facts;
+    a.string("gm_scope_projection".len())?;
+    let mut id = "gm_scope_projection".to_owned();
+    while a.find(&app.actions, &id, |action| &action.id)?.is_some() {
+        a.pay(16)?;
+        if id.len() == id.capacity() {
+            let next = id
+                .capacity()
+                .checked_mul(2)
+                .map(|n| n.max(8))
+                .ok_or_else(|| a.overflow())?;
+            a.scaled(id.len(), 1, 1)?;
+            a.scaled(next, 1, 1)?;
+        }
+        a.pay(6)?;
+        id.push('_');
+    }
+    a.check_id(&id)?;
+    a.pay(2)?;
+    a.bounded(actions.checked_add(1).ok_or_else(|| a.overflow())?)?;
+    a.nonempty("Host projection type check")?;
+    a.require(true, "action needs steps")?;
+    a.pay(8)?;
+    let mut parameters = BTreeMap::new();
+    a.insert_string(&mut parameters, binding, a.reference_type(entity)?)?;
+    a.map_iter(parameters.len())?;
+    a.unique(parameters.keys().map(String::as_str))?;
+    let mut validator = Validator::new(app, a);
+    validator.nodes = prefix;
+    a.map_iter(parameters.len())?;
+    for typ in parameters.values() {
+        validator.typ(typ, 0)?;
+    }
+    let env = a.clone_owned(&parameters)?;
+    a.bounded(0)?;
+    a.bounded(0)?;
+    a.bounded(1)?;
+    a.slice(1)?;
+    a.pay(8)?;
+    validator.node(0)?;
+    a.nonempty("Projection type check")?;
+    a.pay(16)?; // Original expect + Expr dispatch before Equal's node.
+    validator.node(1)?;
+    // Both actual depth2 occurrences use the SAME original Validator and node counter.
+    let actual = validator.comparison_operands(expr, expr, &env, 2, true, false)?;
+    let expected = Type::Boolean;
+    let equal = a.type_equal(&actual, &expected)?;
+    a.type_message(44, &expected, &actual)?;
+    a.require_owned(
+        equal,
+        format!("expression type mismatch: expected {expected:?}, found {actual:?}"),
+    )?;
+    a.pay(6)?;
+    let suffix = total.checked_sub(prefix).ok_or_else(|| a.overflow())?;
+    let augmented = validator
+        .nodes
+        .checked_add(suffix)
+        .ok_or_else(|| a.overflow())?;
+    a.require(
+        augmented <= MAX_AST_NODES,
+        "AST depth or node budget exceeded",
+    )?;
+    a.pay(16 + size_of::<SyntheticAction<'_>>() as u64 + 4 * size_of::<usize>() as u64)?;
+    let synthetic = SyntheticAction {
+        id: &id,
+        label: "Host projection type check",
+        parameters: Parameters { binding, entity },
+        guards: [],
+        ensures: [],
+        steps: [SyntheticAssert {
+            kind: "assert",
+            condition: SyntheticEqual {
+                kind: "equal",
+                left: expr,
+                right: expr,
+            },
+            message: "Projection type check",
+        }],
+    };
+    let bytes = capture_canonical::canonical_bytes_audited(&synthetic, a)?;
+    a.pay(6)?;
+    let len = wire
+        .checked_add(bytes.len())
+        .and_then(|n| n.checked_add(usize::from(actions > 0)))
+        .ok_or_else(|| a.overflow())?;
+    a.require(len <= MAX_WIRE_BYTES, "program exceeds byte budget")?;
+    a.pay(0)
+}

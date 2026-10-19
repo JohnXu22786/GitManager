@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 pub const OWNED_SCOPE_VERSION: u32 = 2;
 pub const OWNED_LOWERING_VERSION: u32 = 2;
-pub(crate) const SCOPE_VERIFIER_REVISION: u32 = 3;
+pub(crate) const SCOPE_VERIFIER_REVISION: u32 = 4;
 pub(crate) const OWNED_TRANSITION_LOWERING_VERSION: u32 = 3;
 pub(crate) const SUPPORTED_OWNED_LOWERINGS: [u32;2] = [OWNED_LOWERING_VERSION,OWNED_TRANSITION_LOWERING_VERSION];
 pub type OwnedScopeRequestV2 = OwnedPreviewRequest;

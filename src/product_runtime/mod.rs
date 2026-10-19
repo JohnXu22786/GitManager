@@ -1,6 +1,11 @@
 //! Production interpreter for the closed, typed local-application language.
 //! Runs own copied state. Only the project store/controller can commit it.
 mod compatibility;
+mod capture_cost;
+mod capture_native;
+mod capture_eval;
+mod capture_key;
+pub(crate) use capture::{ProjectionHost, ProjectionReservation};
 mod eval;
 mod execute;
 mod view;
@@ -251,6 +256,7 @@ struct Meter {
     writes: usize,
     started: Instant,
     cancelled: Arc<AtomicBool>,
+    row: Option<capture::RowStop>,
 }
 impl Meter {
     fn new(limits: RuntimeLimits, fuel: u64, cancelled: Arc<AtomicBool>) -> Self {
@@ -261,9 +267,13 @@ impl Meter {
             writes: 0,
             started: Instant::now(),
             cancelled,
+            row: None,
         }
     }
     fn tick(&mut self, cost: u64) -> Result<()> {
+        if self.row.is_some() {
+            return self.row_charge(cost).map_err(capture_cost::resource);
+        }
         if self.cancelled.load(Ordering::Relaxed) {
             return Err(AdapterError::Cancelled);
         }
@@ -304,6 +314,7 @@ impl Meter {
         }
     }
     fn value(&mut self, value: &DataValue) -> Result<()> {
+        if self.row.is_some() { return self.row_value(value); }
         self.tick(1)?;
         match value {
             DataValue::List { items, .. } => {
@@ -1075,7 +1086,6 @@ pub(crate) fn merged_definition_data(
 }
 
 // Capture-row API/payment controls are staged before the APIs exist.
-#[cfg(test)]
 mod capture;
 #[cfg(test)]
 mod capture_row_controls;

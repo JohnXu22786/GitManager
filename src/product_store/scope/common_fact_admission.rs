@@ -1,6 +1,9 @@
 //! Exact-source, ephemeral admission. Serializable diagnostics never carry authority.
 use super::*;
-use crate::product_runtime::{LocalRuntime, ProjectionValidation};
+use crate::product_contract::{capture_payment, ContractWork, ContractWorkError, WorkFailure};
+use crate::product_runtime::{LocalRuntime, ProjectionHost, ProjectionReservation};
+#[cfg(test)]
+use crate::product_runtime::ProjectionValidation;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -79,32 +82,44 @@ impl ProofMeter {
         self.additional_cancelled = Some(token.clone());
     }
     #[cfg_attr(test, track_caller)]
-    pub(crate) fn charge(&mut self, units: u64) -> AdmissionResult<()> {
+    fn charge_cause(&mut self, units: u64) -> std::result::Result<(), ProofChargeFailure> {
         #[cfg(test)]
         let caller = std::panic::Location::caller();
-        if self.cancelled.load(Ordering::Relaxed)
-            || self
-                .additional_cancelled
-                .as_ref()
-                .is_some_and(|c| c.load(Ordering::Relaxed))
-            || self.started.elapsed().as_millis() >= u128::from(self.millis)
+        let stopped = if self.cancelled.load(Ordering::Relaxed) {
+            Some(ProofChargeFailure::Cancelled)
+        } else if self
+            .additional_cancelled
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::Relaxed))
         {
+            Some(ProofChargeFailure::Cancelled)
+        } else if self.started.elapsed().as_millis() >= u128::from(self.millis) {
+            Some(ProofChargeFailure::Elapsed)
+        } else {
+            None
+        };
+        if let Some(cause) = stopped {
             #[cfg(test)]
             adoption_diagnostic::refusal(self.adoption_diagnostic, self.left, units, 2, caller);
-            return Err(refuse(
-                "budget",
-                "cancelled or cumulative elapsed budget exhausted",
-            ));
+            return Err(cause);
         }
-        self.left = self
-            .left
-            .checked_sub(units)
-            .ok_or_else(|| {
-                #[cfg(test)]
-                adoption_diagnostic::refusal(self.adoption_diagnostic, self.left, units, 1, caller);
-                refuse("budget", "cumulative proof/initialization budget exhausted")
-            })?;
+        self.left = self.left.checked_sub(units).ok_or_else(|| {
+            #[cfg(test)]
+            adoption_diagnostic::refusal(self.adoption_diagnostic, self.left, units, 1, caller);
+            ProofChargeFailure::Fuel
+        })?;
         Ok(())
+    }
+    #[cfg_attr(test, track_caller)]
+    pub(crate) fn charge(&mut self, units: u64) -> AdmissionResult<()> {
+        self.charge_cause(units).map_err(|cause| match cause {
+            ProofChargeFailure::Cancelled | ProofChargeFailure::Elapsed => refuse(
+                "budget", "cancelled or cumulative elapsed budget exhausted",
+            ),
+            ProofChargeFailure::Fuel => {
+                refuse("budget", "cumulative proof/initialization budget exhausted")
+            }
+        })
     }
     /// Reserve the entire allowed evaluation fuel before each execution. A new
     /// interpreter meter never replenishes this enclosing preparation budget.
@@ -123,6 +138,55 @@ impl ProofMeter {
     }
     pub(super) fn cancelled(&self) -> Arc<AtomicBool> {
         self.cancelled.clone()
+    }
+}
+// The ordinary wrapper and capture adapter consume the actual selected cause.
+// No later token reread or diagnostic text classification determines it.
+enum ProofChargeFailure {
+    Cancelled,
+    Elapsed,
+    Fuel,
+}
+impl ProofChargeFailure {
+    fn work(self) -> WorkFailure {
+        match self {
+            Self::Cancelled => WorkFailure::Cancelled,
+            Self::Elapsed => WorkFailure::BudgetExhausted("cumulative elapsed budget exhausted"),
+            Self::Fuel => WorkFailure::BudgetExhausted("cumulative proof/initialization budget exhausted"),
+        }
+    }
+}
+impl ContractWork for ProofMeter {
+    fn charge(&mut self, units: u64) -> std::result::Result<(), WorkFailure> {
+        self.charge_cause(units).map_err(ProofChargeFailure::work)
+    }
+}
+impl ProjectionHost for ProofMeter {
+    fn reserve_projection_row(&mut self) -> std::result::Result<ProjectionReservation, WorkFailure> {
+        // Compile-time pricing cannot overflow on any supported pointer width.
+        const _: () = assert!(usize::BITS <= u64::BITS);
+        const HEADER: u64 = 40 + std::mem::size_of::<ProjectionReservation>() as u64;
+        self.charge_cause(HEADER).map_err(ProofChargeFailure::work)?;
+        let mut limits = RuntimeLimits::default();
+        let host_deadline = self.started.checked_add(std::time::Duration::from_millis(self.millis))
+            .ok_or(WorkFailure::BudgetExhausted("cumulative elapsed budget exhausted"))?;
+        let reservation_now = Instant::now();
+        let remaining = self.millis.saturating_sub(
+            self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        );
+        if remaining == 0 {
+            return Err(WorkFailure::BudgetExhausted("cumulative elapsed budget exhausted"));
+        }
+        let row_window = limits.elapsed_millis;
+        limits.elapsed_millis = row_window.min(remaining);
+        let row_deadline = reservation_now.checked_add(std::time::Duration::from_millis(row_window))
+            .ok_or(WorkFailure::BudgetExhausted("cumulative elapsed budget exhausted"))?
+            .min(host_deadline);
+        self.charge_cause(limits.fuel).map_err(ProofChargeFailure::work)?;
+        Ok(ProjectionReservation::from_actual_host(
+            limits, host_deadline, row_deadline,
+            self.cancelled.clone(), self.additional_cancelled.clone(),
+        ))
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -533,68 +597,201 @@ pub(super) fn capture_frame(
     projections: &[OwnedProjectionRecipe],
     meter: &mut ProofMeter,
 ) -> AdmissionResult<BTreeMap<String, Values>> {
+    capture_frame_batched(baseline, data, day, request, projections, meter)
+}
+
+fn capture_resource_error(cause: WorkFailure) -> AdapterError {
+    match cause {
+        WorkFailure::Cancelled => AdapterError::Cancelled,
+        WorkFailure::BudgetExhausted(reason) => AdapterError::BudgetExhausted(reason.into()),
+    }
+}
+fn capture_formula_error(error: ContractWorkError) -> AdapterError {
+    match error {
+        ContractWorkError::Contract(error) => AdapterError::Invalid(error),
+        ContractWorkError::Resource(cause) => capture_resource_error(cause),
+    }
+}
+fn capture_arithmetic_error() -> AdapterError {
+    capture_resource_error(WorkFailure::BudgetExhausted("capture work arithmetic overflow"))
+}
+
+// These private helpers receive only the current capture's charge method. They
+// neither construct a gate nor accept a replacement source/frame/reservation.
+fn capture_string_equal(
+    left: &str, right: &str,
+    charge: &mut impl FnMut(u64) -> std::result::Result<(), AdapterError>,
+) -> std::result::Result<bool, AdapterError> {
+    charge(2)?; // Actual length reads, including uncapped no-root input.
+    let a = left.len();
+    let b = right.len();
+    charge(2)?; // Length comparison and its branch.
+    let native = if a == b {
+        charge(6)?; // Conversion, multiply, add and their failure decisions.
+        u64::try_from(a).ok().and_then(|n| n.checked_mul(2))
+            .and_then(|n| n.checked_add(3)).ok_or_else(capture_arithmetic_error)?
+    } else {
+        3
+    };
+    charge(native)?;
+    Ok(left == right)
+}
+fn capture_string_copy(
+    value: &str,
+    charge: &mut impl FnMut(u64) -> std::result::Result<(), AdapterError>,
+) -> std::result::Result<String, AdapterError> {
+    charge(8)?;
+    let native = capture_payment::string_copy_bytes(value.len()).map_err(capture_formula_error)?;
+    charge(native)?;
+    Ok(value.to_owned())
+}
+fn capture_reference_equal(
+    left: &RecordRef, right: &RecordRef,
+    charge: &mut impl FnMut(u64) -> std::result::Result<(), AdapterError>,
+) -> std::result::Result<bool, AdapterError> {
+    charge(2)?;
+    let entity = capture_string_equal(&left.entity, &right.entity, charge)?;
+    charge(1)?;
+    if !entity { return Ok(false); }
+    charge(2)?;
+    capture_string_equal(&left.record, &right.record, charge)
+}
+fn capture_insert<V>(
+    map: &mut BTreeMap<String, V>, key: String, value: V,
+    charge: &mut impl FnMut(u64) -> std::result::Result<(), AdapterError>,
+) -> std::result::Result<(), AdapterError> {
+    charge(8)?; // Two lengths, conversion, comparator multiply/add and decisions.
+    let len = map.len();
+    let comparator = u64::try_from(key.len()).ok().and_then(|n| n.checked_mul(2))
+        .and_then(|n| n.checked_add(3)).ok_or_else(capture_arithmetic_error)?;
+    const INSERT_DESCRIPTOR: u64 = 104 + 4 * usize::BITS as u64;
+    charge(INSERT_DESCRIPTOR)?; // D+96, including checked native formula.
+    let native = capture_payment::btree_insert::<String, V>(len, comparator)
+        .map_err(capture_formula_error)?;
+    charge(native)?;
+    map.insert(key, value);
+    Ok(())
+}
+fn capture_paid_refusal(
+    at: &str, rule: &str,
+    charge: &mut impl FnMut(u64) -> std::result::Result<(), AdapterError>,
+) -> AdmissionResult<StoreError> {
+    charge(8)?; // Actual two lengths, three additions and failure decisions.
+    let bytes = 26usize.checked_add(at.len()).and_then(|n| n.checked_add(2))
+        .and_then(|n| n.checked_add(rule.len())).ok_or_else(capture_arithmetic_error)?;
+    const FORMAT_DESCRIPTOR: u64 = 64 + 4 * usize::BITS as u64;
+    charge(FORMAT_DESCRIPTOR)?;
+    let native = capture_payment::format_bytes(bytes).map_err(capture_formula_error)?;
+    charge(native)?;
+    charge(1)?; // StoreError wrapper, before constructing the formatted error.
+    Ok(refuse(at, rule))
+}
+
+fn capture_frame_batched(
+    baseline: &CapturedProgram,
+    data: &DataSnapshot,
+    day: i32,
+    request: &OwnedPreviewRequest,
+    projections: &[OwnedProjectionRecipe],
+    meter: &mut ProofMeter,
+) -> AdmissionResult<BTreeMap<String, Values>> {
+    // Empty capture-map cleanup8 and actual LocalRuntime token/header lifetime5.
+    ContractWork::charge(meter, 13).map_err(capture_resource_error)?;
     let mut captured = BTreeMap::new();
     let runtime = LocalRuntime::with_cancellation(meter.cancelled());
-    let mut checks = ProjectionValidation::default();
-    for row in data
-        .records
-        .iter()
-        .filter(|r| r.entity == request.inventory.sources.root_entity)
-    {
-        meter.charge(1)?;
-        let reference = RecordRef {
-            entity: row.entity.clone(),
-            record: row.id.clone(),
-        };
-        let completed = runtime.evaluate_record_projection_with(
-            &mut checks,
-            meter.runtime()?,
-            baseline,
-            data,
-            &reference,
-            "record",
-            &request.inventory.lifecycle.before,
-            &Type::Boolean,
-            day,
-        )?;
-        let is_completed = completed == DataValue::Boolean { value: true };
-        if matches!(&request.population,ScopePopulation::SelectedUnfinished{records} if records.contains(&reference))
-            && is_completed
-        {
-            return Err(refuse("scope", "selected root is already completed"));
+    runtime.with_projection_capture(baseline, data, day, meter, |capture| {
+        capture.charge_host(1)?;
+        let mut records = data.records.iter();
+        loop {
+            capture.charge_host(1)?;
+            let Some(record) = records.next() else { break; };
+            capture.charge_host(5)?; // Child edge2, record1, two inspected entity fields2.
+            let matches = capture_string_equal(
+                &record.entity, &request.inventory.sources.root_entity,
+                &mut |n| capture.charge_host(n),
+            )?;
+            capture.charge_host(1)?;
+            if !matches { continue; }
+            capture.charge_host(1)?; // Preserve the original matching-row debit.
+            capture.charge_host(2)?;
+            let entity = capture_string_copy(&record.entity, &mut |n| capture.charge_host(n))?;
+            let id = capture_string_copy(&record.id, &mut |n| capture.charge_host(n))?;
+            capture.charge_host(4)?; // Field moves, RecordRef constructor and cleanup.
+            let reference = RecordRef { entity, record: id };
+            let values = capture.with_row(
+                &reference, "record", &request.inventory.lifecycle.before, &Type::Boolean,
+                |row, completed| -> AdmissionResult<Option<Values>> {
+                    row.charge_host(3)?; // Boolean/tag inspection and comparison.
+                    let is_completed = completed == DataValue::Boolean { value: true };
+                    row.charge_host(2)?; // Population field/tag inspection.
+                    let selected = if let ScopePopulation::SelectedUnfinished { records } = &request.population {
+                        row.charge_host(1)?;
+                        let mut selected = records.iter();
+                        let mut found = false;
+                        loop {
+                            row.charge_host(1)?;
+                            let Some(candidate) = selected.next() else { break; };
+                            row.charge_host(2)?;
+                            let equal = capture_reference_equal(candidate, &reference, &mut |n| row.charge_host(n))?;
+                            row.charge_host(1)?;
+                            if equal { found = true; break; }
+                        }
+                        found
+                    } else { false };
+                    // Membership deliberately precedes the completed short circuit.
+                    row.charge_host(1)?;
+                    if selected {
+                        row.charge_host(1)?;
+                        if is_completed {
+                            return Err(capture_paid_refusal(
+                                "scope", "selected root is already completed", &mut |n| row.charge_host(n),
+                            )?);
+                        }
+                    }
+                    row.charge_host(2)?; // Archived field and its Boolean branch.
+                    if !record.archived {
+                        row.charge_host(1)?;
+                        if !is_completed { return Ok(None); }
+                    }
+                    row.charge_host(8)?;
+                    let mut values = Values::new();
+                    row.charge_host(1)?;
+                    let mut recipes = projections.iter();
+                    loop {
+                        row.charge_host(1)?;
+                        let Some(projection) = recipes.next() else { break; };
+                        row.charge_host(4)?; // Child edge2, record and baseline tag.
+                        let value = if let Some(expr) = &projection.baseline {
+                            row.evaluate(&projection.binding, expr, &projection.value_type)?
+                        } else {
+                            row.charge_host(1)?;
+                            let Some(value) = projection.absent_value.as_ref() else {
+                                return Err(capture_paid_refusal(
+                                    &projection.location, "absent baseline has no explicit availability rule",
+                                    &mut |n| row.charge_host(n),
+                                )?);
+                            };
+                            row.account_value(value, &projection.host_value_type)?
+                        };
+                        row.charge_host(1)?;
+                        let key = capture_string_copy(&projection.location, &mut |n| row.charge_host(n))?;
+                        capture_insert(&mut values, key, value, &mut |n| row.charge_host(n))?;
+                        row.charge_host(1)?; // Preserve original successful insertion debit.
+                    }
+                    row.charge_host(1)?;
+                    Ok(Some(values))
+                },
+            )?;
+            capture.charge_host(1)?;
+            if let Some(values) = values {
+                capture.charge_host(1)?;
+                let key = capture_string_copy(&record.id, &mut |n| capture.charge_host(n))?;
+                capture_insert(&mut captured, key, values, &mut |n| capture.charge_host(n))?;
+            }
         }
-        if !row.archived && !is_completed {
-            continue;
-        }
-        let mut values = Values::new();
-        for projection in projections {
-            let value = if let Some(expr) = &projection.baseline {
-                runtime.evaluate_record_projection_with(
-                    &mut checks,
-                    meter.runtime()?,
-                    baseline,
-                    data,
-                    &reference,
-                    &projection.binding,
-                    expr,
-                    &projection.value_type,
-                    day,
-                )?
-            } else {
-                projection.absent_value.clone().ok_or_else(|| {
-                    refuse(
-                        &projection.location,
-                        "absent baseline has no explicit availability rule",
-                    )
-                })?
-            };
-            // Inserting even Null is intentional; presence is part of the capture receipt.
-            values.insert(projection.location.clone(), value);
-            meter.charge(1)?;
-        }
-        captured.insert(row.id.clone(), values);
-    }
-    Ok(captured)
+        capture.charge_host(1)?;
+        Ok(captured)
+    })
 }
 
 #[cfg(test)]
