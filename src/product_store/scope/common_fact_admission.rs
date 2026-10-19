@@ -78,7 +78,10 @@ impl ProofMeter {
     pub(super) fn watch_cancellation(&mut self, token: &Arc<AtomicBool>) {
         self.additional_cancelled = Some(token.clone());
     }
+    #[cfg_attr(test, track_caller)]
     pub(crate) fn charge(&mut self, units: u64) -> AdmissionResult<()> {
+        #[cfg(test)]
+        let caller = std::panic::Location::caller();
         if self.cancelled.load(Ordering::Relaxed)
             || self
                 .additional_cancelled
@@ -87,7 +90,7 @@ impl ProofMeter {
             || self.started.elapsed().as_millis() >= u128::from(self.millis)
         {
             #[cfg(test)]
-            adoption_diagnostic::refusal(self.adoption_diagnostic, self.left, units, 2);
+            adoption_diagnostic::refusal(self.adoption_diagnostic, self.left, units, 2, caller);
             return Err(refuse(
                 "budget",
                 "cancelled or cumulative elapsed budget exhausted",
@@ -98,13 +101,14 @@ impl ProofMeter {
             .checked_sub(units)
             .ok_or_else(|| {
                 #[cfg(test)]
-                adoption_diagnostic::refusal(self.adoption_diagnostic, self.left, units, 1);
+                adoption_diagnostic::refusal(self.adoption_diagnostic, self.left, units, 1, caller);
                 refuse("budget", "cumulative proof/initialization budget exhausted")
             })?;
         Ok(())
     }
     /// Reserve the entire allowed evaluation fuel before each execution. A new
     /// interpreter meter never replenishes this enclosing preparation budget.
+    #[cfg_attr(test, track_caller)]
     pub(super) fn runtime(&mut self) -> AdmissionResult<RuntimeLimits> {
         let mut limits = RuntimeLimits::default();
         self.charge(limits.fuel)?;
@@ -533,6 +537,8 @@ pub(crate) mod adoption_diagnostic {
         Resume = 15, Save = 16, Pointer = 17, ErrorLoad = 18,
         ErrorConfirm = 19,
         ArchiveReconstruct = 20, ArchivePolicy = 21,
+        SurfaceReconstruct = 22, SurfaceDerive = 23,
+        SurfaceFrames = 24, SurfaceComplete = 25,
     }
     pub(crate) struct Guard((bool, u64, u8, bool));
     pub(crate) fn start() -> Guard {
@@ -563,13 +569,21 @@ pub(crate) mod adoption_diagnostic {
             (next, file, at.line(), phase)
         })
     }
-    pub(super) fn refusal(meter: (u64, u8, u32, u8), left: u64, requested: u64, reason: u8) {
+    pub(super) fn refusal(meter: (u64, u8, u32, u8), left: u64, requested: u64, reason: u8, caller: &std::panic::Location<'_>) {
         STATE.with(|s| {
             let (active, next, phase, failed) = s.get();
             if active && !failed {
                 s.set((active, next, phase, true));
-                eprintln!("P5_ADOPTION_FIRST_REFUSAL meter={} file={} line={} origin_phase={} phase={} left={} requested={} reason={}",
-                    meter.0, meter.1, meter.2, meter.3, phase, left, requested, reason);
+                let charge_file = if caller.file().ends_with("common_fact_admission.rs") { 1 }
+                    else if caller.file().ends_with("owned_transition.rs") { 2 }
+                    else if caller.file().ends_with("owned_persist.rs") { 3 }
+                    else if caller.file().ends_with("owned_replay.rs") { 4 }
+                    else if caller.file().ends_with("owned_lifecycle.rs") { 5 }
+                    else if caller.file().ends_with("owned_preview.rs") { 6 }
+                    else if caller.file().ends_with("owned_choice.rs") { 7 }
+                    else { 0 };
+                eprintln!("P5_ADOPTION_FIRST_REFUSAL meter={} file={} line={} origin_phase={} phase={} left={} requested={} reason={} charge_file={} charge_line={}",
+                    meter.0, meter.1, meter.2, meter.3, phase, left, requested, reason, charge_file, caller.line());
             }
         });
     }

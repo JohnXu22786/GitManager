@@ -46,6 +46,8 @@ impl<'gate> OwnedPolicyCheck<'gate> {
             None => {
                 // Archive fallback retains its fresh old-position reconstruction;
                 // an endpoint registry cannot cover a historical prefix.
+                #[cfg(test)]
+                adoption_diagnostic::phase(adoption_diagnostic::Phase::SurfaceReconstruct);
                 let registry = owned_persist::reconstruct(execution.current(), self.meter)?;
                 policy_surface_from_registry(execution, &registry, source, layer, self.meter)
             }
@@ -585,6 +587,8 @@ fn policy_surface_from_registry(
     layer: &OwnedLayerV2,
     meter: &mut ProofMeter,
 ) -> Result<owned_continuation::VerifiedOwnedPolicySurface> {
+    #[cfg(test)]
+    adoption_diagnostic::phase(adoption_diagnostic::Phase::SurfaceDerive);
     let surface = match registry.resolve(source)? {
         owned_persist::OwnedExecutionRecipe::Initial(original) => {
             owned_continuation::derive_policy_surface(original, layer, None, meter)?
@@ -598,7 +602,11 @@ fn policy_surface_from_registry(
             )?
         }
     };
+    #[cfg(test)]
+    adoption_diagnostic::phase(adoption_diagnostic::Phase::SurfaceFrames);
     registry.validate_policy_frames(execution.current(), &surface, meter)?;
+    #[cfg(test)]
+    adoption_diagnostic::phase(adoption_diagnostic::Phase::SurfaceComplete);
     Ok(surface)
 }
 pub(crate) fn transition_policy_scope(
