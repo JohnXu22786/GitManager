@@ -148,7 +148,7 @@ fn all_policy_count_current_data_survives_evolution_withdrawal_and_fresh_recover
     job_action(&store, "evolved-begin-reserve", "begin", "reserve");
     apply(&store, "evolved-material-withdrawal", material_input(&store, "withdraw", "actual evolved memory"));
     add(&store, "add-evolved-completion", "evolved-completion");
-    assert_eq!(store.load().unwrap().session.values["name_input"], value("implementation-one"));
+    assert_eq!(store.load().unwrap().session.values[MARKER], value("implementation-one"));
     assert_member(&store.load().unwrap(), "evolved-completion", &key, true);
     completed.push(complete_with_actual_producer(&store, "complete-under-evolved", "evolved-completion"));
     add(&store, "later-unfinished-record", "later-unfinished");
@@ -183,7 +183,7 @@ fn all_policy_count_current_data_survives_evolution_withdrawal_and_fresh_recover
     completed.push(complete_with_actual_producer(&store, "complete-after-withdrawal", "live"));
     add(&store, "inactive-add", "inactive-before-evolution");
     assert_member(&store.load().unwrap(), "inactive-before-evolution", &key, false);
-    assert_eq!(store.load().unwrap().session.values["name_input"], value("implementation-one"));
+    assert_eq!(store.load().unwrap().session.values[MARKER], value("implementation-one"));
     assert_eq!(store.load().unwrap().data.records.iter().filter(|r| r.entity == "pause").cloned().collect::<Vec<_>>(), dormant_aux);
     let before_inactive = store.load().unwrap();
     let (a2, b2) = fixture::evolved(&a1, &b1, "implementation-two");
@@ -198,7 +198,7 @@ fn all_policy_count_current_data_survives_evolution_withdrawal_and_fresh_recover
     assert_eq!(witnesses(&store), original_witnesses);
     assert_original_history(&initial, &inactive_evolved, &key, &completed);
     add(&store, "inactive-evolved-add", "inactive-completion");
-    assert_eq!(store.load().unwrap().session.values["name_input"], value("implementation-two"));
+    assert_eq!(store.load().unwrap().session.values[MARKER], value("implementation-two"));
     assert_member(&store.load().unwrap(), "inactive-completion", &key, false);
     completed.push(complete_with_actual_producer(&store, "inactive-evolved-complete", "inactive-completion"));
     let saved = store.load().unwrap();
@@ -223,7 +223,7 @@ fn all_policy_count_current_data_survives_evolution_withdrawal_and_fresh_recover
     assert_original_history(&initial, &saved, &key, &completed);
     add(&recovered, "recovered-normal-add", "recovered-normal");
     assert_member(&recovered.load().unwrap(), "recovered-normal", &key, false);
-    assert_eq!(recovered.load().unwrap().session.values["name_input"], value("implementation-two"));
+    assert_eq!(recovered.load().unwrap().session.values[MARKER], value("implementation-two"));
     job_action(&recovered, "recovered-normal-complete", "complete", "recovered-normal");
     let final_state = recovered.load().unwrap();
     assert_eq!(final_state.decisions, expected_graph);

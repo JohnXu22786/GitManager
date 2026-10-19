@@ -9,6 +9,7 @@ use std::sync::{atomic::AtomicBool, Arc};
 
 pub const POLICY: &str = "policy_memory_used";
 pub const COUNT: &str = "policy_memory_count";
+pub const MARKER: &str = "evolution_marker";
 pub fn cancel() -> Arc<AtomicBool> { Arc::new(AtomicBool::new(false)) }
 pub fn engine(s: &ProductStore) -> DecisionEngine<LocalRuntime> {
     DecisionEngine::new(LocalRuntime::default(), IntentArchive::new(s.clone()))
@@ -71,6 +72,8 @@ pub fn pair() -> (CapturedProgram, CapturedProgram) {
         vec![update(var("existing_memory"), vec![("pending", boolean(true))])],
     ));
     for app in [&mut a, &mut b] {
+        // Pre-existing inert state: no expression or UI binding reads it.
+        app.state.push(StateDefinition { id: MARKER.into(), label: "Evolution marker".into(), value_type: Type::Text, initial: value("") });
         app.entities.iter_mut().find(|e| e.id == "job").unwrap().fields.push(FieldDefinition { id: POLICY.into(), label: "Policy memory used".into(), value_type: Type::Boolean });
         let Statement::Create { values, .. } = &mut app.actions.iter_mut().find(|a| a.id == "add").unwrap().steps[0] else { panic!() };
         values.insert(POLICY.into(), boolean(false));
@@ -121,6 +124,9 @@ pub fn request(s: &ProductStore, a: &CapturedProgram, b: &CapturedProgram) -> Ow
 }
 pub fn setup() -> (tempfile::TempDir, ProductStore, CapturedProgram, CapturedProgram) {
     let (a, b) = pair();
+    setup_pair(a, b)
+}
+pub fn setup_pair(a: CapturedProgram, b: CapturedProgram) -> (tempfile::TempDir, ProductStore, CapturedProgram, CapturedProgram) {
     let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let s = ProductStore::create(dir.path().join("store"), &a, 20000).unwrap();
     for title in ["live", "reserve", "complete-original", "finished"] { add(&s, &format!("add-{title}"), title); }
@@ -225,7 +231,7 @@ pub fn evolved(a: &CapturedProgram, b: &CapturedProgram, marker: &str) -> (Captu
     for app in [&mut a, &mut b] {
         let add = app.actions.iter_mut().find(|a| a.id == "add").unwrap();
         add.steps.truncate(1);
-        add.steps.push(Statement::SetState { state: "name_input".into(), value: text(marker) });
+        add.steps.push(Statement::SetState { state: MARKER.into(), value: text(marker) });
     }
     for action in &mut b.actions {
         for statement in &mut action.steps {
