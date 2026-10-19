@@ -588,3 +588,6 @@ pub(crate) mod adoption_diagnostic {
         });
     }
 }
+
+#[cfg(test)]
+mod retained_lifecycle_controls;

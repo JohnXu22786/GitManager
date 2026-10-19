@@ -1215,3 +1215,93 @@ fn nested_absence_queries_see_prior_common_creates_in_original_root_order() {
         .count();
     assert_eq!(events, 1);
 }
+
+#[test]
+fn retained_lifecycle_reconstruct_derive_preserves_values_and_payments() {
+    let (a, b) = pair();
+    let (_d, store) = setup(&a);
+    let r = request(&store, &a, &b);
+    let accepted = acceptance(&store, &b, &r);
+    for case in [
+        "selected",
+        "ordinary:derive",
+        "ordinary:derive_retained",
+        "ordinary:derive_for_decision",
+        "helper-limit:0:fuel",
+        "helper-limit:0:collection_items",
+        "helper-limit:0:action_steps",
+        "helper-limit:0:transaction_writes",
+        "helper-limit:0:output_bytes",
+        "helper-limit:0:elapsed_millis",
+        "helper-limit:1:fuel",
+        "helper-limit:1:collection_items",
+        "helper-limit:1:action_steps",
+        "helper-limit:1:transaction_writes",
+        "helper-limit:1:output_bytes",
+        "helper-limit:1:elapsed_millis",
+        "helper-cardinality:0",
+        "helper-cardinality:1",
+        "helper-cardinality:3",
+    ] {
+        store.assert_retained_lifecycle_values_for_test(&b, &r, &accepted, case);
+    }
+}
+
+#[test]
+fn retained_lifecycle_reconstruct_derive_preserves_errors_and_precedence() {
+    let (a, b) = pair();
+    let (_d, store) = setup(&a);
+    let r = request(&store, &a, &b);
+    let accepted = acceptance(&store, &b, &r);
+    for case in [
+        "version-before-invalid-request",
+        "disclosure",
+        "event",
+        "origin",
+        "evidence-binding",
+        "evidence-regeneration",
+        "witness-count",
+        "witness-order",
+        "witness-frame",
+        "witness-transition",
+        "witness-distinct",
+        "witness-missing",
+        "witness-interpretation",
+        "source-binding",
+        "basis-binding",
+        "basis-authentication",
+        "request-binding",
+        "request-authentication",
+        "operations-authentication",
+        "inventory-basis-authentication",
+        "ordinary-purpose:derive",
+        "ordinary-purpose:derive_retained",
+        "ordinary-purpose:derive_for_decision",
+        "ordinary-source:derive",
+        "ordinary-source:derive_retained",
+        "ordinary-source:derive_for_decision",
+    ] {
+        store.assert_retained_lifecycle_error_for_test(&b, &r, &accepted, case);
+    }
+}
+
+#[test]
+fn retained_lifecycle_reconstruct_derive_enforces_real_resource_boundaries() {
+    let (a, b) = pair();
+    let (_d, store) = setup(&a);
+    let r = request(&store, &a, &b);
+    let accepted = acceptance(&store, &b, &r);
+    for case in [
+        "first-replay-fuel",
+        "guard-fuel",
+        "handoff-fuel",
+        "primary-first-replay",
+        "secondary-first-replay",
+        "primary-handoff",
+        "secondary-handoff",
+        "short-window-fallback",
+        "expired-first-replay",
+    ] {
+        store.assert_retained_lifecycle_resource_for_test(&b, &r, &accepted, case);
+    }
+}
