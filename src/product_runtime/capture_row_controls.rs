@@ -429,7 +429,7 @@ fn capture_row_source_session_checks_are_once_per_capture_and_never_reused_next_
                 for _ in 0..3 {
                     capture.with_row(&reference,"record",&yes(),&Type::Boolean, |row,_| {
                         assert_eq!(row.evaluate("record",&Expr::Today,&Type::Date)?,DataValue::Date{days:20000});
-                        Ok(())
+                        Ok::<(),AdapterError>(())
                     })?;
                 }
                 Ok(())

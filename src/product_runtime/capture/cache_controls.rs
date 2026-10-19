@@ -43,7 +43,7 @@ fn capture_row_complete_cache_keys_hit_and_saturate_without_value_reuse() {
                         let binding=format!("bind_{}",row_index*24+column);
                         assert_eq!(row.evaluate(&binding,&yes(),&Type::Boolean)?,DataValue::Boolean{value:true});
                     }
-                    Ok(())
+                    Ok::<(),AdapterError>(())
                 })?;
                 let old_complete_key=canonical_bytes(&(0usize,&reference.entity,"record",&yes(),&Type::Boolean,&RuntimeLimits::default())).unwrap();
                 assert!(capture.cache.contains(&old_complete_key));
@@ -59,7 +59,7 @@ fn capture_row_complete_cache_keys_hit_and_saturate_without_value_reuse() {
                 let after=row.snapshot_for_test();
                 assert!(after.3<before.3);
                 assert_eq!(after.4,before.4+31);
-                Ok(())
+                Ok::<(),AdapterError>(())
             })?;
             assert_eq!(capture.cache,retained);
             Ok(())
