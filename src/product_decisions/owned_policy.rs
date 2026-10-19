@@ -273,15 +273,13 @@ pub(super) fn withdrawal_graph(
     Ok(next)
 }
 pub(super) fn check_decision(
-    execution: &crate::product_store::scope::VerifiedOwnedTransitionExecution,
+    check: &mut crate::product_store::scope::OwnedPolicyCheck<'_>,
     decision: &ScopedDecision,
     scenes: &[AcceptedScene],
-    meter: &mut crate::product_store::scope::ProofMeter,
 ) -> Result<()> {
-    use crate::product_store::scope::{
-        transition_layer, transition_policy_scope, transition_policy_surface,
-    };
-    meter.charge(1)?;
+    use crate::product_store::scope::{transition_layer, transition_policy_scope};
+    let execution = check.execution()?;
+    check.charge(1)?;
     decision.validate()?;
     if validate_scene_bindings(decision, scenes)? != IntentionBinding::PropertiesOnly
         || decision.scope != transition_policy_scope(execution)?
@@ -303,11 +301,11 @@ pub(super) fn check_decision(
         crate::product_store::scope::VerifiedOwnedPolicySurface,
     )> = vec![];
     for scene in scenes {
-        meter.charge(1)?;
+        check.charge(1)?;
         scene.validate()?;
         let mut found = None;
         for (index, (source, _)) in surfaces.iter().enumerate() {
-            meter.charge(1)?;
+            check.charge(1)?;
             if *source == &scene.program {
                 found = Some(index);
                 break;
@@ -316,8 +314,8 @@ pub(super) fn check_decision(
         let index = if let Some(index) = found {
             index
         } else {
-            let surface = transition_policy_surface(execution, &scene.program, meter)?;
-            meter.charge(1)?;
+            let surface = check.surface(&scene.program)?;
+            check.charge(1)?;
             surfaces.push((&scene.program, surface));
             surfaces.len() - 1
         };
@@ -331,7 +329,7 @@ pub(super) fn check_decision(
             ));
         }
         for property in &decision.obligations {
-            meter.charge(1)?;
+            check.charge(1)?;
             property.validate()?;
             let mut qualify = |point: &str, observable: &str| -> Result<i64> {
                 let cap = surface.qualify_observable(observable).ok_or_else(|| {
@@ -355,7 +353,7 @@ pub(super) fn check_decision(
                 Ok(cap)
             };
             predicate_intervals(&property.predicate, &mut qualify, &mut |units| {
-                meter.charge(units).map_err(DecisionError::from)
+                check.charge(units).map_err(DecisionError::from)
             })?;
             if property.evaluate(&scene.evidence.observations) != Some(true) {
                 return Err(DecisionError::Unverified(
@@ -368,16 +366,16 @@ pub(super) fn check_decision(
 }
 pub(super) fn check_withdrawal(
     archive: &IntentArchive,
-    execution: &crate::product_store::scope::VerifiedOwnedTransitionExecution,
-    meter: &mut crate::product_store::scope::ProofMeter,
+    check: &mut crate::product_store::scope::OwnedPolicyCheck<'_>,
 ) -> Result<Vec<Id>> {
+    let execution = check.execution()?;
     let current = execution.current();
     let ids = retirement_ids(
         current,
         crate::product_store::scope::transition_layer(execution),
     )?;
     for id in &ids {
-        meter.charge(1)?;
+        check.charge(1)?;
         let decision = current
             .decisions
             .decisions
@@ -385,7 +383,11 @@ pub(super) fn check_withdrawal(
             .find(|d| &d.id == id)
             .ok_or_else(|| invalid("owned retirement decision missing"))?;
         let scenes = archive.load(&decision.witness)?;
-        check_decision(execution, decision, &scenes, meter)?;
+        check_decision(check, decision, &scenes)?;
     }
     Ok(ids)
 }
+
+#[cfg(test)]
+#[path = "owned_policy_registry_controls.rs"]
+mod registry_controls;

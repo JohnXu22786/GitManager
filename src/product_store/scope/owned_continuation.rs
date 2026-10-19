@@ -1957,3 +1957,20 @@ mod tests;
 #[cfg(test)]
 #[path = "owned_continuation_amendment_tests.rs"]
 mod amendment_tests;
+
+// Assertion-only value comparison. No fields, registry or authority are exposed.
+#[cfg(test)]
+impl VerifiedOwnedPolicySurface {
+    pub(crate) fn assert_same_value_for_test(&self, old: &Self) {
+        assert_eq!(self.source, old.source);
+        assert_eq!(self.original_layer, old.original_layer);
+        assert_eq!(self.baseline, old.baseline);
+        assert_eq!(self.candidate, old.candidate);
+        assert_eq!(self.counters, old.counters);
+        assert_eq!(self.root, old.root);
+        assert_eq!(self.member, old.member);
+        assert_eq!(self.sealed, old.sealed);
+        assert_eq!(self.schema, old.schema);
+        assert_eq!(self.policy_fields, old.policy_fields);
+    }
+}

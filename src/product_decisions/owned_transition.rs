@@ -86,7 +86,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             budget,
             cancelled,
             self.runtime.cancellation_token(),
-            |_, _| Ok(()),
+            |_| Ok(()),
         )?;
         let report = self.with_owned_transition(
             OwnedTransitionDecisionContext {
@@ -247,8 +247,8 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             budget,
             cancelled,
             self.runtime.cancellation_token(),
-            |execution, meter| {
-                retire = owned_policy::check_withdrawal(&self.archive, execution, meter)
+            |check| {
+                retire = owned_policy::check_withdrawal(&self.archive, check)
                     .map_err(into_store_error)?;
                 Ok(())
             },
@@ -335,6 +335,10 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 &change.decisions,
                 self.runtime.cancellation_token(),
                 |current, fresh, next, plan, candidate, meter| {
+                    #[cfg(test)]
+                    crate::product_store::scope::adoption_diagnostic::phase(
+                        crate::product_store::scope::adoption_diagnostic::Phase::CallbackBinding,
+                    );
                     if canonical_digest(IdentityDomain::Data, current)? != change.expected_snapshot
                         || self.runtime.capabilities() != change.runtime
                         || self.limits != change.limits
@@ -347,12 +351,20 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                         ));
                     }
                     let mut verify = || -> Result<()> {
+                        #[cfg(test)]
+                        crate::product_store::scope::adoption_diagnostic::phase(
+                            crate::product_store::scope::adoption_diagnostic::Phase::WithdrawalGraph,
+                        );
                         validate_withdrawal_history(current)?;
                         validate_withdrawal_delta(current, next, plan)?;
                         if fresh.is_withdrawal() {
+                            #[cfg(test)]
+                            crate::product_store::scope::adoption_diagnostic::phase(
+                                crate::product_store::scope::adoption_diagnostic::Phase::Policy,
+                            );
                             let ids = fresh.check_policy(
-                                |execution, meter| {
-                                    owned_policy::check_withdrawal(&self.archive, execution, meter)
+                                |check| {
+                                    owned_policy::check_withdrawal(&self.archive, check)
                                         .map_err(into_store_error)
                                 },
                                 meter,
@@ -363,7 +375,15 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                         } else if next != &current.decisions || !plan.retire_decisions.is_empty() {
                             return Err(invalid("implementation transition changed intentions"));
                         }
+                        #[cfg(test)]
+                        crate::product_store::scope::adoption_diagnostic::phase(
+                            crate::product_store::scope::adoption_diagnostic::Phase::Packages,
+                        );
                         self.verify_destination_packages(store, current, next, plan)?;
+                        #[cfg(test)]
+                        crate::product_store::scope::adoption_diagnostic::phase(
+                            crate::product_store::scope::adoption_diagnostic::Phase::RemainingReplay,
+                        );
                         let report = self.check_bound(next, fresh.target(), &change.mappings)?;
                         if report.disposition != CheckDisposition::Ready {
                             return Err(DecisionError::Unverified(
@@ -371,6 +391,10 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                                     .into(),
                             ));
                         }
+                        #[cfg(test)]
+                        crate::product_store::scope::adoption_diagnostic::phase(
+                            crate::product_store::scope::adoption_diagnostic::Phase::Bundle,
+                        );
                         IntentArchive::new(store.clone()).export_for(candidate)?;
                         Ok(())
                     };
@@ -420,10 +444,10 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             ProofBudget::default(),
             primary.clone(),
             self.runtime.cancellation_token(),
-            |execution, meter| {
+            |check| {
                 reached = true;
                 primary.store(true, Ordering::Release);
-                let refusal = owned_policy::check_withdrawal(&self.archive, execution, meter);
+                let refusal = owned_policy::check_withdrawal(&self.archive, check);
                 assert!(matches!(&refusal, Err(DecisionError::Store(StoreError::Invalid(reason)))
                     if reason == "Common factual admission: budget: cancelled or cumulative elapsed budget exhausted"));
                 refusal.map(|_| ()).map_err(into_store_error)

@@ -1450,7 +1450,7 @@ fn validate_revision_ownership(snapshot: &ProjectSnapshot) -> Result<()> {
     Ok(())
 }
 impl ReconstructedOwned {
-    fn check_snapshot(&self, snapshot: &ProjectSnapshot) -> Result<()> {
+    pub(super) fn check_snapshot(&self, snapshot: &ProjectSnapshot) -> Result<()> {
         if self.snapshot != canonical_digest(IdentityDomain::Data, snapshot)? {
             return Err(err(
                 "execution registry belongs to another complete snapshot",
@@ -2039,3 +2039,7 @@ impl ProjectSnapshot {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "owned_persist_registry_controls.rs"]
+mod registry_policy_controls;

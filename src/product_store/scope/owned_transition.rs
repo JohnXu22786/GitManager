@@ -8,6 +8,51 @@ use std::sync::{
     Arc,
 };
 
+/// One lexical callback borrows the actual successful preparation and gate.
+/// No constructor or registry/meter borrow is exposed to policy callers.
+pub(crate) struct OwnedPolicyCheck<'gate> {
+    execution: &'gate VerifiedOwnedTransitionExecution,
+    registry: Option<&'gate owned_persist::ReconstructedOwned>,
+    meter: &'gate mut ProofMeter,
+}
+impl<'gate> OwnedPolicyCheck<'gate> {
+    pub(crate) fn execution(&mut self) -> Result<&'gate VerifiedOwnedTransitionExecution> {
+        self.meter.charge(3)?;
+        Ok(self.execution)
+    }
+    pub(crate) fn charge(&mut self, units: u64) -> Result<()> {
+        self.meter.charge(units)
+    }
+    pub(crate) fn surface(
+        &mut self,
+        source: &CapturedProgram,
+    ) -> Result<owned_continuation::VerifiedOwnedPolicySurface> {
+        self.meter.charge(5)?;
+        let execution = self.execution;
+        let layer_id = execution.continuation.original_layer();
+        let layer = execution
+            .current()
+            .owned_scope()?
+            .layers
+            .get(layer_id)
+            .ok_or_else(|| refuse("owned policy", "original layer missing"))?;
+        match self.registry {
+            Some(registry) => {
+                // current() is the verified execution's immutable clone. Keep
+                // the complete-snapshot association, not pointer equality.
+                registry.check_snapshot(execution.current())?;
+                policy_surface_from_registry(execution, registry, source, layer, self.meter)
+            }
+            None => {
+                // Adoption/archive executions retain their fresh old-position
+                // reconstruction; an endpoint registry cannot cover a prefix.
+                let registry = owned_persist::reconstruct(execution.current(), self.meter)?;
+                policy_surface_from_registry(execution, &registry, source, layer, self.meter)
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct PreparedOwnedTransitionV2 {
     pub(super) execution: Arc<VerifiedOwnedTransitionExecution>,
@@ -59,10 +104,16 @@ impl PreparedOwnedTransitionV2 {
     }
     pub(crate) fn check_policy<T>(
         &self,
-        check: impl FnOnce(&VerifiedOwnedTransitionExecution, &mut ProofMeter) -> Result<T>,
+        check: impl for<'gate> FnOnce(&mut OwnedPolicyCheck<'gate>) -> Result<T>,
         meter: &mut ProofMeter,
     ) -> Result<T> {
-        check(&self.execution, meter)
+        meter.charge(6)?;
+        let mut context = OwnedPolicyCheck {
+            execution: &self.execution,
+            registry: None,
+            meter,
+        };
+        check(&mut context)
     }
     pub(crate) fn basis(&self) -> &ProjectSnapshot {
         self.execution.current()
@@ -170,17 +221,27 @@ pub(crate) fn prepare_owned_evolution<F>(
     verify: F,
 ) -> Result<PreparedOwnedTransitionV2>
 where
-    F: FnOnce(&VerifiedOwnedTransitionExecution, &mut ProofMeter) -> Result<()>,
+    F: for<'gate> FnOnce(&mut OwnedPolicyCheck<'gate>) -> Result<()>,
 {
     let mut meter = ProofMeter::new(budget, cancelled.clone())?;
     if let Some(token) = &secondary {
         meter.watch_cancellation(token);
     }
     meter.charge(0)?;
-    let execution = owned_persist::transition(
-        current, before, after, sources, layer, operation, withdrawal, &mut meter,
+    let registry = owned_persist::reconstruct(current, &mut meter)?;
+    let execution = owned_persist::transition_from_registry(
+        current, &registry, before, after, sources, layer, operation, withdrawal, &mut meter,
     )?;
-    verify(&execution, &mut meter)?;
+    meter.charge(8)?;
+    {
+        let mut context = OwnedPolicyCheck {
+            execution: &execution,
+            registry: Some(&registry),
+            meter: &mut meter,
+        };
+        verify(&mut context)?;
+    }
+    drop(registry);
     finish(execution, budget, cancelled, &mut meter)
 }
 pub(crate) fn prepare_owned_withdrawal<F>(
@@ -193,7 +254,7 @@ pub(crate) fn prepare_owned_withdrawal<F>(
     verify: F,
 ) -> Result<PreparedOwnedTransitionV2>
 where
-    F: FnOnce(&VerifiedOwnedTransitionExecution, &mut ProofMeter) -> Result<()>,
+    F: for<'gate> FnOnce(&mut OwnedPolicyCheck<'gate>) -> Result<()>,
 {
     let (before, after, sources) =
         owned_persist::effective_pair(current, &current.active_revision)?;
@@ -286,8 +347,12 @@ impl ProductStore {
         ) -> Result<()>,
         V: Fn(&ProjectSnapshot) -> Result<()>,
     {
+        #[cfg(test)]
+        adoption_diagnostic::phase(adoption_diagnostic::Phase::LockedLoad);
         let _lock = self.root.lock()?;
         let current = self.load()?;
+        #[cfg(test)]
+        adoption_diagnostic::phase(adoption_diagnostic::Phase::Request);
         let request = prepared.request(&adoption.plan, decisions)?;
         if let Some(receipt) = current.operations.get(&adoption.plan.id) {
             if receipt.request != request {
@@ -295,6 +360,8 @@ impl ProductStore {
                     "owned operation ID belongs to a different request".into(),
                 ));
             }
+            #[cfg(test)]
+            adoption_diagnostic::phase(adoption_diagnostic::Phase::Retry);
             self.confirm_owned_transition_current(&current, &verify_retry)?;
             return Ok(current);
         }
@@ -303,16 +370,22 @@ impl ProductStore {
                 "owned transition revision changed".into(),
             ));
         }
+        #[cfg(test)]
+        adoption_diagnostic::phase(adoption_diagnostic::Phase::Regenerate);
         let mut meter = ProofMeter::new(prepared.budget, prepared.cancelled.clone())?;
         if let Some(token) = &secondary {
             meter.watch_cancellation(token);
         }
         meter.charge(0)?;
         let fresh = prepared.fresh(&current, &mut meter)?;
+        #[cfg(test)]
+        adoption_diagnostic::phase(adoption_diagnostic::Phase::Plan);
         if adoption.target != revision(fresh.target())? {
             return Err(refuse("owned transition", "target differs"));
         }
         self.check_owned_transition_plan(&current, &adoption.plan, &fresh)?;
+        #[cfg(test)]
+        adoption_diagnostic::phase(adoption_diagnostic::Phase::Graph);
         owned_epoch::validate_transition_graph(
             &current,
             &fresh.execution.manifest,
@@ -366,7 +439,11 @@ impl ProductStore {
             &next,
             &mut meter,
         )?;
+        #[cfg(test)]
+        adoption_diagnostic::phase(adoption_diagnostic::Phase::NextValidate);
         next.validate()?;
+        #[cfg(test)]
+        adoption_diagnostic::phase(adoption_diagnostic::Phase::Resume);
         LocalRuntime::with_cancellation(
             secondary
                 .clone()
@@ -382,6 +459,8 @@ impl ProductStore {
             &next.artifacts,
         )?;
         meter.charge(0)?;
+        #[cfg(test)]
+        adoption_diagnostic::phase(adoption_diagnostic::Phase::Save);
         let result = self.save_with_checkpoint(
             &next,
             true,
@@ -399,6 +478,8 @@ impl ProductStore {
                     }
                     _ => {}
                 }
+                #[cfg(test)]
+                adoption_diagnostic::phase(adoption_diagnostic::Phase::Pointer);
                 meter.charge(0)
             },
             #[cfg(test)]
@@ -409,12 +490,16 @@ impl ProductStore {
             Err(error) => {
                 // The pointer is the commit linearization point. Complete
                 // confirmation even when cancellation arrived after activation.
+                #[cfg(test)]
+                adoption_diagnostic::phase(adoption_diagnostic::Phase::ErrorLoad);
                 let actual = self.load()?;
                 if actual
                     .operations
                     .get(&adoption.plan.id)
                     .is_some_and(|r| r.request == request)
                 {
+                    #[cfg(test)]
+                    adoption_diagnostic::phase(adoption_diagnostic::Phase::ErrorConfirm);
                     self.confirm_owned_transition_current(&actual, &verify_retry)?;
                 }
                 Err(error)
@@ -480,6 +565,15 @@ pub(crate) fn transition_policy_surface(
         .get(layer_id)
         .ok_or_else(|| refuse("owned policy", "original layer missing"))?;
     let registry = owned_persist::reconstruct(execution.current(), meter)?;
+    policy_surface_from_registry(execution, &registry, source, layer, meter)
+}
+fn policy_surface_from_registry(
+    execution: &VerifiedOwnedTransitionExecution,
+    registry: &owned_persist::ReconstructedOwned,
+    source: &CapturedProgram,
+    layer: &OwnedLayerV2,
+    meter: &mut ProofMeter,
+) -> Result<owned_continuation::VerifiedOwnedPolicySurface> {
     let surface = match registry.resolve(source)? {
         owned_persist::OwnedExecutionRecipe::Initial(original) => {
             owned_continuation::derive_policy_surface(original, layer, None, meter)?
@@ -512,7 +606,7 @@ pub(crate) fn transition_layer(execution: &VerifiedOwnedTransitionExecution) -> 
 }
 pub(crate) fn check_retained_transition_policies(
     snapshot: &ProjectSnapshot,
-    mut check: impl FnMut(&VerifiedOwnedTransitionExecution, &mut ProofMeter) -> Result<()>,
+    mut check: impl for<'gate> FnMut(&mut OwnedPolicyCheck<'gate>) -> Result<()>,
 ) -> Result<()> {
     if !snapshot.owned_scope().is_ok_and(|state| {
         state.compositions.values().any(|m| {
@@ -526,7 +620,21 @@ pub(crate) fn check_retained_transition_policies(
     let registry = owned_persist::reconstruct(snapshot, &mut meter)?;
     for execution in registry.checked_withdrawals() {
         meter.charge(1)?;
-        check(execution, &mut meter)?;
+        meter.charge(6)?;
+        let mut context = OwnedPolicyCheck {
+            execution,
+            registry: None,
+            meter: &mut meter,
+        };
+        check(&mut context)?;
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "owned_transition_registry_controls.rs"]
+mod policy_reference_tests;
+
+#[cfg(test)]
+#[path = "owned_policy_context_tests.rs"]
+mod policy_context_tests;

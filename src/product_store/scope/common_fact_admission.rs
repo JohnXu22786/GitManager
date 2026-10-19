@@ -50,8 +50,11 @@ pub(crate) struct ProofMeter {
     millis: u64,
     cancelled: Arc<AtomicBool>,
     additional_cancelled: Option<Arc<AtomicBool>>,
+    #[cfg(test)]
+    adoption_diagnostic: (u64, u8, u32, u8),
 }
 impl ProofMeter {
+    #[cfg_attr(test, track_caller)]
     pub(super) fn new(budget: ProofBudget, cancelled: Arc<AtomicBool>) -> AdmissionResult<Self> {
         if budget.units == 0
             || budget.units > 10_000_000
@@ -66,6 +69,8 @@ impl ProofMeter {
             millis: budget.elapsed_millis,
             cancelled,
             additional_cancelled: None,
+            #[cfg(test)]
+            adoption_diagnostic: adoption_diagnostic::meter(std::panic::Location::caller()),
         };
         result.charge(1)?;
         Ok(result)
@@ -81,6 +86,8 @@ impl ProofMeter {
                 .is_some_and(|c| c.load(Ordering::Relaxed))
             || self.started.elapsed().as_millis() >= u128::from(self.millis)
         {
+            #[cfg(test)]
+            adoption_diagnostic::refusal(self.adoption_diagnostic, self.left, units, 2);
             return Err(refuse(
                 "budget",
                 "cancelled or cumulative elapsed budget exhausted",
@@ -89,7 +96,11 @@ impl ProofMeter {
         self.left = self
             .left
             .checked_sub(units)
-            .ok_or_else(|| refuse("budget", "cumulative proof/initialization budget exhausted"))?;
+            .ok_or_else(|| {
+                #[cfg(test)]
+                adoption_diagnostic::refusal(self.adoption_diagnostic, self.left, units, 1);
+                refuse("budget", "cumulative proof/initialization budget exhausted")
+            })?;
         Ok(())
     }
     /// Reserve the entire allowed evaluation fuel before each execution. A new
@@ -495,4 +506,70 @@ pub(super) fn capture_frame(
         captured.insert(row.id.clone(), values);
     }
     Ok(captured)
+}
+
+#[cfg(test)]
+impl ProofMeter {
+    pub(super) fn remaining_units_for_test(&self) -> u64 {
+        self.left
+    }
+}
+
+// Numeric, test-only diagnosis of one strict withdrawal-adoption call. This
+// cannot reserve, refund, mutate, expose or construct a proof capability.
+#[cfg(test)]
+pub(crate) mod adoption_diagnostic {
+    use std::cell::Cell;
+    thread_local! {
+        static STATE: Cell<(bool, u64, u8, bool)> = const { Cell::new((false, 0, 0, false)) };
+    }
+    #[derive(Clone, Copy)]
+    #[repr(u8)]
+    pub(crate) enum Phase {
+        Entry = 1, LockedLoad = 2, Request = 3, Retry = 4,
+        Regenerate = 5, Plan = 6, Graph = 7, CallbackBinding = 8,
+        WithdrawalGraph = 9, Policy = 10, Packages = 11,
+        RemainingReplay = 12, Bundle = 13, NextValidate = 14,
+        Resume = 15, Save = 16, Pointer = 17, ErrorLoad = 18,
+        ErrorConfirm = 19,
+    }
+    pub(crate) struct Guard((bool, u64, u8, bool));
+    pub(crate) fn start() -> Guard {
+        Guard(STATE.with(|s| s.replace((true, 0, Phase::Entry as u8, false))))
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) { STATE.with(|s| s.set(self.0)); }
+    }
+    pub(crate) fn phase(phase: Phase) {
+        STATE.with(|s| { let (active, next, _, failed) = s.get();
+            if active { s.set((active, next, phase as u8, failed)); }
+        });
+    }
+    pub(super) fn meter(at: &std::panic::Location<'_>) -> (u64, u8, u32, u8) {
+        STATE.with(|s| {
+            let (active, next, phase, failed) = s.get();
+            if !active { return (0, 0, 0, 0); }
+            let next = next.saturating_add(1);
+            s.set((active, next, phase, failed));
+            let file = if at.file().ends_with("common_fact_admission.rs") { 1 }
+                else if at.file().ends_with("owned_transition.rs") { 2 }
+                else if at.file().ends_with("owned_persist.rs") { 3 }
+                else if at.file().ends_with("owned_replay.rs") { 4 }
+                else if at.file().ends_with("owned_lifecycle.rs") { 5 }
+                else if at.file().ends_with("owned_preview.rs") { 6 }
+                else if at.file().ends_with("owned_choice.rs") { 7 }
+                else { 0 };
+            (next, file, at.line(), phase)
+        })
+    }
+    pub(super) fn refusal(meter: (u64, u8, u32, u8), left: u64, requested: u64, reason: u8) {
+        STATE.with(|s| {
+            let (active, next, phase, failed) = s.get();
+            if active && !failed {
+                s.set((active, next, phase, true));
+                eprintln!("P5_ADOPTION_FIRST_REFUSAL meter={} file={} line={} origin_phase={} phase={} left={} requested={} reason={}",
+                    meter.0, meter.1, meter.2, meter.3, phase, left, requested, reason);
+            }
+        });
+    }
 }

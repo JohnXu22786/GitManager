@@ -230,18 +230,19 @@ pub fn validate_bundle(snapshot: &ProjectSnapshot, bundle: &IntentionBundle) -> 
             "intention bundle lacks reachable immutable objects",
         ));
     }
-    crate::product_store::scope::check_retained_transition_policies(snapshot,|execution,meter| {
+    crate::product_store::scope::check_retained_transition_policies(snapshot,|check| {
         let mut verify = || -> Result<()> {
+            let execution=check.execution()?;
             let basis=execution.current();
             let layer=crate::product_store::scope::transition_layer(execution);
             let ids=owned_policy::retirement_ids(basis,layer)?;
             for id in &ids {
-                meter.charge(1)?;
+                check.charge(1)?;
                 let decision=basis.decisions.decisions.iter().find(|d|&d.id==id)
                     .ok_or_else(||invalid("historical owned retirement decision missing"))?;
                 let range=accepted_ranges.get(&decision.witness)
                     .ok_or_else(||invalid("historical owned retirement witness missing"))?;
-                owned_policy::check_decision(execution,decision,&accepted[range.clone()],meter)?;
+                owned_policy::check_decision(check,decision,&accepted[range.clone()])?;
             }
             Ok(())
         };
