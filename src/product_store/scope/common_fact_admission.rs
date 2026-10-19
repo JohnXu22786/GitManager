@@ -676,3 +676,6 @@ pub(crate) mod adoption_diagnostic {
 
 #[cfg(test)]
 mod retained_lifecycle_controls;
+
+#[cfg(test)]
+mod capture_row_batch_controls;

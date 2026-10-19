@@ -1073,3 +1073,11 @@ pub(crate) fn merged_definition_data(
 ) -> Result<DataSnapshot> {
     compatibility::merge(program, current)
 }
+
+// Capture-row API/payment controls are staged before the APIs exist.
+#[cfg(test)]
+mod capture;
+#[cfg(test)]
+mod capture_row_controls;
+#[cfg(test)]
+mod capture_native_controls;

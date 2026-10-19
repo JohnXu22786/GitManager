@@ -5153,3 +5153,7 @@ impl Observation {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "product_contract/capture_stage_tests.rs"]
+mod capture_stage_tests;

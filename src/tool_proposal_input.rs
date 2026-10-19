@@ -210,3 +210,7 @@ impl<'de> Visitor<'de> for ValueSeed<'_> {
         Ok(Value::Object(values))
     }
 }
+
+#[cfg(test)]
+#[path = "product_contract/capture_input_stage_tests.rs"]
+mod capture_input_stage_tests;

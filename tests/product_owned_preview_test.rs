@@ -1305,3 +1305,30 @@ fn retained_lifecycle_reconstruct_derive_enforces_real_resource_boundaries() {
         store.assert_retained_lifecycle_resource_for_test(&b, &r, &accepted, case);
     }
 }
+
+
+#[test]
+fn capture_row_batch_preserves_actual_frame_values_and_presence() {
+    let (a, b) = pair(); let (_d, store) = setup(&a);
+    let r = request(&store, &a, &b); let proof = verify(&store, &b, &r).unwrap();
+    for case in ["full", "selected-live", "excluded-live", "future", "archived-unfinished",
+        "zero-projections", "nullable-absence", "duplicate-location", "actual-day",
+        "distinct-source", "unfinished-skips-poison"] {
+        store.assert_capture_row_values_for_test(&proof, case);
+    }
+}
+#[test]
+fn capture_row_batch_preserves_first_errors_and_lazy_boundaries() {
+    let (a, b) = pair(); let (_d, store) = setup(&a);
+    let r = request(&store, &a, &b); let proof = verify(&store, &b, &r).unwrap();
+    for case in ["source-before-data", "binding-before-expression",
+        "selected-completed-before-projection", "absent-is-lazy", "no-root-is-lazy"] {
+        store.assert_capture_row_order_for_test(&proof, case);
+    }
+}
+#[test]
+fn capture_row_batch_uses_actual_host_reservation_and_refusals() {
+    let (a, b) = pair(); let (_d, store) = setup(&a);
+    let r = request(&store, &a, &b); let proof = verify(&store, &b, &r).unwrap();
+    store.assert_capture_row_host_for_test(&proof);
+}
