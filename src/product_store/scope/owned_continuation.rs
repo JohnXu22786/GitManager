@@ -5,6 +5,9 @@ use super::owned_lowering::{self, Metadata};
 use super::*;
 use serde::Serialize;
 
+#[path = "owned_state_consumers.rs"]
+mod state_consumers;
+
 /// Local rule capability: only this verifying constructor can create it. It is
 /// neither serialized nor returned as a preparation/publication permission.
 struct ClosedContinuationRules {
@@ -192,7 +195,10 @@ fn collect_common_state_markers(
                 }
             }
         }
-        if common {
+        if common
+            && !state_consumers::reads_state(before, state, meter)?
+            && !state_consumers::reads_state(after, state, meter)?
+        {
             for (side, index) in sites {
                 output.insert(state_marker_key(side, &action.id, &[index], step, meter)?);
             }
