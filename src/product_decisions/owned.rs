@@ -15,6 +15,7 @@ pub(super) enum ChangeAuthority {
     ScalarActivation(PreparedScopedChange),
     ScalarRecording(Vec<PreparedScopedChange>, Vec<Id>),
     Owned(OwnedDecisionContext),
+    OwnedTransition(super::owned_transition::OwnedTransitionDecisionContext),
 }
 impl<R: RuntimeAdapter> DecisionEngine<R> {
     pub(super) fn with_owned<T>(
@@ -22,7 +23,8 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         owned: OwnedDecisionContext,
         f: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
-        if self.pending_scope.borrow().is_some()
+        if self.pending_owned_transition.borrow().is_some()
+            || self.pending_scope.borrow().is_some()
             || self.pending_rehearsal.borrow().is_some()
             || !self.pending_correspondences.borrow().is_empty()
         {

@@ -373,9 +373,32 @@ pub(super) fn derive(
     if basis != request.snapshot || snapshot.active_revision != request.sources.before {
         return Err(error("stale authenticated snapshot/source basis"));
     }
-    let before = &snapshot.program()?.program;
+    derive_pair_inner(snapshot, snapshot.program()?, candidate, request, basis)
+}
+/// Explicit ordinary pair on the actual protected frame. The returned inventory
+/// remains diagnostic; only the closed continuation verifier can consume it.
+pub(super) fn derive_pair(
+    snapshot: &ProjectSnapshot,
+    baseline: &CapturedProgram,
+    candidate: &CapturedProgram,
+    request: &CommonFactInventoryRequest,
+) -> Result<CommonFactInventory> {
+    let basis = canonical_digest(IdentityDomain::Data, snapshot)?;
+    if basis != request.snapshot {
+        return Err(error("stale authenticated current frame"));
+    }
+    derive_pair_inner(snapshot, baseline, candidate, request, basis)
+}
+fn derive_pair_inner(
+    snapshot: &ProjectSnapshot,
+    baseline: &CapturedProgram,
+    candidate: &CapturedProgram,
+    request: &CommonFactInventoryRequest,
+    basis: Digest,
+) -> Result<CommonFactInventory> {
+    let before = &baseline.program;
     let after = &candidate.program;
-    let structure = super::analyze_owned_sources(snapshot.program()?, candidate, &request.sources)?;
+    let structure = super::analyze_owned_sources(baseline, candidate, &request.sources)?;
     if request.lifecycle.entity != structure.root_entity
         || request.lifecycle.meaning.trim().is_empty()
         || request.lifecycle.meaning.len() > MAX_TEXT_BYTES

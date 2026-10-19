@@ -314,6 +314,12 @@ impl Directory {
         Ok(WriteLock { file })
     }
     pub fn publish(&self, name: &str, bytes: &[u8], replace: bool) -> io::Result<()> {
+        self.publish_with_checkpoint(name, bytes, replace, || Ok(()))
+    }
+    pub(super) fn publish_with_checkpoint<E: From<io::Error>>(
+        &self, name: &str, bytes: &[u8], replace: bool,
+        checkpoint: impl FnOnce() -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
         valid_name(OsStr::new(name))?;
         // Existing objects/pointers must never be symlinks or special files.
         match self.open_file(OsStr::new(name), false, false) {
@@ -324,11 +330,11 @@ impl Directory {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "the existing project file is read-only",
-                    ));
+                    ).into());
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
@@ -346,27 +352,28 @@ impl Directory {
             let result = (|| {
                 file.write_all(bytes)?;
                 file.sync_all()?;
+                checkpoint()?;
                 if replace {
                     unix::rename(&self.file, &temp, OsStr::new(name))?;
                 } else {
                     unix::rename_new(&self.file, &temp, OsStr::new(name))?;
                 }
-                self.sync()
+                self.sync().map_err(E::from)
             })();
             let _ = unix::unlink(&self.file, &temp);
             result
         }
         #[cfg(windows)]
         {
-            windows::publish(&self.path, name, bytes, replace)
+            windows::publish_with_checkpoint(&self.path, name, bytes, replace, checkpoint)
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
-            let _ = (bytes, replace);
+            let _ = (bytes, replace, checkpoint);
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "safe store unavailable",
-            ))
+            ).into())
         }
     }
     pub fn sync(&self) -> io::Result<()> {
@@ -579,7 +586,10 @@ mod windows {
         }
         Ok(identity(a)? == identity(b)?)
     }
-    pub fn publish(path: &Path, name: &str, bytes: &[u8], replace: bool) -> io::Result<()> {
+    pub fn publish_with_checkpoint<E: From<io::Error>>(
+        path: &Path, name: &str, bytes: &[u8], replace: bool,
+        checkpoint: impl FnOnce() -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
         let mut temporary = tempfile::NamedTempFile::new_in(path)?;
         temporary.write_all(bytes)?;
         temporary.as_file().sync_all()?;
@@ -588,8 +598,10 @@ mod windows {
             // existing readers retain their old handle while new opens see
             // the new file. MoveFileExW alone can reject an open destination.
             // Keep the no-clobber path below separate for immutable objects.
-            fs::rename(temporary.path(), path.join(name))?;
-            return temporary.as_file().sync_all();
+            let target = path.join(name);
+            checkpoint()?;
+            fs::rename(temporary.path(), target)?;
+            return temporary.as_file().sync_all().map_err(E::from);
         }
         let source: Vec<u16> = temporary
             .path()
@@ -603,8 +615,9 @@ mod windows {
             .encode_wide()
             .chain(Some(0))
             .collect();
+        checkpoint()?;
         if unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
-            return Err(io::Error::last_os_error());
+            return Err(io::Error::last_os_error().into());
         }
         Ok(())
     }

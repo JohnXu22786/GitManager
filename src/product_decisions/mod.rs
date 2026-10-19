@@ -6,6 +6,10 @@ mod context;
 mod evolution;
 mod mapping;
 mod owned;
+mod owned_policy;
+mod owned_transition;
+use owned_transition::OwnedTransitionDecisionContext;
+pub use owned_transition::OwnedWithdrawalSummary;
 use owned::{ChangeAuthority, OwnedDecisionContext};
 mod recovery;
 mod replay;
@@ -154,9 +158,12 @@ struct AdmissionKey {
     rehearsal: Option<(Vec<PreparedScopedChange>, Vec<Id>)>,
     correspondences: BTreeMap<Digest, ScopeCorrespondence>,
     owned: Option<OwnedDecisionContext>,
+    owned_transition: Option<OwnedTransitionDecisionContext>,
     limits: RuntimeLimits,
     runtime: RuntimeCapabilities,
     driver: &'static str,
+    scope_verifier: u32,
+    owned_lowerings: [u32;2],
 }
 struct AdmissionCache {
     key: AdmissionKey,
@@ -168,6 +175,7 @@ pub struct DecisionEngine<R: RuntimeAdapter> {
     limits: RuntimeLimits,
     pending_scope: RefCell<Option<PreparedScopedChange>>,
     pending_owned: RefCell<Option<OwnedDecisionContext>>,
+    pending_owned_transition: RefCell<Option<OwnedTransitionDecisionContext>>,
     pending_rehearsal: RefCell<Option<(Vec<PreparedScopedChange>, Vec<Id>)>>,
     pending_correspondences: RefCell<BTreeMap<Digest, ScopeCorrespondence>>,
     // One immutable admission result; every lookup still freshly loads and
@@ -186,6 +194,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             limits: RuntimeLimits::default(),
             pending_scope: RefCell::new(None),
             pending_owned: RefCell::new(None),
+            pending_owned_transition: RefCell::new(None),
             pending_rehearsal: RefCell::new(None),
             pending_correspondences: RefCell::new(BTreeMap::new()),
             admission_cache: RefCell::new(None),
@@ -236,10 +245,19 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             rehearsal: self.pending_rehearsal.borrow().clone(),
             correspondences: self.pending_correspondences.borrow().clone(),
             owned: self.pending_owned.borrow().clone(),
+            owned_transition: self.pending_owned_transition.borrow().clone(),
             limits: self.limits.clone(),
             runtime: self.runtime.capabilities(),
             driver: DRIVER_VERSION,
+            scope_verifier: crate::product_store::scope::SCOPE_VERIFIER_REVISION,
+            owned_lowerings: crate::product_store::scope::SUPPORTED_OWNED_LOWERINGS,
         };
+        if let Some(transition) = &key.owned_transition {
+            transition.prepared.check_basis(&key.current)?;
+            if key.owned.is_some() || key.prepared.is_some() || key.rehearsal.is_some() || !key.correspondences.is_empty() {
+                return Err(invalid("owned transition and other authority cannot coexist"));
+            }
+        }
         if let Some(owned) = &key.owned {
             owned.prepared.check_basis(&key.current)?;
             if key.prepared.is_some() || key.rehearsal.is_some() || !key.correspondences.is_empty()
@@ -259,7 +277,13 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         self.clear_admission_cache();
         #[cfg(test)]
         self.admission_builds.set(self.admission_builds.get() + 1);
-        let context = if let Some(owned) = &key.owned {
+        let context = if let Some(transition) = &key.owned_transition {
+            if transition.current_scene {
+                ScopedExecutionContext::owned_transition_current(&key.current,&transition.prepared,transition.next.as_ref())?
+            } else {
+                ScopedExecutionContext::owned_transition_prepared(&key.current,&transition.prepared,transition.next.as_ref())?
+            }
+        } else if let Some(owned) = &key.owned {
             ScopedExecutionContext::owned_prepared(
                 &key.current,
                 &owned.prepared,
@@ -298,6 +322,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
     ) -> Result<ScopedExecutionContext> {
         if self.pending_scope.borrow().is_some()
             || self.pending_owned.borrow().is_some()
+            || self.pending_owned_transition.borrow().is_some()
             || self.pending_rehearsal.borrow().is_some()
             || self.archive.snapshot()? != *current
         {
@@ -1025,7 +1050,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 .iter()
                 .find(|s| s.original == scene.scenario.identity().expect("validated scene"))
         });
-        let mapped = match if self.scope_context()?.uses_owned_initializer(target) {
+        let mapped = match if self.scope_context()?.uses_owned_replay_recipe(target) {
             // Required owned cells must come from the verified isolated recipe,
             // before ordinary target-schema mapping can validate this old seed.
             if !relevant.is_empty() || explicit.is_some() {
@@ -1057,7 +1082,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             &canonical_digest(IdentityDomain::Decision, &(&decision.id, index))?.as_str()[..32]
         );
         let execution =
-            if self.scope_context()?.uses_owned_initializer(target) && scene.program != *target {
+            if self.scope_context()?.uses_owned_replay_recipe(target) && scene.program != *target {
                 self.execute_retained_owned_scene(decision, scene, target, graph, &run_id)
             } else {
                 self.execute_mapped_scene(
@@ -1638,6 +1663,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                         .as_ref()
                         .map(|o| o.prepared.scope())
                 })
+                .or_else(|| self.pending_owned_transition.borrow().as_ref().map(|o|o.prepared.scope()))
                 .unwrap_or_else(|| DecisionScope {
                     operations: target
                         .program
@@ -1675,7 +1701,10 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         validate_withdrawal_delta(current, &next, &plan)?;
         self.verify_destination_packages(store, current, &next, &plan)?;
         let owned = self.pending_owned.borrow().clone();
-        let prepared = if let Some(owned) = &owned {
+        let transition = self.pending_owned_transition.borrow().clone();
+        let prepared = if let Some(transition) = &transition {
+            store.prepare_owned_transition_adoption(plan,&transition.prepared,&next)?
+        } else if let Some(owned) = &owned {
             store.prepare_owned_adoption(plan, &owned.prepared, &owned.mode)?
         } else {
             match self.pending_scope.borrow().as_ref() {
@@ -1696,7 +1725,9 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             scoped.correspondences = correspondences.clone();
         }
         Ok(VerifiedChange {
-            authority: if let Some(owned) = owned {
+            authority: if let Some(transition) = transition {
+                ChangeAuthority::OwnedTransition(transition)
+            } else if let Some(owned) = owned {
                 ChangeAuthority::Owned(owned)
             } else if let Some(scoped) = scoped {
                 ChangeAuthority::ScalarActivation(scoped)
@@ -1718,6 +1749,9 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         })
     }
     pub fn adopt(&self, store: &ProductStore, change: &VerifiedChange) -> Result<ProjectSnapshot> {
+        if let ChangeAuthority::OwnedTransition(transition) = &change.authority {
+            return self.adopt_owned_transition(store,change,transition,#[cfg(test)]None);
+        }
         if let ChangeAuthority::Owned(owned) = &change.authority {
             return self.adopt_owned(
                 store,

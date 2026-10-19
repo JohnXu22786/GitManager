@@ -44,7 +44,7 @@ impl Default for ProofBudget {
         }
     }
 }
-pub(super) struct ProofMeter {
+pub(crate) struct ProofMeter {
     left: u64,
     started: Instant,
     millis: u64,
@@ -73,7 +73,7 @@ impl ProofMeter {
     pub(super) fn watch_cancellation(&mut self, token: &Arc<AtomicBool>) {
         self.additional_cancelled = Some(token.clone());
     }
-    pub(super) fn charge(&mut self, units: u64) -> AdmissionResult<()> {
+    pub(crate) fn charge(&mut self, units: u64) -> AdmissionResult<()> {
         if self.cancelled.load(Ordering::Relaxed)
             || self
                 .additional_cancelled

@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 
 pub const OWNED_SCOPE_VERSION: u32 = 2;
 pub const OWNED_LOWERING_VERSION: u32 = 2;
-pub(crate) const SCOPE_VERIFIER_REVISION: u32 = 2;
+pub(crate) const SCOPE_VERIFIER_REVISION: u32 = 3;
+pub(crate) const OWNED_TRANSITION_LOWERING_VERSION: u32 = 3;
+pub(crate) const SUPPORTED_OWNED_LOWERINGS: [u32;2] = [OWNED_LOWERING_VERSION,OWNED_TRANSITION_LOWERING_VERSION];
 pub type OwnedScopeRequestV2 = OwnedPreviewRequest;
 
 pub(super) fn identity<T: Serialize>(tag: &str, value: &T) -> Result<Digest> {
@@ -251,4 +253,10 @@ pub(super) fn adoption_request(
         "owned-adoption-recording/2",
         &(plan, graph, composition, initialization),
     )
+}
+
+/// Output is the result of the authenticated transition recipe, not an
+/// initializer or first-entry adoption request.
+pub(super) fn transition_request(plan: &AdoptionPlan, graph: &DecisionGraph, manifest: &OwnedCompositionV2) -> Result<Digest> {
+    identity("owned-transition-recording/2", &(plan, graph, manifest))
 }

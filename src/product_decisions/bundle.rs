@@ -65,6 +65,7 @@ pub fn validate_bundle(snapshot: &ProjectSnapshot, bundle: &IntentionBundle) -> 
     let mut found = BTreeSet::new();
     let mut sources = vec![];
     let mut accepted = vec![];
+    let mut accepted_ranges = BTreeMap::<Digest,std::ops::Range<usize>>::new();
     let mut recipes = vec![];
     // One immutable committed basis and fixed runtime apply throughout this
     // call. Each scene is still decoded, validated and admitted independently.
@@ -108,7 +109,9 @@ pub fn validate_bundle(snapshot: &ProjectSnapshot, bundle: &IntentionBundle) -> 
                     }
                 }
                 validate_rehearsal_scenes(snapshot, &object.digest, &scenes)?;
+                let first = accepted.len();
                 accepted.extend(scenes.clone());
+                accepted_ranges.insert(object.digest.clone(),first..accepted.len());
                 let ids = scenes
                     .iter()
                     .map(|s| s.scenario.identity())
@@ -227,6 +230,23 @@ pub fn validate_bundle(snapshot: &ProjectSnapshot, bundle: &IntentionBundle) -> 
             "intention bundle lacks reachable immutable objects",
         ));
     }
+    crate::product_store::scope::check_retained_transition_policies(snapshot,|execution,meter| {
+        let mut verify = || -> Result<()> {
+            let basis=execution.current();
+            let layer=crate::product_store::scope::transition_layer(execution);
+            let ids=owned_policy::retirement_ids(basis,layer)?;
+            for id in &ids {
+                meter.charge(1)?;
+                let decision=basis.decisions.decisions.iter().find(|d|&d.id==id)
+                    .ok_or_else(||invalid("historical owned retirement decision missing"))?;
+                let range=accepted_ranges.get(&decision.witness)
+                    .ok_or_else(||invalid("historical owned retirement witness missing"))?;
+                owned_policy::check_decision(execution,decision,&accepted[range.clone()],meter)?;
+            }
+            Ok(())
+        };
+        verify().map_err(owned_transition::into_store_error)
+    })?;
     Ok(())
 }
 impl IntentArchive {
