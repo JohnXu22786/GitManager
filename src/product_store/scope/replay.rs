@@ -86,6 +86,14 @@ pub struct ScopedExecutionContext {
     correspondences: BTreeMap<Digest, correspondence::VerifiedCorrespondence>,
 }
 impl ScopedExecutionContext {
+    pub(crate) fn require_current_scene_snapshot(&self, expected: &ProjectSnapshot) -> Result<()> {
+        if self.snapshot != *expected {
+            return Err(StoreError::Invalid(
+                "current scene replay context differs from supplied snapshot".into(),
+            ));
+        }
+        Ok(())
+    }
     pub(crate) fn applicability(
         &self,
         source: &CapturedProgram,

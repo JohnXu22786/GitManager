@@ -334,7 +334,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 &change.prepared,
                 &change.decisions,
                 self.runtime.cancellation_token(),
-                |current, fresh, next, plan, candidate, meter| {
+                |current, fresh, next, plan, candidate, check| {
                     #[cfg(test)]
                     crate::product_store::scope::adoption_diagnostic::phase(
                         crate::product_store::scope::adoption_diagnostic::Phase::CallbackBinding,
@@ -362,13 +362,9 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                             crate::product_store::scope::adoption_diagnostic::phase(
                                 crate::product_store::scope::adoption_diagnostic::Phase::Policy,
                             );
-                            let ids = fresh.check_policy(
-                                |check| {
-                                    owned_policy::check_withdrawal(&self.archive, check)
-                                        .map_err(into_store_error)
-                                },
-                                meter,
-                            )?;
+                            check.charge(6)?;
+                            let ids = owned_policy::check_withdrawal(&self.archive, check)
+                                .map_err(into_store_error)?;
                             if ids != plan.retire_decisions {
                                 return Err(invalid("locked owned retirement union changed"));
                             }

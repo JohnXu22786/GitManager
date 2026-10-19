@@ -31,3 +31,16 @@ fn policy_context_methods_preserve_both_tokens_and_real_fuel_refusal() {
     adopt(&store, &a, &b);
     store.assert_owned_policy_context_actual_refusals_for_test();
 }
+
+#[test]
+fn policy_context_locked_adoption_keeps_fresh_registry_and_exact_dispatch() {
+    let (_dir, store, a, b) = setup();
+    adopt(&store, &a, &b);
+    store.assert_owned_adoption_policy_context_exact_dispatch_for_test();
+}
+#[test]
+fn policy_context_locked_adoption_preserves_actual_fuel_and_both_tokens() {
+    let (_dir, store, a, b) = setup();
+    adopt(&store, &a, &b);
+    store.assert_owned_adoption_policy_context_actual_refusals_for_test();
+}

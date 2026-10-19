@@ -44,8 +44,8 @@ impl<'gate> OwnedPolicyCheck<'gate> {
                 policy_surface_from_registry(execution, registry, source, layer, self.meter)
             }
             None => {
-                // Adoption/archive executions retain their fresh old-position
-                // reconstruction; an endpoint registry cannot cover a prefix.
+                // Archive fallback retains its fresh old-position reconstruction;
+                // an endpoint registry cannot cover a historical prefix.
                 let registry = owned_persist::reconstruct(execution.current(), self.meter)?;
                 policy_surface_from_registry(execution, &registry, source, layer, self.meter)
             }
@@ -148,32 +148,6 @@ impl PreparedOwnedTransitionV2 {
         }
         scene.validate(&self.target().program)?;
         Ok(())
-    }
-    fn fresh(&self, current: &ProjectSnapshot, meter: &mut ProofMeter) -> Result<Self> {
-        if current != self.basis() {
-            return Err(StoreError::Conflict(
-                "owned transition basis changed".into(),
-            ));
-        }
-        let proof = &self.execution.continuation;
-        let execution = owned_persist::transition(
-            current,
-            proof.before(),
-            proof.after(),
-            &proof.request().inventory.sources,
-            proof.original_layer(),
-            self.operation_id(),
-            self.is_withdrawal(),
-            meter,
-        )?;
-        let result = finish(execution, self.budget, self.cancelled.clone(), meter)?;
-        if &result != self {
-            return Err(refuse(
-                "owned transition",
-                "complete recipe does not regenerate",
-            ));
-        }
-        Ok(result)
     }
     fn request(&self, plan: &AdoptionPlan, graph: &DecisionGraph) -> Result<Digest> {
         owned_wire::transition_request(plan, graph, &self.execution.manifest)
@@ -337,13 +311,13 @@ impl ProductStore {
         #[cfg(test)] fault: Option<FaultPoint>,
     ) -> Result<ProjectSnapshot>
     where
-        F: FnOnce(
+        F: for<'gate> FnOnce(
             &ProjectSnapshot,
             &PreparedOwnedTransitionV2,
             &DecisionGraph,
             &AdoptionPlan,
             &ProjectSnapshot,
-            &mut ProofMeter,
+            &mut OwnedPolicyCheck<'gate>,
         ) -> Result<()>,
         V: Fn(&ProjectSnapshot) -> Result<()>,
     {
@@ -377,7 +351,35 @@ impl ProductStore {
             meter.watch_cancellation(token);
         }
         meter.charge(0)?;
-        let fresh = prepared.fresh(&current, &mut meter)?;
+        if &current != prepared.basis() {
+            return Err(StoreError::Conflict(
+                "owned transition basis changed".into(),
+            ));
+        }
+        let proof = &prepared.execution.continuation;
+        // Prepay the retained local owner header and its cleanup.
+        meter.charge(2)?;
+        let registry = owned_persist::reconstruct(&current, &mut meter)?;
+        let execution = owned_persist::transition_from_registry(
+            &current,
+            &registry,
+            proof.before(),
+            proof.after(),
+            &proof.request().inventory.sources,
+            proof.original_layer(),
+            prepared.operation_id(),
+            prepared.is_withdrawal(),
+            &mut meter,
+        )?;
+        let fresh = finish(
+            execution, prepared.budget, prepared.cancelled.clone(), &mut meter,
+        )?;
+        if &fresh != prepared {
+            return Err(refuse(
+                "owned transition",
+                "complete recipe does not regenerate",
+            ));
+        }
         #[cfg(test)]
         adoption_diagnostic::phase(adoption_diagnostic::Phase::Plan);
         if adoption.target != revision(fresh.target())? {
@@ -431,14 +433,23 @@ impl ProductStore {
                 revision: next.revision,
             },
         );
-        verify(
-            &current,
-            &fresh,
-            decisions,
-            &adoption.plan,
-            &next,
-            &mut meter,
-        )?;
+        meter.charge(8)?;
+        {
+            let mut check = OwnedPolicyCheck {
+                execution: &fresh.execution,
+                registry: Some(&registry),
+                meter: &mut meter,
+            };
+            verify(
+                &current,
+                &fresh,
+                decisions,
+                &adoption.plan,
+                &next,
+                &mut check,
+            )?;
+        }
+        drop(registry);
         #[cfg(test)]
         adoption_diagnostic::phase(adoption_diagnostic::Phase::NextValidate);
         next.validate()?;

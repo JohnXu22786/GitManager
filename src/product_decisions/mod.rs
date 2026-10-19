@@ -12,6 +12,10 @@ use owned_transition::OwnedTransitionDecisionContext;
 pub use owned_transition::OwnedWithdrawalSummary;
 use owned::{ChangeAuthority, OwnedDecisionContext};
 mod recovery;
+#[cfg(test)]
+mod current_scene_controls;
+#[cfg(test)]
+pub(crate) use current_scene_controls::CurrentScenePendingForTest;
 mod replay;
 use crate::product_contract::*;
 use crate::product_runtime::{LocalRuntime, DRIVER_VERSION};
@@ -463,6 +467,42 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         scenario: &ScenarioSpec,
         disclosure: Disclosure,
     ) -> Result<AcceptedScene> {
+        if matches!(
+            &current.scope,
+            crate::product_store::scope::ScopeEnvelope::OwnedV2(_)
+        ) {
+            if !self.pending_correspondences.borrow().is_empty() {
+                return Err(invalid(
+                    "retained replay context does not match the committed snapshot",
+                ));
+            }
+            let context = self.retained_replay_context(current)?;
+            context.require_current_scene_snapshot(current)?;
+            let program = current.program()?;
+            context.verify_seed(program, &scenario.seed, scenario.clock_day)?;
+            let (run, _) = execute_admitted(
+                &self.runtime,
+                program,
+                scenario,
+                &current.decisions,
+                self.limits.clone(),
+                "accepted",
+                Some(&context),
+            )?;
+            if run.state != EvidenceState::Observed {
+                return Err(invalid("accepted scene must execute completely"));
+            }
+            if self.archive.snapshot()? != *current {
+                return Err(invalid("saved work changed during current scene replay"));
+            }
+            return Ok(AcceptedScene {
+                program: program.clone(),
+                scenario: scenario.clone(),
+                evidence: run,
+                disclosure,
+                bind_outcome: true,
+            });
+        }
         ScopedExecutionContext::committed(current)?.verify_seed(
             current.program()?,
             &scenario.seed,
