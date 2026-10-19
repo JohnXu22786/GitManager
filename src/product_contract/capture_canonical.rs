@@ -1301,3 +1301,7 @@ pub(super) fn reserve_from_iter<K, V>(len: usize, comparator: u64, a: Audit<'_>)
     a.scaled(len, 2 * size_of::<(K, V)>() as u64, 4)?;
     a.amount(native.checked_add(sort))
 }
+
+#[cfg(test)]
+#[path = "capture_app_length_tests.rs"]
+mod app_length_tests;
