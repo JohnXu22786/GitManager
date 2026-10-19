@@ -628,7 +628,11 @@ pub(crate) fn check_retained_transition_policies(
         return Ok(());
     }
     let mut meter = ProofMeter::new(ProofBudget::default(), Arc::new(AtomicBool::new(false)))?;
+    #[cfg(test)]
+    adoption_diagnostic::phase(adoption_diagnostic::Phase::ArchiveReconstruct);
     let registry = owned_persist::reconstruct(snapshot, &mut meter)?;
+    #[cfg(test)]
+    adoption_diagnostic::phase(adoption_diagnostic::Phase::ArchivePolicy);
     for execution in registry.checked_withdrawals() {
         meter.charge(1)?;
         meter.charge(6)?;

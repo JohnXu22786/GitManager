@@ -532,6 +532,7 @@ pub(crate) mod adoption_diagnostic {
         RemainingReplay = 12, Bundle = 13, NextValidate = 14,
         Resume = 15, Save = 16, Pointer = 17, ErrorLoad = 18,
         ErrorConfirm = 19,
+        ArchiveReconstruct = 20, ArchivePolicy = 21,
     }
     pub(crate) struct Guard((bool, u64, u8, bool));
     pub(crate) fn start() -> Guard {
