@@ -4186,8 +4186,8 @@ pub trait SourceAdapter {
         task_id: Option<&str>,
     ) -> std::result::Result<SourceBinding, AdapterError>;
 }
-pub const APP_SCHEMA: &str = include_str!("../assets/product_protocol/app.schema.json");
-pub const RESPONSE_SCHEMA: &str = include_str!("../assets/product_protocol/response.schema.json");
+pub const APP_SCHEMA: &str = include_str!("../../../assets/product_protocol/app.schema.json");
+pub const RESPONSE_SCHEMA: &str = include_str!("../../../assets/product_protocol/response.schema.json");
 
 fn encode_output(
     format: OutputFormat,
