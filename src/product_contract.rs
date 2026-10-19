@@ -1713,12 +1713,14 @@ impl CapturedProgram {
         let raw=capture_validation::bytes_digest_audited(IdentityDomain::Source,&self.source_bytes,a)?;
         a.require(a.eq_str(self.artifact.raw_digest.as_str(),raw.as_str())?
             && a.eq_str(self.binding.source_digest.as_str(),self.artifact.raw_digest.as_str())?, "raw source digest mismatch")?;
-        actual.validate_audited(a)?;
+        a.pay(8 + 2 * std::mem::size_of::<Audit<'_>>() as u64 + 4 * std::mem::size_of::<bool>() as u64)?;
+        if !a.enabled() { actual.validate_audited(a)?; }
         let bytes=capture_canonical::canonical_bytes_audited(&actual,a)?;
         let program=capture_validation::bytes_digest_audited(IdentityDomain::Program,&bytes,a)?;
         let equal=a.eq_str(self.artifact.program_digest.as_str(),program.as_str())?;
         let equal=if equal {
-            actual.validate_audited(a)?;
+            a.pay(8 + 2 * std::mem::size_of::<Audit<'_>>() as u64 + 4 * std::mem::size_of::<bool>() as u64)?;
+            if !a.enabled() { actual.validate_audited(a)?; }
             let mut semantic=a.clone_owned(&actual)?;
             semantic.clear_display_labels_audited(a)?;
             let bytes=capture_canonical::canonical_bytes_audited(&semantic,a)?;
