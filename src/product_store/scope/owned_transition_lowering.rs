@@ -489,7 +489,7 @@ pub(super) fn compile(
                 .programs
                 .iter()
                 .map(revision)
-                .collect::<Result<Vec<_>>>()?
+                .collect::<std::result::Result<Vec<_>, _>>()?
     {
         return Err(refuse(
             "transition compiler",
