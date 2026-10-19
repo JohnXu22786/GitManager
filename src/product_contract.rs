@@ -1368,12 +1368,19 @@ impl AppDefinition {
             a.pay(12)?;
             validator.view(view)?;
         }
-        let bytes = capture_canonical::canonical_bytes_audited(self, a)?;
+        // Keep the ordinary Vec alive through the original validation tail.
+        let bytes;
+        let canonical_len = if a.enabled() {
+            capture_canonical::app_canonical_len_audited(self, a)?
+        } else {
+            bytes = capture_canonical::canonical_bytes_audited(self, a)?;
+            bytes.len()
+        };
         a.pay(3)?;
-        a.require(bytes.len() <= MAX_WIRE_BYTES, "program exceeds byte budget")?;
+        a.require(canonical_len <= MAX_WIRE_BYTES, "program exceeds byte budget")?;
         a.pay(5)?;
         Ok(capture_validation::CaptureFacts { total_nodes: validator.nodes,
-            action_prefix_nodes, canonical_len: bytes.len(), action_count: self.actions.len() })
+            action_prefix_nodes, canonical_len, action_count: self.actions.len() })
     }
     pub fn identity(&self) -> Result<Digest> {
         self.validate()?;

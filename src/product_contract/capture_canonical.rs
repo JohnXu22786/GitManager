@@ -770,6 +770,127 @@ pub(super) fn canonical_bytes_audited<T: Serialize + ?Sized>(
     Ok(bytes)
 }
 
+struct AppLengthCounter<'w> {
+    audit: Audit<'w>,
+    size: usize,
+    overflowed: bool,
+}
+impl AppLengthCounter<'_> {
+    fn add_len(&mut self, n: usize) -> std::io::Result<()> {
+        if self.overflowed {
+            return Err(std::io::ErrorKind::Other.into());
+        }
+        let Some(size) = self.size.checked_add(n) else {
+            self.overflowed = true;
+            let _ = self.audit.overflow();
+            return Err(std::io::ErrorKind::Other.into());
+        };
+        self.size = size;
+        Ok(())
+    }
+    fn finish(&self, native: serde_json::Result<()>) -> Result<usize> {
+        if self.overflowed {
+            return Err(ContractError(String::new()));
+        }
+        native.map_err(|error| ContractError(error.to_string()))?;
+        self.audit.pay(0)?;
+        Ok(self.size)
+    }
+}
+impl std::io::Write for AppLengthCounter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.add_len(bytes.len())?;
+        Ok(bytes.len())
+    }
+    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.add_len(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn reserve_app_count(shape: &Shape<'_>) -> Result<()> {
+    let a = shape.audit;
+    a.pay(96)?;
+    usize::try_from(shape.bytes).map_err(|_| a.overflow())?;
+    let writes = shape
+        .bytes
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(shape.nodes.checked_mul(4)?))
+        .and_then(|n| n.checked_add(shape.pairs.checked_mul(4)?))
+        .and_then(|n| n.checked_add(2))
+        .ok_or_else(|| a.overflow())?;
+    let counter = a.usize(size_of::<AppLengthCounter<'_>>())?;
+    let serializer = a.usize(size_of::<serde_json::Serializer<&mut AppLengthCounter<'_>>>())?;
+    let result = a.usize(size_of::<serde_json::Result<()>>())?;
+    let root = counter
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(serializer.checked_mul(2)?))
+        .and_then(|n| n.checked_add(result.checked_mul(2)?))
+        .and_then(|n| n.checked_add(12))
+        .ok_or_else(|| a.overflow())?;
+    // Native traversal, each complete Write chunk, fixed owners and first failure.
+    let amount = writes
+        .checked_mul(14)
+        .and_then(|n| shape.native.checked_add(n))
+        .and_then(|n| n.checked_add(root))
+        .and_then(|n| n.checked_add(72))
+        .ok_or_else(|| a.overflow())?;
+    let error_bytes = size_of::<usize>()
+        .checked_mul(4)
+        .and_then(|n| n.checked_add(size_of::<Box<str>>().max(size_of::<std::io::Error>())))
+        .ok_or_else(|| a.overflow())?;
+    a.format(128)?;
+    a.scaled(error_bytes, 2, 5)?;
+    a.pay(amount)
+}
+
+// Only the App validator's successful semantic prefix establishes this depth bound.
+#[cfg_attr(test, track_caller)]
+pub(super) fn app_canonical_len_audited(app: &AppDefinition, a: Audit<'_>) -> Result<usize> {
+    #[cfg(test)]
+    let _diagnostic = super::capture_work::diagnostic::enter(
+        super::capture_work::diagnostic::Phase::Canonical,
+    );
+    if !a.enabled() {
+        return canonical_bytes(app).map(|bytes| bytes.len());
+    }
+    a.pay(0)?;
+    a.pay(96)?;
+    // H = 8 + 3*(expr+1) + 2*(type+1) + (type+1).
+    let height = a
+        .usize(MAX_EXPR_DEPTH)?
+        .checked_add(a.usize(MAX_TYPE_DEPTH)?)
+        .and_then(|n| n.checked_add(2))
+        .and_then(|n| n.checked_mul(3))
+        .and_then(|n| n.checked_add(8))
+        .ok_or_else(|| a.overflow())?;
+    let frame = a
+        .usize(size_of::<usize>())?
+        .checked_mul(64)
+        .and_then(|n| n.checked_add(64))
+        .ok_or_else(|| a.overflow())?;
+    // Separate descriptor/native logical frames, including their inline writes.
+    let stack = height
+        .checked_mul(frame)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| a.overflow())?;
+    a.pay(stack)?;
+    let mut shape = Shape::new(a)?;
+    a.pay(1)?;
+    shape.canonical = false;
+    app.serialize(&mut shape)?;
+    reserve_app_count(&shape)?;
+    let mut counter = AppLengthCounter {
+        audit: a,
+        size: 0,
+        overflowed: false,
+    };
+    let native = serde_json::to_writer(&mut counter, app);
+    counter.finish(native)
+}
+
 pub(super) trait ManualShape {
     fn describe(&self, shape: &mut Shape<'_>) -> Result<()>;
 }
