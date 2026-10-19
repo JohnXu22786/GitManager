@@ -129,14 +129,14 @@ pub fn read_json(reader: impl Read) -> Result<Value, InputError> {
 
 // Use serde's tokenizer and syntax checks, customizing only container traversal
 // so depth and duplicate members are checked before accepting nested values.
-struct ValueSeed<'a> {
+struct ValueSeed<'v, 'w> {
     depth: usize,
     // Preserve typed intake errors through serde's generic error interface.
-    violation: &'a mut Option<InputError>,
-    paid: Option<&'a std::cell::RefCell<dyn capture_paid::IntakeCharge + 'a>>,
+    violation: &'v mut Option<InputError>,
+    paid: Option<&'w std::cell::RefCell<dyn capture_paid::IntakeCharge + 'w>>,
 }
 
-impl<'de> DeserializeSeed<'de> for ValueSeed<'_> {
+impl<'de> DeserializeSeed<'de> for ValueSeed<'_, '_> {
     type Value = Value;
 
     fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<Value, D::Error> {
@@ -144,7 +144,7 @@ impl<'de> DeserializeSeed<'de> for ValueSeed<'_> {
     }
 }
 
-impl ValueSeed<'_> {
+impl ValueSeed<'_, '_> {
     fn check_container<E: de::Error>(&mut self) -> Result<(), E> {
         self.pay::<E>(2)?;
         if self.depth >= MAX_NESTING_DEPTH {
@@ -155,7 +155,7 @@ impl ValueSeed<'_> {
     }
 }
 
-impl<'de> Visitor<'de> for ValueSeed<'_> {
+impl<'de> Visitor<'de> for ValueSeed<'_, '_> {
     type Value = Value;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {

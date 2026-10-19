@@ -197,7 +197,7 @@ pub(crate) fn parse_json_bytes_with_work<E: Clone>(
     Ok(value)
 }
 
-impl ValueSeed<'_> {
+impl ValueSeed<'_, '_> {
     pub(super) fn pay<E: de::Error>(&self, units: u64) -> Result<(), E> {
         if let Some(work) = self.paid {
             work.borrow_mut()
