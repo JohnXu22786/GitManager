@@ -320,6 +320,77 @@ pub(super) fn derive(
 ) -> AdmissionResult<VerifiedOwnedPreviewPlan> {
     derive_inner(snapshot, candidate, request, accepted, meter, true)
 }
+// This closed composition alone may reuse the verification it just performed.
+// A live default-sized window is an explicit resource-sensitive eligibility
+// rule; it does not assert equivalence to later counterfactual clock clamps.
+pub(super) fn reconstruct_and_derive_retained(
+    snapshot: &ProjectSnapshot,
+    candidate: &CapturedProgram,
+    request: &OwnedPreviewRequest,
+    lifecycle: &OwnedLifecycleV2,
+    meter: &mut ProofMeter,
+) -> AdmissionResult<(super::owned_lifecycle::AcceptedPreviewLifecycle, VerifiedOwnedPreviewPlan)> {
+    let accepted = super::owned_lifecycle::AcceptedPreviewLifecycle::reconstruct(
+        snapshot, candidate, request, lifecycle, meter,
+    )?;
+    let inventory = authenticate_inner(snapshot, candidate, request, meter, false)?;
+    // Prepay the fixed guard, private-tail boundary and inventory transport.
+    meter.charge(32)?;
+    let proof = finish_reconstructed_plan(
+        snapshot, candidate, request, lifecycle, &accepted, inventory, meter,
+    )?;
+    Ok((accepted, proof))
+}
+
+// Sole production entrance: the closed factory above, after its actual
+// reconstruction, authentication and guard payment on this original meter.
+fn finish_reconstructed_plan(
+    snapshot: &ProjectSnapshot,
+    candidate: &CapturedProgram,
+    request: &OwnedPreviewRequest,
+    lifecycle: &OwnedLifecycleV2,
+    accepted: &super::owned_lifecycle::AcceptedPreviewLifecycle,
+    inventory: CommonFactInventory,
+    meter: &mut ProofMeter,
+) -> AdmissionResult<VerifiedOwnedPreviewPlan> {
+    let RuntimeLimits {
+        fuel, collection_items, action_steps, transaction_writes, output_bytes,
+        elapsed_millis,
+    } = RuntimeLimits::default();
+    // Exhaustive fields deliberately make a future runtime limit an explicit
+    // eligibility decision rather than silently reusing incomplete evidence.
+    let default_limits = |limits: &RuntimeLimits| {
+        let RuntimeLimits {
+            fuel: actual_fuel,
+            collection_items: actual_collection_items,
+            action_steps: actual_action_steps,
+            transaction_writes: actual_transaction_writes,
+            output_bytes: actual_output_bytes,
+            elapsed_millis: actual_elapsed_millis,
+        } = limits;
+        *actual_fuel == fuel
+            && *actual_collection_items == collection_items
+            && *actual_action_steps == action_steps
+            && *actual_transaction_writes == transaction_writes
+            && *actual_output_bytes == output_bytes
+            && *actual_elapsed_millis == elapsed_millis
+    };
+    let eligible = match lifecycle.evidence.as_slice() {
+        [before, after] if default_limits(&before.limits) && default_limits(&after.limits) => {
+            let elapsed = meter.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            meter.millis.saturating_sub(elapsed) >= elapsed_millis
+        }
+        _ => false,
+    };
+    if !eligible {
+        accepted.verify(snapshot, candidate, request, meter)?;
+    }
+    // Includes the suffix boundary and the factory's returned pair/headers.
+    // This live check retains both tokens and the original elapsed deadline.
+    meter.charge(5)?;
+    finish_derived_plan(snapshot, candidate, request, accepted, meter, false, inventory)
+}
+
 fn derive_inner(
     snapshot: &ProjectSnapshot,
     candidate: &CapturedProgram,
@@ -330,6 +401,20 @@ fn derive_inner(
 ) -> AdmissionResult<VerifiedOwnedPreviewPlan> {
     let inventory = authenticate_inner(snapshot, candidate, request, meter, verify_snapshot)?;
     accepted.verify(snapshot, candidate, request, meter)?;
+    meter.charge(2)?;
+    finish_derived_plan(
+        snapshot, candidate, request, accepted, meter, verify_snapshot, inventory,
+    )
+}
+fn finish_derived_plan(
+    snapshot: &ProjectSnapshot,
+    candidate: &CapturedProgram,
+    request: &OwnedPreviewRequest,
+    accepted: &super::owned_lifecycle::AcceptedPreviewLifecycle,
+    meter: &mut ProofMeter,
+    verify_snapshot: bool,
+    inventory: CommonFactInventory,
+) -> AdmissionResult<VerifiedOwnedPreviewPlan> {
     // Structural regeneration of retained recipes never settles independent
     // intentions. Their archive scenes are checked by the decision replay path.
     // Public preview still cannot make that comparison or issue write authority.

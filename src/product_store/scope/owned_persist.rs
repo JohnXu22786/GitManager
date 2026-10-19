@@ -436,18 +436,11 @@ fn reconstruct_recipe(
             ));
         }
     }
-    let accepted = AcceptedPreviewLifecycle::reconstruct(
+    let (_accepted, proof) = common_fact_admission::reconstruct_and_derive_retained(
         &basis,
         candidate,
         &layer.request,
         &layer.lifecycle,
-        meter,
-    )?;
-    let proof = common_fact_admission::derive_retained(
-        &basis,
-        candidate,
-        &layer.request,
-        &accepted,
         meter,
     )?;
     if inventory(&proof)? != layer.inventory {
