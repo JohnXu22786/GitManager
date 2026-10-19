@@ -186,21 +186,11 @@ fn bytes_digest(domain: IdentityDomain, bytes: &[u8]) -> Digest {
 /// typed values, and contains no whitespace. This is a versioned local format,
 /// not a claim of cross-language RFC 8785 floating-point canonicalization.
 pub fn canonical_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    fn sorted(value: JsonValue) -> JsonValue {
-        match value {
-            JsonValue::Object(map) => JsonValue::Object(
-                map.into_iter()
-                    .collect::<BTreeMap<_, _>>()
-                    .into_iter()
-                    .map(|(k, v)| (k, sorted(v)))
-                    .collect(),
-            ),
-            JsonValue::Array(array) => JsonValue::Array(array.into_iter().map(sorted).collect()),
-            scalar => scalar,
-        }
-    }
     serde_json::to_value(value)
-        .and_then(|v| serde_json::to_vec(&sorted(v)))
+        .and_then(|mut value| {
+            value.sort_all_objects();
+            serde_json::to_vec(&value)
+        })
         .map_err(|e| ContractError(e.to_string()))
 }
 pub fn canonical_digest<T: Serialize>(domain: IdentityDomain, value: &T) -> Result<Digest> {
@@ -5381,3 +5371,7 @@ impl Observation {
 #[cfg(test)]
 #[path = "product_contract/capture_stage_tests.rs"]
 mod capture_stage_tests;
+
+#[cfg(test)]
+#[path = "product_contract/capture_canonical_removal_tests.rs"]
+mod capture_canonical_removal_tests;

@@ -141,7 +141,6 @@ impl<'w> Shape<'w> {
         Ok(Container {
             shape: self,
             count: 0,
-            max_key: 0,
             object: false,
             outer: false,
         })
@@ -152,7 +151,6 @@ impl<'w> Shape<'w> {
         Ok(Container {
             shape: self,
             count: 0,
-            max_key: 0,
             object: true,
             outer: false,
         })
@@ -196,7 +194,6 @@ impl<'w> Shape<'w> {
 pub(super) struct Container<'a, 'w> {
     shape: &'a mut Shape<'w>,
     count: usize,
-    max_key: usize,
     object: bool,
     outer: bool,
 }
@@ -250,7 +247,6 @@ impl Container<'_, '_> {
                     .ok_or_else(|| self.shape.audit.overflow())?,
             )?;
         }
-        self.max_key = self.max_key.max(key.len());
         self.shape.pairs = self
             .shape
             .pairs
@@ -261,26 +257,12 @@ impl Container<'_, '_> {
     pub(super) fn end(self) -> Result<()> {
         self.shape.audit.pay(8)?;
         if self.object && self.shape.canonical {
-            self.shape.audit.pay(native::BULK_DESCRIPTOR + 24)?;
-            let c = self.shape.audit.comparator(self.max_key)?;
-            let bulk = native::btree_bulk::<String, JsonValue>(self.count, c)
-                .ok_or_else(|| self.shape.audit.overflow())?;
+            // Initial Value insertion/ownership remains paid at each key. With
+            // the pinned BTree representation, sort_all_objects is a no-op;
+            // only the final serializer's complete map traversal remains here.
+            self.shape.audit.pay(8)?;
             let iter = native::btree_iter(self.count).ok_or_else(|| self.shape.audit.overflow())?;
-            // Two FromIterator passes, each pair Vec + unchanged stable sort + bulk.
-            let sort = sort_bound::<(String, JsonValue)>(self.count, c, self.shape.audit)?;
-            let pairs = (self.count as u64)
-                .checked_mul(size_of::<(String, JsonValue)>() as u64)
-                .and_then(|n| n.checked_mul(2))
-                .and_then(|n| n.checked_add(4))
-                .ok_or_else(|| self.shape.audit.overflow())?;
-            let amount = bulk
-                .checked_add(iter)
-                .and_then(|n| n.checked_add(sort))
-                .and_then(|n| n.checked_add(pairs))
-                .and_then(|n| n.checked_mul(2))
-                .and_then(|n| n.checked_add(iter))
-                .ok_or_else(|| self.shape.audit.overflow())?;
-            self.shape.add(0, amount)?;
+            self.shape.add(0, iter)?;
         }
         if self.outer {
             self.shape.add(1, 1)?;
@@ -782,7 +764,7 @@ pub(super) fn canonical_bytes_audited<T: Serialize + ?Sized>(
     let mut shape = Shape::new(a)?;
     value.serialize(&mut shape)?;
     shape.reserve_output()?;
-    // The original native operation (including all sorted-object passes) is retained.
+    // Conversion and final serialization retain their original native boundaries.
     let bytes = canonical_bytes(&value)?;
     a.pay(0)?;
     Ok(bytes)
