@@ -132,9 +132,9 @@ fn canonical_removal_retains_literal_native_region_and_refusal_prefix() {
     assert_eq!(std::mem::size_of::<JsonValue>(), 32);
     assert_eq!(std::mem::size_of::<std::io::Error>(), 8);
     assert_eq!(std::mem::size_of::<capture_work::WorkState<'_>>(), 56);
-    assert_eq!(std::mem::size_of::<capture_canonical::Shape<'_>>(), 56);
+    assert_eq!(std::mem::size_of::<capture_canonical::Shape<'_>>(), 64);
     let value = DataValue::Integer { value: 7 };
-    let mut work = Work::new(6941);
+    let mut work = Work::new(7239);
     let actual = canonical_bytes_with_work(&value, &mut work).unwrap();
     assert_eq!(actual, br#"{"kind":"integer","value":7}"#);
     assert_eq!(actual, old_canonical_bytes(&value).unwrap());
@@ -143,9 +143,9 @@ fn canonical_removal_retains_literal_native_region_and_refusal_prefix() {
     // separate. FMT(128)=1855, S(128)=260 and serde-error owner85 remain paid.
     assert!(work.calls.ends_with(&[320, 1855, 8, 260, 5, 85, 2775, 0]));
     assert_eq!(work.left, 0);
-    // Independent preparation prefix4166 + native2775 =6941; one unit less
+    // Independent preparation prefix4464 + native2775 =7239; one unit less
     // reaches and refuses that native region, before its call or completion poll.
-    let mut work = Work::new(6940);
+    let mut work = Work::new(7238);
     assert_eq!(
         canonical_bytes_with_work(&value, &mut work),
         Err(ContractWorkError::Resource(WorkFailure::BudgetExhausted("canonical test fuel"))),

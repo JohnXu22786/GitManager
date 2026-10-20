@@ -203,6 +203,11 @@ pub(super) fn parse_app(bytes: &[u8], a: Audit<'_>) -> Result<AppDefinition> {
         Err(bounded_input::InputWorkError::Resource(error)) => return Err(error),
         Err(bounded_input::InputWorkError::ArithmeticOverflow) => return Err(a.overflow()),
     };
+    convert_app(value, a)
+}
+// App-only original post-intake Conversion; the paid miss transfers the same
+// untouched Value owner here. No admission/proof state is returned.
+pub(super) fn convert_app(value: JsonValue, a: Audit<'_>) -> Result<AppDefinition> {
     a.pay(9 + 65 * (8 * size_of::<usize>() as u64) + 2 * size_of::<usize>() as u64)?;
     let mut descriptor = Conversion {
         bytes: 0,

@@ -5,18 +5,18 @@ use serde_json::{json, Value};
 use std::io::Write;
 
 #[path = "../../tests/support/capture_source_fixture.rs"]
-mod fixture;
+pub(super) mod fixture;
 #[path = "../../tests/support/product_contract_fixture.rs"]
 mod rich;
 #[path = "../../tests/support/capture_native_oracle/product_contract.rs"]
-mod old;
+pub(super) mod old;
 
 #[derive(Default)]
-struct Work {
-    calls: Vec<u64>,
-    left: Option<u64>,
-    refuse: Option<usize>,
-    cause: Option<WorkFailure>,
+pub(super) struct Work {
+    pub(super) calls: Vec<u64>,
+    pub(super) left: Option<u64>,
+    pub(super) refuse: Option<usize>,
+    pub(super) cause: Option<WorkFailure>,
 }
 impl ContractWork for Work {
     fn charge(&mut self, n: u64) -> std::result::Result<(), WorkFailure> {
@@ -39,7 +39,7 @@ fn validated(app: &AppDefinition, work: &mut Work) -> ContractWorkResult<usize> 
     let state = WorkState::new(work);
     state.finish(app.validate_audited(Audit(Some(&state))).map(|facts| facts.canonical_len))
 }
-fn old_app(app: &AppDefinition) -> old::AppDefinition {
+pub(super) fn old_app(app: &AppDefinition) -> old::AppDefinition {
     serde_json::from_slice(&serde_json::to_vec(app).unwrap()).unwrap()
 }
 fn yes() -> Value { rich::yes() }
@@ -94,7 +94,7 @@ fn expression_cases() -> Vec<Value> {
         json!({"kind":"date_difference","later":{"kind":"today"},"earlier":{"kind":"today"}}),
     ]
 }
-fn complete_fixture() -> Value {
+pub(super) fn complete_fixture() -> Value {
     let mut app = fixture::minimal();
     app["entities"][0]["fields"].as_array_mut().unwrap().push(json!({"id":"numbers","label":"Numbers","value_type":{"kind":"list","item":{"kind":"integer"}}}));
     app["entities"][0]["unique"] = json!([["name"]]);
@@ -144,7 +144,7 @@ fn complete_fixture() -> Value {
     app["views"].as_array_mut().unwrap().push(json!({"id":"form","label":"Form","kind":{"kind":"form","action":"change_search","fields":[{"parameter":"value","label":"Value"}],"defaults":{"value":{"kind":"text","value":"default"}}},"actions":[],"keys":[]}));
     app
 }
-fn deepest_valid_fixture() -> Value {
+pub(super) fn deepest_valid_fixture() -> Value {
     let mut app = fixture::minimal();
     let mut typ = json!({"kind":"integer"});
     let mut value = json!({"kind":"integer","value":0});
@@ -273,7 +273,7 @@ fn app_length_counter_keeps_full_chunks_and_native_err_before_poll() {
         let outcome = {
             let state = WorkState::new(&mut work);
             let a = Audit(Some(&state));
-            let shape = Shape {audit:a,bytes:1076,nodes:158,pairs:75,native:7303,canonical:false,digest_copies:0};
+            let shape = Shape {audit:a,bytes:1076,nodes:158,pairs:75,native:7303,canonical:false,digest_copies:0,escaped:0,simple_app:false};
             reserve_app_count(&shape).unwrap(); // Actual ErrorImpl/FMT ownership reserve.
             let mut counter = AppLengthCounter {audit:a,size:usize::MAX-1,overflowed:false};
             assert_eq!(counter.write(b"x").unwrap(),1);
@@ -294,7 +294,7 @@ fn app_length_counter_keeps_full_chunks_and_native_err_before_poll() {
             state.finish(counter.finish(result))
         };
         assert_eq!(outcome,Err(ContractWorkError::Resource(WorkFailure::BudgetExhausted("capture work arithmetic overflow"))));
-        assert_eq!(work.calls,vec![96,320,1855,8,260,5,101,50671]);
+        assert_eq!(work.calls,vec![96,2,320,1855,8,260,5,101,50671]);
     }
     // Defensive display branch only: a finite independently produced native Err,
     // not evidence that a well-formed App spontaneously fails serialization.
@@ -304,12 +304,12 @@ fn app_length_counter_keeps_full_chunks_and_native_err_before_poll() {
     let outcome = {
         let state = WorkState::new(&mut work);
         let a = Audit(Some(&state));
-        reserve_app_count(&Shape {audit:a,bytes:1076,nodes:158,pairs:75,native:7303,canonical:false,digest_copies:0}).unwrap();
+        reserve_app_count(&Shape {audit:a,bytes:1076,nodes:158,pairs:75,native:7303,canonical:false,digest_copies:0,escaped:0,simple_app:false}).unwrap();
         let counter = AppLengthCounter {audit:a,size:17,overflowed:false};
         state.finish(counter.finish(Err(error)))
     };
     assert_eq!(outcome,Err(ContractWorkError::Contract(ContractError(expected))));
-    assert_eq!(work.calls,vec![96,320,1855,8,260,5,101,50671]);
+    assert_eq!(work.calls,vec![96,2,320,1855,8,260,5,101,50671]);
 }
 
 // Independent literal transcribed in the reviewed LITERAL-CONTROLS.json.
@@ -324,7 +324,7 @@ fn app_length_literal_payments_and_each_new_boundary_refuse_exactly() {
     app.validate().unwrap();
     assert_eq!(old::canonical_bytes(&old_app(&app)).unwrap().len(),1076);
     assert_eq!(size_of::<usize>(),8);
-    assert_eq!(size_of::<Shape<'_>>(),56);
+    assert_eq!(size_of::<Shape<'_>>(),64);
     assert_eq!(size_of::<AppLengthCounter<'_>>(),24);
     assert_eq!(size_of::<serde_json::Serializer<&mut AppLengthCounter<'_>>>(),8);
     assert_eq!(size_of::<serde_json::Result<()>>(),8);
@@ -340,32 +340,34 @@ fn app_length_literal_payments_and_each_new_boundary_refuse_exactly() {
         let mut shape = Shape::new(a).unwrap();
         a.pay(1).unwrap();
         shape.canonical = false;
+        a.pay(1).unwrap();
+        shape.simple_app = true;
         app.serialize(&mut shape).unwrap();
         assert_eq!((shape.bytes,shape.nodes,shape.pairs,shape.native,shape.digest_copies),(1076,158,75,7303,0));
     }
-    assert_eq!(descriptor_work.calls.iter().sum::<u64>(),68+1+13395);
-    let mut exact = Work {left:Some(237372),..Work::default()};
+    assert_eq!(descriptor_work.calls.iter().sum::<u64>(),358+2+13395+2*111+6*623);
+    let mut exact = Work {left:Some(207297),..Work::default()};
     assert_eq!(counted(&app,&mut exact),Ok(1076));
     assert_eq!(exact.left,Some(0));
-    assert_eq!(exact.calls.iter().sum::<u64>(),237372);
-    assert_eq!(&exact.calls[..5],&[0,96,170496,68,1]);
-    assert!(exact.calls.ends_with(&[96,320,1855,8,260,5,101,50671,0]));
-    assert_eq!(&exact.calls[3..exact.calls.len()-9],descriptor_work.calls.as_slice());
-    assert_eq!(exact.calls[..exact.calls.len()-2].iter().sum::<u64>(),186701);
-    let mut short = Work {left:Some(237371),..Work::default()};
+    assert_eq!(exact.calls.iter().sum::<u64>(),207297);
+    assert_eq!(&exact.calls[..6],&[0,96,170496,358,1,1]);
+    assert!(exact.calls.ends_with(&[96,2,320,1855,8,260,5,101,16343,0]));
+    assert_eq!(&exact.calls[3..exact.calls.len()-10],descriptor_work.calls.as_slice());
+    assert_eq!(exact.calls[..exact.calls.len()-2].iter().sum::<u64>(),190954);
+    let mut short = Work {left:Some(207296),..Work::default()};
     assert_eq!(counted(&app,&mut short),Err(ContractWorkError::Resource(WorkFailure::BudgetExhausted("app length test fuel"))));
-    assert_eq!(short.left,Some(50670));
+    assert_eq!(short.left,Some(16342));
     assert_eq!(short.calls.as_slice(),&exact.calls[..exact.calls.len()-1]);
-    assert_eq!(short.calls.last(),Some(&50671));
+    assert_eq!(short.calls.last(),Some(&16343));
     // Initial poll, stack arithmetic/storage, Shape/direct flag, first object,
     // first key/string byte, and actual first sequence/container/map callbacks.
-    let mut boundaries = vec![0,1,2,3,4,5,6,7,8,9,10,11,12];
+    let mut boundaries = vec![0,1,2,3,4,5,6,7,8,9,10,11,12,13,14];
     for amount in [18,20,34] {
         boundaries.push(exact.calls.iter().position(|&n|n==amount).unwrap());
     }
     // Reserve arithmetic, display descriptor/FMT/copy, Box descriptor/owner,
     // final native aggregate and success-only poll: every new tail payment.
-    boundaries.extend(exact.calls.len()-9..exact.calls.len());
+    boundaries.extend(exact.calls.len()-10..exact.calls.len());
     boundaries.sort_unstable();
     boundaries.dedup();
     for index in boundaries {
@@ -402,18 +404,18 @@ fn app_length_checked_reserve_and_descriptor_overflow_stay_typed() {
         let mut work = Work::default();
         let result = {
             let state = WorkState::new(&mut work);
-            let shape = Shape {audit:Audit(Some(&state)),bytes,nodes,pairs,native,canonical:false,digest_copies:0};
+            let shape = Shape {audit:Audit(Some(&state)),bytes,nodes,pairs,native,canonical:false,digest_copies:0,escaped:0,simple_app:false};
             state.finish(reserve_app_count(&shape))
         };
         assert_eq!(result,Err(ContractWorkError::Resource(WorkFailure::BudgetExhausted("capture work arithmetic overflow"))));
-        assert_eq!(work.calls,vec![96]); // Arithmetic prepaid; no error/native reserve or poll.
+        assert_eq!(work.calls,vec![96,2]); // Arithmetic prepaid; no error/native reserve or poll.
     }
     for which in 0..4 {
         let mut work = Work::default();
         let result = {
             let state = WorkState::new(&mut work);
             let a = Audit(Some(&state));
-            let mut shape = Shape {audit:a,bytes:0,nodes:0,pairs:0,native:0,canonical:false,digest_copies:0};
+            let mut shape = Shape {audit:a,bytes:0,nodes:0,pairs:0,native:0,canonical:false,digest_copies:0,escaped:0,simple_app:false};
             let result = match which {
                 0 => {shape.bytes=u64::MAX;shape.add(1,0)},
                 1 => {shape.native=u64::MAX;shape.add(0,1)},
@@ -440,7 +442,7 @@ fn app_length_reserve_usize_conversion_is_checked_on_32_bit_targets() {
     let mut work = Work::default();
     let result = {
         let state = WorkState::new(&mut work);
-        let shape = Shape {audit:Audit(Some(&state)),bytes:u64::from(u32::MAX)+1,nodes:0,pairs:0,native:0,canonical:false,digest_copies:0};
+        let shape = Shape {audit:Audit(Some(&state)),bytes:u64::from(u32::MAX)+1,nodes:0,pairs:0,native:0,canonical:false,digest_copies:0,escaped:0,simple_app:false};
         state.finish(reserve_app_count(&shape))
     };
     assert_eq!(result,Err(ContractWorkError::Resource(WorkFailure::BudgetExhausted("capture work arithmetic overflow"))));
@@ -498,17 +500,17 @@ fn app_length_real_validator_wire_boundary_keeps_semantic_precedence() {
         assert_ne!(expected,"program exceeds byte budget");
         let mut work = Work::default();
         assert_eq!(validated(&app,&mut work),Err(ContractWorkError::Contract(ContractError(expected))));
-        assert!(!work.calls.windows(5).any(|w|w==[0,96,170496,68,1]));
+        assert!(!work.calls.windows(6).any(|w|w==[0,96,170496,358,1,1]));
     }
     // This is component semantic parity on a recording work carrier, NOT a10M
     // host-fit claim. Source capture's earlier raw-size gate is tested separately.
 }
 
-fn source_result(capture: &CapturedProgram, work: &mut Work) -> ContractWorkResult<()> {
+pub(super) fn source_result(capture: &CapturedProgram, work: &mut Work) -> ContractWorkResult<()> {
     let state = WorkState::new(work);
     state.finish(capture.validate_audited(Audit(Some(&state))).map(|_|()))
 }
-fn capture_minimal() -> CapturedProgram {
+pub(super) fn capture_minimal() -> CapturedProgram {
     CapturedProgram::capture(&serde_json::to_vec(&fixture::minimal()).unwrap(),"project",Producer::UserAuthored,None).unwrap()
 }
 #[test]
@@ -525,8 +527,8 @@ fn app_length_single_source_count_and_publication_fail_closed() {
     source_result(&capture,&mut direct).unwrap();
     assert_eq!(validation_counts().captures,1);
     assert_eq!(validation_counts().apps,1);
-    let starts: Vec<usize> = direct.calls.windows(5).enumerate().filter_map(|(i,w)| {
-        (w==[0,96,170496,68,1]).then_some(i)
+    let starts: Vec<usize> = direct.calls.windows(6).enumerate().filter_map(|(i,w)| {
+        (w==[0,96,170496,358,1,1]).then_some(i)
     }).collect();
     assert_eq!(starts.len(),1);
     // Local trace locators reject missing/ambiguous signatures. They do not
@@ -541,16 +543,16 @@ fn app_length_single_source_count_and_publication_fail_closed() {
     let program_hash = unique(&direct.calls,0,direct.calls.len(),&[0,96,253]);
     let semantic_hash = unique(&direct.calls,0,direct.calls.len(),&[0,96,298]);
     assert!(starts[0]<source_hash && source_hash<program_hash && program_hash<semantic_hash);
-    let count_tail = unique(&direct.calls,starts[0],source_hash,&[96,320,1855,8,260,5,101,50671,0]);
-    let count_native = count_tail+7;
-    assert_eq!(&direct.calls[count_native..count_native+2],&[50671,0]);
+    let count_tail = unique(&direct.calls,starts[0],source_hash,&[96,2,320,1855,8,260,5,101,16343,0]);
+    let count_native = count_tail+8;
+    assert_eq!(&direct.calls[count_native..count_native+2],&[16343,0]);
     // Domain framing is8/9/18 bytes; each complete hash ends at its real native
     // handoff412 and success0, after FMT(2)*32=2144. No native observer is added.
     let source_end = unique(&direct.calls,source_hash,program_hash,&[320,2144,12,412,0])+4;
     let program_end = unique(&direct.calls,program_hash,semantic_hash,&[320,2144,12,412,0])+4;
     let semantic_end = unique(&direct.calls,semantic_hash,direct.calls.len(),&[320,2144,12,412,0])+4;
-    assert_eq!(&direct.calls[source_end+1..source_end+11],&[3,5,128,3,5,128,1,28,0,68]);
-    assert_eq!(&direct.calls[program_end+1..program_end+6],&[3,5,128,28,1]);
+    assert_eq!(&direct.calls[source_end+1..source_end+11],&[3,5,128,3,5,128,1,28,0,96]);
+    assert_eq!(&direct.calls[program_end+1..program_end+6],&[3,5,128,28,96]);
     assert_eq!(&direct.calls[semantic_end+1..],&[3,5,128,1]);
     let first_select = source_end+8;
     let second_select = program_end+4;
@@ -559,7 +561,7 @@ fn app_length_single_source_count_and_publication_fail_closed() {
     // native reserve and success poll immediately before the next domain hash.
     // The observed reserve is only a locator; its quantity is not an oracle here.
     for (start,hash) in [(first_select+1,program_hash),(second_select+1,semantic_hash)] {
-        unique(&direct.calls,start,hash,&[0,68]);
+        unique(&direct.calls,start,hash,&[0,96,170873,358,1,1]);
         assert_eq!(unique(&direct.calls,start,hash,&[320,1855,8,260,5,85]),hash-8);
         assert!(direct.calls[hash-2]>0);
         assert_eq!(direct.calls[hash-1],0);
@@ -599,7 +601,7 @@ fn app_length_single_source_count_and_publication_fail_closed() {
         ("second selection",4+second_select,4+second_select+1),
     ] {
         // Fund only the observed already-executed prefix. Literal27 refuses28;
-        // literal28 admits selection, then the original68/1 header refuses.
+        // literal28 admits selection, then the positive output/mutation setup96 refuses.
         let prefix = all.calls[..index].iter().try_fold(0u64,|n,&x|n.checked_add(x)).unwrap();
         for (allowance,refused) in [(27u64,index),(28u64,next_failure)] {
             let mut work = Work {left:Some(prefix.checked_add(allowance).unwrap()),..Work::default()};
@@ -648,7 +650,7 @@ fn app_length_single_source_count_and_publication_fail_closed() {
         });
         assert_eq!(result,Err(ContractWorkError::Contract(ContractError(expected))));
         assert_eq!((validation_counts().captures,validation_counts().apps),(1,[1,1,1,1,0][fault]));
-        assert_eq!(work.calls.windows(5).filter(|w|*w==[0,96,170496,68,1]).count(),[1,1,1,1,0][fault]);
+        assert_eq!(work.calls.windows(6).filter(|w|*w==[0,96,170496,358,1,1]).count(),[1,1,1,1,0][fault]);
         assert_eq!(work.calls.windows(3).filter(|w|*w==[0,96,248]).count(),[0,1,1,1,0][fault]);
         assert_eq!(work.calls.windows(3).filter(|w|*w==[0,96,253]).count(),[0,0,1,1,0][fault]);
         assert_eq!(work.calls.windows(3).filter(|w|*w==[0,96,298]).count(),[0,0,0,1,0][fault]);
@@ -681,9 +683,20 @@ fn app_length_single_source_count_and_publication_fail_closed() {
         }).unwrap();
         assert_eq!(validation_counts().apps,1);
         assert_eq!(validation_counts().captures,1);
-        assert_eq!(work.calls.windows(5).filter(|w|*w==[0,96,170496,68,1]).count(),1);
+        assert_eq!(work.calls.windows(6).filter(|w|*w==[0,96,170496,358,1,1]).count(),1);
         assert_eq!(&work.calls[4..4+direct.calls.len()],direct.calls.as_slice());
         assert_eq!(serde_json::to_vec(&next).unwrap(),next_before);
     }
     assert_eq!((serde_json::to_vec(&capture).unwrap(),serde_json::to_vec(&data).unwrap()),before);
+}
+
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn closed_value_simple_app_count_is_complete() {
+    let app: AppDefinition = serde_json::from_str(MINIMAL_LITERAL).unwrap();
+    let mut work = Work::default();
+    assert_eq!(counted(&app,&mut work),Ok(1076));
+    assert_eq!(work.calls.iter().sum::<u64>(),207297);
+    assert_eq!(&work.calls[..6], &[0,96,170496,358,1,1]);
+    assert!(work.calls.ends_with(&[96,2,320,1855,8,260,5,101,16343,0]));
 }

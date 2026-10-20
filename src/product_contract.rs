@@ -658,8 +658,13 @@ impl<'a, 'w> Validator<'a, 'w> {
         a.pay(8)?;
         a.check_id(name)?;
         let available = !a.has(env, name)?;
+        a.pay(8)?;
+        if a.enabled() && available {
+            a.pay(1)?;
+        } else {
         a.pay(2)?;a.format(name.len().checked_add(35).ok_or_else(|| a.overflow())?)?;
         a.require_owned(available, format!("binding shadows existing variable: {name}"))?;
+        }
         let mut env = a.clone_owned(env)?;
         a.insert_string(&mut env, name, typ)?;
         Ok(env)
@@ -676,8 +681,14 @@ impl<'a, 'w> Validator<'a, 'w> {
         a.pay(8)?;
         let actual = self.expr(expr, env, depth, state)?;
         let equal = a.type_equal(&actual, expected)?;
+        a.pay(8)?;
+        if a.enabled() && equal {
+            a.pay(1)?;
+            Ok(())
+        } else {
         a.type_message(44, expected, &actual)?;
         a.require_owned(equal, format!("expression type mismatch: expected {expected:?}, found {actual:?}"))
+        }
     }
     fn list_item(
         &mut self,
@@ -916,8 +927,14 @@ impl<'a, 'w> Validator<'a, 'w> {
         let compatible = a.type_equal(&actual, expected)? || match expected {
             Type::Optional { item } => a.type_equal(item, &actual)?, _ => false,
         };
+        a.pay(8)?;
+        if a.enabled() && compatible {
+            a.pay(1)?;
+            Ok(())
+        } else {
         a.type_message(44, expected, &actual)?;
         a.require_owned(compatible, format!("assignment type mismatch: expected {expected:?}, found {actual:?}"))
+        }
     }
     fn assignments(
         &mut self,
@@ -945,8 +962,13 @@ impl<'a, 'w> Validator<'a, 'w> {
             for field in fields {
             a.pay(8)?;
                 let present = a.has(values, &field.id)? || matches!(field.value_type, Type::Optional { .. });
+        a.pay(8)?;
+        if a.enabled() && present {
+            a.pay(1)?;
+        } else {
                 a.pay(2)?;a.format(field.id.len().checked_add(24).ok_or_else(||a.overflow())?)?;
                 a.require_owned(present, format!("missing required field: {}", field.id))?;
+        }
             }
         }
         Ok(())
@@ -1707,7 +1729,7 @@ impl CapturedProgram {
         a.require(self.artifact.kind == ArtifactKind::GeneratedApp
             && a.eq_str(&self.artifact.language, LANGUAGE_VERSION)?, "unsupported executable artifact")?;
         a.require(self.source_bytes.len() <= MAX_WIRE_BYTES, "source exceeds byte limit")?;
-        let actual: AppDefinition = if a.enabled() {capture_typed::parse_app(&self.source_bytes,a)?} else {parse(&self.source_bytes)?};
+        let actual: AppDefinition = if a.enabled() {return capture_canonical::validate_closed_value_capture(self,a)} else {parse(&self.source_bytes)?};
         let facts=actual.validate_audited(a)?;
         a.require(a.equal_owned(&actual,&self.program)?, "source bytes do not represent captured program")?;
         let raw=capture_validation::bytes_digest_audited(IdentityDomain::Source,&self.source_bytes,a)?;

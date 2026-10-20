@@ -465,3 +465,204 @@ fn shared_native_formula_literals_have_independent_boundary_expectations() {
         assert_eq!(validation_counts(),ValidationCounts::default());
     }
 }
+
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn closed_value_paid_capture_uses_source_relation_before_v1() {
+    let c = capture(fixture::minimal());
+    let before = serde_json::to_vec(&c).unwrap();
+    reset_validation_counts();
+    let mut work = Work::default();
+    let state = capture_work::WorkState::new(&mut work);
+    let result = state.finish(c.validate_audited(Audit(Some(&state))));
+    assert!(result.is_ok());
+    assert_eq!(validation_counts().apps, 1);
+    // Independent F_C=576 and R_C=212 on the authenticated 64-bit target.
+    // This root reserve occurs after actual intake, before the first relation node.
+    assert_eq!(work.calls.windows(4).filter(|w| *w == [96,149972,6,12]).count(),1);
+    assert_eq!(serde_json::to_vec(&c).unwrap(),before);
+}
+
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn lazy_error_success_keeps_literal_conditions_and_removes_format_work() {
+    let mut work = Work::default();
+    {
+        let state = capture_work::WorkState::new(&mut work);
+        let a = Audit(Some(&state));
+        a.check_id("x").unwrap();
+    }
+    assert_eq!(work.calls,[4,1,9,1,4,1]);
+    let mut work = Work::default();
+    {
+        let state = capture_work::WorkState::new(&mut work);
+        Audit(Some(&state)).unique(["x"]).unwrap();
+    }
+    assert_eq!(work.calls,[9,1,3,4,1,9,1,4,1,6,360,395,8,1,1,2,1]);
+    let mut app:AppDefinition=serde_json::from_value(fixture::minimal()).unwrap();
+    app.entities[0].fields=vec![FieldDefinition {id:"x".into(),label:"X".into(),value_type:Type::Optional {item:Box::new(Type::Date)}}];
+    let env=Environment::new();
+    let mut work=Work::default();
+    {
+        let state=capture_work::WorkState::new(&mut work);
+        let v=Validator::new(&app,Audit(Some(&state)));
+        let bound=v.bound(&env,"x",Type::Boolean).unwrap();
+        assert_eq!(bound,BTreeMap::from([("x".to_owned(),Type::Boolean)]));
+        assert!(env.is_empty());
+    }
+    assert_eq!(&work.calls[..12],&[8,4,1,9,1,4,1,276,6,98,8,1]);
+    for (method,expected,total) in [(0,Type::Date,50),(1,Type::Date,50),(1,Type::Optional {item:Box::new(Type::Date)},54)] {
+        let mut work=Work::default();
+        {
+            let state=capture_work::WorkState::new(&mut work);
+            let mut v=Validator::new(&app,Audit(Some(&state)));
+            if method==0 {v.expect(&Expr::Today,&env,&expected,0,true).unwrap();}
+            else {v.assignment(&Expr::Today,&env,&expected,0).unwrap();}
+            assert_eq!(v.nodes,1);
+        }
+        let expected=if total==50 {vec![8,8,8,1,12,4,8,1]} else {vec![8,8,8,1,12,4,4,8,1]};
+        assert_eq!(work.calls,expected);
+        assert_eq!(work.calls.iter().sum::<u64>(),total);
+    }
+    let mut work=Work::default();
+    {
+        let state=capture_work::WorkState::new(&mut work);
+        let mut v=Validator::new(&app,Audit(Some(&state)));
+        v.assignments("row",&BTreeMap::new(),&env,0,true).unwrap();
+    }
+    assert_eq!(work.calls,[8,2,1,8,8,1,3,3,5,6,5,5,8,276,6,98,8,1]);
+}
+
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn lazy_error_selection_and_failure_reserves_preserve_first_typed_cause() {
+    for (id,expected) in [("x",vec![4,1,9,1,4,1]),("!",vec![4,1,9,1,4,2,320,325,8,44,1])] {
+        let mut work=Work::default();
+        let state=capture_work::WorkState::new(&mut work);
+        let result=state.finish(Audit(Some(&state)).check_id(id));
+        if id=="x" {assert_eq!(result,Ok(()));}
+        else {assert_eq!(result,Err(ContractWorkError::Contract(ContractError("invalid stable ID: !".into()))));}
+        assert_eq!(work.calls,expected);
+        for index in 0..expected.len() {
+            for cancel in [true,false] {
+                let prefix=expected[..=index].iter().sum::<u64>();
+                let mut work=Work {fail_call:cancel.then_some(index+1),remaining:(!cancel).then_some(prefix-1),..Work::default()};
+                let state=capture_work::WorkState::new(&mut work);
+                let a=Audit(Some(&state));
+                let result=a.check_id(id);
+                assert!(result.is_err());
+                assert!(a.pay(0).is_err());
+                let result=state.finish(result);
+                let cause=if cancel {WorkFailure::Cancelled} else {WorkFailure::BudgetExhausted("source test fuel")};
+                assert_eq!(result,Err(ContractWorkError::Resource(cause)));
+                assert_eq!(work.calls,&expected[..=index]);
+            }
+        }
+    }
+}
+
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn lazy_error_failures_match_original_bytes_and_check_order() {
+    let mut app:AppDefinition=serde_json::from_value(fixture::minimal()).unwrap();
+    app.entities[0].fields=vec![FieldDefinition {id:"x".into(),label:"X".into(),value_type:Type::Text}];
+    let occupied=Environment::from([("x".to_owned(),Type::Boolean)]);
+    let empty=Environment::new();
+    for (method,expected,suffix) in [
+        (0,"duplicate ID: x",vec![8,2,320,246,8,34,1]),
+        (1,"binding shadows existing variable: x",vec![8,2,320,558,8,76,1]),
+        (2,"expression type mismatch: expected Text, found Date",vec![8,3,4,4,320,1575,8,220,1]),
+        (3,"assignment type mismatch: expected Text, found Date",vec![8,3,4,4,320,1575,8,220,1]),
+        (4,"missing required field: x",vec![8,2,320,395,8,54,1]),
+    ] {
+        let run=|a:Audit<'_>|->Result<()> {
+            let mut validator=Validator::new(&app,a);
+            match method {
+                0=>a.unique(["x","x","INVALID"]),
+                1=>validator.bound(&occupied,"x",Type::Date).map(|_|()),
+                2=>validator.expect(&Expr::Today,&empty,&Type::Text,0,true),
+                3=>validator.assignment(&Expr::Today,&empty,&Type::Text,0),
+                _=>validator.assignments("row",&BTreeMap::new(),&empty,0,true),
+            }
+        };
+        assert_eq!(run(Audit::none()),Err(ContractError(expected.into())));
+        let mut trace=Work::default();let state=capture_work::WorkState::new(&mut trace);
+        assert_eq!(state.finish(run(Audit(Some(&state)))),Err(ContractWorkError::Contract(ContractError(expected.into()))));
+        assert!(trace.calls.ends_with(&suffix));
+        for index in trace.calls.len()-suffix.len()..trace.calls.len() {
+            for cancel in [true,false] {
+                let prefix=trace.calls[..=index].iter().sum::<u64>();
+                let mut work=Work {fail_call:cancel.then_some(index+1),remaining:(!cancel).then_some(prefix-1),..Work::default()};
+                let state=capture_work::WorkState::new(&mut work);let a=Audit(Some(&state));
+                let result=run(a);assert!(result.is_err());assert!(a.pay(0).is_err());
+                let cause=if cancel {WorkFailure::Cancelled}else{WorkFailure::BudgetExhausted("source test fuel")};
+                assert_eq!(state.finish(result),Err(ContractWorkError::Resource(cause)));
+                assert_eq!(work.calls,&trace.calls[..=index]);
+            }
+        }
+        assert_eq!(occupied,Environment::from([("x".to_owned(),Type::Boolean)]));
+    }
+    for id in ["".to_owned(),"x".repeat(129),"!x".into(),"x!".into(),"\"\\\nβ".into()] {
+        let expected=format!("invalid stable ID: {id}");
+        assert_eq!(Audit::none().check_id(&id),Err(ContractError(expected.clone())));
+        let mut work=Work::default();let state=capture_work::WorkState::new(&mut work);
+        assert_eq!(state.finish(Audit(Some(&state)).check_id(&id)),Err(ContractWorkError::Contract(ContractError(expected))));
+    }
+    for id in ["a0_-".to_owned(),"x".repeat(128)] {
+        let mut work=Work::default();let state=capture_work::WorkState::new(&mut work);
+        assert_eq!(state.finish(Audit(Some(&state)).check_id(&id)),Ok(()));
+    }
+}
+
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn lazy_error_all_success_selectors_and_outcomes_refuse_exactly() {
+    let mut app:AppDefinition=serde_json::from_value(fixture::minimal()).unwrap();
+    app.entities[0].fields=vec![FieldDefinition {id:"x".into(),label:"X".into(),value_type:Type::Optional {item:Box::new(Type::Date)}}];
+    let empty=Environment::new();
+    let before=serde_json::to_vec(&app).unwrap();
+    for method in 0..6 {
+        let run=|a:Audit<'_>|->Result<()> {
+            let mut v=Validator::new(&app,a);
+            match method {
+                0=>a.unique(["x"]),
+                1=>v.bound(&empty,"x",Type::Boolean).map(|bound|assert_eq!(bound,Environment::from([("x".into(),Type::Boolean)]))),
+                2=>v.expect(&Expr::Today,&empty,&Type::Date,0,true),
+                3=>v.assignment(&Expr::Today,&empty,&Type::Date,0),
+                4=>v.assignments("row",&BTreeMap::new(),&empty,0,true),
+                _=>v.assignment(&Expr::Today,&empty,&Type::Optional {item:Box::new(Type::Date)},0),
+            }
+        };
+        assert_eq!(run(Audit::none()),Ok(()));
+        let mut trace=Work::default();let state=capture_work::WorkState::new(&mut trace);
+        assert_eq!(state.finish(run(Audit(Some(&state)))),Ok(()));
+        let selector=match method {0=>12,1=>10,2|3=>6,4=>16,_=>7};
+        assert_eq!(&trace.calls[selector..selector+2],&[8,1],"method{method}");
+        for index in selector..=selector+1 {
+            let funded=trace.calls[..=index].iter().try_fold(0u64,|n,&x|n.checked_add(x)).unwrap();
+            let mut work=Work {remaining:Some(funded),..Work::default()};
+            let state=capture_work::WorkState::new(&mut work);let a=Audit(Some(&state));
+            let result=run(a);
+            if index+1==trace.calls.len() {
+                assert_eq!(state.finish(result),Ok(()));assert_eq!(work.calls,trace.calls);
+            } else {
+                assert!(a.pay(0).is_err());
+                assert_eq!(state.finish(result),Err(ContractWorkError::Resource(WorkFailure::BudgetExhausted("source test fuel"))));
+                assert_eq!(work.calls,&trace.calls[..=index+1]);
+            }
+            assert_eq!(work.remaining,Some(0));
+        }
+        for index in 0..trace.calls.len() {
+            for cancel in [true,false] {
+                let prefix=trace.calls[..=index].iter().try_fold(0u64,|n,&x|n.checked_add(x)).unwrap();
+                let mut work=Work {fail_call:cancel.then_some(index+1),remaining:(!cancel).then_some(prefix-1),..Work::default()};
+                let state=capture_work::WorkState::new(&mut work);let a=Audit(Some(&state));
+                let result=run(a);assert!(result.is_err());assert!(a.pay(0).is_err());
+                let cause=if cancel {WorkFailure::Cancelled}else{WorkFailure::BudgetExhausted("source test fuel")};
+                assert_eq!(state.finish(result),Err(ContractWorkError::Resource(cause)));
+                assert_eq!(work.calls,&trace.calls[..=index],"method{method}, callback{index}");
+                assert!(empty.is_empty());assert_eq!(serde_json::to_vec(&app).unwrap(),before);
+            }
+        }
+    }
+}

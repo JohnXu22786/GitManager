@@ -158,6 +158,11 @@ impl<'a> Audit<'a> {
             self.pay(1)?;
             valid
         };
+        self.pay(4)?;
+        if valid {
+            self.pay(1)?;
+            return Ok(());
+        }
         self.pay(2)?;
         let bound = id.len().checked_add(19).ok_or_else(|| self.overflow())?;
         self.format(bound)?;
@@ -241,9 +246,14 @@ impl<'a> Audit<'a> {
             self.check_id(id)?;
             self.insert::<&str, ()>(seen.len(), self.comparator(id.len())?)?;
             let inserted = seen.insert(id);
+            self.pay(8)?;
+            if self.enabled() && inserted {
+                self.pay(1)?;
+            } else {
             self.pay(2)?;
             self.format(id.len().checked_add(14).ok_or_else(|| self.overflow())?)?;
             self.require_owned(inserted, format!("duplicate ID: {id}"))?;
+            }
         }
         self.pay(1)?;
         self.bounded(seen.len())

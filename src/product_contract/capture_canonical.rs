@@ -23,10 +23,16 @@ pub(super) struct Shape<'w> {
     native: u64,
     canonical: bool,
     pub(super) digest_copies: u64,
+    escaped: u64,
+    simple_app: bool,
 }
 impl<'w> Shape<'w> {
     pub(super) fn new(audit: Audit<'w>) -> Result<Self> {
-        audit.pay(12 + size_of::<Self>() as u64)?;
+        // The leaf-only X scratch is funded once per fresh descriptor. Constants
+        // fail compilation on target-width overflow, before any native operation.
+        const SCRATCH: usize = 4 * (16 + 4 * size_of::<usize>() + size_of::<Option<u64>>());
+        audit.pay((12 + size_of::<Self>() + 8 + 2 * size_of::<u64>()
+            + 2 * size_of::<bool>() + SCRATCH) as u64)?;
         Ok(Self {
             audit,
             bytes: 0,
@@ -35,6 +41,8 @@ impl<'w> Shape<'w> {
             native: 0,
             canonical: true,
             digest_copies: 0,
+            escaped: 0,
+            simple_app: false,
         })
     }
     fn add(&mut self, bytes: u64, native: u64) -> Result<()> {
@@ -61,6 +69,24 @@ impl<'w> Shape<'w> {
         self.node()?;
         self.audit.pay(12)?;
         let mut encoded = 2u64;
+        self.audit.pay(2)?;
+        if self.simple_app {
+        for byte in value.bytes() {
+            self.audit.pay(14)?;
+            let n = match byte {
+                b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 8 | 12 => 2,
+                0..=31 => 6,
+                _ => 1,
+            };
+            encoded = encoded
+                .checked_add(n)
+                .ok_or_else(|| self.audit.overflow())?;
+            if n != 1 {
+                self.escaped = self.escaped.checked_add(1)
+                    .ok_or_else(|| self.audit.overflow())?;
+            }
+        }
+        } else {
         for byte in value.bytes() {
             self.audit.pay(8)?;
             let n = match byte {
@@ -71,6 +97,7 @@ impl<'w> Shape<'w> {
             encoded = encoded
                 .checked_add(n)
                 .ok_or_else(|| self.audit.overflow())?;
+        }
         }
         self.audit.pay(12)?;
         let copy = if self.canonical {
@@ -173,13 +200,21 @@ impl<'w> Shape<'w> {
             .ok_or_else(|| self.audit.overflow())?;
         self.add(0, amount)?;
         self.audit.pay(64)?;
-        let writes = self
-            .bytes
+        self.audit.pay(2)?;
+        let writes = if self.simple_app {
+            self.nodes.checked_mul(4)
+                .and_then(|n| n.checked_add(self.escaped.checked_mul(2)?))
+                .and_then(|n| n.checked_add(2))
+                .ok_or_else(|| self.audit.overflow())?
+        } else {
+            self
+                .bytes
             .checked_mul(2)
             .and_then(|n| n.checked_add(self.nodes.checked_mul(4)?))
             .and_then(|n| n.checked_add(self.pairs.checked_mul(4)?))
             .and_then(|n| n.checked_add(2))
-            .ok_or_else(|| self.audit.overflow())?;
+            .ok_or_else(|| self.audit.overflow())?
+        };
         self.add(
             0,
             writes.checked_mul(8).ok_or_else(|| self.audit.overflow())?,
@@ -814,13 +849,21 @@ fn reserve_app_count(shape: &Shape<'_>) -> Result<()> {
     let a = shape.audit;
     a.pay(96)?;
     usize::try_from(shape.bytes).map_err(|_| a.overflow())?;
-    let writes = shape
-        .bytes
+    a.pay(2)?;
+    let writes = if shape.simple_app {
+        shape.nodes.checked_mul(4)
+            .and_then(|n| n.checked_add(shape.escaped.checked_mul(2)?))
+            .and_then(|n| n.checked_add(2))
+            .ok_or_else(|| a.overflow())?
+    } else {
+        shape
+            .bytes
         .checked_mul(2)
         .and_then(|n| n.checked_add(shape.nodes.checked_mul(4)?))
         .and_then(|n| n.checked_add(shape.pairs.checked_mul(4)?))
         .and_then(|n| n.checked_add(2))
-        .ok_or_else(|| a.overflow())?;
+        .ok_or_else(|| a.overflow())?
+    };
     let counter = a.usize(size_of::<AppLengthCounter<'_>>())?;
     let serializer = a.usize(size_of::<serde_json::Serializer<&mut AppLengthCounter<'_>>>())?;
     let result = a.usize(size_of::<serde_json::Result<()>>())?;
@@ -880,6 +923,8 @@ pub(super) fn app_canonical_len_audited(app: &AppDefinition, a: Audit<'_>) -> Re
     let mut shape = Shape::new(a)?;
     a.pay(1)?;
     shape.canonical = false;
+    a.pay(1)?;
+    shape.simple_app = true;
     app.serialize(&mut shape)?;
     reserve_app_count(&shape)?;
     let mut counter = AppLengthCounter {
@@ -1426,3 +1471,11 @@ pub(super) fn reserve_from_iter<K, V>(len: usize, comparator: u64, a: Audit<'_>)
 #[cfg(test)]
 #[path = "capture_app_length_tests.rs"]
 mod app_length_tests;
+
+#[path = "capture_closed_value.rs"]
+mod closed_value;
+pub(super) use closed_value::validate_closed_value_capture;
+
+#[cfg(test)]
+#[path = "capture_closed_value_tests.rs"]
+mod closed_value_tests;
