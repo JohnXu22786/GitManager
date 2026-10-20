@@ -122,7 +122,8 @@ fn closed_value_representative_sources_keep_reviewed_complete_payments() {
         // all three new128 control packets and the actual2240 owner root pay.
         let bound_additions = 3 * 128 + 2240;
         assert_eq!(work.calls.iter().sum::<u64>() + 5,
-            expected - removed + additions - removed_count + bound_additions);
+            expected - removed + additions - removed_count + bound_additions
+                - super::checked_tag_tests::removed_tag_units(&c));
         eprintln!("complete source old={expected} removed_descriptor={removed} removed_count={removed_count} K={k} L={l} added={additions} bound_added={bound_additions} actual={}", work.calls.iter().sum::<u64>() + 5);
     }
 }

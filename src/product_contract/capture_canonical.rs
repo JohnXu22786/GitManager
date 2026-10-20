@@ -1555,3 +1555,7 @@ mod source_wire_bound_tests;
 #[cfg(test)]
 #[path = "capture_synthetic_count_tests.rs"]
 mod synthetic_count_tests;
+
+#[cfg(test)]
+#[path = "capture_checked_tag_tests.rs"]
+mod checked_tag_tests;

@@ -164,6 +164,20 @@ pub(in super::super) fn validate_closed_value_capture(
         }};
     }
 
+    // Only after this same immutable object's complete successful tag probe.
+    // Keep the second traversal and exact key check; the String leaf is proven.
+    macro_rules! checked_kind_field {
+        ($a:ident, $cursor:ident) => {{
+            $a.pay(8)?;
+            let Some((key, _)) = $cursor.next() else {
+                relation_result!($a, false);
+            };
+            if !$a.eq_str(key, "kind")? {
+                relation_result!($a, false);
+            }
+        }};
+    }
+
     fn rel_type(v: &JsonValue, p: &Type, a: Audit<'_>) -> Result<bool> {
         a.pay(12)?;
         let JsonValue::Object(m) = v else {
@@ -189,13 +203,7 @@ pub(in super::super) fn validate_closed_value_capture(
             Type::Boolean => {
                 a.map_iter(m.len())?;
                 let mut cursor = m.iter();
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "boolean", a)?
-                );
+                checked_kind_field!(a, cursor);
                 a.pay(4)?;
                 let end = cursor.next().is_none();
                 relation_result!(a, end);
@@ -203,13 +211,7 @@ pub(in super::super) fn validate_closed_value_capture(
             Type::Integer => {
                 a.map_iter(m.len())?;
                 let mut cursor = m.iter();
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "integer", a)?
-                );
+                checked_kind_field!(a, cursor);
                 a.pay(4)?;
                 let end = cursor.next().is_none();
                 relation_result!(a, end);
@@ -217,13 +219,7 @@ pub(in super::super) fn validate_closed_value_capture(
             Type::Text => {
                 a.map_iter(m.len())?;
                 let mut cursor = m.iter();
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "text", a)?
-                );
+                checked_kind_field!(a, cursor);
                 a.pay(4)?;
                 let end = cursor.next().is_none();
                 relation_result!(a, end);
@@ -231,13 +227,7 @@ pub(in super::super) fn validate_closed_value_capture(
             Type::Date => {
                 a.map_iter(m.len())?;
                 let mut cursor = m.iter();
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "date", a)?
-                );
+                checked_kind_field!(a, cursor);
                 a.pay(4)?;
                 let end = cursor.next().is_none();
                 relation_result!(a, end);
@@ -252,13 +242,7 @@ pub(in super::super) fn validate_closed_value_capture(
                     source_child,
                     rel_string(source_child, entity, a)?
                 );
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "reference", a)?
-                );
+                checked_kind_field!(a, cursor);
                 a.pay(4)?;
                 let end = cursor.next().is_none();
                 relation_result!(a, end);
@@ -270,13 +254,7 @@ pub(in super::super) fn validate_closed_value_capture(
                     a.pay(2)?;
                     rel_type(source_child, (item).as_ref(), a)?
                 });
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "list", a)?
-                );
+                checked_kind_field!(a, cursor);
                 a.pay(4)?;
                 let end = cursor.next().is_none();
                 relation_result!(a, end);
@@ -288,13 +266,7 @@ pub(in super::super) fn validate_closed_value_capture(
                     a.pay(2)?;
                     rel_type(source_child, (item).as_ref(), a)?
                 });
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "optional", a)?
-                );
+                checked_kind_field!(a, cursor);
                 a.pay(4)?;
                 let end = cursor.next().is_none();
                 relation_result!(a, end);
@@ -327,13 +299,7 @@ pub(in super::super) fn validate_closed_value_capture(
             DataValue::Null => {
                 a.map_iter(m.len())?;
                 let mut cursor = m.iter();
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "null", a)?
-                );
+                checked_kind_field!(a, cursor);
                 a.pay(4)?;
                 let end = cursor.next().is_none();
                 relation_result!(a, end);
@@ -341,13 +307,7 @@ pub(in super::super) fn validate_closed_value_capture(
             DataValue::Boolean { value } => {
                 a.map_iter(m.len())?;
                 let mut cursor = m.iter();
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "boolean", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(
                     a,
                     cursor,
@@ -362,13 +322,7 @@ pub(in super::super) fn validate_closed_value_capture(
             DataValue::Integer { value } => {
                 a.map_iter(m.len())?;
                 let mut cursor = m.iter();
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "integer", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(
                     a,
                     cursor,
@@ -383,13 +337,7 @@ pub(in super::super) fn validate_closed_value_capture(
             DataValue::Text { value } => {
                 a.map_iter(m.len())?;
                 let mut cursor = m.iter();
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "text", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(
                     a,
                     cursor,
@@ -411,13 +359,7 @@ pub(in super::super) fn validate_closed_value_capture(
                     source_child,
                     rel_i32(source_child, days, a)?
                 );
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "date", a)?
-                );
+                checked_kind_field!(a, cursor);
                 a.pay(4)?;
                 let end = cursor.next().is_none();
                 relation_result!(a, end);
@@ -432,13 +374,7 @@ pub(in super::super) fn validate_closed_value_capture(
                     source_child,
                     rel_string(source_child, entity, a)?
                 );
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "reference", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(
                     a,
                     cursor,
@@ -467,13 +403,7 @@ pub(in super::super) fn validate_closed_value_capture(
                     source_child,
                     rel_vec_datavalue(source_child, items, a)?
                 );
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "list", a)?
-                );
+                checked_kind_field!(a, cursor);
                 a.pay(4)?;
                 let end = cursor.next().is_none();
                 relation_result!(a, end);
@@ -526,13 +456,7 @@ pub(in super::super) fn validate_closed_value_capture(
             Expr::Literal { value_type, value } => {
                 a.map_iter(m.len())?;
                 let mut cursor = m.iter();
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "literal", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(
                     a,
                     cursor,
@@ -554,13 +478,7 @@ pub(in super::super) fn validate_closed_value_capture(
             Expr::Variable { name } => {
                 a.map_iter(m.len())?;
                 let mut cursor = m.iter();
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "variable", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(
                     a,
                     cursor,
@@ -582,13 +500,7 @@ pub(in super::super) fn validate_closed_value_capture(
                     source_child,
                     rel_string(source_child, field, a)?
                 );
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "field", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(a, cursor, "record", source_child, {
                     a.pay(2)?;
                     rel_expr(source_child, (record).as_ref(), a)?
@@ -600,13 +512,7 @@ pub(in super::super) fn validate_closed_value_capture(
             Expr::State { state } => {
                 a.map_iter(m.len())?;
                 let mut cursor = m.iter();
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "state", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(
                     a,
                     cursor,
@@ -621,13 +527,7 @@ pub(in super::super) fn validate_closed_value_capture(
             Expr::Today => {
                 a.map_iter(m.len())?;
                 let mut cursor = m.iter();
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "today", a)?
-                );
+                checked_kind_field!(a, cursor);
                 a.pay(4)?;
                 let end = cursor.next().is_none();
                 relation_result!(a, end);
@@ -663,13 +563,7 @@ pub(in super::super) fn validate_closed_value_capture(
                     source_child,
                     rel_bool(source_child, include_archived, a)?
                 );
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "query", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(
                     a,
                     cursor,
@@ -710,13 +604,7 @@ pub(in super::super) fn validate_closed_value_capture(
                     a.pay(2)?;
                     rel_expr(source_child, (items).as_ref(), a)?
                 });
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "filter", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(a, cursor, "predicate", source_child, {
                     a.pay(2)?;
                     rel_expr(source_child, (predicate).as_ref(), a)?
@@ -743,13 +631,7 @@ pub(in super::super) fn validate_closed_value_capture(
                     a.pay(2)?;
                     rel_expr(source_child, (items).as_ref(), a)?
                 });
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "map", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(a, cursor, "value", source_child, {
                     a.pay(2)?;
                     rel_expr(source_child, (value).as_ref(), a)?
@@ -765,13 +647,7 @@ pub(in super::super) fn validate_closed_value_capture(
                     a.pay(2)?;
                     rel_expr(source_child, (items).as_ref(), a)?
                 });
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "count", a)?
-                );
+                checked_kind_field!(a, cursor);
                 a.pay(4)?;
                 let end = cursor.next().is_none();
                 relation_result!(a, end);
@@ -794,13 +670,7 @@ pub(in super::super) fn validate_closed_value_capture(
                     a.pay(2)?;
                     rel_expr(source_child, (items).as_ref(), a)?
                 });
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "any", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(a, cursor, "predicate", source_child, {
                     a.pay(2)?;
                     rel_expr(source_child, (predicate).as_ref(), a)?
@@ -827,13 +697,7 @@ pub(in super::super) fn validate_closed_value_capture(
                     a.pay(2)?;
                     rel_expr(source_child, (items).as_ref(), a)?
                 });
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "all", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(a, cursor, "predicate", source_child, {
                     a.pay(2)?;
                     rel_expr(source_child, (predicate).as_ref(), a)?
@@ -849,13 +713,7 @@ pub(in super::super) fn validate_closed_value_capture(
                     a.pay(2)?;
                     rel_expr(source_child, (items).as_ref(), a)?
                 });
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "sum", a)?
-                );
+                checked_kind_field!(a, cursor);
                 a.pay(4)?;
                 let end = cursor.next().is_none();
                 relation_result!(a, end);
@@ -867,13 +725,7 @@ pub(in super::super) fn validate_closed_value_capture(
                     a.pay(2)?;
                     rel_expr(source_child, (items).as_ref(), a)?
                 });
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "contains", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(a, cursor, "value", source_child, {
                     a.pay(2)?;
                     rel_expr(source_child, (value).as_ref(), a)?
@@ -885,13 +737,7 @@ pub(in super::super) fn validate_closed_value_capture(
             Expr::Equal { left, right } => {
                 a.map_iter(m.len())?;
                 let mut cursor = m.iter();
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "equal", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(a, cursor, "left", source_child, {
                     a.pay(2)?;
                     rel_expr(source_child, (left).as_ref(), a)?
@@ -907,13 +753,7 @@ pub(in super::super) fn validate_closed_value_capture(
             Expr::Less { left, right } => {
                 a.map_iter(m.len())?;
                 let mut cursor = m.iter();
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "less", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(a, cursor, "left", source_child, {
                     a.pay(2)?;
                     rel_expr(source_child, (left).as_ref(), a)?
@@ -929,13 +769,7 @@ pub(in super::super) fn validate_closed_value_capture(
             Expr::Add { left, right } => {
                 a.map_iter(m.len())?;
                 let mut cursor = m.iter();
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "add", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(a, cursor, "left", source_child, {
                     a.pay(2)?;
                     rel_expr(source_child, (left).as_ref(), a)?
@@ -951,13 +785,7 @@ pub(in super::super) fn validate_closed_value_capture(
             Expr::Subtract { left, right } => {
                 a.map_iter(m.len())?;
                 let mut cursor = m.iter();
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "subtract", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(a, cursor, "left", source_child, {
                     a.pay(2)?;
                     rel_expr(source_child, (left).as_ref(), a)?
@@ -973,13 +801,7 @@ pub(in super::super) fn validate_closed_value_capture(
             Expr::Concat { left, right } => {
                 a.map_iter(m.len())?;
                 let mut cursor = m.iter();
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "concat", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(a, cursor, "left", source_child, {
                     a.pay(2)?;
                     rel_expr(source_child, (left).as_ref(), a)?
@@ -995,13 +817,7 @@ pub(in super::super) fn validate_closed_value_capture(
             Expr::TextContains { text, search } => {
                 a.map_iter(m.len())?;
                 let mut cursor = m.iter();
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "text_contains", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(a, cursor, "search", source_child, {
                     a.pay(2)?;
                     rel_expr(source_child, (search).as_ref(), a)?
@@ -1017,13 +833,7 @@ pub(in super::super) fn validate_closed_value_capture(
             Expr::Lower { value } => {
                 a.map_iter(m.len())?;
                 let mut cursor = m.iter();
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "lower", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(a, cursor, "value", source_child, {
                     a.pay(2)?;
                     rel_expr(source_child, (value).as_ref(), a)?
@@ -1035,13 +845,7 @@ pub(in super::super) fn validate_closed_value_capture(
             Expr::And { values } => {
                 a.map_iter(m.len())?;
                 let mut cursor = m.iter();
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "and", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(
                     a,
                     cursor,
@@ -1056,13 +860,7 @@ pub(in super::super) fn validate_closed_value_capture(
             Expr::Or { values } => {
                 a.map_iter(m.len())?;
                 let mut cursor = m.iter();
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "or", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(
                     a,
                     cursor,
@@ -1077,13 +875,7 @@ pub(in super::super) fn validate_closed_value_capture(
             Expr::Not { value } => {
                 a.map_iter(m.len())?;
                 let mut cursor = m.iter();
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "not", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(a, cursor, "value", source_child, {
                     a.pay(2)?;
                     rel_expr(source_child, (value).as_ref(), a)?
@@ -1107,13 +899,7 @@ pub(in super::super) fn validate_closed_value_capture(
                     a.pay(2)?;
                     rel_expr(source_child, (else_value).as_ref(), a)?
                 });
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "if", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(a, cursor, "then_value", source_child, {
                     a.pay(2)?;
                     rel_expr(source_child, (then_value).as_ref(), a)?
@@ -1129,13 +915,7 @@ pub(in super::super) fn validate_closed_value_capture(
                     a.pay(2)?;
                     rel_expr(source_child, (fallback).as_ref(), a)?
                 });
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "coalesce", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(a, cursor, "value", source_child, {
                     a.pay(2)?;
                     rel_expr(source_child, (value).as_ref(), a)?
@@ -1155,13 +935,7 @@ pub(in super::super) fn validate_closed_value_capture(
                     a.pay(2)?;
                     rel_expr(source_child, (days).as_ref(), a)?
                 });
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "date_add", a)?
-                );
+                checked_kind_field!(a, cursor);
                 a.pay(4)?;
                 let end = cursor.next().is_none();
                 relation_result!(a, end);
@@ -1173,13 +947,7 @@ pub(in super::super) fn validate_closed_value_capture(
                     a.pay(2)?;
                     rel_expr(source_child, (earlier).as_ref(), a)?
                 });
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "date_difference", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(a, cursor, "later", source_child, {
                     a.pay(2)?;
                     rel_expr(source_child, (later).as_ref(), a)?
@@ -1455,13 +1223,7 @@ pub(in super::super) fn validate_closed_value_capture(
                     source_child,
                     rel_string(source_child, entity, a)?
                 );
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "create", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(
                     a,
                     cursor,
@@ -1476,13 +1238,7 @@ pub(in super::super) fn validate_closed_value_capture(
             Statement::Update { record, values } => {
                 a.map_iter(m.len())?;
                 let mut cursor = m.iter();
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "update", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(
                     a,
                     cursor,
@@ -1504,13 +1260,7 @@ pub(in super::super) fn validate_closed_value_capture(
             Statement::Archive { record } => {
                 a.map_iter(m.len())?;
                 let mut cursor = m.iter();
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "archive", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(
                     a,
                     cursor,
@@ -1525,13 +1275,7 @@ pub(in super::super) fn validate_closed_value_capture(
             Statement::SetState { state, value } => {
                 a.map_iter(m.len())?;
                 let mut cursor = m.iter();
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "set_state", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(
                     a,
                     cursor,
@@ -1564,13 +1308,7 @@ pub(in super::super) fn validate_closed_value_capture(
                     source_child,
                     rel_expr(source_child, items, a)?
                 );
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "collection", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(
                     a,
                     cursor,
@@ -1610,13 +1348,7 @@ pub(in super::super) fn validate_closed_value_capture(
                     source_child,
                     rel_expr(source_child, items, a)?
                 );
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "for_each", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(
                     a,
                     cursor,
@@ -1638,13 +1370,7 @@ pub(in super::super) fn validate_closed_value_capture(
                     source_child,
                     rel_expr(source_child, condition, a)?
                 );
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "assert", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(
                     a,
                     cursor,
@@ -1685,13 +1411,7 @@ pub(in super::super) fn validate_closed_value_capture(
                     source_child,
                     rel_expr(source_child, items, a)?
                 );
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "emit", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(
                     a,
                     cursor,
@@ -1726,13 +1446,7 @@ pub(in super::super) fn validate_closed_value_capture(
             CollectionTarget::State { state } => {
                 a.map_iter(m.len())?;
                 let mut cursor = m.iter();
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "state", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(
                     a,
                     cursor,
@@ -1754,13 +1468,7 @@ pub(in super::super) fn validate_closed_value_capture(
                     source_child,
                     rel_string(source_child, field, a)?
                 );
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "field", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(
                     a,
                     cursor,
@@ -2088,13 +1796,7 @@ pub(in super::super) fn validate_closed_value_capture(
                     source_child,
                     rel_string(source_child, entity, a)?
                 );
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "list", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(
                     a,
                     cursor,
@@ -2134,13 +1836,7 @@ pub(in super::super) fn validate_closed_value_capture(
                     source_child,
                     rel_string(source_child, entity, a)?
                 );
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "detail", a)?
-                );
+                checked_kind_field!(a, cursor);
                 relation_field!(
                     a,
                     cursor,
@@ -2180,13 +1876,7 @@ pub(in super::super) fn validate_closed_value_capture(
                     source_child,
                     rel_vec_forminput(source_child, fields, a)?
                 );
-                relation_field!(
-                    a,
-                    cursor,
-                    "kind",
-                    source_child,
-                    rel_string(source_child, "form", a)?
-                );
+                checked_kind_field!(a, cursor);
                 a.pay(4)?;
                 let end = cursor.next().is_none();
                 relation_result!(a, end);
