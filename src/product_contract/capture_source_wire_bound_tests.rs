@@ -37,12 +37,12 @@ fn parity(c: &CapturedProgram, hit: bool) {
     });
     let outputs = closed_value::native_outputs::take();
     assert_eq!(got,want);
-    // Admission marker is a paid closed-branch root, not a proof API. It occurs
-    // before V1 even for a semantic error; native-conversion errors stay misses.
-    assert_eq!(work.calls.windows(3).any(|w|w==[128,2240,12]),hit);
+    // Exact bytes, not the old complete-Value relation, select the new hit.
+    let native_hit=c.source_bytes==serde_json::to_vec(&c.program).unwrap();
+    if !hit { assert!(!native_hit); }
     if got.is_ok() {
-        assert_eq!(count_starts(&work.calls),usize::from(!hit));
-        assert_eq!(outputs.len(),if hit {2} else {0});
+        assert_eq!(count_starts(&work.calls),usize::from(!native_hit));
+        assert_eq!(outputs.len(),if native_hit {2} else {0});
     }
 }
 
@@ -264,7 +264,7 @@ fn source_wire_owner_and_finalizer_exact_one_below_packets() {
     let c=rebind(fixture::minimal(),None);
     let data=DataSnapshot::empty("project",&c.program).unwrap();
     let mut trace=Work::default();source_result(&c,&mut trace).unwrap();
-    let owner=trace.calls.windows(3).position(|w|w==[128,2240,12]).unwrap();
+    let owner=trace.calls.windows(4).position(|w|w==[128,2240,0,96]).unwrap();
     let bound=trace.calls.windows(5).position(|w|w==[0,128,0,3,1]).unwrap()+1;
     let finalizer=trace.calls.windows(5).position(|w|w==[0,128,5,0,96]).unwrap()+1;
     for index in [owner,owner+1,bound,finalizer,finalizer+1] {

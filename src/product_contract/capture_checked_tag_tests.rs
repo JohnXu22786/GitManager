@@ -1,6 +1,6 @@
 //! Independent closed-schema callback oracle. No production hook or receipt.
 use super::app_length_tests::{
-    capture_minimal, complete_fixture, old, old_app, source_result, Work,
+    capture_minimal, complete_fixture, old, old_app, Work,
 };
 use super::*;
 use serde_json::{json, Value};
@@ -291,10 +291,26 @@ fn facts(f: capture_validation::CaptureFacts) -> (usize, usize, usize, usize) {
         f.action_count,
     )
 }
+// Historical matcher controls remain explicit test-only callers. The guarded
+// production route never calls this matcher or borrows its source authority.
+fn historical(c: &CapturedProgram,a:Audit<'_>)->Result<capture_validation::CaptureFacts> {
+    a.pay(8)?;
+    count_validation(|counts|counts.captures+=1);
+    c.binding.validate_audited(a)?;
+    a.version(c.artifact.version)?;
+    a.require(c.artifact.kind==ArtifactKind::GeneratedApp
+        && a.eq_str(&c.artifact.language,LANGUAGE_VERSION)?,"unsupported executable artifact")?;
+    a.require(c.source_bytes.len()<=MAX_WIRE_BYTES,"source exceeds byte limit")?;
+    validate_closed_value_capture(c,a)
+}
+pub(super) fn source_result(c:&CapturedProgram,w:&mut Work)->ContractWorkResult<()> {
+    let state=WorkState::new(w);
+    state.finish(historical(c,Audit(Some(&state))).map(|_|()))
+}
 fn full(c: &CapturedProgram) -> (ContractWorkResult<(usize, usize, usize, usize)>, Vec<u64>) {
     let mut w = Work::default();
     let state = WorkState::new(&mut w);
-    let result = state.finish(c.validate_audited(Audit(Some(&state))).map(facts));
+    let result = state.finish(historical(c,Audit(Some(&state))).map(facts));
     (result, w.calls)
 }
 fn check(c: &CapturedProgram) -> (Vec<u64>, usize, Model) {
@@ -512,18 +528,15 @@ fn checked_tag_surviving_refusals_keep_first_cause() {
             reset_validation_counts();
             closed_value::native_outputs::begin();
             let mut w = Work {
-                refuse: Some(index + 5),
+                refuse: Some(index + 1),
                 cause: Some(cause.clone()),
                 ..Work::default()
             };
-            let result =
-                with_capture_validation(&c, &data, &mut w, |ctx| -> ContractWorkResult<()> {
-                    assert!(ctx.ensure_source_and_data().is_err());
-                    assert!(ctx.facts.is_none());
-                    Ok(())
-                });
+            // This isolated historical matcher has no facts publication API.
+            // Active guarded-capture publication refusals are tested separately.
+            let result = source_result(&c, &mut w);
             assert_eq!(result, Err(ContractWorkError::Resource(cause)));
-            assert_eq!(&w.calls[4..], &trace[..=index]);
+            assert_eq!(&w.calls, &trace[..=index]);
             assert_eq!(validation_counts().apps, 0);
             assert!(closed_value::native_outputs::take().is_empty());
         }

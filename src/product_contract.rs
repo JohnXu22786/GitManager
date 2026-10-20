@@ -1737,7 +1737,12 @@ impl CapturedProgram {
         a.require(self.artifact.kind == ArtifactKind::GeneratedApp
             && a.eq_str(&self.artifact.language, LANGUAGE_VERSION)?, "unsupported executable artifact")?;
         a.require(self.source_bytes.len() <= MAX_WIRE_BYTES, "source exceeds byte limit")?;
-        let actual: AppDefinition = if a.enabled() {return capture_canonical::validate_closed_value_capture(self,a)} else {parse(&self.source_bytes)?};
+        let actual: AppDefinition = if a.enabled() {
+            // Both roots precede the new helper, closures, and borrowed owners.
+            a.pay(capture_canonical::COMMON)?;
+            a.pay(capture_canonical::SOURCE_DELTA_ROOT)?;
+            return capture_canonical::validate_guarded_native_capture(self, a);
+        } else {parse(&self.source_bytes)?};
         let facts=actual.validate_audited(a)?;
         a.require(a.equal_owned(&actual,&self.program)?, "source bytes do not represent captured program")?;
         let raw=capture_validation::bytes_digest_audited(IdentityDomain::Source,&self.source_bytes,a)?;

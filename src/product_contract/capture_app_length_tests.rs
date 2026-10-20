@@ -449,7 +449,7 @@ fn app_length_reserve_usize_conversion_is_checked_on_32_bit_targets() {
     assert_eq!(work.calls,vec![96]);
 }
 
-fn wire_app(target: usize) -> AppDefinition {
+pub(super) fn wire_app(target: usize) -> AppDefinition {
     let mut value = fixture::minimal();
     value["observables"] = Value::Array((0..MAX_ITEMS).map(|i| {
         json!({"id":format!("wire_{i}"),"label":"x","value":yes()})
@@ -511,7 +511,9 @@ pub(super) fn source_result(capture: &CapturedProgram, work: &mut Work) -> Contr
     state.finish(capture.validate_audited(Audit(Some(&state))).map(|_|()))
 }
 pub(super) fn capture_minimal() -> CapturedProgram {
-    CapturedProgram::capture(&serde_json::to_vec(&fixture::minimal()).unwrap(),"project",Producer::UserAuthored,None).unwrap()
+    // Native declaration order deliberately exercises the exact-source hit.
+    let app: AppDefinition = serde_json::from_value(fixture::minimal()).unwrap();
+    CapturedProgram::capture(&serde_json::to_vec(&app).unwrap(),"project",Producer::UserAuthored,None).unwrap()
 }
 #[test]
 #[cfg(target_pointer_width = "64")]
@@ -675,7 +677,7 @@ fn app_length_single_source_count_and_publication_fail_closed() {
             Err(error)
         });
         assert_eq!(result,Err(ContractWorkError::Contract(ContractError(expected))));
-        assert_eq!((validation_counts().captures,validation_counts().apps),(1,[1,1,1,1,0][fault]));
+        assert_eq!((validation_counts().captures,validation_counts().apps),(1,[2,1,1,1,0][fault]));
         assert_eq!(work.calls.windows(6).filter(|w|*w==[0,96,170496,358,1,1]).count(),[1,0,0,0,0][fault]);
         assert_eq!(work.calls.windows(3).filter(|w|*w==[0,96,248]).count(),[0,1,1,1,0][fault]);
         assert_eq!(work.calls.windows(3).filter(|w|*w==[0,96,253]).count(),[0,0,1,1,0][fault]);

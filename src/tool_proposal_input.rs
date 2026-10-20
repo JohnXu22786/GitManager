@@ -13,8 +13,7 @@ pub(crate) mod capture_payment_core;
 #[path = "tool_proposal_input/capture_paid.rs"]
 mod capture_paid;
 pub(super) use capture_paid::{parse_json_bytes_with_work, InputWorkError};
-#[cfg(test)]
-use capture_paid::lexical_envelope_with_work;
+pub(super) use capture_paid::{lexical_envelope_with_work, LexicalEnvelope};
 
 use std::fmt;
 use std::io::{self, Read};

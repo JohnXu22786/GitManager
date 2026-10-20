@@ -1542,7 +1542,9 @@ mod app_length_tests;
 
 #[path = "capture_closed_value.rs"]
 mod closed_value;
+#[cfg(test)]
 pub(super) use closed_value::validate_closed_value_capture;
+pub(super) use closed_value::{validate_guarded_native_capture, COMMON, SOURCE_DELTA_ROOT};
 
 #[cfg(test)]
 #[path = "capture_closed_value_tests.rs"]
@@ -1559,3 +1561,7 @@ mod synthetic_count_tests;
 #[cfg(test)]
 #[path = "capture_checked_tag_tests.rs"]
 mod checked_tag_tests;
+
+#[cfg(test)]
+#[path = "capture_guarded_native_tests.rs"]
+mod guarded_native_tests;

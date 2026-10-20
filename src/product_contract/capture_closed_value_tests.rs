@@ -1,4 +1,4 @@
-//! These controls enter the real paid capture, never a comparator/proof API.
+//! Current capture/output controls plus explicitly isolated historical matcher regressions.
 use super::app_length_tests::{
     capture_minimal, complete_fixture, deepest_valid_fixture, fixture, old, old_app, source_result,
     Work,
@@ -35,7 +35,10 @@ fn parity(capture: &CapturedProgram, expect_hit: Option<bool>) {
     let outputs = closed_value::native_outputs::take();
     assert_eq!(actual, expected);
     assert_eq!(serde_json::to_vec(capture).unwrap(), before);
-    if actual.is_ok() && expect_hit == Some(true) {
+    // The new method admits only exact native bytes. Other previously matched
+    // Value spellings now take the complete original fallback, not rejection.
+    let native_hit = capture.source_bytes == serde_json::to_vec(&capture.program).unwrap();
+    if actual.is_ok() && native_hit {
         assert_eq!(outputs.len(), 2);
         let original = old_app(&capture.program);
         let mut semantic = capture.program.clone();
@@ -53,7 +56,8 @@ fn parity(capture: &CapturedProgram, expect_hit: Option<bool>) {
         );
         assert!(outputs.iter().all(|o| o.2 >= 128));
     }
-    if expect_hit == Some(false) {
+    if expect_hit == Some(false) { assert!(!native_hit); }
+    if !native_hit {
         assert!(outputs.is_empty());
     }
 }
@@ -61,6 +65,8 @@ fn parity(capture: &CapturedProgram, expect_hit: Option<bool>) {
 #[test]
 #[cfg(target_pointer_width = "64")]
 fn closed_value_representative_sources_keep_reviewed_complete_payments() {
+    // Preserve the retired matcher's exact regression model, not production authority.
+    use super::checked_tag_tests::source_result;
     for (raw, expected) in [
         (
             include_str!("../../tests/fixtures/closed_value/before_a.json"),
@@ -252,7 +258,7 @@ fn closed_value_complete_graph_native_outputs_and_differing_children() {
     .unwrap();
     let value = complete_fixture();
     let c = CapturedProgram::capture(
-        &serde_json::to_vec(&value).unwrap(),
+        &serde_json::to_vec(&serde_json::from_value::<AppDefinition>(value.clone()).unwrap()).unwrap(),
         "project",
         Producer::UserAuthored,
         None,
@@ -424,6 +430,8 @@ fn closed_value_native_alternatives_use_the_complete_miss() {
 #[test]
 #[cfg(target_pointer_width = "64")]
 fn closed_value_unadmitted_payloads_stop_at_source_bounds() {
+    // Preserve the retired matcher's exact regression model, not production authority.
+    use super::checked_tag_tests::source_result;
     let base = capture_minimal();
     let fixtures: Vec<(CapturedProgram, CapturedProgram)> = vec![
         {
@@ -489,7 +497,7 @@ fn closed_value_unadmitted_payloads_stop_at_source_bounds() {
 fn closed_value_every_small_prefix_and_mutation_refuses_without_publication() {
     let value = complete_fixture();
     let valid = CapturedProgram::capture(
-        &serde_json::to_vec(&value).unwrap(),
+        &serde_json::to_vec(&serde_json::from_value::<AppDefinition>(value.clone()).unwrap()).unwrap(),
         "project",
         Producer::UserAuthored,
         None,
@@ -517,19 +525,12 @@ fn closed_value_every_small_prefix_and_mutation_refuses_without_publication() {
             .iter()
             .position(|&n| n == 0)
             .unwrap();
-    let relation = trace
-        .calls
-        .windows(4)
-        .position(|w| w == [96, 149972, 6, 12])
-        .unwrap();
-    let relation_end = relation
-        + trace.calls[relation..]
-            .iter()
-            .position(|&n| n == 0)
-            .unwrap();
-    // Exhaustive positions, not amount-based equivalence: node12 and Number12
-    // are distinct callbacks even when their debit is equal. The complete graph
-    // fixture reaches every relation family and all schema-cleared owner kinds.
+    let relation = trace.calls.windows(3)
+        .position(|w| w == [COMMON, SOURCE_DELTA_ROOT, 10]).unwrap();
+    let relation_end = trace.calls.windows(5)
+        .position(|w| w == [4096,1,0,96,248]).unwrap()-1;
+    // Every reached guarded source prefix and every label mutation callback.
+    // The old matcher is no longer a production source authority.
     let selected: BTreeSet<_> = (relation..=relation_end + 1)
         .chain(mutation..=end)
         .collect();
@@ -866,7 +867,7 @@ fn closed_value_label_mutation_leaves_dynamic_label_and_kind_payloads() {
     labels(&mut value, &mut serial);
     assert!(serial > 20);
     let c = CapturedProgram::capture(
-        &serde_json::to_vec(&value).unwrap(),
+        &serde_json::to_vec(&serde_json::from_value::<AppDefinition>(value.clone()).unwrap()).unwrap(),
         "project",
         Producer::UserAuthored,
         None,
@@ -878,10 +879,12 @@ fn closed_value_label_mutation_leaves_dynamic_label_and_kind_payloads() {
 #[test]
 #[cfg(target_pointer_width = "64")]
 fn closed_value_tag_probe_finishes_before_payload_or_fallback() {
+    // Preserve the retired matcher's exact regression model, not production authority.
+    use super::checked_tag_tests::source_result;
     let mut value = fixture::minimal();
     value["observables"][0]["value"] = json!({"kind":"field","record":{"kind":"literal","value_type":{"kind":"reference","entity":"row"},"value":{"kind":"reference","entity":"row","record":"r1"}},"field":"name"});
     let good = CapturedProgram::capture(
-        &serde_json::to_vec(&value).unwrap(),
+        &serde_json::to_vec(&serde_json::from_value::<AppDefinition>(value.clone()).unwrap()).unwrap(),
         "project",
         Producer::UserAuthored,
         None,
@@ -966,7 +969,7 @@ fn closed_value_full_miss_identity_selection_and_publication_refusals() {
     source_result(&capture, &mut trace).unwrap();
     assert_eq!(
         (validation_counts().captures, validation_counts().apps),
-        (1, 1)
+        (1, 2)
     );
     let unique = |start: usize, end: usize, signature: &[u64]| {
         let matches: Vec<_> = trace.calls[start..end]
@@ -1147,9 +1150,17 @@ fn closed_value_callers_and_helper_scopes_remain_closed() {
         (
             "validate_closed_value_capture",
             BTreeMap::from([
+                ("product_contract/capture_canonical.rs".into(), 1),
+                ("product_contract/capture_closed_value.rs".into(), 1),
+            ]),
+        ),
+        (
+            "validate_guarded_native_capture",
+            BTreeMap::from([
                 ("product_contract.rs".into(), 1),
                 ("product_contract/capture_canonical.rs".into(), 1),
                 ("product_contract/capture_closed_value.rs".into(), 1),
+                ("product_contract/capture_guarded_native.rs".into(), 1),
             ]),
         ),
         (
@@ -1164,10 +1175,10 @@ fn closed_value_callers_and_helper_scopes_remain_closed() {
         references(&root, &root, name, &mut actual);
         assert_eq!(actual, expected, "{name} caller/import closure drift");
     }
-    assert_closed_source_bodies(include_str!("../product_contract.rs"), include_str!("capture_closed_value.rs"), include_str!("capture_typed.rs"), include_str!("capture_canonical.rs"));
+    assert_closed_source_bodies(include_str!("../product_contract.rs"), include_str!("capture_closed_value.rs"), include_str!("capture_typed.rs"), include_str!("capture_canonical.rs"), include_str!("capture_guarded_native.rs"));
 }
 
-fn assert_closed_source_bodies(parent: &str, closed: &str, typed: &str, canonical: &str) {
+fn assert_closed_source_bodies(parent: &str, closed: &str, typed: &str, canonical: &str, guarded: &str) {
     // Current bounded helper bodies contain no braces inside literal strings.
     // Balance complete lexical bodies rather than accepting declaration presence.
     fn body(source: &str, signature: &str) -> std::ops::Range<usize> {
@@ -1193,7 +1204,7 @@ fn assert_closed_source_bodies(parent: &str, closed: &str, typed: &str, canonica
     let prefix = "fn validate_audited(&self,a:Audit<'_>)->Result<capture_validation::CaptureFacts>";
     let range = body(&parent, prefix);
     let method = &parent[range];
-    let call="let actual: AppDefinition = if a.enabled() {return capture_canonical::validate_closed_value_capture(self,a)} else {parse(&self.source_bytes)?};";
+    let call="let actual: AppDefinition = if a.enabled() {";
     assert!(method.contains(call));
     assert_eq!(
         method[..method.find(call).unwrap()].trim(),
@@ -1207,44 +1218,28 @@ fn assert_closed_source_bodies(parent: &str, closed: &str, typed: &str, canonica
             && a.eq_str(&self.artifact.language, LANGUAGE_VERSION)?, "unsupported executable artifact")?;
         a.require(self.source_bytes.len() <= MAX_WIRE_BYTES, "source exceeds byte limit")?;"#
     );
+    assert!(method.contains("a.pay(capture_canonical::COMMON)?;\n            a.pay(capture_canonical::SOURCE_DELTA_ROOT)?;\n            return capture_canonical::validate_guarded_native_capture(self, a);"));
+    assert!(method.contains("} else {parse(&self.source_bytes)?};"));
     let closed = source_guard_text(closed);
-    let validate = body(
-        &closed,
-        "pub(in super::super) fn validate_closed_value_capture(",
-    );
-    let hit_start = validate.start
-        + closed[validate.clone()]
-            .find("if equal {\n        fn clear_field")
-            .unwrap();
-    let hit = body(&closed[hit_start..], "if equal {\n        fn clear_field");
-    let hit = (hit_start + hit.start)..(hit_start + hit.end);
-    let call_pos = closed
-        .find("capture_typed::convert_app(value, a)?")
-        .unwrap();
-    assert!(call_pos > hit.end && call_pos < validate.end);
-    assert!(closed[hit.end..call_pos].contains("// False is not a validation result"));
-    let production_end = closed.find("// Test-only scoped capture").unwrap();
-    for (offset, _) in closed[..production_end].match_indices("fn ") {
-        let tail = &closed[offset + 3..];
-        if tail.starts_with("validate_closed_value_capture(") {
-            continue;
-        }
-        assert!(
-            offset > validate.start && offset < validate.end,
-            "helper escaped capture body"
-        );
-        if tail.starts_with("rel_") || tail.starts_with("tag_matches(") {
-            assert!(
-                offset < hit.start,
-                "relation helper escaped comparison scope"
-            );
-        } else {
-            assert!(
-                offset > hit.start && offset < hit.end,
-                "mutation/output helper escaped hit scope"
-            );
-        }
+    assert!(closed.contains("#[cfg(test)]\npub(in super::super) fn validate_closed_value_capture("));
+    assert!(closed.contains("macro_rules! value_output_types"));
+    let validate = body(&closed,"pub(in super::super) fn validate_closed_value_capture(");
+    let hit_start = validate.start + closed[validate.clone()].find("if equal {\n        value_output_types!").unwrap();
+    let hit = body(&closed[hit_start..],"if equal {\n        value_output_types!");
+    let hit_end = hit_start + hit.end;
+    let conversion=closed.find("capture_typed::convert_app(value, a)?").unwrap();
+    assert!(conversion > hit_end && conversion < validate.end);
+    let guarded=source_guard_text(guarded);
+    let production=guarded.split("// Tests observe").next().unwrap();
+    assert!(production.contains("validate_app_semantics!(app, a, validator, action_prefix_nodes)"));
+    assert!(production.contains("value_output_types!(PendingLength, BOUND_ROOT)"));
+    assert!(production.contains("capture_typed::parse_app(&capture.source_bytes, a)?"));
+    assert!(!production.contains("validate_closed_value_capture("));
+    for forbidden in ["run_host(",".finish(",".borrow_mut(","Clone for SemanticScalars","Serialize for SemanticScalars"] {
+        assert!(!production.contains(forbidden),"guarded source leaked authority: {forbidden}");
     }
+    assert_eq!(production.matches("struct SemanticScalars").count(),1);
+    assert_eq!(production.matches("struct SameCaptureOutputBound").count(),1);
     let typed = source_guard_text(typed);
     let parse = body(&typed, "pub(super) fn parse_app(");
     assert!(typed[parse].contains("convert_app(value, a)"));
@@ -1252,7 +1247,7 @@ fn assert_closed_source_bodies(parent: &str, closed: &str, typed: &str, canonica
         "pub(super) fn convert_app(value: JsonValue, a: Audit<'_>) -> Result<AppDefinition>"
     ));
     assert!(source_guard_text(canonical).contains(
-        "mod closed_value;\npub(super) use closed_value::validate_closed_value_capture;"
+        "mod closed_value;\n#[cfg(test)]\npub(super) use closed_value::validate_closed_value_capture;"
     ));
 }
 
@@ -1261,7 +1256,7 @@ fn assert_closed_source_bodies(parent: &str, closed: &str, typed: &str, canonica
 fn closed_value_each_fresh_output_callback_refuses_before_publication() {
     let value = complete_fixture();
     let capture = CapturedProgram::capture(
-        &serde_json::to_vec(&value).unwrap(),
+        &serde_json::to_vec(&serde_json::from_value::<AppDefinition>(value.clone()).unwrap()).unwrap(),
         "project",
         Producer::UserAuthored,
         None,
@@ -1276,6 +1271,7 @@ fn closed_value_each_fresh_output_callback_refuses_before_publication() {
         .windows(6)
         .enumerate()
         .filter_map(|(i, w)| (w == [0, 96, 170873, 358, 1, 1]).then_some(i))
+        .skip(1) // The new earlier native raw Vec is not a canonical output.
         .collect();
     assert_eq!(starts.len(), 2);
     let mut boundaries = Vec::new();
@@ -1355,7 +1351,7 @@ fn completed_semantic_shape_matches_fresh_descriptor_for_label_bytes() {
     for label in labels {
         let mut value = fixture::minimal();
         value["label"] = json!(format!("x{label}"));
-        let c = CapturedProgram::capture(&serde_json::to_vec(&value).unwrap(), "project", Producer::UserAuthored, None).unwrap();
+        let c = CapturedProgram::capture(&serde_json::to_vec(&serde_json::from_value::<AppDefinition>(value.clone()).unwrap()).unwrap(), "project", Producer::UserAuthored, None).unwrap();
         closed_value::semantic_shapes::begin();
         parity(&c, Some(true));
         let metrics = closed_value::semantic_shapes::take();
@@ -1377,7 +1373,7 @@ fn completed_semantic_shape_matches_fresh_descriptor_for_label_bytes() {
 fn completed_semantic_shape_new_packets_keep_first_cause() {
     let mut value = fixture::minimal();
     value["label"] = json!("\"\\\né🦀\u{1}");
-    let c = CapturedProgram::capture(&serde_json::to_vec(&value).unwrap(), "project", Producer::UserAuthored, None).unwrap();
+    let c = CapturedProgram::capture(&serde_json::to_vec(&serde_json::from_value::<AppDefinition>(value.clone()).unwrap()).unwrap(), "project", Producer::UserAuthored, None).unwrap();
     let mut trace = Work::default();
     source_result(&c, &mut trace).unwrap();
     let start = trace.calls.windows(6).position(|w| w == [0, 96, 170873, 358, 1, 1]).unwrap();
@@ -1400,7 +1396,7 @@ fn completed_semantic_shape_new_packets_keep_first_cause() {
 fn completed_semantic_shape_delta_arithmetic_refuses_before_second_output() {
     let mut value = fixture::minimal();
     value["label"] = json!("x\n");
-    let c = CapturedProgram::capture(&serde_json::to_vec(&value).unwrap(), "project", Producer::UserAuthored, None).unwrap();
+    let c = CapturedProgram::capture(&serde_json::to_vec(&serde_json::from_value::<AppDefinition>(value.clone()).unwrap()).unwrap(), "project", Producer::UserAuthored, None).unwrap();
     for fault in ["bytes", "native", "escaped", "multiply", "add"] {
         closed_value::semantic_shapes::fault(fault);
         closed_value::native_outputs::begin();
@@ -1413,16 +1409,16 @@ fn completed_semantic_shape_delta_arithmetic_refuses_before_second_output() {
 
 #[test]
 fn closed_value_source_guards_accept_line_endings_and_reject_mutations() {
-    let raw = [include_str!("../product_contract.rs"), include_str!("capture_closed_value.rs"), include_str!("capture_typed.rs"), include_str!("capture_canonical.rs"), include_str!("../../tests/support/capture_closed_schema.txt")];
+    let raw = [include_str!("../product_contract.rs"), include_str!("capture_closed_value.rs"), include_str!("capture_typed.rs"), include_str!("capture_canonical.rs"), include_str!("../../tests/support/capture_closed_schema.txt"), include_str!("capture_guarded_native.rs")];
     for newline in ["\n", "\r\n"] {
         let texts = raw.map(|s| s.replace("\r\n", "\n").replace('\n', newline));
         assert_closed_schema(&texts[0], &texts[4]);
-        assert_closed_source_bodies(&texts[0], &texts[1], &texts[2], &texts[3]);
+        assert_closed_source_bodies(&texts[0], &texts[1], &texts[2], &texts[3], &texts[5]);
         let changed_schema = texts[4].replacen("Boolean,", "BooleanChanged,", 1);
         assert_ne!(changed_schema, texts[4]);
         assert!(std::panic::catch_unwind(|| assert_closed_schema(&texts[0], &changed_schema)).is_err());
         let changed_parent = texts[0].replacen("        self.binding.validate_audited(a)?;", "        self.binding.validate_audited(a)?; // changed", 1);
         assert_ne!(changed_parent, texts[0]);
-        assert!(std::panic::catch_unwind(|| assert_closed_source_bodies(&changed_parent, &texts[1], &texts[2], &texts[3])).is_err());
+        assert!(std::panic::catch_unwind(|| assert_closed_source_bodies(&changed_parent, &texts[1], &texts[2], &texts[3], &texts[5])).is_err());
     }
 }

@@ -22,7 +22,8 @@ impl ContractWork for Work {
     }
 }
 fn capture(value:Value)->CapturedProgram {
-    CapturedProgram::capture(&serde_json::to_vec(&value).unwrap(),"project",Producer::UserAuthored,None).unwrap()
+    let app:AppDefinition=serde_json::from_value(value).unwrap();
+    CapturedProgram::capture(&serde_json::to_vec(&app).unwrap(),"project",Producer::UserAuthored,None).unwrap()
 }
 fn old_capture(c:&CapturedProgram)->old::CapturedProgram {
     serde_json::from_slice(&serde_json::to_vec(c).unwrap()).unwrap()
@@ -72,7 +73,10 @@ fn query()->Value { json!({"kind":"query","entity":"row","binding":"item","predi
 #[test]
 fn closed_capture_keeps_one_paid_validation_and_four_literal_facts() {
     for value in [fixture::minimal(),rich::organizer(),rich::equipment(),rich::new_composition()] {
-        for bytes in [serde_json::to_vec(&value).unwrap(),serde_json::to_vec_pretty(&value).unwrap()] {
+        let app:AppDefinition=serde_json::from_value(value.clone()).unwrap();
+        let native=serde_json::to_vec(&app).unwrap();
+        for bytes in [native.clone(),serde_json::to_vec(&value).unwrap(),serde_json::to_vec_pretty(&value).unwrap()] {
+            let attempted_apps=if bytes==native {1}else{2};
             let c=CapturedProgram::capture(&bytes,"project",Producer::UserAuthored,None).unwrap();
             let d=DataSnapshot::empty("project",&c.program).unwrap();
             let oc=old_capture(&c);
@@ -102,7 +106,7 @@ fn closed_capture_keeps_one_paid_validation_and_four_literal_facts() {
                 ctx.ensure_source_and_data()?;
                 let actual=ctx.initial_session(&mut Work::default())?;
                 assert_eq!(serde_json::to_value(actual).unwrap(),serde_json::to_value(&expected_session).unwrap());
-                assert_eq!(validation_counts(),ValidationCounts {captures:1,apps:1,observables:0,views:0});
+                assert_eq!(validation_counts(),ValidationCounts {captures:1,apps:attempted_apps,observables:0,views:0});
                 Ok(())
             }).unwrap();
             assert_eq!(serde_json::to_vec(&c).unwrap(),before);
@@ -117,12 +121,13 @@ fn complete_external_error_prefixes_match_the_frozen_native_capture() {
     let other=capture(rich::organizer());
     let mut cases:Vec<(&str,CapturedProgram,usize,usize)>=vec![];
     for (name,bytes) in fixture::malformed_sources(MAX_WIRE_BYTES) {
-        let mut c=good.clone();c.source_bytes=bytes;cases.push((name,c,0,0));
+        let paid=usize::from(bytes.len()<=MAX_WIRE_BYTES && name!="depth_65");
+        let mut c=good.clone();c.source_bytes=bytes;cases.push((name,c,0,paid));
     }
     for (name,value) in fixture::semantic_negatives() {
         let mut c=good.clone();c.source_bytes=serde_json::to_vec(&value).unwrap();
         let apps=if matches!(name,"unknown_typed_field"|"unknown_typed_variant") {0} else {1};
-        cases.push((name,c,apps,apps));
+        cases.push((name,c,apps,apps+1));
     }
     for prefix in 0..9 {
         let mut c=good.clone();
@@ -137,7 +142,7 @@ fn complete_external_error_prefixes_match_the_frozen_native_capture() {
             7=>c.artifact.program_digest=other.artifact.program_digest.clone(),
             _=>c.artifact.semantic_digest=other.artifact.semantic_digest.clone(),
         }
-        cases.push(("suffix/preference",c,[0,0,0,0,0,1,1,2,3][prefix],[0,0,0,0,0,1,1,1,1][prefix]));
+        cases.push(("suffix/preference",c,[0,0,0,0,0,1,1,2,3][prefix],[0,0,0,0,0,2,1,1,1][prefix]));
     }
     // Finite multiple-fault prefixes: the earlier real check must win even when
     // the retained App and all later identities are independently wrong.
@@ -166,14 +171,14 @@ fn complete_external_error_prefixes_match_the_frozen_native_capture() {
                 ("kind/language before source cap",0,0)
             },
             4=>{c.source_bytes=vec![b'!';MAX_WIRE_BYTES+1];("source cap before parser/retained/digests",0,0)},
-            5=>{c.source_bytes=b"?".to_vec();("parser before retained/digests",0,0)},
-            6=>{c.source_bytes=b"{}".to_vec();("typed conversion before retained/digests",0,0)},
+            5=>{c.source_bytes=b"?".to_vec();("parser before retained/digests",0,1)},
+            6=>{c.source_bytes=b"{}".to_vec();("typed conversion before retained/digests",0,1)},
             7=>{
                 let mut value=fixture::minimal();value["label"]=json!(" ");
                 c.source_bytes=serde_json::to_vec(&value).unwrap();
-                ("V1 semantic before retained/digests",1,1)
+                ("V1 semantic before retained/digests",1,2)
             },
-            8=>("retained App before all digests",1,1),
+            8=>("retained App before all digests",1,2),
             9=>{c.program=good.program.clone();("raw before Program/semantic",1,1)},
             10=>{
                 c.program=good.program.clone();c.artifact.raw_digest=good.artifact.raw_digest.clone();
@@ -468,13 +473,19 @@ fn shared_native_formula_literals_have_independent_boundary_expectations() {
 
 #[test]
 #[cfg(target_pointer_width = "64")]
-fn closed_value_paid_capture_uses_source_relation_before_v1() {
+fn historical_closed_value_source_relation_precedes_v1() {
     let c = capture(fixture::minimal());
     let before = serde_json::to_vec(&c).unwrap();
     reset_validation_counts();
     let mut work = Work::default();
     let state = capture_work::WorkState::new(&mut work);
-    let result = state.finish(c.validate_audited(Audit(Some(&state))));
+    // This ordered trace belongs only to the historical test-only matcher.
+    // Guarded-native production semantic/fallback/refusal behavior is exercised
+    // independently by capture_canonical::guarded_native_tests.
+    let result = state.finish(capture_canonical::validate_closed_value_capture(
+        &c,
+        Audit(Some(&state)),
+    ));
     assert!(result.is_ok());
     assert_eq!(validation_counts().apps, 1);
     // Independent F_C=576 and R_C=212 on the authenticated 64-bit target.

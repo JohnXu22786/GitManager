@@ -10,9 +10,9 @@ pub(crate) enum InputWorkError<E> {
     ArithmeticOverflow,
 }
 
-pub(super) struct LexicalEnvelope {
+pub(in super::super) struct LexicalEnvelope {
     pub(super) raw_len: usize,
-    pub(super) container_depth: usize,
+    pub(in super::super) container_depth: usize,
     pub(super) spans: usize,
     pub(super) string_bytes: usize,
     pub(super) escaped_bytes: usize,
@@ -24,7 +24,7 @@ fn add(a: usize, b: usize) -> Result<usize, ()> {
     a.checked_add(b).ok_or(())
 }
 
-pub(super) fn lexical_envelope_with_work<E>(
+pub(in super::super) fn lexical_envelope_with_work<E>(
     bytes: &[u8],
     work: &mut impl FnMut(u64) -> Result<(), E>,
 ) -> Result<LexicalEnvelope, InputWorkError<E>> {

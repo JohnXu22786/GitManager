@@ -52,6 +52,17 @@ impl<'a> Audit<'a> {
     pub(super) fn enabled(self) -> bool {
         self.0.is_some()
     }
+    // The guarded source COMMON packet prepays this non-consuming private peek.
+    // It cannot clear, copy, expose, or replace the original sticky first cause.
+    pub(super) fn resource_failed_prepaid(self) -> bool {
+        match self.0 {
+            None => false,
+            Some(state) => {
+                let first = state.first.borrow();
+                first.is_some()
+            }
+        }
+    }
     #[cfg_attr(test, track_caller)]
     pub(super) fn pay(self, units: u64) -> Result<()> {
         if let Some(state) = self.0 {
