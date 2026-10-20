@@ -8,13 +8,104 @@ use serde::Serialize;
 #[path = "owned_state_consumers.rs"]
 mod state_consumers;
 
+// All packet arithmetic is compile-time checked over complete by-value layouts.
+// usize is losslessly representable on every supported Rust target here.
+pub(super) const fn comparison_payment<const N: usize>(base: u64, terms: [(usize, u64); N]) -> u64 {
+    assert!(usize::BITS <= u64::BITS);
+    let mut total = base;
+    let mut i = 0;
+    while i < N {
+        let term = match (terms[i].0 as u64).checked_mul(terms[i].1) {
+            Some(value) => value,
+            None => panic!("comparison payment multiplication overflow"),
+        };
+        total = match total.checked_add(term) {
+            Some(value) => value,
+            None => panic!("comparison payment addition overflow"),
+        };
+        i += 1;
+    }
+    total
+}
+use std::mem::size_of;
+use super::owned_persist::InitialComparison;
+
+// The General route never discovers provenance by examining registry contents.
+enum ComparisonOrigins<'a> {
+    FreshInitial(InitialComparison<'a>),
+    General {
+        original: &'a PreparedOwnedPreview,
+        predecessor_before: &'a CapturedProgram,
+        predecessor_after: &'a CapturedProgram,
+    },
+}
+// Two owned payloads on a hit, four otherwise; four ordered logical proofs always.
+struct ComparisonProofs {
+    original: [VerifiedSourceContinuation; 2],
+    predecessor: Option<[VerifiedSourceContinuation; 2]>,
+}
+impl ComparisonProofs {
+    fn logical(&self) -> [&VerifiedSourceContinuation; 4] {
+        let [before, after] = &self.original;
+        match &self.predecessor {
+            Some([prior_before, prior_after]) => [before, after, prior_before, prior_after],
+            None => [before, after, before, after],
+        }
+    }
+}
+type IdentityIter<'a> = std::iter::Map<
+    std::array::IntoIter<&'a VerifiedSourceContinuation, 4>,
+    fn(&VerifiedSourceContinuation) -> Digest,
+>;
+fn comparison_identity(proof: &VerifiedSourceContinuation) -> Digest { proof.identity.clone() }
+
+// R5 and R6 are paid before constructing either origins enum or entering the body.
+pub(super) const COMPARISON_DISPATCH_PAYMENT: u64 = comparison_payment(32, [
+    (size_of::<InitialComparison<'_>>(), 4),
+    (size_of::<ComparisonOrigins<'_>>(), 4),
+    (size_of::<AdmissionResult<VerifiedOwnedContinuation>>(), 2),
+    (size_of::<&mut ProofMeter>(), 4),
+    // Explicit complete added shared-body/accessor/selector transports (delta 02).
+    (size_of::<&ProjectSnapshot>(), 4), (size_of::<&OwnedLayerV2>(), 4),
+    (size_of::<&OwnedInitializationV2>(), 4), (size_of::<&CapturedProgram>(), 8),
+    (size_of::<&OwnedSourceRequest>(), 4),
+    (size_of::<(&PreparedOwnedPreview, &CapturedProgram, &CapturedProgram)>(), 4),
+    (size_of::<&ComparisonOrigins<'_>>(), 4),
+]);
+pub(super) const COMPARISON_OWNER_PAYMENT: u64 = comparison_payment(64, [
+    (size_of::<[VerifiedSourceContinuation; 2]>(), 4),
+    (size_of::<Option<[VerifiedSourceContinuation; 2]>>(), 4),
+    (size_of::<ComparisonProofs>(), 6),
+    (size_of::<ClosedContinuationRules>(), 4),
+    (size_of::<RetainedOwned>(), 4),
+    (size_of::<AdmissionResult<ClosedContinuationRules>>(), 2),
+    (size_of::<AdmissionResult<RetainedOwned>>(), 2),
+]);
+const COMPARISON_HIT_PAYMENT: u64 = comparison_payment(8, [
+    (size_of::<&VerifiedSourceContinuation>(), 2), (size_of::<AdmissionResult<()>>(), 2),
+]);
+const COMPARISON_VIEW_PAYMENT: u64 = comparison_payment(64, [
+    (size_of::<[&VerifiedSourceContinuation; 4]>(), 4),
+    (size_of::<std::array::IntoIter<&VerifiedSourceContinuation, 4>>(), 2),
+    (size_of::<IdentityIter<'_>>(), 2), (size_of::<AdmissionResult<()>>(), 2),
+]);
+const COMPARISON_QUERY_PAYMENT: u64 = comparison_payment(8, [
+    (size_of::<[&VerifiedSourceContinuation; 4]>(), 2),
+    (size_of::<std::array::IntoIter<&VerifiedSourceContinuation, 4>>(), 2),
+    (size_of::<&Dependency>(), 2),
+]);
+fn marker_query_payment(before: usize, after: usize) -> Option<u64> {
+    before.checked_add(after).and_then(|n| u64::try_from(n).ok())
+        .and_then(|n| n.checked_mul(COMPARISON_QUERY_PAYMENT))
+}
+
 /// Local rule capability: only this verifying constructor can create it. It is
 /// neither serialized nor returned as a preparation/publication permission.
 struct ClosedContinuationRules {
     snapshot: Digest,
     before: Digest,
     after: Digest,
-    proofs: Vec<VerifiedSourceContinuation>,
+    proofs: ComparisonProofs,
     markers: BTreeSet<Vec<u8>>,
 }
 impl ClosedContinuationRules {
@@ -30,6 +121,7 @@ impl ClosedContinuationRules {
         inventory: &CommonFactInventory,
         seed: &Dependencies,
         controlled: &Dependencies,
+        origins: &ComparisonOrigins<'_>,
         meter: &mut ProofMeter,
     ) -> AdmissionResult<Self> {
         meter.charge(1)?;
@@ -46,46 +138,38 @@ impl ClosedContinuationRules {
             ));
         }
         let original_sources = &original.proof.request.inventory.sources;
-        let mut proofs = Vec::new();
-        for (old, new, old_sources, side) in [
-            (
-                original.proof.snapshot.program()?,
-                before,
-                original_sources,
-                OwnedSourceSide::Before,
-            ),
-            (
-                &original.proof.candidate,
-                after,
-                original_sources,
-                OwnedSourceSide::After,
-            ),
-            (
-                predecessor_before,
-                before,
-                predecessor_sources,
-                OwnedSourceSide::Before,
-            ),
-            (
-                predecessor_after,
-                after,
-                predecessor_sources,
-                OwnedSourceSide::After,
-            ),
-        ] {
-            proofs.push(continuation(
-                old,
-                new,
-                old_sources,
-                sources,
-                side,
-                seed,
-                controlled,
-                meter,
-            )?);
-        }
+        let original_before = continuation(
+            original.proof.snapshot.program()?, before, original_sources, sources,
+            OwnedSourceSide::Before, seed, controlled, meter,
+        )?;
+        let original_after = continuation(
+            &original.proof.candidate, after, original_sources, sources,
+            OwnedSourceSide::After, seed, controlled, meter,
+        )?;
+        let predecessor = match origins {
+            ComparisonOrigins::FreshInitial(_) => {
+                // Separate positive live polls at the two original logical slots.
+                meter.charge(COMPARISON_HIT_PAYMENT)?;
+                meter.charge(COMPARISON_HIT_PAYMENT)?;
+                None
+            }
+            ComparisonOrigins::General { .. } => Some([
+                continuation(predecessor_before, before, predecessor_sources, sources,
+                    OwnedSourceSide::Before, seed, controlled, meter)?,
+                continuation(predecessor_after, after, predecessor_sources, sources,
+                    OwnedSourceSide::After, seed, controlled, meter)?,
+            ]),
+        };
+        let proofs = ComparisonProofs { original: [original_before, original_after], predecessor };
         let mut markers =
             collect_common_state_markers(&before.program, &after.program, sources, meter)?;
+        // R8 bounds queries by validated O(1) action lengths, never an AST scan.
+        meter.charge(COMPARISON_VIEW_PAYMENT)?;
+        // Overflow uses the existing host's first-cause resource refusal; no new
+        // formatted error payload or replacement meter is introduced.
+        meter.charge(marker_query_payment(before.program.actions.len(), after.program.actions.len())
+            .unwrap_or(u64::MAX))?;
+        let logical = proofs.logical();
         for (app, side) in [
             (&before.program, OwnedSourceSide::Before),
             (&after.program, OwnedSourceSide::After),
@@ -99,7 +183,7 @@ impl ClosedContinuationRules {
                     continue;
                 };
                 let dependency = Dependency::State(state.into());
-                if proofs.iter().any(|p| {
+                if logical.into_iter().any(|p| {
                     p.protected.contains(&dependency) || p.influenced.contains(&dependency)
                 }) {
                     let key =
@@ -1305,6 +1389,46 @@ pub(super) fn verify(
     sources: &OwnedSourceRequest,
     meter: &mut ProofMeter,
 ) -> AdmissionResult<VerifiedOwnedContinuation> {
+    meter.charge(COMPARISON_DISPATCH_PAYMENT)?;
+    meter.charge(COMPARISON_OWNER_PAYMENT)?;
+    verify_with_origins(current, ComparisonOrigins::General {
+        original, predecessor_before, predecessor_after,
+    }, layer, initialization, before, after, sources, meter)
+}
+
+// Only the closed persistence dispatcher can construct the argument. Its caller
+// prepays R5/R6 before constructing it; this wrapper must not charge twice.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn verify_initial(
+    current: &ProjectSnapshot,
+    origin: InitialComparison<'_>,
+    layer: &OwnedLayerV2,
+    initialization: &OwnedInitializationV2,
+    before: &CapturedProgram,
+    after: &CapturedProgram,
+    sources: &OwnedSourceRequest,
+    meter: &mut ProofMeter,
+) -> AdmissionResult<VerifiedOwnedContinuation> {
+    verify_with_origins(current, ComparisonOrigins::FreshInitial(origin), layer,
+        initialization, before, after, sources, meter)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_with_origins(
+    current: &ProjectSnapshot,
+    origins: ComparisonOrigins<'_>,
+    layer: &OwnedLayerV2,
+    initialization: &OwnedInitializationV2,
+    before: &CapturedProgram,
+    after: &CapturedProgram,
+    sources: &OwnedSourceRequest,
+    meter: &mut ProofMeter,
+) -> AdmissionResult<VerifiedOwnedContinuation> {
+    let (original, predecessor_before, predecessor_after) = match &origins {
+        ComparisonOrigins::FreshInitial(origin) => origin.references(),
+        ComparisonOrigins::General { original, predecessor_before, predecessor_after } =>
+            (*original, *predecessor_before, *predecessor_after),
+    };
     meter.charge(1)?;
     let state = current.owned_scope()?;
     let layer_id = layer.identity()?;
@@ -1440,12 +1564,14 @@ pub(super) fn verify(
         &inventory,
         &seed,
         &controlled,
+        &origins,
         meter,
     )?;
     let continuation_ids = closed
         .proofs
-        .iter()
-        .map(|proof| proof.identity.clone())
+        .logical()
+        .into_iter()
+        .map(comparison_identity as fn(&VerifiedSourceContinuation) -> Digest)
         .collect();
     let retained = RetainedOwned::new(original, closed)?;
     let (certificates, projections, comparison) = super::common_fact_rules::verify_pair_frame(
@@ -1974,3 +2100,7 @@ impl VerifiedOwnedPolicySurface {
         assert_eq!(self.policy_fields, old.policy_fields);
     }
 }
+
+#[cfg(test)]
+#[path = "owned_continuation_initial_reuse_tests.rs"]
+mod initial_reuse_tests;

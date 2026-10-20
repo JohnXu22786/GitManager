@@ -204,9 +204,9 @@ where
         meter.watch_cancellation(token);
     }
     meter.charge(0)?;
-    let registry = owned_persist::reconstruct(current, &mut meter)?;
-    let execution = owned_persist::transition_from_registry(
-        current, &registry, before, after, sources, layer, operation, withdrawal, &mut meter,
+    meter.charge(owned_persist::TRANSITION_RECONSTRUCT_PAYMENT)?;
+    let (registry, execution) = owned_persist::reconstruct_and_transition(
+        current, before, after, sources, layer, operation, withdrawal, &mut meter,
     )?;
     meter.charge(8)?;
     {
@@ -361,10 +361,9 @@ impl ProductStore {
         let proof = &prepared.execution.continuation;
         // Prepay the retained local owner header and its cleanup.
         meter.charge(2)?;
-        let registry = owned_persist::reconstruct(&current, &mut meter)?;
-        let execution = owned_persist::transition_from_registry(
+        meter.charge(owned_persist::TRANSITION_RECONSTRUCT_PAYMENT)?;
+        let (registry, execution) = owned_persist::reconstruct_and_transition(
             &current,
-            &registry,
             proof.before(),
             proof.after(),
             &proof.request().inventory.sources,

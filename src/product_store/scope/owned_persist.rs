@@ -14,6 +14,89 @@ pub(super) struct ReconstructedOwned {
     pub manifests: BTreeMap<Digest, OwnedCompositionV2>,
     pub initializations: BTreeMap<Digest, OwnedInitializationV2>,
 }
+// This owner never leaves the private reconstruction worker/finish operation.
+// Only the freshly regenerated committed Initial can mint its extra Arc.
+struct FreshInitialOrigin<'s> {
+    retained: &'s ProjectSnapshot,
+    original: Arc<PreparedOwnedPreview>,
+}
+pub(super) struct InitialComparison<'a> {
+    original: &'a PreparedOwnedPreview,
+    predecessor_before: &'a CapturedProgram,
+    predecessor_after: &'a CapturedProgram,
+}
+impl<'a> InitialComparison<'a> {
+    pub(super) fn references(&self) -> (&'a PreparedOwnedPreview, &'a CapturedProgram, &'a CapturedProgram) {
+        (self.original, self.predecessor_before, self.predecessor_after)
+    }
+}
+use std::mem::size_of;
+use super::owned_continuation::comparison_payment;
+trait ReconstructionFinish<'s>: Sized {
+    type Output;
+    // R1 is paid at the immediate audited wrapper caller, before construction.
+    const FRAME_PAYMENT: u64 = comparison_payment(64, [
+        (size_of::<Self>(), 2), (size_of::<Option<FreshInitialOrigin<'s>>>(), 2),
+        (size_of::<ReconstructedOwned>(), 2), (size_of::<Result<ReconstructedOwned>>(), 2),
+        (size_of::<Self::Output>(), 2), (size_of::<Result<Self::Output>>(), 2),
+        (size_of::<&mut ProofMeter>(), 4),
+    ]);
+    const FINISH_PAYMENT: u64 = comparison_payment(32, [
+        (size_of::<Self>(), 4), (size_of::<Self::Output>(), 4),
+        (size_of::<Result<Self::Output>>(), 4), (size_of::<Option<FreshInitialOrigin<'s>>>(), 4),
+        (size_of::<Option<&FreshInitialOrigin<'s>>>(), 4),
+        (size_of::<&ProjectSnapshot>(), 4), (size_of::<&mut ProofMeter>(), 4),
+    ]);
+    fn finish(self, snapshot: &'s ProjectSnapshot, registry: ReconstructedOwned,
+        origin: Option<FreshInitialOrigin<'s>>, meter: &mut ProofMeter) -> Result<Self::Output>;
+}
+struct RegistryOnly;
+struct TransitionFinish<'a> {
+    before: &'a CapturedProgram,
+    after: &'a CapturedProgram,
+    sources: &'a OwnedSourceRequest,
+    layer: &'a Digest,
+    operation: &'a str,
+    withdrawal: bool,
+}
+impl<'s> ReconstructionFinish<'s> for RegistryOnly {
+    type Output = ReconstructedOwned;
+    fn finish(self, _snapshot: &'s ProjectSnapshot, registry: ReconstructedOwned,
+        origin: Option<FreshInitialOrigin<'s>>, _meter: &mut ProofMeter) -> Result<Self::Output> {
+        drop(origin);
+        Ok(registry)
+    }
+}
+impl<'s> ReconstructionFinish<'s> for TransitionFinish<'_> {
+    type Output = (ReconstructedOwned, Arc<VerifiedOwnedTransitionExecution>);
+    fn finish(self, snapshot: &'s ProjectSnapshot, registry: ReconstructedOwned,
+        origin: Option<FreshInitialOrigin<'s>>, meter: &mut ProofMeter) -> Result<Self::Output> {
+        let execution = transition_with_origin(snapshot, &registry, self.before, self.after,
+            self.sources, self.layer, self.operation, self.withdrawal, origin.as_ref(), meter)?;
+        drop(origin);
+        Ok((registry, execution))
+    }
+}
+pub(super) const TRANSITION_RECONSTRUCT_PAYMENT: u64 = TransitionFinish::FRAME_PAYMENT;
+const INITIAL_ORIGIN_PAYMENT: u64 = comparison_payment(32, [
+    (size_of::<FreshInitialOrigin<'_>>(), 4), (size_of::<Option<FreshInitialOrigin<'_>>>(), 4),
+    (size_of::<Arc<PreparedOwnedPreview>>(), 4), (size_of::<&ProjectSnapshot>(), 2),
+]);
+const HISTORICAL_ORIGIN_PAYMENT: u64 = comparison_payment(32, [
+    (size_of::<Option<FreshInitialOrigin<'_>>>(), 4),
+    (size_of::<Option<&FreshInitialOrigin<'_>>>(), 4),
+    (size_of::<Result<VerifiedOwnedTransitionExecution>>(), 2), (size_of::<&mut ProofMeter>(), 2),
+]);
+// Additional direct-general route coverage: unlike the closed finish, this
+// entry has not prepaid R4. Pay its complete new call/return headers locally.
+const GENERAL_TRANSITION_PAYMENT: u64 = comparison_payment(64, [
+    (size_of::<&ProjectSnapshot>(), 4), (size_of::<&ReconstructedOwned>(), 4),
+    (size_of::<&CapturedProgram>(), 8), (size_of::<&OwnedSourceRequest>(), 4),
+    (size_of::<&Digest>(), 4), (size_of::<&str>(), 4), (size_of::<bool>(), 4),
+    (size_of::<Option<&FreshInitialOrigin<'_>>>(), 4), (size_of::<&mut ProofMeter>(), 4),
+    (size_of::<Result<Arc<VerifiedOwnedTransitionExecution>>>(), 4),
+    (size_of::<Arc<VerifiedOwnedTransitionExecution>>(), 4),
+]);
 struct GraphHistory {
     prior: BTreeMap<u64, DecisionGraph>,
     after: BTreeMap<u64, DecisionGraph>,
@@ -575,6 +658,13 @@ pub(super) fn reconstruct(
     snapshot: &ProjectSnapshot,
     meter: &mut ProofMeter,
 ) -> Result<ReconstructedOwned> {
+    meter.charge(RegistryOnly::FRAME_PAYMENT)?;
+    reconstruct_with(snapshot, meter, RegistryOnly)
+}
+fn reconstruct_with<'s, F: ReconstructionFinish<'s>>(
+    snapshot: &'s ProjectSnapshot, meter: &mut ProofMeter, finish: F,
+) -> Result<F::Output> {
+    let mut origin = None;
     let state = snapshot.owned_scope()?;
     if state.layers.len() > 1
         || state.compositions.len() > MAX_ITEMS
@@ -707,6 +797,8 @@ pub(super) fn reconstruct(
             let initial = Arc::new(reconstruct_recipe(
                 snapshot, layer, manifest, init, &graphs, meter,
             )?);
+            meter.charge(INITIAL_ORIGIN_PAYMENT)?;
+            origin = Some(FreshInitialOrigin { retained: snapshot, original: initial.clone() });
             result
                 .proofs
                 .insert(manifest.output.clone(), initial.clone());
@@ -747,6 +839,8 @@ pub(super) fn reconstruct(
                 after,
                 Some(&adoption.plan.retire_decisions),
             )?;
+            meter.charge(HISTORICAL_ORIGIN_PAYMENT)?;
+            let fresh_origin = origin.take();
             let transition = reconstruct_transition(
                 snapshot,
                 &historical,
@@ -754,8 +848,10 @@ pub(super) fn reconstruct(
                 layer,
                 init,
                 manifest,
+                fresh_origin.as_ref(),
                 meter,
             )?;
+            drop(fresh_origin);
             OwnedExecutionRecipe::Transition(Arc::new(transition))
         };
         bind_plan(snapshot, adoption, manifest, layer, recipe.seed(), false)?;
@@ -1022,7 +1118,8 @@ pub(super) fn reconstruct(
             return Err(err("adoption changed exact session, day or artifacts"));
         }
     }
-    Ok(result)
+    meter.charge(F::FINISH_PAYMENT)?;
+    finish.finish(snapshot, result, origin, meter)
 }
 pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
     let mut meter = ProofMeter::new(ProofBudget::default(), Arc::new(AtomicBool::new(false)))?;
@@ -1700,6 +1797,7 @@ fn reconstruct_transition(
     layer: &OwnedLayerV2,
     initialization: &OwnedInitializationV2,
     manifest: &OwnedCompositionV2,
+    origin: Option<&FreshInitialOrigin<'_>>,
     meter: &mut ProofMeter,
 ) -> Result<VerifiedOwnedTransitionExecution> {
     let last = registry
@@ -1746,7 +1844,7 @@ fn reconstruct_transition(
         ));
     }
     let (prior_before, prior_after, prior_sources) =
-        registry.effective_pair(snapshot, &last.output)?;
+        registry.effective_pair(match origin { Some(o) => o.retained, None => snapshot }, &last.output)?;
     let (before, after, sources) = match manifest.transition {
         ScopeTransition::Evolution => {
             if manifest.active != predecessor.active {
@@ -1785,18 +1883,20 @@ fn reconstruct_transition(
         }
         _ => return Err(err("unsupported owned transition kind")),
     };
-    let continuation = owned_continuation::verify(
-        current,
-        &original,
-        layer,
-        initialization,
-        prior_before,
-        prior_after,
-        before,
-        after,
-        sources,
-        meter,
-    )?;
+    let continuation = match origin {
+        Some(origin) if manifest.transition == ScopeTransition::Evolution => {
+        meter.charge(owned_continuation::COMPARISON_DISPATCH_PAYMENT)?;
+        meter.charge(owned_continuation::COMPARISON_OWNER_PAYMENT)?;
+        owned_continuation::verify_initial(current, InitialComparison {
+            original: &origin.original, predecessor_before: prior_before,
+            predecessor_after: prior_after,
+        }, layer, initialization, before, after, sources, meter)?
+        }
+        _ => {
+        owned_continuation::verify(current, &original, layer, initialization,
+            prior_before, prior_after, before, after, sources, meter)?
+        }
+    };
     let (target, metadata) = owned_transition_lowering::compile(
         &continuation,
         manifest,
@@ -1826,10 +1926,20 @@ pub(super) fn transition(
     withdrawal: bool,
     meter: &mut ProofMeter,
 ) -> Result<Arc<VerifiedOwnedTransitionExecution>> {
-    let registry = reconstruct(current, meter)?;
-    transition_from_registry(
-        current, &registry, before, after, sources, layer_id, operation, withdrawal, meter,
-    )
+    meter.charge(TRANSITION_RECONSTRUCT_PAYMENT)?;
+    reconstruct_and_transition(current, before, after, sources, layer_id, operation,
+        withdrawal, meter).map(|(_, execution)| execution)
+}
+// R1 must be prepaid at each of the three audited production call sites.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn reconstruct_and_transition(
+    current: &ProjectSnapshot, before: &CapturedProgram, after: &CapturedProgram,
+    sources: &OwnedSourceRequest, layer: &Digest, operation: &str,
+    withdrawal: bool, meter: &mut ProofMeter,
+) -> Result<(ReconstructedOwned, Arc<VerifiedOwnedTransitionExecution>)> {
+    reconstruct_with(current, meter, TransitionFinish {
+        before, after, sources, layer, operation, withdrawal,
+    })
 }
 pub(super) fn transition_from_registry(
     current: &ProjectSnapshot,
@@ -1840,6 +1950,22 @@ pub(super) fn transition_from_registry(
     layer_id: &Digest,
     operation: &str,
     withdrawal: bool,
+    meter: &mut ProofMeter,
+) -> Result<Arc<VerifiedOwnedTransitionExecution>> {
+    meter.charge(GENERAL_TRANSITION_PAYMENT)?;
+    transition_with_origin(current, registry, before, after, sources, layer_id,
+        operation, withdrawal, None, meter)
+}
+fn transition_with_origin(
+    current: &ProjectSnapshot,
+    registry: &ReconstructedOwned,
+    before: &CapturedProgram,
+    after: &CapturedProgram,
+    sources: &OwnedSourceRequest,
+    layer_id: &Digest,
+    operation: &str,
+    withdrawal: bool,
+    origin: Option<&FreshInitialOrigin<'_>>,
     meter: &mut ProofMeter,
 ) -> Result<Arc<VerifiedOwnedTransitionExecution>> {
     registry.check_snapshot(current)?;
@@ -1870,7 +1996,7 @@ pub(super) fn transition_from_registry(
         return Err(err("invalid or noncurrent transition operation"));
     }
     let (prior_before, prior_after, prior_sources) =
-        registry.effective_pair(current, &last.output)?;
+        registry.effective_pair(match origin { Some(o) => o.retained, None => current }, &last.output)?;
     if withdrawal
         && (predecessor.active != BTreeSet::from([layer_id.clone()])
             || before != prior_before
@@ -1892,18 +2018,20 @@ pub(super) fn transition_from_registry(
         )
         .ok_or_else(|| err("original preview missing"))?
         .clone();
-    let continuation = owned_continuation::verify(
-        current,
-        &original,
-        layer,
-        initialization,
-        prior_before,
-        prior_after,
-        before,
-        after,
-        sources,
-        meter,
-    )?;
+    let continuation = match origin {
+        Some(origin) if !withdrawal => {
+        meter.charge(owned_continuation::COMPARISON_DISPATCH_PAYMENT)?;
+        meter.charge(owned_continuation::COMPARISON_OWNER_PAYMENT)?;
+        owned_continuation::verify_initial(current, InitialComparison {
+            original: &origin.original, predecessor_before: prior_before,
+            predecessor_after: prior_after,
+        }, layer, initialization, before, after, sources, meter)?
+        }
+        _ => {
+        owned_continuation::verify(current, &original, layer, initialization,
+            prior_before, prior_after, before, after, sources, meter)?
+        }
+    };
     let mut manifest = OwnedCompositionV2 {
         version: OWNED_SCOPE_VERSION,
         lowering: OWNED_TRANSITION_LOWERING_VERSION,
@@ -2077,3 +2205,7 @@ impl ProjectSnapshot {
 #[cfg(test)]
 #[path = "owned_persist_registry_controls.rs"]
 mod registry_policy_controls;
+
+#[cfg(test)]
+#[path = "owned_persist_initial_reuse_tests.rs"]
+mod initial_reuse_tests;
