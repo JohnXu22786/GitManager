@@ -646,24 +646,35 @@ fn assert_checked_tag_schema(source: &str) {
 
 #[test]
 fn checked_tag_schema_table_and_scope_drift() {
-    let source = include_str!("capture_closed_value.rs");
-    assert_checked_tag_schema(source);
-    assert_checked_tag_schema(&source.replace('\n', "\r\n"));
-    for changed in [
-        source.replacen(
-            "Type::Boolean => (1, 0, \"boolean\")",
-            "Type::Boolean => (1, 0, \"integer\")",
-            1,
-        ),
-        source.replacen("checked_kind_field!(a, cursor);", "", 1),
-        source.replacen("if !tag_matches(m, index, tag, a)?", "if false", 1),
-        source.replacen(
-            "let Some((key, _)) = $cursor.next()",
-            "let Some((key, _)) = $cursor.next_back()",
-            1,
-        ),
-    ] {
-        assert_ne!(changed, source);
-        assert!(std::panic::catch_unwind(|| assert_checked_tag_schema(&changed)).is_err());
+    let source = include_str!("capture_closed_value.rs").replace("\r\n", "\n");
+    // Exercise both possible checkout encodings regardless of the host OS.
+    for checkout_source in [source.clone(), source.replace('\n', "\r\n")] {
+        // Normalize before synthesis so a CRLF checkout cannot become CRCRLF.
+        let source = checkout_source.replace("\r\n", "\n");
+        for source in [source.clone(), source.replace('\n', "\r\n")] {
+            assert_checked_tag_schema(&source);
+            for changed in [
+                source.replacen(
+                    "Type::Boolean => (1, 0, \"boolean\")",
+                    "Type::Boolean => (1, 0, \"integer\")",
+                    1,
+                ),
+                source.replacen("checked_kind_field!(a, cursor);", "", 1),
+                source.replacen("if !tag_matches(m, index, tag, a)?", "if false", 1),
+                source.replacen(
+                    "let Some((key, _)) = $cursor.next()",
+                    "let Some((key, _)) = $cursor.next_back()",
+                    1,
+                ),
+                source.replacen(
+                    "if !$a.eq_str(key, \"kind\")?",
+                    "if !$a.eq_str(key, \"type\")?",
+                    1,
+                ),
+            ] {
+                assert_ne!(changed, source);
+                assert!(std::panic::catch_unwind(|| assert_checked_tag_schema(&changed)).is_err());
+            }
+        }
     }
 }
