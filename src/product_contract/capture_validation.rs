@@ -255,7 +255,7 @@ pub(super) fn bytes_digest_audited(
 }
 
 #[derive(Serialize)]
-struct SyntheticAction<'a> {
+pub(super) struct SyntheticAction<'a> {
     id: &'a str,
     label: &'static str,
     parameters: Parameters<'a>,
@@ -267,13 +267,13 @@ struct Parameters<'a> {
     binding: &'a str,
     entity: &'a str,
 }
+#[derive(Serialize)]
+struct Reference<'a> {
+    kind: &'static str,
+    entity: &'a str,
+}
 impl Serialize for Parameters<'_> {
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
-        #[derive(Serialize)]
-        struct Reference<'a> {
-            kind: &'static str,
-            entity: &'a str,
-        }
         let mut map = s.serialize_map(Some(1))?;
         map.serialize_entry(
             self.binding,
@@ -296,6 +296,27 @@ struct SyntheticEqual<'a> {
     kind: &'static str,
     left: &'a Expr,
     right: &'a Expr,
+}
+// The one-entry Parameters map is a borrowed custom serializer, not a BTree.
+// Describe its actual fields without the generic map's BTree iterator reserve.
+impl capture_canonical::ManualShape for Parameters<'_> {
+    fn describe(&self, s: &mut capture_canonical::Shape<'_>) -> Result<()> {
+        let mut object = s.object()?;
+        object.field(self.binding, &Reference { kind: "reference", entity: self.entity })?;
+        object.end()
+    }
+}
+impl SyntheticAction<'_> {
+    pub(super) fn describe(&self, s: &mut capture_canonical::Shape<'_>) -> Result<()> {
+        let mut object = s.object()?;
+        object.field("id", &self.id)?;
+        object.field("label", &self.label)?;
+        object.manual_field("parameters", &self.parameters)?;
+        object.field("guards", &self.guards)?;
+        object.field("steps", &self.steps)?;
+        object.field("ensures", &self.ensures)?;
+        object.end()
+    }
 }
 fn extension(
     app: &AppDefinition,
@@ -386,12 +407,147 @@ fn extension(
             message: "Projection type check",
         }],
     };
-    let bytes = capture_canonical::canonical_bytes_audited(&synthetic, a)?;
+    // Ordinary output retains its original lifetime through the wire-limit tail.
+    // Only the audited path removes the Value tree and final Vec.
+    a.pay(32 + 2 * size_of::<Result<usize>>() as u64 + 2 * size_of::<usize>() as u64)?;
+    let bytes;
+    let synthetic_len = if a.enabled() {
+        capture_canonical::synthetic_canonical_len_audited(&synthetic, a)?
+    } else {
+        bytes = capture_canonical::canonical_bytes_audited(&synthetic, a)?;
+        bytes.len()
+    };
     a.pay(6)?;
     let len = wire
-        .checked_add(bytes.len())
+        .checked_add(synthetic_len)
         .and_then(|n| n.checked_add(usize::from(actions > 0)))
         .ok_or_else(|| a.overflow())?;
     a.require(len <= MAX_WIRE_BYTES, "program exceeds byte budget")?;
     a.pay(0)
 }
+
+
+// A paid, concrete height walk, used only to reserve this action's two later
+// serialization stacks. These are actual logical frame/lifetime slots, never
+// heap allocations: self/a plus six field references, six scalar temporaries,
+// one iterator and its Option, three result and two unit-result carriers.
+const SYNTHETIC_HEIGHT_FRAME: usize = 2 * (
+    8 * size_of::<usize>() + 6 * size_of::<usize>()
+    + size_of::<std::slice::Iter<'static, Expr>>() + size_of::<Option<&Expr>>()
+    + 3 * size_of::<Result<usize>>() + 2 * size_of::<Result<()>>()
+    + size_of::<Option<usize>>()
+);
+impl SyntheticAction<'_> {
+    pub(super) fn serialization_height(&self, a: Audit<'_>) -> Result<usize> {
+        a.pay(SYNTHETIC_HEIGHT_FRAME as u64 + 96)?;
+        let SyntheticAction { id: _, label: _, parameters: _, guards: [], steps: [step], ensures: [] } = self;
+        let SyntheticAssert { kind: _, condition: SyntheticEqual { kind: _, left, right }, message: _ } = step;
+        // action / steps / assert / equal. Parameters / Reference has height3.
+        // Visit BOTH occurrences, even though this lexical owner borrows one Expr.
+        let left = synthetic_expr_height(left, a)?;
+        let right = synthetic_expr_height(right, a)?;
+        left.max(right).checked_add(4).ok_or_else(|| a.overflow())
+    }
+}
+fn synthetic_expr_height(expr: &Expr, a: Audit<'_>) -> Result<usize> {
+    a.pay(SYNTHETIC_HEIGHT_FRAME as u64 + 96)?;
+    let child = match expr {
+        Expr::Literal { value_type, value } => {
+            let typ = synthetic_type_height(value_type, a)?;
+            typ.max(synthetic_value_height(value, a)?)
+        }
+        Expr::Variable { name: _ } | Expr::State { state: _ } | Expr::Today => 0,
+        Expr::Field { record, field: _ } => synthetic_expr_height(record, a)?,
+        Expr::Query { entity: _, binding: _, predicate, sort, limit: _, include_archived: _ } => {
+            let mut height = synthetic_expr_height(predicate, a)?.max(1);
+            let mut iter = sort.iter();
+            loop {
+                a.pay(32)?; // next, Option, SortKey borrow, max and checked add
+                let Some(SortKey { value, descending: _ }) = iter.next() else { break };
+                let next = synthetic_expr_height(value, a)?.checked_add(2).ok_or_else(|| a.overflow())?;
+                height = height.max(next); // sort array + SortKey object
+            }
+            height
+        }
+        Expr::Filter { items, binding: _, predicate } | Expr::Any { items, binding: _, predicate }
+        | Expr::All { items, binding: _, predicate } => {
+            let items = synthetic_expr_height(items, a)?;
+            items.max(synthetic_expr_height(predicate, a)?)
+        }
+        Expr::Map { items, binding: _, value } | Expr::Contains { items, value } => {
+            let items = synthetic_expr_height(items, a)?;
+            items.max(synthetic_expr_height(value, a)?)
+        }
+        Expr::Count { items } | Expr::Sum { items } => synthetic_expr_height(items, a)?,
+        Expr::Equal { left, right } | Expr::Less { left, right } | Expr::Add { left, right }
+        | Expr::Subtract { left, right } | Expr::Concat { left, right } => {
+            let left = synthetic_expr_height(left, a)?;
+            left.max(synthetic_expr_height(right, a)?)
+        }
+        Expr::TextContains { text, search } => {
+            let text = synthetic_expr_height(text, a)?;
+            text.max(synthetic_expr_height(search, a)?)
+        }
+        Expr::Lower { value } | Expr::Not { value } => synthetic_expr_height(value, a)?,
+        Expr::And { values } | Expr::Or { values } => {
+            let mut height = 0usize;
+            let mut iter = values.iter();
+            loop {
+                a.pay(32)?;
+                let Some(value) = iter.next() else { break };
+                height = height.max(synthetic_expr_height(value, a)?);
+            }
+            height.checked_add(1).ok_or_else(|| a.overflow())? // values array, even empty
+        }
+        Expr::If { condition, then_value, else_value } => {
+            let condition = synthetic_expr_height(condition, a)?;
+            let then_value = synthetic_expr_height(then_value, a)?;
+            condition.max(then_value).max(synthetic_expr_height(else_value, a)?)
+        }
+        Expr::Coalesce { value, fallback } => {
+            let value = synthetic_expr_height(value, a)?;
+            value.max(synthetic_expr_height(fallback, a)?)
+        }
+        Expr::DateAdd { date, days } => {
+            let date = synthetic_expr_height(date, a)?;
+            date.max(synthetic_expr_height(days, a)?)
+        }
+        Expr::DateDifference { later, earlier } => {
+            let later = synthetic_expr_height(later, a)?;
+            later.max(synthetic_expr_height(earlier, a)?)
+        }
+    };
+    child.checked_add(1).ok_or_else(|| a.overflow()) // internally tagged object
+}
+fn synthetic_type_height(typ: &Type, a: Audit<'_>) -> Result<usize> {
+    a.pay(SYNTHETIC_HEIGHT_FRAME as u64 + 96)?;
+    let child = match typ {
+        Type::Boolean | Type::Integer | Type::Text | Type::Date | Type::Reference { entity: _ } => 0,
+        Type::List { item } | Type::Optional { item } => synthetic_type_height(item, a)?,
+    };
+    child.checked_add(1).ok_or_else(|| a.overflow())
+}
+fn synthetic_value_height(value: &DataValue, a: Audit<'_>) -> Result<usize> {
+    a.pay(SYNTHETIC_HEIGHT_FRAME as u64 + 96)?;
+    let child = match value {
+        DataValue::Null | DataValue::Boolean { value: _ } | DataValue::Integer { value: _ }
+        | DataValue::Text { value: _ } | DataValue::Date { days: _ }
+        | DataValue::Reference { entity: _, record: _ } => 0,
+        DataValue::List { item_type, items } => {
+            let mut height = synthetic_type_height(item_type, a)?.max(1);
+            let mut iter = items.iter();
+            loop {
+                a.pay(32)?;
+                let Some(value) = iter.next() else { break };
+                let next = synthetic_value_height(value, a)?.checked_add(1).ok_or_else(|| a.overflow())?;
+                height = height.max(next); // items array, including its empty case
+            }
+            height
+        }
+    };
+    child.checked_add(1).ok_or_else(|| a.overflow())
+}
+
+#[cfg(test)]
+#[path = "capture_synthetic_extension_tests.rs"]
+mod synthetic_extension_tests;

@@ -936,6 +936,74 @@ pub(super) fn app_canonical_len_audited(app: &AppDefinition, a: Audit<'_>) -> Re
     counter.finish(native)
 }
 
+const SYNTHETIC_COUNT_ROOT: usize = 2 * size_of::<AppLengthCounter<'static>>()
+    + 2 * size_of::<serde_json::Serializer<&mut AppLengthCounter<'static>>>()
+    + 2 * size_of::<serde_json::Result<()>>()
+    + 2 * size_of::<Result<usize>>() + 2 * size_of::<Result<()>>()
+    + 8 * size_of::<u64>() + 4 * size_of::<Option<u64>>();
+
+// Concrete extension-only admission. No arbitrary Serialize or caller length is
+// accepted. The caller has already checked BOTH occurrences at Expr depth two.
+#[cfg_attr(test, track_caller)]
+pub(super) fn synthetic_canonical_len_audited(
+    action: &capture_validation::SyntheticAction<'_>,
+    a: Audit<'_>,
+) -> Result<usize> {
+    #[cfg(test)]
+    let _diagnostic = super::capture_work::diagnostic::enter(
+        super::capture_work::diagnostic::Phase::Canonical,
+    );
+    a.pay(0)?;
+    a.pay(SYNTHETIC_COUNT_ROOT as u64)?;
+    a.pay(96)?;
+    // Paid concrete walk of this exact borrowed action, not an App-only bound
+    // or caller-supplied authority. The semantic prefix has already succeeded.
+    let height = a.usize(action.serialization_height(a)?)?;
+    // Two lifetime slots per level in EACH descriptor/native traversal. The
+    // bounded logical frame includes derive references, Container/Compound,
+    // custom Parameters/Reference, iterators, Result and integer/escape scratch.
+    let frame = a.usize(size_of::<usize>())?.checked_mul(64)
+        .and_then(|n| n.checked_add(64)).ok_or_else(|| a.overflow())?;
+    a.amount(height.checked_mul(frame).and_then(|n| n.checked_mul(4)))?;
+    let mut shape = Shape::new(a)?;
+    a.pay(2)?;
+    shape.canonical = false;
+    shape.simple_app = true;
+    action.describe(&mut shape)?;
+    reserve_synthetic_count(&shape)?;
+    // The same checked sink implementation, NOT the App-only reservation.
+    let mut counter = AppLengthCounter { audit: a, size: 0, overflowed: false };
+    let native = serde_json::to_writer(&mut counter, action);
+    counter.finish(native)
+}
+
+fn reserve_synthetic_count(shape: &Shape<'_>) -> Result<()> {
+    let a = shape.audit;
+    a.pay(128)?;
+    usize::try_from(shape.bytes).map_err(|_| a.overflow())?;
+    // Every counted node is a scalar, string/key, object or sequence. A string
+    // uses <=3+2X writes, a number/bool one, a container two; commas/colons
+    // add at most one per child/key. Thus 4N+2X+2 covers the complete graph.
+    let writes = shape.nodes.checked_mul(4)
+        .and_then(|n| n.checked_add(shape.escaped.checked_mul(2)?))
+        .and_then(|n| n.checked_add(2)).ok_or_else(|| a.overflow())?;
+    // Shape's canonical byte-write terms are not executed by a length sink.
+    // Keep its native input scans/dispatch/container traversal, and pay every
+    // complete counter write separately; no output-byte copying is performed.
+    let traversal = shape.native.checked_sub(shape.bytes).ok_or_else(|| a.overflow())?;
+    let amount = writes.checked_mul(14)
+        .and_then(|n| n.checked_add(traversal))
+        .and_then(|n| n.checked_add(72)).ok_or_else(|| a.overflow())?;
+    // The only native failure is checked sink overflow. Preserve the complete
+    // finite ErrorImpl/transport/display/drop region and sticky WorkState cause.
+    let error_bytes = size_of::<usize>().checked_mul(4)
+        .and_then(|n| n.checked_add(size_of::<Box<str>>().max(size_of::<std::io::Error>())))
+        .ok_or_else(|| a.overflow())?;
+    a.format(128)?;
+    a.scaled(error_bytes, 2, 5)?;
+    a.pay(amount)
+}
+
 pub(super) trait ManualShape {
     fn describe(&self, shape: &mut Shape<'_>) -> Result<()>;
 }
@@ -1483,3 +1551,7 @@ mod closed_value_tests;
 #[cfg(test)]
 #[path = "capture_source_wire_bound_tests.rs"]
 mod source_wire_bound_tests;
+
+#[cfg(test)]
+#[path = "capture_synthetic_count_tests.rs"]
+mod synthetic_count_tests;
