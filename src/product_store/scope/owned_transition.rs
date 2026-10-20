@@ -8,6 +8,32 @@ use std::sync::{
     Arc,
 };
 
+// This capsule is minted only by the fresh locked writer below. Its contents
+// never leave the fixed-result callback and are not policy-success authority.
+pub(crate) struct LockedArchivePolicy<'gate> {
+    registry: &'gate owned_persist::ReconstructedOwned,
+}
+use std::mem::size_of;
+use super::owned_continuation::comparison_payment;
+const LOCKED_ARCHIVE_TRANSPORT_PAYMENT: u64 = comparison_payment(64, [
+    (size_of::<LockedArchivePolicy<'_>>(), 4),
+    (size_of::<Option<LockedArchivePolicy<'_>>>(), 4),
+    (size_of::<Option<&LockedArchivePolicy<'_>>>(), 8),
+    (size_of::<&owned_persist::ReconstructedOwned>(), 8),
+    (size_of::<&mut OwnedPolicyCheck<'_>>(), 4),
+    (size_of::<&mut ProofMeter>(), 4),
+    (size_of::<Result<()>>(), 4),
+]);
+const LOCKED_ARCHIVE_SELECTOR_PAYMENT: u64 = comparison_payment(64 + 4 * 64, [
+    (size_of::<Option<&owned_persist::ReconstructedOwned>>(), 8),
+    (size_of::<&LockedArchivePolicy<'_>>(), 4),
+    (size_of::<&VerifiedOwnedTransitionExecution>(), 4),
+    (size_of::<&Digest>(), 8),
+    (size_of::<bool>(), 4),
+    (size_of::<OwnedPolicyCheck<'_>>(), 4),
+    (size_of::<Result<()>>(), 4),
+]);
+
 /// One lexical callback borrows the actual successful preparation and gate.
 /// No constructor or registry/meter borrow is exposed to policy callers.
 pub(crate) struct OwnedPolicyCheck<'gate> {
@@ -320,6 +346,7 @@ impl ProductStore {
             &AdoptionPlan,
             &ProjectSnapshot,
             &mut OwnedPolicyCheck<'gate>,
+            Option<&LockedArchivePolicy<'gate>>,
         ) -> Result<()>,
         V: Fn(&ProjectSnapshot) -> Result<()>,
     {
@@ -435,7 +462,14 @@ impl ProductStore {
             },
         );
         meter.charge(8)?;
+        // Prepay both Some and None transports, errors and callback cleanup.
+        meter.charge(LOCKED_ARCHIVE_TRANSPORT_PAYMENT)?;
         {
+            let archive_policy = if fresh.is_withdrawal() {
+                Some(LockedArchivePolicy { registry: &registry })
+            } else {
+                None
+            };
             let mut check = OwnedPolicyCheck {
                 execution: &fresh.execution,
                 registry: Some(&registry),
@@ -448,6 +482,7 @@ impl ProductStore {
                 &adoption.plan,
                 &next,
                 &mut check,
+                archive_policy.as_ref(),
             )?;
         }
         drop(registry);
@@ -622,11 +657,10 @@ pub(crate) fn transition_policy_scope(
 pub(crate) fn transition_layer(execution: &VerifiedOwnedTransitionExecution) -> &Digest {
     execution.continuation.original_layer()
 }
-pub(crate) fn check_retained_transition_policies(
-    snapshot: &ProjectSnapshot,
-    mut check: impl for<'gate> FnMut(&mut OwnedPolicyCheck<'gate>) -> Result<()>,
-) -> Result<()> {
-    if !snapshot.owned_scope().is_ok_and(|state| {
+// Lexical sharing keeps ordinary export's original frame and None path.
+macro_rules! retained_transition_policy_body {
+    ($snapshot:ident, $check:ident, $execution:ident, $meter:ident, [$($select:tt)*], $registry:expr) => {{
+    if !$snapshot.owned_scope().is_ok_and(|state| {
         state.compositions.values().any(|m| {
             m.lowering == OWNED_TRANSITION_LOWERING_VERSION
                 && m.transition == ScopeTransition::Withdrawal
@@ -634,23 +668,47 @@ pub(crate) fn check_retained_transition_policies(
     }) {
         return Ok(());
     }
-    let mut meter = ProofMeter::new(ProofBudget::default(), Arc::new(AtomicBool::new(false)))?;
+    let mut $meter = ProofMeter::new(ProofBudget::default(), Arc::new(AtomicBool::new(false)))?;
     #[cfg(test)]
     adoption_diagnostic::phase(adoption_diagnostic::Phase::ArchiveReconstruct);
-    let registry = owned_persist::reconstruct(snapshot, &mut meter)?;
+    let registry = owned_persist::reconstruct($snapshot, &mut $meter)?;
     #[cfg(test)]
     adoption_diagnostic::phase(adoption_diagnostic::Phase::ArchivePolicy);
-    for execution in registry.checked_withdrawals() {
-        meter.charge(1)?;
-        meter.charge(6)?;
+    for $execution in registry.checked_withdrawals() {
+        $meter.charge(1)?;
+        $meter.charge(6)?;
+        $($select)*
         let mut context = OwnedPolicyCheck {
-            execution,
-            registry: None,
-            meter: &mut meter,
+            execution: $execution,
+            registry: $registry,
+            meter: &mut $meter,
         };
-        check(&mut context)?;
+        $check(&mut context)?;
     }
     Ok(())
+    }};
+}
+pub(crate) fn check_retained_transition_policies(
+    snapshot: &ProjectSnapshot,
+    mut check: impl for<'gate> FnMut(&mut OwnedPolicyCheck<'gate>) -> Result<()>,
+) -> Result<()> {
+    retained_transition_policy_body!(snapshot, check, execution, meter, [], None)
+}
+pub(crate) fn check_retained_transition_policies_locked(
+    snapshot: &ProjectSnapshot,
+    capsule: &LockedArchivePolicy<'_>,
+    mut check: impl for<'gate> FnMut(&mut OwnedPolicyCheck<'gate>) -> Result<()>,
+) -> Result<()> {
+    retained_transition_policy_body!(snapshot, check, execution, meter, [
+        meter.charge(LOCKED_ARCHIVE_SELECTOR_PAYMENT)?;
+        // Only a bounded eligibility hint. surface() must still associate the
+        // complete actual historical snapshot and resolve this exact source.
+        let selected_registry = if capsule.registry.snapshot == execution.manifest.basis.frozen.snapshot {
+            Some(capsule.registry)
+        } else {
+            None
+        };
+    ], selected_registry)
 }
 
 #[cfg(test)]
@@ -660,3 +718,7 @@ mod policy_reference_tests;
 #[cfg(test)]
 #[path = "owned_policy_context_tests.rs"]
 mod policy_context_tests;
+
+#[cfg(test)]
+#[path = "owned_archive_policy_reuse_tests.rs"]
+mod archive_policy_reuse_tests;

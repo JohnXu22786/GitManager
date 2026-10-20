@@ -7,7 +7,7 @@ mod owned_continuation;
 mod owned_transition_lowering;
 mod owned_epoch;
 pub use owned_transition::PreparedOwnedTransitionV2;
-pub(crate) use owned_transition::{OwnedPolicyCheck,prepare_owned_evolution, prepare_owned_withdrawal, transition_policy_surface, transition_policy_scope, transition_layer, check_retained_transition_policies};
+pub(crate) use owned_transition::{LockedArchivePolicy, check_retained_transition_policies_locked, OwnedPolicyCheck,prepare_owned_evolution, prepare_owned_withdrawal, transition_policy_surface, transition_policy_scope, transition_layer, check_retained_transition_policies};
 pub(crate) use owned_continuation::VerifiedOwnedPolicySurface;
 pub(crate) use common_fact_admission::ProofMeter;
 #[cfg(test)]

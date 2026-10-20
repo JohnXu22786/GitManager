@@ -334,7 +334,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 &change.prepared,
                 &change.decisions,
                 self.runtime.cancellation_token(),
-                |current, fresh, next, plan, candidate, check| {
+                |current, fresh, next, plan, candidate, check, archive_policy| {
                     #[cfg(test)]
                     crate::product_store::scope::adoption_diagnostic::phase(
                         crate::product_store::scope::adoption_diagnostic::Phase::CallbackBinding,
@@ -391,7 +391,13 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                         crate::product_store::scope::adoption_diagnostic::phase(
                             crate::product_store::scope::adoption_diagnostic::Phase::Bundle,
                         );
-                        IntentArchive::new(store.clone()).export_for(candidate)?;
+                        if let Some(capsule) = archive_policy {
+                            check.charge(super::bundle::LOCKED_ARCHIVE_EXPORT_PAYMENT)?;
+                            IntentArchive::new(store.clone())
+                                .export_for_locked_withdrawal(candidate, capsule)?;
+                        } else {
+                            IntentArchive::new(store.clone()).export_for(candidate)?;
+                        }
                         Ok(())
                     };
                     verify().map_err(into_store_error)

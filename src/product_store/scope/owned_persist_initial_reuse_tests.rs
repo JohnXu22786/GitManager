@@ -524,7 +524,7 @@ fn adopt_component(
             &adoption,
             &current.decisions,
             None,
-            |before, fresh, graph, _plan, next, gate| {
+            |before, fresh, graph, _plan, next, gate, _archive_policy| {
                 adoption_calls += 1;
                 assert_eq!(before, &current);
                 assert_eq!(fresh.seed(), &current.data);

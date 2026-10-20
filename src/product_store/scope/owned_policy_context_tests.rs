@@ -242,7 +242,7 @@ impl ProductStore {
         let mut reached = false;
         let result = self.adopt_owned_transition_verified(
             current.revision, &prepared, &adoption, &graph, Some(secondary),
-            |locked_current, fresh, _, _, _, check| {
+            |locked_current, fresh, _, _, _, check, _archive_policy| {
                 reached = true;
                 assert_eq!(locked_current, &current);
                 assert_eq!(fresh.basis(), locked_current);
@@ -275,7 +275,7 @@ impl ProductStore {
         self.assert_locked_adoption_policy_callback_for_test(
             operation, token(), token(), SENTINEL, |check| {
                 // Frozen old prefix + unchanged finish1 + retained owner2 + selected context8.
-                assert_eq!(MAX - check.remaining_units_for_test(), spent + 11);
+                assert_eq!(MAX - check.remaining_units_for_test(), spent + 11 + LOCKED_ARCHIVE_TRANSPORT_PAYMENT);
                 let before = check.remaining_units_for_test();
                 let execution = check.execution()?;
                 assert_eq!(before - check.remaining_units_for_test(), 3);
