@@ -4,11 +4,99 @@ use super::common_fact_admission::{refuse, ProofMeter};
 use super::*;
 use std::sync::{atomic::AtomicBool, Arc};
 
+pub(crate) use super::owned_epoch::VerifiedOwnedTransitionExecution;
+pub(super) use super::owned_epoch::{OwnedExecutionRecipe, OwnedProducerEpoch};
 pub(super) struct ReconstructedOwned {
+    pub snapshot: Digest,
+    pub recipes: BTreeMap<Digest, OwnedExecutionRecipe>,
+    pub epochs: Vec<OwnedProducerEpoch>,
     pub proofs: BTreeMap<Digest, Arc<PreparedOwnedPreview>>,
     pub manifests: BTreeMap<Digest, OwnedCompositionV2>,
     pub initializations: BTreeMap<Digest, OwnedInitializationV2>,
 }
+// This owner never leaves the private reconstruction worker/finish operation.
+// Only the freshly regenerated committed Initial can mint its extra Arc.
+struct FreshInitialOrigin<'s> {
+    retained: &'s ProjectSnapshot,
+    original: Arc<PreparedOwnedPreview>,
+}
+pub(super) struct InitialComparison<'a> {
+    original: &'a PreparedOwnedPreview,
+    predecessor_before: &'a CapturedProgram,
+    predecessor_after: &'a CapturedProgram,
+}
+impl<'a> InitialComparison<'a> {
+    pub(super) fn references(&self) -> (&'a PreparedOwnedPreview, &'a CapturedProgram, &'a CapturedProgram) {
+        (self.original, self.predecessor_before, self.predecessor_after)
+    }
+}
+use std::mem::size_of;
+use super::owned_continuation::comparison_payment;
+trait ReconstructionFinish<'s>: Sized {
+    type Output;
+    // R1 is paid at the immediate audited wrapper caller, before construction.
+    const FRAME_PAYMENT: u64 = comparison_payment(64, [
+        (size_of::<Self>(), 2), (size_of::<Option<FreshInitialOrigin<'s>>>(), 2),
+        (size_of::<ReconstructedOwned>(), 2), (size_of::<Result<ReconstructedOwned>>(), 2),
+        (size_of::<Self::Output>(), 2), (size_of::<Result<Self::Output>>(), 2),
+        (size_of::<&mut ProofMeter>(), 4),
+    ]);
+    const FINISH_PAYMENT: u64 = comparison_payment(32, [
+        (size_of::<Self>(), 4), (size_of::<Self::Output>(), 4),
+        (size_of::<Result<Self::Output>>(), 4), (size_of::<Option<FreshInitialOrigin<'s>>>(), 4),
+        (size_of::<Option<&FreshInitialOrigin<'s>>>(), 4),
+        (size_of::<&ProjectSnapshot>(), 4), (size_of::<&mut ProofMeter>(), 4),
+    ]);
+    fn finish(self, snapshot: &'s ProjectSnapshot, registry: ReconstructedOwned,
+        origin: Option<FreshInitialOrigin<'s>>, meter: &mut ProofMeter) -> Result<Self::Output>;
+}
+struct RegistryOnly;
+struct TransitionFinish<'a> {
+    before: &'a CapturedProgram,
+    after: &'a CapturedProgram,
+    sources: &'a OwnedSourceRequest,
+    layer: &'a Digest,
+    operation: &'a str,
+    withdrawal: bool,
+}
+impl<'s> ReconstructionFinish<'s> for RegistryOnly {
+    type Output = ReconstructedOwned;
+    fn finish(self, _snapshot: &'s ProjectSnapshot, registry: ReconstructedOwned,
+        origin: Option<FreshInitialOrigin<'s>>, _meter: &mut ProofMeter) -> Result<Self::Output> {
+        drop(origin);
+        Ok(registry)
+    }
+}
+impl<'s> ReconstructionFinish<'s> for TransitionFinish<'_> {
+    type Output = (ReconstructedOwned, Arc<VerifiedOwnedTransitionExecution>);
+    fn finish(self, snapshot: &'s ProjectSnapshot, registry: ReconstructedOwned,
+        origin: Option<FreshInitialOrigin<'s>>, meter: &mut ProofMeter) -> Result<Self::Output> {
+        let execution = transition_with_origin(snapshot, &registry, self.before, self.after,
+            self.sources, self.layer, self.operation, self.withdrawal, origin.as_ref(), meter)?;
+        drop(origin);
+        Ok((registry, execution))
+    }
+}
+pub(super) const TRANSITION_RECONSTRUCT_PAYMENT: u64 = TransitionFinish::FRAME_PAYMENT;
+const INITIAL_ORIGIN_PAYMENT: u64 = comparison_payment(32, [
+    (size_of::<FreshInitialOrigin<'_>>(), 4), (size_of::<Option<FreshInitialOrigin<'_>>>(), 4),
+    (size_of::<Arc<PreparedOwnedPreview>>(), 4), (size_of::<&ProjectSnapshot>(), 2),
+]);
+const HISTORICAL_ORIGIN_PAYMENT: u64 = comparison_payment(32, [
+    (size_of::<Option<FreshInitialOrigin<'_>>>(), 4),
+    (size_of::<Option<&FreshInitialOrigin<'_>>>(), 4),
+    (size_of::<Result<VerifiedOwnedTransitionExecution>>(), 2), (size_of::<&mut ProofMeter>(), 2),
+]);
+// Additional direct-general route coverage: unlike the closed finish, this
+// entry has not prepaid R4. Pay its complete new call/return headers locally.
+const GENERAL_TRANSITION_PAYMENT: u64 = comparison_payment(64, [
+    (size_of::<&ProjectSnapshot>(), 4), (size_of::<&ReconstructedOwned>(), 4),
+    (size_of::<&CapturedProgram>(), 8), (size_of::<&OwnedSourceRequest>(), 4),
+    (size_of::<&Digest>(), 4), (size_of::<&str>(), 4), (size_of::<bool>(), 4),
+    (size_of::<Option<&FreshInitialOrigin<'_>>>(), 4), (size_of::<&mut ProofMeter>(), 4),
+    (size_of::<Result<Arc<VerifiedOwnedTransitionExecution>>>(), 4),
+    (size_of::<Arc<VerifiedOwnedTransitionExecution>>(), 4),
+]);
 struct GraphHistory {
     prior: BTreeMap<u64, DecisionGraph>,
     after: BTreeMap<u64, DecisionGraph>,
@@ -136,10 +224,16 @@ fn retained_state(state: &OwnedScopeStateV2, revision: u64) -> OwnedScopeStateV2
             .collect(),
     }
 }
+#[derive(Clone, Copy)]
+enum BasisPurpose {
+    FirstEntry,
+    Continuation,
+}
 fn historical_basis(
     snapshot: &ProjectSnapshot,
     basis: &OwnedBasisV2,
     graphs: &GraphHistory,
+    purpose: BasisPurpose,
     meter: &mut ProofMeter,
 ) -> Result<ProjectSnapshot> {
     let frozen = &basis.frozen;
@@ -255,19 +349,28 @@ fn historical_basis(
         }
         validate_recording_continuation(&result, meter)?;
     }
-    compiler::reject_reserved(&result.program()?.program)?;
-    if matches!(basis.family, OwnedBasisFamilyV2::ScalarEmpty) {
-        for source in &result.programs {
-            compiler::reject_reserved(&source.program)?;
+    if matches!(purpose, BasisPurpose::Continuation) {
+        if !matches!(&result.scope, ScopeEnvelope::OwnedV2(s) if s.layers.len() == 1 && s.initializations.len() == 1 && !s.adoptions.is_empty())
+        {
+            return Err(err(
+                "continuation basis lacks committed original layer and initialization",
+            ));
         }
-    }
-    if result
-        .data
-        .schema
-        .iter()
-        .any(|e| e.fields.iter().any(|f| f.id.starts_with(RESERVED_PREFIX)))
-    {
-        return Err(err("first-layer basis contains protected live storage"));
+    } else {
+        compiler::reject_reserved(&result.program()?.program)?;
+        if matches!(basis.family, OwnedBasisFamilyV2::ScalarEmpty) {
+            for source in &result.programs {
+                compiler::reject_reserved(&source.program)?;
+            }
+        }
+        if result
+            .data
+            .schema
+            .iter()
+            .any(|e| e.fields.iter().any(|f| f.id.starts_with(RESERVED_PREFIX)))
+        {
+            return Err(err("first-layer basis contains protected live storage"));
+        }
     }
     result.session.validate(&result.program()?.program)?;
     validate_day(result.clock_day)?;
@@ -389,7 +492,13 @@ fn reconstruct_recipe(
             "composition changed exact layer/basis/active inventory",
         ));
     }
-    let basis = historical_basis(snapshot, &layer.basis, graphs, meter)?;
+    let basis = historical_basis(
+        snapshot,
+        &layer.basis,
+        graphs,
+        BasisPurpose::FirstEntry,
+        meter,
+    )?;
     if matches!(&basis.scope, ScopeEnvelope::OwnedV2(s) if !s.layers.is_empty()) {
         return Err(err(
             "second committed owned layer is unsupported, including after withdrawal",
@@ -410,18 +519,11 @@ fn reconstruct_recipe(
             ));
         }
     }
-    let accepted = AcceptedPreviewLifecycle::reconstruct(
+    let (_accepted, proof) = common_fact_admission::reconstruct_and_derive_retained(
         &basis,
         candidate,
         &layer.request,
         &layer.lifecycle,
-        meter,
-    )?;
-    let proof = common_fact_admission::derive_retained(
-        &basis,
-        candidate,
-        &layer.request,
-        &accepted,
         meter,
     )?;
     if inventory(&proof)? != layer.inventory {
@@ -556,6 +658,13 @@ pub(super) fn reconstruct(
     snapshot: &ProjectSnapshot,
     meter: &mut ProofMeter,
 ) -> Result<ReconstructedOwned> {
+    meter.charge(RegistryOnly::FRAME_PAYMENT)?;
+    reconstruct_with(snapshot, meter, RegistryOnly)
+}
+fn reconstruct_with<'s, F: ReconstructionFinish<'s>>(
+    snapshot: &'s ProjectSnapshot, meter: &mut ProofMeter, finish: F,
+) -> Result<F::Output> {
+    let mut origin = None;
     let state = snapshot.owned_scope()?;
     if state.layers.len() > 1
         || state.compositions.len() > MAX_ITEMS
@@ -589,6 +698,7 @@ pub(super) fn reconstruct(
             return Err(err("owned correspondence receipt key differs"));
         }
     }
+    validate_revision_ownership(snapshot)?;
     let graphs = graph_history(snapshot)?;
     let mut active = revision(
         snapshot
@@ -613,22 +723,30 @@ pub(super) fn reconstruct(
         return Err(err("active source differs from ordered adoption tail"));
     }
     let mut result = ReconstructedOwned {
+        snapshot: canonical_digest(IdentityDomain::Data, snapshot)?,
+        recipes: BTreeMap::new(),
+        epochs: vec![],
         proofs: BTreeMap::new(),
         manifests: BTreeMap::new(),
         initializations: BTreeMap::new(),
     };
+    let mut previous_revision = None;
     for receipt in &state.adoptions {
-        if receipt.version != OWNED_SCOPE_VERSION || !revisions.insert(receipt.revision) {
-            return Err(err("unknown or duplicate owned adoption receipt"));
+        if receipt.version != OWNED_SCOPE_VERSION
+            || !revisions.insert(receipt.revision)
+            || previous_revision.is_some_and(|r| receipt.revision <= r)
+        {
+            return Err(err(
+                "unknown, reordered or duplicate owned adoption receipt",
+            ));
         }
+        previous_revision = Some(receipt.revision);
         let manifest = state
             .compositions
             .get(&receipt.composition)
             .ok_or_else(|| err("adoption composition missing"))?;
         let [id] = manifest.layers.as_slice() else {
-            return Err(err(
-                "committed composition requires exactly one retained layer",
-            ));
+            return Err(err("committed composition needs one original layer"));
         };
         let layer = state
             .layers
@@ -639,45 +757,115 @@ pub(super) fn reconstruct(
             .iter()
             .find(|r| &r.layer == id)
             .ok_or_else(|| err("committed initialization missing"))?;
-        let a = linked(snapshot, &manifest.operation, receipt.revision)?;
-        if receipt.plan != a.plan.identity()?
-            || receipt.initialization != Some(init.identity()?)
-            || snapshot.operations[&a.plan.id].request
-                != owned_wire::adoption_request(
-                    &a.plan,
-                    &graphs.after[&a.revision],
-                    manifest,
-                    init,
-                )?
-        {
-            return Err(err("owned adoption request/receipt identity differs"));
+        let adoption = linked(snapshot, &manifest.operation, receipt.revision)?;
+        let after = graphs
+            .after
+            .get(&adoption.revision)
+            .ok_or_else(|| err("adoption graph checkpoint missing"))?;
+        let born = graphs
+            .births
+            .get(&adoption.revision)
+            .ok_or_else(|| err("adoption graph birth checkpoint missing"))?;
+        let operation = snapshot
+            .operations
+            .get(&adoption.plan.id)
+            .ok_or_else(|| err("adoption operation missing"))?;
+        if receipt.plan != adoption.plan.identity()? {
+            return Err(err("owned plan identity differs"));
         }
-        let actual: BTreeSet<_> = receipt.decisions.iter().cloned().collect();
-        let born = &graphs.births[&a.revision];
-        let expected: BTreeSet<_> = graphs.after[&a.revision]
-            .decisions
-            .iter()
-            .filter(|d| {
-                born.contains(&d.id)
-                    && d.status == DecisionStatus::Active
-                    && d.scope == layer.scope()
-            })
-            .map(|d| d.id.clone())
-            .collect();
-        if actual.len() != receipt.decisions.len() || actual != expected || actual.iter().any(|id| !graphs.after[&a.revision].decisions.iter().any(|d| &d.id == id && matches!(&d.outcome, DecisionOutcome::Accept { artifact } if artifact == &a.plan.target.program_digest))) { return Err(err("owned accepted decisions differ from exact graph births")); }
-        let prepared = reconstruct_recipe(snapshot, layer, manifest, init, &graphs, meter)?;
-        bind_plan(snapshot, a, manifest, layer, &prepared.initialized, false)?;
+        let recipe = if result.epochs.is_empty() {
+            if receipt.initialization != Some(init.identity()?)
+                || operation.request
+                    != owned_wire::adoption_request(&adoption.plan, after, manifest, init)?
+            {
+                return Err(err("initial adoption request/initializer differs"));
+            }
+            let actual: BTreeSet<_> = receipt.decisions.iter().cloned().collect();
+            let expected: BTreeSet<_> = after
+                .decisions
+                .iter()
+                .filter(|d| {
+                    born.contains(&d.id)
+                        && d.status == DecisionStatus::Active
+                        && d.scope == layer.scope()
+                })
+                .map(|d| d.id.clone())
+                .collect();
+            if actual.len() != receipt.decisions.len() || actual != expected
+                || actual.iter().any(|id| !after.decisions.iter().any(|d| &d.id == id && matches!(&d.outcome, DecisionOutcome::Accept { artifact } if artifact == &adoption.plan.target.program_digest)))
+            { return Err(err("owned accepted decisions differ from exact graph births")); }
+            let initial = Arc::new(reconstruct_recipe(
+                snapshot, layer, manifest, init, &graphs, meter,
+            )?);
+            meter.charge(INITIAL_ORIGIN_PAYMENT)?;
+            origin = Some(FreshInitialOrigin { retained: snapshot, original: initial.clone() });
+            result
+                .proofs
+                .insert(manifest.output.clone(), initial.clone());
+            OwnedExecutionRecipe::Initial(initial)
+        } else {
+            if receipt.initialization.is_some()
+                || !receipt.decisions.is_empty()
+                || !born.is_empty()
+                || operation.request
+                    != owned_wire::transition_request(&adoption.plan, after, manifest)?
+            {
+                return Err(err(
+                    "transition has initialization, decision birth or wrong request",
+                ));
+            }
+            let historical = historical_basis(
+                snapshot,
+                &manifest.basis,
+                &graphs,
+                BasisPurpose::Continuation,
+                meter,
+            )?;
+            result.validate_endpoint(
+                snapshot,
+                &historical.data,
+                historical.clock_day,
+                historical.revision,
+                meter,
+            )?;
+            if graphs.prior.get(&adoption.revision) != Some(&historical.decisions) {
+                return Err(err(
+                    "transition prior graph differs from authenticated basis",
+                ));
+            }
+            owned_epoch::validate_transition_graph(
+                &historical,
+                manifest,
+                after,
+                Some(&adoption.plan.retire_decisions),
+            )?;
+            meter.charge(HISTORICAL_ORIGIN_PAYMENT)?;
+            let fresh_origin = origin.take();
+            let transition = reconstruct_transition(
+                snapshot,
+                &historical,
+                &result,
+                layer,
+                init,
+                manifest,
+                fresh_origin.as_ref(),
+                meter,
+            )?;
+            drop(fresh_origin);
+            OwnedExecutionRecipe::Transition(Arc::new(transition))
+        };
+        bind_plan(snapshot, adoption, manifest, layer, recipe.seed(), false)?;
         if LocalRuntime::default().compatibility_at(
-            &prepared.target,
-            &prepared.initialized,
+            recipe.target(),
+            recipe.seed(),
             manifest.basis.frozen.day,
         )? != receipt.initialized_compatibility
         {
-            return Err(err("initialized compatibility receipt differs"));
+            return Err(err("owned compatibility receipt differs"));
         }
         if result
-            .proofs
-            .insert(manifest.output.clone(), Arc::new(prepared))
+            .recipes
+            .insert(manifest.output.clone(), recipe)
             .is_some()
         {
             return Err(err("ambiguous owned executable"));
@@ -688,6 +876,10 @@ pub(super) fn reconstruct(
         result
             .initializations
             .insert(manifest.output.clone(), init.clone());
+        result.epochs.push(OwnedProducerEpoch {
+            output: manifest.output.clone(),
+            adoption_revision: receipt.revision,
+        });
     }
     let mut recordings = BTreeSet::new();
     for proof in state.rehearsals.values() {
@@ -710,8 +902,15 @@ pub(super) fn reconstruct(
             .as_ref()
             .ok_or_else(|| err("prospective owned initialization missing"))?;
         let a = linked(snapshot, &proof.recorded_by, proof.recorded_revision)?;
-        let born = &graphs.births[&a.revision];
-        let expected: BTreeSet<_> = graphs.after[&a.revision]
+        let born = graphs
+            .births
+            .get(&a.revision)
+            .ok_or_else(|| err("recording birth checkpoint missing"))?;
+        let after_graph = graphs
+            .after
+            .get(&a.revision)
+            .ok_or_else(|| err("recording graph checkpoint missing"))?;
+        let expected: BTreeSet<_> = after_graph
             .decisions
             .iter()
             .filter(|d| born.contains(&d.id) && d.status == DecisionStatus::Pending)
@@ -723,7 +922,7 @@ pub(super) fn reconstruct(
             ));
         }
         for (id, witness) in &proof.witnesses {
-            let d = graphs.after[&a.revision]
+            let d = after_graph
                 .decisions
                 .iter()
                 .find(|d| &d.id == id)
@@ -751,11 +950,17 @@ pub(super) fn reconstruct(
             "owned-decision-recording/2",
             &(
                 &a.plan,
-                &graphs.after[&a.revision],
+                &after_graph,
                 owned_wire::recording_request(proof, &correspondence)?,
             ),
         )?;
-        if snapshot.operations[&a.plan.id].request != request {
+        if snapshot
+            .operations
+            .get(&a.plan.id)
+            .ok_or_else(|| err("recording operation missing"))?
+            .request
+            != request
+        {
             return Err(err("owned recording request inventory differs"));
         }
         let prepared = reconstruct_recipe(snapshot, layer, &proof.manifest, init, &graphs, meter)?;
@@ -776,9 +981,20 @@ pub(super) fn reconstruct(
         {
             return Err(err("prospective owned seed/compatibility differs"));
         }
+        let prepared = Arc::new(prepared);
+        if result
+            .recipes
+            .insert(
+                proof.manifest.output.clone(),
+                OwnedExecutionRecipe::Initial(prepared.clone()),
+            )
+            .is_some()
+        {
+            return Err(err("prospective recipe aliases committed executable"));
+        }
         if result
             .proofs
-            .insert(proof.manifest.output.clone(), Arc::new(prepared))
+            .insert(proof.manifest.output.clone(), prepared)
             .is_some()
         {
             return Err(err("prospective recipe aliases another executable"));
@@ -795,8 +1011,14 @@ pub(super) fn reconstruct(
             .proofs
             .get(&receipt.proof.target)
             .ok_or_else(|| err("correspondence target recipe missing"))?;
-        let manifest = &result.manifests[&receipt.proof.target];
-        let init = &result.initializations[&receipt.proof.target];
+        let manifest = result
+            .manifests
+            .get(&receipt.proof.target)
+            .ok_or_else(|| err("correspondence manifest missing"))?;
+        let init = result
+            .initializations
+            .get(&receipt.proof.target)
+            .ok_or_else(|| err("correspondence initialization missing"))?;
         check_correspondence(&receipt.proof, manifest, init, prepared)?;
         linked(snapshot, &receipt.operation, receipt.revision)?;
         if !state.rehearsals.values().any(|r| {
@@ -812,7 +1034,7 @@ pub(super) fn reconstruct(
     let mut declared = BTreeMap::new();
     for source in &snapshot.programs {
         let id = revision(source)?;
-        if !result.proofs.contains_key(&id) {
+        if !result.recipes.contains_key(&id) {
             compiler::reject_reserved(&source.program)?;
         }
         if state.compositions.values().any(|m| m.output == id) {
@@ -862,48 +1084,42 @@ pub(super) fn reconstruct(
     }
     for a in &snapshot.adoptions {
         if a.active != a.previous
-            && (result.proofs.contains_key(&a.active) || result.proofs.contains_key(&a.previous))
+            && (result.recipes.contains_key(&a.active) || result.recipes.contains_key(&a.previous))
             && !state.adoptions.iter().any(|r| r.revision == a.revision)
         {
             return Err(err("managed source changed without owned adoption receipt"));
         }
     }
     validate_recording_continuation(snapshot, meter)?;
-    if let Some(prepared) = result.proofs.get(&snapshot.active_revision) {
-        owned_replay::validate_history(prepared, &snapshot.data, snapshot.clock_day, meter)?;
-        // Persistent events must be tied to real post-initialization operations.
-        // Isolated replay deliberately has no store receipts and is validated
-        // separately by its exact scenario and original operation IDs.
-        let mut prior_revision = result
-            .initializations
-            .get(&snapshot.active_revision)
-            .ok_or_else(|| err("active owned initialization missing"))?
-            .adoption_revision;
-        if snapshot.revision == prior_revision
-            && (snapshot.session != prepared.proof.snapshot.session
-                || snapshot.clock_day != prepared.proof.snapshot.clock_day)
-        {
-            return Err(err("owned adoption changed its exact initial session or clock"));
+    if !result.epochs.is_empty() {
+        result.validate_endpoint(
+            snapshot,
+            &snapshot.data,
+            snapshot.clock_day,
+            snapshot.revision,
+            meter,
+        )?;
+        let epoch = result
+            .epochs
+            .last()
+            .ok_or_else(|| err("committed epoch missing"))?;
+        if epoch.output != snapshot.active_revision {
+            return Err(err("active source is not committed epoch tail"));
         }
-        for event in &snapshot.data.events[prepared.initialized.events.len()..] {
-            meter.charge(1)?;
-            let receipt = snapshot
-                .operations
-                .get(&event.operation_id)
-                .ok_or_else(|| err("owned event lacks its retained operation"))?;
-            if receipt.revision <= prior_revision
-                || receipt.revision > snapshot.revision
-                || snapshot
-                    .adoptions
-                    .iter()
-                    .any(|a| a.revision == receipt.revision)
-            {
-                return Err(err("owned event is not a post-initialization operation"));
-            }
-            prior_revision = receipt.revision;
+        let recipe = result
+            .recipes
+            .get(&epoch.output)
+            .ok_or_else(|| err("active recipe missing"))?;
+        if snapshot.revision == epoch.adoption_revision
+            && (snapshot.session != recipe.basis().session
+                || snapshot.clock_day != recipe.basis().clock_day
+                || snapshot.artifacts != recipe.basis().artifacts)
+        {
+            return Err(err("adoption changed exact session, day or artifacts"));
         }
     }
-    Ok(result)
+    meter.charge(F::FINISH_PAYMENT)?;
+    finish.finish(snapshot, result, origin, meter)
 }
 pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
     let mut meter = ProofMeter::new(ProofBudget::default(), Arc::new(AtomicBool::new(false)))?;
@@ -934,6 +1150,47 @@ fn basis_recipe(snapshot: &ProjectSnapshot) -> Result<OwnedBasisV2> {
 }
 /// Private, non-authoritative recipe extraction for the later locked writer.
 /// No public prepared/adoption conversion or store mutation is exposed here.
+// Added helper frame only on the closed route: actual copied parameters,
+// two return-place/status words plus two alignment/cleanup words, and finite
+// call/return dispatch64. The ordinary recipe below remains inline and unchanged.
+pub(super) const RECIPE_LAYER_CALL: u64 = 4 * (std::mem::size_of::<&PreparedOwnedPreview>()
+    + std::mem::size_of::<&str>() + 4 * std::mem::size_of::<usize>()) as u64 + 64;
+pub(super) const RECIPE_MANIFEST_CALL: u64 = 4 * (std::mem::size_of::<&OwnedLayerV2>()
+    + std::mem::size_of::<&CapturedProgram>() + std::mem::size_of::<&str>()
+    + 4 * std::mem::size_of::<usize>()) as u64 + 64;
+pub(super) fn recipe_layer(preview: &PreparedOwnedPreview, operation: &str) -> Result<OwnedLayerV2> {
+    if !valid_id(operation) || preview.proof.snapshot.operations.contains_key(operation) {
+        return Err(err("invalid or reused owned operation"));
+    }
+    let original = &preview.proof;
+    Ok(OwnedLayerV2 {
+        version: OWNED_SCOPE_VERSION,
+        lowering: OWNED_LOWERING_VERSION,
+        operation: operation.into(),
+        basis: basis_recipe(&original.snapshot)?,
+        candidate: revision(&original.candidate)?,
+        request: original.request.clone(),
+        lifecycle: original.accepted.recipe(),
+        inventory: inventory(original)?,
+    })
+}
+pub(super) fn recipe_manifest(layer: &OwnedLayerV2, target: &CapturedProgram, operation: &str) -> Result<OwnedCompositionV2> {
+    Ok(OwnedCompositionV2 {
+        version: OWNED_SCOPE_VERSION,
+        lowering: OWNED_LOWERING_VERSION,
+        basis: layer.basis.clone(),
+        transition: ScopeTransition::Adoption,
+        business: layer.candidate.clone(),
+        layers: vec![layer.identity()?],
+        active: BTreeSet::from([layer.identity()?]),
+        previous: None,
+        operation: operation.into(),
+        runtime: RUNTIME_VERSION.into(),
+        driver: DRIVER_VERSION.into(),
+        output: revision(target)?,
+        correspondences: vec![],
+    })
+}
 pub(super) fn recipe(
     preview: &PreparedOwnedPreview,
     operation: &str,
@@ -1131,7 +1388,14 @@ pub(crate) fn owned_historical_basis_for_test(
     basis: &OwnedBasisV2,
 ) -> Result<()> {
     let mut meter = ProofMeter::new(ProofBudget::default(), Arc::new(AtomicBool::new(false)))?;
-    historical_basis(snapshot, basis, &graph_history(snapshot)?, &mut meter).map(|_| ())
+    historical_basis(
+        snapshot,
+        basis,
+        &graph_history(snapshot)?,
+        BasisPurpose::FirstEntry,
+        &mut meter,
+    )
+    .map(|_| ())
 }
 #[cfg(test)]
 pub(crate) fn owned_retained_preview_for_test(
@@ -1261,7 +1525,11 @@ fn validate_recording_continuation(
             }
         }
         revisions.event(
-            event.changes.iter().map(|c| (c.entity.clone(), c.record.clone())).collect(),
+            event
+                .changes
+                .iter()
+                .map(|c| (c.entity.clone(), c.record.clone()))
+                .collect(),
             0,
             meter,
         )?;
@@ -1291,3 +1559,653 @@ fn validate_recording_continuation(
     }
     revisions.validate(&snapshot.data, meter)
 }
+
+fn validate_revision_ownership(snapshot: &ProjectSnapshot) -> Result<()> {
+    let mut revisions = BTreeSet::new();
+    for (id, operation) in &snapshot.operations {
+        if id != &operation.operation
+            || operation.revision == 0
+            || operation.revision > snapshot.revision
+            || !revisions.insert(operation.revision)
+        {
+            return Err(err("operation revision is missing, duplicated or foreign"));
+        }
+    }
+    let mut previous = 0;
+    for adoption in &snapshot.adoptions {
+        if adoption.revision <= previous || adoption.revision > snapshot.revision {
+            return Err(err("ordinary adoptions are not strictly chronological"));
+        }
+        previous = adoption.revision;
+    }
+    Ok(())
+}
+impl ReconstructedOwned {
+    pub(super) fn check_snapshot(&self, snapshot: &ProjectSnapshot) -> Result<()> {
+        if self.snapshot != canonical_digest(IdentityDomain::Data, snapshot)? {
+            return Err(err(
+                "execution registry belongs to another complete snapshot",
+            ));
+        }
+        Ok(())
+    }
+    pub fn resolve(&self, source: &CapturedProgram) -> Result<&OwnedExecutionRecipe> {
+        let recipe = self
+            .recipes
+            .get(&revision(source)?)
+            .ok_or_else(|| err("source is not a checked owned recipe"))?;
+        if recipe.target() != source {
+            return Err(err("source capture/provenance differs from checked recipe"));
+        }
+        Ok(recipe)
+    }
+    pub fn effective_pair<'a>(
+        &'a self,
+        snapshot: &'a ProjectSnapshot,
+        output: &Digest,
+    ) -> Result<(
+        &'a CapturedProgram,
+        &'a CapturedProgram,
+        &'a OwnedSourceRequest,
+    )> {
+        match self
+            .recipes
+            .get(output)
+            .ok_or_else(|| err("effective recipe missing"))?
+        {
+            OwnedExecutionRecipe::Initial(p) => Ok((
+                program(snapshot, &p.proof.request.inventory.sources.before)?,
+                program(snapshot, &p.proof.request.inventory.sources.after)?,
+                &p.proof.request.inventory.sources,
+            )),
+            OwnedExecutionRecipe::Transition(p) => Ok((
+                p.continuation.before(),
+                p.continuation.after(),
+                &p.continuation.request().inventory.sources,
+            )),
+        }
+    }
+    pub fn checked_withdrawals(&self) -> Vec<&Arc<VerifiedOwnedTransitionExecution>> {
+        self.epochs
+            .iter()
+            .filter_map(|epoch| match self.recipes.get(&epoch.output) {
+                Some(OwnedExecutionRecipe::Transition(p))
+                    if p.manifest.transition == ScopeTransition::Withdrawal =>
+                {
+                    Some(p)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+    /// Every boundary is an exact authenticated data snapshot. The shared-row
+    /// max-flow proof finishes at that boundary before the next segment reseeds.
+    pub fn validate_endpoint(
+        &self,
+        snapshot: &ProjectSnapshot,
+        data: &DataSnapshot,
+        day: i32,
+        revision: u64,
+        meter: &mut ProofMeter,
+    ) -> Result<()> {
+        self.check_snapshot(snapshot)?;
+        for (index, epoch) in self.epochs.iter().enumerate() {
+            if epoch.adoption_revision > revision {
+                return Err(err("history endpoint predates registered producer"));
+            }
+            let recipe = self
+                .recipes
+                .get(&epoch.output)
+                .ok_or_else(|| err("registered producer recipe missing"))?;
+            let (endpoint, endpoint_day, endpoint_revision) =
+                if let Some(next) = self.epochs.get(index + 1) {
+                    let next_recipe = self
+                        .recipes
+                        .get(&next.output)
+                        .ok_or_else(|| err("next producer missing"))?;
+                    (
+                        next_recipe.seed(),
+                        next_recipe.basis().clock_day,
+                        next_recipe.basis().revision,
+                    )
+                } else {
+                    (data, day, revision)
+                };
+            owned_epoch::validate_interval(
+                snapshot,
+                recipe,
+                epoch.adoption_revision,
+                endpoint_revision,
+                endpoint,
+                endpoint_day,
+                meter,
+            )?;
+        }
+        Ok(())
+    }
+    /// Additional withdrawal-only value induction over actual protected history.
+    /// Pure P4 validity does not call this stricter eligibility check.
+    pub fn validate_policy_frames(
+        &self,
+        snapshot: &ProjectSnapshot,
+        surface: &owned_continuation::VerifiedOwnedPolicySurface,
+        meter: &mut ProofMeter,
+    ) -> Result<()> {
+        self.check_snapshot(snapshot)?;
+        let state = snapshot.owned_scope()?;
+        if !state.layers.contains_key(surface.original_layer()) || self.epochs.is_empty() {
+            return Err(err(
+                "policy surface is not bound to this committed original layer",
+            ));
+        }
+        // The type cannot be caller-constructed; the source still has to belong
+        // to this exact reconstructed prefix, including provenance.
+        let source = program(snapshot, surface.source())?;
+        self.resolve(source)?;
+        for (index, epoch) in self.epochs.iter().enumerate() {
+            let recipe = self
+                .recipes
+                .get(&epoch.output)
+                .ok_or_else(|| err("policy producer recipe missing"))?;
+            let (endpoint, day) = if let Some(next) = self.epochs.get(index + 1) {
+                let next_recipe = self
+                    .recipes
+                    .get(&next.output)
+                    .ok_or_else(|| err("policy successor recipe missing"))?;
+                (next_recipe.seed(), next_recipe.basis().clock_day)
+            } else {
+                (&snapshot.data, snapshot.clock_day)
+            };
+            let mut visit = |frame: &DataSnapshot, meter: &mut ProofMeter| {
+                meter.charge(canonical_bytes(frame)?.len() as u64)?;
+                surface.validate_frame(frame)
+            };
+            owned_replay::validate_recipe_history_with(
+                recipe,
+                recipe.seed(),
+                recipe.basis().clock_day,
+                endpoint,
+                day,
+                meter,
+                &mut visit,
+            )?;
+        }
+        Ok(())
+    }
+    /// Authenticate an archived frame under the prefix ending at its genuine
+    /// producer. No future implementation may lend event capacity or provenance.
+    pub fn validate_historical_frame(
+        &self,
+        snapshot: &ProjectSnapshot,
+        source: &CapturedProgram,
+        data: &DataSnapshot,
+        day: i32,
+        meter: &mut ProofMeter,
+    ) -> Result<()> {
+        self.check_snapshot(snapshot)?;
+        let output = revision(source)?;
+        let index = self
+            .epochs
+            .iter()
+            .position(|e| e.output == output)
+            .ok_or_else(|| err("historical source is not a committed producer"))?;
+        self.resolve(source)?;
+        for (i, epoch) in self.epochs.iter().enumerate().take(index + 1) {
+            let recipe = self
+                .recipes
+                .get(&epoch.output)
+                .ok_or_else(|| err("historical producer missing"))?;
+            let (endpoint, endpoint_day, end_revision) = if i < index {
+                let next = self
+                    .epochs
+                    .get(i + 1)
+                    .ok_or_else(|| err("historical successor missing"))?;
+                let next_recipe = self
+                    .recipes
+                    .get(&next.output)
+                    .ok_or_else(|| err("historical successor recipe missing"))?;
+                (
+                    next_recipe.seed(),
+                    next_recipe.basis().clock_day,
+                    next_recipe.basis().revision,
+                )
+            } else {
+                let end = self
+                    .epochs
+                    .get(i + 1)
+                    .map(|e| e.adoption_revision - 1)
+                    .unwrap_or(snapshot.revision);
+                (data, day, end)
+            };
+            owned_epoch::validate_interval(
+                snapshot,
+                recipe,
+                epoch.adoption_revision,
+                end_revision,
+                endpoint,
+                endpoint_day,
+                meter,
+            )?;
+        }
+        Ok(())
+    }
+}
+fn reconstruct_transition(
+    snapshot: &ProjectSnapshot,
+    current: &ProjectSnapshot,
+    registry: &ReconstructedOwned,
+    layer: &OwnedLayerV2,
+    initialization: &OwnedInitializationV2,
+    manifest: &OwnedCompositionV2,
+    origin: Option<&FreshInitialOrigin<'_>>,
+    meter: &mut ProofMeter,
+) -> Result<VerifiedOwnedTransitionExecution> {
+    let last = registry
+        .epochs
+        .last()
+        .ok_or_else(|| err("transition has no committed predecessor"))?;
+    let predecessor = registry
+        .manifests
+        .get(&last.output)
+        .ok_or_else(|| err("predecessor manifest missing"))?;
+    let original = registry
+        .proofs
+        .get(
+            &registry
+                .epochs
+                .first()
+                .ok_or_else(|| err("original epoch missing"))?
+                .output,
+        )
+        .ok_or_else(|| err("original initializer recipe missing"))?
+        .clone();
+    let id = layer.identity()?;
+    if manifest.version != OWNED_SCOPE_VERSION
+        || manifest.lowering != OWNED_TRANSITION_LOWERING_VERSION
+        || manifest.runtime != RUNTIME_VERSION
+        || manifest.driver != DRIVER_VERSION
+        || !valid_id(&manifest.operation)
+        || manifest.previous.as_ref() != Some(&last.output)
+        || current.active_revision != last.output
+        || manifest.layers != [id.clone()]
+        || manifest.basis.frozen != basis(current)?
+        || manifest.basis.graph != current.decisions
+        || manifest.basis.artifacts != current.artifacts
+        || manifest.basis.sources
+            != current
+                .programs
+                .iter()
+                .map(revision)
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        || manifest.basis.family != OwnedBasisFamilyV2::OwnedV2
+    {
+        return Err(err(
+            "transition dispatch, immediate predecessor or complete basis differs",
+        ));
+    }
+    let (prior_before, prior_after, prior_sources) =
+        registry.effective_pair(match origin { Some(o) => o.retained, None => snapshot }, &last.output)?;
+    let (before, after, sources) = match manifest.transition {
+        ScopeTransition::Evolution => {
+            if manifest.active != predecessor.active {
+                return Err(err("implementation changed active layer set"));
+            }
+            let [correspondence] = manifest.correspondences.as_slice() else {
+                return Err(err(
+                    "evolution needs one exact implementation correspondence",
+                ));
+            };
+            if correspondence.version != OWNED_SCOPE_VERSION
+                || correspondence.source != last.output
+                || correspondence.target != manifest.business
+                || correspondence.sources.after != manifest.business
+                || correspondence.sources.root_entity != layer.request.inventory.sources.root_entity
+            {
+                return Err(err("evolution ordinary pair correspondence differs"));
+            }
+            (
+                program(snapshot, &correspondence.sources.before)?,
+                program(snapshot, &correspondence.sources.after)?,
+                &correspondence.sources,
+            )
+        }
+        ScopeTransition::Withdrawal => {
+            if predecessor.active != BTreeSet::from([id])
+                || !manifest.active.is_empty()
+                || manifest.correspondences != predecessor.correspondences
+                || manifest.business != predecessor.business
+            {
+                return Err(err(
+                    "withdrawal changed effective correspondence or inactive lineage",
+                ));
+            }
+            (prior_before, prior_after, prior_sources)
+        }
+        _ => return Err(err("unsupported owned transition kind")),
+    };
+    let continuation = match origin {
+        Some(origin) if manifest.transition == ScopeTransition::Evolution => {
+        meter.charge(owned_continuation::COMPARISON_DISPATCH_PAYMENT)?;
+        meter.charge(owned_continuation::COMPARISON_OWNER_PAYMENT)?;
+        owned_continuation::verify_initial(current, InitialComparison {
+            original: &origin.original, predecessor_before: prior_before,
+            predecessor_after: prior_after,
+        }, layer, initialization, before, after, sources, meter)?
+        }
+        _ => {
+        owned_continuation::verify(current, &original, layer, initialization,
+            prior_before, prior_after, before, after, sources, meter)?
+        }
+    };
+    let (target, metadata) = owned_transition_lowering::compile(
+        &continuation,
+        manifest,
+        !manifest.active.is_empty(),
+        meter,
+    )?;
+    if revision(&target)? != manifest.output || program(snapshot, &manifest.output)? != &target {
+        return Err(err("transition source bytes/provenance do not regenerate"));
+    }
+    Ok(VerifiedOwnedTransitionExecution {
+        continuation: Arc::new(continuation),
+        target,
+        metadata,
+        manifest: manifest.clone(),
+        original,
+        initialization: initialization.clone(),
+    })
+}
+
+pub(super) fn transition(
+    current: &ProjectSnapshot,
+    before: &CapturedProgram,
+    after: &CapturedProgram,
+    sources: &OwnedSourceRequest,
+    layer_id: &Digest,
+    operation: &str,
+    withdrawal: bool,
+    meter: &mut ProofMeter,
+) -> Result<Arc<VerifiedOwnedTransitionExecution>> {
+    meter.charge(TRANSITION_RECONSTRUCT_PAYMENT)?;
+    reconstruct_and_transition(current, before, after, sources, layer_id, operation,
+        withdrawal, meter).map(|(_, execution)| execution)
+}
+// R1 must be prepaid at each of the three audited production call sites.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn reconstruct_and_transition(
+    current: &ProjectSnapshot, before: &CapturedProgram, after: &CapturedProgram,
+    sources: &OwnedSourceRequest, layer: &Digest, operation: &str,
+    withdrawal: bool, meter: &mut ProofMeter,
+) -> Result<(ReconstructedOwned, Arc<VerifiedOwnedTransitionExecution>)> {
+    reconstruct_with(current, meter, TransitionFinish {
+        before, after, sources, layer, operation, withdrawal,
+    })
+}
+pub(super) fn transition_from_registry(
+    current: &ProjectSnapshot,
+    registry: &ReconstructedOwned,
+    before: &CapturedProgram,
+    after: &CapturedProgram,
+    sources: &OwnedSourceRequest,
+    layer_id: &Digest,
+    operation: &str,
+    withdrawal: bool,
+    meter: &mut ProofMeter,
+) -> Result<Arc<VerifiedOwnedTransitionExecution>> {
+    meter.charge(GENERAL_TRANSITION_PAYMENT)?;
+    transition_with_origin(current, registry, before, after, sources, layer_id,
+        operation, withdrawal, None, meter)
+}
+fn transition_with_origin(
+    current: &ProjectSnapshot,
+    registry: &ReconstructedOwned,
+    before: &CapturedProgram,
+    after: &CapturedProgram,
+    sources: &OwnedSourceRequest,
+    layer_id: &Digest,
+    operation: &str,
+    withdrawal: bool,
+    origin: Option<&FreshInitialOrigin<'_>>,
+    meter: &mut ProofMeter,
+) -> Result<Arc<VerifiedOwnedTransitionExecution>> {
+    registry.check_snapshot(current)?;
+    let state = current.owned_scope()?;
+    let layer = state
+        .layers
+        .get(layer_id)
+        .ok_or_else(|| err("requested original layer missing"))?;
+    let initialization = state
+        .initializations
+        .iter()
+        .find(|i| &i.layer == layer_id)
+        .ok_or_else(|| err("requested original initializer missing"))?;
+    let last = registry
+        .epochs
+        .last()
+        .ok_or_else(|| err("continuation requires a committed owned layer"))?;
+    let predecessor = registry
+        .manifests
+        .get(&last.output)
+        .ok_or_else(|| err("committed predecessor missing"))?;
+    if current.operations.contains_key(operation) {
+        return Err(StoreError::Conflict(
+            "owned transition operation ID was already used".into(),
+        ));
+    }
+    if current.active_revision != last.output || !valid_id(operation) {
+        return Err(err("invalid or noncurrent transition operation"));
+    }
+    let (prior_before, prior_after, prior_sources) =
+        registry.effective_pair(match origin { Some(o) => o.retained, None => current }, &last.output)?;
+    if withdrawal
+        && (predecessor.active != BTreeSet::from([layer_id.clone()])
+            || before != prior_before
+            || after != prior_after
+            || sources != prior_sources)
+    {
+        return Err(err(
+            "withdrawal is inactive or changed its exact effective pair",
+        ));
+    }
+    let original = registry
+        .proofs
+        .get(
+            &registry
+                .epochs
+                .first()
+                .ok_or_else(|| err("original epoch missing"))?
+                .output,
+        )
+        .ok_or_else(|| err("original preview missing"))?
+        .clone();
+    let continuation = match origin {
+        Some(origin) if !withdrawal => {
+        meter.charge(owned_continuation::COMPARISON_DISPATCH_PAYMENT)?;
+        meter.charge(owned_continuation::COMPARISON_OWNER_PAYMENT)?;
+        owned_continuation::verify_initial(current, InitialComparison {
+            original: &origin.original, predecessor_before: prior_before,
+            predecessor_after: prior_after,
+        }, layer, initialization, before, after, sources, meter)?
+        }
+        _ => {
+        owned_continuation::verify(current, &original, layer, initialization,
+            prior_before, prior_after, before, after, sources, meter)?
+        }
+    };
+    let mut manifest = OwnedCompositionV2 {
+        version: OWNED_SCOPE_VERSION,
+        lowering: OWNED_TRANSITION_LOWERING_VERSION,
+        basis: OwnedBasisV2 {
+            container_format: super::super::FORMAT,
+            family: OwnedBasisFamilyV2::OwnedV2,
+            frozen: basis(current)?,
+            sources: current
+                .programs
+                .iter()
+                .map(revision)
+                .collect::<std::result::Result<_, _>>()?,
+            graph: current.decisions.clone(),
+            artifacts: current.artifacts.clone(),
+        },
+        transition: if withdrawal {
+            ScopeTransition::Withdrawal
+        } else {
+            ScopeTransition::Evolution
+        },
+        business: revision(after)?,
+        layers: vec![layer_id.clone()],
+        active: if withdrawal {
+            BTreeSet::new()
+        } else {
+            predecessor.active.clone()
+        },
+        previous: Some(last.output.clone()),
+        operation: operation.into(),
+        runtime: RUNTIME_VERSION.into(),
+        driver: DRIVER_VERSION.into(),
+        output: last.output.clone(), // Excluded by lowering3's recipe digest.
+        correspondences: if withdrawal {
+            predecessor.correspondences.clone()
+        } else {
+            vec![OwnedImplementationCorrespondenceV2 {
+                version: OWNED_SCOPE_VERSION,
+                source: last.output.clone(),
+                target: revision(after)?,
+                sources: sources.clone(),
+            }]
+        },
+    };
+    let (target, metadata) = owned_transition_lowering::compile(
+        &continuation,
+        &manifest,
+        !manifest.active.is_empty(),
+        meter,
+    )?;
+    manifest.output = revision(&target)?;
+    Ok(Arc::new(VerifiedOwnedTransitionExecution {
+        continuation: Arc::new(continuation),
+        target,
+        metadata,
+        manifest,
+        original,
+        initialization: initialization.clone(),
+    }))
+}
+
+/// Extract proposed arguments only. Callers must pass them to `transition`,
+/// which reconstructs the complete family before granting any authority.
+pub(super) fn effective_pair<'a>(
+    snapshot: &'a ProjectSnapshot,
+    target: &Digest,
+) -> Result<(
+    &'a CapturedProgram,
+    &'a CapturedProgram,
+    &'a OwnedSourceRequest,
+)> {
+    let state = snapshot.owned_scope()?;
+    let manifest = state
+        .compositions
+        .values()
+        .find(|m| &m.output == target)
+        .ok_or_else(|| err("effective manifest missing"))?;
+    let sources = if manifest.transition == ScopeTransition::Adoption {
+        let [id] = manifest.layers.as_slice() else {
+            return Err(err("effective original layer ambiguous"));
+        };
+        &state
+            .layers
+            .get(id)
+            .ok_or_else(|| err("effective original layer missing"))?
+            .request
+            .inventory
+            .sources
+    } else if let [correspondence] = manifest.correspondences.as_slice() {
+        &correspondence.sources
+    } else if manifest.transition == ScopeTransition::Withdrawal
+        && manifest.correspondences.is_empty()
+    {
+        let [id] = manifest.layers.as_slice() else {
+            return Err(err("effective original layer ambiguous"));
+        };
+        &state
+            .layers
+            .get(id)
+            .ok_or_else(|| err("effective original layer missing"))?
+            .request
+            .inventory
+            .sources
+    } else {
+        return Err(err("effective ordinary source pair ambiguous"));
+    };
+    Ok((
+        program(snapshot, &sources.before)?,
+        program(snapshot, &sources.after)?,
+        sources,
+    ))
+}
+
+// Assertion-only fixture bridge: no proof, source, registry or write capability
+// leaves this cfg(test) method. It probes one real private mechanism after full
+// reconstruction of the unmodified two-epoch fixture has already succeeded.
+#[cfg(test)]
+impl ProjectSnapshot {
+    pub(crate) fn assert_owned_epoch_interval_rejects_unique_swapped_receipts_for_test(&self) {
+        self.validate_container().unwrap();
+        let mut meter =
+            ProofMeter::new(ProofBudget::default(), Arc::new(AtomicBool::new(false))).unwrap();
+        let registry = reconstruct(self, &mut meter).unwrap();
+        assert_eq!(
+            registry.epochs.len(),
+            2,
+            "bridge requires the genuine two-epoch fixture"
+        );
+        let epoch = &registry.epochs[0];
+        let recipe = registry.recipes.get(&epoch.output).unwrap();
+        let next = registry.recipes.get(&registry.epochs[1].output).unwrap();
+        let endpoint = next.seed();
+        let endpoint_revision = next.basis().revision;
+        let old_revision = self.operations["old-complete"].revision;
+        let new_revision = self.operations["new-epoch-add"].revision;
+        assert!(epoch.adoption_revision < old_revision && old_revision <= endpoint_revision);
+        assert!(new_revision > endpoint_revision);
+        assert!(endpoint.events[recipe.seed().events.len()..]
+            .iter()
+            .any(|event| event.operation_id == "old-complete"
+                && event.program == recipe.target().artifact.program_digest));
+        assert!(self.data.events[endpoint.events.len()..]
+            .iter()
+            .any(|event| event.operation_id == "new-epoch-add"
+                && event.program == next.target().artifact.program_digest));
+        let mut swapped = self.clone();
+        swapped.operations.get_mut("old-complete").unwrap().revision = new_revision;
+        swapped
+            .operations
+            .get_mut("new-epoch-add")
+            .unwrap()
+            .revision = old_revision;
+        validate_revision_ownership(&swapped).unwrap();
+        let error = owned_epoch::validate_interval(
+            &swapped,
+            recipe,
+            epoch.adoption_revision,
+            endpoint_revision,
+            endpoint,
+            next.basis().clock_day,
+            &mut meter,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, StoreError::Invalid(message)
+            if message == "Common factual admission: owned producer epoch: event is outside its actual producer operation interval"),
+            "{error}"
+        );
+    }
+}
+
+#[cfg(test)]
+#[path = "owned_persist_registry_controls.rs"]
+mod registry_policy_controls;
+
+#[cfg(test)]
+#[path = "owned_persist_initial_reuse_tests.rs"]
+mod initial_reuse_tests;

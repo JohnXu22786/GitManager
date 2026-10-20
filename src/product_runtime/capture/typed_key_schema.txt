@@ -1,0 +1,167 @@
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Type {
+    Boolean,
+    Integer,
+    Text,
+    Date,
+    Reference { entity: Id },
+    List { item: Box<Type> },
+    Optional { item: Box<Type> },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DataValue {
+    Null,
+    Boolean {
+        value: bool,
+    },
+    Integer {
+        value: i64,
+    },
+    Text {
+        value: String,
+    },
+    /// Gregorian day number relative to 1970-01-01; arithmetic must be checked.
+    Date {
+        days: i32,
+    },
+    Reference {
+        entity: Id,
+        record: Id,
+    },
+    List {
+        item_type: Type,
+        items: Vec<DataValue>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Expr {
+    Literal {
+        value_type: Type,
+        value: DataValue,
+    },
+    Variable {
+        name: Id,
+    },
+    Field {
+        record: Box<Expr>,
+        field: Id,
+    },
+    State {
+        state: Id,
+    },
+    Today,
+    Query {
+        entity: Id,
+        binding: Id,
+        predicate: Box<Expr>,
+        sort: Vec<SortKey>,
+        limit: usize,
+        include_archived: bool,
+    },
+    Filter {
+        items: Box<Expr>,
+        binding: Id,
+        predicate: Box<Expr>,
+    },
+    Map {
+        items: Box<Expr>,
+        binding: Id,
+        value: Box<Expr>,
+    },
+    Count {
+        items: Box<Expr>,
+    },
+    Any {
+        items: Box<Expr>,
+        binding: Id,
+        predicate: Box<Expr>,
+    },
+    All {
+        items: Box<Expr>,
+        binding: Id,
+        predicate: Box<Expr>,
+    },
+    Sum {
+        items: Box<Expr>,
+    },
+    Contains {
+        items: Box<Expr>,
+        value: Box<Expr>,
+    },
+    Equal {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    Less {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    Add {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    Subtract {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    Concat {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    TextContains {
+        text: Box<Expr>,
+        search: Box<Expr>,
+    },
+    Lower {
+        value: Box<Expr>,
+    },
+    And {
+        values: Vec<Expr>,
+    },
+    Or {
+        values: Vec<Expr>,
+    },
+    Not {
+        value: Box<Expr>,
+    },
+    If {
+        condition: Box<Expr>,
+        then_value: Box<Expr>,
+        else_value: Box<Expr>,
+    },
+    Coalesce {
+        value: Box<Expr>,
+        fallback: Box<Expr>,
+    },
+    DateAdd {
+        date: Box<Expr>,
+        days: Box<Expr>,
+    },
+    DateDifference {
+        later: Box<Expr>,
+        earlier: Box<Expr>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SortKey {
+    pub value: Expr,
+    pub descending: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeLimits {
+    pub fuel: u64,
+    pub collection_items: usize,
+    pub action_steps: usize,
+    pub transaction_writes: usize,
+    pub output_bytes: usize,
+    pub elapsed_millis: u64,
+}

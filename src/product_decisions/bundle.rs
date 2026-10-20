@@ -2,6 +2,37 @@
 //! restored intentions are always rerun before later behavior adoption.
 use super::archive::{decode, validate_rehearsal_scenes, Content, Object};
 use super::*;
+use crate::product_store::scope::LockedArchivePolicy;
+use std::mem::size_of;
+// Same checked compile-time packet arithmetic as the scope layer, deliberately
+// private here rather than widening the scope helper's visibility.
+const fn archive_payment<const N: usize>(base: u64, terms: [(usize, u64); N]) -> u64 {
+    assert!(usize::BITS <= u64::BITS);
+    let mut total = base;
+    let mut i = 0;
+    while i < N {
+        let term = match (terms[i].0 as u64).checked_mul(terms[i].1) {
+            Some(value) => value,
+            None => panic!("archive payment multiplication overflow"),
+        };
+        total = match total.checked_add(term) {
+            Some(value) => value,
+            None => panic!("archive payment addition overflow"),
+        };
+        i += 1;
+    }
+    total
+}
+pub(super) const LOCKED_ARCHIVE_EXPORT_PAYMENT: u64 = archive_payment(128, [
+    (size_of::<&IntentArchive>(), 8),
+    (size_of::<&ProjectSnapshot>(), 12),
+    (size_of::<&LockedArchivePolicy<'_>>(), 12),
+    (size_of::<&IntentionBundle>(), 8),
+    (size_of::<IntentionBundle>(), 4),
+    (size_of::<Result<IntentionBundle>>(), 4),
+    (size_of::<Result<()>>(), 12),
+    (size_of::<(&Vec<AcceptedScene>, &BTreeMap<Digest, std::ops::Range<usize>>)>(), 8),
+]);
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BundledObject {
@@ -48,35 +79,39 @@ fn reachable(snapshot: &ProjectSnapshot) -> BTreeSet<Digest> {
         )
         .collect()
 }
-pub fn validate_bundle(snapshot: &ProjectSnapshot, bundle: &IntentionBundle) -> Result<()> {
-    snapshot.validate()?;
-    validate_withdrawal_history(snapshot)?;
-    if bundle.version != 1
-        || bundle.snapshot != canonical_digest(IdentityDomain::Data, snapshot)?
-        || bundle.objects.len() > MAX_ITEMS * 2
-        || bundle.objects.iter().map(|o| o.bytes.len()).sum::<usize>() > MAX_BUNDLE_BYTES
-        || canonical_bytes(bundle)?.len() > MAX_BUNDLE_BYTES
+// The complete ordinary body is expanded lexically, with only the final
+// retained-policy call selected. Object/scene/mapping error order stays shared.
+macro_rules! validate_bundle_body {
+    ($snapshot:ident, $bundle:ident, $retained:path $(, $capsule:ident)?) => {{
+    $snapshot.validate()?;
+    validate_withdrawal_history($snapshot)?;
+    if $bundle.version != 1
+        || $bundle.snapshot != canonical_digest(IdentityDomain::Data, $snapshot)?
+        || $bundle.objects.len() > MAX_ITEMS * 2
+        || $bundle.objects.iter().map(|o| o.bytes.len()).sum::<usize>() > MAX_BUNDLE_BYTES
+        || canonical_bytes($bundle)?.len() > MAX_BUNDLE_BYTES
     {
         return Err(invalid(
             "intention bundle version, snapshot identity or size is invalid",
         ));
     }
-    let expected = reachable(snapshot);
+    let expected = reachable($snapshot);
     let mut found = BTreeSet::new();
     let mut sources = vec![];
     let mut accepted = vec![];
+    let mut accepted_ranges = BTreeMap::<Digest,std::ops::Range<usize>>::new();
     let mut recipes = vec![];
     // One immutable committed basis and fixed runtime apply throughout this
     // call. Each scene is still decoded, validated and admitted independently.
     let mut committed_context = None;
-    for object in &bundle.objects {
+    for object in &$bundle.objects {
         if !found.insert(object.digest.clone()) || !expected.contains(&object.digest) {
             return Err(invalid("duplicate or unrelated intention object"));
         }
         let content = decode(&object.bytes, &object.digest)?;
         match content {
             Content::Scenes { scenes } => {
-                if snapshot
+                if $snapshot
                     .adoptions
                     .iter()
                     .any(|a| a.plan.evidence.first() == Some(&object.digest))
@@ -91,7 +126,7 @@ pub fn validate_bundle(snapshot: &ProjectSnapshot, bundle: &IntentionBundle) -> 
                 for s in &scenes {
                     s.validate()?;
                     if committed_context.is_none() {
-                        committed_context = Some(ScopedExecutionContext::committed(snapshot)?);
+                        committed_context = Some(ScopedExecutionContext::committed($snapshot)?);
                     }
                     committed_context.as_ref().unwrap().verify_seed(
                         &s.program,
@@ -103,17 +138,19 @@ pub fn validate_bundle(snapshot: &ProjectSnapshot, bundle: &IntentionBundle) -> 
                     }) {
                         sources.push(s.program.clone());
                     }
-                    if s.program.binding.project_id != snapshot.data.project_id {
+                    if s.program.binding.project_id != $snapshot.data.project_id {
                         return Err(invalid("accepted scene belongs to another project"));
                     }
                 }
-                validate_rehearsal_scenes(snapshot, &object.digest, &scenes)?;
+                validate_rehearsal_scenes($snapshot, &object.digest, &scenes)?;
+                let first = accepted.len();
                 accepted.extend(scenes.clone());
+                accepted_ranges.insert(object.digest.clone(),first..accepted.len());
                 let ids = scenes
                     .iter()
                     .map(|s| s.scenario.identity())
                     .collect::<std::result::Result<Vec<_>, _>>()?;
-                for d in snapshot
+                for d in $snapshot
                     .decisions
                     .decisions
                     .iter()
@@ -126,7 +163,7 @@ pub fn validate_bundle(snapshot: &ProjectSnapshot, bundle: &IntentionBundle) -> 
                         ));
                     }
                 }
-                if !snapshot
+                if !$snapshot
                     .decisions
                     .decisions
                     .iter()
@@ -136,7 +173,7 @@ pub fn validate_bundle(snapshot: &ProjectSnapshot, bundle: &IntentionBundle) -> 
                 }
             }
             Content::Mappings { target, mappings } => {
-                if snapshot
+                if $snapshot
                     .decisions
                     .decisions
                     .iter()
@@ -150,7 +187,7 @@ pub fn validate_bundle(snapshot: &ProjectSnapshot, bundle: &IntentionBundle) -> 
                 if mappings.len() > MAX_ITEMS {
                     return Err(invalid("mapping count exceeds limits"));
                 }
-                for a in snapshot
+                for a in $snapshot
                     .adoptions
                     .iter()
                     .filter(|a| a.plan.evidence.first() == Some(&object.digest))
@@ -159,7 +196,7 @@ pub fn validate_bundle(snapshot: &ProjectSnapshot, bundle: &IntentionBundle) -> 
                         return Err(invalid("restored mappings target another executable"));
                     }
                 }
-                if !snapshot
+                if !$snapshot
                     .adoptions
                     .iter()
                     .any(|a| a.plan.evidence.first() == Some(&object.digest))
@@ -171,7 +208,7 @@ pub fn validate_bundle(snapshot: &ProjectSnapshot, bundle: &IntentionBundle) -> 
         }
     }
     for (target, mappings) in recipes {
-        let target = snapshot
+        let target = $snapshot
             .programs
             .iter()
             .find(|p| p.artifact == target)
@@ -227,13 +264,41 @@ pub fn validate_bundle(snapshot: &ProjectSnapshot, bundle: &IntentionBundle) -> 
             "intention bundle lacks reachable immutable objects",
         ));
     }
+    $retained($snapshot, $($capsule,)? |check| {
+        let mut verify = || -> Result<()> {
+            let execution=check.execution()?;
+            let basis=execution.current();
+            let layer=crate::product_store::scope::transition_layer(execution);
+            let ids=owned_policy::retirement_ids(basis,layer)?;
+            for id in &ids {
+                check.charge(1)?;
+                let decision=basis.decisions.decisions.iter().find(|d|&d.id==id)
+                    .ok_or_else(||invalid("historical owned retirement decision missing"))?;
+                let range=accepted_ranges.get(&decision.witness)
+                    .ok_or_else(||invalid("historical owned retirement witness missing"))?;
+                owned_policy::check_decision(check,decision,&accepted[range.clone()])?;
+            }
+            Ok(())
+        };
+        verify().map_err(owned_transition::into_store_error)
+    })?;
     Ok(())
+    }};
 }
-impl IntentArchive {
-    pub fn export_for(&self, snapshot: &ProjectSnapshot) -> Result<IntentionBundle> {
+pub fn validate_bundle(snapshot: &ProjectSnapshot, bundle: &IntentionBundle) -> Result<()> {
+    validate_bundle_body!(snapshot, bundle, crate::product_store::scope::check_retained_transition_policies)
+}
+fn validate_bundle_locked(
+    snapshot: &ProjectSnapshot, bundle: &IntentionBundle, capsule: &LockedArchivePolicy<'_>,
+) -> Result<()> {
+    validate_bundle_body!(snapshot, bundle, crate::product_store::scope::check_retained_transition_policies_locked, capsule)
+}
+
+macro_rules! export_bundle_body {
+    ($archive:ident, $snapshot:ident, $validate:path $(, $capsule:ident)?) => {{
         let mut objects = vec![];
-        for digest in reachable(snapshot) {
-            let content = self.read(&digest)?;
+        for digest in reachable($snapshot) {
+            let content = $archive.read(&digest)?;
             let bytes = canonical_bytes(&Object {
                 version: 1,
                 content,
@@ -242,11 +307,21 @@ impl IntentArchive {
         }
         let bundle = IntentionBundle {
             version: 1,
-            snapshot: canonical_digest(IdentityDomain::Data, snapshot)?,
+            snapshot: canonical_digest(IdentityDomain::Data, $snapshot)?,
             objects,
         };
-        validate_bundle(snapshot, &bundle)?;
+        $validate($snapshot, &bundle $(, $capsule)?)?;
         Ok(bundle)
+    }};
+}
+impl IntentArchive {
+    pub fn export_for(&self, snapshot: &ProjectSnapshot) -> Result<IntentionBundle> {
+        export_bundle_body!(self, snapshot, validate_bundle)
+    }
+    pub(super) fn export_for_locked_withdrawal(
+        &self, snapshot: &ProjectSnapshot, capsule: &LockedArchivePolicy<'_>,
+    ) -> Result<IntentionBundle> {
+        export_bundle_body!(self, snapshot, validate_bundle_locked, capsule)
     }
     pub fn restore_for(&self, snapshot: &ProjectSnapshot, bundle: &IntentionBundle) -> Result<()> {
         validate_bundle(snapshot, bundle)?;
@@ -284,3 +359,7 @@ pub(crate) fn upgrade_bundle_binding(
     }
     Ok(upgraded)
 }
+
+#[cfg(test)]
+#[path = "owned_archive_policy_reuse_tests.rs"]
+mod archive_policy_reuse_tests;

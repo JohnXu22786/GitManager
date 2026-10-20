@@ -87,6 +87,7 @@ struct Rules<'a> {
     certs: Vec<CommonFactCertificate>,
     discovered: BTreeSet<(Id, Id)>,
     all_roots_active: bool,
+    retained: Option<&'a super::owned_continuation::RetainedOwned>,
 }
 fn literal(expr: &Expr) -> Option<&DataValue> {
     if let Expr::Literal { value, .. } = expr {
@@ -165,11 +166,15 @@ fn schemas(
     after: &AppDefinition,
     request: &OwnedPreviewRequest,
     inventory: &CommonFactInventory,
+    retained: Option<&super::owned_continuation::RetainedOwned>,
 ) -> AdmissionResult<BTreeMap<Id, Kind>> {
     let root = &request.inventory.sources.root_entity;
+    if let Some(retained) = retained {
+        retained.verify_schema(before, data, after, request)?;
+    }
     for e in &data.schema {
-        if before.entities.iter().find(|x| x.id == e.id) != Some(e)
-            || after.entities.iter().find(|x| x.id == e.id) != Some(e)
+        if retained.is_none() && (before.entities.iter().find(|x| x.id == e.id) != Some(e)
+            || after.entities.iter().find(|x| x.id == e.id) != Some(e))
         {
             return Err(refuse(
                 &format!("entity {}", e.id),
@@ -219,7 +224,7 @@ fn schemas(
             Kind::Root
         } else if let Some(aux) = request.auxiliary.iter().find(|a| a.entity == entity.id) {
             if before.entities.iter().any(|e| e.id == entity.id)
-                || data.schema.iter().any(|e| e.id == entity.id)
+                || (retained.is_none() && data.schema.iter().any(|e| e.id == entity.id))
                 || owner.as_ref() != Some(&aux.owner_field)
                 || refs.len() != 1
                 || entity.unique != vec![vec![aux.owner_field.clone()]]
@@ -1297,14 +1302,24 @@ impl Rules<'_> {
                         || !control.policy.is_empty()
                         || path.len() != 1
                         || i + 1 != steps.len()
-                        || !matches!(literal(value),Some(DataValue::Text{value}) if value.is_empty())
                     {
                         return Err(refuse(
                             &at,
                             "input reset must be literal empty, common, top-level and final",
                         ));
                     }
-                    self.certify(&at, &format!("closed input reset {state}"), step)?;
+                    if matches!(literal(value),Some(DataValue::Text{value}) if value.is_empty()) {
+                        self.certify(&at, &format!("closed input reset {state}"), step)?;
+                    } else if match self.retained {
+                        Some(retained) => retained.permits_state_marker(
+                            self.inventory, self.side, &action.id, &path, step, self.meter,
+                        )?,
+                        None => false,
+                    } {
+                        self.certify(&at, &format!("closed continuation common final text marker {state}"), step)?;
+                    } else {
+                        return Err(refuse(&at, "input reset must be literal empty, common, top-level and final"));
+                    }
                 }
                 Statement::Assert { condition, .. } => {
                     let v = self.expr(condition, env, false, false, &at)?;
@@ -1885,7 +1900,20 @@ pub(super) fn verify_frame(
     Vec<OwnedProjectionRecipe>,
     Vec<String>,
 )> {
-    let before = &snapshot.program()?.program;
+    verify_pair_frame(snapshot.program()?, candidate, request, inventory, data, None, meter)
+}
+/// The retained mode can only be constructed from the original reconstructed
+/// initializer/layout. No schema/row stripping is used for current frames.
+pub(super) fn verify_pair_frame(
+    baseline: &CapturedProgram,
+    candidate: &CapturedProgram,
+    request: &OwnedPreviewRequest,
+    inventory: &CommonFactInventory,
+    data: &DataSnapshot,
+    retained: Option<&super::owned_continuation::RetainedOwned>,
+    meter: &mut ProofMeter,
+) -> AdmissionResult<(Vec<CommonFactCertificate>, Vec<OwnedProjectionRecipe>, Vec<String>)> {
+    let before = &baseline.program;
     let after = &candidate.program;
     let first = lifecycle(&request.inventory.lifecycle.before)?;
     let second = lifecycle(&request.inventory.lifecycle.after)?;
@@ -1901,7 +1929,7 @@ pub(super) fn verify_frame(
                 "paired variant lacks an exact single-root correspondence; split at a proved root frontier"));
         }
     }
-    let kinds = schemas(before, data, after, request, inventory)?;
+    let kinds = schemas(before, data, after, request, inventory, retained)?;
     // Every allowed LocalRuntime run has <= 10,000,000 cumulative fuel. Each
     // business write consumes fuel, so this exact retained-data margin rules out
     // policy-selected revision overflow throughout that entire isolated run.
@@ -1971,6 +1999,7 @@ pub(super) fn verify_frame(
                 certs: vec![],
                 discovered: BTreeSet::new(),
                 all_roots_active,
+                retained,
             };
             rules.actions()?;
             rules.observations()?;
