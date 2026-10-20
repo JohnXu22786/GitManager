@@ -530,7 +530,7 @@ fn app_length_single_source_count_and_publication_fail_closed() {
     let starts: Vec<usize> = direct.calls.windows(6).enumerate().filter_map(|(i,w)| {
         (w==[0,96,170496,358,1,1]).then_some(i)
     }).collect();
-    assert_eq!(starts.len(),1);
+    assert!(starts.is_empty(), "complete hit has no duplicate count");
     // Local trace locators reject missing/ambiguous signatures. They do not
     // calculate semantic bytes, native amounts or a whole-route cost oracle.
     let unique = |calls: &[u64], start: usize, end: usize, signature: &[u64]| {
@@ -542,10 +542,34 @@ fn app_length_single_source_count_and_publication_fail_closed() {
     let source_hash = unique(&direct.calls,0,direct.calls.len(),&[0,96,248]);
     let program_hash = unique(&direct.calls,0,direct.calls.len(),&[0,96,253]);
     let semantic_hash = unique(&direct.calls,0,direct.calls.len(),&[0,96,298]);
-    assert!(starts[0]<source_hash && source_hash<program_hash && program_hash<semantic_hash);
-    let count_tail = unique(&direct.calls,starts[0],source_hash,&[96,2,320,1855,8,260,5,101,16343,0]);
-    let count_native = count_tail+8;
-    assert_eq!(&direct.calls[count_native..count_native+2],&[16343,0]);
+    assert!(source_hash<program_hash && program_hash<semantic_hash);
+    // A deserialize-equivalent omitted Option is an explicit complete-relation
+    // miss. Its genuine V1 count and every count refusal remain mandatory.
+    let mut miss = capture.clone();
+    let mut value = serde_json::to_value(&capture.program).unwrap();
+    value["views"][0]["kind"].as_object_mut().unwrap().remove("selection");
+    miss.source_bytes = serde_json::to_vec(&value).unwrap();
+    miss.artifact.raw_digest = bytes_digest(IdentityDomain::Source, &miss.source_bytes);
+    miss.binding.source_digest = miss.artifact.raw_digest.clone();
+    let mut miss_trace = Work::default();
+    source_result(&miss, &mut miss_trace).unwrap();
+    let mut count_trace = Work::default();
+    assert_eq!(counted(&capture.program, &mut count_trace), Ok(1076));
+    let count_start = unique(&miss_trace.calls, 0, miss_trace.calls.len(), &count_trace.calls);
+    assert_eq!(miss_trace.calls.windows(6).filter(|w| *w==[0,96,170496,358,1,1]).count(),1);
+    assert_eq!(&count_trace.calls[count_trace.calls.len()-2..], &[16343,0]);
+    for index in count_start..count_start+count_trace.calls.len() {
+        for cause in [WorkFailure::Cancelled, WorkFailure::BudgetExhausted("miss count refusal")] {
+            let mut work = Work { refuse:Some(index+5),cause:Some(cause.clone()),..Work::default() };
+            let result = with_capture_validation(&miss,&data,&mut work,|ctx|->ContractWorkResult<()> {
+                assert!(ctx.ensure_source_and_data().is_err());
+                assert!(ctx.facts.is_none());
+                Ok(())
+            });
+            assert_eq!(result,Err(ContractWorkError::Resource(cause)));
+            assert_eq!(&work.calls[4..], &miss_trace.calls[..=index]);
+        }
+    }
     // Domain framing is8/9/18 bytes; each complete hash ends at its real native
     // handoff412 and success0, after FMT(2)*32=2144. No native observer is added.
     let source_end = unique(&direct.calls,source_hash,program_hash,&[320,2144,12,412,0])+4;
@@ -561,10 +585,12 @@ fn app_length_single_source_count_and_publication_fail_closed() {
     // native reserve and success poll immediately before the next domain hash.
     // The observed reserve is only a locator; its quantity is not an oracle here.
     for (start,hash) in [(first_select+1,program_hash),(second_select+1,semantic_hash)] {
-        unique(&direct.calls,start,hash,&[0,96,170873,358,1,1]);
-        assert_eq!(unique(&direct.calls,start,hash,&[320,1855,8,260,5,85]),hash-8);
-        assert!(direct.calls[hash-2]>0);
-        assert_eq!(direct.calls[hash-1],0);
+        let output_end = if hash == program_hash { hash - 2 } else { hash };
+        unique(&direct.calls,start,output_end,&[0,96,170873,358,1,1]);
+        assert_eq!(unique(&direct.calls,start,output_end,&[320,1855,8,260,5,85]),output_end-8);
+        assert!(direct.calls[output_end-2]>0);
+        assert_eq!(direct.calls[output_end-1],0);
+        if hash == program_hash { assert_eq!(&direct.calls[output_end..hash], &[128,5]); }
     }
     let mut all = Work::default();
     with_capture_validation(&capture,&data,&mut all,|ctx|->ContractWorkResult<()> {
@@ -577,10 +603,10 @@ fn app_length_single_source_count_and_publication_fail_closed() {
     let publication = 4+direct.calls.len();
     assert_eq!(all.calls[publication],5);
     for (name,index) in [
-        ("V1 count native",4+count_native),("V1 count success",4+count_native+1),
         ("Source hash native",4+source_end-1),("Source hash success",4+source_end),
         ("first selection",4+first_select),
-        ("Program canonical native",4+program_hash-2),("Program canonical success",4+program_hash-1),
+        ("Program canonical native",4+program_hash-4),("Program canonical success",4+program_hash-3),
+        ("exact facts control",4+program_hash-2),("exact facts construction",4+program_hash-1),
         ("Program hash native",4+program_end-1),("Program hash success",4+program_end),
         ("second selection",4+second_select),
         ("semantic canonical native",4+semantic_hash-2),("semantic canonical success",4+semantic_hash-1),
@@ -650,7 +676,7 @@ fn app_length_single_source_count_and_publication_fail_closed() {
         });
         assert_eq!(result,Err(ContractWorkError::Contract(ContractError(expected))));
         assert_eq!((validation_counts().captures,validation_counts().apps),(1,[1,1,1,1,0][fault]));
-        assert_eq!(work.calls.windows(6).filter(|w|*w==[0,96,170496,358,1,1]).count(),[1,1,1,1,0][fault]);
+        assert_eq!(work.calls.windows(6).filter(|w|*w==[0,96,170496,358,1,1]).count(),[1,0,0,0,0][fault]);
         assert_eq!(work.calls.windows(3).filter(|w|*w==[0,96,248]).count(),[0,1,1,1,0][fault]);
         assert_eq!(work.calls.windows(3).filter(|w|*w==[0,96,253]).count(),[0,0,1,1,0][fault]);
         assert_eq!(work.calls.windows(3).filter(|w|*w==[0,96,298]).count(),[0,0,0,1,0][fault]);
@@ -683,7 +709,7 @@ fn app_length_single_source_count_and_publication_fail_closed() {
         }).unwrap();
         assert_eq!(validation_counts().apps,1);
         assert_eq!(validation_counts().captures,1);
-        assert_eq!(work.calls.windows(6).filter(|w|*w==[0,96,170496,358,1,1]).count(),1);
+        assert_eq!(work.calls.windows(6).filter(|w|*w==[0,96,170496,358,1,1]).count(),0);
         assert_eq!(&work.calls[4..4+direct.calls.len()],direct.calls.as_slice());
         assert_eq!(serde_json::to_vec(&next).unwrap(),next_before);
     }

@@ -3504,9 +3504,36 @@ pub(in super::super) fn validate_closed_value_capture(
             assert!(size_of::<SemanticOutput<'static, 'static>>() == 64);
             assert!(DELTA_FRAME == 144 && DELTA_ROOT == 1536);
         };
-        fn first_value_output<'v, 'w>(value: &'v mut JsonValue, a: Audit<'w>)
-            -> Result<(Vec<u8>, ProgramOutput<'v, 'w>)>
+        // This pending-length phase exists only in this complete relation arm.
+        // It cannot attach arbitrary bytes, clone, serialize, or leave this call.
+        struct PendingLength<'c, 'v, 'w> {
+            capture: &'c CapturedProgram,
+            value: &'v mut JsonValue,
+            a: Audit<'w>,
+            total_nodes: usize,
+            action_prefix_nodes: usize,
+            action_count: usize,
+        }
+        // Positive owner/transport coverage is separate from DELTA_ROOT. The
+        // full new tuple and Result carriers are counted, not just their delta.
+        const BOUND_ROOT: usize = 4 * (
+            2 * size_of::<PendingLength<'static, 'static, 'static>>()
+            + 2 * size_of::<capture_validation::CaptureFacts>()
+            + 8 * size_of::<usize>() + 4 * size_of::<Result<()>>()
+            + size_of::<(Vec<u8>, ProgramOutput<'static, 'static>, capture_validation::CaptureFacts)>()
+            + size_of::<Result<(Vec<u8>, ProgramOutput<'static, 'static>, capture_validation::CaptureFacts)>>()
+        );
+        #[cfg(target_pointer_width = "64")]
+        const _: () = {
+            assert!(size_of::<PendingLength<'static, 'static, 'static>>() == 48);
+            assert!(size_of::<capture_validation::CaptureFacts>() == 32);
+            assert!(BOUND_ROOT == 2240);
+        };
+        impl<'v, 'w> PendingLength<'_, 'v, 'w> {
+        fn first_value_output(self)
+            -> Result<(Vec<u8>, ProgramOutput<'v, 'w>, capture_validation::CaptureFacts)>
         {
+            let Self { capture: _, value, a, total_nodes, action_prefix_nodes, action_count } = self;
             a.pay(0)?;
             a.pay(96)?;
             a.pay(OUTPUT_STACK_ROOT as u64)?;
@@ -3531,7 +3558,17 @@ pub(in super::super) fn validate_closed_value_capture(
             #[cfg(test)]
             native_outputs::record(&bytes);
             a.pay(0)?;
-            Ok((bytes, ProgramOutput { value, a, raw }))
+            // Read the first actual native Vec before any label mutation. The
+            // fixed control packet pays the consume/reborrow/len/transfer work;
+            // the original facts5 is charged at actual construction, not early.
+            a.pay(128)?;
+            let canonical_len = bytes.len();
+            a.pay(5)?;
+            let facts = capture_validation::CaptureFacts {
+                total_nodes, action_prefix_nodes, canonical_len, action_count,
+            };
+            Ok((bytes, ProgramOutput { value, a, raw }, facts))
+        }
         }
         impl<'v, 'w> ProgramOutput<'v, 'w> {
             fn clear_labels(self) -> Result<SemanticOutput<'v, 'w>> {
@@ -3576,27 +3613,48 @@ pub(in super::super) fn validate_closed_value_capture(
             }
         }
 
-        let facts = capture.program.validate_audited(a)?;
+        // Prepay every new root owner and fixed handoff before constructing it.
+        // Constant checked target layouts fail compilation on arithmetic overflow.
+        a.pay(128)?;
+        a.pay(BOUND_ROOT as u64)?;
+        let pending = {
+            let app = &capture.program;
+            validate_app_semantics!(app, a, validator, action_prefix_nodes);
+            // Complete same-Value equality excludes floats/coercion and schema
+            // expansion. Native compact length is <= this actual immutable raw
+            // source length. This establishes only the V1 budget predicate.
+            // Keep the removed count's entry/success cancellation opportunities.
+            a.pay(0)?;
+            a.pay(128)?;
+            let source_len = capture.source_bytes.len();
+            a.pay(0)?;
+            a.pay(3)?;
+            a.require(source_len <= MAX_WIRE_BYTES, "program exceeds byte budget")?;
+            PendingLength { capture, value: &mut value, a, total_nodes: validator.nodes,
+                action_prefix_nodes, action_count: app.actions.len() }
+        };
+        // The Validator drops here, after the original semantic tail. No pending
+        // facts can publish, and no exact canonical length has been invented.
         // Successful equality continuation, not a synthetic self-comparison.
         a.pay(1)?;
         let raw = capture_validation::bytes_digest_audited(
             IdentityDomain::Source,
-            &capture.source_bytes,
+            &pending.capture.source_bytes,
             a,
         )?;
         a.require(
-            a.eq_str(capture.artifact.raw_digest.as_str(), raw.as_str())?
+            a.eq_str(pending.capture.artifact.raw_digest.as_str(), raw.as_str())?
                 && a.eq_str(
-                    capture.binding.source_digest.as_str(),
-                    capture.artifact.raw_digest.as_str(),
+                    pending.capture.binding.source_digest.as_str(),
+                    pending.capture.artifact.raw_digest.as_str(),
                 )?,
             "raw source digest mismatch",
         )?;
         a.pay(8 + 2 * size_of::<Audit<'_>>() as u64 + 4 * size_of::<bool>() as u64)?;
         if !a.enabled() {
-            capture.program.validate_audited(a)?;
+            pending.capture.program.validate_audited(a)?;
         }
-        let (bytes, program_output) = first_value_output(&mut value, a)?;
+        let (bytes, program_output, facts) = pending.first_value_output()?;
         let program = capture_validation::bytes_digest_audited(IdentityDomain::Program, &bytes, a)?;
         let equal = a.eq_str(capture.artifact.program_digest.as_str(), program.as_str())?;
         let equal = if equal {

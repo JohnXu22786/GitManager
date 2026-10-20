@@ -114,8 +114,16 @@ fn closed_value_representative_sources_keep_reviewed_complete_payments() {
         let k = labels.len() as u64;
         let l = labels.iter().map(|s| s.len() as u64).sum::<u64>();
         let additions = 6144 + 256 + 128 * k + 14 * l;
-        assert_eq!(work.calls.iter().sum::<u64>() + 5, expected - removed + additions);
-        eprintln!("complete source old={expected} removed_descriptor={removed} K={k} L={l} added={additions} actual={}", work.calls.iter().sum::<u64>() + 5);
+        let mut count = Work::default();
+        let state = WorkState::new(&mut count);
+        state.finish(app_canonical_len_audited(&c.program, Audit(Some(&state)))).unwrap();
+        let removed_count = count.calls.iter().sum::<u64>();
+        // Only this complete-hit count disappears. Both count polls survive;
+        // all three new128 control packets and the actual2240 owner root pay.
+        let bound_additions = 3 * 128 + 2240;
+        assert_eq!(work.calls.iter().sum::<u64>() + 5,
+            expected - removed + additions - removed_count + bound_additions);
+        eprintln!("complete source old={expected} removed_descriptor={removed} removed_count={removed_count} K={k} L={l} added={additions} bound_added={bound_additions} actual={}", work.calls.iter().sum::<u64>() + 5);
     }
 }
 
@@ -1279,11 +1287,13 @@ fn closed_value_each_fresh_output_callback_refuses_before_publication() {
             .collect();
         assert_eq!(hits.len(), 1);
         let hash = hits[0];
-        assert!(starts[ordinal] < hash - 2);
-        assert!(trace.calls[hash - 2] > 0);
-        assert_eq!(trace.calls[hash - 1], 0);
+        let success_poll = if ordinal == 0 { hash - 3 } else { hash - 1 };
+        assert!(starts[ordinal] < success_poll - 1);
+        assert!(trace.calls[success_poll - 1] > 0);
+        assert_eq!(trace.calls[success_poll], 0);
+        if ordinal == 0 { assert_eq!(&trace.calls[success_poll+1..hash], &[128,5]); }
         boundaries.extend(
-            (starts[ordinal]..hash).map(|index| (index, ordinal + usize::from(index == hash - 1))),
+            (starts[ordinal]..hash).map(|index| (index, ordinal + usize::from(index >= success_poll))),
         );
     }
     eprintln!(

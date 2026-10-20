@@ -1479,3 +1479,7 @@ pub(super) use closed_value::validate_closed_value_capture;
 #[cfg(test)]
 #[path = "capture_closed_value_tests.rs"]
 mod closed_value_tests;
+
+#[cfg(test)]
+#[path = "capture_source_wire_bound_tests.rs"]
+mod source_wire_bound_tests;

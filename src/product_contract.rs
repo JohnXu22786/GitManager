@@ -4,6 +4,101 @@
 //! model's claims. Use the production `RuntimeAdapter` to obtain observations.
 //! There is deliberately no eval, shell, URL, file-path or credential operation.
 
+// One lexical V1 semantic prefix, with no callable semantic-only authority.
+// The ordinary/count tail remains in its original scope with the Validator.
+macro_rules! validate_app_semantics {
+    ($this:ident, $a:ident, $validator:ident, $action_prefix_nodes:ident) => {
+        $a.pay(12)?;
+        #[cfg(test)]
+        count_validation(|counts| counts.apps += 1);
+        $a.version($this.version)?;
+        $a.check_id(&$this.id)?;
+        $a.nonempty(&$this.label)?;
+        $a.require(
+            !$this.entities.is_empty() && !$this.views.is_empty(),
+            "application needs entities and views",
+        )?;
+        $a.unique($this.entities.iter().map(|e| e.id.as_str()))?;
+        $a.unique($this.state.iter().map(|s| s.id.as_str()))?;
+        $a.unique($this.actions.iter().map(|$a| $a.id.as_str()))?;
+        $a.unique($this.outputs.iter().map(|o| o.id.as_str()))?;
+        $a.unique($this.observables.iter().map(|o| o.id.as_str()))?;
+        $a.unique($this.views.iter().map(|v| v.id.as_str()))?;
+        $a.require(
+            $a.find(&$this.views, &$this.initial_view, |v| &v.id)?.is_some(),
+            "unknown initial view",
+        )?;
+        $a.pay(8)?;
+        let mut $validator = Validator::new($this, $a);
+        validate_entities(&$this.entities, &mut $validator)?;
+        $a.slice($this.state.len())?;
+        for state in &$this.state {
+            $a.pay(12)?;
+            $a.nonempty(&state.label)?;
+            $validator.typ(&state.value_type, 0)?;
+            validate_value_audited(&state.initial, &state.value_type, 0, $a)?;
+        }
+        $a.slice($this.outputs.len())?;
+        for output in &$this.outputs {
+            $a.pay(12)?;
+            $a.nonempty(&output.label)?;
+            $a.require(!output.columns.is_empty(), "output needs columns")?;
+            $a.unique(output.columns.iter().map(|c| c.id.as_str()))?;
+            $a.slice(output.columns.len())?;
+        for column in &output.columns {
+            $a.pay(12)?;
+                $a.nonempty(&column.label)?;
+                $validator.typ(&column.value_type, 0)?;
+                $a.require(
+                    column.value_type.is_scalar(),
+                    "output columns must be scalar",
+                )?;
+            }
+        }
+        $a.slice($this.actions.len())?;
+        for action in &$this.actions {
+            $a.pay(12)?;
+            $a.nonempty(&action.label)?;
+            $a.require(!action.steps.is_empty(), "action needs steps")?;
+            $a.map_iter(action.parameters.len())?;
+            $a.unique(action.parameters.keys().map(String::as_str))?;
+            $a.map_iter(action.parameters.len())?;
+        for typ in action.parameters.values() {
+            $a.pay(12)?;
+                $validator.typ(typ, 0)?;
+            }
+            let mut env = $a.clone_owned(&action.parameters)?;
+            $a.bounded(action.guards.len())?;
+            $a.bounded(action.ensures.len())?;
+            $a.slice(action.guards.len())?;
+        for guard in &action.guards {
+            $a.pay(12)?;
+                $validator.expect(guard, &env, &Type::Boolean, 0, true)?;
+            }
+            $validator.statements(&action.steps, &mut env, 0)?;
+            $a.slice(action.ensures.len())?;
+        for condition in &action.ensures {
+            $a.pay(12)?;
+                $validator.expect(condition, &env, &Type::Boolean, 0, true)?;
+            }
+        }
+        $a.pay(1)?;
+        let $action_prefix_nodes = $validator.nodes;
+        $a.slice($this.observables.len())?;
+        for observable in &$this.observables {
+            $a.pay(12)?;
+            $a.nonempty(&observable.label)?;
+            $a.pay(8)?;
+            $validator.expr(&observable.value, &Environment::new(), 0, true)?;
+        }
+        $a.slice($this.views.len())?;
+        for view in &$this.views {
+            $a.pay(12)?;
+            $validator.view(view)?;
+        }
+    };
+}
+
 #[path = "tool_proposal_input.rs"]
 mod bounded_input;
 #[path = "product_contract/capture_work.rs"]
@@ -1302,94 +1397,7 @@ impl AppDefinition {
         self.validate_audited(Audit::none()).map(|_| ())
     }
     fn validate_audited(&self, a: Audit<'_>) -> Result<capture_validation::CaptureFacts> {
-        a.pay(12)?;
-        #[cfg(test)]
-        count_validation(|counts| counts.apps += 1);
-        a.version(self.version)?;
-        a.check_id(&self.id)?;
-        a.nonempty(&self.label)?;
-        a.require(
-            !self.entities.is_empty() && !self.views.is_empty(),
-            "application needs entities and views",
-        )?;
-        a.unique(self.entities.iter().map(|e| e.id.as_str()))?;
-        a.unique(self.state.iter().map(|s| s.id.as_str()))?;
-        a.unique(self.actions.iter().map(|a| a.id.as_str()))?;
-        a.unique(self.outputs.iter().map(|o| o.id.as_str()))?;
-        a.unique(self.observables.iter().map(|o| o.id.as_str()))?;
-        a.unique(self.views.iter().map(|v| v.id.as_str()))?;
-        a.require(
-            a.find(&self.views, &self.initial_view, |v| &v.id)?.is_some(),
-            "unknown initial view",
-        )?;
-        a.pay(8)?;
-        let mut validator = Validator::new(self, a);
-        validate_entities(&self.entities, &mut validator)?;
-        a.slice(self.state.len())?;
-        for state in &self.state {
-            a.pay(12)?;
-            a.nonempty(&state.label)?;
-            validator.typ(&state.value_type, 0)?;
-            validate_value_audited(&state.initial, &state.value_type, 0, a)?;
-        }
-        a.slice(self.outputs.len())?;
-        for output in &self.outputs {
-            a.pay(12)?;
-            a.nonempty(&output.label)?;
-            a.require(!output.columns.is_empty(), "output needs columns")?;
-            a.unique(output.columns.iter().map(|c| c.id.as_str()))?;
-            a.slice(output.columns.len())?;
-        for column in &output.columns {
-            a.pay(12)?;
-                a.nonempty(&column.label)?;
-                validator.typ(&column.value_type, 0)?;
-                a.require(
-                    column.value_type.is_scalar(),
-                    "output columns must be scalar",
-                )?;
-            }
-        }
-        a.slice(self.actions.len())?;
-        for action in &self.actions {
-            a.pay(12)?;
-            a.nonempty(&action.label)?;
-            a.require(!action.steps.is_empty(), "action needs steps")?;
-            a.map_iter(action.parameters.len())?;
-            a.unique(action.parameters.keys().map(String::as_str))?;
-            a.map_iter(action.parameters.len())?;
-        for typ in action.parameters.values() {
-            a.pay(12)?;
-                validator.typ(typ, 0)?;
-            }
-            let mut env = a.clone_owned(&action.parameters)?;
-            a.bounded(action.guards.len())?;
-            a.bounded(action.ensures.len())?;
-            a.slice(action.guards.len())?;
-        for guard in &action.guards {
-            a.pay(12)?;
-                validator.expect(guard, &env, &Type::Boolean, 0, true)?;
-            }
-            validator.statements(&action.steps, &mut env, 0)?;
-            a.slice(action.ensures.len())?;
-        for condition in &action.ensures {
-            a.pay(12)?;
-                validator.expect(condition, &env, &Type::Boolean, 0, true)?;
-            }
-        }
-        a.pay(1)?;
-        let action_prefix_nodes = validator.nodes;
-        a.slice(self.observables.len())?;
-        for observable in &self.observables {
-            a.pay(12)?;
-            a.nonempty(&observable.label)?;
-            a.pay(8)?;
-            validator.expr(&observable.value, &Environment::new(), 0, true)?;
-        }
-        a.slice(self.views.len())?;
-        for view in &self.views {
-            a.pay(12)?;
-            validator.view(view)?;
-        }
+        validate_app_semantics!(self, a, validator, action_prefix_nodes);
         // Keep the ordinary Vec alive through the original validation tail.
         let bytes;
         let canonical_len = if a.enabled() {
