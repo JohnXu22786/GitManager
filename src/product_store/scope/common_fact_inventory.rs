@@ -389,28 +389,20 @@ pub(super) fn derive_pair(
     }
     derive_pair_inner(snapshot, baseline, candidate, request, basis)
 }
-fn derive_pair_inner(
-    snapshot: &ProjectSnapshot,
-    baseline: &CapturedProgram,
-    candidate: &CapturedProgram,
-    request: &CommonFactInventoryRequest,
-    basis: Digest,
-) -> Result<CommonFactInventory> {
-    let before = &baseline.program;
-    let after = &candidate.program;
-    let structure = super::analyze_owned_sources(baseline, candidate, &request.sources)?;
-    if request.lifecycle.entity != structure.root_entity
-        || request.lifecycle.meaning.trim().is_empty()
-        || request.lifecycle.meaning.len() > MAX_TEXT_BYTES
+macro_rules! common_fact_inventory_tail {
+    ($snapshot:ident, $request:ident, $basis:ident, $structure:ident, $before:ident, $after:ident) => {{
+    if $request.lifecycle.entity != $structure.root_entity
+        || $request.lifecycle.meaning.trim().is_empty()
+        || $request.lifecycle.meaning.len() > MAX_TEXT_BYTES
     {
         return Err(error(
             "lifecycle suggestion must name the exact root and a bounded explicit meaning",
         ));
     }
-    let env = Env::from([("record".into(), Type::reference(&structure.root_entity))]);
+    let env = Env::from([("record".into(), Type::reference(&$structure.root_entity))]);
     for (app, predicate) in [
-        (before, &request.lifecycle.before),
-        (after, &request.lifecycle.after),
+        ($before, &$request.lifecycle.before),
+        ($after, &$request.lifecycle.after),
     ] {
         if app.expression_type_in(predicate, &env)? != Type::Boolean {
             return Err(error("lifecycle suggestion is not Boolean"));
@@ -418,7 +410,7 @@ fn derive_pair_inner(
         super::compiler::own_row(
             predicate,
             "record",
-            &structure.root_entity,
+            &$structure.root_entity,
             app,
             &Env::new(),
             false,
@@ -429,23 +421,23 @@ fn derive_pair_inner(
     let mut obligations = vec![];
     for (app, source, side, predicate) in [
         (
-            before,
-            &structure.before,
+            $before,
+            &$structure.before,
             OwnedSourceSide::Before,
-            &request.lifecycle.before,
+            &$request.lifecycle.before,
         ),
         (
-            after,
-            &structure.after,
+            $after,
+            &$structure.after,
             OwnedSourceSide::After,
-            &request.lifecycle.after,
+            &$request.lifecycle.after,
         ),
     ] {
         lifecycle_origins.push(super::common_fact_uses::inventory(
             app,
             source,
             side,
-            &structure.root_entity,
+            &$structure.root_entity,
             predicate,
             &mut uses,
             &mut obligations,
@@ -453,7 +445,7 @@ fn derive_pair_inner(
     }
     obligation(&mut obligations,None,"lifecycle","lifecycle_meaning","The source/basis-bound own-row suggestion is untrusted: business meaning, exact admission occurrences, preservation, and completed-history sealing remain unproved");
     let mut lifecycle_writers = vec![];
-    for writer in &structure.writers {
+    for writer in &$structure.writers {
         let lifecycle_field = lifecycle_origins
             .iter()
             .flat_map(|origin| &uses[origin.clone()])
@@ -463,11 +455,11 @@ fn derive_pair_inner(
                     && u.entity.as_ref() == Some(&writer.entity)
                     && u.field == writer.field
             });
-        if writer.entity == structure.root_entity
+        if writer.entity == $structure.root_entity
             && (lifecycle_field || writer.kind == OwnedStatementKind::Archive)
         {
             lifecycle_writers.push(writer.clone());
-            let code = if edited(writer, &structure) {
+            let code = if edited(writer, &$structure) {
                 "mixed_lifecycle_transition"
             } else {
                 "lifecycle_writer"
@@ -477,15 +469,15 @@ fn derive_pair_inner(
     }
     let mut references = vec![];
     for (app, side) in [
-        (before, OwnedSourceSide::Before),
-        (after, OwnedSourceSide::After),
+        ($before, OwnedSourceSide::Before),
+        ($after, OwnedSourceSide::After),
     ] {
         for entity in &app.entities {
             for field in &entity.fields {
                 let Some(target) = relation(&field.value_type) else {
                     continue;
                 };
-                let writers: Vec<_> = structure
+                let writers: Vec<_> = $structure
                     .writers
                     .iter()
                     .filter(|w| {
@@ -509,7 +501,7 @@ fn derive_pair_inner(
                     field: field.id.clone(),
                     target_entity: target.into(),
                     required: matches!(field.value_type, Type::Reference { .. }),
-                    matches_retained_schema: snapshot
+                    matches_retained_schema: $snapshot
                         .data
                         .schema
                         .iter()
@@ -522,9 +514,9 @@ fn derive_pair_inner(
             }
         }
     }
-    for entity in &snapshot.data.schema {
-        if before.entities.iter().find(|e| e.id == entity.id) != Some(entity)
-            || after.entities.iter().find(|e| e.id == entity.id) != Some(entity)
+    for entity in &$snapshot.data.schema {
+        if $before.entities.iter().find(|e| e.id == entity.id) != Some(entity)
+            || $after.entities.iter().find(|e| e.id == entity.id) != Some(entity)
         {
             obligation(&mut obligations,None,&format!("retained entity {}",entity.id),"retained_schema","Cumulative retained schema differs from a source definition; source equality cannot establish runtime compatibility or retained uniqueness");
         }
@@ -533,14 +525,14 @@ fn derive_pair_inner(
         }
     }
     let mut actions = vec![];
-    for a in &before.actions {
-        let b = after
+    for a in &$before.actions {
+        let b = $after
             .actions
             .iter()
             .find(|b| b.id == a.id)
             .expect("resolved action");
         let mut result = vec![];
-        phases(before, after, a, b, &structure, &a.steps, &[], &mut result)?;
+        phases($before, $after, a, b, &$structure, &a.steps, &[], &mut result)?;
         actions.push(CommonFactAction {
             action: a.id.clone(),
             parameters: a.parameters.clone(),
@@ -552,7 +544,7 @@ fn derive_pair_inner(
         });
         obligation(&mut obligations,None,&a.id,"resource_atomicity","Common phases must run once in authored order; ordinary fuel/collection/statement/write/output/elapsed/cancellation failures must not commit business/session/output prefixes, while fuel and trace/outcome may change");
     }
-    let identity_hazards = identity_hazards(&structure);
+    let identity_hazards = identity_hazards(&$structure);
     for h in &identity_hazards {
         obligation(
             &mut obligations,
@@ -562,14 +554,14 @@ fn derive_pair_inner(
             &h.reason,
         );
     }
-    Ok(CommonFactInventory {
-        snapshot: basis,
-        retained_data: snapshot.data.identity()?,
-        retained_schema: snapshot.data.schema.clone(),
-        before_schema: before.entities.clone(),
-        after_schema: after.entities.clone(),
-        structure,
-        lifecycle: request.lifecycle.clone(),
+    Ok::<_, StoreError>(CommonFactInventory {
+        snapshot: $basis,
+        retained_data: $snapshot.data.identity()?,
+        retained_schema: $snapshot.data.schema.clone(),
+        before_schema: $before.entities.clone(),
+        after_schema: $after.entities.clone(),
+        structure: $structure,
+        lifecycle: $request.lifecycle.clone(),
         lifecycle_writers,
         actions,
         uses,
@@ -578,13 +570,27 @@ fn derive_pair_inner(
         obligations,
         resources: CommonFactResources {
             total_record_cap: MAX_COLLECTION,
-            stored_records: snapshot.data.records.len(),
+            stored_records: $snapshot.data.records.len(),
             includes_archived_and_auxiliary: true,
             ordinary_defaults: RuntimeLimits::default(),
             max_query_limit_proves_order_independence: false,
             failures_commit_fuel_and_trace: true,
         },
     })
+    }};
+}
+
+fn derive_pair_inner(
+    snapshot: &ProjectSnapshot,
+    baseline: &CapturedProgram,
+    candidate: &CapturedProgram,
+    request: &CommonFactInventoryRequest,
+    basis: Digest,
+) -> Result<CommonFactInventory> {
+    let before = &baseline.program;
+    let after = &candidate.program;
+    let structure = super::analyze_owned_sources(baseline, candidate, &request.sources)?;
+    common_fact_inventory_tail!(snapshot, request, basis, structure, before, after)
 }
 impl ProductStore {
     /// Re-derive diagnostic inventories from the currently validated store and
@@ -596,4 +602,40 @@ impl ProductStore {
     ) -> Result<CommonFactInventory> {
         derive(&self.load()?, candidate, request)
     }
+}
+
+pub(super) struct InventoryTail<'s> {
+    baseline: &'s AppDefinition,
+    snapshot: &'s ProjectSnapshot,
+    candidate: &'s AppDefinition,
+    request: &'s CommonFactInventoryRequest,
+    basis: Digest,
+    finish: super::common_fact_admission::RetainedFinish<'s>,
+}
+impl InventoryTail<'_> {
+    pub(super) fn prepare(self, structure: OwnedStructuralReport,
+        meter: &mut super::common_fact_admission::ProofMeter,
+    ) -> Result<super::common_fact_admission::PreparedRetainedCapture> {
+        let Self { baseline, snapshot, candidate, request, basis, finish } = self;
+        let before = baseline;
+        let after = candidate;
+        let inventory = common_fact_inventory_tail!(snapshot, request, basis, structure, before, after)?;
+        finish.prepare(inventory, meter)
+    }
+}
+pub(super) fn derive_retained<'s>(
+    snapshot: &'s ProjectSnapshot, candidate: &'s CapturedProgram, request: &'s CommonFactInventoryRequest,
+    meter: &mut super::common_fact_admission::ProofMeter,
+    finish: super::common_fact_admission::RetainedFinish<'s>,
+    consume: super::common_fact_admission::CaptureTail<'s>,
+) -> Result<super::common_fact_admission::CapturedRetainedCapture> {
+    let basis = canonical_digest(IdentityDomain::Data, snapshot)?;
+    if basis != request.snapshot || snapshot.active_revision != request.sources.before {
+        return Err(error("stale authenticated snapshot/source basis"));
+    }
+    let baseline = snapshot.program()?;
+    let before = &baseline.program;
+    let after = &candidate.program;
+    super::owned_resolve::analyze_retained_sources(baseline, candidate, &request.sources, meter,
+        InventoryTail { baseline: before, snapshot, candidate: after, request, basis, finish }, consume)
 }

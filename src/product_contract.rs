@@ -117,7 +117,8 @@ use capture_work::Audit;
 use capture_owned::OwnedWork;
 pub(crate) use capture_work::{ContractWork, WorkFailure, ContractWorkError, ContractWorkResult};
 pub(crate) use capture_canonical::canonical_bytes_with_work;
-pub(crate) use capture_validation::{with_capture_validation, CaptureValidation, validate_value_with_work};
+pub(crate) use capture_validation::{with_capture_validation, CaptureValidation, validate_value_with_work,
+    with_ordinary_source_facts, ReadyCaptureSource, SourcePreparation, SourceConsumer};
 
 use ring::digest::{digest, SHA256};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -5419,3 +5420,7 @@ mod capture_stage_tests;
 #[cfg(test)]
 #[path = "product_contract/capture_canonical_removal_tests.rs"]
 mod capture_canonical_removal_tests;
+
+#[cfg(test)]
+#[path = "product_contract/retained_source_controls.rs"]
+mod retained_source_controls;

@@ -111,6 +111,15 @@ pub(crate) struct ProjectionCapture<'c,'v,'a,'s,H:ProjectionHost+?Sized>{
     cache_bytes:usize,
     first_failure:Option<AdapterError>,
 }
+macro_rules! projection_capture_body {
+    ($validation:ident, $program:ident, $data:ident, $day:ident, $body:ident) => {{
+            let mut capture=ProjectionCapture{validation:$validation,program:$program,data:$data,day:$day,cache:Vec::new(),cache_bytes:0,first_failure:None};
+            let result=$body(&mut capture);
+            if let Some(error)=capture.first_failure.take(){return Err(ScopeExit::Caller(E::from(error)))}
+            // Source owns its first error; an unrelated caller E passes through.
+            result.map_err(ScopeExit::Caller)
+    }};
+}
 impl LocalRuntime{
     pub(crate) fn with_projection_capture<'a,'s,H,R,E>(&self,program:&'s CapturedProgram,data:&'s DataSnapshot,day:i32,host:&'a mut H,
         body:impl for<'c,'v> FnOnce(&mut ProjectionCapture<'c,'v,'a,'s,H>)->std::result::Result<R,E>)->std::result::Result<R,E>
@@ -120,11 +129,7 @@ impl LocalRuntime{
             .map_err(|error|E::from(cost::resource(error)))?;
         let mut host=CaptureHost{host,active_row_deadline:None,first_failure:None};
         let result=with_capture_validation(program,data,&mut host,|validation|{
-            let mut capture=ProjectionCapture{validation,program,data,day,cache:Vec::new(),cache_bytes:0,first_failure:None};
-            let result=body(&mut capture);
-            if let Some(error)=capture.first_failure.take(){return Err(ScopeExit::Caller(E::from(error)))}
-            // Source owns its first error; an unrelated caller E passes through.
-            result.map_err(ScopeExit::Caller)
+            projection_capture_body!(validation, program, data, day, body)
         });
         match result{
             Ok(value)=>Ok(value),
@@ -132,6 +137,31 @@ impl LocalRuntime{
             Err(ScopeExit::Contract(error))=>Err(E::from(cost::contract(error))),
         }
     }
+    pub(crate) const fn capture_result_bytes<R, E>() -> usize {
+        size_of::<std::result::Result<R, ScopeExit<E>>>()
+    }
+    pub(crate) fn with_retained_projection_capture<'g,'s,H,R,E>(&self,
+        ready:ReadyCaptureSource<'g,'s,H>,data:&'s DataSnapshot,day:i32,
+        body:impl for<'c,'v> FnOnce(&mut ProjectionCapture<'c,'v,'g,'s,H>)->std::result::Result<R,E>)->std::result::Result<R,E>
+    where H:ProjectionHost+?Sized,E:From<AdapterError>{
+        let program=ready.source();
+        #[cfg(test)]
+        let caller_bytes = std::mem::size_of_val(&body);
+        let bridge = move |validation: &mut CaptureValidation<'_, 's, CaptureHost<'g, H>>| {
+            projection_capture_body!(validation, program, data, day, body)
+        };
+        #[cfg(test)]
+        RETAINED_CALLBACK_WIDTHS.with(|v| v.set((caller_bytes, std::mem::size_of_val(&bridge))));
+        let result=ready.into_capture_validation(data,ProjectionCapture::<H>::ENTRY,
+            |host| CaptureHost{host,active_row_deadline:None,first_failure:None}, bridge);
+
+        match result{
+            Ok(value)=>Ok(value),
+            Err(ScopeExit::Caller(error))=>Err(error),
+            Err(ScopeExit::Contract(error))=>Err(E::from(cost::contract(error))),
+        }
+    }
+
 }
 impl<'c,'v,'a,'s,H:ProjectionHost+?Sized> ProjectionCapture<'c,'v,'a,'s,H>{
     const ENTRY:u64=153+size_of::<CaptureHost<'a,H>>() as u64+size_of::<Self>() as u64;
@@ -275,3 +305,18 @@ impl<H:ProjectionHost+?Sized> ProjectionRow<'_,'_,'_,'_,'_,H>{
 #[cfg(test)]
 #[path = "capture/cache_controls.rs"]
 mod cache_controls;
+
+#[cfg(test)]
+thread_local! {
+    static RETAINED_CALLBACK_WIDTHS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+#[cfg(test)]
+impl LocalRuntime {
+    pub(crate) fn retained_callback_widths_for_test() -> (usize, usize) {
+        RETAINED_CALLBACK_WIDTHS.with(|v| v.get())
+    }
+}
+
+#[cfg(test)]
+#[path = "capture/retained_source_controls.rs"]
+mod retained_source_controls;

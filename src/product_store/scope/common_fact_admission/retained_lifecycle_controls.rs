@@ -207,8 +207,10 @@ impl ProductStore {
             let old_left = old_meter.remaining_units_for_test();
             let new_left = new_meter.remaining_units_for_test();
             if case == "selected" {
-                assert_eq!(new_left, old_left + SAVED_UNITS);
-                assert_eq!(start - new_left, (start - old_left) - SAVED_UNITS);
+                let (source_body, source_wrapper) = snapshot.program().unwrap().retained_source_payments_for_test();
+                let saving = SAVED_UNITS + source_body + source_wrapper - RETAINED_SOURCE_HANDOFF_G;
+                assert_eq!(new_left, old_left + saving);
+                assert_eq!(start - new_left, (start - old_left) - saving);
             } else {
                 // Full verification remains on both sides. The new guard32,
                 // handoff5 and complete private suffix transport are positively paid.
@@ -379,8 +381,12 @@ impl ProductStore {
             (assert_invalid(old, expected), assert_invalid(new, expected))
         };
         assert_eq!(old_error, new_error, "{case}");
-        // Every negative case returns before the new guard/handoff, so no added debit.
-        assert_eq!(old_meter.remaining_units_for_test(), new_meter.remaining_units_for_test(), "{case}");
+        // Only these negatives finish lifecycle reconstruction and reach G.
+        let added = if matches!(case, "basis-authentication" | "request-authentication"
+            | "operations-authentication" | "inventory-basis-authentication") {
+            RETAINED_SOURCE_HANDOFF_G
+        } else { 0 };
+        assert_eq!(old_meter.remaining_units_for_test(), new_meter.remaining_units_for_test() + added, "{case}");
         assert_eq!((snapshot, candidate, request, lifecycle), inputs);
         assert_eq!(accepted.recipe(), original.2);
         assert_eq!(self.load().unwrap(), original_snapshot);
@@ -406,8 +412,8 @@ impl ProductStore {
             "first-replay-fuel" | "guard-fuel" | "handoff-fuel" => {
                 let (units, left) = match case {
                     "first-replay-fuel" => (100_000, 99_999 - 384 - 800 - 32),
-                    "guard-fuel" => (prefix + GUARD_UNITS - 1, GUARD_UNITS - 1),
-                    _ => (prefix + GUARD_UNITS + SELECTED_HANDOFF_UNITS - 1, SELECTED_HANDOFF_UNITS - 1),
+                    "guard-fuel" => (prefix + RETAINED_SOURCE_HANDOFF_G + GUARD_UNITS - 1, GUARD_UNITS - 1),
+                    _ => (prefix + RETAINED_SOURCE_HANDOFF_G + GUARD_UNITS + SELECTED_HANDOFF_UNITS - 1, SELECTED_HANDOFF_UNITS - 1),
                 };
                 let mut meter = ProofMeter::new(
                     ProofBudget { units, elapsed_millis: 60_000 },

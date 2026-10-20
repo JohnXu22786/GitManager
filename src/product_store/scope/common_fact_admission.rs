@@ -263,35 +263,30 @@ pub(super) fn request_identity(request: &OwnedPreviewRequest) -> AdmissionResult
         &("owned-preview-request/1", request),
     )?)
 }
-fn authenticate_inner(
-    snapshot: &ProjectSnapshot,
-    candidate: &CapturedProgram,
-    request: &OwnedPreviewRequest,
-    meter: &mut ProofMeter,
-    verify_snapshot: bool,
-) -> AdmissionResult<CommonFactInventory> {
-    meter.charge((candidate.source_bytes.len() + snapshot.program()?.source_bytes.len()) as u64)?;
-    if verify_snapshot {
-        snapshot.validate()?;
+macro_rules! authenticate_body {
+    ($snapshot:ident, $candidate:ident, $request:ident, $meter:ident, $verify_snapshot:ident, $tail:expr) => {{
+    $meter.charge(($candidate.source_bytes.len() + $snapshot.program()?.source_bytes.len()) as u64)?;
+    if $verify_snapshot {
+        $snapshot.validate()?;
     }
-    candidate.validate()?;
-    if !matches!(snapshot.scope,ScopeEnvelope::ScalarV1(ref s) if *s==ScopeState::default())
-        && !matches!(snapshot.scope, ScopeEnvelope::OwnedV2(ref s) if s.layers.is_empty() && !s.rehearsals.is_empty())
+    $candidate.validate()?;
+    if !matches!($snapshot.scope,ScopeEnvelope::ScalarV1(ref s) if *s==ScopeState::default())
+        && !matches!($snapshot.scope, ScopeEnvelope::OwnedV2(ref s) if s.layers.is_empty() && !s.rehearsals.is_empty())
     {
         return Err(refuse("basis", "existing scoped lineage is unsupported"));
     }
-    super::compiler::reject_reserved(&candidate.program)?;
-    if request.purpose.trim().is_empty()
-        || request.purpose.len() > MAX_TEXT_BYTES
-        || request.operations.is_empty()
-        || request.operations.len() > MAX_ITEMS
+    super::compiler::reject_reserved(&$candidate.program)?;
+    if $request.purpose.trim().is_empty()
+        || $request.purpose.len() > MAX_TEXT_BYTES
+        || $request.operations.is_empty()
+        || $request.operations.len() > MAX_ITEMS
     {
         return Err(refuse(
             "request",
             "bounded explicit preview purpose and operations required",
         ));
     }
-    let all: BTreeSet<_> = snapshot
+    let all: BTreeSet<_> = $snapshot
         .program()?
         .program
         .actions
@@ -300,17 +295,17 @@ fn authenticate_inner(
         .collect();
     // This first closed grammar requires a complete writer surface. No silently
     // expanded operation set or unverified Invoke-only route can survive.
-    if request.operations != all {
+    if $request.operations != all {
         return Err(refuse(
             "operations",
             "all source writers must be explicitly covered",
         ));
     }
     let mut seen = BTreeSet::new();
-    for row in &request.excluded_records {
-        if row.entity != request.inventory.sources.root_entity
+    for row in &$request.excluded_records {
+        if row.entity != $request.inventory.sources.root_entity
             || !seen.insert((&row.entity, &row.record))
-            || !snapshot
+            || !$snapshot
                 .data
                 .records
                 .iter()
@@ -319,19 +314,19 @@ fn authenticate_inner(
             return Err(refuse("scope", "missing, duplicate or foreign exclusion"));
         }
     }
-    if request.excluded_records.len() > MAX_COLLECTION {
+    if $request.excluded_records.len() > MAX_COLLECTION {
         return Err(refuse("scope", "exclusion bound exceeded"));
     }
-    if let ScopePopulation::SelectedUnfinished { records } = &request.population {
+    if let ScopePopulation::SelectedUnfinished { records } = &$request.population {
         if records.is_empty() || records.len() > MAX_COLLECTION {
             return Err(refuse("scope", "invalid selected population"));
         }
         let mut ids = BTreeSet::new();
         for row in records {
-            if row.entity != request.inventory.sources.root_entity
+            if row.entity != $request.inventory.sources.root_entity
                 || !ids.insert((&row.entity, &row.record))
-                || request.excluded_records.contains(row)
-                || !snapshot
+                || $request.excluded_records.contains(row)
+                || !$snapshot
                     .data
                     .records
                     .iter()
@@ -344,7 +339,20 @@ fn authenticate_inner(
             }
         }
     }
-    super::common_fact_inventory::derive(snapshot, candidate, &request.inventory)
+
+    $tail
+    }};
+}
+
+fn authenticate_inner(
+    snapshot: &ProjectSnapshot,
+    candidate: &CapturedProgram,
+    request: &OwnedPreviewRequest,
+    meter: &mut ProofMeter,
+    verify_snapshot: bool,
+) -> AdmissionResult<CommonFactInventory> {
+    authenticate_body!(snapshot, candidate, request, meter, verify_snapshot,
+        super::common_fact_inventory::derive(snapshot, candidate, &request.inventory))
 }
 pub(super) fn authenticate(
     snapshot: &ProjectSnapshot,
@@ -453,6 +461,34 @@ pub(super) fn derive(
 // This closed composition alone may reuse the verification it just performed.
 // A live default-sized window is an explicit resource-sensitive eligibility
 // rule; it does not assert equivalence to later counterfactual clock clamps.
+macro_rules! finish_admission_body {
+    ($snapshot:ident, $candidate:ident, $request:ident, $accepted:ident, $meter:ident, $inventory:ident, $certificates:ident, $projections:ident, $comparison:ident, $captured:ident) => {{
+    let report = CommonFactAdmissionReport {
+        version: 1,
+        snapshot: $request.inventory.snapshot.clone(),
+        before: $inventory.structure.before.clone(),
+        after: $inventory.structure.after.clone(),
+        decisions: $snapshot.decisions.identity()?,
+        acceptance: $accepted.identity().clone(),
+        certificates: $certificates,
+        projections: $projections,
+        phases: $inventory.actions,
+        outcome_comparison: $comparison,
+        capture_presence_required: true,
+        durable_adoption_supported: false,
+    };
+    $meter.charge(1)?;
+    Ok::<_, StoreError>(VerifiedOwnedPreviewPlan {
+        snapshot: $snapshot.clone(),
+        candidate: $candidate.clone(),
+        request: $request.clone(),
+        accepted: $accepted.copy_internal(),
+        report,
+        captured: $captured,
+    })
+    }};
+}
+
 pub(super) fn reconstruct_and_derive_retained(
     snapshot: &ProjectSnapshot,
     candidate: &CapturedProgram,
@@ -463,26 +499,18 @@ pub(super) fn reconstruct_and_derive_retained(
     let accepted = super::owned_lifecycle::AcceptedPreviewLifecycle::reconstruct(
         snapshot, candidate, request, lifecycle, meter,
     )?;
-    let inventory = authenticate_inner(snapshot, candidate, request, meter, false)?;
-    // Prepay the fixed guard, private-tail boundary and inventory transport.
-    meter.charge(32)?;
-    let proof = finish_reconstructed_plan(
-        snapshot, candidate, request, lifecycle, &accepted, inventory, meter,
-    )?;
+    meter.charge(RETAINED_SOURCE_HANDOFF_G)?;
+    let CapturedRetainedCapture { inventory, certificates, projections, comparison, captured } =
+        authenticate_retained(snapshot, candidate, request, meter,
+            RetainedFinish { snapshot, candidate, request, accepted: &accepted, lifecycle },
+            CaptureTail { snapshot, request })?;
+    let proof = finish_admission_body!(snapshot, candidate, request, accepted, meter, inventory,
+        certificates, projections, comparison, captured)?;
     Ok((accepted, proof))
 }
 
-// Sole production entrance: the closed factory above, after its actual
-// reconstruction, authentication and guard payment on this original meter.
-fn finish_reconstructed_plan(
-    snapshot: &ProjectSnapshot,
-    candidate: &CapturedProgram,
-    request: &OwnedPreviewRequest,
-    lifecycle: &OwnedLifecycleV2,
-    accepted: &super::owned_lifecycle::AcceptedPreviewLifecycle,
-    inventory: CommonFactInventory,
-    meter: &mut ProofMeter,
-) -> AdmissionResult<VerifiedOwnedPreviewPlan> {
+macro_rules! retained_guard_body {
+    ($snapshot:ident, $candidate:ident, $request:ident, $lifecycle:ident, $accepted:ident, $meter:ident) => {{
     let RuntimeLimits {
         fuel, collection_items, action_steps, transaction_writes, output_bytes,
         elapsed_millis,
@@ -505,19 +533,36 @@ fn finish_reconstructed_plan(
             && *actual_output_bytes == output_bytes
             && *actual_elapsed_millis == elapsed_millis
     };
-    let eligible = match lifecycle.evidence.as_slice() {
+    let eligible = match $lifecycle.evidence.as_slice() {
         [before, after] if default_limits(&before.limits) && default_limits(&after.limits) => {
-            let elapsed = meter.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-            meter.millis.saturating_sub(elapsed) >= elapsed_millis
+            let elapsed = $meter.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            $meter.millis.saturating_sub(elapsed) >= elapsed_millis
         }
         _ => false,
     };
     if !eligible {
-        accepted.verify(snapshot, candidate, request, meter)?;
+        $accepted.verify($snapshot, $candidate, $request, $meter)?;
     }
     // Includes the suffix boundary and the factory's returned pair/headers.
     // This live check retains both tokens and the original elapsed deadline.
-    meter.charge(5)?;
+    $meter.charge(5)?;
+
+    }};
+}
+
+// Test-only frozen selected suffix retains the previous exact accounting oracle.
+// Production uses RetainedFinish and the same lexical guard/body below.
+#[cfg(test)]
+fn finish_reconstructed_plan(
+    snapshot: &ProjectSnapshot,
+    candidate: &CapturedProgram,
+    request: &OwnedPreviewRequest,
+    lifecycle: &OwnedLifecycleV2,
+    accepted: &super::owned_lifecycle::AcceptedPreviewLifecycle,
+    inventory: CommonFactInventory,
+    meter: &mut ProofMeter,
+) -> AdmissionResult<VerifiedOwnedPreviewPlan> {
+    retained_guard_body!(snapshot, candidate, request, lifecycle, accepted, meter);
     finish_derived_plan(snapshot, candidate, request, accepted, meter, false, inventory)
 }
 
@@ -553,6 +598,7 @@ fn finish_derived_plan(
     meter.charge(FINISH_PROFILE_FRAME)?;
     finish_derived_plan_profiled(snapshot, candidate, request, accepted, meter, verify_snapshot, inventory, None)
 }
+
 fn finish_derived_plan_profiled(
     snapshot: &ProjectSnapshot,
     candidate: &CapturedProgram,
@@ -587,29 +633,7 @@ fn finish_derived_plan_profiled(
         meter,
         profile,
     )?;
-    let report = CommonFactAdmissionReport {
-        version: 1,
-        snapshot: request.inventory.snapshot.clone(),
-        before: inventory.structure.before.clone(),
-        after: inventory.structure.after.clone(),
-        decisions: snapshot.decisions.identity()?,
-        acceptance: accepted.identity().clone(),
-        certificates,
-        projections,
-        phases: inventory.actions,
-        outcome_comparison: comparison,
-        capture_presence_required: true,
-        durable_adoption_supported: false,
-    };
-    meter.charge(1)?;
-    Ok(VerifiedOwnedPreviewPlan {
-        snapshot: snapshot.clone(),
-        candidate: candidate.clone(),
-        request: request.clone(),
-        accepted: accepted.copy_internal(),
-        report,
-        captured,
-    })
+    finish_admission_body!(snapshot, candidate, request, accepted, meter, inventory, certificates, projections, comparison, captured)
 }
 impl ProductStore {
     pub fn verify_owned_preview(
@@ -794,50 +818,38 @@ fn capture_frame_batched(
     meter.charge(INITIAL_CAPTURE_PROFILE_TRANSPORT)?;
     capture_frame_batched_profiled(baseline, data, day, request, projections, meter, None)
 }
-fn capture_frame_batched_profiled(
-    baseline: &CapturedProgram,
-    data: &DataSnapshot,
-    day: i32,
-    request: &OwnedPreviewRequest,
-    projections: &[OwnedProjectionRecipe],
-    meter: &mut ProofMeter,
-    mut profile: Option<&mut InitialLimitsProfile>,
-) -> AdmissionResult<BTreeMap<String, Values>> {
-    // Empty capture-map cleanup8 and actual LocalRuntime token/header lifetime5.
-    ContractWork::charge(meter, 13).map_err(capture_resource_error)?;
-    let mut captured = BTreeMap::new();
-    let runtime = LocalRuntime::with_cancellation(meter.cancelled());
-    runtime.with_projection_capture(baseline, data, day, meter, |capture| {
-        capture.charge_host(1)?;
-        let mut records = data.records.iter();
+macro_rules! capture_frame_body {
+    ($capture:ident, $data:ident, $request:ident, $projections:ident, $profile:ident, $captured:ident) => {{
+        $capture.charge_host(1)?;
+        let mut records = $data.records.iter();
         loop {
-            capture.charge_host(1)?;
+            $capture.charge_host(1)?;
             let Some(record) = records.next() else { break; };
-            capture.charge_host(5)?; // Child edge2, record1, two inspected entity fields2.
+            $capture.charge_host(5)?; // Child edge2, record1, two inspected entity fields2.
             let matches = capture_string_equal(
-                &record.entity, &request.inventory.sources.root_entity,
-                &mut |n| capture.charge_host(n),
+                &record.entity, &$request.inventory.sources.root_entity,
+                &mut |n| $capture.charge_host(n),
             )?;
-            capture.charge_host(1)?;
+            $capture.charge_host(1)?;
             if !matches { continue; }
-            capture.charge_host(1)?; // Preserve the original matching-row debit.
-            capture.charge_host(2)?;
-            let entity = capture_string_copy(&record.entity, &mut |n| capture.charge_host(n))?;
-            let id = capture_string_copy(&record.id, &mut |n| capture.charge_host(n))?;
-            capture.charge_host(4)?; // Field moves, RecordRef constructor and cleanup.
+            $capture.charge_host(1)?; // Preserve the original matching-row debit.
+            $capture.charge_host(2)?;
+            let entity = capture_string_copy(&record.entity, &mut |n| $capture.charge_host(n))?;
+            let id = capture_string_copy(&record.id, &mut |n| $capture.charge_host(n))?;
+            $capture.charge_host(4)?; // Field moves, RecordRef constructor and cleanup.
             let reference = RecordRef { entity, record: id };
-            let values = capture.with_row(
-                &reference, "record", &request.inventory.lifecycle.before, &Type::Boolean,
+            let values = $capture.with_row(
+                &reference, "record", &$request.inventory.lifecycle.before, &Type::Boolean,
                 |row, completed| -> AdmissionResult<Option<Values>> {
                     row.charge_host(2)?;
-                    if let Some(profile) = profile.as_deref_mut() {
+                    if let Some($profile) = $profile.as_deref_mut() {
                         row.charge_host(256)?;
-                        profile.observe_paid(row.actual_limits(), true).map_err(capture_resource_error)?;
+                        $profile.observe_paid(row.actual_limits(), true).map_err(capture_resource_error)?;
                     }
                     row.charge_host(3)?; // Boolean/tag inspection and comparison.
                     let is_completed = completed == DataValue::Boolean { value: true };
                     row.charge_host(2)?; // Population field/tag inspection.
-                    let selected = if let ScopePopulation::SelectedUnfinished { records } = &request.population {
+                    let selected = if let ScopePopulation::SelectedUnfinished { records } = &$request.population {
                         row.charge_host(1)?;
                         let mut selected = records.iter();
                         let mut found = false;
@@ -869,7 +881,7 @@ fn capture_frame_batched_profiled(
                     row.charge_host(8)?;
                     let mut values = Values::new();
                     row.charge_host(1)?;
-                    let mut recipes = projections.iter();
+                    let mut recipes = $projections.iter();
                     loop {
                         row.charge_host(1)?;
                         let Some(projection) = recipes.next() else { break; };
@@ -895,15 +907,186 @@ fn capture_frame_batched_profiled(
                     Ok(Some(values))
                 },
             )?;
-            capture.charge_host(1)?;
+            $capture.charge_host(1)?;
             if let Some(values) = values {
-                capture.charge_host(1)?;
-                let key = capture_string_copy(&record.id, &mut |n| capture.charge_host(n))?;
-                capture_insert(&mut captured, key, values, &mut |n| capture.charge_host(n))?;
+                $capture.charge_host(1)?;
+                let key = capture_string_copy(&record.id, &mut |n| $capture.charge_host(n))?;
+                capture_insert(&mut $captured, key, values, &mut |n| $capture.charge_host(n))?;
             }
         }
-        capture.charge_host(1)?;
-        Ok(captured)
+        $capture.charge_host(1)?;
+        Ok($captured)
+    }};
+}
+
+fn capture_frame_batched_profiled(
+    baseline: &CapturedProgram,
+    data: &DataSnapshot,
+    day: i32,
+    request: &OwnedPreviewRequest,
+    projections: &[OwnedProjectionRecipe],
+    meter: &mut ProofMeter,
+    mut profile: Option<&mut InitialLimitsProfile>,
+) -> AdmissionResult<BTreeMap<String, Values>> {
+    // Empty capture-map cleanup8 and actual LocalRuntime token/header lifetime5.
+    ContractWork::charge(meter, 13).map_err(capture_resource_error)?;
+    let mut captured = BTreeMap::new();
+    let runtime = LocalRuntime::with_cancellation(meter.cancelled());
+    runtime.with_projection_capture(baseline, data, day, meter, |capture| {
+        capture_frame_body!(capture, data, request, projections, profile, captured)
+    })
+}
+
+// All arithmetic is evaluated only in constants. Overflow or an unsupported
+// pointer width is a compilation error, never a discounted runtime payment.
+const fn retained_sum<const N: usize>(terms: [usize; N]) -> usize {
+    let mut total = 0usize;
+    let mut i = 0;
+    while i < N { total = match total.checked_add(terms[i]) { Some(n) => n, None => panic!("retained source sum overflow") }; i += 1; }
+    total
+}
+const fn retained_mul(a: usize, b: usize) -> usize {
+    match a.checked_mul(b) { Some(n) => n, None => panic!("retained source product overflow") }
+}
+const fn retained_units(bytes: usize) -> u64 {
+    assert!(usize::BITS <= u64::BITS, "retained source size conversion overflow");
+    bytes as u64
+}
+const RETAINED_SOURCE_REGIONS: [usize; 14] = {
+    use std::mem::size_of;
+    type Ready = ReadyCaptureSource<'static, 'static, ProofMeter>;
+    type Map = BTreeMap<String, Values>;
+    const R: usize = size_of::<&()>();
+    const PWORD: usize = size_of::<usize>();
+    const WORDS: usize = retained_mul(8, PWORD);
+    const F: usize = Ready::FACT_BYTES;
+    const O: usize = size_of::<Ready>();
+    const CB: usize = retained_sum([size_of::<RetainedCaptureBody>(), WORDS]);
+    const WB: usize = retained_sum([CB, retained_mul(2, R), size_of::<i32>(), WORDS]);
+    const T: usize = size_of::<RetainedFinish>();
+    const IX: usize = size_of::<super::common_fact_inventory::InventoryTail>();
+    const SX: usize = size_of::<super::owned_resolve::StructuralTail>();
+    const CX: usize = size_of::<CaptureTail>();
+    const P: usize = size_of::<PreparedRetainedCapture>();
+    const K: usize = size_of::<CapturedRetainedCapture>();
+    const L: usize = size_of::<LocalRuntime>();
+    const A: usize = size_of::<CommonFactInventory>();
+    const S: usize = size_of::<OwnedStructuralReport>();
+    const D: usize = size_of::<Digest>();
+    const V: usize = size_of::<VerifiedOwnedPreviewPlan>();
+    const B: usize = size_of::<CommonFactAdmissionReport>();
+    const M: usize = size_of::<Map>();
+    const Q: usize = Ready::FACT_RESULT_BYTES;
+    const Z: usize = size_of::<AdmissionResult<PreparedRetainedCapture>>();
+    const RR: usize = size_of::<AdmissionResult<CapturedRetainedCapture>>();
+    const J: usize = size_of::<AdmissionResult<VerifiedOwnedPreviewPlan>>();
+    const Y: usize = size_of::<AdmissionResult<(Vec<CommonFactCertificate>, Vec<OwnedProjectionRecipe>, Vec<String>)>>();
+    const AS: usize = size_of::<AdmissionResult<OwnedStructuralReport>>();
+    const AA: usize = size_of::<AdmissionResult<CommonFactInventory>>();
+    const AM: usize = size_of::<AdmissionResult<Map>>();
+    const X: usize = LocalRuntime::capture_result_bytes::<Map, StoreError>();
+    [
+        retained_sum([T, CX, WORDS]),
+        retained_sum([retained_mul(4,R), T, CX, RR, WORDS]),
+        retained_sum([retained_mul(4,R), T, CX, IX, D, RR, WORDS]),
+        retained_sum([retained_mul(4,R), IX, CX, SX, RR, WORDS]),
+        retained_sum([retained_mul(2,R), SX, CX, F, Q, P, Z, retained_mul(2,O), RR, WORDS]),
+        retained_sum([SX, R, S, AS, Z, WORDS]),
+        retained_sum([IX, S, R, A, AA, Z, WORDS]),
+        retained_sum([T, A, R, P, Y, Z, L, M, WORDS]),
+        retained_sum([CX, O, P, K, L, retained_mul(2,M), AM, RR, WORDS]),
+        retained_sum([O, retained_mul(3,R), size_of::<&str>(), size_of::<i32>(), retained_mul(2,M), AM, retained_mul(2,CB), WORDS]),
+        retained_sum([retained_mul(2,R), CB, O, size_of::<i32>(), M, X, AM, WORDS]),
+        retained_sum([O, retained_mul(2,R), WB, size_of::<u64>(), F, Ready::OPTIONAL_FACT_BYTES, X, WORDS]),
+        retained_sum([retained_mul(3,R), retained_mul(4,PWORD)]),
+        retained_sum([retained_mul(2,RR), retained_mul(2,Z), retained_mul(2,AM), retained_mul(2,Q), retained_mul(2,X), J, V, B, K, WORDS]),
+    ]
+};
+const RETAINED_SOURCE_HANDOFF_G: u64 = retained_units(retained_sum([
+    retained_mul(4, retained_sum(RETAINED_SOURCE_REGIONS)), retained_mul(14, 128),
+]));
+
+// Fixed, private transport records. Every complete owner/result is in G below.
+pub(super) struct RetainedFinish<'s> {
+    snapshot: &'s ProjectSnapshot,
+    candidate: &'s CapturedProgram,
+    request: &'s OwnedPreviewRequest,
+    accepted: &'s super::owned_lifecycle::AcceptedPreviewLifecycle,
+    lifecycle: &'s OwnedLifecycleV2,
+}
+pub(super) struct PreparedRetainedCapture {
+    inventory: CommonFactInventory,
+    certificates: Vec<CommonFactCertificate>,
+    projections: Vec<OwnedProjectionRecipe>,
+    comparison: Vec<String>,
+    captured: BTreeMap<String, Values>,
+    runtime: LocalRuntime,
+}
+pub(super) struct CapturedRetainedCapture {
+    inventory: CommonFactInventory,
+    certificates: Vec<CommonFactCertificate>,
+    projections: Vec<OwnedProjectionRecipe>,
+    comparison: Vec<String>,
+    captured: BTreeMap<String, Values>,
+}
+pub(super) struct CaptureTail<'s> {
+    snapshot: &'s ProjectSnapshot,
+    request: &'s OwnedPreviewRequest,
+}
+impl RetainedFinish<'_> {
+    pub(super) fn prepare(self, inventory: CommonFactInventory, meter: &mut ProofMeter)
+        -> AdmissionResult<PreparedRetainedCapture>
+    {
+        let Self { snapshot, candidate, request, accepted, lifecycle } = self;
+        meter.charge(32)?;
+        retained_guard_body!(snapshot, candidate, request, lifecycle, accepted, meter);
+        meter.charge(FINISH_PROFILE_FRAME)?;
+        let (certificates, projections, comparison) =
+            super::common_fact_rules::verify(snapshot, candidate, request, &inventory, meter)?;
+        meter.charge(INITIAL_CAPTURE_PROFILE_TRANSPORT)?;
+        // Preserve the original capture prelude's lookup and error position.
+        snapshot.program()?;
+        ContractWork::charge(meter, 13).map_err(capture_resource_error)?;
+        let captured = BTreeMap::new();
+        let runtime = LocalRuntime::with_cancellation(meter.cancelled());
+        Ok(PreparedRetainedCapture { inventory, certificates, projections, comparison, captured, runtime })
+    }
+}
+impl<'s> SourceConsumer<'s, ProofMeter, PreparedRetainedCapture> for CaptureTail<'s> {
+    type Output = CapturedRetainedCapture;
+    type Error = StoreError;
+    fn consume<'g>(self, ready: ReadyCaptureSource<'g, 's, ProofMeter>, prepared: PreparedRetainedCapture)
+        -> AdmissionResult<CapturedRetainedCapture>
+    {
+        let PreparedRetainedCapture { inventory, certificates, projections, comparison, captured, runtime } = prepared;
+        let captured = capture_frame_retained(ready, &runtime, &self.snapshot.data,
+            self.snapshot.clock_day, self.request, &projections, captured)?;
+        Ok(CapturedRetainedCapture { inventory, certificates, projections, comparison, captured })
+    }
+}
+fn authenticate_retained<'s>(snapshot: &'s ProjectSnapshot, candidate: &'s CapturedProgram,
+    request: &'s OwnedPreviewRequest, meter: &mut ProofMeter,
+    finish: RetainedFinish<'s>, consume: CaptureTail<'s>,
+) -> AdmissionResult<CapturedRetainedCapture> {
+    let verify_snapshot = false;
+    authenticate_body!(snapshot, candidate, request, meter, verify_snapshot,
+        super::common_fact_inventory::derive_retained(snapshot, candidate, &request.inventory, meter, finish, consume))
+}
+struct RetainedCaptureBody<'b, 'p> {
+    captured: BTreeMap<String, Values>,
+    data: &'b DataSnapshot,
+    request: &'b OwnedPreviewRequest,
+    projections: &'b [OwnedProjectionRecipe],
+    profile: Option<&'p mut InitialLimitsProfile>,
+}
+fn capture_frame_retained<'g, 's>(ready: ReadyCaptureSource<'g, 's, ProofMeter>, runtime: &LocalRuntime,
+    data: &'s DataSnapshot, day: i32, request: &OwnedPreviewRequest,
+    projections: &[OwnedProjectionRecipe], captured: BTreeMap<String, Values>,
+) -> AdmissionResult<BTreeMap<String, Values>> {
+    let body = RetainedCaptureBody { captured, data, request, projections, profile: None };
+    runtime.with_retained_projection_capture(ready, data, day, move |capture| {
+        let RetainedCaptureBody { mut captured, data, request, projections, mut profile } = body;
+        capture_frame_body!(capture, data, request, projections, profile, captured)
     })
 }
 
@@ -989,3 +1172,6 @@ mod retained_lifecycle_controls;
 
 #[cfg(test)]
 mod capture_row_batch_controls;
+
+#[cfg(test)]
+mod retained_source_controls;

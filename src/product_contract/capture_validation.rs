@@ -19,6 +19,30 @@ pub(crate) struct CaptureValidation<'h, 's, H: ContractWork + ?Sized> {
     frame_valid: bool,
     first_failure: Option<ContractWorkError>,
 }
+// Lexical expansion preserves the ordinary entrance without a new wrapper.
+macro_rules! capture_validation_body {
+    ($program:ident, $data:ident, $host:ident, $body:ident, $facts:expr) => {{
+    let mut context = CaptureValidation {
+        program: $program,
+        data: $data,
+        host: $host,
+        facts: $facts,
+        frame_valid: false,
+        first_failure: None,
+    };
+    let result = $body(&mut context);
+    if let Some(error) = context.first_failure.take() {
+        return Err(E::from(error));
+    }
+    // Caller Err is not a successful native/callback region and receives no poll.
+    let value = result?;
+    context
+        .$host
+        .charge(0)
+        .map_err(|e| E::from(ContractWorkError::Resource(e)))?;
+    Ok(value)
+    }};
+}
 pub(crate) fn with_capture_validation<'s, H, R, E>(
     program: &'s CapturedProgram,
     data: &'s DataSnapshot,
@@ -33,26 +57,67 @@ where
         .map_err(|e| E::from(ContractWorkError::Resource(e)))?;
     host.charge(10 + size_of::<CaptureValidation<'_, '_, H>>() as u64)
         .map_err(|e| E::from(ContractWorkError::Resource(e)))?;
-    let mut context = CaptureValidation {
-        program,
-        data,
-        host,
-        facts: None,
-        frame_valid: false,
-        first_failure: None,
-    };
-    let result = body(&mut context);
-    if let Some(error) = context.first_failure.take() {
-        return Err(E::from(error));
-    }
-    // Caller Err is not a successful native/callback region and receives no poll.
-    let value = result?;
-    context
-        .host
-        .charge(0)
-        .map_err(|e| E::from(ContractWorkError::Resource(e)))?;
-    Ok(value)
+    capture_validation_body!(program, data, host, body, None)
 }
+// Only the closed retained store chain implements these production protocols.
+// The lifetime-generic consumer cannot return the factory's facts/host borrow.
+pub(crate) trait SourcePreparation<H: ContractWork + ?Sized> {
+    type Prepared;
+    type Error: From<ContractError>;
+    fn prepare(self, host: &mut H) -> std::result::Result<Self::Prepared, Self::Error>;
+}
+pub(crate) trait SourceConsumer<'s, H: ContractWork + ?Sized, P> {
+    type Output;
+    type Error;
+    fn consume<'g>(self, ready: ReadyCaptureSource<'g, 's, H>, prepared: P)
+        -> std::result::Result<Self::Output, Self::Error>;
+}
+pub(crate) struct ReadyCaptureSource<'g, 's, H: ContractWork + ?Sized> {
+    source: &'s CapturedProgram,
+    facts: &'g CaptureFacts,
+    host: &'g mut H,
+}
+pub(crate) fn with_ordinary_source_facts<'s, H, P, C>(
+    source: &'s CapturedProgram, host: &mut H, prepare: P, consume: C,
+) -> std::result::Result<C::Output, P::Error>
+where
+    H: ContractWork + ?Sized,
+    P: SourcePreparation<H>,
+    C: SourceConsumer<'s, H, P::Prepared, Error = P::Error>,
+{
+    // Replaces only the original analyzer before.validate() position.
+    let facts = source.validate_audited(Audit::none())?;
+    let prepared = prepare.prepare(host)?;
+    consume.consume(ReadyCaptureSource { source, facts: &facts, host }, prepared)
+}
+impl<'g, 's, H: ContractWork + ?Sized> ReadyCaptureSource<'g, 's, H> {
+    pub(crate) const FACT_BYTES: usize = size_of::<CaptureFacts>();
+    pub(crate) const OPTIONAL_FACT_BYTES: usize = size_of::<Option<CaptureFacts>>();
+    pub(crate) const FACT_RESULT_BYTES: usize = size_of::<Result<CaptureFacts>>();
+    pub(crate) fn source(&self) -> &'s CapturedProgram { self.source }
+    pub(crate) fn into_capture_validation<W, R, E>(
+        self, data: &'s DataSnapshot, entry: u64,
+        wrap: impl FnOnce(&'g mut H) -> W,
+        body: impl for<'v> FnOnce(&mut CaptureValidation<'v, 's, W>) -> std::result::Result<R, E>,
+    ) -> std::result::Result<R, E>
+    where W: ContractWork, E: From<ContractWorkError>,
+    {
+        self.host.charge(entry).map_err(|e| E::from(ContractWorkError::Resource(e)))?;
+        let mut wrapped = wrap(self.host);
+        let host = &mut wrapped;
+        host.charge(0).map_err(|e| E::from(ContractWorkError::Resource(e)))?;
+        host.charge(10 + size_of::<CaptureValidation<'_, '_, W>>() as u64)
+            .map_err(|e| E::from(ContractWorkError::Resource(e)))?;
+        let program = self.source;
+        capture_validation_body!(program, data, host, body, Some(CaptureFacts {
+            total_nodes: self.facts.total_nodes,
+            action_prefix_nodes: self.facts.action_prefix_nodes,
+            canonical_len: self.facts.canonical_len,
+            action_count: self.facts.action_count,
+        }))
+    }
+}
+
 struct Forward<'h, H: ?Sized>(&'h mut H);
 impl<H: ContractWork + ?Sized> ContractWork for Forward<'_, H> {
     fn charge(&mut self, n: u64) -> std::result::Result<(), WorkFailure> {

@@ -1415,8 +1415,8 @@ fn assert_initial_owned_source_guards(sources: [&str; 5]) {
     let admission = initial_owned_guard_text(sources[3]);
     let meter = admission.split("pub(crate) struct ProofMeter {").nth(1).unwrap().split("impl ProofMeter").next().unwrap();
     assert!(!meter.contains("profile"));
-    assert!(admission.contains("row.charge_host(256)?;\n                        profile.observe_paid(row.actual_limits(), true)"));
-    assert_eq!(admission.matches("meter.charge(INITIAL_CAPTURE_PROFILE_TRANSPORT)?").count(), 2);
+    assert!(admission.contains("row.charge_host(256)?;\n                        $profile.observe_paid(row.actual_limits(), true)"));
+    assert_eq!(admission.matches("meter.charge(INITIAL_CAPTURE_PROFILE_TRANSPORT)?").count(), 3);
     assert!(admission.contains("units: 10_000_000"));
     assert!(admission.contains("elapsed_millis: 60_000"));
     let lifecycle = initial_owned_guard_text(sources[4]);
@@ -1438,6 +1438,17 @@ fn initial_owned_source_guards_accept_line_endings_and_reject_mutations() {
         changed[0] = changed[0].replacen("struct CompletedInitialOwnedFacts", "struct UncompletedInitialOwnedFacts", 1);
         assert_ne!(changed[0], texts[0]);
         assert!(std::panic::catch_unwind(|| assert_initial_owned_source_guards(changed.each_ref().map(String::as_str))).is_err());
+        for (from, to) in [
+            ("row.charge_host(256)?;", "row.charge_host(255)?;"),
+            ("$profile.observe_paid(row.actual_limits(), true)", "$profile.observe_paid(row.actual_limits(), false)"),
+            ("meter.charge(INITIAL_CAPTURE_PROFILE_TRANSPORT)?", "meter.charge(0)?"),
+            ("meter.charge(INITIAL_CAPTURE_PROFILE_TRANSPORT)?", "meter.charge(INITIAL_CAPTURE_PROFILE_TRANSPORT)?; meter.charge(INITIAL_CAPTURE_PROFILE_TRANSPORT)?"),
+        ] {
+            let mut changed = texts.clone();
+            changed[3] = changed[3].replacen(from, to, 1);
+            assert_ne!(changed[3], texts[3]);
+            assert!(std::panic::catch_unwind(|| assert_initial_owned_source_guards(changed.each_ref().map(String::as_str))).is_err());
+        }
         for changed in [sample.replace("exact", "other"), sample.replace("    ", "   "), sample.replace("é", "e")] {
             assert_ne!(initial_owned_guard_text(&changed.replace('\n', newline)), sample);
         }
