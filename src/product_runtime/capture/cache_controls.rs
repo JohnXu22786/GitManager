@@ -35,15 +35,16 @@ fn complete_key(reference:&RecordRef,binding:&str,limits:&RuntimeLimits)->Vec<u8
 }
 
 // Observe only completed expressions and count only newly retained real keys.
-fn observe_publication(cache:&BTreeSet<Vec<u8>>,bytes:usize,key:Vec<u8>,
+fn observe_publication(cache:&[Box<capture_key::OwnedCaptureKey>],bytes:usize,key:Vec<u8>,
     successful:&mut BTreeSet<Vec<u8>>,publications:&mut usize)
 {
+    let cache=cache_oracle(cache);
     if !successful.contains(&key) && cache.contains(&key) {
         assert_eq!(bytes,successful.iter().map(Vec::len).sum::<usize>()+key.len());
         successful.insert(key);
         *publications+=1;
     }
-    assert_eq!(cache,&*successful);
+    assert_eq!(cache,*successful);
     assert_eq!(bytes,successful.iter().map(Vec::len).sum::<usize>());
     assert!(cache.len()<=MAX_ITEMS);
     assert!(bytes<=MAX_WIRE_BYTES);
@@ -71,7 +72,7 @@ fn capture_row_real_workload_refuses_without_failed_publication() {
             // The original twelve 24-expression rows and final retained-hit tail
             // remain requested work. Stop at the first refusal; no tail credit.
             for row_index in 0..=12 {
-                let retained=if row_index==12 {Some(capture.cache.clone())}else{None};
+                let retained=if row_index==12 {Some(cache_oracle(&capture.cache))}else{None};
                 let mut row_entered=false;
                 attempted_row=Some(row_index);
                 attempted_evaluate=None;
@@ -87,7 +88,7 @@ fn capture_row_real_workload_refuses_without_failed_publication() {
                             let binding=if row_index==12 {"bind_0".into()}else{
                                 format!("bind_{}",row_index*24+column)};
                             let key=complete_key(&reference,&binding,&row.evaluator.meter.limits);
-                            let before_cache=row.capture.cache.clone();
+                            let before_cache=cache_oracle(&row.capture.cache);
                             let before_bytes=row.capture.cache_bytes;
                             let before=row.snapshot_for_test();
                             attempted_evaluate=Some((row_index,binding.clone()));
@@ -101,15 +102,15 @@ fn capture_row_real_workload_refuses_without_failed_publication() {
                                         let after=row.snapshot_for_test();
                                         assert!(after.3<before.3);
                                         assert_eq!(after.4,before.4+31);
-                                        assert_eq!(row.capture.cache,before_cache);
+                                        assert_eq!(cache_oracle(&row.capture.cache),before_cache);
                                         assert_eq!(row.capture.cache_bytes,before_bytes);
                                     }
                                 }
                                 Err(error)=>{
                                     caught_evaluate=Some(error.clone());
-                                    assert_eq!(row.capture.cache,before_cache);
+                                    assert_eq!(cache_oracle(&row.capture.cache),before_cache);
                                     assert_eq!(row.capture.cache_bytes,before_bytes);
-                                    assert_eq!(row.capture.cache,successful);
+                                    assert_eq!(cache_oracle(&row.capture.cache),successful);
                                     return Err(error); // propagate immediately through the row
                                 }
                             }
@@ -121,13 +122,13 @@ fn capture_row_real_workload_refuses_without_failed_publication() {
                     failed_row_entered=Some(row_entered);
                     // A first-expression refusal can precede callback entry.
                     // Use the actual successful ledger; invent no absent row key.
-                    assert_eq!(capture.cache,successful);
+                    assert_eq!(cache_oracle(&capture.cache),successful);
                     assert_eq!(capture.cache_bytes,successful.iter().map(Vec::len).sum::<usize>());
                     assert!(capture.cache.len()<=MAX_ITEMS);
                     assert!(capture.cache_bytes<=MAX_WIRE_BYTES);
                     return Ok(()); // sole swallowed refusal: sticky capture must still fail
                 }
-                if let Some(retained)=retained {assert_eq!(capture.cache,retained);}
+                if let Some(retained)=retained {assert_eq!(cache_oracle(&capture.cache),retained);}
             }
             Ok(())
         });
@@ -161,15 +162,15 @@ fn capture_row_retained_hit_across_real_rows_spends_fresh_fuel_and_output() {
                 assert_eq!(first,DataValue::Boolean{value:true});
                 expected.insert(complete_key(&reference,"record",&row.evaluator.meter.limits));
                 let key=complete_key(&reference,"bind_0",&row.evaluator.meter.limits);
-                assert!(!row.capture.cache.contains(&key));
+                assert!(!cache_oracle(&row.capture.cache).contains(&key));
                 assert_eq!(row.evaluate("bind_0",&yes(),&Type::Boolean)?,DataValue::Boolean{value:true});
-                assert!(row.capture.cache.contains(&key));
+                assert!(cache_oracle(&row.capture.cache).contains(&key));
                 expected.insert(key.clone());
                 retained_key=Some(key);
                 Ok::<(),AdapterError>(())
             })?;
             completed_rows+=1;
-            assert_eq!(capture.cache,expected);
+            assert_eq!(cache_oracle(&capture.cache),expected);
             assert_eq!(capture.cache_bytes,expected.iter().map(Vec::len).sum::<usize>());
             let retained_key=retained_key.unwrap();
             capture.with_row(&reference,"record",&yes(),&Type::Boolean, |row,first| {
@@ -177,9 +178,9 @@ fn capture_row_retained_hit_across_real_rows_spends_fresh_fuel_and_output() {
                 assert_eq!(first,DataValue::Boolean{value:true});
                 let key=complete_key(&reference,"bind_0",&row.evaluator.meter.limits);
                 assert_eq!(key,retained_key);
-                assert!(row.capture.cache.contains(&key));
-                assert_eq!(row.capture.cache,expected);
-                let before_cache=row.capture.cache.clone();
+                assert!(cache_oracle(&row.capture.cache).contains(&key));
+                assert_eq!(cache_oracle(&row.capture.cache),expected);
+                let before_cache=cache_oracle(&row.capture.cache);
                 let before_bytes=row.capture.cache_bytes;
                 let before=row.snapshot_for_test();
                 assert_eq!(before.4,31);
@@ -188,12 +189,12 @@ fn capture_row_retained_hit_across_real_rows_spends_fresh_fuel_and_output() {
                 let after=row.snapshot_for_test();
                 assert!(after.3<before.3);
                 assert_eq!(after.4,before.4+31);
-                assert_eq!(row.capture.cache,before_cache);
+                assert_eq!(cache_oracle(&row.capture.cache),before_cache);
                 assert_eq!(row.capture.cache_bytes,before_bytes);
                 Ok::<(),AdapterError>(())
             })?;
             completed_rows+=1;
-            assert_eq!(capture.cache,expected);
+            assert_eq!(cache_oracle(&capture.cache),expected);
             assert_eq!(capture.cache_bytes,expected.iter().map(Vec::len).sum::<usize>());
             Ok(())
         });
@@ -209,11 +210,11 @@ fn capture_publisher_isolated_entry_cap_preserves_retained_keys() {
     // Direct publication proves admission mechanics only, not validation,
     // evaluation, key-construction affordability or whole-route saturation.
     let mut keys:Vec<_>=(0..=MAX_ITEMS).map(|i|
-        complete_key(&reference,&format!("bind_{}",i),&RuntimeLimits::default())).collect();
+        fixture_key(&reference,&format!("bind_{}",i),&RuntimeLimits::default())).collect();
     let not_admitted=keys.pop().unwrap();
-    let expected:BTreeSet<_>=keys.iter().cloned().collect();
+    let expected:BTreeSet<_>=keys.iter().map(capture_key::bytes_for_test).collect();
     assert_eq!(expected.len(),MAX_ITEMS);
-    assert!(!expected.contains(&not_admitted));
+    assert!(!expected.contains(&capture_key::bytes_for_test(&not_admitted)));
     let bytes=expected.iter().map(Vec::len).sum::<usize>();
     assert!(bytes<=MAX_WIRE_BYTES); // invariant only; the byte boundary is not reached
     let mut host=TestHost::new();
@@ -222,15 +223,58 @@ fn capture_publisher_isolated_entry_cap_preserves_retained_keys() {
             assert!(capture.cache.is_empty());
             assert_eq!(capture.cache_bytes,0);
             for key in keys {capture.publish(Some(key))?;}
-            assert_eq!(capture.cache,expected);
+            assert_eq!(cache_oracle(&capture.cache),expected);
             assert_eq!(capture.cache_bytes,bytes);
             capture.publish(Some(not_admitted))?;
-            assert_eq!(capture.cache,expected);
+            assert_eq!(cache_oracle(&capture.cache),expected);
             assert_eq!(capture.cache_bytes,bytes);
             capture.publish(None)?; // actual hit preparation uses None, not duplicate Some
-            assert_eq!(capture.cache,expected);
+            assert_eq!(cache_oracle(&capture.cache),expected);
             assert_eq!(capture.cache_bytes,bytes);
             Ok(()) // no row/evaluation or authority-bearing value leaves this scope
         });
     assert_eq!(result,Ok(()));
+}
+
+// Unmetered test observation is never used to decide production identity.
+fn cache_oracle(cache:&[Box<capture_key::OwnedCaptureKey>])->BTreeSet<Vec<u8>>{
+    cache.iter().map(|key|capture_key::bytes_for_test(key)).collect()
+}
+struct FixtureWork;
+impl ContractWork for FixtureWork {
+    fn charge(&mut self,_:u64)->std::result::Result<(),WorkFailure>{Ok(())}
+}
+fn fixture_key(reference:&RecordRef,binding:&str,limits:&RuntimeLimits)->capture_key::OwnedCaptureKey{
+    capture_key::key(&reference.entity,binding,&yes(),&Type::Boolean,limits,&mut FixtureWork).unwrap().unwrap()
+}
+#[test]
+fn capture_typed_cache_two_different_records_are_fresh_and_new_capture_is_empty(){
+    let (program,mut data,first)=prepared();
+    let mut record=data.records[0].clone();record.id="r1".into();record.values.insert("name".into(),DataValue::Text{value:"Grace".into()});data.records.push(record);
+    let second=RecordRef{entity:first.entity.clone(),record:"r1".into()};
+    let expression=Expr::Field{record:Box::new(Expr::Variable{name:"record".into()}),field:"name".into()};
+    for _ in 0..2 {
+        let mut host=TestHost::new();let mut completed=0;
+        let result:std::result::Result<(),AdapterError>=LocalRuntime::default().with_projection_capture(&program,&data,20000,&mut host,|capture|{
+            assert!(capture.cache.is_empty());assert_eq!(capture.cache_bytes,0);
+            let mut retained=None;
+            for (reference,name) in [(&first,"Ada"),(&second,"Grace")]{
+                capture.with_row(reference,"record",&expression,&Type::Text,|row,value|{
+                    assert_eq!(value,DataValue::Text{value:name.into()});let before=row.snapshot_for_test();assert!(before.3<100_000);assert!(before.4>0);
+                    let keys=cache_oracle(&row.capture.cache);assert_eq!(keys.len(),1);if let Some(old)=&retained{assert_eq!(&keys,old)}else{retained=Some(keys)}
+                    assert_eq!(row.evaluate("record",&expression,&Type::Text)?,DataValue::Text{value:name.into()});let after=row.snapshot_for_test();assert!(after.3<before.3);assert_eq!(after.4,2*before.4);completed+=1;Ok::<_,AdapterError>(())
+                })?;
+            }Ok(())
+        });assert_eq!(result,Ok(()));assert_eq!(completed,2);
+    }
+}
+#[test]
+fn capture_typed_shape_rejection_still_enters_normal_validation(){
+    let (program,data,reference)=prepared();let mut host=TestHost::new();
+    let expression=Expr::Variable{name:"x".repeat(MAX_TEXT_BYTES+1)};
+    let old=LocalRuntime::default().evaluate_record_projection(&program,&data,&reference,"record",&expression,&Type::Text,20000);
+    assert!(old.is_err());
+    let result:std::result::Result<DataValue,AdapterError>=LocalRuntime::default().with_projection_capture(&program,&data,20000,&mut host,|capture|{
+        let result=capture.with_row(&reference,"record",&expression,&Type::Text,|_,value|Ok(value));assert!(capture.cache.is_empty());assert_eq!(capture.cache_bytes,0);result
+    });assert_eq!(result,old);
 }

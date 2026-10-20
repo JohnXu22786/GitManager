@@ -107,7 +107,7 @@ pub(crate) struct ProjectionCapture<'c,'v,'a,'s,H:ProjectionHost+?Sized>{
     program:&'s CapturedProgram,
     data:&'s DataSnapshot,
     day:i32,
-    cache:BTreeSet<Vec<u8>>,
+    cache:Vec<Box<capture_key::OwnedCaptureKey>>,
     cache_bytes:usize,
     first_failure:Option<AdapterError>,
 }
@@ -120,7 +120,7 @@ impl LocalRuntime{
             .map_err(|error|E::from(cost::resource(error)))?;
         let mut host=CaptureHost{host,active_row_deadline:None,first_failure:None};
         let result=with_capture_validation(program,data,&mut host,|validation|{
-            let mut capture=ProjectionCapture{validation,program,data,day,cache:BTreeSet::new(),cache_bytes:0,first_failure:None};
+            let mut capture=ProjectionCapture{validation,program,data,day,cache:Vec::new(),cache_bytes:0,first_failure:None};
             let result=body(&mut capture);
             if let Some(error)=capture.first_failure.take(){return Err(ScopeExit::Caller(E::from(error)))}
             // Source owns its first error; an unrelated caller E passes through.
@@ -140,7 +140,7 @@ impl<'c,'v,'a,'s,H:ProjectionHost+?Sized> ProjectionCapture<'c,'v,'a,'s,H>{
         // The outer136 reserve buys one owner, never a swallowed retry/clone.
         self.validation.with_host(|host|host.charge(units)).map_err(cost::resource)
     }
-    fn prepare(&mut self,reference:&RecordRef,binding:&str,expression:&Expr,expected:&Type,limits:&RuntimeLimits)->std::result::Result<Option<Vec<u8>>,StepError>{
+    fn prepare(&mut self,reference:&RecordRef,binding:&str,expression:&Expr,expected:&Type,limits:&RuntimeLimits)->std::result::Result<Option<capture_key::OwnedCaptureKey>,StepError>{
         self.validation.with_host(|work|->Result<()>{
             cost::pay(work,5)?;validate_day(self.day)?;
             cost::pay(work,28)?;limits.validate()?;
@@ -157,23 +157,21 @@ impl<'c,'v,'a,'s,H:ProjectionHost+?Sized> ProjectionCapture<'c,'v,'a,'s,H>{
         })?;
         let key=self.validation.with_host(|work|capture_key::key(&reference.entity,binding,expression,expected,limits,work))?;
         let cached=if let Some(key)=&key{
-            self.validation.with_host(|work|cost::search(self.cache.len(),key.len(),work))?;
-            self.cache.contains(key)
+            self.validation.with_host(|work|{
+                cost::pay(work,capture_key::SEARCH_FRAME)?;
+                Ok::<_,AdapterError>(capture_key::search(&self.cache,key,work)?.is_ok())
+            })?
         }else{false};
         if !cached{self.validation.validate_extension(&reference.entity,binding,expression).map_err(StepError::source)?;}
         Ok(if cached{None}else{key})
     }
-    fn publish(&mut self,key:Option<Vec<u8>>)->Result<()>{
-        let Some(key)=key else{return Ok(())};
-        self.validation.with_host(|work|cost::pay(work,4))?;
-        if self.cache.len()<MAX_ITEMS{
-            let bytes=self.cache_bytes.checked_add(key.len()).ok_or_else(cost::overflow)?;
-            if bytes<=MAX_WIRE_BYTES{
-                self.validation.with_host(|work|cost::insert::<Vec<u8>,()>(self.cache.len(),key.len(),work))?;
-                self.cache.insert(key);self.cache_bytes=bytes;
-            }
-        }Ok(())
+    fn publish(&mut self,key:Option<capture_key::OwnedCaptureKey>)->Result<()>{
+        self.validation.with_host(|work|{
+            cost::pay(work,capture_key::PUBLISH_FRAME)?;
+            capture_key::publish(&mut self.cache,&mut self.cache_bytes,key,work)
+        })
     }
+
     pub(crate) fn with_row<R,E>(&mut self,reference:&RecordRef,first_binding:&str,first_expression:&Expr,first_expected:&Type,
         body:impl for<'r> FnOnce(&mut ProjectionRow<'r,'c,'v,'a,'s,H>,DataValue)->std::result::Result<R,E>)->std::result::Result<R,E>
     where E:From<AdapterError>{
@@ -182,6 +180,9 @@ impl<'c,'v,'a,'s,H:ProjectionHost+?Sized> ProjectionCapture<'c,'v,'a,'s,H>{
             let mut meter=Meter::from_reservation(reservation,ProjectionRow::<H>::HEADER).map_err(E::from)?;
             self.validation.with_host(|host|host.active_row_deadline=Some(meter.row.as_ref().expect("row reservation").row_deadline));
             self.validation.ensure_source_and_data().map_err(|error|E::from(cost::contract(error)))?;
+            // Fund enlarged owned-key/Option/result slots before prepare, even
+            // when an unchanged pre-key guard refuses before key construction.
+            self.validation.with_host(|work|cost::pay(work,capture_key::KEY_FRAME)).map_err(E::from)?;
             let key=match self.prepare(reference,first_binding,first_expression,first_expected,&meter.limits){
                 Ok(key)=>key,
                 Err(StepError::Source(error))=>return Err(E::from(error)),
@@ -230,7 +231,7 @@ impl<H:ProjectionHost+?Sized> ProjectionRow<'_,'_,'_,'_,'_,H>{
         cost::pay(self.evaluator.meter,cost::number(bytes)?)?;
         cost::pay(self.evaluator.meter,1)?;self.output_bytes=total;Ok(())
     }
-    fn finish_expression(&mut self,binding:&str,expression:&Expr,expected:&Type,key:Option<Vec<u8>>)->Result<DataValue>{
+    fn finish_expression(&mut self,binding:&str,expression:&Expr,expected:&Type,key:Option<capture_key::OwnedCaptureKey>)->Result<DataValue>{
         cost::pay(self.evaluator.meter,8)?;let mut env=Env::new();
         let typ=cost::reference_type(&self.reference.entity,self.evaluator.meter)?;
         let value=cost::reference(&self.reference.entity,&self.reference.record,self.evaluator.meter)?;
@@ -244,6 +245,8 @@ impl<H:ProjectionHost+?Sized> ProjectionRow<'_,'_,'_,'_,'_,H>{
         Ok(value)
     }
     pub(crate) fn evaluate(&mut self,binding:&str,expression:&Expr,expected:&Type)->Result<DataValue>{
+        let entry=self.capture.validation.with_host(|work|cost::pay(work,capture_key::KEY_FRAME));
+        self.remember(entry)?;
         let key=match self.capture.prepare(self.reference,binding,expression,expected,&self.evaluator.meter.limits){
             Ok(key)=>key,
             // The source context already owns the only retained semantic B.
