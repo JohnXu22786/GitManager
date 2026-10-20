@@ -215,6 +215,9 @@ pub(crate) struct ProjectionRow<'r,'c,'v,'a,'s,H:ProjectionHost+?Sized>{
 }
 impl<H:ProjectionHost+?Sized> ProjectionRow<'_,'_,'_,'_,'_,H>{
     const HEADER:u64=16+size_of::<Meter>() as u64+size_of::<RowStop>() as u64+size_of::<Self>() as u64;
+    // Immutable readout of this actually reserved/executing row. It cannot
+    // create a reservation, extend a deadline, or transfer runtime authority.
+    pub(crate) fn actual_limits(&self)->&RuntimeLimits { &self.evaluator.meter.limits }
     fn remember<T>(&mut self,result:Result<T>)->Result<T>{
         if let Err(error)=&result{if self.first_failure.is_none(){self.first_failure=Some(RowFailure::Local(error.clone()))}}
         result

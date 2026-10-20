@@ -185,6 +185,24 @@ impl ProductStore {
         &self, proof: &VerifiedOwnedPreviewPlan,
     ) {
         assert_eq!(self.load().unwrap(), proof.snapshot);
+        // The new optional-owner/closure envelope is purchased before even
+        // first-row reservation setup, including the ordinary None path.
+        for available in [495, 496] {
+            let mut host = ProofMeter::new(ProofBudget { units: available + 1, elapsed_millis: 60_000 },
+                Arc::new(AtomicBool::new(false))).unwrap();
+            reset_validation_counts();
+            let result = super::capture_frame_batched(proof.snapshot.program().unwrap(),
+                &proof.snapshot.data, proof.snapshot.clock_day, &proof.request,
+                &proof.report.projections, &mut host);
+            if available == 495 {
+                assert_error(result, &refuse("budget", "cumulative proof/initialization budget exhausted"));
+                assert_eq!(host.remaining_units_for_test(), 495);
+            } else {
+                assert_error(result, &StoreError::Runtime(AdapterError::BudgetExhausted(FUEL.into())));
+                assert_eq!(host.remaining_units_for_test(), 0);
+            }
+            assert_eq!(validation_counts(), ValidationCounts::default());
+        }
         let header = 40 + u64::try_from(std::mem::size_of::<ProjectionReservation>()).unwrap();
         for extra in [0, 1, 2] {
             // ProofMeter::new consumes1. The real header precedes the unchanged100k reserve.

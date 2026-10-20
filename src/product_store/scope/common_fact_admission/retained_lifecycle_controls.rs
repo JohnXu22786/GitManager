@@ -3,10 +3,17 @@
 use super::*;
 use std::time::Duration;
 
-const VERIFY_UNITS: u64 = 600_002;
+// Frozen original verification plus the new positively paid None-profile path:
+// full verify frame384 + replay root(4*(56+48+64+32)) + dispatch32 + ten branch2.
+const OLD_VERIFY_UNITS: u64 = 600_002;
+const PROFILE_VERIFY_UNITS: u64 = 384 + 800 + 32 + 20;
+const VERIFY_UNITS: u64 = OLD_VERIFY_UNITS + PROFILE_VERIFY_UNITS;
+// The frozen reference calls capture_frame directly; the new private suffix
+// adds its complete native-sized wrapper envelope. Keep it separate from verification credit.
+const SUFFIX_TRANSPORT_UNITS: u64 = FINISH_PROFILE_FRAME;
 const GUARD_UNITS: u64 = 32;
 const SELECTED_HANDOFF_UNITS: u64 = 5;
-const SAVED_UNITS: u64 = 599_965;
+const SAVED_UNITS: u64 = 599_965 + PROFILE_VERIFY_UNITS - SUFFIX_TRANSPORT_UNITS;
 const EXHAUSTED: &str =
     "Common factual admission: budget: cumulative proof/initialization budget exhausted";
 const CANCELLED: &str =
@@ -148,8 +155,8 @@ impl ProductStore {
             assert_eq!(old.candidate, *candidate);
             assert_eq!(old.request, *request);
             assert_eq!(old.accepted.recipe(), lifecycle);
-            assert_eq!(new_meter.remaining_units_for_test() + 2, old_meter.remaining_units_for_test());
-            assert_eq!(start - new_meter.remaining_units_for_test(), start - old_meter.remaining_units_for_test() + 2);
+            assert_eq!(new_meter.remaining_units_for_test() + 2 + SUFFIX_TRANSPORT_UNITS, old_meter.remaining_units_for_test());
+            assert_eq!(start - new_meter.remaining_units_for_test(), start - old_meter.remaining_units_for_test() + 2 + SUFFIX_TRANSPORT_UNITS);
         } else {
             let (old_accepted, old): (AcceptedPreviewLifecycle, VerifiedOwnedPreviewPlan) =
                 old_selected(&snapshot, candidate, request, &lifecycle, &mut old_meter).unwrap();
@@ -203,10 +210,10 @@ impl ProductStore {
                 assert_eq!(new_left, old_left + SAVED_UNITS);
                 assert_eq!(start - new_left, (start - old_left) - SAVED_UNITS);
             } else {
-                // Includes the unchanged 600002 verification plus the identical
-                // suffix: only guard32 + selected handoff5 are extra versus old.
-                assert_eq!(new_left + GUARD_UNITS + SELECTED_HANDOFF_UNITS, old_left);
-                assert_eq!(start - new_left, start - old_left + 37);
+                // Full verification remains on both sides. The new guard32,
+                // handoff5 and complete private suffix transport are positively paid.
+                assert_eq!(new_left + GUARD_UNITS + SELECTED_HANDOFF_UNITS + SUFFIX_TRANSPORT_UNITS, old_left);
+                assert_eq!(start - new_left, start - old_left + 37 + SUFFIX_TRANSPORT_UNITS);
             }
         }
         assert_eq!((snapshot, candidate.clone(), request.clone(), accepted.recipe()), inputs);
@@ -392,13 +399,13 @@ impl ProductStore {
         let lifecycle = accepted.recipe();
         let inputs = (snapshot.clone(), candidate.clone(), request.clone(), lifecycle.clone());
         assert_defaults(&lifecycle);
-        // new() charge1, first verify600002, and authenticate's exact byte charge.
+        // new() charge1, complete first verification and exact authentication bytes.
         let authentication = (candidate.source_bytes.len() + snapshot.program().unwrap().source_bytes.len()) as u64;
         let prefix = 1 + VERIFY_UNITS + authentication;
         match case {
             "first-replay-fuel" | "guard-fuel" | "handoff-fuel" => {
                 let (units, left) = match case {
-                    "first-replay-fuel" => (100_000, 99_999),
+                    "first-replay-fuel" => (100_000, 99_999 - 384 - 800 - 32),
                     "guard-fuel" => (prefix + GUARD_UNITS - 1, GUARD_UNITS - 1),
                     _ => (prefix + GUARD_UNITS + SELECTED_HANDOFF_UNITS - 1, SELECTED_HANDOFF_UNITS - 1),
                 };
@@ -561,4 +568,96 @@ fn frozen_derive_inner_before_retained_reuse(
         report,
         captured,
     })
+}
+
+#[test]
+fn initial_owned_limits_profile_checks_every_field_and_original_window() {
+    for field in ["full", "fuel", "collection_items", "action_steps", "transaction_writes", "output_bytes", "elapsed_millis"] {
+        let mut meter = meter();
+        let mut profile = InitialLimitsProfile::new(&mut meter).unwrap();
+        for index in 0..6 {
+            let mut limits = RuntimeLimits::default();
+            if index == 3 {
+                match field {
+                    "full" => (),
+                    "fuel" => limits.fuel -= 1,
+                    "collection_items" => limits.collection_items -= 1,
+                    "action_steps" => limits.action_steps -= 1,
+                    "transaction_writes" => limits.transaction_writes -= 1,
+                    "output_bytes" => limits.output_bytes -= 1,
+                    "elapsed_millis" => limits.elapsed_millis -= 1,
+                    _ => unreachable!(),
+                }
+            }
+            profile.observe(&limits, false, &mut meter).unwrap();
+        }
+        for _ in 0..2 { profile.observe(&RuntimeLimits::default(), true, &mut meter).unwrap(); }
+        assert_eq!(profile.eligible(&mut meter).unwrap(), field == "full");
+        meter.started = Instant::now() - Duration::from_millis(55_001);
+        assert!(!profile.eligible(&mut meter).unwrap());
+        meter.cancelled.store(true, Ordering::Relaxed);
+        assert_invalid(profile.eligible(&mut meter), CANCELLED);
+    }
+    let mut meter = meter();
+    let mut partial = InitialLimitsProfile::new(&mut meter).unwrap();
+    for _ in 0..5 { partial.observe(&RuntimeLimits::default(), false, &mut meter).unwrap(); }
+    for _ in 0..2 { partial.observe(&RuntimeLimits::default(), true, &mut meter).unwrap(); }
+    assert!(!partial.eligible(&mut meter).unwrap());
+}
+
+#[test]
+fn initial_owned_limits_profile_packets_refuse_before_state_changes() {
+    let root = InitialLimitsProfile::ROOT as u64 + 64;
+    assert_eq!(INITIAL_CAPTURE_PROFILE_TRANSPORT, 496);
+    assert_eq!(AcceptedPreviewLifecycle::PROFILE_VERIFY_FRAME, 384);
+    eprintln!("initial frames finish={} inventory={} capture={} verify={}", FINISH_PROFILE_FRAME,
+        std::mem::size_of::<CommonFactInventory>(), INITIAL_CAPTURE_PROFILE_TRANSPORT,
+        AcceptedPreviewLifecycle::PROFILE_VERIFY_FRAME);
+    // Concrete native widths, not an inferred native traversal credit.
+    assert_eq!(std::mem::size_of::<InitialLimitsProfile>(), 24);
+    assert_eq!(std::mem::size_of::<RuntimeLimits>(), 48);
+    eprintln!("initial profile root={} result_width={}", root,
+        std::mem::size_of::<AdmissionResult<()>>());
+    for (packet, operation) in [(root, 0), (256, 1), (64, 2)] {
+        for exact in [false, true] {
+            let mut m = meter();
+            let mut p = InitialLimitsProfile::new(&mut m).unwrap();
+            let available = packet - u64::from(!exact);
+            m.charge(m.remaining_units_for_test() - available).unwrap();
+            let before = p.counts_for_test();
+            let result = match operation {
+                0 => InitialLimitsProfile::new(&mut m).map(|_| ()),
+                1 => p.observe(&RuntimeLimits::default(), false, &mut m),
+                _ => p.eligible(&mut m).map(|_| ()),
+            };
+            if exact { result.unwrap(); assert_eq!(m.remaining_units_for_test(), 0); }
+            else {
+                assert_invalid(result, EXHAUSTED);
+                assert_eq!(p.counts_for_test(), before);
+                assert_eq!(m.remaining_units_for_test(), available);
+            }
+        }
+    }
+    for row in [false, true] {
+        let mut m = meter(); let mut p = InitialLimitsProfile::new(&mut m).unwrap();
+        if row { p.rows = u64::MAX; } else { p.lifecycle = u64::MAX; }
+        let before = p.counts_for_test(); let left = m.remaining_units_for_test();
+        assert!(p.observe(&RuntimeLimits::default(), row, &mut m).is_err());
+        assert_eq!(p.counts_for_test(), before);
+        assert_eq!(left - m.remaining_units_for_test(), 256);
+    }
+    for secondary in [false, true] {
+        let mut m = meter(); let mut p = InitialLimitsProfile::new(&mut m).unwrap();
+        let other = Arc::new(AtomicBool::new(false)); m.watch_cancellation(&other);
+        m.charge(m.remaining_units_for_test()).unwrap();
+        if secondary { other.store(true, Ordering::Relaxed); }
+        else { m.cancelled.store(true, Ordering::Relaxed); }
+        assert_invalid(p.observe(&RuntimeLimits::default(), false, &mut m), CANCELLED);
+        assert_invalid(p.eligible(&mut m), CANCELLED);
+        assert_eq!(p.counts_for_test(), (0, 0, true));
+    }
+    let mut m = meter(); let p = InitialLimitsProfile::new(&mut m).unwrap();
+    m.charge(m.remaining_units_for_test()).unwrap();
+    m.started = Instant::now() - Duration::from_millis(60_001);
+    assert_invalid(p.eligible(&mut m), CANCELLED);
 }

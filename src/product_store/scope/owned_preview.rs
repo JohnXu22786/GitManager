@@ -826,4 +826,266 @@ impl PreparedOwnedPreview {
             receipt,
         })
     }
+    // Private ownership constructor for only the closed completed-D1 route.
+    // Ordinary retained construction above keeps its original body and owners.
+    fn from_retained_arc(
+        proof: Arc<VerifiedOwnedPreviewPlan>,
+        target: CapturedProgram,
+        metadata: Metadata,
+        initialized: DataSnapshot,
+    ) -> Result<Self> {
+        let receipt = OwnedPreviewReceipt {
+            basis: proof.report.snapshot.clone(),
+            compiler: metadata.identity.clone(),
+            target: revision(&target)?,
+            original_data: proof.snapshot.data.identity()?,
+            initialized_data: initialized.identity()?,
+            session: proof.snapshot.session.identity()?,
+            decisions: proof.snapshot.decisions.identity()?,
+            day: proof.snapshot.clock_day,
+            random_seed: 0,
+            runtime: RUNTIME_VERSION.into(),
+            driver: DRIVER_VERSION.into(),
+            availability: proof.request.availability.clone(),
+            outcome_comparison: proof.report.outcome_comparison.clone(),
+        };
+        Ok(Self {
+            proof,
+            target,
+            metadata,
+            initialized,
+            receipt,
+        })
+    }
+}
+
+// One closed producer/consumer on the caller's original lexical meter. No
+// caller-supplied proof, prior preview, profile or Boolean can enter this route.
+// The extra composition call exists even when D1 validation/authentication
+// refuses. Buy its five thin refs, fat operation ref and return-place/status,
+// alignment/cleanup words before any D1 work. No later marker credit is used.
+const INITIAL_OWNED_ENTRY: u64 = 4 * (5 * std::mem::size_of::<&()>()
+    + std::mem::size_of::<&str>() + 4 * std::mem::size_of::<usize>()) as u64 + 64;
+pub(super) fn initial_owned_recipe(
+    current: &ProjectSnapshot,
+    candidate: &CapturedProgram,
+    request: &OwnedPreviewRequest,
+    accepted: &AcceptedPreviewLifecycle,
+    operation: &str,
+    meter: &mut ProofMeter,
+) -> Result<(OwnedLayerV2, OwnedCompositionV2, OwnedInitializationV2, PreparedOwnedPreview, CompatibilityReport)> {
+    struct CompletedInitialOwnedFacts {
+        proof: VerifiedOwnedPreviewPlan,
+        profile: super::common_fact_admission::InitialLimitsProfile,
+    }
+    struct CompletedInitialOwnedPreview {
+        preview: PreparedOwnedPreview,
+        profile: super::common_fact_admission::InitialLimitsProfile,
+    }
+    const ROOT: usize = 4 * (std::mem::size_of::<CompletedInitialOwnedFacts>()
+        + std::mem::size_of::<CompletedInitialOwnedPreview>()
+        + 2 * std::mem::size_of::<Arc<VerifiedOwnedPreviewPlan>>()
+        + std::mem::size_of::<CompatibilityReport>()
+        + 8 * std::mem::size_of::<usize>() + 4 * std::mem::size_of::<Result<()>>());
+    meter.charge(INITIAL_OWNED_ENTRY)?;
+    meter.charge(0)?;
+    let (proof, mut profile) = super::common_fact_admission::derive_initial_for_decision(
+        current, candidate, request, accepted, meter,
+    )?;
+    #[cfg(test)]
+    {
+        let (calls, rows, full) = profile.counts_for_test();
+        assert_eq!(calls, 6);
+        assert!(rows >= 2);
+        if initial_owned_observation::deny() { profile.deny_reuse_for_test(); }
+        initial_owned_observation::record(1, meter);
+        let _ = full;
+    }
+    // Positive lifetime/transport storage before the non-clone marker exists.
+    meter.charge(ROOT as u64 + 64)?;
+    let completed = CompletedInitialOwnedFacts { proof, profile };
+    meter.charge(0)?;
+    meter.charge(64)?;
+    let CompletedInitialOwnedFacts { proof, profile } = completed;
+    let preview = build(proof, meter)?;
+    #[cfg(test)]
+    initial_owned_observation::record(2, meter);
+    meter.charge(64)?;
+    let completed = CompletedInitialOwnedPreview { preview, profile };
+    meter.charge(0)?;
+    // Keep operation validity/reuse strictly after the preview compiler/init.
+    meter.charge(super::owned_persist::RECIPE_LAYER_CALL)?;
+    let layer = super::owned_persist::recipe_layer(&completed.preview, operation)?;
+    #[cfg(test)]
+    initial_owned_observation::record(3, meter);
+    let eligible = completed.profile.eligible(meter)?;
+    #[cfg(test)]
+    initial_owned_observation::record(4, meter);
+    // Two Arc handles, the shared-owner reference count and all branch/move
+    // cleanup are new work. No old D2 traversal or allocation is credited.
+    const OWNER: usize = 64 + 4 * (2 * std::mem::size_of::<Arc<VerifiedOwnedPreviewPlan>>()
+        + 2 * std::mem::size_of::<usize>() + 4 * std::mem::size_of::<Result<()>>());
+    #[cfg(test)]
+    if initial_owned_observation::active() {
+        eprintln!("initial owned slots entry={INITIAL_OWNED_ENTRY} root={ROOT} owner={OWNER} proof={} preview={} facts_marker={} preview_marker={} compatibility={} result={}",
+            std::mem::size_of::<VerifiedOwnedPreviewPlan>(), std::mem::size_of::<PreparedOwnedPreview>(),
+            std::mem::size_of::<CompletedInitialOwnedFacts>(), std::mem::size_of::<CompletedInitialOwnedPreview>(),
+            std::mem::size_of::<CompatibilityReport>(), std::mem::size_of::<Result<()>>());
+    }
+    meter.charge(OWNER as u64)?;
+    let proof = if eligible {
+        Arc::clone(&completed.preview.proof)
+    } else {
+        let original = &completed.preview.proof;
+        let proof = super::common_fact_admission::derive_retained(
+            &original.snapshot, &original.candidate, &original.request, &original.accepted, meter,
+        )?;
+        #[cfg(test)]
+        initial_owned_observation::record(5, meter);
+        Arc::new(proof)
+    };
+    meter.charge(0)?;
+    let (target, metadata) = lowering::compile_owned(&proof, &layer.identity()?, meter)?;
+    let data = initialize(&proof, &target, &metadata, meter)?;
+    meter.charge(super::owned_persist::RECIPE_MANIFEST_CALL)?;
+    let manifest = super::owned_persist::recipe_manifest(&layer, &target, operation)?;
+    let prepared = PreparedOwnedPreview::from_retained_arc(proof, target, metadata, data)?;
+    let initialization = super::owned_persist::initialization(&layer, &prepared)?;
+    meter.charge(0)?;
+    let compatibility = LocalRuntime::with_cancellation(meter.cancelled()).compatibility_at(
+        &prepared.target, &prepared.initialized, current.clock_day,
+    )?;
+    if compatibility.state != CompatibilityState::Compatible {
+        return Err(StoreError::Incompatible(compatibility));
+    }
+    meter.charge(1)?;
+    #[cfg(test)]
+    initial_owned_observation::record(6, meter);
+    // The entire separate preview product is retained through durable creation.
+    // Its marker and owners are erased here, never in returned durable data.
+    Ok((layer, manifest, initialization, prepared, compatibility))
+}
+
+#[cfg(test)]
+mod initial_owned_observation {
+    use std::cell::RefCell;
+    thread_local! {
+        static STATE: RefCell<Option<(bool, Vec<(u8, u64)>, Option<(u8, std::sync::Arc<std::sync::atomic::AtomicBool>)>)>> = const { RefCell::new(None) };
+    }
+    pub(super) fn begin(deny: bool) { STATE.with(|s| assert!(s.borrow_mut().replace((deny, vec![], None)).is_none())); }
+    pub(super) fn active() -> bool { STATE.with(|s| s.borrow().is_some()) }
+    pub(super) fn cancel_after(stage: u8, token: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        STATE.with(|s| s.borrow_mut().as_mut().unwrap().2 = Some((stage, token)));
+    }
+    pub(super) fn deny() -> bool { STATE.with(|s| s.borrow().as_ref().is_some_and(|s| s.0)) }
+    pub(super) fn record(stage: u8, meter: &super::ProofMeter) {
+        STATE.with(|s| { if let Some((_, values, cancel)) = s.borrow_mut().as_mut() {
+            values.push((stage, meter.remaining_units_for_test()));
+            if let Some((wanted, token)) = cancel { if *wanted == stage { token.store(true, std::sync::atomic::Ordering::Relaxed); } }
+        } });
+    }
+    pub(super) fn take() -> Vec<(u8, u64)> { STATE.with(|s| s.borrow_mut().take().unwrap().1) }
+}
+
+#[cfg(test)]
+impl ProductStore {
+    pub(crate) fn assert_initial_owned_completed_facts_for_test(
+        &self, candidate: &CapturedProgram, request: &OwnedPreviewRequest, accepted: &AcceptedPreviewLifecycle,
+    ) {
+        fn meter() -> ProofMeter { ProofMeter::new(ProofBudget::default(), Arc::new(AtomicBool::new(false))).unwrap() }
+        fn same(a: &PreparedOwnedPreview, b: &PreparedOwnedPreview) {
+            assert_eq!(a.proof.snapshot, b.proof.snapshot);
+            assert_eq!(a.proof.candidate, b.proof.candidate);
+            assert_eq!(a.proof.request, b.proof.request);
+            assert_eq!(a.proof.accepted.recipe(), b.proof.accepted.recipe());
+            assert_eq!(a.proof.report, b.proof.report);
+            assert_eq!(a.proof.captured, b.proof.captured);
+            assert_eq!(a.target, b.target);
+            assert_eq!(a.metadata, b.metadata);
+            assert_eq!(a.initialized, b.initialized);
+            assert_eq!(a.receipt, b.receipt);
+        }
+        let current = self.load().unwrap();
+        let before = self.root.read("CURRENT", 16 * 1024).unwrap();
+        let mut old_meter = meter();
+        let proof = common_fact_admission::derive_for_decision(&current, candidate, request, accepted, &mut old_meter).unwrap();
+        let preview = build(proof, &mut old_meter).unwrap();
+        assert!(preview.proof.report.projections.iter().any(|p| p.baseline.is_none() && p.absent_value == Some(DataValue::Null)));
+        assert!(preview.proof.captured.values().any(|values| values.values().any(|v| *v == DataValue::Null)));
+        let (old_layer, old_manifest, old_init, old_execution) = super::owned_persist::recipe(&preview, "completed-facts-control", &mut old_meter).unwrap();
+        assert_ne!(preview.target, old_execution.target, "distinct preview and durable compiler products");
+        let old_compatibility = LocalRuntime::with_cancellation(old_meter.cancelled()).compatibility_at(
+            &old_execution.target, &old_execution.initialized, current.clock_day,
+        ).unwrap();
+        old_meter.charge(1).unwrap();
+        let mut successful_trace = vec![];
+        for deny in [false, true] {
+            initial_owned_observation::begin(deny);
+            let mut new_meter = meter();
+            let (layer, manifest, init, execution, compatibility) = initial_owned_recipe(&current, candidate, request, accepted, "completed-facts-control", &mut new_meter).unwrap();
+            let trace = initial_owned_observation::take();
+            assert_eq!(layer, old_layer);
+            assert_eq!(manifest, old_manifest);
+            assert_eq!(init, old_init);
+            same(&execution, &old_execution);
+            assert_eq!(compatibility, old_compatibility);
+            if !deny { successful_trace = trace.clone(); }
+            assert_eq!(trace.iter().any(|e| e.0 == 5), deny, "fallback must execute full D2");
+            assert_eq!(trace.iter().map(|e| e.0).filter(|s| *s != 5).collect::<Vec<_>>(), [1, 2, 3, 4, 6]);
+            if deny { assert!(new_meter.remaining_units_for_test() < old_meter.remaining_units_for_test()); }
+            else { assert!(new_meter.remaining_units_for_test() > old_meter.remaining_units_for_test()); }
+            eprintln!("initial owned smaller-fixture deny={deny} old_paid={} new_paid={} stages={trace:?}", 10_000_000-old_meter.remaining_units_for_test(), 10_000_000-new_meter.remaining_units_for_test());
+        }
+        // Exact paid stage boundaries fail closed. In particular the layer to
+        // live-guard boundary must never fall back when guard payment refuses.
+        for (stage, left) in successful_trace.iter().filter(|e| e.0 <= 4) {
+            for extra in [0, -1i64] {
+                let units = (10_000_000 - left) as i64 + extra;
+                let mut bounded = ProofMeter::new(ProofBudget { units: units as u64, elapsed_millis: 60_000 }, Arc::new(AtomicBool::new(false))).unwrap();
+                initial_owned_observation::begin(false);
+                assert!(initial_owned_recipe(&current, candidate, request, accepted, "completed-facts-control", &mut bounded).is_err());
+                let failed = initial_owned_observation::take();
+                assert!(!failed.iter().any(|e| e.0 == 5 || e.0 > *stage));
+            }
+        }
+        // A separate old preview on another meter cannot supply authority to
+        // this operation. Its ordinary recipe still performs a full fresh D2.
+        let mut another_meter = meter();
+        let (_, _, _, separate) = super::owned_persist::recipe(&preview, "completed-facts-control", &mut another_meter).unwrap();
+        same(&separate, &old_execution);
+        assert!(!Arc::ptr_eq(&separate.proof, &preview.proof));
+        assert!(10_000_000 - another_meter.remaining_units_for_test() > 600_002);
+        let (_, _, _, separate_initial, _) = initial_owned_recipe(&current, candidate, request, accepted, "completed-facts-control", &mut meter()).unwrap();
+        assert!(!Arc::ptr_eq(&separate_initial.proof, &separate.proof));
+        same(&separate_initial, &old_execution);
+        for stage in [1, 2, 3, 4] {
+            for secondary in [false, true] {
+                let mut bounded = meter();
+                let token = if secondary {
+                    let token = Arc::new(AtomicBool::new(false)); bounded.watch_cancellation(&token); token
+                } else { bounded.cancelled() };
+                initial_owned_observation::begin(false);
+                initial_owned_observation::cancel_after(stage, token);
+                let error = initial_owned_recipe(&current, candidate, request, accepted, "completed-facts-control", &mut bounded).err().unwrap();
+                assert_eq!(format!("{error:?}"), format!("{:?}", refuse("budget", "cancelled or cumulative elapsed budget exhausted")));
+                let trace = initial_owned_observation::take();
+                assert_eq!(trace.last().unwrap().0, stage);
+                assert!(!trace.iter().any(|e| e.0 == 5));
+            }
+        }
+        for operation in ["", "one"] {
+            let old = super::owned_persist::recipe(&preview, operation, &mut meter()).err().unwrap();
+            let new = initial_owned_recipe(&current, candidate, request, accepted, operation, &mut meter()).err().unwrap();
+            assert_eq!(format!("{old:?}"), format!("{new:?}"));
+        }
+        let mut stale = current.clone(); stale.clock_day += 1;
+        let mut wrong = request.clone(); wrong.purpose.push_str(" different");
+        for (snapshot, request) in [(&stale, request), (&current, &wrong)] {
+            let old = common_fact_admission::derive_for_decision(snapshot, candidate, request, accepted, &mut meter()).err().unwrap();
+            let new = initial_owned_recipe(snapshot, candidate, request, accepted, "completed-facts-control", &mut meter()).err().unwrap();
+            assert_eq!(format!("{old:?}"), format!("{new:?}"));
+        }
+        assert_eq!(self.load().unwrap(), current);
+        assert_eq!(self.root.read("CURRENT", 16 * 1024).unwrap(), before);
+    }
 }

@@ -3332,18 +3332,46 @@ pub(in super::super) fn validate_closed_value_capture(
                 None => Err(a.error("capture Value shape changed")?),
             }
         }
-        fn clear_label(m: &mut serde_json::Map<String, JsonValue>, a: Audit<'_>) -> Result<()> {
+        fn clear_label(m: &mut serde_json::Map<String, JsonValue>, a: Audit<'_>, raw: &mut RawOutputShape) -> Result<()> {
             let value = clear_field(m, "label", a)?;
             a.pay(8)?;
             let JsonValue::String(s) = value else {
                 return Err(a.error("capture Value shape changed")?);
             };
+            a.pay(64)?;
+            let mut len = u64::try_from(s.len()).map_err(|_| a.overflow())?;
+            let mut encoded = 0u64;
+            let mut escaped = 0u64;
+            for byte in s.bytes() {
+                a.pay(14)?;
+                let n = match byte {
+                    b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 8 | 12 => 2,
+                    0..=31 => 6,
+                    _ => 1,
+                };
+                encoded = encoded.checked_add(n).ok_or_else(|| a.overflow())?;
+                if n != 1 {
+                    escaped = escaped.checked_add(1).ok_or_else(|| a.overflow())?;
+                }
+            }
+            a.pay(64)?;
+            #[cfg(test)]
+            semantic_shapes::alter_delta(&mut len, &mut encoded,
+                &mut raw.bytes, &mut raw.native_base, &mut raw.escaped);
+            let removed = len.checked_mul(6).and_then(|n| n.checked_add(encoded))
+                .ok_or_else(|| a.overflow())?;
+            let bytes = raw.bytes.checked_sub(encoded).ok_or_else(|| a.overflow())?;
+            let native = raw.native_base.checked_sub(removed).ok_or_else(|| a.overflow())?;
+            let remaining_escaped = raw.escaped.checked_sub(escaped).ok_or_else(|| a.overflow())?;
+            raw.bytes = bytes;
+            raw.native_base = native;
+            raw.escaped = remaining_escaped;
             a.pay(8)?;
             s.clear();
             Ok(())
         }
         macro_rules! clear_array {
-            ($a:ident, $map:ident, $key:literal, $child:ident) => {{
+            ($a:ident, $map:ident, $key:literal, $child:ident, $raw:ident) => {{
                 let value = clear_field($map, $key, $a)?;
                 $a.pay(8)?;
                 let JsonValue::Array(values) = value else {
@@ -3352,67 +3380,67 @@ pub(in super::super) fn validate_closed_value_capture(
                 $a.slice(values.len())?;
                 for item in values.iter_mut() {
                     $a.pay(4)?;
-                    $child(item, $a)?;
+                    $child(item, $a, $raw)?;
                 }
                 $a.pay(2)?;
             }};
         }
-        fn clear_app(v: &mut JsonValue, a: Audit<'_>) -> Result<()> {
+        fn clear_app(v: &mut JsonValue, a: Audit<'_>, raw: &mut RawOutputShape) -> Result<()> {
             a.pay(8)?;
             let JsonValue::Object(m) = v else {
                 return Err(a.error("capture Value shape changed")?);
             };
-            clear_label(m, a)?;
-            clear_array!(a, m, "entities", clear_entity);
-            clear_array!(a, m, "state", clear_leaf);
-            clear_array!(a, m, "actions", clear_leaf);
-            clear_array!(a, m, "outputs", clear_output);
-            clear_array!(a, m, "observables", clear_leaf);
-            clear_array!(a, m, "views", clear_view);
+            clear_label(m, a, raw)?;
+            clear_array!(a, m, "entities", clear_entity, raw);
+            clear_array!(a, m, "state", clear_leaf, raw);
+            clear_array!(a, m, "actions", clear_leaf, raw);
+            clear_array!(a, m, "outputs", clear_output, raw);
+            clear_array!(a, m, "observables", clear_leaf, raw);
+            clear_array!(a, m, "views", clear_view, raw);
             a.pay(2)?;
             Ok(())
         }
-        fn clear_entity(v: &mut JsonValue, a: Audit<'_>) -> Result<()> {
+        fn clear_entity(v: &mut JsonValue, a: Audit<'_>, raw: &mut RawOutputShape) -> Result<()> {
             a.pay(8)?;
             let JsonValue::Object(m) = v else {
                 return Err(a.error("capture Value shape changed")?);
             };
-            clear_label(m, a)?;
-            clear_array!(a, m, "fields", clear_leaf);
+            clear_label(m, a, raw)?;
+            clear_array!(a, m, "fields", clear_leaf, raw);
             a.pay(2)?;
             Ok(())
         }
-        fn clear_output(v: &mut JsonValue, a: Audit<'_>) -> Result<()> {
+        fn clear_output(v: &mut JsonValue, a: Audit<'_>, raw: &mut RawOutputShape) -> Result<()> {
             a.pay(8)?;
             let JsonValue::Object(m) = v else {
                 return Err(a.error("capture Value shape changed")?);
             };
-            clear_label(m, a)?;
-            clear_array!(a, m, "columns", clear_leaf);
+            clear_label(m, a, raw)?;
+            clear_array!(a, m, "columns", clear_leaf, raw);
             a.pay(2)?;
             Ok(())
         }
-        fn clear_view(v: &mut JsonValue, a: Audit<'_>) -> Result<()> {
+        fn clear_view(v: &mut JsonValue, a: Audit<'_>, raw: &mut RawOutputShape) -> Result<()> {
             a.pay(8)?;
             let JsonValue::Object(m) = v else {
                 return Err(a.error("capture Value shape changed")?);
             };
-            clear_label(m, a)?;
-            clear_array!(a, m, "actions", clear_leaf);
-            clear_view_kind(clear_field(m, "kind", a)?, a)?;
+            clear_label(m, a, raw)?;
+            clear_array!(a, m, "actions", clear_leaf, raw);
+            clear_view_kind(clear_field(m, "kind", a)?, a, raw)?;
             a.pay(2)?;
             Ok(())
         }
-        fn clear_leaf(v: &mut JsonValue, a: Audit<'_>) -> Result<()> {
+        fn clear_leaf(v: &mut JsonValue, a: Audit<'_>, raw: &mut RawOutputShape) -> Result<()> {
             a.pay(8)?;
             let JsonValue::Object(m) = v else {
                 return Err(a.error("capture Value shape changed")?);
             };
-            clear_label(m, a)?;
+            clear_label(m, a, raw)?;
             a.pay(2)?;
             Ok(())
         }
-        fn clear_view_kind(v: &mut JsonValue, a: Audit<'_>) -> Result<()> {
+        fn clear_view_kind(v: &mut JsonValue, a: Audit<'_>, raw: &mut RawOutputShape) -> Result<()> {
             a.pay(8)?;
             let JsonValue::Object(m) = v else {
                 return Err(a.error("capture Value shape changed")?);
@@ -3424,16 +3452,16 @@ pub(in super::super) fn validate_closed_value_capture(
             };
             a.pay(2)?;
             if a.eq_str(tag, "list")? {
-                clear_array!(a, m, "columns", clear_leaf);
-                clear_array!(a, m, "controls", clear_leaf);
+                clear_array!(a, m, "columns", clear_leaf, raw);
+                clear_array!(a, m, "controls", clear_leaf, raw);
             } else {
                 a.pay(2)?;
                 if a.eq_str(tag, "detail")? {
-                    clear_array!(a, m, "columns", clear_leaf);
+                    clear_array!(a, m, "columns", clear_leaf, raw);
                 } else {
                     a.pay(2)?;
                     if a.eq_str(tag, "form")? {
-                        clear_array!(a, m, "fields", clear_leaf);
+                        clear_array!(a, m, "fields", clear_leaf, raw);
                     } else {
                         return Err(a.error("capture Value shape changed")?);
                     }
@@ -3442,7 +3470,43 @@ pub(in super::super) fn validate_closed_value_capture(
             a.pay(2)?;
             Ok(())
         }
-        fn value_bytes(value: &JsonValue, a: Audit<'_>) -> Result<Vec<u8>> {
+        // These exclusive borrowed states cannot attach to another Value, be
+        // cloned, or escape this successful equal branch. No native-tail total
+        // is reused: each output keeps its own complete reservation and Vec.
+        struct RawOutputShape {
+            bytes: u64,
+            nodes: u64,
+            pairs: u64,
+            native_base: u64,
+            escaped: u64,
+            digest_copies: u64,
+        }
+        struct ProgramOutput<'v, 'w> {
+            value: &'v mut JsonValue,
+            a: Audit<'w>,
+            raw: RawOutputShape,
+        }
+        struct SemanticOutput<'v, 'w> {
+            value: &'v mut JsonValue,
+            a: Audit<'w>,
+            raw: RawOutputShape,
+        }
+        const DELTA_FRAME: usize = 8 * size_of::<u64>() + 4 * size_of::<usize>()
+            + 4 * size_of::<&mut RawOutputShape>() + size_of::<std::slice::Iter<'static, u8>>();
+        const DELTA_ROOT: usize = 4 * (2 * size_of::<RawOutputShape>()
+            + size_of::<ProgramOutput<'static, 'static>>()
+            + size_of::<SemanticOutput<'static, 'static>>()
+            + 8 * size_of::<usize>() + 4 * size_of::<Result<()>>());
+        #[cfg(target_pointer_width = "64")]
+        const _: () = {
+            assert!(size_of::<RawOutputShape>() == 48);
+            assert!(size_of::<ProgramOutput<'static, 'static>>() == 64);
+            assert!(size_of::<SemanticOutput<'static, 'static>>() == 64);
+            assert!(DELTA_FRAME == 144 && DELTA_ROOT == 1536);
+        };
+        fn first_value_output<'v, 'w>(value: &'v mut JsonValue, a: Audit<'w>)
+            -> Result<(Vec<u8>, ProgramOutput<'v, 'w>)>
+        {
             a.pay(0)?;
             a.pay(96)?;
             a.pay(OUTPUT_STACK_ROOT as u64)?;
@@ -3452,13 +3516,64 @@ pub(in super::super) fn validate_closed_value_capture(
             a.pay(1)?;
             shape.simple_app = true;
             value.serialize(&mut shape)?;
+            a.pay(DELTA_ROOT as u64)?;
+            a.pay(64)?;
+            let raw = RawOutputShape {
+                bytes: shape.bytes, nodes: shape.nodes, pairs: shape.pairs,
+                native_base: shape.native, escaped: shape.escaped,
+                digest_copies: shape.digest_copies,
+            };
+            #[cfg(test)]
+            semantic_shapes::record([raw.bytes, raw.nodes, raw.pairs, raw.native_base,
+                raw.escaped, raw.digest_copies]);
             shape.reserve_output()?;
-            let bytes =
-                serde_json::to_vec(value).map_err(|error| ContractError(error.to_string()))?;
+            let bytes = serde_json::to_vec(&*value).map_err(|error| ContractError(error.to_string()))?;
             #[cfg(test)]
             native_outputs::record(&bytes);
             a.pay(0)?;
-            Ok(bytes)
+            Ok((bytes, ProgramOutput { value, a, raw }))
+        }
+        impl<'v, 'w> ProgramOutput<'v, 'w> {
+            fn clear_labels(self) -> Result<SemanticOutput<'v, 'w>> {
+                self.a.pay(64)?;
+                let Self { value, a, mut raw } = self;
+                a.pay(96)?;
+                a.pay(MUTATION_STACK_ROOT as u64)?;
+                a.pay((4 * 8 * DELTA_FRAME) as u64)?;
+                clear_app(value, a, &mut raw)?;
+                a.pay(0)?;
+                a.pay(64)?;
+                Ok(SemanticOutput { value, a, raw })
+            }
+        }
+        impl SemanticOutput<'_, '_> {
+            fn write(self) -> Result<Vec<u8>> {
+                self.a.pay(0)?;
+                self.a.pay(96)?;
+                self.a.pay(OUTPUT_STACK_ROOT as u64)?;
+                let mut shape = Shape::new(self.a)?;
+                self.a.pay(1)?;
+                shape.canonical = false;
+                self.a.pay(1)?;
+                shape.simple_app = true;
+                self.a.pay(64)?;
+                let Self { value, a, raw } = self;
+                shape.bytes = raw.bytes;
+                shape.nodes = raw.nodes;
+                shape.pairs = raw.pairs;
+                shape.native = raw.native_base;
+                shape.escaped = raw.escaped;
+                shape.digest_copies = raw.digest_copies;
+                #[cfg(test)]
+                semantic_shapes::record([shape.bytes, shape.nodes, shape.pairs, shape.native,
+                    shape.escaped, shape.digest_copies]);
+                shape.reserve_output()?;
+                let bytes = serde_json::to_vec(&*value).map_err(|error| ContractError(error.to_string()))?;
+                #[cfg(test)]
+                native_outputs::record(&bytes);
+                a.pay(0)?;
+                Ok(bytes)
+            }
         }
 
         let facts = capture.program.validate_audited(a)?;
@@ -3481,7 +3596,7 @@ pub(in super::super) fn validate_closed_value_capture(
         if !a.enabled() {
             capture.program.validate_audited(a)?;
         }
-        let bytes = value_bytes(&value, a)?;
+        let (bytes, program_output) = first_value_output(&mut value, a)?;
         let program = capture_validation::bytes_digest_audited(IdentityDomain::Program, &bytes, a)?;
         let equal = a.eq_str(capture.artifact.program_digest.as_str(), program.as_str())?;
         let equal = if equal {
@@ -3489,12 +3604,9 @@ pub(in super::super) fn validate_closed_value_capture(
             if !a.enabled() {
                 capture.program.validate_audited(a)?;
             }
-            a.pay(96)?;
-            a.pay(MUTATION_STACK_ROOT as u64)?;
-            clear_app(&mut value, a)?;
-            a.pay(0)?;
+            let semantic_output = program_output.clear_labels()?;
             // Program bytes remain owned and live throughout this fresh output.
-            let semantic_bytes = value_bytes(&value, a)?;
+            let semantic_bytes = semantic_output.write()?;
             let digest = capture_validation::bytes_digest_audited(
                 IdentityDomain::SemanticProgram,
                 &semantic_bytes,
@@ -3570,5 +3682,33 @@ pub(super) mod native_outputs {
     }
     pub(in super::super) fn take() -> Vec<(Vec<u8>, usize, usize)> {
         OUTPUTS.with(|slot| slot.borrow_mut().take().unwrap())
+    }
+}
+
+// Test-only numeric observations and corruption faults. Neither provides an
+// attach/constructor, output bytes, payment credit or production authority.
+#[cfg(test)]
+pub(super) mod semantic_shapes {
+    thread_local! {
+        static SHAPES: std::cell::RefCell<Option<Vec<[u64; 6]>>> = const { std::cell::RefCell::new(None) };
+        static FAULT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+    }
+    pub(super) fn record(shape: [u64; 6]) {
+        SHAPES.with(|slot| { if let Some(values) = slot.borrow_mut().as_mut() { values.push(shape); } });
+    }
+    pub(in super::super) fn begin() { SHAPES.with(|slot| assert!(slot.borrow_mut().replace(vec![]).is_none())); }
+    pub(in super::super) fn take() -> Vec<[u64; 6]> { SHAPES.with(|slot| slot.borrow_mut().take().unwrap()) }
+    pub(in super::super) fn fault(fault: &'static str) { FAULT.with(|slot| assert!(slot.replace(Some(fault)).is_none())); }
+    pub(in super::super) fn clear_fault() { FAULT.with(|slot| slot.set(None)); }
+    pub(super) fn alter_delta(len: &mut u64, encoded: &mut u64, bytes: &mut u64, native: &mut u64, escaped: &mut u64) {
+        FAULT.with(|slot| match slot.take() {
+            Some("bytes") => *bytes = 0,
+            Some("native") => *native = 0,
+            Some("escaped") => *escaped = 0,
+            Some("multiply") => *len = u64::MAX,
+            Some("add") => { *len = 1; *encoded = u64::MAX; },
+            Some(other) => panic!("unknown fault {other}"),
+            None => (),
+        });
     }
 }

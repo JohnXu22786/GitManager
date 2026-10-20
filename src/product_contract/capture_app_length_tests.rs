@@ -552,7 +552,7 @@ fn app_length_single_source_count_and_publication_fail_closed() {
     let program_end = unique(&direct.calls,program_hash,semantic_hash,&[320,2144,12,412,0])+4;
     let semantic_end = unique(&direct.calls,semantic_hash,direct.calls.len(),&[320,2144,12,412,0])+4;
     assert_eq!(&direct.calls[source_end+1..source_end+11],&[3,5,128,3,5,128,1,28,0,96]);
-    assert_eq!(&direct.calls[program_end+1..program_end+6],&[3,5,128,28,96]);
+    assert_eq!(&direct.calls[program_end+1..program_end+7],&[3,5,128,28,64,96]);
     assert_eq!(&direct.calls[semantic_end+1..],&[3,5,128,1]);
     let first_select = source_end+8;
     let second_select = program_end+4;

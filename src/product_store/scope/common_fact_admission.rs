@@ -366,6 +366,72 @@ pub(super) fn derive_for_decision(
     snapshot.validate()?;
     derive_inner(snapshot, candidate, request, accepted, meter, false)
 }
+// A finite D1-only record, never a proof or reusable runtime admission. The
+// closed producer owns it through completion; failed work cannot export facts.
+pub(super) struct InitialLimitsProfile {
+    lifecycle: u64,
+    rows: u64,
+    full: bool,
+}
+impl InitialLimitsProfile {
+    const ROOT: usize = 4 * (std::mem::size_of::<Self>()
+        + 2 * std::mem::size_of::<RuntimeLimits>() + 8 * std::mem::size_of::<usize>()
+        + 4 * std::mem::size_of::<AdmissionResult<()>>());
+    pub(super) fn new(meter: &mut ProofMeter) -> AdmissionResult<Self> {
+        meter.charge(0)?;
+        meter.charge(Self::ROOT as u64 + 64)?;
+        Ok(Self { lifecycle: 0, rows: 0, full: true })
+    }
+    pub(super) fn observe(&mut self, limits: &RuntimeLimits, row: bool, meter: &mut ProofMeter) -> AdmissionResult<()> {
+        meter.charge(256)?;
+        self.observe_paid(limits, row).map_err(capture_resource_error)?;
+        Ok(())
+    }
+    // Caller prepays256 before the immutable tuple read and this finite update.
+    pub(super) fn observe_paid(&mut self, limits: &RuntimeLimits, row: bool) -> std::result::Result<(), WorkFailure> {
+        let RuntimeLimits { fuel, collection_items, action_steps, transaction_writes, output_bytes, elapsed_millis } = RuntimeLimits::default();
+        let RuntimeLimits { fuel: f, collection_items: c, action_steps: a, transaction_writes: w, output_bytes: o, elapsed_millis: e } = limits;
+        let full = *f == fuel && *c == collection_items && *a == action_steps
+            && *w == transaction_writes && *o == output_bytes && *e == elapsed_millis;
+        let count = if row { &mut self.rows } else { &mut self.lifecycle };
+        *count = count.checked_add(1).ok_or(WorkFailure::BudgetExhausted("initial limits profile overflow"))?;
+        self.full &= full;
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(super) fn deny_reuse_for_test(&mut self) { self.full = false; }
+    #[cfg(test)]
+    pub(super) fn counts_for_test(&self) -> (u64, u64, bool) { (self.lifecycle, self.rows, self.full) }
+    pub(super) fn eligible(&self, meter: &mut ProofMeter) -> AdmissionResult<bool> {
+        meter.charge(0)?;
+        meter.charge(64)?;
+        let elapsed = meter.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let eligible = self.full && self.lifecycle == 6 && self.rows >= 2
+            && meter.millis.saturating_sub(elapsed) >= RuntimeLimits::default().elapsed_millis;
+        meter.charge(0)?;
+        Ok(eligible)
+    }
+}
+// Sole caller: the closed initial-owned composition. This returns real full D1
+// facts, not authority to attach a plan supplied by a caller or another meter.
+pub(super) fn derive_initial_for_decision(
+    snapshot: &ProjectSnapshot,
+    candidate: &CapturedProgram,
+    request: &OwnedPreviewRequest,
+    accepted: &super::owned_lifecycle::AcceptedPreviewLifecycle,
+    meter: &mut ProofMeter,
+) -> AdmissionResult<(VerifiedOwnedPreviewPlan, InitialLimitsProfile)> {
+    snapshot.validate()?;
+    let inventory = authenticate_inner(snapshot, candidate, request, meter, false)?;
+    let mut profile = InitialLimitsProfile::new(meter)?;
+    accepted.verify_profiled(snapshot, candidate, request, meter, Some(&mut profile))?;
+    meter.charge(2)?;
+    meter.charge(FINISH_PROFILE_FRAME)?;
+    let proof = finish_derived_plan_profiled(snapshot, candidate, request, accepted, meter, false, inventory, Some(&mut profile))?;
+    meter.charge(0)?;
+    meter.charge(64)?;
+    Ok((proof, profile))
+}
 pub(super) fn derive_retained(
     snapshot: &ProjectSnapshot,
     candidate: &CapturedProgram,
@@ -470,6 +536,11 @@ fn derive_inner(
         snapshot, candidate, request, accepted, meter, verify_snapshot, inventory,
     )
 }
+// Added wrapper arguments include the owned inventory itself, not merely its
+// pointer. Four extra words cover return-place/status and alignment/cleanup.
+const FINISH_PROFILE_FRAME: u64 = 4 * (6 * std::mem::size_of::<&()>()
+    + std::mem::size_of::<bool>() + std::mem::size_of::<CommonFactInventory>()
+    + 4 * std::mem::size_of::<usize>()) as u64 + 64;
 fn finish_derived_plan(
     snapshot: &ProjectSnapshot,
     candidate: &CapturedProgram,
@@ -478,6 +549,19 @@ fn finish_derived_plan(
     meter: &mut ProofMeter,
     verify_snapshot: bool,
     inventory: CommonFactInventory,
+) -> AdmissionResult<VerifiedOwnedPreviewPlan> {
+    meter.charge(FINISH_PROFILE_FRAME)?;
+    finish_derived_plan_profiled(snapshot, candidate, request, accepted, meter, verify_snapshot, inventory, None)
+}
+fn finish_derived_plan_profiled(
+    snapshot: &ProjectSnapshot,
+    candidate: &CapturedProgram,
+    request: &OwnedPreviewRequest,
+    accepted: &super::owned_lifecycle::AcceptedPreviewLifecycle,
+    meter: &mut ProofMeter,
+    verify_snapshot: bool,
+    inventory: CommonFactInventory,
+    profile: Option<&mut InitialLimitsProfile>,
 ) -> AdmissionResult<VerifiedOwnedPreviewPlan> {
     // Structural regeneration of retained recipes never settles independent
     // intentions. Their archive scenes are checked by the decision replay path.
@@ -493,13 +577,15 @@ fn finish_derived_plan(
     }
     let (certificates, projections, comparison) =
         super::common_fact_rules::verify(snapshot, candidate, request, &inventory, meter)?;
-    let captured = capture_frame(
+    meter.charge(INITIAL_CAPTURE_PROFILE_TRANSPORT)?;
+    let captured = capture_frame_batched_profiled(
         snapshot.program()?,
         &snapshot.data,
         snapshot.clock_day,
         request,
         &projections,
         meter,
+        profile,
     )?;
     let report = CommonFactAdmissionReport {
         version: 1,
@@ -687,6 +773,16 @@ fn capture_paid_refusal(
     Ok(refuse(at, rule))
 }
 
+// The added helper owns copies of all ordinary arguments as well as three
+// simultaneous optional-profile roles (parameter, outer and inner closures).
+// Two return-place/status words and two alignment/cleanup words are explicit.
+// Prepay before the helper/closures, including None and first-row refusal.
+const INITIAL_CAPTURE_PROFILE_TRANSPORT: u64 = 4 * (
+    std::mem::size_of::<&CapturedProgram>() + std::mem::size_of::<&DataSnapshot>()
+    + std::mem::size_of::<i32>() + std::mem::size_of::<&OwnedPreviewRequest>()
+    + std::mem::size_of::<&[OwnedProjectionRecipe]>() + std::mem::size_of::<&mut ProofMeter>()
+    + 3 * std::mem::size_of::<Option<&'static mut InitialLimitsProfile>>()
+    + 4 * std::mem::size_of::<usize>()) as u64 + 64;
 fn capture_frame_batched(
     baseline: &CapturedProgram,
     data: &DataSnapshot,
@@ -694,6 +790,18 @@ fn capture_frame_batched(
     request: &OwnedPreviewRequest,
     projections: &[OwnedProjectionRecipe],
     meter: &mut ProofMeter,
+) -> AdmissionResult<BTreeMap<String, Values>> {
+    meter.charge(INITIAL_CAPTURE_PROFILE_TRANSPORT)?;
+    capture_frame_batched_profiled(baseline, data, day, request, projections, meter, None)
+}
+fn capture_frame_batched_profiled(
+    baseline: &CapturedProgram,
+    data: &DataSnapshot,
+    day: i32,
+    request: &OwnedPreviewRequest,
+    projections: &[OwnedProjectionRecipe],
+    meter: &mut ProofMeter,
+    mut profile: Option<&mut InitialLimitsProfile>,
 ) -> AdmissionResult<BTreeMap<String, Values>> {
     // Empty capture-map cleanup8 and actual LocalRuntime token/header lifetime5.
     ContractWork::charge(meter, 13).map_err(capture_resource_error)?;
@@ -721,6 +829,11 @@ fn capture_frame_batched(
             let values = capture.with_row(
                 &reference, "record", &request.inventory.lifecycle.before, &Type::Boolean,
                 |row, completed| -> AdmissionResult<Option<Values>> {
+                    row.charge_host(2)?;
+                    if let Some(profile) = profile.as_deref_mut() {
+                        row.charge_host(256)?;
+                        profile.observe_paid(row.actual_limits(), true).map_err(capture_resource_error)?;
+                    }
                     row.charge_host(3)?; // Boolean/tag inspection and comparison.
                     let is_completed = completed == DataValue::Boolean { value: true };
                     row.charge_host(2)?; // Population field/tag inspection.

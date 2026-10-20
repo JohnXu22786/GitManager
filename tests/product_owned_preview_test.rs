@@ -1338,3 +1338,108 @@ fn capture_row_batch_uses_actual_host_reservation_and_refusals() {
     };
     store.assert_capture_row_host_for_test(&proof);
 }
+
+#[test]
+fn initial_owned_completed_facts_match_full_recipe_and_limits() {
+    // Dedicated smaller complete fixture: both old and new structural schedules
+    // must fit the unchanged legal budget; the original strict fixture is intact.
+    let (original, original_candidate) = pair();
+    let mut app = original.program.clone();
+    app.entities.retain(|e| e.id == "job");
+    app.state.clear();
+    app.actions.retain(|a| a.id == "add" || a.id == "complete");
+    app.views.retain(|v| v.id == "jobs");
+    app.views[0].actions.clear();
+    if let ViewKind::List { columns, controls, .. } = &mut app.views[0].kind {
+        columns[1].value = field("row", "status");
+        controls.clear();
+    }
+    app.observables.clear();
+    let a = capture(&app);
+    app.label.push_str(" candidate");
+    if let ViewKind::List { columns, .. } = &mut app.views[0].kind {
+        columns.push(Column { id: "added".into(), label: "Added".into(), value: Expr::Literal { value_type: Type::Boolean, value: DataValue::Boolean { value: true } } });
+    }
+    let b = capture(&app);
+    let (_d, store) = setup(&a);
+    let mut r = request(&store, &original, &original_candidate);
+    r.inventory.sources = OwnedSourceRequest {
+        before: canonical_digest(IdentityDomain::Source, &a).unwrap(),
+        after: canonical_digest(IdentityDomain::Source, &b).unwrap(),
+        root_entity: "job".into(), edits: vec![],
+    };
+    r.auxiliary.clear();
+    r.operations = a.program.actions.iter().map(|a| a.id.clone()).collect();
+    let accepted = acceptance(&store, &b, &r);
+    store.assert_initial_owned_completed_facts_for_test(&b, &r, &accepted);
+}
+
+#[test]
+fn initial_owned_completed_facts_source_boundaries_remain_closed() {
+    assert_initial_owned_source_guards(initial_owned_guard_sources());
+}
+
+fn initial_owned_guard_sources() -> [&'static str; 5] {
+    [include_str!("../src/product_store/scope/owned_preview.rs"), include_str!("../src/product_store/scope/owned_choice.rs"), include_str!("../src/product_store/scope/owned_persist.rs"), include_str!("../src/product_store/scope/common_fact_admission.rs"), include_str!("../src/product_store/scope/owned_lifecycle.rs")]
+}
+
+// Source-text newline handling only, not canonical JSON or runtime content.
+fn initial_owned_guard_text(source: &str) -> String { source.replace("\r\n", "\n") }
+
+fn assert_initial_owned_source_guards(sources: [&str; 5]) {
+    let preview = initial_owned_guard_text(sources[0]);
+    let production = preview.split("#[cfg(test)]\nmod initial_owned_observation").next().unwrap();
+    let handoff = production.split("pub(super) fn initial_owned_recipe(").nth(1).unwrap();
+    assert!(handoff.contains("struct CompletedInitialOwnedFacts"));
+    assert!(handoff.contains("struct CompletedInitialOwnedPreview"));
+    assert!(!handoff.contains("#[derive"));
+    assert!(!handoff.contains("ptr_eq"));
+    assert!(!handoff.contains("ProofMeter::new"));
+    assert!(!handoff.contains("refund"));
+    assert_eq!(production.matches("from_retained_arc(").count(), 2); // definition and sole closed caller
+    assert!(production.contains("fn from_retained_arc("));
+    assert!(!production.contains("pub(super) fn from_retained_arc("));
+    let ordered = ["meter.charge(INITIAL_OWNED_ENTRY)?", "derive_initial_for_decision(", "let preview = build(", "recipe_layer(",
+        "completed.profile.eligible(meter)?", "derive_retained(", "lowering::compile_owned(",
+        "let data = initialize(", "recipe_manifest(", "from_retained_arc(", "compatibility_at("];
+    let mut at = 0;
+    for text in ordered { at += handoff[at..].find(text).unwrap() + text.len(); }
+    let choice = initial_owned_guard_text(sources[1]);
+    assert_eq!(choice.matches("owned_preview::initial_owned_recipe(").count(), 1);
+    assert!(choice.contains("let fresh = prepared.fresh(&current)?"));
+    assert!(production.contains("let current = store.load()?"));
+    assert!(production.contains("common_fact_admission::derive("));
+    let persist = initial_owned_guard_text(sources[2]);
+    assert!(persist.contains("common_fact_admission::reconstruct_and_derive_retained("));
+    assert!(persist.matches("common_fact_admission::derive_retained(").count() >= 2);
+    let admission = initial_owned_guard_text(sources[3]);
+    let meter = admission.split("pub(crate) struct ProofMeter {").nth(1).unwrap().split("impl ProofMeter").next().unwrap();
+    assert!(!meter.contains("profile"));
+    assert!(admission.contains("row.charge_host(256)?;\n                        profile.observe_paid(row.actual_limits(), true)"));
+    assert_eq!(admission.matches("meter.charge(INITIAL_CAPTURE_PROFILE_TRANSPORT)?").count(), 2);
+    assert!(admission.contains("units: 10_000_000"));
+    assert!(admission.contains("elapsed_millis: 60_000"));
+    let lifecycle = initial_owned_guard_text(sources[4]);
+    assert!(lifecycle.contains("profile.observe(&run.limits, false, meter)?"));
+    assert!(lifecycle.contains("Some(limits.clone())"));
+    assert!(lifecycle.contains("profile.observe(&limits, false, meter)?"));
+}
+
+#[test]
+fn initial_owned_source_guards_accept_line_endings_and_reject_mutations() {
+    let sample = "fn exact() {\n    é(); // \\r\\n\n}\r lone";
+    assert_eq!(initial_owned_guard_text(sample), sample);
+    assert_eq!(initial_owned_guard_text(&sample.replace('\n', "\r\n")), sample);
+    assert_eq!(initial_owned_guard_text("a\r\nb\nc\rd"), "a\nb\nc\rd");
+    for newline in ["\n", "\r\n"] {
+        let texts = initial_owned_guard_sources().map(|s| s.replace("\r\n", "\n").replace('\n', newline));
+        assert_initial_owned_source_guards(texts.each_ref().map(String::as_str));
+        let mut changed = texts.clone();
+        changed[0] = changed[0].replacen("struct CompletedInitialOwnedFacts", "struct UncompletedInitialOwnedFacts", 1);
+        assert_ne!(changed[0], texts[0]);
+        assert!(std::panic::catch_unwind(|| assert_initial_owned_source_guards(changed.each_ref().map(String::as_str))).is_err());
+        for changed in [sample.replace("exact", "other"), sample.replace("    ", "   "), sample.replace("é", "e")] {
+            assert_ne!(initial_owned_guard_text(&changed.replace('\n', newline)), sample);
+        }
+    }
+}

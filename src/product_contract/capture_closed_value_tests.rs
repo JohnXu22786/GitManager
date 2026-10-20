@@ -6,6 +6,20 @@ use super::app_length_tests::{
 use super::*;
 use serde_json::{json, Value};
 
+// Textual source guards only; never used for JSON or production values.
+fn source_guard_text(source: &str) -> String { source.replace("\r\n", "\n") }
+
+#[test]
+fn closed_value_source_guard_normalizes_only_crlf_pairs() {
+    let lf = "pub enum Type {\n    Text, // é \\r\\n\n}\n\r standalone";
+    assert_eq!(source_guard_text(lf), lf);
+    assert_eq!(source_guard_text(&lf.replace('\n', "\r\n")), lf);
+    assert_eq!(source_guard_text("a\r\nb\nc\rd"), "a\nb\nc\rd");
+    for changed in [lf.replace("Text", "Integer"), lf.replace("    ", "   "), lf.replace("é", "e")] {
+        assert_ne!(source_guard_text(&changed.replace('\n', "\r\n")), lf);
+    }
+}
+
 fn parity(capture: &CapturedProgram, expect_hit: Option<bool>) {
     let frozen: old::CapturedProgram =
         serde_json::from_slice(&serde_json::to_vec(capture).unwrap()).unwrap();
@@ -70,8 +84,38 @@ fn closed_value_representative_sources_keep_reviewed_complete_payments() {
         parity(&c, Some(true));
         let mut work = Work::default();
         source_result(&c, &mut work).unwrap();
-        // The frozen independent source bound includes publication5 exactly once.
-        assert_eq!(work.calls.iter().sum::<u64>() + 5, expected);
+        // Keep the original frozen complete-source bound. Remove only the
+        // reference second descriptor execution, never its native reservation.
+        let mut semantic = c.program.clone();
+        semantic.clear_display_labels_audited(Audit::none()).unwrap();
+        let value = serde_json::to_value(&semantic).unwrap();
+        let mut descriptor = Work::default();
+        let mut shape = Shape::new(Audit::none()).unwrap();
+        shape.canonical = false;
+        shape.simple_app = true;
+        let state = WorkState::new(&mut descriptor);
+        shape.audit = Audit(Some(&state));
+        state.finish(value.serialize(&mut shape)).unwrap();
+        let removed = descriptor.calls.iter().sum::<u64>();
+        let mut labels: Vec<&str> = vec![&c.program.label];
+        for e in &c.program.entities { labels.push(&e.label); labels.extend(e.fields.iter().map(|f| f.label.as_str())); }
+        labels.extend(c.program.state.iter().map(|v| v.label.as_str()));
+        labels.extend(c.program.actions.iter().map(|v| v.label.as_str()));
+        labels.extend(c.program.observables.iter().map(|v| v.label.as_str()));
+        for o in &c.program.outputs { labels.push(&o.label); labels.extend(o.columns.iter().map(|v| v.label.as_str())); }
+        for v in &c.program.views {
+            labels.push(&v.label); labels.extend(v.actions.iter().map(|v| v.label.as_str()));
+            match &v.kind {
+                ViewKind::List { columns, controls, .. } => { labels.extend(columns.iter().map(|v| v.label.as_str())); labels.extend(controls.iter().map(|v| v.label.as_str())); },
+                ViewKind::Detail { columns, .. } => labels.extend(columns.iter().map(|v| v.label.as_str())),
+                ViewKind::Form { fields, .. } => labels.extend(fields.iter().map(|v| v.label.as_str())),
+            }
+        }
+        let k = labels.len() as u64;
+        let l = labels.iter().map(|s| s.len() as u64).sum::<u64>();
+        let additions = 6144 + 256 + 128 * k + 14 * l;
+        assert_eq!(work.calls.iter().sum::<u64>() + 5, expected - removed + additions);
+        eprintln!("complete source old={expected} removed_descriptor={removed} K={k} L={l} added={additions} actual={}", work.calls.iter().sum::<u64>() + 5);
     }
 }
 
@@ -455,8 +499,8 @@ fn closed_value_every_small_prefix_and_mutation_refuses_without_publication() {
     source_result(&valid, &mut trace).unwrap();
     let mutation = trace
         .calls
-        .windows(4)
-        .position(|w| w == [28, 96, 13448, 8])
+        .windows(6)
+        .position(|w| w == [28, 64, 96, 13448, 4608, 8])
         .unwrap()
         + 1;
     let end = mutation
@@ -531,15 +575,15 @@ fn closed_value_every_small_prefix_and_mutation_refuses_without_publication() {
     }
 }
 
-#[test]
-fn closed_value_schema_and_native_representation_guards() {
-    let source = include_str!("../product_contract.rs");
+fn assert_closed_schema(source: &str, schema: &str) {
+    let source = source_guard_text(source);
+    let schema = source_guard_text(schema);
     let declaration = source.find("pub enum Type {").unwrap();
     let start = source[..declaration].rfind("#[derive(").unwrap();
     let end = source[declaration..].find("\n\nstruct Validator<").unwrap() + declaration;
     assert_eq!(
         source[start..end].trim_end(),
-        include_str!("../../tests/support/capture_closed_schema.txt").trim_end()
+        schema.trim_end()
     );
     assert_eq!(
         source
@@ -555,6 +599,11 @@ fn closed_value_schema_and_native_representation_guards() {
             .collect::<Vec<_>>(),
         ["pub type Values = BTreeMap<Id, DataValue>;"]
     );
+}
+
+#[test]
+fn closed_value_schema_and_native_representation_guards() {
+    assert_closed_schema(include_str!("../product_contract.rs"), include_str!("../../tests/support/capture_closed_schema.txt"));
     assert_ne!(
         serde_json::Number::from(1u32),
         serde_json::from_str::<Value>("1.0")
@@ -1106,6 +1155,10 @@ fn closed_value_callers_and_helper_scopes_remain_closed() {
         references(&root, &root, name, &mut actual);
         assert_eq!(actual, expected, "{name} caller/import closure drift");
     }
+    assert_closed_source_bodies(include_str!("../product_contract.rs"), include_str!("capture_closed_value.rs"), include_str!("capture_typed.rs"), include_str!("capture_canonical.rs"));
+}
+
+fn assert_closed_source_bodies(parent: &str, closed: &str, typed: &str, canonical: &str) {
     // Current bounded helper bodies contain no braces inside literal strings.
     // Balance complete lexical bodies rather than accepting declaration presence.
     fn body(source: &str, signature: &str) -> std::ops::Range<usize> {
@@ -1127,9 +1180,9 @@ fn closed_value_callers_and_helper_scopes_remain_closed() {
         }
         panic!("unclosed body: {signature}")
     }
-    let parent = include_str!("../product_contract.rs");
+    let parent = source_guard_text(parent);
     let prefix = "fn validate_audited(&self,a:Audit<'_>)->Result<capture_validation::CaptureFacts>";
-    let range = body(parent, prefix);
+    let range = body(&parent, prefix);
     let method = &parent[range];
     let call="let actual: AppDefinition = if a.enabled() {return capture_canonical::validate_closed_value_capture(self,a)} else {parse(&self.source_bytes)?};";
     assert!(method.contains(call));
@@ -1145,9 +1198,9 @@ fn closed_value_callers_and_helper_scopes_remain_closed() {
             && a.eq_str(&self.artifact.language, LANGUAGE_VERSION)?, "unsupported executable artifact")?;
         a.require(self.source_bytes.len() <= MAX_WIRE_BYTES, "source exceeds byte limit")?;"#
     );
-    let closed = include_str!("capture_closed_value.rs");
+    let closed = source_guard_text(closed);
     let validate = body(
-        closed,
+        &closed,
         "pub(in super::super) fn validate_closed_value_capture(",
     );
     let hit_start = validate.start
@@ -1183,13 +1236,13 @@ fn closed_value_callers_and_helper_scopes_remain_closed() {
             );
         }
     }
-    let typed = include_str!("capture_typed.rs");
-    let parse = body(typed, "pub(super) fn parse_app(");
+    let typed = source_guard_text(typed);
+    let parse = body(&typed, "pub(super) fn parse_app(");
     assert!(typed[parse].contains("convert_app(value, a)"));
     assert!(typed.contains(
         "pub(super) fn convert_app(value: JsonValue, a: Audit<'_>) -> Result<AppDefinition>"
     ));
-    assert!(include_str!("capture_canonical.rs").contains(
+    assert!(source_guard_text(canonical).contains(
         "mod closed_value;\npub(super) use closed_value::validate_closed_value_capture;"
     ));
 }
@@ -1272,4 +1325,93 @@ fn closed_value_each_fresh_output_callback_refuses_before_publication() {
         }
     }
     assert_eq!(serde_json::to_vec(&capture).unwrap(), before);
+}
+
+#[test]
+fn completed_semantic_shape_matches_fresh_descriptor_for_label_bytes() {
+    let mut labels = vec![String::new(), "éβ🦀\"\\\n\r\t\u{8}\u{c}".into(),
+        (0u8..=31).map(char::from).collect::<String>()];
+    for n in [1, 31, 63, 127, 128, 129, 255, 256, 257, 511, 1023] {
+        labels.push("x".repeat(n));
+    }
+    let base = fixture::minimal();
+    let c = CapturedProgram::capture(&serde_json::to_vec(&base).unwrap(), "project", Producer::UserAuthored, None).unwrap();
+    let without_label = serde_json::to_vec(&c.program).unwrap().len() - c.program.label.len();
+    let boundary = (without_label + 2).next_power_of_two();
+    for target in [boundary - 1, boundary, boundary + 1] {
+        labels.push("g".repeat(target - without_label - 1)); // x prefix below
+    }
+    for label in labels {
+        let mut value = fixture::minimal();
+        value["label"] = json!(format!("x{label}"));
+        let c = CapturedProgram::capture(&serde_json::to_vec(&value).unwrap(), "project", Producer::UserAuthored, None).unwrap();
+        closed_value::semantic_shapes::begin();
+        parity(&c, Some(true));
+        let metrics = closed_value::semantic_shapes::take();
+        assert_eq!(metrics.len(), 2, "only producer and completed semantic descriptors");
+        let mut app = c.program.clone();
+        app.clear_display_labels_audited(Audit::none()).unwrap();
+        let semantic = serde_json::to_value(app).unwrap();
+        for (actual, value) in metrics.iter().zip([serde_json::to_value(&c.program).unwrap(), semantic]) {
+            let mut fresh = Shape::new(Audit::none()).unwrap();
+            fresh.canonical = false;
+            fresh.simple_app = true;
+            value.serialize(&mut fresh).unwrap();
+            assert_eq!(*actual, [fresh.bytes, fresh.nodes, fresh.pairs, fresh.native, fresh.escaped, fresh.digest_copies]);
+        }
+    }
+}
+
+#[test]
+fn completed_semantic_shape_new_packets_keep_first_cause() {
+    let mut value = fixture::minimal();
+    value["label"] = json!("\"\\\né🦀\u{1}");
+    let c = CapturedProgram::capture(&serde_json::to_vec(&value).unwrap(), "project", Producer::UserAuthored, None).unwrap();
+    let mut trace = Work::default();
+    source_result(&c, &mut trace).unwrap();
+    let start = trace.calls.windows(6).position(|w| w == [0, 96, 170873, 358, 1, 1]).unwrap();
+    for index in start..trace.calls.len() {
+        for cause in [WorkFailure::Cancelled, WorkFailure::BudgetExhausted("completed shape") ] {
+            let mut work = Work { refuse: Some(index + 1), cause: Some(cause.clone()), ..Work::default() };
+            assert_eq!(source_result(&c, &mut work), Err(ContractWorkError::Resource(cause)));
+            assert_eq!(work.calls, trace.calls[..=index]);
+        }
+    }
+    let total = trace.calls.iter().sum();
+    let mut exact = Work { left: Some(total), ..Work::default() };
+    source_result(&c, &mut exact).unwrap();
+    assert_eq!(exact.left, Some(0));
+    let mut short = Work { left: Some(total - 1), ..Work::default() };
+    assert!(matches!(source_result(&c, &mut short), Err(ContractWorkError::Resource(_))));
+}
+
+#[test]
+fn completed_semantic_shape_delta_arithmetic_refuses_before_second_output() {
+    let mut value = fixture::minimal();
+    value["label"] = json!("x\n");
+    let c = CapturedProgram::capture(&serde_json::to_vec(&value).unwrap(), "project", Producer::UserAuthored, None).unwrap();
+    for fault in ["bytes", "native", "escaped", "multiply", "add"] {
+        closed_value::semantic_shapes::fault(fault);
+        closed_value::native_outputs::begin();
+        let mut work = Work::default();
+        assert!(matches!(source_result(&c, &mut work), Err(ContractWorkError::Resource(WorkFailure::BudgetExhausted(_)))));
+        assert_eq!(closed_value::native_outputs::take().len(), 1);
+        closed_value::semantic_shapes::clear_fault();
+    }
+}
+
+#[test]
+fn closed_value_source_guards_accept_line_endings_and_reject_mutations() {
+    let raw = [include_str!("../product_contract.rs"), include_str!("capture_closed_value.rs"), include_str!("capture_typed.rs"), include_str!("capture_canonical.rs"), include_str!("../../tests/support/capture_closed_schema.txt")];
+    for newline in ["\n", "\r\n"] {
+        let texts = raw.map(|s| s.replace("\r\n", "\n").replace('\n', newline));
+        assert_closed_schema(&texts[0], &texts[4]);
+        assert_closed_source_bodies(&texts[0], &texts[1], &texts[2], &texts[3]);
+        let changed_schema = texts[4].replacen("Boolean,", "BooleanChanged,", 1);
+        assert_ne!(changed_schema, texts[4]);
+        assert!(std::panic::catch_unwind(|| assert_closed_schema(&texts[0], &changed_schema)).is_err());
+        let changed_parent = texts[0].replacen("        self.binding.validate_audited(a)?;", "        self.binding.validate_audited(a)?; // changed", 1);
+        assert_ne!(changed_parent, texts[0]);
+        assert!(std::panic::catch_unwind(|| assert_closed_source_bodies(&changed_parent, &texts[1], &texts[2], &texts[3])).is_err());
+    }
 }

@@ -187,21 +187,9 @@ pub(crate) fn prepare_owned(
     cancelled: Arc<AtomicBool>,
 ) -> Result<PreparedOwnedScopedChangeV2> {
     let mut meter = ProofMeter::new(budget, cancelled.clone())?;
-    let proof = common_fact_admission::derive_for_decision(
-        current, candidate, request, accepted, &mut meter,
+    let (layer, manifest, initialization, execution, compatibility) = owned_preview::initial_owned_recipe(
+        current, candidate, request, accepted, operation, &mut meter,
     )?;
-    let preview = owned_preview::build(proof, &mut meter)?;
-    let (layer, manifest, initialization, execution) =
-        owned_persist::recipe(&preview, operation, &mut meter)?;
-    let compatibility = LocalRuntime::with_cancellation(cancelled.clone()).compatibility_at(
-        &execution.target,
-        &execution.initialized,
-        current.clock_day,
-    )?;
-    if compatibility.state != CompatibilityState::Compatible {
-        return Err(StoreError::Incompatible(compatibility));
-    }
-    meter.charge(1)?;
     Ok(PreparedOwnedScopedChangeV2 {
         execution: Arc::new(execution),
         layer,

@@ -1053,6 +1053,47 @@ fn basis_recipe(snapshot: &ProjectSnapshot) -> Result<OwnedBasisV2> {
 }
 /// Private, non-authoritative recipe extraction for the later locked writer.
 /// No public prepared/adoption conversion or store mutation is exposed here.
+// Added helper frame only on the closed route: actual copied parameters,
+// two return-place/status words plus two alignment/cleanup words, and finite
+// call/return dispatch64. The ordinary recipe below remains inline and unchanged.
+pub(super) const RECIPE_LAYER_CALL: u64 = 4 * (std::mem::size_of::<&PreparedOwnedPreview>()
+    + std::mem::size_of::<&str>() + 4 * std::mem::size_of::<usize>()) as u64 + 64;
+pub(super) const RECIPE_MANIFEST_CALL: u64 = 4 * (std::mem::size_of::<&OwnedLayerV2>()
+    + std::mem::size_of::<&CapturedProgram>() + std::mem::size_of::<&str>()
+    + 4 * std::mem::size_of::<usize>()) as u64 + 64;
+pub(super) fn recipe_layer(preview: &PreparedOwnedPreview, operation: &str) -> Result<OwnedLayerV2> {
+    if !valid_id(operation) || preview.proof.snapshot.operations.contains_key(operation) {
+        return Err(err("invalid or reused owned operation"));
+    }
+    let original = &preview.proof;
+    Ok(OwnedLayerV2 {
+        version: OWNED_SCOPE_VERSION,
+        lowering: OWNED_LOWERING_VERSION,
+        operation: operation.into(),
+        basis: basis_recipe(&original.snapshot)?,
+        candidate: revision(&original.candidate)?,
+        request: original.request.clone(),
+        lifecycle: original.accepted.recipe(),
+        inventory: inventory(original)?,
+    })
+}
+pub(super) fn recipe_manifest(layer: &OwnedLayerV2, target: &CapturedProgram, operation: &str) -> Result<OwnedCompositionV2> {
+    Ok(OwnedCompositionV2 {
+        version: OWNED_SCOPE_VERSION,
+        lowering: OWNED_LOWERING_VERSION,
+        basis: layer.basis.clone(),
+        transition: ScopeTransition::Adoption,
+        business: layer.candidate.clone(),
+        layers: vec![layer.identity()?],
+        active: BTreeSet::from([layer.identity()?]),
+        previous: None,
+        operation: operation.into(),
+        runtime: RUNTIME_VERSION.into(),
+        driver: DRIVER_VERSION.into(),
+        output: revision(target)?,
+        correspondences: vec![],
+    })
+}
 pub(super) fn recipe(
     preview: &PreparedOwnedPreview,
     operation: &str,
