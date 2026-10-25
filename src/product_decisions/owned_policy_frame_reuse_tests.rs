@@ -4,16 +4,17 @@ const FRAME_SENTINEL: &str = "policy frame assertion boundary";
 
 #[test]
 fn policy_frame_export_lexical_packets_are_exact() {
-    assert_eq!(super::super::bundle::POLICY_FRAME_EXPORT_PAYMENT, 3040,
-        "the reviewed lexical owner formula replaces the removed export/validation transport");
-    super::super::bundle::assert_policy_frame_export_layouts_for_test();
-    for cost in [policy_frame_continuation_payment::<LocalRuntime>(),
-        super::super::owned_policy::POLICY_FRAME_DECISION_RECORD_PAYMENT,
-        super::super::owned_policy::POLICY_FRAME_DECISION_CONSUME_PAYMENT,
-        super::super::bundle::POLICY_FRAME_EXPORT_PAYMENT] {
-        crate::product_store::scope::OwnedPolicyCheck::assert_archive_packet_for_test(cost);
-    }
+    // Print the producing owner decomposition even if an exact packet check fails.
     println!("POLICY_FRAME_DECISION_LAYOUTS {}", serde_json::json!({
+        "pointer_width": usize::BITS,
+        "os_string": std::mem::size_of::<std::ffi::OsString>(),
+        "os_string_align": std::mem::align_of::<std::ffi::OsString>(),
+        "product_store": std::mem::size_of::<ProductStore>(),
+        "product_store_align": std::mem::align_of::<ProductStore>(),
+        "archive_owner": std::mem::size_of::<IntentArchive>(),
+        "archive_owner_align": std::mem::align_of::<IntentArchive>(),
+        "recorder_borrow": std::mem::size_of::<&crate::product_store::scope::PolicyFrameRecorder<'_>>(),
+        "bundle_borrow": std::mem::size_of::<&IntentionBundle>(),
         "record_decision": std::mem::size_of::<super::super::owned_policy::RecordDecisionCall<'_, '_>>(),
         "receipt_decision": std::mem::size_of::<super::super::owned_policy::ReceiptDecisionCall<'_, '_, '_>>(),
         "continuation_capture": std::mem::size_of::<RecordContinuationCapture<'_, '_, LocalRuntime>>(),
@@ -25,6 +26,24 @@ fn policy_frame_export_lexical_packets_are_exact() {
         "decision_result": std::mem::size_of::<Result<()>>(),
         "store_result": std::mem::size_of::<std::result::Result<(), StoreError>>(),
     }));
+    assert_eq!(usize::BITS, 64, "the independent subtotal pins the supported 64-bit release targets");
+    // Independent non-archive pins: base 64 + recorder borrow 8*16 + bundle
+    // borrow 8*4 + retained capture 16*4 + retained dispatch 24*4 + full
+    // decision/store results 152*8 each = 2816. Do not derive this subtotal
+    // from the production payment: it must detect changed terms/multipliers.
+    // The owning archive embeds ProductStore/OsString and varies by target;
+    // 3040 is the recorded-layout floor, not a target-independent exact cost.
+    let expected = super::super::bundle::archive_payment(
+        2816, [(std::mem::size_of::<IntentArchive>(), 4)]).max(3040);
+    assert_eq!(super::super::bundle::POLICY_FRAME_EXPORT_PAYMENT, expected,
+        "the reviewed lexical owner formula replaces the removed export/validation transport");
+    super::super::bundle::assert_policy_frame_export_layouts_for_test();
+    for cost in [policy_frame_continuation_payment::<LocalRuntime>(),
+        super::super::owned_policy::POLICY_FRAME_DECISION_RECORD_PAYMENT,
+        super::super::owned_policy::POLICY_FRAME_DECISION_CONSUME_PAYMENT,
+        super::super::bundle::POLICY_FRAME_EXPORT_PAYMENT] {
+        crate::product_store::scope::OwnedPolicyCheck::assert_archive_packet_for_test(cost);
+    }
 }
 impl<'gate> RecordContinuationCapture<'_, 'gate, LocalRuntime> {
     fn assert_for_test(self, check: &mut crate::product_store::scope::OwnedPolicyCheck<'gate>, recorder: &mut crate::product_store::scope::PolicyFrameRecorder<'gate>) -> std::result::Result<(), StoreError> {
