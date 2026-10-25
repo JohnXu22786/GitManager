@@ -102,12 +102,46 @@ pub(super) struct OwnedProducerEpoch {
     pub output: Digest,
     pub adoption_revision: u64,
 }
-fn err(reason: &str) -> StoreError {
+pub(super) fn err(reason: &str) -> StoreError {
     refuse("owned producer epoch", reason)
 }
 
 /// Operation receipt revisions select one producer. Merely retaining another
 /// matching program digest never authorizes that producer in this interval.
+// The receipt proof is common to the native wrapper and the single lexical
+// cold historical endpoint expansion. No flag or serialization witness escapes.
+macro_rules! validate_interval_body {
+    ($snapshot:ident, $recipe:ident, $adoption_revision:expr, $end_revision:ident,
+     $data:ident, $meter:ident, [$($history:tt)*]) => {{
+    if $end_revision < $adoption_revision || !$data.events.starts_with(&$recipe.seed().events) {
+        return Err(crate::product_store::scope::owned_epoch::err("producer endpoint precedes its exact adopted seed"));
+    }
+    let mut prior_revision = $adoption_revision;
+    for event in &$data.events[$recipe.seed().events.len()..] {
+        $meter.charge(1)?;
+        let receipt = $snapshot
+            .operations
+            .get(&event.operation_id)
+            .ok_or_else(|| crate::product_store::scope::owned_epoch::err("event lacks its retained operation receipt"))?;
+        if receipt.revision <= prior_revision
+            || receipt.revision > $end_revision
+            || $snapshot
+                .adoptions
+                .iter()
+                .any(|a| a.revision == receipt.revision)
+            || event.program != $recipe.target().artifact.program_digest
+        {
+            return Err(crate::product_store::scope::owned_epoch::err(
+                "event is outside its actual producer operation interval",
+            ));
+        }
+        prior_revision = receipt.revision;
+    }
+    $($history)*
+    }};
+}
+pub(super) use validate_interval_body;
+
 pub(super) fn validate_interval(
     snapshot: &ProjectSnapshot,
     recipe: &OwnedExecutionRecipe,
@@ -117,30 +151,7 @@ pub(super) fn validate_interval(
     day: i32,
     meter: &mut ProofMeter,
 ) -> Result<()> {
-    if end_revision < adoption_revision || !data.events.starts_with(&recipe.seed().events) {
-        return Err(err("producer endpoint precedes its exact adopted seed"));
-    }
-    let mut prior_revision = adoption_revision;
-    for event in &data.events[recipe.seed().events.len()..] {
-        meter.charge(1)?;
-        let receipt = snapshot
-            .operations
-            .get(&event.operation_id)
-            .ok_or_else(|| err("event lacks its retained operation receipt"))?;
-        if receipt.revision <= prior_revision
-            || receipt.revision > end_revision
-            || snapshot
-                .adoptions
-                .iter()
-                .any(|a| a.revision == receipt.revision)
-            || event.program != recipe.target().artifact.program_digest
-        {
-            return Err(err(
-                "event is outside its actual producer operation interval",
-            ));
-        }
-        prior_revision = receipt.revision;
-    }
+    validate_interval_body!(snapshot, recipe, adoption_revision, end_revision, data, meter, [
     owned_replay::validate_recipe_history_from(
         recipe,
         recipe.seed(),
@@ -149,6 +160,7 @@ pub(super) fn validate_interval(
         day,
         meter,
     )
+    ])
 }
 
 /// Closed structural graph mode check. Package-level whole-obligation ownership

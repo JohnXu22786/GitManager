@@ -4,6 +4,53 @@ use serde::ser::SerializeMap;
 use serde_json::json;
 use std::cell::Cell;
 
+#[test]
+fn canonical_evidence_owner_preserves_canonical_and_domain_identity() {
+    for value in [
+        json!(null),
+        json!([]),
+        json!({}),
+        json!({"z": [{"b": 2, "a": 1}], "a": ["β", "\n", "\0", "\\\""]}),
+        json!([u64::MAX, i64::MIN, true, false]),
+    ] {
+        let bytes = canonical_bytes(&value).unwrap();
+        let expected = canonical_digest(IdentityDomain::Evidence, &value).unwrap();
+        let owner = CanonicalEvidenceBytes::from_value(&value).unwrap();
+        assert_eq!(owner.len(), bytes.len());
+        assert_eq!(owner.into_evidence_digest(), expected);
+        assert_ne!(expected, canonical_digest(IdentityDomain::Program, &value).unwrap());
+        assert_ne!(expected, canonical_digest(IdentityDomain::Evidence, &bytes).unwrap());
+    }
+}
+
+#[test]
+fn canonical_evidence_owner_serializes_once_before_consuming() {
+    // This artificial serializer checks encoding work, never proof authority.
+    let calls = Cell::new(0);
+    let owner = CanonicalEvidenceBytes::from_value(&OrderedCalls { calls: &calls, fail: false }).unwrap();
+    assert_eq!(calls.get(), 1);
+    assert_eq!(owner.len(), br#"{"a":[2,1],"z":2}"#.len());
+    assert_eq!(owner.into_evidence_digest(), canonical_digest(
+        IdentityDomain::Evidence, &json!({"a": [2, 1], "z": 2}),
+    ).unwrap());
+    assert_eq!(calls.get(), 1);
+}
+
+#[test]
+fn canonical_evidence_owner_retains_first_serializer_error() {
+    let calls = Cell::new(0);
+    match CanonicalEvidenceBytes::from_value(&OrderedCalls { calls: &calls, fail: true }) {
+        Err(error) => assert_eq!(error, ContractError("canonical fixture failure".into())),
+        Ok(_) => panic!("failing serialization must not produce canonical bytes"),
+    }
+    assert_eq!(calls.get(), 1);
+    let invalid_key = BTreeMap::from([(vec![1u8, 2], 3u8)]);
+    match CanonicalEvidenceBytes::from_value(&invalid_key) {
+        Err(error) => assert_eq!(error, ContractError("key must be a string".into())),
+        Ok(_) => panic!("invalid map key must not produce canonical bytes"),
+    }
+}
+
 #[path = "../../tests/support/capture_source_fixture.rs"]
 mod fixture;
 

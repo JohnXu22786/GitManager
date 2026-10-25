@@ -272,41 +272,38 @@ pub(super) fn withdrawal_graph(
     next.validate()?;
     Ok(next)
 }
-pub(super) fn check_decision(
-    check: &mut crate::product_store::scope::OwnedPolicyCheck<'_>,
-    decision: &ScopedDecision,
-    scenes: &[AcceptedScene],
-) -> Result<()> {
+macro_rules! check_decision_body {
+    ($check:ident, $decision:ident, $scenes:ident, $scene:ident, $surface:expr) => {{
     use crate::product_store::scope::{transition_layer, transition_policy_scope};
-    let execution = check.execution()?;
-    check.charge(1)?;
-    decision.validate()?;
-    if validate_scene_bindings(decision, scenes)? != IntentionBinding::PropertiesOnly
-        || decision.scope != transition_policy_scope(execution)?
-        || decision.obligations.is_empty()
+    let execution = $check.execution()?;
+    $check.charge(1)?;
+    $decision.validate()?;
+    if validate_scene_bindings($decision, $scenes)? != IntentionBinding::PropertiesOnly
+        || $decision.scope != transition_policy_scope(execution)?
+        || $decision.obligations.is_empty()
     {
         return Err(DecisionError::Unverified(
             "owned retirement requires the complete original PropertiesOnly obligation".into(),
         ));
     }
-    let ids = scenes
+    let ids = $scenes
         .iter()
         .map(|s| s.scenario.identity())
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    if ids != decision.scenarios {
+    if ids != $decision.scenarios {
         return Err(invalid("owned retirement scene identities changed"));
     }
     let mut surfaces: Vec<(
         &CapturedProgram,
         crate::product_store::scope::VerifiedOwnedPolicySurface,
     )> = vec![];
-    for scene in scenes {
-        check.charge(1)?;
-        scene.validate()?;
+    for $scene in $scenes {
+        $check.charge(1)?;
+        $scene.validate()?;
         let mut found = None;
         for (index, (source, _)) in surfaces.iter().enumerate() {
-            check.charge(1)?;
-            if *source == &scene.program {
+            $check.charge(1)?;
+            if *source == &$scene.program {
                 found = Some(index);
                 break;
             }
@@ -314,22 +311,22 @@ pub(super) fn check_decision(
         let index = if let Some(index) = found {
             index
         } else {
-            let surface = check.surface(&scene.program)?;
-            check.charge(1)?;
-            surfaces.push((&scene.program, surface));
+            let surface = $surface;
+            $check.charge(1)?;
+            surfaces.push((&$scene.program, surface));
             surfaces.len() - 1
         };
         let surface = &surfaces[index].1;
-        surface.validate_frame(&scene.scenario.seed)?;
+        surface.validate_frame(&$scene.scenario.seed)?;
         if surface.original_layer() != transition_layer(execution)
-            || surface.source() != &canonical_digest(IdentityDomain::Source, &scene.program)?
+            || surface.source() != &canonical_digest(IdentityDomain::Source, &$scene.program)?
         {
             return Err(invalid(
                 "owned policy surface belongs to another producer or layer",
             ));
         }
-        for property in &decision.obligations {
-            check.charge(1)?;
+        for property in &$decision.obligations {
+            $check.charge(1)?;
             property.validate()?;
             let mut qualify = |point: &str, observable: &str| -> Result<i64> {
                 let cap = surface.qualify_observable(observable).ok_or_else(|| {
@@ -337,7 +334,7 @@ pub(super) fn check_decision(
                         "whole obligation contains an unowned observed surface".into(),
                     )
                 })?;
-                let observation = scene
+                let observation = $scene
                     .evidence
                     .observations
                     .iter()
@@ -353,9 +350,9 @@ pub(super) fn check_decision(
                 Ok(cap)
             };
             predicate_intervals(&property.predicate, &mut qualify, &mut |units| {
-                check.charge(units).map_err(DecisionError::from)
+                $check.charge(units).map_err(DecisionError::from)
             })?;
-            if property.evaluate(&scene.evidence.observations) != Some(true) {
+            if property.evaluate(&$scene.evidence.observations) != Some(true) {
                 return Err(DecisionError::Unverified(
                     "owned policy predicate is not satisfied by its actual accepted scene".into(),
                 ));
@@ -363,31 +360,145 @@ pub(super) fn check_decision(
         }
     }
     Ok(())
+    }};
 }
-pub(super) fn check_withdrawal(
-    archive: &IntentArchive,
+pub(super) fn check_decision(
     check: &mut crate::product_store::scope::OwnedPolicyCheck<'_>,
-) -> Result<Vec<Id>> {
-    let execution = check.execution()?;
+    decision: &ScopedDecision,
+    scenes: &[AcceptedScene],
+) -> Result<()> {
+    check_decision_body!(check, decision, scenes, scene, check.surface(&scene.program)?)
+}
+macro_rules! check_withdrawal_body {
+    ($archive:ident, $check:ident, $decision:ident, $scenes:ident, [$($decision_call:tt)*]) => {{
+    let execution = $check.execution()?;
     let current = execution.current();
     let ids = retirement_ids(
         current,
         crate::product_store::scope::transition_layer(execution),
     )?;
     for id in &ids {
-        check.charge(1)?;
-        let decision = current
+        $check.charge(1)?;
+        let $decision = current
             .decisions
             .decisions
             .iter()
             .find(|d| &d.id == id)
             .ok_or_else(|| invalid("owned retirement decision missing"))?;
-        let scenes = archive.load(&decision.witness)?;
-        check_decision(check, decision, &scenes)?;
+        let $scenes = $archive.load(&$decision.witness)?;
+        $($decision_call)*
     }
     Ok(ids)
+    }};
+}
+pub(super) fn check_withdrawal(
+    archive: &IntentArchive,
+    check: &mut crate::product_store::scope::OwnedPolicyCheck<'_>,
+) -> Result<Vec<Id>> {
+    check_withdrawal_body!(archive, check, decision, scenes, [check_decision(check, decision, &scenes)?;])
+}
+
+use crate::product_store::scope::{PolicyFrameRecorder, OwnedPolicyCheck,
+    SurfaceRecordCall, SurfaceConsumeCall, POLICY_FRAME_RECORD_PAYMENT, POLICY_FRAME_CONSUME_PAYMENT};
+use std::mem::size_of;
+pub(super) struct RecordDecisionCall<'a, 'gate> {
+    pub(super) check: &'a mut OwnedPolicyCheck<'gate>,
+    pub(super) recorder: &'a mut PolicyFrameRecorder<'gate>,
+    pub(super) decision: &'a ScopedDecision,
+    pub(super) scenes: &'a [AcceptedScene],
+}
+pub(super) struct ReceiptDecisionCall<'a, 'gate, 'record> {
+    pub(super) check: &'a mut OwnedPolicyCheck<'gate>,
+    pub(super) recorder: &'a PolicyFrameRecorder<'record>,
+    pub(super) decision: &'a ScopedDecision,
+    pub(super) scenes: &'a [AcceptedScene],
+}
+pub(super) const POLICY_FRAME_DECISION_RECORD_PAYMENT: u64 = super::bundle::archive_payment(64, [
+    (size_of::<RecordDecisionCall<'_, '_>>(), 4),
+    (size_of::<&mut OwnedPolicyCheck<'_>>(), 8),
+    (size_of::<&mut PolicyFrameRecorder<'_>>(), 8),
+    (size_of::<&ScopedDecision>(), 8),
+    (size_of::<&[AcceptedScene]>(), 8),
+    (size_of::<Result<()>>(), 8),
+    (size_of::<std::result::Result<(), StoreError>>(), 4),
+]);
+pub(super) const POLICY_FRAME_DECISION_CONSUME_PAYMENT: u64 = super::bundle::archive_payment(64, [
+    (size_of::<ReceiptDecisionCall<'_, '_, '_>>(), 4),
+    (size_of::<&mut OwnedPolicyCheck<'_>>(), 8),
+    (size_of::<&PolicyFrameRecorder<'_>>(), 8),
+    (size_of::<&ScopedDecision>(), 8),
+    (size_of::<&[AcceptedScene]>(), 8),
+    (size_of::<Result<()>>(), 8),
+    (size_of::<std::result::Result<(), StoreError>>(), 4),
+]);
+impl RecordDecisionCall<'_, '_> {
+    pub(super) fn run(self) -> Result<()> {
+        let Self { check, recorder, decision, scenes } = self;
+        check_decision_body!(check, decision, scenes, scene, {
+            check.charge(POLICY_FRAME_RECORD_PAYMENT)?;
+            SurfaceRecordCall { check, recorder, source: &scene.program }.run()?
+        })
+    }
+}
+impl ReceiptDecisionCall<'_, '_, '_> {
+    pub(super) fn run(self) -> Result<()> {
+        let Self { check, recorder, decision, scenes } = self;
+        check_decision_body!(check, decision, scenes, scene, {
+            check.charge(POLICY_FRAME_CONSUME_PAYMENT)?;
+            SurfaceConsumeCall { check, recorder, source: &scene.program }.run()?
+        })
+    }
+}
+pub(super) fn check_withdrawal_recorded<'gate>(
+    archive: &IntentArchive, check: &mut OwnedPolicyCheck<'gate>,
+    recorder: &mut PolicyFrameRecorder<'gate>,
+) -> Result<Vec<Id>> {
+    check_withdrawal_body!(archive, check, decision, scenes, [
+        check.charge(POLICY_FRAME_DECISION_RECORD_PAYMENT)?;
+        RecordDecisionCall { check, recorder, decision, scenes: &scenes }.run()?;
+    ])
 }
 
 #[cfg(test)]
 #[path = "owned_policy_registry_controls.rs"]
 mod registry_controls;
+
+// Separately selected ordinary path. No withdrawal frame receipt is accepted.
+pub(super) struct InitialDecisionCall<'call, 'gate, 'loan> {
+    pub(super) check: &'call mut OwnedPolicyCheck<'gate>,
+    pub(super) loan: &'call crate::product_store::scope::HistoricalInitialLoan<'loan>,
+    pub(super) decision: &'call ScopedDecision,
+    pub(super) scenes: &'call [AcceptedScene],
+}
+// Complete producing fixed slots: 33; direct activation/control sites: 12.
+pub(super) const HISTORICAL_INITIAL_DECISION_PAYMENT: u64 = super::bundle::archive_payment(768, [
+        (size_of::<&[crate::product_decisions::replay::AcceptedScene]>(), 16),
+        (size_of::<&mut crate::product_store::scope::OwnedPolicyCheck<'_>>(), 12),
+        (size_of::<&crate::product_contract::ScopedDecision>(), 8),
+        (size_of::<&crate::product_store::scope::HistoricalInitialLoan<'_>>(), 8),
+        (size_of::<&std::ops::Range<usize>>(), 4),
+        (size_of::<&std::vec::Vec<crate::product_decisions::replay::AcceptedScene>>(), 4),
+        (size_of::<()>(), 20),
+        (size_of::<isize>(), 8),
+        (size_of::<crate::product_decisions::owned_policy::InitialDecisionCall<'_, '_, '_>>(), 8),
+        (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_decisions::DecisionError>>>(), 4),
+        (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>>(), 4),
+        (size_of::<std::ops::Range<usize>>(), 4),
+        (size_of::<std::result::Result<(), crate::product_decisions::DecisionError>>(), 8),
+        (size_of::<std::result::Result<(), crate::product_store::StoreError>>(), 4),
+        (size_of::<std::result::Result<std::convert::Infallible, crate::product_decisions::DecisionError>>(), 8),
+        (size_of::<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>(), 8),
+        (size_of::<u64>(), 4),
+    ]);
+impl InitialDecisionCall<'_, '_, '_> {
+    pub(super) fn run(self) -> Result<()> {
+        let Self { check, loan, decision, scenes } = self;
+        check_decision_body!(check, decision, scenes, scene, {
+            check.charge(crate::product_store::scope::HISTORICAL_INITIAL_SURFACE_PAYMENT)?;
+            check.surface_with_initial_loan(loan, &scene.program)?
+        })
+    }
+}
+
+#[cfg(all(test, target_pointer_width = "64"))]
+const _: [(); 7264] = [(); HISTORICAL_INITIAL_DECISION_PAYMENT as usize];

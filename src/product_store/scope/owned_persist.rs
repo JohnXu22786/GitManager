@@ -14,11 +14,777 @@ pub(super) struct ReconstructedOwned {
     pub manifests: BTreeMap<Digest, OwnedCompositionV2>,
     pub initializations: BTreeMap<Digest, OwnedInitializationV2>,
 }
+
+// V11 producing fixed packets. Each is checked over the complete lowered
+// owner/Result/argument/cleanup layouts; all prior payment families remain.
+// Complete producing fixed slots: 54; direct activation/control sites: 18.
+pub(super) const fn historical_initial_callback_payment<C>() -> u64 {
+    comparison_payment(1152, [
+        (size_of::<&mut C>(), 16),
+        (size_of::<&mut crate::product_store::scope::common_fact_admission::ProofMeter>(), 24),
+        (size_of::<&mut crate::product_store::scope::OwnedPolicyCheck<'_>>(), 8),
+        (size_of::<&crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution>(), 24),
+        (size_of::<&crate::product_store::scope::HistoricalInitialLoan<'_>>(), 16),
+        (size_of::<&crate::product_store::scope::owned_persist::ReconstructedOwned>(), 8),
+        (size_of::<&std::sync::Arc<crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution>>(), 8),
+        (size_of::<(&mut crate::product_store::scope::OwnedPolicyCheck<'_>, &crate::product_store::scope::HistoricalInitialLoan<'_>)>(), 4),
+        (size_of::<()>(), 24),
+        (size_of::<isize>(), 12),
+        (size_of::<crate::product_store::scope::HistoricalInitialLoan<'_>>(), 4),
+        (size_of::<crate::product_store::scope::OwnedPolicyCheck<'_>>(), 4),
+        (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>>(), 12),
+        (size_of::<std::option::Option<&crate::product_store::scope::owned_persist::ReconstructedOwned>>(), 4),
+        (size_of::<std::result::Result<(), crate::product_store::StoreError>>(), 16),
+        (size_of::<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>(), 24),
+        (size_of::<u64>(), 8),
+    ])
+}
+// Complete producing fixed slots: 105; direct activation/control sites: 47.
+// Includes the new exact error String boundary and checked 81-byte literal copy.
+pub(crate) const HISTORICAL_INITIAL_SURFACE_PAYMENT: u64 = comparison_payment(3008, [
+        (size_of::<&mut crate::product_store::scope::common_fact_admission::ProofMeter>(), 32),
+        (size_of::<&mut crate::product_store::scope::OwnedPolicyCheck<'_>>(), 12),
+        (size_of::<&crate::product_contract::CapturedProgram>(), 24),
+        (size_of::<&crate::product_contract::Digest>(), 8),
+        (size_of::<&crate::product_store::ProjectSnapshot>(), 8),
+        (size_of::<&crate::product_store::scope::owned_continuation::VerifiedOwnedContinuation>(), 8),
+        (size_of::<&crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution>(), 24),
+        (size_of::<&crate::product_store::scope::HistoricalInitialLoan<'_>>(), 20),
+        (size_of::<&crate::product_store::scope::owned_persist::ReconstructedOwned>(), 8),
+        (size_of::<&crate::product_store::scope::owned_wire::OwnedLayerV2>(), 12),
+        (size_of::<&crate::product_store::scope::owned_wire::OwnedScopeStateV2>(), 8),
+        (size_of::<&std::collections::BTreeMap<crate::product_contract::Digest, crate::product_store::scope::owned_wire::OwnedLayerV2>>(), 4),
+        (size_of::<&std::sync::Arc<crate::product_store::scope::owned_continuation::VerifiedOwnedContinuation>>(), 4),
+        (size_of::<&str>(), 8),
+        (size_of::<()>(), 32),
+        (size_of::<*const crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution>(), 8),
+        (size_of::<bool>(), 8),
+        (size_of::<isize>(), 28),
+        (size_of::<crate::product_store::StoreError>(), 4),
+        (size_of::<crate::product_store::scope::owned_continuation::VerifiedOwnedPolicySurface>(), 4),
+        (size_of::<crate::product_store::scope::owned_persist::ReconstructedOwned>(), 8),
+        (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>, &crate::product_store::scope::owned_wire::OwnedLayerV2>>(), 4),
+        (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>, &crate::product_store::scope::owned_wire::OwnedScopeStateV2>>(), 4),
+        (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>, crate::product_store::scope::owned_continuation::VerifiedOwnedPolicySurface>>(), 4),
+        (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>, crate::product_store::scope::owned_persist::ReconstructedOwned>>(), 4),
+        (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>>(), 12),
+        (size_of::<std::option::Option<&crate::product_store::scope::owned_wire::OwnedLayerV2>>(), 4),
+        (size_of::<std::result::Result<&crate::product_store::scope::owned_wire::OwnedLayerV2, crate::product_store::StoreError>>(), 4),
+        (size_of::<std::result::Result<&crate::product_store::scope::owned_wire::OwnedScopeStateV2, crate::product_store::StoreError>>(), 4),
+        (size_of::<std::result::Result<(), crate::product_store::StoreError>>(), 12),
+        (size_of::<std::result::Result<crate::product_store::scope::owned_continuation::VerifiedOwnedPolicySurface, crate::product_store::StoreError>>(), 12),
+        (size_of::<std::result::Result<crate::product_store::scope::owned_persist::ReconstructedOwned, crate::product_store::StoreError>>(), 4),
+        (size_of::<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>(), 56),
+        (size_of::<std::string::String>(), 8),
+        (size_of::<u64>(), 12),
+        ("Common factual admission: owned policy: historical Initial loan execution differs".len(), 1),
+    ]);
+// Complete producing fixed slots: 19; direct activation/control sites: 7.
+const HISTORICAL_INITIAL_WORKER_PAYMENT: u64 = comparison_payment(448, [
+        (size_of::<&mut crate::product_store::scope::common_fact_admission::ProofMeter>(), 8),
+        (size_of::<&crate::product_store::ProjectSnapshot>(), 4),
+        (size_of::<&crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution>(), 8),
+        (size_of::<&crate::product_store::scope::HistoricalInitialLoan<'_>>(), 4),
+        (size_of::<()>(), 16),
+        (size_of::<isize>(), 4),
+        (size_of::<crate::product_store::scope::owned_persist::RegistryOnly>(), 4),
+        (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>>(), 4),
+        (size_of::<std::option::Option<crate::product_store::scope::owned_persist::CompletedInitialOrigin<'_, '_>>>(), 8),
+        (size_of::<std::result::Result<(), crate::product_store::StoreError>>(), 4),
+        (size_of::<std::result::Result<crate::product_store::scope::owned_persist::ReconstructedOwned, crate::product_store::StoreError>>(), 4),
+        (size_of::<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>(), 8),
+    ]);
+// Complete producing fixed slots: 160; direct activation/control sites: 64.
+const HISTORICAL_INITIAL_SLOT_PAYMENT: u64 = comparison_payment(4096, [
+        (size_of::<&mut crate::product_store::scope::common_fact_admission::ProofMeter>(), 48),
+        (size_of::<&crate::product_contract::Digest>(), 20),
+        (size_of::<&crate::product_store::ProjectSnapshot>(), 12),
+        (size_of::<&crate::product_store::scope::owned_persist::GraphHistory>(), 16),
+        (size_of::<&crate::product_store::scope::HistoricalInitialLoan<'_>>(), 12),
+        (size_of::<&crate::product_store::scope::owned_persist::HistoricalInitialPrepared>(), 4),
+        (size_of::<&crate::product_store::scope::owned_persist::ReconstructedOwned>(), 4),
+        (size_of::<&crate::product_store::scope::owned_preview::PreparedOwnedPreview>(), 12),
+        (size_of::<&crate::product_store::scope::owned_wire::OwnedCompositionV2>(), 12),
+        (size_of::<&crate::product_store::scope::owned_wire::OwnedInitializationV2>(), 8),
+        (size_of::<&crate::product_store::scope::owned_wire::OwnedLayerV2>(), 8),
+        (size_of::<&std::sync::Arc<crate::product_store::scope::owned_preview::PreparedOwnedPreview>>(), 24),
+        (size_of::<&std::time::Duration>(), 4),
+        (size_of::<&std::time::Instant>(), 4),
+        (size_of::<()>(), 48),
+        (size_of::<bool>(), 40),
+        (size_of::<isize>(), 68),
+        (size_of::<crate::product_contract::RuntimeLimits>(), 4),
+        (size_of::<crate::product_store::scope::owned_persist::FreshInitialOrigin<'_>>(), 4),
+        (size_of::<crate::product_store::scope::owned_persist::HistoricalInitialPrepared>(), 8),
+        (size_of::<crate::product_store::scope::owned_preview::PreparedOwnedPreview>(), 16),
+        (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>, bool>>(), 4),
+        (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>, crate::product_store::scope::owned_preview::PreparedOwnedPreview>>(), 8),
+        (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>, std::option::Option<&std::sync::Arc<crate::product_store::scope::owned_preview::PreparedOwnedPreview>>>>(), 8),
+        (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>>(), 20),
+        (size_of::<std::option::Option<&std::sync::Arc<crate::product_store::scope::owned_preview::PreparedOwnedPreview>>>(), 20),
+        (size_of::<std::option::Option<crate::product_store::scope::owned_persist::FreshInitialOrigin<'_>>>(), 4),
+        (size_of::<std::option::Option<u128>>(), 4),
+        (size_of::<std::result::Result<(), crate::product_store::StoreError>>(), 20),
+        (size_of::<std::result::Result<bool, crate::product_store::StoreError>>(), 8),
+        (size_of::<std::result::Result<crate::product_store::scope::owned_preview::PreparedOwnedPreview, crate::product_store::StoreError>>(), 8),
+        (size_of::<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>(), 80),
+        (size_of::<std::result::Result<std::option::Option<&std::sync::Arc<crate::product_store::scope::owned_preview::PreparedOwnedPreview>>, crate::product_store::StoreError>>(), 12),
+        (size_of::<std::sync::Arc<crate::product_store::scope::owned_preview::PreparedOwnedPreview>>(), 16),
+        (size_of::<std::time::Duration>(), 4),
+        (size_of::<u128>(), 20),
+        (size_of::<u64>(), 28),
+    ]);
+// Complete producing fixed slots: 11; direct activation/control sites: 6.
+const HISTORICAL_INITIAL_SCAN_PAYMENT: u64 = comparison_payment(384, [
+        (size_of::<&mut crate::product_store::scope::common_fact_admission::ProofMeter>(), 4),
+        (size_of::<&std::collections::BTreeMap<crate::product_contract::Digest, crate::product_store::scope::owned_epoch::OwnedExecutionRecipe>>(), 4),
+        (size_of::<()>(), 8),
+        (size_of::<isize>(), 4),
+        (size_of::<std::collections::btree_map::Iter<'_, crate::product_contract::Digest, crate::product_store::scope::owned_epoch::OwnedExecutionRecipe>>(), 4),
+        (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>>(), 4),
+        (size_of::<std::result::Result<(), crate::product_store::StoreError>>(), 4),
+        (size_of::<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>(), 8),
+        (size_of::<u64>(), 4),
+    ]);
+// Complete producing fixed slots: 15; direct activation/control sites: 7.
+const HISTORICAL_INITIAL_NEXT_PAYMENT: u64 = comparison_payment(448, [
+        (size_of::<&mut crate::product_store::scope::common_fact_admission::ProofMeter>(), 4),
+        (size_of::<&mut std::collections::btree_map::Iter<'_, crate::product_contract::Digest, crate::product_store::scope::owned_epoch::OwnedExecutionRecipe>>(), 4),
+        (size_of::<&crate::product_contract::Digest>(), 4),
+        (size_of::<&crate::product_store::scope::owned_epoch::OwnedExecutionRecipe>(), 4),
+        (size_of::<()>(), 8),
+        (size_of::<isize>(), 8),
+        (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>>(), 4),
+        (size_of::<std::option::Option<&std::sync::Arc<crate::product_store::scope::owned_preview::PreparedOwnedPreview>>>(), 4),
+        (size_of::<std::option::Option<(&crate::product_contract::Digest, &crate::product_store::scope::owned_epoch::OwnedExecutionRecipe)>>(), 4),
+        (size_of::<std::result::Result<(), crate::product_store::StoreError>>(), 4),
+        (size_of::<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>(), 8),
+        (size_of::<u64>(), 4),
+    ]);
+// Complete producing fixed slots: 41; direct activation/control sites: 24.
+const HISTORICAL_INITIAL_COMPARE_PAYMENT: u64 = comparison_payment(1536, [
+        (size_of::<&&crate::product_contract::Digest>(), 8),
+        (size_of::<&mut crate::product_store::scope::common_fact_admission::ProofMeter>(), 8),
+        (size_of::<&crate::product_contract::Digest>(), 8),
+        (size_of::<&std::sync::Arc<crate::product_store::scope::owned_preview::PreparedOwnedPreview>>(), 8),
+        (size_of::<&str>(), 16),
+        (size_of::<()>(), 16),
+        (size_of::<bool>(), 4),
+        (size_of::<isize>(), 12),
+        (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>>(), 8),
+        (size_of::<std::option::Option<&std::sync::Arc<crate::product_store::scope::owned_preview::PreparedOwnedPreview>>>(), 4),
+        (size_of::<std::option::Option<u64>>(), 8),
+        (size_of::<std::option::Option<usize>>(), 4),
+        (size_of::<std::result::Result<(), crate::product_store::StoreError>>(), 8),
+        (size_of::<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>(), 16),
+        (size_of::<std::result::Result<u64, std::num::TryFromIntError>>(), 4),
+        (size_of::<u64>(), 8),
+        (size_of::<usize>(), 16),
+    ]);
+// Complete producing fixed slots: 24; direct activation/control sites: 10.
+const HISTORICAL_INITIAL_MINT_PAYMENT: u64 = comparison_payment(640, [
+        (size_of::<&mut crate::product_store::scope::common_fact_admission::ProofMeter>(), 8),
+        (size_of::<&crate::product_store::ProjectSnapshot>(), 4),
+        (size_of::<&std::sync::Arc<crate::product_store::scope::owned_preview::PreparedOwnedPreview>>(), 8),
+        (size_of::<()>(), 16),
+        (size_of::<isize>(), 8),
+        (size_of::<crate::product_store::scope::owned_persist::CompletedInitialOrigin<'_, '_>>(), 4),
+        (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>>(), 8),
+        (size_of::<std::option::Option<crate::product_store::scope::owned_persist::CompletedInitialOrigin<'_, '_>>>(), 4),
+        (size_of::<std::result::Result<(), crate::product_store::StoreError>>(), 8),
+        (size_of::<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>(), 16),
+        (size_of::<std::sync::Arc<crate::product_store::scope::owned_preview::PreparedOwnedPreview>>(), 4),
+        (size_of::<u64>(), 8),
+    ]);
+// Complete producing fixed slots: 74; direct activation/control sites: 23.
+const HISTORICAL_INITIAL_TRANSITION_PAYMENT: u64 = comparison_payment(1472, [
+        (size_of::<&mut crate::product_store::scope::common_fact_admission::ProofMeter>(), 16),
+        (size_of::<&mut std::option::Option<crate::product_store::scope::owned_persist::CompletedInitialOrigin<'_, '_>>>(), 4),
+        (size_of::<&mut std::option::Option<crate::product_store::scope::owned_persist::FreshInitialOrigin<'_>>>(), 4),
+        (size_of::<&crate::product_store::ProjectSnapshot>(), 40),
+        (size_of::<&crate::product_store::scope::contract::ScopeTransition>(), 12),
+        (size_of::<&crate::product_store::scope::owned_persist::CompletedInitialOrigin<'_, '_>>(), 12),
+        (size_of::<&crate::product_store::scope::owned_persist::ReconstructedOwned>(), 20),
+        (size_of::<&crate::product_store::scope::owned_wire::OwnedCompositionV2>(), 12),
+        (size_of::<&crate::product_store::scope::owned_wire::OwnedInitializationV2>(), 12),
+        (size_of::<&crate::product_store::scope::owned_wire::OwnedLayerV2>(), 12),
+        (size_of::<&std::option::Option<crate::product_store::scope::owned_persist::CompletedInitialOrigin<'_, '_>>>(), 4),
+        (size_of::<&std::option::Option<crate::product_store::scope::owned_persist::FreshInitialOrigin<'_>>>(), 4),
+        (size_of::<&std::sync::Arc<crate::product_store::scope::owned_preview::PreparedOwnedPreview>>(), 4),
+        (size_of::<()>(), 16),
+        (size_of::<bool>(), 4),
+        (size_of::<isize>(), 16),
+        (size_of::<crate::product_store::scope::contract::ScopeTransition>(), 4),
+        (size_of::<crate::product_store::scope::owned_continuation::VerifiedOwnedContinuation>(), 4),
+        (size_of::<crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution>(), 12),
+        (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>, crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution>>(), 8),
+        (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>>(), 4),
+        (size_of::<std::option::Option<&crate::product_store::scope::owned_persist::CompletedInitialOrigin<'_, '_>>>(), 4),
+        (size_of::<std::option::Option<&crate::product_store::scope::owned_persist::FreshInitialOrigin<'_>>>(), 4),
+        (size_of::<std::option::Option<crate::product_store::scope::owned_persist::CompletedInitialOrigin<'_, '_>>>(), 8),
+        (size_of::<std::option::Option<crate::product_store::scope::owned_persist::FreshInitialOrigin<'_>>>(), 8),
+        (size_of::<std::result::Result<(), crate::product_store::StoreError>>(), 4),
+        (size_of::<std::result::Result<crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution, crate::product_store::StoreError>>(), 12),
+        (size_of::<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>(), 24),
+        (size_of::<std::sync::Arc<crate::product_store::scope::owned_preview::PreparedOwnedPreview>>(), 4),
+        (size_of::<u64>(), 4),
+    ]);
+// Preserve every old transition component; prepay the additional view before
+// take, selected activation, tuple construction or any new borrowed owner.
+const HISTORICAL_INITIAL_TRANSITION_WITH_VIEW_PAYMENT: u64 =
+    HISTORICAL_INITIAL_TRANSITION_PAYMENT
+        .checked_add(owned_continuation::COMPLETED_INITIAL_ORIGIN_VIEW_PAYMENT)
+        .expect("completed transition view payment overflow");
+// Complete producing fixed slots: 14; direct activation/control sites: 7.
+const HISTORICAL_INITIAL_ARC_PAYMENT: u64 = comparison_payment(448, [
+        (size_of::<&mut crate::product_store::scope::common_fact_admission::ProofMeter>(), 4),
+        (size_of::<()>(), 8),
+        (size_of::<isize>(), 8),
+        (size_of::<crate::product_store::scope::owned_preview::PreparedOwnedPreview>(), 8),
+        (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>>(), 4),
+        (size_of::<std::result::Result<(), crate::product_store::StoreError>>(), 4),
+        (size_of::<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>(), 8),
+        (size_of::<std::sync::Arc<crate::product_store::scope::owned_preview::PreparedOwnedPreview>>(), 8),
+        (size_of::<u64>(), 4),
+    ]);
+
+// Only the completed outer checker below mints this pair. No parts factory,
+// registry getter, Clone/Copy, or source-selected historical endpoint exists.
+pub(crate) struct HistoricalInitialLoan<'gate> {
+    registry: &'gate ReconstructedOwned,
+    execution: &'gate VerifiedOwnedTransitionExecution,
+}
+// V12 complete fixed transport packets. All old floors remain unchanged;
+// the whole duplicate native interval is removed only by its one-use proof.
+// I0: 53 actual full typed slots; 60 operations, including both worker-entry cleanup flags.
+const HISTORICAL_INITIAL_INTERVAL_ENTRY_PAYMENT: u64 = comparison_payment(64_u64.checked_mul(60).expect("interval operation count overflow"), [
+    (size_of::<&mut crate::product_store::scope::common_fact_admission::ProofMeter>(), 4_u64.checked_mul(6).expect("interval slot count overflow")),
+    (size_of::<&crate::product_contract::CapturedProgram>(), 4_u64.checked_mul(2).expect("interval slot count overflow")),
+    (size_of::<&crate::product_store::ProjectSnapshot>(), 4_u64.checked_mul(1).expect("interval slot count overflow")),
+    (size_of::<&crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution>(), 4_u64.checked_mul(3).expect("interval slot count overflow")),
+    (size_of::<&crate::product_store::scope::owned_persist::HistoricalInitialLoan<'_>>(), 4_u64.checked_mul(3).expect("interval slot count overflow")),
+    (size_of::<&crate::product_store::scope::owned_persist::ReconstructedOwned>(), 4_u64.checked_mul(2).expect("interval slot count overflow")),
+    (size_of::<&crate::product_store::scope::owned_wire::OwnedLayerV2>(), 4_u64.checked_mul(1).expect("interval slot count overflow")),
+    (size_of::<bool>(), 4_u64.checked_mul(2).expect("interval slot count overflow")),
+    (size_of::<()>(), 4_u64.checked_mul(7).expect("interval slot count overflow")),
+    (size_of::<isize>(), 4_u64.checked_mul(3).expect("interval slot count overflow")),
+    (size_of::<crate::product_store::scope::owned_persist::ReconstructedOwned>(), 4_u64.checked_mul(2).expect("interval slot count overflow")),
+    (size_of::<crate::product_store::scope::owned_persist::RegistryOnly>(), 4_u64.checked_mul(1).expect("interval slot count overflow")),
+    (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>, crate::product_store::scope::owned_persist::ReconstructedOwned>>(), 4_u64.checked_mul(1).expect("interval slot count overflow")),
+    (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>>(), 4_u64.checked_mul(2).expect("interval slot count overflow")),
+    (size_of::<std::option::Option<crate::product_store::scope::owned_persist::CompletedInitialInterval<'_, '_>>>(), 4_u64.checked_mul(2).expect("interval slot count overflow")),
+    (size_of::<std::option::Option<crate::product_store::scope::owned_persist::CompletedInitialOrigin<'_, '_>>>(), 4_u64.checked_mul(2).expect("interval slot count overflow")),
+    (size_of::<std::result::Result<(), crate::product_store::StoreError>>(), 4_u64.checked_mul(2).expect("interval slot count overflow")),
+    (size_of::<std::result::Result<crate::product_store::scope::owned_continuation::VerifiedOwnedPolicySurface, crate::product_store::StoreError>>(), 4_u64.checked_mul(1).expect("interval slot count overflow")),
+    (size_of::<std::result::Result<crate::product_store::scope::owned_persist::ReconstructedOwned, crate::product_store::StoreError>>(), 4_u64.checked_mul(2).expect("interval slot count overflow")),
+    (size_of::<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>(), 4_u64.checked_mul(6).expect("interval slot count overflow")),
+    (size_of::<u64>(), 4_u64.checked_mul(2).expect("interval slot count overflow")),
+]);
+// I1: 15 actual full typed slots; 18 paid fixed activation/control operations.
+const HISTORICAL_INITIAL_INTERVAL_MINT_PAYMENT: u64 = comparison_payment(64_u64.checked_mul(18).expect("interval operation count overflow"), [
+    (size_of::<&mut crate::product_store::scope::common_fact_admission::ProofMeter>(), 4_u64.checked_mul(1).expect("interval slot count overflow")),
+    (size_of::<&crate::product_store::scope::owned_persist::HistoricalInitialLoan<'_>>(), 4_u64.checked_mul(1).expect("interval slot count overflow")),
+    (size_of::<&std::sync::Arc<crate::product_store::scope::owned_preview::PreparedOwnedPreview>>(), 4_u64.checked_mul(1).expect("interval slot count overflow")),
+    (size_of::<()>(), 4_u64.checked_mul(2).expect("interval slot count overflow")),
+    (size_of::<isize>(), 4_u64.checked_mul(1).expect("interval slot count overflow")),
+    (size_of::<crate::product_store::scope::owned_persist::CompletedInitialInterval<'_, '_>>(), 4_u64.checked_mul(1).expect("interval slot count overflow")),
+    (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>>(), 4_u64.checked_mul(1).expect("interval slot count overflow")),
+    (size_of::<std::option::Option<crate::product_store::scope::owned_persist::CompletedInitialInterval<'_, '_>>>(), 4_u64.checked_mul(1).expect("interval slot count overflow")),
+    (size_of::<std::option::Option<crate::product_store::scope::owned_persist::CompletedInitialOrigin<'_, '_>>>(), 4_u64.checked_mul(1).expect("interval slot count overflow")),
+    (size_of::<std::result::Result<(), crate::product_store::StoreError>>(), 4_u64.checked_mul(1).expect("interval slot count overflow")),
+    (size_of::<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>(), 4_u64.checked_mul(2).expect("interval slot count overflow")),
+    (size_of::<std::sync::Arc<crate::product_store::scope::owned_preview::PreparedOwnedPreview>>(), 4_u64.checked_mul(1).expect("interval slot count overflow")),
+    (size_of::<u64>(), 4_u64.checked_mul(1).expect("interval slot count overflow")),
+]);
+// I2: 66 full typed slots; 94 operations, including cause materialization, Err construction and later flag control.
+const HISTORICAL_INITIAL_INTERVAL_SELECT_PAYMENT: u64 = comparison_payment(64_u64.checked_mul(94).expect("interval operation count overflow"), [
+    (size_of::<&mut crate::product_store::scope::common_fact_admission::ProofMeter>(), 4_u64.checked_mul(5).expect("interval slot count overflow")),
+    (size_of::<&mut std::option::Option<crate::product_store::scope::owned_persist::CompletedInitialInterval<'_, '_>>>(), 4_u64.checked_mul(1).expect("interval slot count overflow")),
+    (size_of::<&crate::product_contract::DataSnapshot>(), 4_u64.checked_mul(1).expect("interval slot count overflow")),
+    (size_of::<&crate::product_store::ProjectSnapshot>(), 4_u64.checked_mul(1).expect("interval slot count overflow")),
+    (size_of::<&crate::product_store::scope::common_fact_admission::ProofMeter>(), 4_u64.checked_mul(2).expect("interval slot count overflow")),
+    (size_of::<&crate::product_store::scope::owned_epoch::OwnedExecutionRecipe>(), 4_u64.checked_mul(1).expect("interval slot count overflow")),
+    (size_of::<&std::time::Duration>(), 4_u64.checked_mul(1).expect("interval slot count overflow")),
+    (size_of::<&std::time::Instant>(), 4_u64.checked_mul(1).expect("interval slot count overflow")),
+    (size_of::<()>(), 4_u64.checked_mul(5).expect("interval slot count overflow")),
+    (size_of::<bool>(), 4_u64.checked_mul(2).expect("interval slot count overflow")),
+    (size_of::<i32>(), 4_u64.checked_mul(1).expect("interval slot count overflow")),
+    (size_of::<isize>(), 4_u64.checked_mul(7).expect("interval slot count overflow")),
+    (size_of::<crate::product_contract::RuntimeLimits>(), 4_u64.checked_mul(1).expect("interval slot count overflow")),
+    (size_of::<crate::product_store::scope::owned_persist::CompletedInitialInterval<'_, '_>>(), 4_u64.checked_mul(1).expect("interval slot count overflow")),
+    (size_of::<std::option::Option<crate::product_store::scope::owned_persist::CompletedInitialInterval<'_, '_>>>(), 4_u64.checked_mul(2).expect("interval slot count overflow")),
+    (size_of::<std::option::Option<u128>>(), 4_u64.checked_mul(1).expect("interval slot count overflow")),
+    (size_of::<std::result::Result<(), crate::product_store::StoreError>>(), 4_u64.checked_mul(1).expect("interval slot count overflow")),
+    (size_of::<crate::product_store::StoreError>(), 4_u64.checked_mul(6).expect("interval slot count overflow")),
+    (size_of::<crate::product_store::scope::common_fact_admission::ProofChargeFailure>(), 4_u64.checked_mul(8).expect("interval slot count overflow")),
+    (size_of::<std::result::Result<(), crate::product_store::scope::common_fact_admission::ProofChargeFailure>>(), 4_u64.checked_mul(4).expect("interval slot count overflow")),
+    (size_of::<std::time::Duration>(), 4_u64.checked_mul(1).expect("interval slot count overflow")),
+    (size_of::<u128>(), 4_u64.checked_mul(5).expect("interval slot count overflow")),
+    (size_of::<u64>(), 4_u64.checked_mul(8).expect("interval slot count overflow")),
+]);
+
+// Only the selected committed Initial clone below mints this distinct one-use
+// interval authority. It cannot escape, expose parts, or represent a row cache.
+struct CompletedInitialInterval<'loan, 'outer> {
+    loan: &'loan HistoricalInitialLoan<'outer>,
+    original: &'loan Arc<PreparedOwnedPreview>,
+}
+
+#[cfg(test)]
+pub(super) const HISTORICAL_INITIAL_INTERVAL_CENSUS: ([usize; 10], [u64; 3]) = {
+    #[cfg(target_pointer_width = "64")]
+    {
+    assert!(size_of::<&mut crate::product_store::scope::common_fact_admission::ProofMeter>() == 8);
+    assert!(size_of::<&mut std::option::Option<crate::product_store::scope::owned_persist::CompletedInitialInterval<'_, '_>>>() == 8);
+    assert!(size_of::<&crate::product_contract::CapturedProgram>() == 8);
+    assert!(size_of::<&crate::product_contract::DataSnapshot>() == 8);
+    assert!(size_of::<&crate::product_store::ProjectSnapshot>() == 8);
+    assert!(size_of::<&crate::product_store::scope::owned_epoch::OwnedExecutionRecipe>() == 8);
+    assert!(size_of::<&crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution>() == 8);
+    assert!(size_of::<&crate::product_store::scope::owned_persist::HistoricalInitialLoan<'_>>() == 8);
+    assert!(size_of::<&crate::product_store::scope::owned_persist::ReconstructedOwned>() == 8);
+    assert!(size_of::<&crate::product_store::scope::owned_wire::OwnedLayerV2>() == 8);
+    assert!(size_of::<&std::sync::Arc<crate::product_store::scope::owned_preview::PreparedOwnedPreview>>() == 8);
+    assert!(size_of::<&std::time::Duration>() == 8);
+    assert!(size_of::<&std::time::Instant>() == 8);
+    assert!(size_of::<()>() == 0);
+    assert!(size_of::<*const crate::product_store::scope::owned_persist::HistoricalInitialLoan<'_>>() == 8);
+    assert!(size_of::<bool>() == 1);
+    assert!(size_of::<i32>() == 4);
+    assert!(size_of::<isize>() == 8);
+    assert!(size_of::<crate::product_contract::RuntimeLimits>() == 48);
+    assert!(size_of::<crate::product_store::scope::owned_persist::CompletedInitialInterval<'_, '_>>() == 16);
+    assert!(size_of::<crate::product_store::scope::owned_persist::ReconstructedOwned>() == 144);
+    assert!(size_of::<crate::product_store::scope::owned_persist::RegistryOnly>() == 0);
+    assert!(size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>, bool>>() == 152);
+    assert!(size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>, crate::product_store::scope::owned_persist::ReconstructedOwned>>() == 152);
+    assert!(size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>>() == 152);
+    assert!(size_of::<std::option::Option<crate::product_store::scope::owned_persist::CompletedInitialInterval<'_, '_>>>() == 16);
+    assert!(size_of::<std::option::Option<crate::product_store::scope::owned_persist::CompletedInitialOrigin<'_, '_>>>() == 16);
+    assert!(size_of::<std::option::Option<u128>>() == 32);
+    assert!(size_of::<std::result::Result<(), crate::product_store::StoreError>>() == 152);
+    assert!(size_of::<std::result::Result<bool, crate::product_store::StoreError>>() == 152);
+    assert!(size_of::<std::result::Result<crate::product_store::scope::owned_continuation::VerifiedOwnedPolicySurface, crate::product_store::StoreError>>() == 240);
+    assert!(size_of::<std::result::Result<crate::product_store::scope::owned_persist::ReconstructedOwned, crate::product_store::StoreError>>() == 152);
+    assert!(size_of::<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>() == 152);
+    assert!(size_of::<std::sync::Arc<crate::product_store::scope::owned_preview::PreparedOwnedPreview>>() == 8);
+    assert!(size_of::<std::time::Duration>() == 16);
+    assert!(size_of::<u128>() == 16);
+    assert!(size_of::<u64>() == 8);
+    assert!(size_of::<usize>() == 8);
+    }
+    ([
+    size_of::<CompletedInitialInterval<'_, '_>>(),
+    size_of::<Option<CompletedInitialInterval<'_, '_>>>(),
+    size_of::<Result<ReconstructedOwned>>(),
+    size_of::<Result<owned_continuation::VerifiedOwnedPolicySurface>>(),
+    size_of::<Result<bool>>(),
+    size_of::<Result<()>>(),
+    size_of::<Result<std::convert::Infallible>>(),
+    size_of::<Option<u128>>(),
+    size_of::<RuntimeLimits>(),
+    size_of::<owned_transition::OwnedPolicyCheck<'_>>(),
+], [HISTORICAL_INITIAL_INTERVAL_ENTRY_PAYMENT,
+    HISTORICAL_INITIAL_INTERVAL_MINT_PAYMENT,
+    HISTORICAL_INITIAL_INTERVAL_SELECT_PAYMENT])
+};
+
+pub(super) struct CompletedInitialOrigin<'h, 'o> {
+    retained: &'h ProjectSnapshot,
+    original: &'o Arc<PreparedOwnedPreview>,
+}
+impl CompletedInitialOrigin<'_, '_> {
+    // Both returned borrows are tied to this unforgeable completed owner.
+    pub(super) fn references(&self) -> (&ProjectSnapshot, &Arc<PreparedOwnedPreview>) {
+        (self.retained, self.original)
+    }
+}
+// Preserve the native prospective Arc-allocation position after bind/seed checks.
+// A hit borrows until that position; a miss still owns the native prepared value.
+enum HistoricalInitialPrepared {
+    Completed(Arc<PreparedOwnedPreview>),
+    Native(PreparedOwnedPreview),
+}
+
+// Sole mint: the consumed first committed Initial origin below. Neither raw
+// registry callers nor an equal-looking deserialized value can construct this.
+pub(super) struct CompletedStructuralLoan<'loan, 'retained, 'original> {
+    origin: &'loan CompletedInitialOrigin<'retained, 'original>,
+    donor: &'loan Arc<VerifiedOwnedTransitionExecution>,
+}
+impl CompletedStructuralLoan<'_, '_, '_> {
+    pub(super) fn references(&self) -> (&ProjectSnapshot, &Arc<VerifiedOwnedTransitionExecution>) {
+        (self.origin.retained, self.donor)
+    }
+}
+
+pub(crate) fn check_retained_transition_policies_with_initials<C>(
+    snapshot: &ProjectSnapshot, mut check: C,
+) -> Result<()>
+where C: for<'gate, 'loan> FnMut(&mut owned_transition::OwnedPolicyCheck<'gate>, &HistoricalInitialLoan<'loan>) -> Result<()>,
+{
+    if !snapshot.owned_scope().is_ok_and(|state| {
+        state.compositions.values().any(|m| {
+            m.lowering == OWNED_TRANSITION_LOWERING_VERSION
+                && m.transition == ScopeTransition::Withdrawal
+        })
+    }) { return Ok(()); }
+    let mut meter = ProofMeter::new(ProofBudget::default(), Arc::new(AtomicBool::new(false)))?;
+    #[cfg(test)]
+    adoption_diagnostic::phase(adoption_diagnostic::Phase::ArchiveReconstruct);
+    let registry = reconstruct(snapshot, &mut meter)?;
+    #[cfg(test)]
+    adoption_diagnostic::phase(adoption_diagnostic::Phase::ArchivePolicy);
+    for execution in registry.checked_withdrawals() {
+        meter.charge(1)?;
+        meter.charge(6)?;
+        meter.charge(const { historical_initial_callback_payment::<C>() })?;
+        let loan = HistoricalInitialLoan { registry: &registry, execution };
+        #[cfg(test)]
+        combined_transition_reuse_tests::accounting("before-policy", &meter);
+        owned_transition::invoke_historical_initial_policy(execution, &loan, &mut meter, &mut check)?;
+        #[cfg(test)]
+        combined_transition_reuse_tests::accounting("after-policy", &meter);
+    }
+    Ok(())
+}
+macro_rules! policy_frames_body {
+    ($self:ident, $snapshot:expr, $surface:ident, $meter:expr,
+     [$($select:tt)*], [$($visitor:tt)*], [$($replay:tt)*],
+     $index:ident, $recipe:ident, $endpoint:ident, $day:ident, $visit:ident, [$($finish:tt)*]) => {{
+        $self.check_snapshot($snapshot)?;
+        let state = $snapshot.owned_scope()?;
+        if !state.layers.contains_key($surface.original_layer()) || $self.epochs.is_empty() {
+            return Err(crate::product_store::scope::owned_persist::err(
+                "policy surface is not bound to this committed original layer",
+            ));
+        }
+        // The type cannot be caller-constructed; the source still has to belong
+        // to this exact reconstructed prefix, including provenance.
+        let source = crate::product_store::scope::program($snapshot, $surface.source())?;
+        $self.resolve(source)?;
+        $($select)*
+        for ($index, epoch) in $self.epochs.iter().enumerate() {
+            let $recipe = $self
+                .recipes
+                .get(&epoch.output)
+                .ok_or_else(|| crate::product_store::scope::owned_persist::err("policy producer recipe missing"))?;
+            let ($endpoint, $day) = if let Some(next) = $self.epochs.get($index + 1) {
+                let next_recipe = $self
+                    .recipes
+                    .get(&next.output)
+                    .ok_or_else(|| crate::product_store::scope::owned_persist::err("policy successor recipe missing"))?;
+                (next_recipe.seed(), next_recipe.basis().clock_day)
+            } else {
+                (&$snapshot.data, $snapshot.clock_day)
+            };
+            $($visitor)*
+            $($replay)*
+        }
+        $($finish)*
+    }};
+}
+pub(super) use policy_frames_body;
+
+// Standalone administrative failure keeps its original full-error boundary.
+// Shared joins below cross only the reviewed equal heap-cleanup regions.
+macro_rules! completed_charge {
+    ($meter:expr, $units:expr) => {
+        match $meter.charge_cause($units) {
+            Ok(()) => (),
+            Err(cause) => return Err(cause.historical_initial_interval_error()),
+        }
+    };
+}
+macro_rules! completed_charge_to {
+    ($failure:lifetime, $meter:expr, $units:expr) => {
+        match $meter.charge_cause($units) {
+            Ok(()) => (),
+            Err(cause) => break $failure Some(cause),
+        }
+    };
+}
+macro_rules! completed_window_to {
+    ($failure:lifetime, $meter:expr) => {{
+        completed_charge_to!($failure, $meter, 0);
+        $meter.reconstruction_default_window_after_poll()
+    }};
+}
+macro_rules! completed_failure {
+    ($failure:expr) => {
+        if let Some(cause) = $failure {
+            return Err(cause.historical_initial_interval_error());
+        }
+    };
+}
+macro_rules! completed_shape {
+    ($pair:ident, $inner:expr) => {{
+        'completed_shape: {
+            let [a,p] = $inner.epochs.as_slice() else { break 'completed_shape false; };
+            let [outer_a,outer_p,_,..] = $pair.loan.registry.epochs.as_slice() else { break 'completed_shape false; };
+            a.output == outer_a.output && p.output == outer_p.output
+                && a.adoption_revision == outer_a.adoption_revision
+                && p.adoption_revision == outer_p.adoption_revision
+        }
+    }};
+}
+macro_rules! completed_recipe {
+    ($pair:ident, $recipe:expr, $initial:expr) => {{
+        match ($recipe, if $initial {$pair.initial} else {$pair.transition}) {
+            (OwnedExecutionRecipe::Initial(a),OwnedExecutionRecipe::Initial(b)) => Arc::ptr_eq(a,b),
+            (OwnedExecutionRecipe::Transition(a),OwnedExecutionRecipe::Transition(b)) => Arc::ptr_eq(a,b),
+            _=>false,
+        }
+    }};
+}
+macro_rules! completed_tail {
+    ($pair:ident, $inner:expr, $recipe:expr, $data:expr, $day:expr, $revision:expr) => {{
+        completed_shape!($pair,$inner) && completed_recipe!($pair,$recipe,false)
+            && std::ptr::eq($data,&$pair.loan.execution.current().data)
+            && $day == $pair.loan.execution.current().clock_day
+            && $revision == $pair.loan.execution.current().revision
+    }};
+}
+macro_rules! completed_epoch {
+    ($pair:ident, $inner:expr, $index:expr, $recipe:expr, $endpoint:expr, $day:expr) => {{
+        if !completed_shape!($pair,$inner) { false } else {
+            match $index {
+                0 => completed_recipe!($pair,$recipe,true)
+                    && std::ptr::eq($endpoint,$pair.transition.seed())
+                    && $day == $pair.transition.basis().clock_day,
+                1 => completed_recipe!($pair,$recipe,false)
+                    && std::ptr::eq($endpoint,&$pair.loan.execution.current().data)
+                    && $day == $pair.loan.execution.current().clock_day,
+                _=>false,
+            }
+        }
+    }};
+}
+macro_rules! completed_surface_body {
+    ($pair:ident, $registry:ident, $source:ident, $layer:ident, $meter:ident) => {{
+        #[cfg(test)] adoption_diagnostic::phase(adoption_diagnostic::Phase::SurfaceDerive);
+        #[cfg(test)] completed_interval_tests::derive_boundary("before",$meter);
+        let surface = match $registry.resolve($source)? {
+            OwnedExecutionRecipe::Initial(original) => owned_continuation::derive_policy_surface(original, $layer, None, $meter)?,
+            OwnedExecutionRecipe::Transition(prior) => owned_continuation::derive_policy_surface(
+                &prior.original, $layer, Some((&prior.continuation, &prior.target)), $meter)?,
+        };
+        #[cfg(test)] completed_interval_tests::derive_boundary("after",$meter);
+        #[cfg(test)] adoption_diagnostic::phase(adoption_diagnostic::Phase::SurfaceFrames);
+        {
+            let surface_ref = &surface;
+            policy_frames_body!($registry, $pair.loan.execution.current(), surface_ref, $meter, [], [
+                let mut visit = |frame: &DataSnapshot, meter: &mut ProofMeter| {
+                    meter.charge(canonical_bytes(frame)?.len() as u64)?;
+                    #[cfg(test)] completed_interval_tests::visit(index,frame);
+                    surface_ref.validate_frame(frame)
+                };
+            ], [
+                let failure = 'completed_epoch_failure: {
+                completed_charge_to!('completed_epoch_failure, $meter, COMPLETED_INTERVAL_DISPATCH_PAYMENT);
+                if completed_epoch!($pair,$registry,index,recipe,endpoint,day)
+                    && completed_window_to!('completed_epoch_failure, $meter) {
+                    #[cfg(test)] completed_interval_tests::stage("replay-entry",$meter);
+                    // Pay all closed replay aliases before evaluating them.
+                    completed_charge_to!('completed_epoch_failure, $meter, COMPLETED_INTERVAL_REPLAY_PAYMENT);
+                    {
+                        // Closed lexical aliases, not an arbitrary-input replay API.
+                        let (recipe, endpoint, day) = if index == 0 {
+                            #[cfg(test)] completed_interval_tests::stage("initial",$meter);
+                            ($pair.initial,$pair.transition.seed(),$pair.transition.basis().clock_day)
+                        } else {
+                            #[cfg(test)] completed_interval_tests::stage("transition",$meter);
+                            ($pair.transition,&$pair.loan.execution.current().data,$pair.loan.execution.current().clock_day)
+                        };
+                        completed_interval_replay_body!($pair,recipe,endpoint,day,surface_ref,$meter,index);
+                    }
+                    // Frame/prior/revision aliases have completed their native drops.
+                    completed_charge_to!('completed_epoch_failure, $meter, 0);
+                } else {
+                    owned_replay::validate_recipe_history_with(recipe,recipe.seed(),recipe.basis().clock_day,
+                        endpoint,day,$meter,&mut visit)?;
+                }
+                None
+                };
+                // Row errors never reach here: they map with the replay owners live.
+                completed_failure!(failure);
+            ], index,recipe,endpoint,day,visit,[()]);
+        }
+        #[cfg(test)] adoption_diagnostic::phase(adoption_diagnostic::Phase::SurfaceComplete);
+        Ok(surface)
+    }};
+}
+
+macro_rules! completed_interval_replay_body {
+    ($self:ident, $recipe:ident, $endpoint:expr, $day:expr, $surface:ident, $meter:ident, $index:expr) => {{
+        let seed = $recipe.seed();
+        let seed_day = $recipe.basis().clock_day;
+        owned_replay::recipe_history_body!($recipe, seed, seed_day,
+            $endpoint, $day, $meter, [
+                $meter.charge(0)?;
+                #[cfg(test)] completed_interval_tests::visit($index, seed);
+                $surface.validate_frame(seed)?;
+            ], [
+                'completed_row: {
+                    owned_replay::protected_row_body!($recipe, &frame, row, old, event.day, $meter, $meter.runtime()?,
+                        [break 'completed_row;], [()], metadata, [
+                            // NEW administration exists only at the native new-seal slot.
+                            // All original row checks and early success precede it.
+                            let failure = 'completed_row_failure: {
+                                completed_charge_to!('completed_row_failure, $meter, COMPLETED_INTERVAL_ROW_PAYMENT);
+                                #[cfg(test)] completed_interval_tests::stage("row-admin", $meter);
+                                completed_charge_to!('completed_row_failure, $meter, COMPLETED_INTERVAL_PROJECTION_PAYMENT);
+                                if completed_window_to!('completed_row_failure, $meter) {
+                                    #[cfg(test)] completed_interval_tests::stage("projection-hit", $meter);
+                                    completed_charge_to!('completed_row_failure, $meter, 0);
+                                } else {
+                                    #[cfg(test)] completed_interval_tests::stage("projection-native", $meter);
+                                    owned_replay::native_completed_projection!($recipe, &frame, row, event.day, $meter, $meter.runtime()?, metadata);
+                                }
+                                None
+                            };
+                            // Convert with the native frame/prior/revisions still live.
+                            completed_failure!(failure);
+                        ]);
+                }
+            ], [
+                $meter.charge(0)?;
+                #[cfg(test)] completed_interval_tests::visit($index, &frame);
+                $surface.validate_frame(&frame)?;
+            ], [
+                $meter.charge(0)?;
+                #[cfg(test)] completed_interval_tests::visit($index, $endpoint);
+                $surface.validate_frame($endpoint)?;
+            ], frame, row, old, event, [$meter.charge(0)?;])
+    }};
+}
+impl HistoricalInitialLoan<'_> {
+    pub(super) fn surface(
+        &self, execution: &VerifiedOwnedTransitionExecution, source: &CapturedProgram,
+        meter: &mut ProofMeter,
+    ) -> Result<owned_continuation::VerifiedOwnedPolicySurface> {
+        // The caller retained the original five-unit entry charge. Preserve the
+        // original layer error before the new paid exact-callback binding.
+        let layer_id = execution.continuation.original_layer();
+        let layer = execution.current().owned_scope()?.layers.get(layer_id)
+            .ok_or_else(|| refuse("owned policy", "original layer missing"))?;
+        if !std::ptr::eq(execution, self.execution) {
+            return Err(StoreError::Invalid(String::from("Common factual admission: owned policy: historical Initial loan execution differs")));
+        }
+        #[cfg(test)]
+        adoption_diagnostic::phase(adoption_diagnostic::Phase::SurfaceReconstruct);
+        meter.charge(HISTORICAL_INITIAL_WORKER_PAYMENT)?;
+        meter.charge(HISTORICAL_INITIAL_INTERVAL_ENTRY_PAYMENT)?;
+        // New owner/lookup/enclosing transports are paid before any mint attempt.
+        let mut completed = None;
+        let failure = 'completed_mint_failure: {
+        completed_charge_to!('completed_mint_failure, meter, COMPLETED_INTERVAL_MINT_PAYMENT);
+        completed = 'completed_mint: {
+            if !completed_window_to!('completed_mint_failure, meter) { break 'completed_mint None; }
+            #[cfg(test)]
+            if completed_interval_tests::force_native() { break 'completed_mint None; }
+            let [first, prior, selected, ..] = self.registry.epochs.as_slice() else { break 'completed_mint None; };
+            if self.execution.manifest.transition != ScopeTransition::Withdrawal
+                || self.execution.manifest.output != selected.output
+                || self.execution.manifest.previous.as_ref() != Some(&prior.output)
+                || self.execution.current().revision.checked_add(1) != Some(selected.adoption_revision)
+            { break 'completed_mint None; }
+            let Some(initial) = self.registry.recipes.get(&first.output) else { break 'completed_mint None; };
+            let Some(transition) = self.registry.recipes.get(&prior.output) else { break 'completed_mint None; };
+            let (OwnedExecutionRecipe::Initial(a), OwnedExecutionRecipe::Transition(p)) = (initial, transition)
+                else { break 'completed_mint None; };
+            if p.manifest.transition != ScopeTransition::Evolution
+                || p.manifest.output != prior.output
+                || p.manifest.previous.as_ref() != Some(&first.output)
+                || p.current().revision.checked_add(1) != Some(prior.adoption_revision)
+                || !Arc::ptr_eq(a, &p.original)
+                || !Arc::ptr_eq(a, &self.execution.original)
+            { break 'completed_mint None; }
+            completed_charge_to!('completed_mint_failure, meter, 0);
+            #[cfg(test)] completed_interval_tests::stage("mint",meter);
+            Some(CompletedHistoricalIntervals { loan: self, initial, transition })
+        };
+        None
+        };
+        completed_failure!(failure);
+        let registry = self.reconstruct(completed.as_ref(), meter)?;
+        completed_charge!(meter, COMPLETED_INTERVAL_SURFACE_PAYMENT);
+        match completed.as_ref() {
+            Some(pair) => {
+                let registry = &registry;
+                #[cfg(test)] completed_interval_tests::guard_cases(pair, registry);
+                completed_surface_body!(pair,registry,source,layer,meter)
+            },
+            None => owned_transition::policy_surface_from_registry(execution, &registry, source, layer, meter),
+        }
+    }
+    // Only this private R/E loan reaches the selected H reconstruction. Its
+    // manifest comes from H's real committed receipt after complete historical
+    // basis, prefix and graph validation. The two exact Arc associations extend
+    // the already-verified outer prefix; equal payloads never create authority.
+    fn transition_donor<'loan>(&'loan self, inner: &ReconstructedOwned,
+        manifest: &OwnedCompositionV2, completed: Option<&CompletedInitialOrigin<'_, '_>>,
+        meter: &mut ProofMeter,
+    ) -> Result<Option<&'loan Arc<VerifiedOwnedTransitionExecution>>> {
+        if !meter.reconstruction_default_window()? { return Ok(None); }
+        let Some(completed) = completed else { return Ok(None); };
+        let [first] = inner.epochs.as_slice() else { return Ok(None); };
+        let Some(previous) = manifest.previous.as_ref() else { return Ok(None); };
+        let [outer_initial, outer_transition, ..] = self.registry.epochs.as_slice() else {
+            return Ok(None);
+        };
+        // The ordinal candidates are not authority. Fund every complete Digest
+        // comparison and the bounded native get before inspecting those keys.
+        #[cfg(test)]
+        combined_transition_reuse_tests::boundary_next("match", HISTORICAL_TRANSITION_FIRST_MATCH_PAYMENT, meter);
+        meter.charge(HISTORICAL_TRANSITION_FIRST_MATCH_PAYMENT)?;
+        if &first.output != previous || &outer_initial.output != previous
+            || outer_transition.output != manifest.output {
+            return Ok(None);
+        }
+        let Some(OwnedExecutionRecipe::Transition(donor)) = self.registry.recipes.get(&manifest.output)
+            else { return Ok(None); };
+        if donor.manifest.transition != manifest.transition || !Arc::ptr_eq(&donor.original, completed.original) {
+            return Ok(None);
+        }
+        Ok(Some(donor))
+    }
+    // Full live query at each original Initial slot. Missing/other-variant donor
+    // is a native-constructor miss; resource failures never become misses.
+    fn initial(&self, output: &Digest, meter: &mut ProofMeter)
+        -> Result<Option<&Arc<PreparedOwnedPreview>>>
+    {
+        if !meter.reconstruction_default_window()? { return Ok(None); }
+        meter.charge(HISTORICAL_INITIAL_SCAN_PAYMENT)?;
+        let mut entries = self.registry.recipes.iter();
+        loop {
+            meter.charge(HISTORICAL_INITIAL_NEXT_PAYMENT)?;
+            let Some((key, recipe)) = entries.next() else { return Ok(None); };
+            meter.charge(HISTORICAL_INITIAL_COMPARE_PAYMENT)?;
+            meter.charge(key.as_str().len().checked_add(output.as_str().len())
+                .and_then(|n| u64::try_from(n).ok()).unwrap_or(u64::MAX))?;
+            if key == output {
+                return Ok(match recipe {
+                    OwnedExecutionRecipe::Initial(initial) => Some(initial),
+                    OwnedExecutionRecipe::Transition(_) => None,
+                });
+            }
+        }
+    }
+}
+
 // This owner never leaves the private reconstruction worker/finish operation.
 // Only the freshly regenerated committed Initial can mint its extra Arc.
-struct FreshInitialOrigin<'s> {
+pub(super) struct FreshInitialOrigin<'s> {
     retained: &'s ProjectSnapshot,
     original: Arc<PreparedOwnedPreview>,
+}
+impl FreshInitialOrigin<'_> {
+    pub(super) fn retained(&self) -> &ProjectSnapshot { self.retained }
+    pub(super) fn comparison<'a>(&'a self, predecessor_before: &'a CapturedProgram,
+        predecessor_after: &'a CapturedProgram) -> InitialComparison<'a> {
+        InitialComparison { original: &self.original, predecessor_before, predecessor_after }
+    }
 }
 pub(super) struct InitialComparison<'a> {
     original: &'a PreparedOwnedPreview,
@@ -46,6 +812,71 @@ trait ReconstructionFinish<'s>: Sized {
         (size_of::<Result<Self::Output>>(), 4), (size_of::<Option<FreshInitialOrigin<'s>>>(), 4),
         (size_of::<Option<&FreshInitialOrigin<'s>>>(), 4),
         (size_of::<&ProjectSnapshot>(), 4), (size_of::<&mut ProofMeter>(), 4),
+    ]);
+    // Full producing lexical scope and initial iterator-step transports. The
+    // interval packet also prepays the next step, including terminal None.
+    const PREFIX_SCOPE_PAYMENT: u64 = comparison_payment(64, [
+        (size_of::<&ReconstructedOwned>(), 4),
+        (size_of::<&ProjectSnapshot>(), 4),
+        (size_of::<&DataSnapshot>(), 4),
+        (size_of::<i32>(), 4),
+        (size_of::<u64>(), 4),
+        (size_of::<&mut ProofMeter>(), 8),
+        (size_of::<std::iter::Enumerate<std::slice::Iter<'_, OwnedProducerEpoch>>>(), 12),
+        (size_of::<std::slice::Iter<'_, OwnedProducerEpoch>>(), 4),
+        (size_of::<&[OwnedProducerEpoch]>(), 4),
+        (size_of::<&Vec<OwnedProducerEpoch>>(), 4),
+        (size_of::<&mut std::iter::Enumerate<std::slice::Iter<'_, OwnedProducerEpoch>>>(), 4),
+        (size_of::<Option<(usize, &OwnedProducerEpoch)>>(), 4),
+        (size_of::<(usize, &OwnedProducerEpoch)>(), 4),
+        (size_of::<usize>(), 4),
+        (size_of::<&OwnedProducerEpoch>(), 4),
+        (size_of::<isize>(), 12),
+        (size_of::<Result<()>>(), 8),
+        (size_of::<std::ops::ControlFlow<Result<std::convert::Infallible>, ()>>(), 8),
+        (size_of::<Result<std::convert::Infallible>>(), 8),
+        (size_of::<Result<Self::Output>>(), 4),
+    ]);
+    // Paid before every added selector/query. Both branches and all full
+    // Results/residuals are funded, including outer finish-specific errors.
+    const PREFIX_INTERVAL_PAYMENT: u64 = comparison_payment(320, [
+        (size_of::<usize>(), 8),
+        (size_of::<&OwnedProducerEpoch>(), 8),
+        (size_of::<(usize, &OwnedProducerEpoch)>(), 4),
+        (size_of::<Option<(usize, &OwnedProducerEpoch)>>(), 4),
+        (size_of::<&mut std::iter::Enumerate<std::slice::Iter<'_, OwnedProducerEpoch>>>(), 4),
+        (size_of::<isize>(), 48),
+        (size_of::<(usize, bool)>(), 4),
+        (size_of::<Option<&OwnedProducerEpoch>>(), 4),
+        (size_of::<&[OwnedProducerEpoch]>(), 4),
+        (size_of::<&Vec<OwnedProducerEpoch>>(), 4),
+        (size_of::<&BTreeMap<Digest, OwnedExecutionRecipe>>(), 8),
+        (size_of::<&Digest>(), 8),
+        (size_of::<Option<&OwnedExecutionRecipe>>(), 8),
+        (size_of::<&OwnedExecutionRecipe>(), 8),
+        (size_of::<Result<&OwnedExecutionRecipe>>(), 8),
+        (size_of::<std::ops::ControlFlow<Result<std::convert::Infallible>, &OwnedExecutionRecipe>>(), 8),
+        (size_of::<(&DataSnapshot, i32, u64)>(), 4),
+        (size_of::<&DataSnapshot>(), 4),
+        (size_of::<i32>(), 4),
+        (size_of::<u64>(), 24),
+        (size_of::<&ReconstructedOwned>(), 8),
+        (size_of::<&ProjectSnapshot>(), 16),
+        (size_of::<&mut ProofMeter>(), 28),
+        (size_of::<RuntimeLimits>(), 4),
+        (size_of::<&std::time::Instant>(), 4),
+        (size_of::<std::time::Duration>(), 4),
+        (size_of::<&std::time::Duration>(), 4),
+        (size_of::<u128>(), 16),
+        (size_of::<Option<u128>>(), 4),
+        (size_of::<bool>(), 12),
+        (size_of::<Result<()>>(), 24),
+        (size_of::<std::ops::ControlFlow<Result<std::convert::Infallible>, ()>>(), 24),
+        (size_of::<Result<bool>>(), 8),
+        (size_of::<std::ops::ControlFlow<Result<std::convert::Infallible>, bool>>(), 4),
+        (size_of::<Result<std::convert::Infallible>>(), 36),
+        (size_of::<StoreError>(), 4),
+        (size_of::<Result<Self::Output>>(), 4),
     ]);
     fn finish(self, snapshot: &'s ProjectSnapshot, registry: ReconstructedOwned,
         origin: Option<FreshInitialOrigin<'s>>, meter: &mut ProofMeter) -> Result<Self::Output>;
@@ -87,6 +918,148 @@ const HISTORICAL_ORIGIN_PAYMENT: u64 = comparison_payment(32, [
     (size_of::<Option<&FreshInitialOrigin<'_>>>(), 4),
     (size_of::<Result<VerifiedOwnedTransitionExecution>>(), 2), (size_of::<&mut ProofMeter>(), 2),
 ]);
+// Original historical-origin work plus the two opaque accessors used only by
+// lexical reconstructed verification. No constructor or raw field is exported.
+const RECONSTRUCTED_ORIGIN_PAYMENT: u64 = comparison_payment(HISTORICAL_ORIGIN_PAYMENT, [
+    (64, 4), // retained/comparison calls, return and branch activation
+    (size_of::<&FreshInitialOrigin<'_>>(), 16),
+    (size_of::<&ProjectSnapshot>(), 8),
+    (size_of::<&CapturedProgram>(), 24),
+    (size_of::<&Arc<PreparedOwnedPreview>>(), 8),
+    (size_of::<&PreparedOwnedPreview>(), 8),
+    (size_of::<InitialComparison<'_>>(), 16),
+]);
+// Exact completed Transition selection is separately funded, including the
+// full helper/caller error path. Native misses retain every previous packet.
+const HISTORICAL_TRANSITION_SELECT_PAYMENT: u64 = comparison_payment(64_u64.checked_mul(30).expect("transition activation overflow"), [
+    (size_of::<&HistoricalInitialLoan<'_>>(), 4_u64.checked_mul(1).expect("transition slot overflow")),
+    (size_of::<&[crate::product_store::scope::owned_epoch::OwnedProducerEpoch]>(), 4_u64.checked_mul(2).expect("transition slot overflow")),
+    (size_of::<&crate::product_contract::Digest>(), 4_u64.checked_mul(1).expect("transition slot overflow")),
+    (size_of::<&crate::product_store::scope::owned_epoch::OwnedProducerEpoch>(), 4_u64.checked_mul(1).expect("transition slot overflow")),
+    (size_of::<&crate::product_store::scope::owned_persist::HistoricalInitialLoan<'_>>(), 4_u64.checked_mul(1).expect("transition slot overflow")),
+    (size_of::<&crate::product_store::scope::owned_persist::ReconstructedOwned>(), 4_u64.checked_mul(4).expect("transition slot overflow")),
+    (size_of::<&crate::product_store::scope::owned_wire::OwnedCompositionV2>(), 4_u64.checked_mul(2).expect("transition slot overflow")),
+    (size_of::<&mut crate::product_store::scope::common_fact_admission::ProofMeter>(), 4_u64.checked_mul(6).expect("transition slot overflow")),
+    (size_of::<&std::option::Option<crate::product_contract::Digest>>(), 4_u64.checked_mul(1).expect("transition slot overflow")),
+    (size_of::<&std::sync::Arc<crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution>>(), 4_u64.checked_mul(1).expect("transition slot overflow")),
+    (size_of::<&std::time::Duration>(), 4_u64.checked_mul(1).expect("transition slot overflow")),
+    (size_of::<&std::time::Instant>(), 4_u64.checked_mul(1).expect("transition slot overflow")),
+    (size_of::<&std::vec::Vec<crate::product_store::scope::owned_epoch::OwnedProducerEpoch>>(), 4_u64.checked_mul(1).expect("transition slot overflow")),
+    (size_of::<()>(), 4_u64.checked_mul(8).expect("transition slot overflow")),
+    (size_of::<OwnedExecutionRecipe>(), 4_u64.checked_mul(1).expect("transition slot overflow")),
+    (size_of::<Result<ReconstructedOwned>>(), 4_u64.checked_mul(1).expect("transition slot overflow")),
+    (size_of::<bool>(), 4_u64.checked_mul(3).expect("transition slot overflow")),
+    (size_of::<crate::product_contract::RuntimeLimits>(), 4_u64.checked_mul(1).expect("transition slot overflow")),
+    (size_of::<isize>(), 4_u64.checked_mul(8).expect("transition slot overflow")),
+    (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>, bool>>(), 4_u64.checked_mul(1).expect("transition slot overflow")),
+    (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>, std::option::Option<&std::sync::Arc<crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution>>>>(), 4_u64.checked_mul(1).expect("transition slot overflow")),
+    (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>>(), 4_u64.checked_mul(2).expect("transition slot overflow")),
+    (size_of::<std::option::Option<&crate::product_contract::Digest>>(), 4_u64.checked_mul(1).expect("transition slot overflow")),
+    (size_of::<std::option::Option<&crate::product_store::scope::owned_epoch::OwnedExecutionRecipe>>(), 4_u64.checked_mul(2).expect("transition slot overflow")),
+    (size_of::<std::option::Option<&crate::product_store::scope::owned_epoch::OwnedProducerEpoch>>(), 4_u64.checked_mul(1).expect("transition slot overflow")),
+    (size_of::<std::option::Option<&std::sync::Arc<crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution>>>(), 4_u64.checked_mul(6).expect("transition slot overflow")),
+    (size_of::<std::option::Option<&std::sync::Arc<crate::product_store::scope::owned_preview::PreparedOwnedPreview>>>(), 4_u64.checked_mul(1).expect("transition slot overflow")),
+    (size_of::<std::option::Option<u128>>(), 4_u64.checked_mul(1).expect("transition slot overflow")),
+    (size_of::<std::result::Result<(), crate::product_store::StoreError>>(), 4_u64.checked_mul(2).expect("transition slot overflow")),
+    (size_of::<std::result::Result<bool, crate::product_store::StoreError>>(), 4_u64.checked_mul(2).expect("transition slot overflow")),
+    (size_of::<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>(), 4_u64.checked_mul(8).expect("transition slot overflow")),
+    (size_of::<std::result::Result<std::option::Option<&std::sync::Arc<crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution>>, crate::product_store::StoreError>>(), 4_u64.checked_mul(2).expect("transition slot overflow")),
+    (size_of::<std::time::Duration>(), 4_u64.checked_mul(1).expect("transition slot overflow")),
+    (size_of::<u128>(), 4_u64.checked_mul(5).expect("transition slot overflow")),
+    (size_of::<u64>(), 4_u64.checked_mul(4).expect("transition slot overflow")),
+]);
+const HISTORICAL_TRANSITION_MATCH_PAYMENT: u64 = comparison_payment(64_u64.checked_mul(20).expect("transition activation overflow"), [
+    (size_of::<&crate::product_store::scope::contract::ScopeTransition>(), 4_u64.checked_mul(2).expect("transition slot overflow")),
+    (size_of::<&crate::product_store::scope::owned_epoch::OwnedExecutionRecipe>(), 4_u64.checked_mul(11).expect("transition slot overflow")),
+    (size_of::<&crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution>(), 4_u64.checked_mul(2).expect("transition slot overflow")),
+    (size_of::<&mut crate::product_store::scope::common_fact_admission::ProofMeter>(), 4_u64.checked_mul(1).expect("transition slot overflow")),
+    (size_of::<&std::sync::Arc<crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution>>(), 4_u64.checked_mul(8).expect("transition slot overflow")),
+    (size_of::<&std::sync::Arc<crate::product_store::scope::owned_preview::PreparedOwnedPreview>>(), 4_u64.checked_mul(8).expect("transition slot overflow")),
+    (size_of::<(&crate::product_store::scope::owned_epoch::OwnedExecutionRecipe, &crate::product_store::scope::owned_epoch::OwnedExecutionRecipe)>(), 4_u64.checked_mul(1).expect("transition slot overflow")),
+    (size_of::<()>(), 4_u64.checked_mul(3).expect("transition slot overflow")),
+    (size_of::<(std::option::Option<&std::sync::Arc<crate::product_store::scope::owned_preview::PreparedOwnedPreview>>, std::option::Option<&crate::product_store::scope::owned_epoch::OwnedExecutionRecipe>, std::option::Option<&crate::product_store::scope::owned_epoch::OwnedExecutionRecipe>, std::option::Option<&std::sync::Arc<crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution>>)>(), 4_u64.checked_mul(1).expect("transition slot overflow")),
+    (size_of::<Result<Option<&Arc<VerifiedOwnedTransitionExecution>>>>(), 4_u64.checked_mul(1).expect("transition slot overflow")),
+    (size_of::<bool>(), 4_u64.checked_mul(4).expect("transition slot overflow")),
+    (size_of::<isize>(), 4_u64.checked_mul(8).expect("transition slot overflow")),
+    (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>>(), 4_u64.checked_mul(1).expect("transition slot overflow")),
+    (size_of::<std::option::Option<&crate::product_store::scope::owned_epoch::OwnedExecutionRecipe>>(), 4_u64.checked_mul(2).expect("transition slot overflow")),
+    (size_of::<std::option::Option<&std::sync::Arc<crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution>>>(), 4_u64.checked_mul(4).expect("transition slot overflow")),
+    (size_of::<std::option::Option<&std::sync::Arc<crate::product_store::scope::owned_preview::PreparedOwnedPreview>>>(), 4_u64.checked_mul(1).expect("transition slot overflow")),
+    (size_of::<std::result::Result<(), crate::product_store::StoreError>>(), 4_u64.checked_mul(1).expect("transition slot overflow")),
+    (size_of::<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>(), 4_u64.checked_mul(2).expect("transition slot overflow")),
+    (size_of::<u64>(), 4_u64.checked_mul(1).expect("transition slot overflow")),
+]);
+// Pinned Rust b940084d7eb6a299eb4bfeb8e34901bc051e7ac4: BTree nodes
+// have capacity 11 and nonroot minimum 5. The completed R contains at most
+// MAX_ITEMS committed plus MAX_ITEMS prospective recipes, all strict Digest64.
+// BT_search = 4 + h * (6 + 11 * (3 + C)); C = String Ord(3 + 2*64)
+// plus both Digest projections. This native logical envelope includes borrowed
+// node/edge/return handling, not allocation or copied key payloads. The caller's
+// full Rust Option/Result/guard transports are funded separately below.
+const HISTORICAL_TRANSITION_LOOKUP_NATIVE_PAYMENT: u64 = {
+    let max = MAX_ITEMS.checked_mul(2).expect("lookup inventory overflow");
+    let mut quotient = max.checked_add(1).expect("lookup inventory overflow") / 2;
+    let mut levels = 1u64;
+    while quotient >= 6 {
+        quotient /= 6;
+        levels = levels.checked_add(1).expect("lookup height overflow");
+    }
+    let comparator = 64u64.checked_mul(2).expect("lookup key overflow")
+        .checked_add(5).expect("lookup comparator overflow");
+    let node = comparator.checked_add(3).expect("lookup dispatch overflow")
+        .checked_mul(11).expect("lookup node overflow")
+        .checked_add(6).expect("lookup node overflow");
+    levels.checked_mul(node).expect("lookup height cost overflow")
+        .checked_add(4).expect("lookup outer cost overflow")
+};
+const HISTORICAL_TRANSITION_GUARD_BYTES_PAYMENT: u64 =
+    133u64.checked_mul(3).expect("transition guard comparison overflow");
+// Positive additional opaque argument, as_ref/formal/return/reborrow slots;
+// the retained SELECT floor still covers its full window/helper/caller errors.
+const HISTORICAL_TRANSITION_FIRST_SELECT_PAYMENT: u64 = comparison_payment(
+    HISTORICAL_TRANSITION_SELECT_PAYMENT.checked_add(64 * 3).expect("first select overflow"), [
+    (size_of::<Option<&CompletedInitialOrigin<'_, '_>>>(), 16),
+    (size_of::<&Option<CompletedInitialOrigin<'_, '_>>>(), 8),
+    (size_of::<&CompletedInitialOrigin<'_, '_>>(), 8),
+    (size_of::<bool>(), 8),
+    (size_of::<Option<&Arc<VerifiedOwnedTransitionExecution>>>(), 4),
+    (size_of::<&Vec<OwnedProducerEpoch>>(), 4),
+    (size_of::<usize>(), 24),
+    (size_of::<&OwnedProducerEpoch>(), 8),
+    (size_of::<&ReconstructedOwned>(), 4),
+    (size_of::<&Arc<PreparedOwnedPreview>>(), 4),
+]);
+const HISTORICAL_TRANSITION_FIRST_MATCH_PAYMENT: u64 = comparison_payment(
+    HISTORICAL_TRANSITION_MATCH_PAYMENT
+        .checked_add(HISTORICAL_TRANSITION_LOOKUP_NATIVE_PAYMENT).expect("first lookup overflow")
+        .checked_add(HISTORICAL_TRANSITION_GUARD_BYTES_PAYMENT).expect("first guard overflow"), [
+    (size_of::<Option<&OwnedExecutionRecipe>>(), 8),
+    (size_of::<&BTreeMap<Digest, OwnedExecutionRecipe>>(), 8),
+    (size_of::<&[OwnedProducerEpoch]>(), 16),
+    (size_of::<&Vec<OwnedProducerEpoch>>(), 8),
+    (size_of::<()>(), 4),
+    (size_of::<bool>(), 4),
+    (size_of::<&&Digest>(), 16),
+    (size_of::<&Digest>(), 24),
+]);
+const HISTORICAL_TRANSITION_HIT_PAYMENT: u64 = comparison_payment(64 * 18, [
+    (size_of::<&mut Option<FreshInitialOrigin<'_>>>(), 4),
+    (size_of::<Option<FreshInitialOrigin<'_>>>(), 8),
+    (size_of::<&mut Option<CompletedInitialOrigin<'_, '_>>>(), 4),
+    (size_of::<Option<CompletedInitialOrigin<'_, '_>>>(), 8),
+    (size_of::<&Arc<VerifiedOwnedTransitionExecution>>(), 16),
+    (size_of::<Arc<VerifiedOwnedTransitionExecution>>(), 16),
+    (size_of::<OwnedExecutionRecipe>(), 12),
+    (size_of::<&std::sync::atomic::AtomicUsize>(), 4),
+    (size_of::<std::sync::atomic::Ordering>(), 4), (size_of::<usize>(), 8),
+    (size_of::<bool>(), 16), (size_of::<isize>(), 12),
+    (size_of::<&mut ProofMeter>(), 12), (size_of::<u64>(), 12),
+    (size_of::<Result<()>>(), 12),
+    (size_of::<std::ops::ControlFlow<Result<std::convert::Infallible>>>(), 12),
+    (size_of::<Result<std::convert::Infallible>>(), 24),
+    (size_of::<Result<ReconstructedOwned>>(), 12),
+]);
+
 // Additional direct-general route coverage: unlike the closed finish, this
 // entry has not prepaid R4. Pay its complete new call/return headers locally.
 const GENERAL_TRANSITION_PAYMENT: u64 = comparison_payment(64, [
@@ -102,7 +1075,7 @@ struct GraphHistory {
     after: BTreeMap<u64, DecisionGraph>,
     births: BTreeMap<u64, BTreeSet<Id>>,
 }
-fn err(reason: &str) -> StoreError {
+pub(super) fn err(reason: &str) -> StoreError {
     refuse("owned persisted proof", reason)
 }
 fn graph_history(snapshot: &ProjectSnapshot) -> Result<GraphHistory> {
@@ -654,6 +1627,190 @@ fn check_correspondence(
     }
     Ok(())
 }
+// A call-local, fixed pair of actual native successes. Only the closed R/E loan
+// below can mint it: before each immutable successor was constructed, ordinary
+// reconstruct_with completed its immediate predecessor's native interval. R then
+// completed in full. H=E.current restricts the same receipts/adoptions by revision;
+// exact recipe/endpoint borrows never turn an ordinal or digest into authority.
+struct CompletedHistoricalIntervals<'a, 'r> {
+    loan: &'a HistoricalInitialLoan<'r>,
+    initial: &'r OwnedExecutionRecipe,
+    transition: &'r OwnedExecutionRecipe,
+}
+// Lexical selected replay: inputs originate only in the fixed owner's two methods.
+// Frame construction, native validation and all seed/event/endpoint policy visits
+// remain; the last event frame is not substituted for the endpoint.
+
+// Provisional conservative complete-type packets; final producing census must
+// cover every introduced place/operation before any fit or acceptance claim.
+// Producing local joins: complete actual types, four lifecycle movements and64
+// per direct call/control. Native map/Digest ceilings are separate. The1828
+// entry surplus retains the approved43486 inventory decomposition; it is not
+// an extra claimed operation or a fit-tuned discount. Every new seal pays anew.
+const COMPLETED_INTERVAL_MINT_PAYMENT: u64 = comparison_payment(64 * 55 + 2 * HISTORICAL_TRANSITION_LOOKUP_NATIVE_PAYMENT + 4 * 133 + 1828, [
+    (size_of::<&std::sync::Arc<crate::product_store::scope::owned_preview::PreparedOwnedPreview>>(), 28),
+    (size_of::<&std::sync::Arc<crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution>>(), 24),
+    (size_of::<&std::collections::BTreeMap<crate::product_contract::Digest, crate::product_store::scope::owned_epoch::OwnedExecutionRecipe>>(), 8),
+    (size_of::<&crate::product_store::scope::owned_persist::CompletedHistoricalIntervals<'_, '_>>(), 4),
+    (size_of::<&crate::product_contract::Digest>(), 48),
+    (size_of::<&std::time::Duration>(), 4),
+    (size_of::<&crate::product_store::scope::owned_persist::HistoricalInitialLoan<'_>>(), 4),
+    (size_of::<&std::time::Instant>(), 4),
+    (size_of::<&std::option::Option<&crate::product_contract::Digest>>(), 16),
+    (size_of::<&std::option::Option<crate::product_store::scope::owned_persist::CompletedHistoricalIntervals<'_, '_>>>(), 4),
+    (size_of::<&std::option::Option<crate::product_contract::Digest>>(), 8),
+    (size_of::<&std::option::Option<u64>>(), 16),
+    (size_of::<&crate::product_store::scope::owned_epoch::OwnedExecutionRecipe>(), 40),
+    (size_of::<&crate::product_store::scope::owned_epoch::OwnedProducerEpoch>(), 12),
+    (size_of::<&crate::product_store::ProjectSnapshot>(), 8),
+    (size_of::<&ProofMeter>(), 8),
+    (size_of::<&crate::product_store::scope::owned_persist::ReconstructedOwned>(), 12),
+    (size_of::<&crate::product_store::scope::contract::ScopeTransition>(), 24),
+    (size_of::<&std::vec::Vec<crate::product_store::scope::owned_epoch::OwnedProducerEpoch>>(), 4),
+    (size_of::<&crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution>(), 48),
+    (size_of::<&[crate::product_store::scope::owned_epoch::OwnedProducerEpoch]>(), 4),
+    (size_of::<&mut crate::product_store::scope::common_fact_admission::ProofMeter>(), 12),
+    (size_of::<(&crate::product_store::scope::owned_epoch::OwnedExecutionRecipe, &crate::product_store::scope::owned_epoch::OwnedExecutionRecipe)>(), 4),
+    (size_of::<crate::product_store::scope::owned_persist::CompletedHistoricalIntervals<'_, '_>>(), 4),
+    (size_of::<std::time::Duration>(), 4),
+    (size_of::<std::option::Option<&crate::product_store::scope::owned_persist::CompletedHistoricalIntervals<'_, '_>>>(), 4),
+    (size_of::<std::option::Option<&crate::product_contract::Digest>>(), 16),
+    (size_of::<std::option::Option<&crate::product_store::scope::owned_epoch::OwnedExecutionRecipe>>(), 8),
+    (size_of::<std::option::Option<crate::product_store::scope::owned_persist::CompletedHistoricalIntervals<'_, '_>>>(), 8),
+    (size_of::<std::option::Option<crate::product_store::scope::common_fact_admission::ProofChargeFailure>>(), 4),
+    (size_of::<std::option::Option<u128>>(), 4),
+    (size_of::<std::option::Option<u64>>(), 16),
+    (size_of::<crate::product_store::scope::common_fact_admission::ProofChargeFailure>(), 32),
+    (size_of::<std::result::Result<(), crate::product_store::scope::common_fact_admission::ProofChargeFailure>>(), 12),
+    (size_of::<crate::product_contract::RuntimeLimits>(), 4),
+    (size_of::<crate::product_store::scope::contract::ScopeTransition>(), 8),
+    (size_of::<crate::product_store::StoreError>(), 4),
+    (size_of::<bool>(), 52),
+    (size_of::<isize>(), 36),
+    (size_of::<u128>(), 20),
+    (size_of::<u64>(), 24),
+    (size_of::<usize>(), 12),
+]);
+const COMPLETED_INTERVAL_TAIL_PAYMENT: u64 = comparison_payment(64 * 41 + 2 * 133, [
+    (size_of::<&std::sync::Arc<crate::product_store::scope::owned_preview::PreparedOwnedPreview>>(), 16),
+    (size_of::<&std::sync::Arc<crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution>>(), 16),
+    (size_of::<&crate::product_contract::DataSnapshot>(), 4),
+    (size_of::<&crate::product_contract::Digest>(), 16),
+    (size_of::<&std::time::Duration>(), 4),
+    (size_of::<&crate::product_store::scope::owned_persist::HistoricalInitialLoan<'_>>(), 16),
+    (size_of::<&std::time::Instant>(), 4),
+    (size_of::<&crate::product_store::scope::owned_epoch::OwnedExecutionRecipe>(), 36),
+    (size_of::<&crate::product_store::scope::owned_epoch::OwnedProducerEpoch>(), 16),
+    (size_of::<&crate::product_store::ProjectSnapshot>(), 12),
+    (size_of::<&ProofMeter>(), 8),
+    (size_of::<&crate::product_store::scope::owned_persist::ReconstructedOwned>(), 4),
+    (size_of::<&std::vec::Vec<crate::product_store::scope::owned_epoch::OwnedProducerEpoch>>(), 8),
+    (size_of::<&crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution>(), 24),
+    (size_of::<&[crate::product_store::scope::owned_epoch::OwnedProducerEpoch]>(), 8),
+    (size_of::<&mut crate::product_store::scope::common_fact_admission::ProofMeter>(), 12),
+    (size_of::<(&crate::product_store::scope::owned_epoch::OwnedExecutionRecipe, &crate::product_store::scope::owned_epoch::OwnedExecutionRecipe)>(), 4),
+    (size_of::<*const crate::product_contract::DataSnapshot>(), 4),
+    (size_of::<std::time::Duration>(), 4),
+    (size_of::<std::option::Option<crate::product_store::scope::common_fact_admission::ProofChargeFailure>>(), 4),
+    (size_of::<std::option::Option<u128>>(), 4),
+    (size_of::<crate::product_store::scope::common_fact_admission::ProofChargeFailure>(), 32),
+    (size_of::<std::result::Result<(), crate::product_store::scope::common_fact_admission::ProofChargeFailure>>(), 12),
+    (size_of::<crate::product_contract::RuntimeLimits>(), 4),
+    (size_of::<crate::product_store::StoreError>(), 4),
+    (size_of::<bool>(), 52),
+    (size_of::<i32>(), 4),
+    (size_of::<isize>(), 36),
+    (size_of::<u128>(), 20),
+    (size_of::<u64>(), 28),
+    (size_of::<usize>(), 24),
+]);
+const COMPLETED_INTERVAL_SURFACE_PAYMENT: u64 = comparison_payment(64 * 9, [
+    (size_of::<&crate::product_store::scope::owned_persist::CompletedHistoricalIntervals<'_, '_>>(), 4),
+    (size_of::<&crate::product_store::scope::owned_persist::HistoricalInitialLoan<'_>>(), 20),
+    (size_of::<&std::option::Option<crate::product_store::scope::owned_persist::CompletedHistoricalIntervals<'_, '_>>>(), 4),
+    (size_of::<&crate::product_store::ProjectSnapshot>(), 16),
+    (size_of::<&crate::product_store::scope::owned_persist::ReconstructedOwned>(), 4),
+    (size_of::<&crate::product_store::scope::owned_continuation::VerifiedOwnedPolicySurface>(), 4),
+    (size_of::<&crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution>(), 36),
+    (size_of::<&mut crate::product_store::scope::common_fact_admission::ProofMeter>(), 4),
+    (size_of::<std::option::Option<&crate::product_store::scope::owned_persist::CompletedHistoricalIntervals<'_, '_>>>(), 4),
+    (size_of::<crate::product_store::scope::common_fact_admission::ProofChargeFailure>(), 8),
+    (size_of::<std::result::Result<(), crate::product_store::scope::common_fact_admission::ProofChargeFailure>>(), 4),
+    (size_of::<crate::product_store::StoreError>(), 4),
+    (size_of::<isize>(), 8),
+]);
+const COMPLETED_INTERVAL_DISPATCH_PAYMENT: u64 = comparison_payment(64 * 48 + 2 * 133, [
+    (size_of::<&std::sync::Arc<crate::product_store::scope::owned_preview::PreparedOwnedPreview>>(), 32),
+    (size_of::<&std::sync::Arc<crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution>>(), 32),
+    (size_of::<&crate::product_contract::DataSnapshot>(), 8),
+    (size_of::<&crate::product_contract::Digest>(), 16),
+    (size_of::<&std::time::Duration>(), 4),
+    (size_of::<&crate::product_store::scope::owned_persist::HistoricalInitialLoan<'_>>(), 12),
+    (size_of::<&std::time::Instant>(), 4),
+    (size_of::<&crate::product_store::scope::owned_epoch::OwnedExecutionRecipe>(), 96),
+    (size_of::<&crate::product_store::scope::owned_epoch::OwnedProducerEpoch>(), 16),
+    (size_of::<&crate::product_store::ProjectSnapshot>(), 12),
+    (size_of::<&ProofMeter>(), 8),
+    (size_of::<&crate::product_store::scope::owned_persist::ReconstructedOwned>(), 4),
+    (size_of::<&std::vec::Vec<crate::product_store::scope::owned_epoch::OwnedProducerEpoch>>(), 8),
+    (size_of::<&crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution>(), 16),
+    (size_of::<&[crate::product_store::scope::owned_epoch::OwnedProducerEpoch]>(), 8),
+    (size_of::<&mut crate::product_store::scope::common_fact_admission::ProofMeter>(), 8),
+    (size_of::<(&crate::product_store::scope::owned_epoch::OwnedExecutionRecipe, &crate::product_store::scope::owned_epoch::OwnedExecutionRecipe)>(), 8),
+    (size_of::<*const crate::product_contract::DataSnapshot>(), 16),
+    (size_of::<std::time::Duration>(), 4),
+    (size_of::<std::option::Option<crate::product_store::scope::common_fact_admission::ProofChargeFailure>>(), 4),
+    (size_of::<std::option::Option<u128>>(), 4),
+    (size_of::<crate::product_store::scope::common_fact_admission::ProofChargeFailure>(), 24),
+    (size_of::<std::result::Result<(), crate::product_store::scope::common_fact_admission::ProofChargeFailure>>(), 8),
+    (size_of::<crate::product_contract::RuntimeLimits>(), 4),
+    (size_of::<crate::product_store::StoreError>(), 4),
+    (size_of::<bool>(), 60),
+    (size_of::<i32>(), 16),
+    (size_of::<isize>(), 40),
+    (size_of::<u128>(), 20),
+    (size_of::<u64>(), 24),
+    (size_of::<usize>(), 24),
+]);
+const COMPLETED_INTERVAL_REPLAY_PAYMENT: u64 = comparison_payment(64 * 11, [
+    (size_of::<&crate::product_contract::DataSnapshot>(), 16),
+    (size_of::<&crate::product_store::scope::owned_persist::HistoricalInitialLoan<'_>>(), 8),
+    (size_of::<&crate::product_store::scope::owned_epoch::OwnedExecutionRecipe>(), 36),
+    (size_of::<&crate::product_store::ProjectSnapshot>(), 16),
+    (size_of::<&crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution>(), 16),
+    (size_of::<&mut crate::product_store::scope::common_fact_admission::ProofMeter>(), 8),
+    (size_of::<(&crate::product_store::scope::owned_epoch::OwnedExecutionRecipe, &crate::product_contract::DataSnapshot, i32)>(), 4),
+    (size_of::<crate::product_store::scope::common_fact_admission::ProofChargeFailure>(), 16),
+    (size_of::<std::result::Result<(), crate::product_store::scope::common_fact_admission::ProofChargeFailure>>(), 8),
+    (size_of::<bool>(), 4),
+    (size_of::<i32>(), 16),
+    (size_of::<isize>(), 8),
+    (size_of::<usize>(), 4),
+]);
+const COMPLETED_INTERVAL_ROW_PAYMENT: u64 = comparison_payment(64 * 4, [
+    (size_of::<&mut crate::product_store::scope::common_fact_admission::ProofMeter>(), 4),
+    (size_of::<std::option::Option<crate::product_store::scope::common_fact_admission::ProofChargeFailure>>(), 4),
+    (size_of::<crate::product_store::scope::common_fact_admission::ProofChargeFailure>(), 16),
+    (size_of::<std::result::Result<(), crate::product_store::scope::common_fact_admission::ProofChargeFailure>>(), 4),
+    (size_of::<crate::product_store::StoreError>(), 4),
+    (size_of::<isize>(), 8),
+]);
+const COMPLETED_INTERVAL_PROJECTION_PAYMENT: u64 = comparison_payment(64 * 14, [
+    (size_of::<&std::time::Duration>(), 4),
+    (size_of::<&std::time::Instant>(), 4),
+    (size_of::<&ProofMeter>(), 8),
+    (size_of::<&mut crate::product_store::scope::common_fact_admission::ProofMeter>(), 12),
+    (size_of::<std::time::Duration>(), 4),
+    (size_of::<std::option::Option<u128>>(), 4),
+    (size_of::<crate::product_store::scope::common_fact_admission::ProofChargeFailure>(), 24),
+    (size_of::<std::result::Result<(), crate::product_store::scope::common_fact_admission::ProofChargeFailure>>(), 12),
+    (size_of::<crate::product_contract::RuntimeLimits>(), 4),
+    (size_of::<bool>(), 8),
+    (size_of::<isize>(), 16),
+    (size_of::<u128>(), 20),
+    (size_of::<u64>(), 8),
+]);
+
 pub(super) fn reconstruct(
     snapshot: &ProjectSnapshot,
     meter: &mut ProofMeter,
@@ -661,69 +1818,69 @@ pub(super) fn reconstruct(
     meter.charge(RegistryOnly::FRAME_PAYMENT)?;
     reconstruct_with(snapshot, meter, RegistryOnly)
 }
-fn reconstruct_with<'s, F: ReconstructionFinish<'s>>(
-    snapshot: &'s ProjectSnapshot, meter: &mut ProofMeter, finish: F,
-) -> Result<F::Output> {
-    let mut origin = None;
-    let state = snapshot.owned_scope()?;
-    if state.layers.len() > 1
-        || state.compositions.len() > MAX_ITEMS
-        || state.rehearsals.len() > MAX_ITEMS
-        || state.correspondences.len() > MAX_ITEMS
-        || state.initializations.len() != state.layers.len()
-        || state.adoptions.len() != state.compositions.len()
-        || (state.layers.is_empty() && state.rehearsals.is_empty())
-        || (state.layers.is_empty() != state.compositions.is_empty())
+macro_rules! reconstruct_body {
+    ($snapshot:ident, $meter:ident, $finish:ident, $F:ident, $origin:ident, $layer:ident, $manifest:ident, $init:ident, $graphs:ident, $result:ident, $historical:ident, $proof:ident, $prepared:ident, $transition:ident, $initial:ident, $tail_index:ident, $tail_epoch:ident, $tail_recipe:ident, $tail_revision:ident, $tail_data:ident, $tail_day:ident, $state:ident, [$($state_serialization:tt)*], [$($completed_scope:tt)*], [$($initial_slot:tt)*], [$($transition_slot:tt)*], [$($prospective_slot:tt)*], [$($prospective_arc:tt)*], [$($completed_finish:tt)*], [$($tail_slot:tt)*], [$($final_tail_slot:tt)*]) => {{
+    let mut $origin = None;
+    $($completed_scope)*
+    let $state = $snapshot.owned_scope()?;
+    if $state.layers.len() > 1
+        || $state.compositions.len() > MAX_ITEMS
+        || $state.rehearsals.len() > MAX_ITEMS
+        || $state.correspondences.len() > MAX_ITEMS
+        || $state.initializations.len() != $state.layers.len()
+        || $state.adoptions.len() != $state.compositions.len()
+        || ($state.layers.is_empty() && $state.rehearsals.is_empty())
+        || ($state.layers.is_empty() != $state.compositions.is_empty())
     {
         return Err(err("invalid owned family inventory or naked entry"));
     }
-    meter.charge(canonical_bytes(state)?.len() as u64)?;
-    for (id, layer) in &state.layers {
-        if layer.identity()? != *id {
+    $($state_serialization)*
+    for (id, $layer) in &$state.layers {
+        if $layer.identity()? != *id {
             return Err(err("owned layer map key differs"));
         }
     }
-    for (id, composition) in &state.compositions {
+    for (id, composition) in &$state.compositions {
         if composition.identity()? != *id {
             return Err(err("owned composition map key differs"));
         }
     }
-    for (id, proof) in &state.rehearsals {
-        if proof.version != OWNED_SCOPE_VERSION || proof.identity()? != *id {
+    for (id, $proof) in &$state.rehearsals {
+        if $proof.version != OWNED_SCOPE_VERSION || $proof.identity()? != *id {
             return Err(err("owned rehearsal version/key differs"));
         }
     }
-    for (id, proof) in &state.correspondences {
-        if proof.identity()? != *id {
+    for (id, $proof) in &$state.correspondences {
+        if $proof.identity()? != *id {
             return Err(err("owned correspondence receipt key differs"));
         }
     }
-    validate_revision_ownership(snapshot)?;
-    let graphs = graph_history(snapshot)?;
+    validate_revision_ownership($snapshot)?;
+    let $graphs = graph_history($snapshot)?;
     let mut active = revision(
-        snapshot
+        $snapshot
             .programs
             .first()
             .ok_or_else(|| err("original source missing"))?,
     )?;
     let mut seen_operations = BTreeSet::new();
     let mut revisions = BTreeSet::new();
-    for a in &snapshot.adoptions {
+    for a in &$snapshot.adoptions {
         if a.previous != active
-            || a.plan.current_source != program(snapshot, &active)?.binding
-            || a.plan.target != program(snapshot, &a.active)?.artifact
+            || a.plan.current_source != program($snapshot, &active)?.binding
+            || a.plan.target != program($snapshot, &a.active)?.artifact
             || !seen_operations.insert(&a.plan.id)
-            || snapshot.operations.get(&a.plan.id).map(|o| o.revision) != Some(a.revision)
+            || $snapshot.operations.get(&a.plan.id).map(|o| o.revision) != Some(a.revision)
         {
             return Err(err("ordered ordinary source/operation chain differs"));
         }
         active = a.active.clone();
     }
-    if active != snapshot.active_revision {
+    if active != $snapshot.active_revision {
         return Err(err("active source differs from ordered adoption tail"));
     }
-    let mut result = ReconstructedOwned {
-        snapshot: canonical_digest(IdentityDomain::Data, snapshot)?,
+    let mut $result = ReconstructedOwned {
+        $snapshot: canonical_digest(IdentityDomain::Data, $snapshot)?,
         recipes: BTreeMap::new(),
         epochs: vec![],
         proofs: BTreeMap::new(),
@@ -731,7 +1888,7 @@ fn reconstruct_with<'s, F: ReconstructionFinish<'s>>(
         initializations: BTreeMap::new(),
     };
     let mut previous_revision = None;
-    for receipt in &state.adoptions {
+    for receipt in &$state.adoptions {
         if receipt.version != OWNED_SCOPE_VERSION
             || !revisions.insert(receipt.revision)
             || previous_revision.is_some_and(|r| receipt.revision <= r)
@@ -741,42 +1898,42 @@ fn reconstruct_with<'s, F: ReconstructionFinish<'s>>(
             ));
         }
         previous_revision = Some(receipt.revision);
-        let manifest = state
+        let $manifest = $state
             .compositions
             .get(&receipt.composition)
             .ok_or_else(|| err("adoption composition missing"))?;
-        let [id] = manifest.layers.as_slice() else {
+        let [id] = $manifest.layers.as_slice() else {
             return Err(err("committed composition needs one original layer"));
         };
-        let layer = state
+        let $layer = $state
             .layers
             .get(id)
             .ok_or_else(|| err("committed layer missing"))?;
-        let init = state
+        let $init = $state
             .initializations
             .iter()
-            .find(|r| &r.layer == id)
+            .find(|r| &r.$layer == id)
             .ok_or_else(|| err("committed initialization missing"))?;
-        let adoption = linked(snapshot, &manifest.operation, receipt.revision)?;
-        let after = graphs
+        let adoption = linked($snapshot, &$manifest.operation, receipt.revision)?;
+        let after = $graphs
             .after
             .get(&adoption.revision)
             .ok_or_else(|| err("adoption graph checkpoint missing"))?;
-        let born = graphs
+        let born = $graphs
             .births
             .get(&adoption.revision)
             .ok_or_else(|| err("adoption graph birth checkpoint missing"))?;
-        let operation = snapshot
+        let operation = $snapshot
             .operations
             .get(&adoption.plan.id)
             .ok_or_else(|| err("adoption operation missing"))?;
         if receipt.plan != adoption.plan.identity()? {
             return Err(err("owned plan identity differs"));
         }
-        let recipe = if result.epochs.is_empty() {
-            if receipt.initialization != Some(init.identity()?)
+        let recipe = if $result.epochs.is_empty() {
+            if receipt.initialization != Some($init.identity()?)
                 || operation.request
-                    != owned_wire::adoption_request(&adoption.plan, after, manifest, init)?
+                    != owned_wire::adoption_request(&adoption.plan, after, $manifest, $init)?
             {
                 return Err(err("initial adoption request/initializer differs"));
             }
@@ -787,126 +1944,140 @@ fn reconstruct_with<'s, F: ReconstructionFinish<'s>>(
                 .filter(|d| {
                     born.contains(&d.id)
                         && d.status == DecisionStatus::Active
-                        && d.scope == layer.scope()
+                        && d.scope == $layer.scope()
                 })
                 .map(|d| d.id.clone())
                 .collect();
             if actual.len() != receipt.decisions.len() || actual != expected
                 || actual.iter().any(|id| !after.decisions.iter().any(|d| &d.id == id && matches!(&d.outcome, DecisionOutcome::Accept { artifact } if artifact == &adoption.plan.target.program_digest)))
             { return Err(err("owned accepted decisions differ from exact graph births")); }
-            let initial = Arc::new(reconstruct_recipe(
-                snapshot, layer, manifest, init, &graphs, meter,
-            )?);
-            meter.charge(INITIAL_ORIGIN_PAYMENT)?;
-            origin = Some(FreshInitialOrigin { retained: snapshot, original: initial.clone() });
-            result
+$($initial_slot)*
+            $result
                 .proofs
-                .insert(manifest.output.clone(), initial.clone());
-            OwnedExecutionRecipe::Initial(initial)
+                .insert($manifest.output.clone(), $initial.clone());
+            OwnedExecutionRecipe::Initial($initial)
         } else {
             if receipt.initialization.is_some()
                 || !receipt.decisions.is_empty()
                 || !born.is_empty()
                 || operation.request
-                    != owned_wire::transition_request(&adoption.plan, after, manifest)?
+                    != owned_wire::transition_request(&adoption.plan, after, $manifest)?
             {
                 return Err(err(
                     "transition has initialization, decision birth or wrong request",
                 ));
             }
-            let historical = historical_basis(
-                snapshot,
-                &manifest.basis,
-                &graphs,
+            let $historical = historical_basis(
+                $snapshot,
+                &$manifest.basis,
+                &$graphs,
                 BasisPurpose::Continuation,
-                meter,
+                $meter,
             )?;
-            result.validate_endpoint(
-                snapshot,
-                &historical.data,
-                historical.clock_day,
-                historical.revision,
-                meter,
-            )?;
-            if graphs.prior.get(&adoption.revision) != Some(&historical.decisions) {
+            $meter.charge($F::PREFIX_SCOPE_PAYMENT)?;
+            {
+                let registry = &$result;
+                let $tail_data = &$historical.data;
+                let $tail_day = $historical.clock_day;
+                let $tail_revision = $historical.revision;
+                registry.check_snapshot($snapshot)?;
+                for ($tail_index, $tail_epoch) in registry.epochs.iter().enumerate() {
+                    $meter.charge($F::PREFIX_INTERVAL_PAYMENT)?;
+                    if $tail_epoch.adoption_revision > $tail_revision {
+                        return Err(err("history endpoint predates registered producer"));
+                    }
+                    let $tail_recipe = registry.recipes.get(&$tail_epoch.output)
+                        .ok_or_else(|| err("registered producer recipe missing"))?;
+                    if let Some(next) = registry.epochs.get($tail_index + 1) {
+                        let next_recipe = registry.recipes.get(&next.output)
+                            .ok_or_else(|| err("next producer missing"))?;
+                        let (endpoint, endpoint_day, endpoint_revision) = (
+                            next_recipe.seed(), next_recipe.basis().clock_day,
+                            next_recipe.basis().revision,
+                        );
+                        // Only this reconstruction activation established the complete
+                        // interval before its immutable successor was constructed. No
+                        // caller-selected index/flag or exported skip capability exists.
+                        if $meter.reconstruction_default_window()? {
+                            $meter.charge(0)?;
+                            $meter.charge(0)?;
+                        } else {
+                            owned_epoch::validate_interval($snapshot, $tail_recipe, $tail_epoch.adoption_revision,
+                                endpoint_revision, endpoint, endpoint_day, $meter)?;
+                        }
+                    } else {
+                        // Ordinary tails stay native; the selected slot can discharge
+                        // only its exact completed first Initial interval.
+$($tail_slot)*
+                    }
+                }
+            }
+            if $graphs.prior.get(&adoption.revision) != Some(&$historical.decisions) {
                 return Err(err(
                     "transition prior graph differs from authenticated basis",
                 ));
             }
             owned_epoch::validate_transition_graph(
-                &historical,
-                manifest,
+                &$historical,
+                $manifest,
                 after,
                 Some(&adoption.plan.retire_decisions),
             )?;
-            meter.charge(HISTORICAL_ORIGIN_PAYMENT)?;
-            let fresh_origin = origin.take();
-            let transition = reconstruct_transition(
-                snapshot,
-                &historical,
-                &result,
-                layer,
-                init,
-                manifest,
-                fresh_origin.as_ref(),
-                meter,
-            )?;
-            drop(fresh_origin);
-            OwnedExecutionRecipe::Transition(Arc::new(transition))
+$($transition_slot)*
         };
-        bind_plan(snapshot, adoption, manifest, layer, recipe.seed(), false)?;
+        bind_plan($snapshot, adoption, $manifest, $layer, recipe.seed(), false)?;
         if LocalRuntime::default().compatibility_at(
             recipe.target(),
             recipe.seed(),
-            manifest.basis.frozen.day,
+            $manifest.basis.frozen.day,
         )? != receipt.initialized_compatibility
         {
             return Err(err("owned compatibility receipt differs"));
         }
-        if result
+        if $result
             .recipes
-            .insert(manifest.output.clone(), recipe)
+            .insert($manifest.output.clone(), recipe)
             .is_some()
         {
             return Err(err("ambiguous owned executable"));
         }
-        result
+        $result
             .manifests
-            .insert(manifest.output.clone(), manifest.clone());
-        result
+            .insert($manifest.output.clone(), $manifest.clone());
+        $result
             .initializations
-            .insert(manifest.output.clone(), init.clone());
-        result.epochs.push(OwnedProducerEpoch {
-            output: manifest.output.clone(),
+            .insert($manifest.output.clone(), $init.clone());
+        $result.epochs.push(OwnedProducerEpoch {
+            output: $manifest.output.clone(),
             adoption_revision: receipt.revision,
         });
     }
     let mut recordings = BTreeSet::new();
-    for proof in state.rehearsals.values() {
+    for $proof in $state.rehearsals.values() {
         // Initial alternatives are separate recordings, never a synthetic pair
         // of layers. Evolution pairs require the later checked evolution route.
-        if !recordings.insert(&proof.recorded_by)
-            || proof.witnesses.is_empty()
-            || proof.witnesses.len() > MAX_ITEMS
+        if !recordings.insert(&$proof.recorded_by)
+            || $proof.witnesses.is_empty()
+            || $proof.witnesses.len() > MAX_ITEMS
         {
             return Err(err(
                 "ambiguous owned rehearsal recording or empty witnesses",
             ));
         }
-        let layer = proof
-            .layer
+        let $layer = $proof
+            .$layer
             .as_ref()
             .ok_or_else(|| err("prospective owned layer recipe missing"))?;
-        let init = proof
+        let $init = $proof
             .initialization
             .as_ref()
             .ok_or_else(|| err("prospective owned initialization missing"))?;
-        let a = linked(snapshot, &proof.recorded_by, proof.recorded_revision)?;
-        let born = graphs
+        let a = linked($snapshot, &$proof.recorded_by, $proof.recorded_revision)?;
+        let born = $graphs
             .births
             .get(&a.revision)
             .ok_or_else(|| err("recording birth checkpoint missing"))?;
-        let after_graph = graphs
+        let after_graph = $graphs
             .after
             .get(&a.revision)
             .ok_or_else(|| err("recording graph checkpoint missing"))?;
@@ -916,19 +2087,19 @@ fn reconstruct_with<'s, F: ReconstructionFinish<'s>>(
             .filter(|d| born.contains(&d.id) && d.status == DecisionStatus::Pending)
             .map(|d| d.id.clone())
             .collect();
-        if proof.witnesses.keys().cloned().collect::<BTreeSet<_>>() != expected {
+        if $proof.witnesses.keys().cloned().collect::<BTreeSet<_>>() != expected {
             return Err(err(
                 "prospective witnesses differ from pending decision births",
             ));
         }
-        for (id, witness) in &proof.witnesses {
+        for (id, witness) in &$proof.witnesses {
             let d = after_graph
                 .decisions
                 .iter()
                 .find(|d| &d.id == id)
                 .ok_or_else(|| err("prospective decision missing"))?;
             if d.witness != *witness
-                || d.scope != layer.scope()
+                || d.scope != $layer.scope()
                 || !matches!(
                     d.outcome,
                     DecisionOutcome::EitherAcceptable
@@ -940,21 +2111,21 @@ fn reconstruct_with<'s, F: ReconstructionFinish<'s>>(
                 return Err(err("prospective decision witness/outcome/scope differs"));
             }
         }
-        let correspondence: Vec<_> = state
+        let correspondence: Vec<_> = $state
             .correspondences
             .values()
-            .filter(|r| r.operation == proof.recorded_by)
-            .map(|r| r.proof.clone())
+            .filter(|r| r.operation == $proof.recorded_by)
+            .map(|r| r.$proof.clone())
             .collect();
         let request = owned_wire::identity(
             "owned-decision-recording/2",
             &(
                 &a.plan,
                 &after_graph,
-                owned_wire::recording_request(proof, &correspondence)?,
+                owned_wire::recording_request($proof, &correspondence)?,
             ),
         )?;
-        if snapshot
+        if $snapshot
             .operations
             .get(&a.plan.id)
             .ok_or_else(|| err("recording operation missing"))?
@@ -963,68 +2134,68 @@ fn reconstruct_with<'s, F: ReconstructionFinish<'s>>(
         {
             return Err(err("owned recording request inventory differs"));
         }
-        let prepared = reconstruct_recipe(snapshot, layer, &proof.manifest, init, &graphs, meter)?;
+$($prospective_slot)*
         bind_plan(
-            snapshot,
+            $snapshot,
             a,
-            &proof.manifest,
-            layer,
-            &prepared.initialized,
+            &$proof.$manifest,
+            $layer,
+            &$prepared.initialized,
             true,
         )?;
-        if prepared.initialized.identity()? != proof.seed
+        if $prepared.initialized.identity()? != $proof.seed
             || LocalRuntime::default().compatibility_at(
-                &prepared.target,
-                &prepared.initialized,
-                proof.manifest.basis.frozen.day,
-            )? != proof.compatibility
+                &$prepared.target,
+                &$prepared.initialized,
+                $proof.$manifest.basis.frozen.day,
+            )? != $proof.compatibility
         {
             return Err(err("prospective owned seed/compatibility differs"));
         }
-        let prepared = Arc::new(prepared);
-        if result
+$($prospective_arc)*
+        if $result
             .recipes
             .insert(
-                proof.manifest.output.clone(),
-                OwnedExecutionRecipe::Initial(prepared.clone()),
+                $proof.$manifest.output.clone(),
+                OwnedExecutionRecipe::Initial($prepared.clone()),
             )
             .is_some()
         {
             return Err(err("prospective recipe aliases committed executable"));
         }
-        if result
+        if $result
             .proofs
-            .insert(proof.manifest.output.clone(), prepared)
+            .insert($proof.$manifest.output.clone(), $prepared)
             .is_some()
         {
             return Err(err("prospective recipe aliases another executable"));
         }
-        result
+        $result
             .manifests
-            .insert(proof.manifest.output.clone(), proof.manifest.clone());
-        result
+            .insert($proof.$manifest.output.clone(), $proof.$manifest.clone());
+        $result
             .initializations
-            .insert(proof.manifest.output.clone(), init.clone());
+            .insert($proof.$manifest.output.clone(), $init.clone());
     }
-    for receipt in state.correspondences.values() {
-        let prepared = result
+    for receipt in $state.correspondences.values() {
+        let $prepared = $result
             .proofs
-            .get(&receipt.proof.target)
+            .get(&receipt.$proof.target)
             .ok_or_else(|| err("correspondence target recipe missing"))?;
-        let manifest = result
+        let $manifest = $result
             .manifests
-            .get(&receipt.proof.target)
+            .get(&receipt.$proof.target)
             .ok_or_else(|| err("correspondence manifest missing"))?;
-        let init = result
+        let $init = $result
             .initializations
-            .get(&receipt.proof.target)
+            .get(&receipt.$proof.target)
             .ok_or_else(|| err("correspondence initialization missing"))?;
-        check_correspondence(&receipt.proof, manifest, init, prepared)?;
-        linked(snapshot, &receipt.operation, receipt.revision)?;
-        if !state.rehearsals.values().any(|r| {
+        check_correspondence(&receipt.$proof, $manifest, $init, $prepared)?;
+        linked($snapshot, &receipt.operation, receipt.revision)?;
+        if !$state.rehearsals.values().any(|r| {
             r.recorded_by == receipt.operation
                 && r.recorded_revision == receipt.revision
-                && r.manifest.output == receipt.proof.target
+                && r.$manifest.output == receipt.$proof.target
         }) {
             return Err(err("correspondence lacks exact owned recording linkage"));
         }
@@ -1032,12 +2203,12 @@ fn reconstruct_with<'s, F: ReconstructionFinish<'s>>(
     // Every protected source and live storage cell must belong to reconstructed
     // committed proofs. Prospective namespaces never enter the live schema.
     let mut declared = BTreeMap::new();
-    for source in &snapshot.programs {
+    for source in &$snapshot.programs {
         let id = revision(source)?;
-        if !result.recipes.contains_key(&id) {
+        if !$result.recipes.contains_key(&id) {
             compiler::reject_reserved(&source.program)?;
         }
-        if state.compositions.values().any(|m| m.output == id) {
+        if $state.compositions.values().any(|m| m.output == id) {
             for e in &source.program.entities {
                 for f in &e.fields {
                     if f.id.starts_with(RESERVED_PREFIX) {
@@ -1047,7 +2218,7 @@ fn reconstruct_with<'s, F: ReconstructionFinish<'s>>(
             }
         }
     }
-    for e in &snapshot.data.schema {
+    for e in &$snapshot.data.schema {
         for f in &e.fields {
             if f.id.starts_with(RESERVED_PREFIX)
                 && declared.get(&(e.id.clone(), f.id.clone())) != Some(&f.value_type)
@@ -1056,16 +2227,16 @@ fn reconstruct_with<'s, F: ReconstructionFinish<'s>>(
             }
         }
     }
-    if state.layers.is_empty() {
-        compiler::reject_reserved(&snapshot.program()?.program)?;
-        for p in result.proofs.values() {
-            for auxiliary in &p.proof.request.auxiliary {
-                if snapshot
+    if $state.layers.is_empty() {
+        compiler::reject_reserved(&$snapshot.program()?.program)?;
+        for p in $result.proofs.values() {
+            for auxiliary in &p.$proof.request.auxiliary {
+                if $snapshot
                     .data
                     .schema
                     .iter()
                     .any(|e| e.id == auxiliary.entity)
-                    || snapshot
+                    || $snapshot
                         .data
                         .records
                         .iter()
@@ -1075,52 +2246,376 @@ fn reconstruct_with<'s, F: ReconstructionFinish<'s>>(
                 }
             }
         }
-    } else if !state
+    } else if !$state
         .compositions
         .values()
-        .any(|m| m.output == snapshot.active_revision)
+        .any(|m| m.output == $snapshot.active_revision)
     {
         return Err(err("committed owned lineage lost active history envelope"));
     }
-    for a in &snapshot.adoptions {
+    for a in &$snapshot.adoptions {
         if a.active != a.previous
-            && (result.recipes.contains_key(&a.active) || result.recipes.contains_key(&a.previous))
-            && !state.adoptions.iter().any(|r| r.revision == a.revision)
+            && ($result.recipes.contains_key(&a.active) || $result.recipes.contains_key(&a.previous))
+            && !$state.adoptions.iter().any(|r| r.revision == a.revision)
         {
             return Err(err("managed source changed without owned adoption receipt"));
         }
     }
-    validate_recording_continuation(snapshot, meter)?;
-    if !result.epochs.is_empty() {
-        result.validate_endpoint(
-            snapshot,
-            &snapshot.data,
-            snapshot.clock_day,
-            snapshot.revision,
-            meter,
-        )?;
-        let epoch = result
+    validate_recording_continuation($snapshot, $meter)?;
+    if !$result.epochs.is_empty() {
+        #[cfg(test)]
+        combined_transition_reuse_tests::boundary_next("tail-scope", $F::PREFIX_SCOPE_PAYMENT, $meter);
+        $meter.charge($F::PREFIX_SCOPE_PAYMENT)?;
+        {
+            let registry = &$result;
+            let $tail_data = &$snapshot.data;
+            let $tail_day = $snapshot.clock_day;
+            let $tail_revision = $snapshot.revision;
+            registry.check_snapshot($snapshot)?;
+            for ($tail_index, $tail_epoch) in registry.epochs.iter().enumerate() {
+                $meter.charge($F::PREFIX_INTERVAL_PAYMENT)?;
+                if $tail_epoch.adoption_revision > $tail_revision {
+                    return Err(err("history endpoint predates registered producer"));
+                }
+                let $tail_recipe = registry.recipes.get(&$tail_epoch.output)
+                    .ok_or_else(|| err("registered producer recipe missing"))?;
+                if let Some(next) = registry.epochs.get($tail_index + 1) {
+                    let next_recipe = registry.recipes.get(&next.output)
+                        .ok_or_else(|| err("next producer missing"))?;
+                    let (endpoint, endpoint_day, endpoint_revision) = (
+                        next_recipe.seed(), next_recipe.basis().clock_day,
+                        next_recipe.basis().revision,
+                    );
+                    // Only this reconstruction activation established the complete
+                    // interval before its immutable successor was constructed. No
+                    // caller-selected index/flag or exported skip capability exists.
+                    if $meter.reconstruction_default_window()? {
+                        $meter.charge(0)?;
+                        $meter.charge(0)?;
+                    } else {
+                        owned_epoch::validate_interval($snapshot, $tail_recipe, $tail_epoch.adoption_revision,
+                            endpoint_revision, endpoint, endpoint_day, $meter)?;
+                    }
+                } else {
+                    // Ordinary tails stay native; the selected slot can discharge
+                    // only its exact completed first Initial interval.
+$($final_tail_slot)*
+                }
+            }
+        }
+        let epoch = $result
             .epochs
             .last()
             .ok_or_else(|| err("committed epoch missing"))?;
-        if epoch.output != snapshot.active_revision {
+        if epoch.output != $snapshot.active_revision {
             return Err(err("active source is not committed epoch tail"));
         }
-        let recipe = result
+        let recipe = $result
             .recipes
             .get(&epoch.output)
             .ok_or_else(|| err("active recipe missing"))?;
-        if snapshot.revision == epoch.adoption_revision
-            && (snapshot.session != recipe.basis().session
-                || snapshot.clock_day != recipe.basis().clock_day
-                || snapshot.artifacts != recipe.basis().artifacts)
+        if $snapshot.revision == epoch.adoption_revision
+            && ($snapshot.session != recipe.basis().session
+                || $snapshot.clock_day != recipe.basis().clock_day
+                || $snapshot.artifacts != recipe.basis().artifacts)
         {
             return Err(err("adoption changed exact session, day or artifacts"));
         }
     }
-    meter.charge(F::FINISH_PAYMENT)?;
-    finish.finish(snapshot, result, origin, meter)
+    $meter.charge($F::FINISH_PAYMENT)?;
+    $($completed_finish)*
+    $finish.$finish($snapshot, $result, $origin, $meter)
+
+    }};
 }
+// Complete producing built/ElaborateDrops union: 50 administrative/positive
+// local slots (including zero-sized units), 14 direct call/control sites.
+// Native receipt/history/visitor transports and fixed floors remain paid;
+// even the unchanged zero-poll and argument aliases are retained here.
+const COLD_HISTORICAL_SERIALIZATION_PAYMENT: u64 = comparison_payment(64 * 14, [
+    (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, StoreError>>>(), 12),
+    (size_of::<Result<()>>(), 12),
+    (size_of::<&mut ProofMeter>(), 24),
+    (size_of::<isize>(), 12),
+    (size_of::<std::result::Result<std::convert::Infallible, StoreError>>(), 24),
+    (size_of::<u64>(), 4),
+    (size_of::<&OwnedExecutionRecipe>(), 8),
+    (size_of::<&ProjectSnapshot>(), 4),
+    // Two thin references to the original noncapturing, zero-sized visitor.
+    (size_of::<&mut ()>(), 8),
+    (size_of::<&DataSnapshot>(), 20),
+    (size_of::<i32>(), 20),
+    (size_of::<&mut dyn FnMut(&DataSnapshot, &mut ProofMeter) -> Result<()>>(), 4),
+    (size_of::<bool>(), 4),
+]);
+
+fn reconstruct_with<'s, F: ReconstructionFinish<'s>>(
+    snapshot: &'s ProjectSnapshot, meter: &mut ProofMeter, finish: F,
+) -> Result<F::Output> {    reconstruct_body!(snapshot, meter, finish, F, origin, layer, manifest, init, graphs, result, historical, proof, prepared, transition, initial, index, epoch, recipe, revision, data, day, state, [
+    meter.charge(canonical_bytes(state)?.len() as u64)?;
+    ], [], [
+            let initial = Arc::new(reconstruct_recipe(
+                snapshot, layer, manifest, init, &graphs, meter,
+            )?);
+            meter.charge(INITIAL_ORIGIN_PAYMENT)?;
+            origin = Some(FreshInitialOrigin { retained: snapshot, original: initial.clone() });
+    ], [
+            #[cfg(test)]
+            combined_transition_reuse_tests::boundary_before("origin", RECONSTRUCTED_ORIGIN_PAYMENT, meter);
+            meter.charge(RECONSTRUCTED_ORIGIN_PAYMENT)?;
+            #[cfg(test)]
+            combined_transition_reuse_tests::boundary_after("origin", meter);
+            let fresh_origin = origin.take();
+            let transition = owned_continuation::reconstruct_transition(
+                snapshot,
+                &historical,
+                &result,
+                layer,
+                init,
+                manifest,
+                fresh_origin.as_ref(),
+                meter,
+            )?;
+            drop(fresh_origin);
+            OwnedExecutionRecipe::Transition(Arc::new(transition))
+    ], [
+        let prepared = reconstruct_recipe(snapshot, layer, &proof.manifest, init, &graphs, meter)?;
+    ], [
+        let prepared = Arc::new(prepared);
+    ], [], [
+        #[cfg(test)] cold_serialization_tests::before(true, recipe, epoch.adoption_revision, revision, data, day, meter, COLD_HISTORICAL_SERIALIZATION_PAYMENT);
+        meter.charge(COLD_HISTORICAL_SERIALIZATION_PAYMENT)?;
+        // Only this lexical first historical tail borrows historical.data after
+        // historical_basis authenticated its complete canonical container and
+        // native bounded DataSnapshot writer. Retain the receipt/history proof,
+        // every native projection and every original no-op visitor invocation.
+        owned_epoch::validate_interval_body!(snapshot, recipe, epoch.adoption_revision,
+            revision, data, meter, [{
+                let seed = recipe.seed();
+                let seed_day = recipe.basis().clock_day;
+                let visit: &mut dyn FnMut(&DataSnapshot, &mut ProofMeter) -> Result<()> = &mut |_, _| {
+                    Ok(())
+                };
+                owned_replay::recipe_history_body!(recipe, seed, seed_day, data, day, meter,
+                    [visit(seed, meter)?;],
+                    [owned_replay::protected_row(recipe, &frame, row, old, event.day, meter)?;],
+                    [visit(&frame, meter)?;], [visit(data, meter)], frame, row, old, event, [
+                        #[cfg(test)] cold_serialization_tests::poll(meter);
+                        meter.charge(0)?;
+                    ])
+            }])?;
+        #[cfg(test)] cold_serialization_tests::after(meter);
+   ], [
+        #[cfg(test)] cold_serialization_tests::before(false, recipe, epoch.adoption_revision, revision, data, day, meter, 0);
+        owned_epoch::validate_interval(snapshot, recipe, epoch.adoption_revision,
+            revision, data, day, meter)?;
+        #[cfg(test)] cold_serialization_tests::after(meter);
+    ])
+}
+impl HistoricalInitialLoan<'_> {
+    fn reconstruct(&self, completed: Option<&CompletedHistoricalIntervals<'_, '_>>, meter: &mut ProofMeter) -> Result<ReconstructedOwned> {
+        let snapshot = self.execution.current();
+        meter.charge(RegistryOnly::FRAME_PAYMENT)?;
+        let finish = RegistryOnly;
+        reconstruct_body!(snapshot, meter, finish, RegistryOnly, origin, layer, manifest, init,
+            graphs, result, historical, proof, prepared, transition, initial,
+            index, epoch, recipe, revision, data, day, state, [
+            meter.charge(0)?;
+        ], [
+            let mut completed_origin = None;
+            let mut completed_interval = None;
+        ], [
+            meter.charge(HISTORICAL_INITIAL_SLOT_PAYMENT)?;
+            let initial = match self.initial(&manifest.output, meter)? {
+                Some(donor_initial) => {
+                    meter.charge(HISTORICAL_INITIAL_MINT_PAYMENT)?;
+                    completed_origin = Some(CompletedInitialOrigin { retained: snapshot, original: donor_initial });
+                    let initial = donor_initial.clone();
+                    meter.charge(0)?;
+                    meter.charge(HISTORICAL_INITIAL_INTERVAL_MINT_PAYMENT)?;
+                    completed_interval = Some(CompletedInitialInterval { loan: self, original: donor_initial });
+                    initial
+                }
+                None => {
+                    let initial = Arc::new(reconstruct_recipe(snapshot, layer, manifest, init, &graphs, meter)?);
+                    meter.charge(INITIAL_ORIGIN_PAYMENT)?;
+                    origin = Some(FreshInitialOrigin { retained: snapshot, original: initial.clone() });
+                    initial
+                }
+            };
+        ], [
+            #[cfg(test)]
+            combined_transition_reuse_tests::start_selection(meter);
+            #[cfg(test)]
+            combined_transition_reuse_tests::boundary_before("select", HISTORICAL_TRANSITION_FIRST_SELECT_PAYMENT, meter);
+            meter.charge(HISTORICAL_TRANSITION_FIRST_SELECT_PAYMENT)?;
+            #[cfg(test)]
+            combined_transition_reuse_tests::boundary_after("select", meter);
+            let donor = self.transition_donor(&result, manifest, completed_origin.as_ref(), meter)?;
+            #[cfg(test)]
+            let donor = combined_transition_reuse_tests::force_native(donor);
+            #[cfg(test)]
+            combined_transition_reuse_tests::selected(self, &result, manifest, completed_origin.as_ref(), donor, meter);
+            if let Some(donor) = donor {
+                #[cfg(test)]
+            combined_transition_reuse_tests::boundary_before("hit", HISTORICAL_TRANSITION_HIT_PAYMENT, meter);
+            meter.charge(HISTORICAL_TRANSITION_HIT_PAYMENT)?;
+            #[cfg(test)]
+            combined_transition_reuse_tests::boundary_after("hit", meter);
+                let fresh_origin = origin.take();
+                let completed_origin = completed_origin.take();
+                #[cfg(test)]
+                combined_transition_reuse_tests::poll("pre-hit", meter);
+                meter.charge(0)?;
+                drop(completed_origin);
+                drop(fresh_origin);
+                let recipe = OwnedExecutionRecipe::Transition(Arc::clone(donor));
+                #[cfg(test)]
+                combined_transition_reuse_tests::poll("post-hit", meter);
+                meter.charge(0)?;
+                #[cfg(test)]
+                combined_transition_reuse_tests::hit(donor, &recipe, meter);
+                recipe
+            } else {
+                #[cfg(test)]
+            combined_transition_reuse_tests::boundary_before("origin", RECONSTRUCTED_ORIGIN_PAYMENT, meter);
+            meter.charge(RECONSTRUCTED_ORIGIN_PAYMENT)?;
+            #[cfg(test)]
+            combined_transition_reuse_tests::boundary_after("origin", meter);
+            meter.charge(HISTORICAL_INITIAL_TRANSITION_WITH_VIEW_PAYMENT)?;
+            let fresh_origin = origin.take();
+            let completed_origin = completed_origin.take();
+            let transition = match completed_origin.as_ref() {
+                Some(completed) => {
+                    meter.charge(owned_continuation::STRUCTURAL_ENTRY_PAYMENT)?;
+                    meter.charge(owned_continuation::STRUCTURAL_LOAN_PAYMENT)?;
+                    let structural = if manifest.transition == ScopeTransition::Evolution {
+                        meter.charge(owned_continuation::STRUCTURAL_SELECT_OPEN_PAYMENT)?;
+                        let mut candidates = self.registry.recipes.iter();
+                        loop {
+                            meter.charge(owned_continuation::STRUCTURAL_SELECT_NEXT_PAYMENT)?;
+                            let Some((key, recipe)) = candidates.next() else { break None; };
+                            meter.charge(owned_continuation::STRUCTURAL_SELECT_COMPARE_PAYMENT)?;
+                            // Lossless on every admitted target; checked addition
+                            // overflows only into the existing fail-closed debit.
+                            meter.charge((key.as_str().len() as u64)
+                                .checked_add(manifest.output.as_str().len() as u64)
+                                .unwrap_or(u64::MAX))?;
+                            if key != &manifest.output { continue; }
+                            let OwnedExecutionRecipe::Transition(donor) = recipe else { break None; };
+                            if donor.manifest.transition != ScopeTransition::Evolution { break None; }
+                            if !Arc::ptr_eq(&donor.original, completed.original) { break None; }
+                            break Some(CompletedStructuralLoan { origin: completed, donor });
+                        }
+                    } else { None };
+                    owned_continuation::reconstruct_transition_completed(snapshot, &historical, &result,
+                        layer, init, manifest, completed, structural.as_ref(), meter)?
+                },
+                None => owned_continuation::reconstruct_transition(snapshot, &historical, &result, layer, init,
+                    manifest, fresh_origin.as_ref(), meter)?,
+            };
+            drop(completed_origin);
+            drop(fresh_origin);
+                OwnedExecutionRecipe::Transition(Arc::new(transition))
+            }
+        ], [
+            meter.charge(HISTORICAL_INITIAL_SLOT_PAYMENT)?;
+            let initial_preparation = match self.initial(&proof.manifest.output, meter)? {
+                Some(initial) => {
+                    let prepared = HistoricalInitialPrepared::Completed(initial.clone());
+                    meter.charge(0)?;
+                    prepared
+                },
+                None => HistoricalInitialPrepared::Native(reconstruct_recipe(
+                    snapshot, layer, &proof.manifest, init, &graphs, meter)?),
+            };
+            let prepared = match &initial_preparation {
+                HistoricalInitialPrepared::Completed(initial) => &**initial,
+                HistoricalInitialPrepared::Native(prepared) => prepared,
+            };
+        ], [
+            meter.charge(HISTORICAL_INITIAL_ARC_PAYMENT)?;
+            let prepared = match initial_preparation {
+                HistoricalInitialPrepared::Completed(initial) => initial,
+                HistoricalInitialPrepared::Native(prepared) => Arc::new(prepared),
+            };
+        ], [drop(completed_interval); drop(completed_origin);], [
+            match meter.charge_cause(HISTORICAL_INITIAL_INTERVAL_SELECT_PAYMENT) {
+                Ok(()) => (),
+                Err(cause) => return Err(cause.historical_initial_interval_error()),
+            }
+            'completed_initial_interval: {
+                if let Some(_completed) = completed_interval.take() {
+                    match meter.charge_cause(0) {
+                        Ok(()) => (),
+                        Err(cause) => return Err(cause.historical_initial_interval_error()),
+                    }
+                    if meter.reconstruction_default_window_after_poll() {
+                        match meter.charge_cause(0) {
+                            Ok(()) => (),
+                            Err(cause) => return Err(cause.historical_initial_interval_error()),
+                        }
+                        match meter.charge_cause(0) {
+                            Ok(()) => (),
+                            Err(cause) => return Err(cause.historical_initial_interval_error()),
+                        }
+                        break 'completed_initial_interval;
+                    }
+                }
+                match owned_epoch::validate_interval(snapshot, recipe, epoch.adoption_revision,
+                    revision, data, day, meter) {
+                    Ok(()) => (),
+                    Err(error) => return Err(error),
+                }
+            }], [
+            'completed_transition_interval: {
+                let failure = 'completed_tail_failure: {
+                completed_charge_to!('completed_tail_failure, meter, COMPLETED_INTERVAL_TAIL_PAYMENT);
+                if let Some(pair) = completed {
+                    if completed_tail!(pair, &result, recipe, data, day, revision)
+                        && completed_window_to!('completed_tail_failure, meter) {
+                        #[cfg(test)]
+                        completed_interval_tests::stage("tail", meter);
+                        completed_charge_to!('completed_tail_failure, meter, 0);
+                        break 'completed_transition_interval;
+                    }
+                }
+                None
+                };
+                completed_failure!(failure);
+            match meter.charge_cause(HISTORICAL_INITIAL_INTERVAL_SELECT_PAYMENT) {
+                Ok(()) => (),
+                Err(cause) => return Err(cause.historical_initial_interval_error()),
+            }
+            'completed_initial_interval: {
+                if let Some(_completed) = completed_interval.take() {
+                    match meter.charge_cause(0) {
+                        Ok(()) => (),
+                        Err(cause) => return Err(cause.historical_initial_interval_error()),
+                    }
+                    if meter.reconstruction_default_window_after_poll() {
+                        match meter.charge_cause(0) {
+                            Ok(()) => (),
+                            Err(cause) => return Err(cause.historical_initial_interval_error()),
+                        }
+                        match meter.charge_cause(0) {
+                            Ok(()) => (),
+                            Err(cause) => return Err(cause.historical_initial_interval_error()),
+                        }
+                        break 'completed_initial_interval;
+                    }
+                }
+                match owned_epoch::validate_interval(snapshot, recipe, epoch.adoption_revision,
+                    revision, data, day, meter) {
+                    Ok(()) => (),
+                    Err(error) => return Err(error),
+                }
+            }
+            }
+        ])
+    }
+}
+
 pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
     let mut meter = ProofMeter::new(ProofBudget::default(), Arc::new(AtomicBool::new(false)))?;
     reconstruct(snapshot, &mut meter).map(|_| ())
@@ -1580,6 +3075,8 @@ fn validate_revision_ownership(snapshot: &ProjectSnapshot) -> Result<()> {
     }
     Ok(())
 }
+
+
 impl ReconstructedOwned {
     pub(super) fn check_snapshot(&self, snapshot: &ProjectSnapshot) -> Result<()> {
         if self.snapshot != canonical_digest(IdentityDomain::Data, snapshot)? {
@@ -1691,35 +3188,13 @@ impl ReconstructedOwned {
         surface: &owned_continuation::VerifiedOwnedPolicySurface,
         meter: &mut ProofMeter,
     ) -> Result<()> {
-        self.check_snapshot(snapshot)?;
-        let state = snapshot.owned_scope()?;
-        if !state.layers.contains_key(surface.original_layer()) || self.epochs.is_empty() {
-            return Err(err(
-                "policy surface is not bound to this committed original layer",
-            ));
-        }
-        // The type cannot be caller-constructed; the source still has to belong
-        // to this exact reconstructed prefix, including provenance.
-        let source = program(snapshot, surface.source())?;
-        self.resolve(source)?;
-        for (index, epoch) in self.epochs.iter().enumerate() {
-            let recipe = self
-                .recipes
-                .get(&epoch.output)
-                .ok_or_else(|| err("policy producer recipe missing"))?;
-            let (endpoint, day) = if let Some(next) = self.epochs.get(index + 1) {
-                let next_recipe = self
-                    .recipes
-                    .get(&next.output)
-                    .ok_or_else(|| err("policy successor recipe missing"))?;
-                (next_recipe.seed(), next_recipe.basis().clock_day)
-            } else {
-                (&snapshot.data, snapshot.clock_day)
-            };
+        policy_frames_body!(self, snapshot, surface, meter, [], [
             let mut visit = |frame: &DataSnapshot, meter: &mut ProofMeter| {
                 meter.charge(canonical_bytes(frame)?.len() as u64)?;
+                #[cfg(test)] completed_interval_tests::visit(index,frame);
                 surface.validate_frame(frame)
             };
+        ], [
             owned_replay::validate_recipe_history_with(
                 recipe,
                 recipe.seed(),
@@ -1729,8 +3204,36 @@ impl ReconstructedOwned {
                 meter,
                 &mut visit,
             )?;
-        }
-        Ok(())
+        ], index, recipe, endpoint, day, visit, [Ok(())])
+    }
+    pub(super) fn validate_policy_frames_reusing(
+        &self, snapshot: &ProjectSnapshot,
+        surface: &owned_continuation::VerifiedOwnedPolicySurface, layer: &OwnedLayerV2,
+        source_recipe: &OwnedExecutionRecipe,
+        recorder: &owned_transition::PolicyFrameRecorder<'_>, meter: &mut ProofMeter,
+    ) -> Result<()> {
+        policy_frames_body!(self, snapshot, surface, meter, [
+            meter.charge(owned_transition::POLICY_FRAME_SELECT_PAYMENT)?;
+            if recorder.eligible(owned_transition::SelectedFrameCall {
+                registry: self, snapshot, recipe: source_recipe, surface, layer, meter,
+            })? { return Ok(()); }
+        ], [
+            let mut visit = |frame: &DataSnapshot, meter: &mut ProofMeter| {
+                meter.charge(canonical_bytes(frame)?.len() as u64)?;
+                #[cfg(test)] completed_interval_tests::visit(index,frame);
+                surface.validate_frame(frame)
+            };
+        ], [
+            owned_replay::validate_recipe_history_with(
+                recipe,
+                recipe.seed(),
+                recipe.basis().clock_day,
+                endpoint,
+                day,
+                meter,
+                &mut visit,
+            )?;
+        ], index, recipe, endpoint, day, visit, [Ok(())])
     }
     /// Authenticate an archived frame under the prefix ending at its genuine
     /// producer. No future implementation may lend event capacity or provenance.
@@ -1790,28 +3293,20 @@ impl ReconstructedOwned {
         Ok(())
     }
 }
-fn reconstruct_transition(
-    snapshot: &ProjectSnapshot,
-    current: &ProjectSnapshot,
-    registry: &ReconstructedOwned,
-    layer: &OwnedLayerV2,
-    initialization: &OwnedInitializationV2,
-    manifest: &OwnedCompositionV2,
-    origin: Option<&FreshInitialOrigin<'_>>,
-    meter: &mut ProofMeter,
-) -> Result<VerifiedOwnedTransitionExecution> {
-    let last = registry
+macro_rules! reconstruct_transition_body {
+    ($snapshot:ident, $current:ident, $registry:ident, $layer:ident, $initialization:ident, $manifest:ident, $origin:ident, $meter:ident, $original:ident, $prior_before:ident, $prior_after:ident, $before:ident, $after:ident, $sources:ident, $continuation:ident, $effective_snapshot:expr, [$($continuation_slot:tt)*]) => {{
+    let last = $registry
         .epochs
         .last()
         .ok_or_else(|| err("transition has no committed predecessor"))?;
-    let predecessor = registry
+    let predecessor = $registry
         .manifests
         .get(&last.output)
         .ok_or_else(|| err("predecessor manifest missing"))?;
-    let original = registry
+    let $original = $registry
         .proofs
         .get(
-            &registry
+            &$registry
                 .epochs
                 .first()
                 .ok_or_else(|| err("original epoch missing"))?
@@ -1819,102 +3314,94 @@ fn reconstruct_transition(
         )
         .ok_or_else(|| err("original initializer recipe missing"))?
         .clone();
-    let id = layer.identity()?;
-    if manifest.version != OWNED_SCOPE_VERSION
-        || manifest.lowering != OWNED_TRANSITION_LOWERING_VERSION
-        || manifest.runtime != RUNTIME_VERSION
-        || manifest.driver != DRIVER_VERSION
-        || !valid_id(&manifest.operation)
-        || manifest.previous.as_ref() != Some(&last.output)
-        || current.active_revision != last.output
-        || manifest.layers != [id.clone()]
-        || manifest.basis.frozen != basis(current)?
-        || manifest.basis.graph != current.decisions
-        || manifest.basis.artifacts != current.artifacts
-        || manifest.basis.sources
-            != current
+    let id = $layer.identity()?;
+    if $manifest.version != OWNED_SCOPE_VERSION
+        || $manifest.lowering != OWNED_TRANSITION_LOWERING_VERSION
+        || $manifest.runtime != RUNTIME_VERSION
+        || $manifest.driver != DRIVER_VERSION
+        || !valid_id(&$manifest.operation)
+        || $manifest.previous.as_ref() != Some(&last.output)
+        || $current.active_revision != last.output
+        || $manifest.layers != [id.clone()]
+        || $manifest.basis.frozen != basis($current)?
+        || $manifest.basis.graph != $current.decisions
+        || $manifest.basis.artifacts != $current.artifacts
+        || $manifest.basis.$sources
+            != $current
                 .programs
                 .iter()
                 .map(revision)
                 .collect::<std::result::Result<Vec<_>, _>>()?
-        || manifest.basis.family != OwnedBasisFamilyV2::OwnedV2
+        || $manifest.basis.family != OwnedBasisFamilyV2::OwnedV2
     {
         return Err(err(
             "transition dispatch, immediate predecessor or complete basis differs",
         ));
     }
-    let (prior_before, prior_after, prior_sources) =
-        registry.effective_pair(match origin { Some(o) => o.retained, None => snapshot }, &last.output)?;
-    let (before, after, sources) = match manifest.transition {
+    let ($prior_before, $prior_after, prior_sources) =
+        $registry.effective_pair($effective_snapshot, &last.output)?;
+    let ($before, $after, $sources) = match $manifest.transition {
         ScopeTransition::Evolution => {
-            if manifest.active != predecessor.active {
+            if $manifest.active != predecessor.active {
                 return Err(err("implementation changed active layer set"));
             }
-            let [correspondence] = manifest.correspondences.as_slice() else {
+            let [correspondence] = $manifest.correspondences.as_slice() else {
                 return Err(err(
                     "evolution needs one exact implementation correspondence",
                 ));
             };
             if correspondence.version != OWNED_SCOPE_VERSION
                 || correspondence.source != last.output
-                || correspondence.target != manifest.business
-                || correspondence.sources.after != manifest.business
-                || correspondence.sources.root_entity != layer.request.inventory.sources.root_entity
+                || correspondence.target != $manifest.business
+                || correspondence.$sources.$after != $manifest.business
+                || correspondence.$sources.root_entity != $layer.request.inventory.$sources.root_entity
             {
                 return Err(err("evolution ordinary pair correspondence differs"));
             }
             (
-                program(snapshot, &correspondence.sources.before)?,
-                program(snapshot, &correspondence.sources.after)?,
-                &correspondence.sources,
+                program($snapshot, &correspondence.$sources.$before)?,
+                program($snapshot, &correspondence.$sources.$after)?,
+                &correspondence.$sources,
             )
         }
         ScopeTransition::Withdrawal => {
             if predecessor.active != BTreeSet::from([id])
-                || !manifest.active.is_empty()
-                || manifest.correspondences != predecessor.correspondences
-                || manifest.business != predecessor.business
+                || !$manifest.active.is_empty()
+                || $manifest.correspondences != predecessor.correspondences
+                || $manifest.business != predecessor.business
             {
                 return Err(err(
                     "withdrawal changed effective correspondence or inactive lineage",
                 ));
             }
-            (prior_before, prior_after, prior_sources)
+            ($prior_before, $prior_after, prior_sources)
         }
         _ => return Err(err("unsupported owned transition kind")),
     };
-    let continuation = match origin {
-        Some(origin) if manifest.transition == ScopeTransition::Evolution => {
-        meter.charge(owned_continuation::COMPARISON_DISPATCH_PAYMENT)?;
-        meter.charge(owned_continuation::COMPARISON_OWNER_PAYMENT)?;
-        owned_continuation::verify_initial(current, InitialComparison {
-            original: &origin.original, predecessor_before: prior_before,
-            predecessor_after: prior_after,
-        }, layer, initialization, before, after, sources, meter)?
-        }
-        _ => {
-        owned_continuation::verify(current, &original, layer, initialization,
-            prior_before, prior_after, before, after, sources, meter)?
-        }
-    };
+    $($continuation_slot)*
     let (target, metadata) = owned_transition_lowering::compile(
-        &continuation,
-        manifest,
-        !manifest.active.is_empty(),
-        meter,
+        &$continuation,
+        $manifest,
+        !$manifest.active.is_empty(),
+        $meter,
     )?;
-    if revision(&target)? != manifest.output || program(snapshot, &manifest.output)? != &target {
+    if revision(&target)? != $manifest.output || program($snapshot, &$manifest.output)? != &target {
         return Err(err("transition source bytes/provenance do not regenerate"));
     }
     Ok(VerifiedOwnedTransitionExecution {
-        continuation: Arc::new(continuation),
+        $continuation: Arc::new($continuation),
         target,
         metadata,
-        manifest: manifest.clone(),
-        original,
-        initialization: initialization.clone(),
+        $manifest: $manifest.clone(),
+        $original,
+        $initialization: $initialization.clone(),
     })
+
+    }};
 }
+pub(super) use reconstruct_transition_body;
+
+
 
 pub(super) fn transition(
     current: &ProjectSnapshot,
@@ -2018,10 +3505,12 @@ fn transition_with_origin(
         )
         .ok_or_else(|| err("original preview missing"))?
         .clone();
+    meter.charge(owned_continuation::STRUCTURAL_ENTRY_PAYMENT)?;
     let continuation = match origin {
         Some(origin) if !withdrawal => {
         meter.charge(owned_continuation::COMPARISON_DISPATCH_PAYMENT)?;
         meter.charge(owned_continuation::COMPARISON_OWNER_PAYMENT)?;
+        meter.charge(owned_continuation::STRUCTURAL_PAIR_PAYMENT)?;
         owned_continuation::verify_initial(current, InitialComparison {
             original: &origin.original, predecessor_before: prior_before,
             predecessor_after: prior_after,
@@ -2209,3 +3698,226 @@ mod registry_policy_controls;
 #[cfg(test)]
 #[path = "owned_persist_initial_reuse_tests.rs"]
 mod initial_reuse_tests;
+
+// Direct packet/query controls only. Actual lexical-route coverage needs the
+// separately admitted genuine histories and fixed-site private sidecar.
+#[cfg(test)]
+mod ordinary_prefix_controls {
+    use super::*;
+    // Compiler-evaluated target layouts; no test executable needed for these checks.
+    const _: () = {
+        assert!(size_of::<&ReconstructedOwned>() == 8);
+        assert!(size_of::<&ProjectSnapshot>() == 8);
+        assert!(size_of::<&DataSnapshot>() == 8);
+        assert!(size_of::<i32>() == 4);
+        assert!(size_of::<u64>() == 8);
+        assert!(size_of::<&mut ProofMeter>() == 8);
+        assert!(size_of::<std::iter::Enumerate<std::slice::Iter<'_, OwnedProducerEpoch>>>() == 24);
+        assert!(size_of::<std::slice::Iter<'_, OwnedProducerEpoch>>() == 16);
+        assert!(size_of::<&[OwnedProducerEpoch]>() == 16);
+        assert!(size_of::<&Vec<OwnedProducerEpoch>>() == 8);
+        assert!(size_of::<&mut std::iter::Enumerate<std::slice::Iter<'_, OwnedProducerEpoch>>>() == 8);
+        assert!(size_of::<Option<(usize, &OwnedProducerEpoch)>>() == 16);
+        assert!(size_of::<(usize, &OwnedProducerEpoch)>() == 16);
+        assert!(size_of::<usize>() == 8);
+        assert!(size_of::<&OwnedProducerEpoch>() == 8);
+        assert!(size_of::<isize>() == 8);
+        assert!(size_of::<Result<()>>() == 152);
+        assert!(size_of::<std::ops::ControlFlow<Result<std::convert::Infallible>, ()>>() == 152);
+        assert!(size_of::<Result<std::convert::Infallible>>() == 152);
+        assert!(size_of::<(usize, bool)>() == 16);
+        assert!(size_of::<Option<&OwnedProducerEpoch>>() == 8);
+        assert!(size_of::<&BTreeMap<Digest, OwnedExecutionRecipe>>() == 8);
+        assert!(size_of::<&Digest>() == 8);
+        assert!(size_of::<Option<&OwnedExecutionRecipe>>() == 8);
+        assert!(size_of::<&OwnedExecutionRecipe>() == 8);
+        assert!(size_of::<Result<&OwnedExecutionRecipe>>() == 152);
+        assert!(size_of::<std::ops::ControlFlow<Result<std::convert::Infallible>, &OwnedExecutionRecipe>>() == 152);
+        assert!(size_of::<(&DataSnapshot, i32, u64)>() == 24);
+        assert!(size_of::<RuntimeLimits>() == 48);
+        assert!(size_of::<&std::time::Instant>() == 8);
+        assert!(size_of::<std::time::Duration>() == 16);
+        assert!(size_of::<&std::time::Duration>() == 8);
+        assert!(size_of::<u128>() == 16);
+        assert!(size_of::<Option<u128>>() == 32);
+        assert!(size_of::<bool>() == 1);
+        assert!(size_of::<Result<bool>>() == 152);
+        assert!(size_of::<std::ops::ControlFlow<Result<std::convert::Infallible>, bool>>() == 152);
+        assert!(size_of::<StoreError>() == 152);
+        assert!(RegistryOnly::PREFIX_SCOPE_PAYMENT == 5296);
+        assert!(RegistryOnly::PREFIX_INTERVAL_PAYMENT == 21148);
+        assert!(TransitionFinish::PREFIX_SCOPE_PAYMENT == 5328);
+        assert!(TransitionFinish::PREFIX_INTERVAL_PAYMENT == 21180);
+    };
+    #[test]
+    fn ordinary_prefix_packet_short_exact_and_actual_layouts() {
+        let packets = [RegistryOnly::PREFIX_SCOPE_PAYMENT, RegistryOnly::PREFIX_INTERVAL_PAYMENT,
+            TransitionFinish::PREFIX_SCOPE_PAYMENT, TransitionFinish::PREFIX_INTERVAL_PAYMENT];
+        for packet in packets {
+            assert!(packet > 0 && packet < ProofBudget::default().units);
+            let mut short = ProofMeter::new(ProofBudget { units: packet, elapsed_millis: 60_000 },
+                Arc::new(AtomicBool::new(false))).unwrap();
+            assert!(matches!(short.charge(packet), Err(StoreError::Invalid(text))
+                if text == "Common factual admission: budget: cumulative proof/initialization budget exhausted"));
+            let mut exact = ProofMeter::new(ProofBudget { units: packet + 1, elapsed_millis: 60_000 },
+                Arc::new(AtomicBool::new(false))).unwrap();
+            exact.charge(packet).unwrap();
+            assert_eq!(exact.remaining_units_for_test(), 0);
+        }
+        println!("ORDINARY_PREFIX_PACKETS {packets:?}");
+        println!("ORDINARY_PREFIX_LAYOUTS {}", serde_json::json!({
+            "registry": size_of::<ReconstructedOwned>(),
+            "registry_result": size_of::<Result<ReconstructedOwned>>(),
+            "transition_result": size_of::<Result<(ReconstructedOwned, Arc<VerifiedOwnedTransitionExecution>)>>(),
+            "iterator": size_of::<std::iter::Enumerate<std::slice::Iter<'_, OwnedProducerEpoch>>>(),
+            "item": size_of::<(usize, &OwnedProducerEpoch)>(),
+            "optional_item": size_of::<Option<(usize, &OwnedProducerEpoch)>>(),
+            "endpoint": size_of::<(&DataSnapshot, i32, u64)>(),
+            "runtime_limits": size_of::<RuntimeLimits>(),
+            "instant": size_of::<std::time::Instant>(),
+            "duration": size_of::<std::time::Duration>(),
+            "u128": size_of::<u128>(), "optional_u128": size_of::<Option<u128>>(),
+            "unit_result": size_of::<Result<()>>(), "bool_result": size_of::<Result<bool>>(),
+            "error": size_of::<StoreError>(), "residual": size_of::<Result<std::convert::Infallible>>(),
+            "unit_control": size_of::<std::ops::ControlFlow<Result<std::convert::Infallible>, ()>>(),
+            "bool_control": size_of::<std::ops::ControlFlow<Result<std::convert::Infallible>, bool>>()
+        }));
+    }
+    #[test]
+    fn ordinary_prefix_paid_window_default_clipped_and_both_tokens() {
+        for elapsed_millis in [60_000, 4999] {
+            let packet = RegistryOnly::PREFIX_INTERVAL_PAYMENT;
+            let mut meter = ProofMeter::new(ProofBudget { units: packet + 1, elapsed_millis },
+                Arc::new(AtomicBool::new(false))).unwrap();
+            meter.charge(packet).unwrap();
+            let eligible = meter.reconstruction_default_window().unwrap();
+            assert_eq!(eligible, elapsed_millis == 60_000);
+            assert_eq!(meter.remaining_units_for_test(), 0, "query never reserves or refunds");
+        }
+        for secondary in [false, true] {
+            let primary = Arc::new(AtomicBool::new(false));
+            let additional = Arc::new(AtomicBool::new(false));
+            let packet = RegistryOnly::PREFIX_INTERVAL_PAYMENT;
+            let mut meter = ProofMeter::new(ProofBudget { units: packet + 1, elapsed_millis: 60_000 }, primary.clone()).unwrap();
+            meter.watch_cancellation(&additional);
+            meter.charge(packet).unwrap();
+            if secondary { additional.store(true, std::sync::atomic::Ordering::Relaxed); }
+            else { primary.store(true, std::sync::atomic::Ordering::Relaxed); }
+            assert!(matches!(meter.reconstruction_default_window(), Err(StoreError::Invalid(text))
+                if text == "Common factual admission: budget: cancelled or cumulative elapsed budget exhausted"));
+        }
+    }
+    // Genuine immutable snapshots only. This test entry cannot request omission,
+    // choose an epoch cutoff or construct a production proof/registry.
+    impl ProjectSnapshot {
+        pub(crate) fn assert_ordinary_prefix_for_test(
+            &self, initial: &ProjectSnapshot, historical: &[ProjectSnapshot],
+            expected_events: &[usize],
+        ) {
+            self.validate_container().unwrap();
+            assert_eq!(historical.len() + 1, expected_events.len());
+            let mut meter = ProofMeter::new(ProofBudget::default(),
+                Arc::new(AtomicBool::new(false))).unwrap();
+            let registry = reconstruct(self, &mut meter).unwrap();
+            registry.check_snapshot(self).unwrap();
+            registry.resolve(self.program().unwrap()).unwrap();
+            assert_eq!(registry.epochs.len(), expected_events.len());
+            let state = self.owned_scope().unwrap();
+            assert_eq!(state.adoptions.len(), expected_events.len());
+            assert_eq!(registry.epochs.iter().map(|e| &e.output).collect::<BTreeSet<_>>().len(),
+                expected_events.len());
+            assert_eq!(registry.epochs.last().unwrap().output, self.active_revision);
+            assert_eq!(registry.recipes[&registry.epochs[0].output].seed(), &initial.data);
+            let mut actual_events = Vec::new();
+            for (index, epoch) in registry.epochs.iter().enumerate() {
+                let adoption = &state.adoptions[index];
+                assert_eq!(epoch.adoption_revision, adoption.revision);
+                assert_eq!(epoch.output, state.compositions[&adoption.composition].output);
+                let recipe = &registry.recipes[&epoch.output];
+                let endpoint = if let Some(next) = registry.epochs.get(index + 1) {
+                    let completed = &historical[index];
+                    let next_recipe = &registry.recipes[&next.output];
+                    assert_eq!(next_recipe.seed(), &completed.data);
+                    assert_eq!(next_recipe.basis().clock_day, completed.clock_day);
+                    assert_eq!(next_recipe.basis().revision, completed.revision);
+                    assert!(!std::ptr::eq(next_recipe.seed(), &completed.data),
+                        "constructor-retained semantic clone, not a pointer assumption");
+                    completed
+                } else { self };
+                assert!(endpoint.data.events.starts_with(&recipe.seed().events));
+                actual_events.push(endpoint.data.events.len() - recipe.seed().events.len());
+            }
+            assert_eq!(actual_events, expected_events);
+            assert_eq!(registry.recipes[&registry.epochs.last().unwrap().output].active(),
+                expected_events.len() < 3);
+
+            // The unchanged generic entry receives no lexical induction authority.
+            // It must still complete under its ordinary default test-local meter.
+            let mut generic = ProofMeter::new(ProofBudget::default(),
+                Arc::new(AtomicBool::new(false))).unwrap();
+            registry.validate_endpoint(self, &self.data, self.clock_day, self.revision,
+                &mut generic).unwrap();
+
+            let mut foreign_current = self.clone();
+            foreign_current.clock_day = foreign_current.clock_day.checked_add(1).unwrap();
+            assert_eq!(foreign_current.data, self.data);
+            assert!(matches!(registry.check_snapshot(&foreign_current), Err(StoreError::Invalid(text))
+                if text == "Common factual admission: owned persisted proof: execution registry belongs to another complete snapshot"));
+            let mut foreign_source = self.program().unwrap().clone();
+            foreign_source.binding.program_path = "foreign-prefix/program.json".into();
+            assert_eq!(foreign_source.artifact, self.program().unwrap().artifact);
+            assert_eq!(foreign_source.source_bytes, self.program().unwrap().source_bytes);
+            foreign_source.validate().unwrap();
+            assert!(matches!(registry.resolve(&foreign_source), Err(StoreError::Invalid(text))
+                if text == "Common factual admission: owned persisted proof: source is not a checked owned recipe"));
+            println!("ORDINARY_PREFIX_GENUINE epochs={} events={actual_events:?} constructor_boundaries={} tail_active={} generic_full_ok=true",
+                registry.epochs.len(), historical.len(), expected_events.len() < 3);
+        }
+    }
+
+}
+
+#[cfg(all(test, target_pointer_width = "64"))]
+const _: [(); 12160] = [(); HISTORICAL_INITIAL_ARC_PAYMENT as usize];
+
+#[cfg(all(test, target_pointer_width = "64"))]
+const _: [(); 10304] = [(); historical_initial_callback_payment::<()>() as usize];
+
+#[cfg(all(test, target_pointer_width = "64"))]
+const _: [(); 7492] = [(); HISTORICAL_INITIAL_COMPARE_PAYMENT as usize];
+
+#[cfg(all(test, target_pointer_width = "64"))]
+const _: [(); 5952] = [(); HISTORICAL_INITIAL_MINT_PAYMENT as usize];
+
+#[cfg(all(test, target_pointer_width = "64"))]
+const _: [(); 3200] = [(); HISTORICAL_INITIAL_NEXT_PAYMENT as usize];
+
+#[cfg(all(test, target_pointer_width = "64"))]
+const _: [(); 3232] = [(); HISTORICAL_INITIAL_SCAN_PAYMENT as usize];
+
+#[cfg(all(test, target_pointer_width = "64"))]
+const _: [(); 76072] = [(); HISTORICAL_INITIAL_SLOT_PAYMENT as usize];
+
+#[cfg(all(test, target_pointer_width = "64"))]
+const _: [(); 27577] = [(); HISTORICAL_INITIAL_SURFACE_PAYMENT as usize];
+
+#[cfg(all(test, target_pointer_width = "64"))]
+const _: [(); 73960] = [(); HISTORICAL_INITIAL_TRANSITION_PAYMENT as usize];
+
+#[cfg(all(test, target_pointer_width = "64"))]
+const _: [(); 3840] = [(); HISTORICAL_INITIAL_WORKER_PAYMENT as usize];
+
+#[cfg(all(test, target_pointer_width = "64"))]
+const _: [(); 74_536] = [(); HISTORICAL_INITIAL_TRANSITION_WITH_VIEW_PAYMENT as usize];
+
+#[cfg(test)]
+#[path = "owned_combined_transition_reuse_tests.rs"]
+pub(super) mod combined_transition_reuse_tests;
+
+#[cfg(test)]
+#[path = "owned_completed_interval_tests.rs"]
+pub(super) mod completed_interval_tests;
+
+#[cfg(test)]
+#[path = "owned_cold_serialization_tests.rs"]
+pub(super) mod cold_serialization_tests;

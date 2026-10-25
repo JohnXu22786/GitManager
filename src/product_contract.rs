@@ -292,6 +292,22 @@ pub fn canonical_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
 pub fn canonical_digest<T: Serialize>(domain: IdentityDomain, value: &T) -> Result<Digest> {
     Ok(bytes_digest(domain, &canonical_bytes(value)?))
 }
+
+/// A fresh canonical encoding, not a semantic proof or admission capability.
+/// No raw-byte constructor, mutable view, extraction, clone or wire format exists.
+pub(crate) struct CanonicalEvidenceBytes(Vec<u8>);
+impl CanonicalEvidenceBytes {
+    pub(crate) fn from_value<T: Serialize>(value: &T) -> Result<Self> {
+        Ok(Self(canonical_bytes(value)?))
+    }
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+    pub(crate) fn into_evidence_digest(self) -> Digest {
+        // The original variable-size domain buffer, SHA-256 and hex work remain.
+        bytes_digest(IdentityDomain::Evidence, &self.0)
+    }
+}
 fn parse<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     let value = bounded_input::parse_json_bytes(bytes).map_err(|e| ContractError(e.to_string()))?;
     serde_json::from_value(value).map_err(|e| ContractError(e.to_string()))

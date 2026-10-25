@@ -2,11 +2,11 @@
 //! restored intentions are always rerun before later behavior adoption.
 use super::archive::{decode, validate_rehearsal_scenes, Content, Object};
 use super::*;
-use crate::product_store::scope::LockedArchivePolicy;
+use crate::product_store::scope::{LockedArchivePolicy, PolicyFrameRecorder, RetainedPolicyDispatch};
 use std::mem::size_of;
 // Same checked compile-time packet arithmetic as the scope layer, deliberately
 // private here rather than widening the scope helper's visibility.
-const fn archive_payment<const N: usize>(base: u64, terms: [(usize, u64); N]) -> u64 {
+pub(super) const fn archive_payment<const N: usize>(base: u64, terms: [(usize, u64); N]) -> u64 {
     assert!(usize::BITS <= u64::BITS);
     let mut total = base;
     let mut i = 0;
@@ -81,8 +81,36 @@ fn reachable(snapshot: &ProjectSnapshot) -> BTreeSet<Digest> {
 }
 // The complete ordinary body is expanded lexically, with only the final
 // retained-policy call selected. Object/scene/mapping error order stays shared.
+macro_rules! retained_decision_body {
+    ($check:ident, $accepted:ident, $accepted_ranges:ident, $decision:ident, $range:ident, [$($decision_call:tt)*]) => {{
+            let execution=$check.execution()?;
+            let basis=execution.current();
+            let layer=crate::product_store::scope::transition_layer(execution);
+            let ids=owned_policy::retirement_ids(basis,layer)?;
+            for id in &ids {
+                $check.charge(1)?;
+                let $decision=basis.decisions.decisions.iter().find(|d|&d.id==id)
+                    .ok_or_else(||invalid("historical owned retirement decision missing"))?;
+                let $range=$accepted_ranges.get(&$decision.witness)
+                    .ok_or_else(||invalid("historical owned retirement witness missing"))?;
+                $($decision_call)*
+            }
+            Ok(())
+    }};
+}
+macro_rules! retained_bundle_body {
+    ($snapshot:ident, $retained:path, [$($args:tt)*], $accepted:ident, $accepted_ranges:ident) => {{
+    $retained($snapshot, $($args)* |check| {
+        let mut verify = || -> Result<()> {
+            retained_decision_body!(check, $accepted, $accepted_ranges, decision, range,
+                [owned_policy::check_decision(check,decision,&$accepted[range.clone()])?;])
+        };
+        verify().map_err(owned_transition::into_store_error)
+    })?;
+    }};
+}
 macro_rules! validate_bundle_body {
-    ($snapshot:ident, $bundle:ident, $retained:path $(, $capsule:ident)?) => {{
+    ($snapshot:ident, $bundle:ident, $accepted:ident, $accepted_ranges:ident, [$($finish:tt)*], [$($terminal:tt)*]) => {{
     $snapshot.validate()?;
     validate_withdrawal_history($snapshot)?;
     if $bundle.version != 1
@@ -98,8 +126,8 @@ macro_rules! validate_bundle_body {
     let expected = reachable($snapshot);
     let mut found = BTreeSet::new();
     let mut sources = vec![];
-    let mut accepted = vec![];
-    let mut accepted_ranges = BTreeMap::<Digest,std::ops::Range<usize>>::new();
+    let mut $accepted = vec![];
+    let mut $accepted_ranges = BTreeMap::<Digest,std::ops::Range<usize>>::new();
     let mut recipes = vec![];
     // One immutable committed basis and fixed runtime apply throughout this
     // call. Each scene is still decoded, validated and admitted independently.
@@ -143,9 +171,9 @@ macro_rules! validate_bundle_body {
                     }
                 }
                 validate_rehearsal_scenes($snapshot, &object.digest, &scenes)?;
-                let first = accepted.len();
-                accepted.extend(scenes.clone());
-                accepted_ranges.insert(object.digest.clone(),first..accepted.len());
+                let first = $accepted.len();
+                $accepted.extend(scenes.clone());
+                $accepted_ranges.insert(object.digest.clone(),first..$accepted.len());
                 let ids = scenes
                     .iter()
                     .map(|s| s.scenario.identity())
@@ -242,7 +270,7 @@ macro_rules! validate_bundle_body {
                 if !scenarios.insert(&replacement.original) {
                     return Err(invalid("ambiguous restored scenario mapping"));
                 }
-                let original = accepted
+                let original = $accepted
                     .iter()
                     .find(|s| {
                         s.program.artifact.program_digest == bound.source_program
@@ -264,38 +292,88 @@ macro_rules! validate_bundle_body {
             "intention bundle lacks reachable immutable objects",
         ));
     }
-    $retained($snapshot, $($capsule,)? |check| {
-        let mut verify = || -> Result<()> {
-            let execution=check.execution()?;
-            let basis=execution.current();
-            let layer=crate::product_store::scope::transition_layer(execution);
-            let ids=owned_policy::retirement_ids(basis,layer)?;
-            for id in &ids {
-                check.charge(1)?;
-                let decision=basis.decisions.decisions.iter().find(|d|&d.id==id)
-                    .ok_or_else(||invalid("historical owned retirement decision missing"))?;
-                let range=accepted_ranges.get(&decision.witness)
-                    .ok_or_else(||invalid("historical owned retirement witness missing"))?;
-                owned_policy::check_decision(check,decision,&accepted[range.clone()])?;
-            }
-            Ok(())
-        };
-        verify().map_err(owned_transition::into_store_error)
-    })?;
-    Ok(())
+    $($finish)*
+    $($terminal)*
     }};
 }
 pub fn validate_bundle(snapshot: &ProjectSnapshot, bundle: &IntentionBundle) -> Result<()> {
-    validate_bundle_body!(snapshot, bundle, crate::product_store::scope::check_retained_transition_policies)
+    validate_bundle_body!(snapshot, bundle, accepted, accepted_ranges, [
+        crate::product_store::scope::check_retained_transition_policies_with_initials(snapshot, |check, loan| {
+            check.charge(HISTORICAL_INITIAL_RETAINED_PAYMENT)?;
+            RetainedPolicyDecisionCapture { accepted: &accepted, ranges: &accepted_ranges }
+                .run_initial(check, loan)
+        })?;
+    ], [Ok(())])
 }
 fn validate_bundle_locked(
     snapshot: &ProjectSnapshot, bundle: &IntentionBundle, capsule: &LockedArchivePolicy<'_>,
 ) -> Result<()> {
-    validate_bundle_body!(snapshot, bundle, crate::product_store::scope::check_retained_transition_policies_locked, capsule)
+    validate_bundle_body!(snapshot, bundle, accepted, accepted_ranges, [
+        retained_bundle_body!(snapshot, crate::product_store::scope::check_retained_transition_policies_locked, [capsule,], accepted, accepted_ranges);
+    ], [Ok(())])
 }
 
+struct RetainedPolicyDecisionCapture<'call> {
+    accepted: &'call Vec<AcceptedScene>,
+    ranges: &'call BTreeMap<Digest, std::ops::Range<usize>>,
+}
+pub(super) const POLICY_FRAME_EXPORT_PAYMENT: u64 = {
+    let actual = archive_payment(64, [
+        (size_of::<&PolicyFrameRecorder<'_>>(), 16),
+        (size_of::<IntentArchive>(), 4),
+        (size_of::<&IntentionBundle>(), 4),
+        (size_of::<RetainedPolicyDecisionCapture<'_>>(), 4),
+        (size_of::<RetainedPolicyDispatch<RetainedPolicyDecisionCapture<'_>>>(), 4),
+        (size_of::<Result<()>>(), 8),
+        (size_of::<std::result::Result<(), StoreError>>(), 8),
+    ]);
+    if actual > 3040 { actual } else { 3040 }
+};
+// Caller-prepaid selected ordinary verification transport.
+// Complete producing fixed slots: 35; direct activation/control sites: 12.
+const HISTORICAL_INITIAL_RETAINED_PAYMENT: u64 = archive_payment(768, [
+        (size_of::<&mut crate::product_store::scope::OwnedPolicyCheck<'_>>(), 20),
+        (size_of::<&crate::product_decisions::bundle::RetainedPolicyDecisionCapture<'_>>(), 16),
+        (size_of::<&crate::product_store::scope::HistoricalInitialLoan<'_>>(), 16),
+        (size_of::<&std::collections::BTreeMap<crate::product_contract::Digest, std::ops::Range<usize>>>(), 16),
+        (size_of::<&std::vec::Vec<crate::product_decisions::replay::AcceptedScene>>(), 16),
+        (size_of::<()>(), 12),
+        (size_of::<isize>(), 4),
+        (size_of::<crate::product_decisions::bundle::RetainedPolicyDecisionCapture<'_>>(), 4),
+        (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>>(), 4),
+        (size_of::<std::result::Result<(), crate::product_decisions::DecisionError>>(), 8),
+        (size_of::<std::result::Result<(), crate::product_store::StoreError>>(), 12),
+        (size_of::<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>(), 8),
+        (size_of::<u64>(), 4),
+    ]);
+impl RetainedPolicyDecisionCapture<'_> {
+    fn run_initial(&self, check: &mut crate::product_store::scope::OwnedPolicyCheck<'_>,
+        loan: &crate::product_store::scope::HistoricalInitialLoan<'_>) -> std::result::Result<(), StoreError> {
+        self.verify_initial(check, loan).map_err(owned_transition::into_store_error)
+    }
+    fn verify_initial(&self, check: &mut crate::product_store::scope::OwnedPolicyCheck<'_>,
+        loan: &crate::product_store::scope::HistoricalInitialLoan<'_>) -> Result<()> {
+        let accepted = self.accepted;
+        let accepted_ranges = self.ranges;
+        retained_decision_body!(check, accepted, accepted_ranges, decision, range, [
+            check.charge(owned_policy::HISTORICAL_INITIAL_DECISION_PAYMENT)?;
+            owned_policy::InitialDecisionCall { check, loan, decision, scenes: &accepted[range.clone()] }.run()?;
+        ])
+    }
+    fn run(&self, check: &mut crate::product_store::scope::OwnedPolicyCheck<'_>, recorder: &PolicyFrameRecorder<'_>) -> std::result::Result<(), StoreError> {
+        self.verify(check, recorder).map_err(owned_transition::into_store_error)
+    }
+    fn verify(&self, check: &mut crate::product_store::scope::OwnedPolicyCheck<'_>, recorder: &PolicyFrameRecorder<'_>) -> Result<()> {
+        let accepted = self.accepted;
+        let accepted_ranges = self.ranges;
+        retained_decision_body!(check, accepted, accepted_ranges, decision, range, [
+            check.charge(owned_policy::POLICY_FRAME_DECISION_CONSUME_PAYMENT)?;
+            owned_policy::ReceiptDecisionCall { check, recorder, decision, scenes: &accepted[range.clone()] }.run()?;
+        ])
+    }
+}
 macro_rules! export_bundle_body {
-    ($archive:ident, $snapshot:ident, $validate:path $(, $capsule:ident)?) => {{
+    ($archive:ident, $snapshot:ident, $bundle:ident, [$($validation:tt)*], [$($terminal:tt)*]) => {{
         let mut objects = vec![];
         for digest in reachable($snapshot) {
             let content = $archive.read(&digest)?;
@@ -305,23 +383,51 @@ macro_rules! export_bundle_body {
             })?;
             objects.push(BundledObject { digest, bytes });
         }
-        let bundle = IntentionBundle {
+        let $bundle = IntentionBundle {
             version: 1,
             snapshot: canonical_digest(IdentityDomain::Data, $snapshot)?,
             objects,
         };
-        $validate($snapshot, &bundle $(, $capsule)?)?;
-        Ok(bundle)
+        $($validation)*
+        $($terminal)*
     }};
+}
+impl<'gate, R: RuntimeAdapter> owned_transition::RecordContinuationCapture<'_, 'gate, R> {
+    pub(super) fn verify(self, check: &mut crate::product_store::scope::OwnedPolicyCheck<'gate>, recorder: &mut PolicyFrameRecorder<'gate>) -> Result<()> {
+        let Self { engine, store, current, fresh, next, plan, candidate, change, capsule } = self;
+        owned_transition::locked_verification_body!(engine, store, current, fresh, next, plan, candidate, change, check, ids, [
+            let ids = owned_policy::check_withdrawal_recorded(&engine.archive, check, recorder).map_err(owned_transition::into_store_error)?;
+        ], [
+            check.charge(LOCKED_ARCHIVE_EXPORT_PAYMENT)?;
+            check.charge(POLICY_FRAME_EXPORT_PAYMENT)?;
+            {
+                // Move the same bundle beyond the archive scope so successful
+                // cleanup remains validation, archive, bundle, then report.
+                let _completed_bundle = {
+                    let archive = IntentArchive::new(store.clone());
+                    export_bundle_body!(archive, candidate, bundle, [
+                        {
+                            let bundle_ref = &bundle;
+                            validate_bundle_body!(candidate, bundle_ref, accepted, accepted_ranges, [
+                                let capture = RetainedPolicyDecisionCapture { accepted: &accepted, ranges: &accepted_ranges };
+                                let dispatch = RetainedPolicyDispatch { capture, run: RetainedPolicyDecisionCapture::run };
+                                crate::product_store::scope::check_retained_transition_policies_with_frames(candidate, capsule, recorder, dispatch)?;
+                            ], []);
+                        }
+                    ], [bundle])
+                };
+            }
+        ])
+    }
 }
 impl IntentArchive {
     pub fn export_for(&self, snapshot: &ProjectSnapshot) -> Result<IntentionBundle> {
-        export_bundle_body!(self, snapshot, validate_bundle)
+        export_bundle_body!(self, snapshot, bundle, [validate_bundle(snapshot, &bundle)?;], [Ok(bundle)])
     }
     pub(super) fn export_for_locked_withdrawal(
         &self, snapshot: &ProjectSnapshot, capsule: &LockedArchivePolicy<'_>,
     ) -> Result<IntentionBundle> {
-        export_bundle_body!(self, snapshot, validate_bundle_locked, capsule)
+        export_bundle_body!(self, snapshot, bundle, [validate_bundle_locked(snapshot, &bundle, capsule)?;], [Ok(bundle)])
     }
     pub fn restore_for(&self, snapshot: &ProjectSnapshot, bundle: &IntentionBundle) -> Result<()> {
         validate_bundle(snapshot, bundle)?;
@@ -363,3 +469,61 @@ pub(crate) fn upgrade_bundle_binding(
 #[cfg(test)]
 #[path = "owned_archive_policy_reuse_tests.rs"]
 mod archive_policy_reuse_tests;
+
+#[cfg(test)]
+impl DecisionEngine<LocalRuntime> {
+    pub(crate) fn assert_policy_frame_retained_boundary_for_test(
+        check: &mut crate::product_store::scope::OwnedPolicyCheck<'_>, recorder: &PolicyFrameRecorder<'_>,
+        decision: &ScopedDecision, scenes: &[AcceptedScene], mode: u8,
+    ) -> std::result::Result<(), StoreError> {
+        let accepted = scenes.to_vec();
+        let ranges = [(decision.witness.clone(), 0..accepted.len())].into();
+        let capture = RetainedPolicyDecisionCapture { accepted: &accepted, ranges: &ranges };
+        let exact = mode % 2 != 0;
+        let surface = mode >= 2;
+        let packet = if surface { crate::product_store::scope::POLICY_FRAME_CONSUME_PAYMENT }
+            else { owned_policy::POLICY_FRAME_DECISION_CONSUME_PAYMENT };
+        let prefix = 4 + if surface { owned_policy::POLICY_FRAME_DECISION_CONSUME_PAYMENT + 5 } else { 0 };
+        check.leave_policy_frame_units_for_test(prefix + packet - u64::from(!exact));
+        let error = capture.verify(check, recorder).unwrap_err();
+        assert!(matches!(error, DecisionError::Store(StoreError::Invalid(ref text)) if text ==
+            "Common factual admission: budget: cumulative proof/initialization budget exhausted"), "{error:?}");
+        check.assert_policy_frame_units_for_test(if exact { 0 } else { packet - 1 });
+        println!("POLICY_FRAME_RECIPIENT_BOUNDARY surface={surface} exact={exact}");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(super) fn assert_policy_frame_export_layouts_for_test() {
+    let actual = archive_payment(64, [
+        (size_of::<&PolicyFrameRecorder<'_>>(), 16),
+        (size_of::<IntentArchive>(), 4),
+        (size_of::<&IntentionBundle>(), 4),
+        (size_of::<RetainedPolicyDecisionCapture<'_>>(), 4),
+        (size_of::<RetainedPolicyDispatch<RetainedPolicyDecisionCapture<'_>>>(), 4),
+        (size_of::<Result<()>>(), 8),
+        (size_of::<std::result::Result<(), StoreError>>(), 8),
+    ]);
+    assert_eq!(POLICY_FRAME_EXPORT_PAYMENT, actual.max(3040));
+    assert_eq!(LOCKED_ARCHIVE_EXPORT_PAYMENT, 3232);
+    assert_eq!(crate::product_store::scope::policy_frame_retained_payment::<RetainedPolicyDecisionCapture<'_>>(), 2688);
+    println!("POLICY_FRAME_EXPORT_LAYOUTS {}", serde_json::json!({
+        "archive_owner": size_of::<IntentArchive>(),
+        "bundle_owner": size_of::<IntentionBundle>(),
+        "bundle_borrow": size_of::<&IntentionBundle>(),
+        "retained_capture": size_of::<RetainedPolicyDecisionCapture<'_>>(),
+        "retained_dispatch": size_of::<RetainedPolicyDispatch<RetainedPolicyDecisionCapture<'_>>>(),
+        "bundle_result": size_of::<Result<IntentionBundle>>(),
+        "decision_error": size_of::<DecisionError>(),
+        "store_error": size_of::<StoreError>(),
+        "decision_result": size_of::<Result<()>>(),
+        "store_result": size_of::<std::result::Result<(), StoreError>>(),
+        "d1": LOCKED_ARCHIVE_EXPORT_PAYMENT,
+        "f5": POLICY_FRAME_EXPORT_PAYMENT,
+        "f6": crate::product_store::scope::policy_frame_retained_payment::<RetainedPolicyDecisionCapture<'_>>(),
+    }));
+}
+
+#[cfg(all(test, target_pointer_width = "64"))]
+const _: [(); 6432] = [(); HISTORICAL_INITIAL_RETAINED_PAYMENT as usize];

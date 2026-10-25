@@ -123,7 +123,7 @@ impl OwnedPolicyCheck<'_> {
         // Force only the digest hint to match an authentic donor while the real
         // execution basis differs. Never turn the forged hint into authority.
         let endpoint = owned_persist::reconstruct(candidate, &mut meter()).unwrap();
-        let counterfeit = LockedArchivePolicy { registry: &endpoint };
+        let counterfeit = LockedArchivePolicy { registry: &endpoint, execution: capsule.execution };
         assert_ne!(counterfeit.registry.snapshot, capsule.registry.snapshot);
         let mut misses = 0;
         check_retained_transition_policies_locked(candidate, &counterfeit, |check| {

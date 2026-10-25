@@ -14,7 +14,7 @@ fn proof(label: &str) -> VerifiedSourceContinuation {
 #[test]
 fn logical_views_keep_four_ordered_identities_without_cloning_payloads() {
     let hit = ComparisonProofs {
-        original: [proof("before"), proof("after")],
+        original: Arc::new([proof("before"), proof("after")]),
         predecessor: None,
     };
     let [a, b, c, d] = hit.logical();
@@ -29,7 +29,7 @@ fn logical_views_keep_four_ordered_identities_without_cloning_payloads() {
         assert_eq!(p.influenced.len(), 1);
     }
     let general = ComparisonProofs {
-        original: [proof("before"), proof("after")],
+        original: Arc::new([proof("before"), proof("after")]),
         predecessor: Some([proof("prior-before"), proof("prior-after")]),
     };
     let expected =

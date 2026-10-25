@@ -82,7 +82,7 @@ impl ProofMeter {
         self.additional_cancelled = Some(token.clone());
     }
     #[cfg_attr(test, track_caller)]
-    fn charge_cause(&mut self, units: u64) -> std::result::Result<(), ProofChargeFailure> {
+    pub(super) fn charge_cause(&mut self, units: u64) -> std::result::Result<(), ProofChargeFailure> {
         #[cfg(test)]
         let caller = std::panic::Location::caller();
         let stopped = if self.cancelled.load(Ordering::Relaxed) {
@@ -136,18 +136,58 @@ impl ProofMeter {
         limits.elapsed_millis = limits.elapsed_millis.min(remaining);
         Ok(limits)
     }
+    // The caller paid F7 before entry. No reservation, refund or new clock.
+    pub(super) fn policy_frame_default_window(&mut self) -> AdmissionResult<bool> {
+        self.charge(0)?;
+        let remaining = u128::from(self.millis).checked_sub(self.started.elapsed().as_millis());
+        Ok(match remaining {
+            Some(remaining) => remaining >= u128::from(RuntimeLimits::default().elapsed_millis),
+            None => false,
+        })
+    }
+    // Independent callers prepay their complete reconstruction interval packet.
+    // Same live query semantics as F7, but no F7/receipt authority is reused.
+    pub(super) fn reconstruction_default_window(&mut self) -> AdmissionResult<bool> {
+        self.charge(0)?;
+        let remaining = u128::from(self.millis).checked_sub(self.started.elapsed().as_millis());
+        Ok(match remaining {
+            Some(remaining) => remaining >= u128::from(RuntimeLimits::default().elapsed_millis),
+            None => false,
+        })
+    }
+    // The selected caller prepays the complete packet and performs the live poll.
+    pub(super) fn reconstruction_default_window_after_poll(&self) -> bool {
+        let remaining = u128::from(self.millis).checked_sub(self.started.elapsed().as_millis());
+        match remaining {
+            Some(remaining) => remaining >= u128::from(RuntimeLimits::default().elapsed_millis),
+            None => false,
+        }
+    }
     pub(super) fn cancelled(&self) -> Arc<AtomicBool> {
         self.cancelled.clone()
     }
 }
 // The ordinary wrapper and capture adapter consume the actual selected cause.
 // No later token reread or diagnostic text classification determines it.
-enum ProofChargeFailure {
+pub(super) enum ProofChargeFailure {
     Cancelled,
     Elapsed,
     Fuel,
 }
 impl ProofChargeFailure {
+    // Selected Initial interval callers consume the actual cause after the same poll.
+    // Ordinary charge/work adapters remain unchanged; no meter is reread here.
+    pub(super) fn historical_initial_interval_error(self) -> StoreError {
+        match self {
+            Self::Cancelled | Self::Elapsed => refuse(
+                "budget", "cancelled or cumulative elapsed budget exhausted",
+            ),
+            Self::Fuel => {
+                refuse("budget", "cumulative proof/initialization budget exhausted")
+            }
+        }
+    }
+
     fn work(self) -> WorkFailure {
         match self {
             Self::Cancelled => WorkFailure::Cancelled,

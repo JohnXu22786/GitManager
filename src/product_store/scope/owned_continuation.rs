@@ -4,6 +4,8 @@ use super::common_fact_admission::{refuse, AdmissionResult, ProofMeter};
 use super::owned_lowering::{self, Metadata};
 use super::*;
 use serde::Serialize;
+use super::owned_persist::{err, CompletedInitialOrigin, FreshInitialOrigin, ReconstructedOwned};
+use std::sync::Arc;
 
 #[path = "owned_state_consumers.rs"]
 mod state_consumers;
@@ -41,18 +43,188 @@ enum ComparisonOrigins<'a> {
 }
 // Two owned payloads on a hit, four otherwise; four ordered logical proofs always.
 struct ComparisonProofs {
-    original: [VerifiedSourceContinuation; 2],
+    original: Arc<[VerifiedSourceContinuation; 2]>,
     predecessor: Option<[VerifiedSourceContinuation; 2]>,
 }
 impl ComparisonProofs {
     fn logical(&self) -> [&VerifiedSourceContinuation; 4] {
-        let [before, after] = &self.original;
+        let [before, after] = &*self.original;
         match &self.predecessor {
             Some([prior_before, prior_after]) => [before, after, prior_before, prior_after],
             None => [before, after, before, after],
         }
     }
 }
+// V15 actual built-MIR fixed-slot census. Each complete slot reserves
+// construction, read/transfer, move/return and normal/error cleanup. Direct
+// call/branch activations are separate; all arithmetic is checked. No sentinel.
+const _: () = assert!(std::mem::align_of::<[VerifiedSourceContinuation; 2]>()
+    <= std::mem::align_of::<[std::sync::atomic::AtomicUsize; 2]>());
+pub(super) const STRUCTURAL_ENTRY_PAYMENT: u64 = comparison_payment(
+    64_u64.checked_mul(10).expect("structural activation overflow"), [
+    (size_of::<&mut crate::product_store::scope::common_fact_admission::ProofMeter>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<()>(), 4_u64.checked_mul(2).expect("structural slot overflow")),
+    (size_of::<isize>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<crate::product_store::scope::owned_continuation::VerifiedOwnedContinuation>(), 4_u64.checked_mul(4).expect("structural slot overflow")),
+    (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>, crate::product_store::scope::owned_continuation::VerifiedOwnedContinuation>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<std::result::Result<(), crate::product_store::StoreError>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<std::result::Result<crate::product_store::scope::owned_continuation::VerifiedOwnedContinuation, crate::product_store::StoreError>>(), 4_u64.checked_mul(3).expect("structural slot overflow")),
+    (size_of::<std::result::Result<crate::product_store::scope::owned_persist::ReconstructedOwned, crate::product_store::StoreError>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>(), 4_u64.checked_mul(2).expect("structural slot overflow")),
+    (size_of::<std::sync::Arc<crate::product_store::scope::owned_continuation::VerifiedOwnedContinuation>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<u64>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<std::result::Result<crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution, crate::product_store::StoreError>>(), 4), // direct selected/ordinary caller refusal return
+]);
+// Reconstructed lexical verifier: retain all old entry terms and ten direct
+// allowances, except its three full Result, one Try and one success transports.
+pub(super) const RECONSTRUCTED_STRUCTURAL_ENTRY_PAYMENT: u64 = comparison_payment(
+    64_u64.checked_mul(10).expect("structural activation overflow"), [
+    (size_of::<&mut crate::product_store::scope::common_fact_admission::ProofMeter>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<()>(), 4_u64.checked_mul(2).expect("structural slot overflow")),
+    (size_of::<isize>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<crate::product_store::scope::owned_continuation::VerifiedOwnedContinuation>(), 4_u64.checked_mul(3).expect("structural slot overflow")),
+    (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<std::result::Result<(), crate::product_store::StoreError>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<std::result::Result<crate::product_store::scope::owned_persist::ReconstructedOwned, crate::product_store::StoreError>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>(), 4_u64.checked_mul(2).expect("structural slot overflow")),
+    (size_of::<std::sync::Arc<crate::product_store::scope::owned_continuation::VerifiedOwnedContinuation>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<u64>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<std::result::Result<crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution, crate::product_store::StoreError>>(), 4), // direct selected/ordinary caller refusal return
+]);
+pub(super) const STRUCTURAL_PAIR_PAYMENT: u64 = comparison_payment(
+    64_u64.checked_mul(21).expect("structural activation overflow"), [
+    (size_of::<&[crate::product_store::scope::owned_continuation::VerifiedSourceContinuation; 2]>(), 4_u64.checked_mul(4).expect("structural slot overflow")),
+    (size_of::<&mut crate::product_store::scope::common_fact_admission::ProofMeter>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<&crate::product_store::scope::owned_continuation::VerifiedOwnedContinuation>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<&crate::product_store::scope::owned_continuation::VerifiedSourceContinuation>(), 4_u64.checked_mul(4).expect("structural slot overflow")),
+    (size_of::<&crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<&std::sync::Arc<[crate::product_store::scope::owned_continuation::VerifiedSourceContinuation; 2]>>(), 4_u64.checked_mul(6).expect("structural slot overflow")),
+    (size_of::<&std::sync::Arc<crate::product_store::scope::owned_continuation::VerifiedOwnedContinuation>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<&std::sync::Arc<crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<()>(), 4_u64.checked_mul(2).expect("structural slot overflow")),
+    (size_of::<*mut u8>(), 4_u64.checked_mul(2).expect("structural slot overflow")),
+    (size_of::<[crate::product_store::scope::owned_continuation::VerifiedSourceContinuation; 2]>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<isize>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<crate::product_store::scope::owned_continuation::VerifiedSourceContinuation>(), 4_u64.checked_mul(2).expect("structural slot overflow")),
+    (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<std::result::Result<(), crate::product_store::StoreError>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<std::result::Result<crate::product_store::scope::owned_continuation::VerifiedOwnedContinuation, crate::product_store::StoreError>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>(), 4_u64.checked_mul(2).expect("structural slot overflow")),
+    (size_of::<std::sync::Arc<[crate::product_store::scope::owned_continuation::VerifiedSourceContinuation; 2]>>(), 4_u64.checked_mul(5).expect("structural slot overflow")),
+    (size_of::<u64>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<usize>(), 4_u64.checked_mul(7).expect("structural slot overflow")),
+    // Both actual complete native ArcInner places: stack construction and heap allocation.
+    (size_of::<[VerifiedSourceContinuation; 2]>().checked_add(size_of::<[std::sync::atomic::AtomicUsize; 2]>()).expect("structural allocation overflow"), 8),
+    (size_of::<std::result::Result<crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution, crate::product_store::StoreError>>(), 4), // direct selected/ordinary caller refusal return
+    (size_of::<bool>(), 4_u64.checked_mul(20).expect("structural slot overflow")), // selected Closed/retained flags plus both actual native Arc cleanup controls
+]);
+pub(super) const STRUCTURAL_SELECT_OPEN_PAYMENT: u64 = comparison_payment(
+    64_u64.checked_mul(5).expect("structural activation overflow"), [
+    (size_of::<&mut crate::product_store::scope::common_fact_admission::ProofMeter>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<&std::collections::BTreeMap<crate::product_contract::Digest, crate::product_store::scope::owned_epoch::OwnedExecutionRecipe>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<()>(), 4_u64.checked_mul(2).expect("structural slot overflow")),
+    (size_of::<isize>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<std::collections::btree_map::Iter<'_, crate::product_contract::Digest, crate::product_store::scope::owned_epoch::OwnedExecutionRecipe>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<std::result::Result<(), crate::product_store::StoreError>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<std::result::Result<crate::product_store::scope::owned_persist::ReconstructedOwned, crate::product_store::StoreError>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>(), 4_u64.checked_mul(2).expect("structural slot overflow")),
+    (size_of::<u64>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+]);
+pub(super) const STRUCTURAL_SELECT_NEXT_PAYMENT: u64 = comparison_payment(
+    64_u64.checked_mul(6).expect("structural activation overflow"), [
+    (size_of::<&mut crate::product_store::scope::common_fact_admission::ProofMeter>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<&mut std::collections::btree_map::Iter<'_, crate::product_contract::Digest, crate::product_store::scope::owned_epoch::OwnedExecutionRecipe>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<&crate::product_contract::Digest>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<&crate::product_store::scope::owned_epoch::OwnedExecutionRecipe>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<()>(), 4_u64.checked_mul(2).expect("structural slot overflow")),
+    (size_of::<isize>(), 4_u64.checked_mul(2).expect("structural slot overflow")),
+    (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<std::option::Option<(&crate::product_contract::Digest, &crate::product_store::scope::owned_epoch::OwnedExecutionRecipe)>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<std::result::Result<(), crate::product_store::StoreError>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<std::result::Result<crate::product_store::scope::owned_persist::ReconstructedOwned, crate::product_store::StoreError>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>(), 4_u64.checked_mul(2).expect("structural slot overflow")),
+    (size_of::<u64>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+]);
+pub(super) const STRUCTURAL_SELECT_COMPARE_PAYMENT: u64 = comparison_payment(
+    64_u64.checked_mul(23).expect("structural activation overflow"), [
+    (size_of::<&&crate::product_contract::Digest>(), 4_u64.checked_mul(2).expect("structural slot overflow")),
+    (size_of::<&mut crate::product_store::scope::common_fact_admission::ProofMeter>(), 4_u64.checked_mul(2).expect("structural slot overflow")),
+    (size_of::<&crate::product_contract::Digest>(), 4_u64.checked_mul(3).expect("structural slot overflow")),
+    (size_of::<&crate::product_store::scope::contract::ScopeTransition>(), 4_u64.checked_mul(2).expect("structural slot overflow")),
+    (size_of::<&crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution>(), 4_u64.checked_mul(2).expect("structural slot overflow")),
+    (size_of::<&std::sync::Arc<crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution>>(), 4_u64.checked_mul(3).expect("structural slot overflow")),
+    (size_of::<&std::sync::Arc<crate::product_store::scope::owned_preview::PreparedOwnedPreview>>(), 4_u64.checked_mul(3).expect("structural slot overflow")),
+    (size_of::<&str>(), 4_u64.checked_mul(4).expect("structural slot overflow")),
+    (size_of::<()>(), 4_u64.checked_mul(7).expect("structural slot overflow")),
+    (size_of::<bool>(), 4_u64.checked_mul(3).expect("structural slot overflow")),
+    (size_of::<isize>(), 4_u64.checked_mul(3).expect("structural slot overflow")),
+    (size_of::<crate::product_store::scope::contract::ScopeTransition>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>>(), 4_u64.checked_mul(2).expect("structural slot overflow")),
+    (size_of::<std::option::Option<u64>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<std::result::Result<(), crate::product_store::StoreError>>(), 4_u64.checked_mul(2).expect("structural slot overflow")),
+    (size_of::<std::result::Result<crate::product_store::scope::owned_persist::ReconstructedOwned, crate::product_store::StoreError>>(), 4_u64.checked_mul(2).expect("structural slot overflow")),
+    (size_of::<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>(), 4_u64.checked_mul(4).expect("structural slot overflow")),
+    (size_of::<u64>(), 4_u64.checked_mul(5).expect("structural slot overflow")),
+    (size_of::<usize>(), 4_u64.checked_mul(2).expect("structural slot overflow")),
+    (size_of::<&Arc<PreparedOwnedPreview>>(), 4), // actual ElaborateDrops identity-field deref-copy
+]);
+pub(super) const STRUCTURAL_LOAN_PAYMENT: u64 = comparison_payment(
+    64_u64.checked_mul(24).expect("structural activation overflow"), [
+    (size_of::<&mut crate::product_store::scope::common_fact_admission::ProofMeter>(), 4_u64.checked_mul(3).expect("structural slot overflow")),
+    (size_of::<&crate::product_contract::CapturedProgram>(), 4_u64.checked_mul(4).expect("structural slot overflow")),
+    (size_of::<&crate::product_store::ProjectSnapshot>(), 4_u64.checked_mul(7).expect("structural slot overflow")),
+    (size_of::<&crate::product_store::scope::common_fact_admission::OwnedPreviewRequest>(), 4_u64.checked_mul(2).expect("structural slot overflow")),
+    (size_of::<&crate::product_store::scope::common_fact_inventory::CommonFactInventory>(), 4_u64.checked_mul(2).expect("structural slot overflow")),
+    (size_of::<&crate::product_store::scope::contract::ScopeTransition>(), 4_u64.checked_mul(2).expect("structural slot overflow")),
+    (size_of::<&crate::product_store::scope::owned_contract::OwnedSourceRequest>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<&crate::product_store::scope::owned_persist::CompletedInitialOrigin<'_, '_>>(), 4_u64.checked_mul(3).expect("structural slot overflow")),
+    (size_of::<&crate::product_store::scope::owned_persist::CompletedStructuralLoan<'_, '_, '_>>(), 4_u64.checked_mul(3).expect("structural slot overflow")),
+    (size_of::<&crate::product_store::scope::owned_persist::ReconstructedOwned>(), 4_u64.checked_mul(2).expect("structural slot overflow")),
+    (size_of::<&crate::product_store::scope::owned_preview::PreparedOwnedPreview>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<&crate::product_store::scope::owned_wire::OwnedCompositionV2>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<&crate::product_store::scope::owned_wire::OwnedInitializationV2>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<&crate::product_store::scope::owned_wire::OwnedLayerV2>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<&std::collections::BTreeSet<crate::product_store::scope::owned_continuation::Dependency>>(), 4_u64.checked_mul(4).expect("structural slot overflow")),
+    (size_of::<&std::option::Option<crate::product_store::scope::owned_persist::CompletedStructuralLoan<'_, '_, '_>>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<&std::sync::Arc<crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution>>(), 4_u64.checked_mul(3).expect("structural slot overflow")),
+    (size_of::<(&crate::product_store::ProjectSnapshot, &std::sync::Arc<crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution>)>(), 4_u64.checked_mul(2).expect("structural slot overflow")),
+    (size_of::<()>(), 4_u64.checked_mul(3).expect("structural slot overflow")),
+    (size_of::<*const crate::product_store::ProjectSnapshot>(), 4_u64.checked_mul(2).expect("structural slot overflow")),
+    (size_of::<bool>(), 4_u64.checked_mul(2).expect("structural slot overflow")),
+    (size_of::<isize>(), 4_u64.checked_mul(4).expect("structural slot overflow")),
+    (size_of::<crate::product_store::scope::contract::ScopeTransition>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<crate::product_store::scope::owned_continuation::ClosedContinuationRules>(), 4_u64.checked_mul(2).expect("structural slot overflow")),
+    (size_of::<crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<crate::product_store::scope::owned_persist::CompletedStructuralLoan<'_, '_, '_>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>, crate::product_store::scope::owned_continuation::ClosedContinuationRules>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>, crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<std::option::Option<&crate::product_store::scope::owned_persist::CompletedStructuralLoan<'_, '_, '_>>>(), 4_u64.checked_mul(4).expect("structural slot overflow")),
+    (size_of::<std::option::Option<crate::product_store::scope::owned_persist::CompletedStructuralLoan<'_, '_, '_>>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<std::result::Result<(), crate::product_store::StoreError>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<std::result::Result<crate::product_store::scope::owned_continuation::ClosedContinuationRules, crate::product_store::StoreError>>(), 4_u64.checked_mul(2).expect("structural slot overflow")),
+    (size_of::<std::result::Result<crate::product_store::scope::owned_epoch::VerifiedOwnedTransitionExecution, crate::product_store::StoreError>>(), 4_u64.checked_mul(2).expect("structural slot overflow")),
+    (size_of::<std::result::Result<crate::product_store::scope::owned_persist::ReconstructedOwned, crate::product_store::StoreError>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>(), 4_u64.checked_mul(6).expect("structural slot overflow")),
+    (size_of::<u64>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<&super::owned_persist::CompletedInitialOrigin<'_, '_>>(), 4), // actual view origin deref-copy
+    (size_of::<&ProjectSnapshot>(), 4), // actual view retained deref-copy
+    (size_of::<&Arc<super::owned_persist::VerifiedOwnedTransitionExecution>>(), 4), // actual view donor deref-copy
+]);
+pub(super) const STRUCTURAL_HIT_PAYMENT: u64 = comparison_payment(
+    64_u64.checked_mul(4).expect("structural activation overflow"), [
+    (size_of::<&mut crate::product_store::scope::common_fact_admission::ProofMeter>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<()>(), 4_u64.checked_mul(2).expect("structural slot overflow")),
+    (size_of::<isize>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<std::result::Result<(), crate::product_store::StoreError>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<std::result::Result<crate::product_store::scope::owned_continuation::ClosedContinuationRules, crate::product_store::StoreError>>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+    (size_of::<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>(), 4_u64.checked_mul(2).expect("structural slot overflow")),
+    (size_of::<u64>(), 4_u64.checked_mul(1).expect("structural slot overflow")),
+]);
+
 type IdentityIter<'a> = std::iter::Map<
     std::array::IntoIter<&'a VerifiedSourceContinuation, 4>,
     fn(&VerifiedSourceContinuation) -> Digest,
@@ -75,11 +247,11 @@ pub(super) const COMPARISON_DISPATCH_PAYMENT: u64 = comparison_payment(32, [
 pub(super) const COMPARISON_OWNER_PAYMENT: u64 = comparison_payment(64, [
     (size_of::<[VerifiedSourceContinuation; 2]>(), 4),
     (size_of::<Option<[VerifiedSourceContinuation; 2]>>(), 4),
-    (size_of::<ComparisonProofs>(), 6),
-    (size_of::<ClosedContinuationRules>(), 4),
-    (size_of::<RetainedOwned>(), 4),
-    (size_of::<AdmissionResult<ClosedContinuationRules>>(), 2),
-    (size_of::<AdmissionResult<RetainedOwned>>(), 2),
+    (if size_of::<ComparisonProofs>() < 288 { 288 } else { size_of::<ComparisonProofs>() }, 6),
+    (if size_of::<ClosedContinuationRules>() < 384 { 384 } else { size_of::<ClosedContinuationRules>() }, 4),
+    (if size_of::<RetainedOwned>() < 480 { 480 } else { size_of::<RetainedOwned>() }, 4),
+    (if size_of::<AdmissionResult<ClosedContinuationRules>>() < 384 { 384 } else { size_of::<AdmissionResult<ClosedContinuationRules>>() }, 2),
+    (if size_of::<AdmissionResult<RetainedOwned>>() < 480 { 480 } else { size_of::<AdmissionResult<RetainedOwned>>() }, 2),
 ]);
 const COMPARISON_HIT_PAYMENT: u64 = comparison_payment(8, [
     (size_of::<&VerifiedSourceContinuation>(), 2), (size_of::<AdmissionResult<()>>(), 2),
@@ -108,6 +280,65 @@ struct ClosedContinuationRules {
     proofs: ComparisonProofs,
     markers: BTreeSet<Vec<u8>>,
 }
+macro_rules! closed_continuation_body {
+    ($original:ident, $predecessor_before:ident, $predecessor_after:ident, $predecessor_sources:ident, $before:ident, $after:ident, $request:ident, $inventory:ident, $seed:ident, $controlled:ident, $origins:ident, $meter:ident, $sources:ident, $predecessor:ident, [$($original_slot:tt)*], [$($predecessor_slot:tt)*], [$($pair_slot:tt)*]) => {{
+        $meter.charge(1)?;
+        let $sources = &$request.$inventory.$sources;
+        if $inventory.snapshot != $request.$inventory.snapshot
+            || $inventory.structure.$before != revision($before)?
+            || $inventory.structure.$after != revision($after)?
+            || $sources.$before != $inventory.structure.$before
+            || $sources.$after != $inventory.structure.$after
+        {
+            return Err(refuse(
+                "continuation rules",
+                "current frame/source inventory mismatch",
+            ));
+        }
+        $($original_slot)*
+        $($predecessor_slot)*
+        let proofs = ComparisonProofs { $original: $($pair_slot)*, $predecessor };
+        let mut markers =
+            collect_common_state_markers(&$before.program, &$after.program, $sources, $meter)?;
+        // R8 bounds queries by validated O(1) action lengths, never an AST scan.
+        $meter.charge(COMPARISON_VIEW_PAYMENT)?;
+        // Overflow uses the existing host's first-cause resource refusal; no new
+        // formatted error payload or replacement meter is introduced.
+        $meter.charge(marker_query_payment($before.program.actions.len(), $after.program.actions.len())
+            .unwrap_or(u64::MAX))?;
+        let logical = proofs.logical();
+        for (app, side) in [
+            (&$before.program, OwnedSourceSide::Before),
+            (&$after.program, OwnedSourceSide::After),
+        ] {
+            for action in &app.actions {
+                $meter.charge(1)?;
+                let Some(step) = action.steps.last() else {
+                    continue;
+                };
+                let Some((state, _)) = bounded_state_marker(step) else {
+                    continue;
+                };
+                let dependency = Dependency::State(state.into());
+                if logical.into_iter().any(|p| {
+                    p.protected.contains(&dependency) || p.influenced.contains(&dependency)
+                }) {
+                    let key =
+                        state_marker_key(side, &action.id, &[action.steps.len() - 1], step, $meter)?;
+                    markers.remove(&key);
+                }
+            }
+        }
+        Ok(Self {
+            snapshot: $inventory.snapshot.clone(),
+            $before: $inventory.structure.$before.clone(),
+            $after: $inventory.structure.$after.clone(),
+            proofs,
+            markers,
+        })
+    
+    }};
+}
 impl ClosedContinuationRules {
     #[allow(clippy::too_many_arguments)]
     fn verify(
@@ -123,20 +354,7 @@ impl ClosedContinuationRules {
         controlled: &Dependencies,
         origins: &ComparisonOrigins<'_>,
         meter: &mut ProofMeter,
-    ) -> AdmissionResult<Self> {
-        meter.charge(1)?;
-        let sources = &request.inventory.sources;
-        if inventory.snapshot != request.inventory.snapshot
-            || inventory.structure.before != revision(before)?
-            || inventory.structure.after != revision(after)?
-            || sources.before != inventory.structure.before
-            || sources.after != inventory.structure.after
-        {
-            return Err(refuse(
-                "continuation rules",
-                "current frame/source inventory mismatch",
-            ));
-        }
+    ) -> AdmissionResult<Self> {        closed_continuation_body!(original, predecessor_before, predecessor_after, predecessor_sources, before, after, request, inventory, seed, controlled, origins, meter, sources, predecessor, [
         let original_sources = &original.proof.request.inventory.sources;
         let original_before = continuation(
             original.proof.snapshot.program()?, before, original_sources, sources,
@@ -146,6 +364,7 @@ impl ClosedContinuationRules {
             &original.proof.candidate, after, original_sources, sources,
             OwnedSourceSide::After, seed, controlled, meter,
         )?;
+        ], [
         let predecessor = match origins {
             ComparisonOrigins::FreshInitial(_) => {
                 // Separate positive live polls at the two original logical slots.
@@ -160,46 +379,76 @@ impl ClosedContinuationRules {
                     OwnedSourceSide::After, seed, controlled, meter)?,
             ]),
         };
-        let proofs = ComparisonProofs { original: [original_before, original_after], predecessor };
-        let mut markers =
-            collect_common_state_markers(&before.program, &after.program, sources, meter)?;
-        // R8 bounds queries by validated O(1) action lengths, never an AST scan.
-        meter.charge(COMPARISON_VIEW_PAYMENT)?;
-        // Overflow uses the existing host's first-cause resource refusal; no new
-        // formatted error payload or replacement meter is introduced.
-        meter.charge(marker_query_payment(before.program.actions.len(), after.program.actions.len())
-            .unwrap_or(u64::MAX))?;
-        let logical = proofs.logical();
-        for (app, side) in [
-            (&before.program, OwnedSourceSide::Before),
-            (&after.program, OwnedSourceSide::After),
-        ] {
-            for action in &app.actions {
-                meter.charge(1)?;
-                let Some(step) = action.steps.last() else {
-                    continue;
-                };
-                let Some((state, _)) = bounded_state_marker(step) else {
-                    continue;
-                };
-                let dependency = Dependency::State(state.into());
-                if logical.into_iter().any(|p| {
-                    p.protected.contains(&dependency) || p.influenced.contains(&dependency)
-                }) {
-                    let key =
-                        state_marker_key(side, &action.id, &[action.steps.len() - 1], step, meter)?;
-                    markers.remove(&key);
-                }
+        ], [Arc::new([original_before, original_after])])
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn verify_completed_initial(
+        original: &PreparedOwnedPreview, predecessor_before: &CapturedProgram,
+        predecessor_after: &CapturedProgram, predecessor_sources: &OwnedSourceRequest,
+        before: &CapturedProgram, after: &CapturedProgram, request: &OwnedPreviewRequest,
+        inventory: &CommonFactInventory, seed: &Dependencies, controlled: &Dependencies,
+        _origins: &super::owned_persist::CompletedInitialOrigin<'_, '_>,
+        snapshot: &ProjectSnapshot,
+        structural: Option<&super::owned_persist::CompletedStructuralLoan<'_, '_, '_>>,
+        meter: &mut ProofMeter,
+    ) -> AdmissionResult<Self> {
+        if let Some(loan) = structural {
+            let (retained, donor) = loan.references();
+            if std::ptr::eq(retained, snapshot) {
+                // Return only this complete Closed result. The caller still runs
+                // all frame/projection/report/target and full historical checks.
+                return closed_continuation_body!(original, predecessor_before,
+                    predecessor_after, predecessor_sources, before, after, request,
+                    inventory, seed, controlled, _origins, meter, sources, predecessor, [
+                    meter.charge(STRUCTURAL_HIT_PAYMENT)?;
+                    meter.charge(STRUCTURAL_HIT_PAYMENT)?;
+                ], [
+                    // Original proofs completed in the exact immutable donor.
+            meter.charge(COMPLETED_INITIAL_WINDOW_PAYMENT)?;
+            let predecessor = if meter.reconstruction_default_window()? {
+                meter.charge(COMPLETED_INITIAL_HIT_PAYMENT)?;
+                meter.charge(COMPLETED_INITIAL_HIT_PAYMENT)?;
+                None
+            } else {
+                Some([
+                    continuation(predecessor_before, before, predecessor_sources, sources,
+                        OwnedSourceSide::Before, seed, controlled, meter)?,
+                    continuation(predecessor_after, after, predecessor_sources, sources,
+                        OwnedSourceSide::After, seed, controlled, meter)?,
+                ])
+            };
+                ], [Arc::clone(&donor.continuation.original_proofs)]);
             }
         }
-        Ok(Self {
-            snapshot: inventory.snapshot.clone(),
-            before: inventory.structure.before.clone(),
-            after: inventory.structure.after.clone(),
-            proofs,
-            markers,
-        })
+        closed_continuation_body!(original, predecessor_before, predecessor_after, predecessor_sources,
+            before, after, request, inventory, seed, controlled, _origins, meter, sources, predecessor, [
+        let original_sources = &original.proof.request.inventory.sources;
+        let original_before = continuation(
+            original.proof.snapshot.program()?, before, original_sources, sources,
+            OwnedSourceSide::Before, seed, controlled, meter,
+        )?;
+        let original_after = continuation(
+            &original.proof.candidate, after, original_sources, sources,
+            OwnedSourceSide::After, seed, controlled, meter,
+        )?;
+        ], [
+            // On a native miss both original proofs completed in this activation.
+            meter.charge(COMPLETED_INITIAL_WINDOW_PAYMENT)?;
+            let predecessor = if meter.reconstruction_default_window()? {
+                meter.charge(COMPLETED_INITIAL_HIT_PAYMENT)?;
+                meter.charge(COMPLETED_INITIAL_HIT_PAYMENT)?;
+                None
+            } else {
+                Some([
+                    continuation(predecessor_before, before, predecessor_sources, sources,
+                        OwnedSourceSide::Before, seed, controlled, meter)?,
+                    continuation(predecessor_after, after, predecessor_sources, sources,
+                        OwnedSourceSide::After, seed, controlled, meter)?,
+                ])
+            };
+        ], [Arc::new([original_before, original_after])])
     }
+
 }
 fn bounded_state_marker(step: &Statement) -> Option<(&str, &str)> {
     match step {
@@ -911,6 +1160,54 @@ struct VerifiedSourceContinuation {
     protected: Dependencies,
     influenced: Dependencies,
 }
+// Layout-only name for the existing immutable evidence tuple; no new runtime owner.
+type CanonicalEvidenceTuple<'a> = (
+    &'static str, Digest, Digest, OwnedSourceSide, &'a Dependencies,
+    &'a Dependencies, Vec<(&'a Id, Vec<u8>)>,
+);
+// Complete producing census: 90 actual MIR/formal slots and two direct scalar
+// arguments, each funded for construction/access/movement/cleanup. The 26 fixed
+// call activations include all normal/error paths and the original three polls.
+// Never-valued and capture-free zero-sized slots have no byte footprint; their
+// actual control activations are included. All variable canonical/hash work is
+// still the existing native work, not represented by this fixed packet.
+const CONTINUATION_CANONICAL_PAYMENT: u64 = comparison_payment(
+    comparison_payment(1, [(64, 26)]), [
+        (size_of::<&CanonicalEvidenceBytes>(), 8),
+        (size_of::<&CanonicalEvidenceTuple<'_>>(), 16),
+        (size_of::<&[u8]>(), 8),
+        (size_of::<&mut ProofMeter>(), 12),
+        (size_of::<&std::vec::Vec<u8>>(), 12),
+        (size_of::<&str>(), 16),
+        (size_of::<()>(), 28),
+        (size_of::<CanonicalEvidenceBytes>(), 20),
+        (size_of::<CanonicalEvidenceTuple<'_>>(), 4),
+        (size_of::<Dependencies>(), 8),
+        (size_of::<Digest>(), 12),
+        (size_of::<IdentityDomain>(), 4),
+        (size_of::<StoreError>(), 4),
+        (size_of::<VerifiedSourceContinuation>(), 4),
+        (size_of::<bool>(), 8),
+        (size_of::<isize>(), 24),
+        (size_of::<std::num::TryFromIntError>(), 4),
+        (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, ContractError>, CanonicalEvidenceBytes>>(), 4),
+        (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, ContractError>, std::vec::Vec<u8>>>(), 4),
+        (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, StoreError>, u64>>(), 4),
+        (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, StoreError>>>(), 12),
+        (size_of::<std::result::Result<(), StoreError>>(), 12),
+        (size_of::<std::result::Result<CanonicalEvidenceBytes, ContractError>>(), 8),
+        (size_of::<std::result::Result<VerifiedSourceContinuation, StoreError>>(), 4),
+        (size_of::<std::result::Result<std::convert::Infallible, ContractError>>(), 16),
+        (size_of::<std::result::Result<std::convert::Infallible, StoreError>>(), 32),
+        (size_of::<std::result::Result<std::vec::Vec<u8>, ContractError>>(), 4),
+        (size_of::<std::result::Result<u64, StoreError>>(), 4),
+        (size_of::<std::result::Result<u64, std::num::TryFromIntError>>(), 4),
+        (size_of::<std::vec::Vec<u8>>(), 8),
+        (size_of::<u64>(), 20),
+        (size_of::<usize>(), 8),
+    ],
+);
+
 fn charged_bytes<T: Serialize + ?Sized>(
     value: &T,
     meter: &mut ProofMeter,
@@ -1192,15 +1489,17 @@ fn continuation(
         &influenced,
         frozen,
     );
-    let bytes = charged_bytes(&evidence, meter)?;
-    // canonical_digest is the public domain-separated hash route. Its second
-    // canonical traversal is real work, not a reuse of the temporary byte Vec.
-    meter.charge(
-        u64::try_from(bytes.len())
-            .map_err(|_| refuse("budget", "canonical byte count overflow"))?,
-    )?;
-    drop(bytes);
-    let commitment = identity(&evidence)?;
+    // This is the original first poll, with its one-unit floor plus the complete
+    // fixed owner/transport payment before constructing the canonical owner.
+    meter.charge(CONTINUATION_CANONICAL_PAYMENT)?;
+    let bytes = crate::product_contract::CanonicalEvidenceBytes::from_value(&evidence)?;
+    let count = u64::try_from(bytes.len())
+        .map_err(|_| refuse("budget", "canonical byte count overflow"))?;
+    meter.charge(count)?;
+    // Delete the second serialization and its debit together, retaining its
+    // live cancellation/elapsed poll before the unchanged variable hash work.
+    meter.charge(0)?;
+    let commitment = bytes.into_evidence_digest();
     drop(evidence);
     Ok(VerifiedSourceContinuation {
         identity: commitment,
@@ -1287,6 +1586,7 @@ pub(super) struct VerifiedOwnedContinuation {
     layer: Digest,
     initialization: Digest,
     continuation: Vec<Digest>,
+    original_proofs: Arc<[VerifiedSourceContinuation; 2]>,
 }
 impl VerifiedOwnedContinuation {
     pub(super) fn current(&self) -> &ProjectSnapshot {
@@ -1391,6 +1691,7 @@ pub(super) fn verify(
 ) -> AdmissionResult<VerifiedOwnedContinuation> {
     meter.charge(COMPARISON_DISPATCH_PAYMENT)?;
     meter.charge(COMPARISON_OWNER_PAYMENT)?;
+    meter.charge(STRUCTURAL_PAIR_PAYMENT)?;
     verify_with_origins(current, ComparisonOrigins::General {
         original, predecessor_before, predecessor_after,
     }, layer, initialization, before, after, sources, meter)
@@ -1413,26 +1714,19 @@ pub(super) fn verify_initial(
         initialization, before, after, sources, meter)
 }
 
+macro_rules! continuation_value_terminal {
+    (result, $value:expr) => { Ok($value) };
+    (value, $value:expr) => { $value };
+}
+
 #[allow(clippy::too_many_arguments)]
-fn verify_with_origins(
-    current: &ProjectSnapshot,
-    origins: ComparisonOrigins<'_>,
-    layer: &OwnedLayerV2,
-    initialization: &OwnedInitializationV2,
-    before: &CapturedProgram,
-    after: &CapturedProgram,
-    sources: &OwnedSourceRequest,
-    meter: &mut ProofMeter,
-) -> AdmissionResult<VerifiedOwnedContinuation> {
-    let (original, predecessor_before, predecessor_after) = match &origins {
-        ComparisonOrigins::FreshInitial(origin) => origin.references(),
-        ComparisonOrigins::General { original, predecessor_before, predecessor_after } =>
-            (*original, *predecessor_before, *predecessor_after),
-    };
-    meter.charge(1)?;
-    let state = current.owned_scope()?;
-    let layer_id = layer.identity()?;
-    let init_id = initialization.identity()?;
+macro_rules! verify_continuation_body {
+    ($current:ident, $origins:ident, $layer:ident, $initialization:ident, $before:ident, $after:ident, $sources:ident, $meter:ident, $original:ident, $predecessor_before:ident, $predecessor_after:ident, $predecessor_sources:ident, $request:ident, $inventory:ident, $seed:ident, $controlled:ident, $closed:ident, $source:ident, [$($references_slot:tt)*], [$($source_slot:tt)*], [$($closed_slot:tt)*], $terminal:ident) => {{
+    $($references_slot)*
+    $meter.charge(1)?;
+    let state = $current.owned_scope()?;
+    let layer_id = $layer.identity()?;
+    let init_id = $initialization.identity()?;
     let tail = state
         .adoptions
         .last()
@@ -1443,116 +1737,187 @@ fn verify_with_origins(
         .first()
         .and_then(|r| state.compositions.get(&r.composition))
         .map(|m| &m.output);
-    if original.metadata.revision.is_none()
-        || initial_output != Some(&revision(&original.target)?)
+    if $original.metadata.revision.is_none()
+        || initial_output != Some(&revision(&$original.target)?)
         || state.layers.len() != 1
-        || state.layers.get(&layer_id) != Some(layer)
+        || state.layers.get(&layer_id) != Some($layer)
         || state.initializations.len() != 1
-        || state.initializations.first() != Some(initialization)
-        || tail.output != current.active_revision
+        || state.initializations.first() != Some($initialization)
+        || tail.output != $current.active_revision
         || tail.layers != vec![layer_id.clone()]
-        || layer.request != original.proof.request
-        || layer.candidate != revision(&original.proof.candidate)?
-        || initialization.layer != layer_id
-        || initialization.after_data != original.initialized.identity()?
-        || initialization.before_data != original.proof.snapshot.data.identity()?
-        || original.metadata.root != sources.root_entity
+        || $layer.$request != $original.proof.$request
+        || $layer.candidate != revision(&$original.proof.candidate)?
+        || $initialization.$layer != layer_id
+        || $initialization.after_data != $original.initialized.identity()?
+        || $initialization.before_data != $original.proof.snapshot.data.identity()?
+        || $original.metadata.root != $sources.root_entity
     {
         return Err(refuse(
             "continuation",
             "original layer/initializer or immediate committed predecessor mismatch",
         ));
     }
-    let predecessor_sources = if tail.correspondences.is_empty() {
-        &layer.request.inventory.sources
+    let $predecessor_sources = if tail.correspondences.is_empty() {
+        &$layer.$request.$inventory.$sources
     } else {
         if tail.correspondences.len() != 1 {
             return Err(refuse("continuation", "ambiguous effective pair"));
         }
-        &tail.correspondences[0].sources
+        &tail.correspondences[0].$sources
     };
-    if predecessor_sources.before != revision(predecessor_before)?
-        || predecessor_sources.after != revision(predecessor_after)?
-        || tail.business != revision(predecessor_after)?
+    if $predecessor_sources.$before != revision($predecessor_before)?
+        || $predecessor_sources.$after != revision($predecessor_after)?
+        || tail.business != revision($predecessor_after)?
     {
         return Err(refuse(
             "continuation",
             "wrong immediate predecessor ordinary pair",
         ));
     }
-    for source in [before, after] {
-        meter.charge(source.source_bytes.len() as u64)?;
-        source.validate()?;
-        super::compiler::reject_reserved(&source.program)?;
-        if source.binding.project_id != current.data.project_id
-            || source.program.id != original.proof.candidate.program.id
+    for $source in [$before, $after] {
+        $($source_slot)*
+        if $source.binding.project_id != $current.data.project_id
+            || $source.program.id != $original.proof.candidate.program.id
         {
             return Err(refuse("continuation", "foreign ordinary program"));
         }
     }
-    let mut request = layer.request.clone();
-    request.inventory.snapshot = canonical_digest(IdentityDomain::Data, current)?;
-    request.inventory.sources = sources.clone();
-    let inventory =
-        super::common_fact_inventory::derive_pair(current, before, after, &request.inventory)?;
+    let mut $request = $layer.$request.clone();
+    $request.$inventory.snapshot = canonical_digest(IdentityDomain::Data, $current)?;
+    $request.$inventory.$sources = $sources.clone();
+    let $inventory =
+        super::common_fact_inventory::derive_pair($current, $before, $after, &$request.$inventory)?;
     // Every original policy writer is a seed, even if copied into both new
     // programs and thus absent from their newly proposed difference inventory.
     let original_inventory = super::common_fact_inventory::derive(
-        &original.proof.snapshot,
-        &original.proof.candidate,
-        &original.proof.request.inventory,
+        &$original.proof.snapshot,
+        &$original.proof.candidate,
+        &$original.proof.$request.$inventory,
     )?;
-    let mut seed = Dependencies::new();
+    let mut $seed = Dependencies::new();
     for writer in &original_inventory.structure.writers {
         let edited = original_inventory.structure.edits.iter().any(|e| {
             let ep = if writer.side == OwnedSourceSide::Before {
-                &e.before
+                &e.$before
             } else {
-                &e.after
+                &e.$after
             };
             ep.action == writer.action && inside(&writer.path, ep)
         });
         if edited {
             if let Some(field) = &writer.field {
-                seed.insert(Dependency::Field(writer.entity.clone(), field.clone()));
+                $seed.insert(Dependency::Field(writer.entity.clone(), field.clone()));
             }
         }
     }
-    for p in &original.proof.report.projections {
+    for p in &$original.proof.report.projections {
         if let Some(expr) = &p.baseline {
-            let types = Types::from([(p.binding.clone(), Type::reference(&sources.root_entity))]);
-            let origins = Origins::from([(
+            let types = Types::from([(p.binding.clone(), Type::reference(&$sources.root_entity))]);
+            let $origins = Origins::from([(
                 p.binding.clone(),
                 identity(&("projection", &p.destination, &p.binding))?,
             )]);
-            dependencies(&before.program, expr, &types, &origins, &mut seed, meter)?;
+            dependencies(&$before.program, expr, &types, &$origins, &mut $seed, $meter)?;
         }
     }
-    let (completed, _) = lifecycle_parts(&request.inventory.lifecycle.before)?;
-    seed.insert(Dependency::Field(
-        sources.root_entity.clone(),
+    let (completed, _) = lifecycle_parts(&$request.$inventory.lifecycle.$before)?;
+    $seed.insert(Dependency::Field(
+        $sources.root_entity.clone(),
         completed.into(),
     ));
-    let mut controlled = Dependencies::new();
+    let mut $controlled = Dependencies::new();
     for (source, side) in [
-        (original.proof.snapshot.program()?, OwnedSourceSide::Before),
-        (&original.proof.candidate, OwnedSourceSide::After),
+        ($original.proof.snapshot.program()?, OwnedSourceSide::Before),
+        (&$original.proof.candidate, OwnedSourceSide::After),
     ] {
         for action in &source.program.actions {
             for node in trace(
                 &source.program,
                 action,
-                &original.proof.request.inventory.sources,
+                &$original.proof.$request.$inventory.$sources,
                 side,
-                meter,
+                $meter,
             )? {
                 if node.edit.is_some() {
-                    controlled.extend(node.writes);
+                    $controlled.extend(node.writes);
                 }
             }
         }
     }
-    seed.extend(controlled.iter().cloned());
+    $seed.extend($controlled.iter().cloned());
+    $($closed_slot)*
+    let continuation_ids = $closed
+        .proofs
+        .logical()
+        .into_iter()
+        .map(comparison_identity as fn(&VerifiedSourceContinuation) -> Digest)
+        .collect();
+    let original_proofs = Arc::clone(&$closed.proofs.original);
+    let retained = RetainedOwned::new($original, $closed)?;
+    let (certificates, projections, comparison) = super::common_fact_rules::verify_pair_frame(
+        $before,
+        $after,
+        &$request,
+        &$inventory,
+        &$current.data,
+        Some(&retained),
+        $meter,
+    )?;
+    let projections = reorder_projections(
+        &$original.proof.report.projections,
+        projections,
+        &$original.metadata,
+    )?;
+    let report = CommonFactAdmissionReport {
+        version: 1,
+        snapshot: $request.$inventory.snapshot.clone(),
+        $before: $inventory.structure.$before,
+        $after: $inventory.structure.$after,
+        decisions: $current.decisions.identity()?,
+        acceptance: $original.proof.report.acceptance.clone(),
+        certificates,
+        projections,
+        phases: $inventory.actions,
+        outcome_comparison: comparison,
+        capture_presence_required: true,
+        durable_adoption_supported: false,
+    };
+    continuation_value_terminal!($terminal, VerifiedOwnedContinuation {
+        $current: $current.clone(),
+        $before: $before.clone(),
+        $after: $after.clone(),
+        $request,
+        report,
+        layout: $original.metadata.clone(),
+        storage_fields: $original.metadata.fields(&$original.proof),
+        $layer: layer_id,
+        $initialization: init_id,
+        continuation: continuation_ids,
+        original_proofs,
+    })
+
+    }};
+}
+fn verify_with_origins(
+    current: &ProjectSnapshot,
+    origins: ComparisonOrigins<'_>,
+    layer: &OwnedLayerV2,
+    initialization: &OwnedInitializationV2,
+    before: &CapturedProgram,
+    after: &CapturedProgram,
+    sources: &OwnedSourceRequest,
+    meter: &mut ProofMeter,
+) -> AdmissionResult<VerifiedOwnedContinuation> {    verify_continuation_body!(current, origins, layer, initialization, before, after, sources, meter, original, predecessor_before, predecessor_after, predecessor_sources, request, inventory, seed, controlled, closed, source, [
+    let (original, predecessor_before, predecessor_after) = match &origins {
+        ComparisonOrigins::FreshInitial(origin) => origin.references(),
+        ComparisonOrigins::General { original, predecessor_before, predecessor_after } =>
+            (*original, *predecessor_before, *predecessor_after),
+    };
+    ], [
+    meter.charge(source.source_bytes.len() as u64)?;
+    source.validate()?;
+    super::compiler::reject_reserved(&source.program)?;
+    ], [
     let closed = ClosedContinuationRules::verify(
         original,
         predecessor_before,
@@ -1567,53 +1932,244 @@ fn verify_with_origins(
         &origins,
         meter,
     )?;
-    let continuation_ids = closed
-        .proofs
-        .logical()
-        .into_iter()
-        .map(comparison_identity as fn(&VerifiedSourceContinuation) -> Digest)
-        .collect();
-    let retained = RetainedOwned::new(original, closed)?;
-    let (certificates, projections, comparison) = super::common_fact_rules::verify_pair_frame(
+    ], result)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn reconstruct_transition(
+    snapshot: &ProjectSnapshot, current: &ProjectSnapshot, registry: &ReconstructedOwned,
+    layer: &OwnedLayerV2, initialization: &OwnedInitializationV2,
+    manifest: &OwnedCompositionV2, origin: Option<&FreshInitialOrigin<'_>>,
+    meter: &mut ProofMeter,
+) -> Result<VerifiedOwnedTransitionExecution> {
+    super::owned_persist::reconstruct_transition_body!(snapshot, current, registry, layer,
+        initialization, manifest, origin, meter, original, prior_before, prior_after,
+        before, after, sources, continuation,
+        match origin { Some(o) => o.retained(), None => snapshot }, [
+        #[cfg(test)]
+        super::owned_persist::combined_transition_reuse_tests::ordinary(origin.is_some(), manifest.transition);
+        #[cfg(test)]
+        super::owned_persist::combined_transition_reuse_tests::boundary_before("structural", RECONSTRUCTED_STRUCTURAL_ENTRY_PAYMENT, meter);
+        meter.charge(RECONSTRUCTED_STRUCTURAL_ENTRY_PAYMENT)?;
+        #[cfg(test)]
+        super::owned_persist::combined_transition_reuse_tests::boundary_after("structural", meter);
+        let continuation = match origin {
+            Some(origin) if manifest.transition == ScopeTransition::Evolution => {
+                #[cfg(test)]
+                super::owned_persist::combined_transition_reuse_tests::boundary_next("dispatch", COMPARISON_DISPATCH_PAYMENT, meter);
+                meter.charge(COMPARISON_DISPATCH_PAYMENT)?;
+                meter.charge(COMPARISON_OWNER_PAYMENT)?;
+                meter.charge(STRUCTURAL_PAIR_PAYMENT)?;
+                let origins = ComparisonOrigins::FreshInitial(origin.comparison(prior_before, prior_after));
+                verify_continuation_body!(current, origins, layer, initialization, before, after, sources,
+                meter, original, predecessor_before, predecessor_after, predecessor_sources,
+                request, inventory, seed, controlled, closed, source, [
+    let (original, predecessor_before, predecessor_after) = match &origins {
+        ComparisonOrigins::FreshInitial(origin) => origin.references(),
+        ComparisonOrigins::General { original, predecessor_before, predecessor_after } =>
+            (*original, *predecessor_before, *predecessor_after),
+    };
+    ], [
+    meter.charge(source.source_bytes.len() as u64)?;
+    source.validate()?;
+    super::compiler::reject_reserved(&source.program)?;
+    ], [
+    let closed = ClosedContinuationRules::verify(
+        original,
+        predecessor_before,
+        predecessor_after,
+        predecessor_sources,
         before,
         after,
         &request,
         &inventory,
-        &current.data,
-        Some(&retained),
+        &seed,
+        &controlled,
+        &origins,
         meter,
     )?;
-    let projections = reorder_projections(
-        &original.proof.report.projections,
-        projections,
-        &original.metadata,
-    )?;
-    let report = CommonFactAdmissionReport {
-        version: 1,
-        snapshot: request.inventory.snapshot.clone(),
-        before: inventory.structure.before,
-        after: inventory.structure.after,
-        decisions: current.decisions.identity()?,
-        acceptance: original.proof.report.acceptance.clone(),
-        certificates,
-        projections,
-        phases: inventory.actions,
-        outcome_comparison: comparison,
-        capture_presence_required: true,
-        durable_adoption_supported: false,
+    #[cfg(test)]
+    super::owned_persist::combined_transition_reuse_tests::poll("closed", meter);
+    ], value)
+            }
+            _ => {
+                #[cfg(test)]
+                super::owned_persist::combined_transition_reuse_tests::boundary_next("dispatch", COMPARISON_DISPATCH_PAYMENT, meter);
+                meter.charge(COMPARISON_DISPATCH_PAYMENT)?;
+                meter.charge(COMPARISON_OWNER_PAYMENT)?;
+                meter.charge(STRUCTURAL_PAIR_PAYMENT)?;
+                let origins = ComparisonOrigins::General { original: &original,
+                    predecessor_before: prior_before, predecessor_after: prior_after };
+                verify_continuation_body!(current, origins, layer, initialization, before, after, sources,
+                meter, original, predecessor_before, predecessor_after, predecessor_sources,
+                request, inventory, seed, controlled, closed, source, [
+    let (original, predecessor_before, predecessor_after) = match &origins {
+        ComparisonOrigins::FreshInitial(origin) => origin.references(),
+        ComparisonOrigins::General { original, predecessor_before, predecessor_after } =>
+            (*original, *predecessor_before, *predecessor_after),
     };
-    Ok(VerifiedOwnedContinuation {
-        current: current.clone(),
-        before: before.clone(),
-        after: after.clone(),
-        request,
-        report,
-        layout: original.metadata.clone(),
-        storage_fields: original.metadata.fields(&original.proof),
-        layer: layer_id,
-        initialization: init_id,
-        continuation: continuation_ids,
-    })
+    ], [
+    meter.charge(source.source_bytes.len() as u64)?;
+    source.validate()?;
+    super::compiler::reject_reserved(&source.program)?;
+    ], [
+    let closed = ClosedContinuationRules::verify(
+        original,
+        predecessor_before,
+        predecessor_after,
+        predecessor_sources,
+        before,
+        after,
+        &request,
+        &inventory,
+        &seed,
+        &controlled,
+        &origins,
+        meter,
+    )?;
+    #[cfg(test)]
+    super::owned_persist::combined_transition_reuse_tests::poll("closed", meter);
+    ], value)
+            }
+        };
+        #[cfg(test)]
+        super::owned_persist::combined_transition_reuse_tests::poll("before-lower", meter);
+    ])
+}
+
+// Distinct completed-object authority, never converted into FreshInitial or
+// added to the old ComparisonOrigins enum. Callers prepay before construction.
+// V13 full actual transport census; the old transition floor pays every
+// retained outer owner. This positive supplement prepays the opaque view.
+pub(super) const COMPLETED_INITIAL_ORIGIN_VIEW_PAYMENT: u64 = comparison_payment(
+    64_u64.checked_mul(4).expect("completed transport activation overflow"), [
+    (size_of::<&crate::product_store::ProjectSnapshot>(), 4_u64.checked_mul(2).expect("completed transport slot overflow")),
+    (size_of::<&crate::product_store::scope::owned_persist::CompletedInitialOrigin<'_, '_>>(), 4_u64.checked_mul(2).expect("completed transport slot overflow")),
+    (size_of::<&std::sync::Arc<crate::product_store::scope::owned_preview::PreparedOwnedPreview>>(), 4_u64.checked_mul(2).expect("completed transport slot overflow")),
+    (size_of::<(&crate::product_store::ProjectSnapshot, &std::sync::Arc<crate::product_store::scope::owned_preview::PreparedOwnedPreview>)>(), 4_u64.checked_mul(2).expect("completed transport slot overflow")),
+]);
+// Only absent selected call/Result/accessor transport is removed. The full
+// General Result and actual continuation/request owners remain in this packet.
+pub(super) const COMPLETED_INITIAL_DISPATCH_PAYMENT: u64 = comparison_payment(
+    64_u64.checked_mul(49).expect("completed transport activation overflow"), [
+    (size_of::<&mut crate::product_store::scope::common_fact_admission::ProofMeter>(), 4_u64.checked_mul(4).expect("completed transport slot overflow")),
+    (size_of::<&crate::product_contract::CapturedProgram>(), 4_u64.checked_mul(6).expect("completed transport slot overflow")),
+    (size_of::<&crate::product_store::ProjectSnapshot>(), 4_u64.checked_mul(1).expect("completed transport slot overflow")),
+    (size_of::<&crate::product_store::scope::owned_contract::OwnedSourceRequest>(), 4_u64.checked_mul(1).expect("completed transport slot overflow")),
+    (size_of::<&crate::product_store::scope::owned_preview::PreparedOwnedPreview>(), 4_u64.checked_mul(4).expect("completed transport slot overflow")),
+    (size_of::<&crate::product_store::scope::owned_wire::OwnedInitializationV2>(), 4_u64.checked_mul(1).expect("completed transport slot overflow")),
+    (size_of::<&crate::product_store::scope::owned_wire::OwnedLayerV2>(), 4_u64.checked_mul(1).expect("completed transport slot overflow")),
+    (size_of::<&std::sync::Arc<crate::product_store::scope::owned_preview::PreparedOwnedPreview>>(), 4_u64.checked_mul(3).expect("completed transport slot overflow")),
+    (size_of::<()>(), 4_u64.checked_mul(6).expect("completed transport slot overflow")),
+    (size_of::<isize>(), 4_u64.checked_mul(4).expect("completed transport slot overflow")),
+    (size_of::<crate::product_store::scope::common_fact_admission::OwnedPreviewRequest>(), 4_u64.checked_mul(1).expect("completed transport slot overflow")),
+    (size_of::<crate::product_store::scope::owned_continuation::VerifiedOwnedContinuation>(), 4_u64.checked_mul(1).expect("completed transport slot overflow")),
+    (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>, crate::product_store::scope::owned_continuation::VerifiedOwnedContinuation>>(), 4_u64.checked_mul(1).expect("completed transport slot overflow")),
+    (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>>(), 4_u64.checked_mul(3).expect("completed transport slot overflow")),
+    (size_of::<std::result::Result<(), crate::product_store::StoreError>>(), 4_u64.checked_mul(3).expect("completed transport slot overflow")),
+    (size_of::<std::result::Result<crate::product_store::scope::owned_continuation::VerifiedOwnedContinuation, crate::product_store::StoreError>>(), 4_u64.checked_mul(1).expect("completed transport slot overflow")),
+    (size_of::<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>(), 4_u64.checked_mul(8).expect("completed transport slot overflow")),
+    (size_of::<u64>(), 4_u64.checked_mul(3).expect("completed transport slot overflow")),
+]);
+// Complete producing fixed slots: 48; direct activation/control sites: 10.
+const COMPLETED_INITIAL_CLOSED_PAYMENT: u64 = comparison_payment(640, [
+        (size_of::<&mut crate::product_store::scope::common_fact_admission::ProofMeter>(), 12),
+        (size_of::<&crate::product_store::scope::owned_contract::OwnedSourceRequest>(), 4),
+        (size_of::<&crate::product_contract::CapturedProgram>(), 32),
+        (size_of::<&crate::product_store::scope::common_fact_admission::OwnedPreviewRequest>(), 12),
+        (size_of::<&crate::product_store::scope::common_fact_inventory::CommonFactInventory>(), 12),
+        (size_of::<&crate::product_store::scope::owned_contract::OwnedSourceRequest>(), 4),
+        (size_of::<&crate::product_store::scope::owned_persist::CompletedInitialOrigin<'_, '_>>(), 12),
+        (size_of::<&crate::product_store::scope::owned_preview::PreparedOwnedPreview>(), 8),
+        (size_of::<&std::collections::BTreeSet<crate::product_store::scope::owned_continuation::Dependency>>(), 24),
+        (size_of::<()>(), 12),
+        (size_of::<isize>(), 8),
+        (if size_of::<crate::product_store::scope::owned_continuation::ClosedContinuationRules>() < 384 { 384 } else { size_of::<crate::product_store::scope::owned_continuation::ClosedContinuationRules>() }, 8),
+        (if size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>, crate::product_store::scope::owned_continuation::ClosedContinuationRules>>() < 384 { 384 } else { size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>, crate::product_store::scope::owned_continuation::ClosedContinuationRules>>() }, 4),
+        (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>>(), 4),
+        (size_of::<std::option::Option<[crate::product_store::scope::owned_continuation::VerifiedSourceContinuation; 2]>>(), 4),
+        (size_of::<std::result::Result<(), crate::product_store::StoreError>>(), 4),
+        (if size_of::<std::result::Result<crate::product_store::scope::owned_continuation::ClosedContinuationRules, crate::product_store::StoreError>>() < 384 { 384 } else { size_of::<std::result::Result<crate::product_store::scope::owned_continuation::ClosedContinuationRules, crate::product_store::StoreError>>() }, 8),
+        (size_of::<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>(), 16),
+        (size_of::<u64>(), 4),
+    ]);
+// Complete producing fixed slots: 76; direct activation/control sites: 34.
+const COMPLETED_INITIAL_WINDOW_PAYMENT: u64 = comparison_payment(2176, [
+        (size_of::<&mut crate::product_store::scope::common_fact_admission::ProofMeter>(), 24),
+        (size_of::<&crate::product_contract::CapturedProgram>(), 16),
+        (size_of::<&crate::product_store::scope::owned_contract::OwnedSourceRequest>(), 16),
+        (size_of::<&std::collections::BTreeSet<crate::product_store::scope::owned_continuation::Dependency>>(), 16),
+        (size_of::<&std::time::Duration>(), 4),
+        (size_of::<&std::time::Instant>(), 4),
+        (size_of::<()>(), 16),
+        (size_of::<[crate::product_store::scope::owned_continuation::VerifiedSourceContinuation; 2]>(), 4),
+        (size_of::<bool>(), 20),
+        (size_of::<isize>(), 24),
+        (size_of::<crate::product_contract::RuntimeLimits>(), 4),
+        (size_of::<crate::product_store::scope::owned_continuation::VerifiedSourceContinuation>(), 16),
+        (size_of::<crate::product_store::scope::owned_contract::OwnedSourceSide>(), 8),
+        (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>, bool>>(), 4),
+        (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>, crate::product_store::scope::owned_continuation::VerifiedSourceContinuation>>(), 8),
+        (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>>(), 8),
+        (size_of::<std::option::Option<[crate::product_store::scope::owned_continuation::VerifiedSourceContinuation; 2]>>(), 4),
+        (size_of::<std::option::Option<u128>>(), 4),
+        (size_of::<std::result::Result<(), crate::product_store::StoreError>>(), 8),
+        (size_of::<std::result::Result<bool, crate::product_store::StoreError>>(), 8),
+        (size_of::<std::result::Result<crate::product_store::scope::owned_continuation::VerifiedSourceContinuation, crate::product_store::StoreError>>(), 8),
+        (size_of::<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>(), 40),
+        (size_of::<std::time::Duration>(), 4),
+        (size_of::<u128>(), 20),
+        (size_of::<u64>(), 16),
+    ]);
+// Complete producing fixed slots: 18; direct activation/control sites: 9.
+const COMPLETED_INITIAL_HIT_PAYMENT: u64 = comparison_payment(576, [
+        (size_of::<&mut crate::product_store::scope::common_fact_admission::ProofMeter>(), 8),
+        (size_of::<()>(), 16),
+        (size_of::<isize>(), 8),
+        (size_of::<std::ops::ControlFlow<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>>(), 8),
+        (size_of::<std::result::Result<(), crate::product_store::StoreError>>(), 8),
+        (size_of::<std::result::Result<std::convert::Infallible, crate::product_store::StoreError>>(), 16),
+        (size_of::<u64>(), 8),
+    ]);
+#[allow(clippy::too_many_arguments)]
+pub(super) fn reconstruct_transition_completed(
+    snapshot: &ProjectSnapshot, current: &ProjectSnapshot, registry: &ReconstructedOwned,
+    layer: &OwnedLayerV2, initialization: &OwnedInitializationV2,
+    manifest: &OwnedCompositionV2, origin: &CompletedInitialOrigin<'_, '_>,
+    structural: Option<&super::owned_persist::CompletedStructuralLoan<'_, '_, '_>>,
+    meter: &mut ProofMeter,
+) -> Result<VerifiedOwnedTransitionExecution> {
+    let (completed_retained, completed_original) = origin.references();
+    super::owned_persist::reconstruct_transition_body!(snapshot, current, registry, layer, initialization, manifest,
+        origin, meter, original, prior_before, prior_after, before, after, sources, continuation,
+        completed_retained, [
+        let continuation = if manifest.transition == ScopeTransition::Evolution {
+            meter.charge(COMPARISON_DISPATCH_PAYMENT)?;
+            meter.charge(COMPARISON_OWNER_PAYMENT)?;
+            meter.charge(STRUCTURAL_PAIR_PAYMENT)?;
+            meter.charge(COMPLETED_INITIAL_DISPATCH_PAYMENT)?;
+            verify_continuation_body!(current, origin, layer, initialization, before, after, sources,
+                meter, original, predecessor_before, predecessor_after, predecessor_sources,
+                request, inventory, seed, controlled, closed, source, [
+                let original = &**completed_original;
+                let predecessor_before = prior_before;
+                let predecessor_after = prior_after;
+            ], [
+                // The completed outer first Evolution validated these exact
+                // immutable captures. Omit both duplicate predicates and their
+                // byte debit together, retaining the original live poll slot.
+                meter.charge(0)?;
+            ], [
+                meter.charge(COMPLETED_INITIAL_CLOSED_PAYMENT)?;
+                let closed = ClosedContinuationRules::verify_completed_initial(original, predecessor_before,
+                    predecessor_after, predecessor_sources, before, after, &request, &inventory,
+                    &seed, &controlled, origin, snapshot, structural, meter)?;
+            ], value)
+        } else {
+            verify(current, &original, layer, initialization,
+                prior_before, prior_after, before, after, sources, meter)?
+        };
+    ])
 }
 
 /// Read-only source-qualified facts, never caller-constructible write authority.
@@ -2104,3 +2660,17 @@ impl VerifiedOwnedPolicySurface {
 #[cfg(test)]
 #[path = "owned_continuation_initial_reuse_tests.rs"]
 mod initial_reuse_tests;
+
+#[cfg(all(test, target_pointer_width = "64"))]
+const _: [(); 13600] = [(); COMPLETED_INITIAL_CLOSED_PAYMENT as usize];
+
+#[cfg(all(test, target_pointer_width = "64"))]
+const _: [(); 46_912] = [(); COMPLETED_INITIAL_DISPATCH_PAYMENT as usize];
+#[cfg(all(test, target_pointer_width = "64"))]
+const _: [(); 576] = [(); COMPLETED_INITIAL_ORIGIN_VIEW_PAYMENT as usize];
+
+#[cfg(all(test, target_pointer_width = "64"))]
+const _: [(); 5632] = [(); COMPLETED_INITIAL_HIT_PAYMENT as usize];
+
+#[cfg(all(test, target_pointer_width = "64"))]
+const _: [(); 18940] = [(); COMPLETED_INITIAL_WINDOW_PAYMENT as usize];

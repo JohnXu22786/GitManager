@@ -13,6 +13,75 @@ pub(super) fn into_store_error(error: DecisionError) -> StoreError {
     }
 }
 
+// Lexical sharing preserves the ordinary callback's complete semantic order.
+macro_rules! locked_verification_body {
+    ($engine:ident, $store:ident, $current:ident, $fresh:ident, $next:ident, $plan:ident,
+     $candidate:ident, $change:ident, $check:ident, $ids:ident, [$($policy:tt)*], [$($export:tt)*]) => {{
+                        #[cfg(test)]
+                        crate::product_store::scope::adoption_diagnostic::phase(
+                            crate::product_store::scope::adoption_diagnostic::Phase::WithdrawalGraph,
+                        );
+                        validate_withdrawal_history($current)?;
+                        validate_withdrawal_delta($current, $next, $plan)?;
+                        if $fresh.is_withdrawal() {
+                            #[cfg(test)]
+                            crate::product_store::scope::adoption_diagnostic::phase(
+                                crate::product_store::scope::adoption_diagnostic::Phase::Policy,
+                            );
+                            $check.charge(6)?;
+                            $($policy)*
+                            if $ids != $plan.retire_decisions {
+                                return Err(invalid("locked owned retirement union changed"));
+                            }
+                        } else if $next != &$current.decisions || !$plan.retire_decisions.is_empty() {
+                            return Err(invalid("implementation transition changed intentions"));
+                        }
+                        #[cfg(test)]
+                        crate::product_store::scope::adoption_diagnostic::phase(
+                            crate::product_store::scope::adoption_diagnostic::Phase::Packages,
+                        );
+                        $engine.verify_destination_packages($store, $current, $next, $plan)?;
+                        #[cfg(test)]
+                        crate::product_store::scope::adoption_diagnostic::phase(
+                            crate::product_store::scope::adoption_diagnostic::Phase::RemainingReplay,
+                        );
+                        let report = $engine.check_bound($next, $fresh.target(), &$change.mappings)?;
+                        if report.disposition != CheckDisposition::Ready {
+                            return Err(DecisionError::Unverified(
+                                "owned transition fails independent remaining-intention replay"
+                                    .into(),
+                            ));
+                        }
+                        #[cfg(test)]
+                        crate::product_store::scope::adoption_diagnostic::phase(
+                            crate::product_store::scope::adoption_diagnostic::Phase::Bundle,
+                        );
+                        $($export)*
+                        Ok(())
+    }};
+}
+pub(super) use locked_verification_body;
+pub(super) struct RecordContinuationCapture<'call, 'gate, R: RuntimeAdapter> {
+    pub(super) engine: &'call DecisionEngine<R>,
+    pub(super) store: &'call ProductStore,
+    pub(super) current: &'call ProjectSnapshot,
+    pub(super) fresh: &'call PreparedOwnedTransitionV2,
+    pub(super) next: &'call DecisionGraph,
+    pub(super) plan: &'call AdoptionPlan,
+    pub(super) candidate: &'call ProjectSnapshot,
+    pub(super) change: &'call VerifiedChange,
+    pub(super) capsule: &'call crate::product_store::scope::LockedArchivePolicy<'gate>,
+}
+const fn policy_frame_continuation_payment<R: RuntimeAdapter>() -> u64 {
+    crate::product_store::scope::policy_frame_open_payment::<RecordContinuationCapture<'_, '_, R>>()
+}
+impl<'gate, R: RuntimeAdapter> RecordContinuationCapture<'_, 'gate, R> {
+    fn run(self, check: &mut crate::product_store::scope::OwnedPolicyCheck<'gate>, recorder: &mut crate::product_store::scope::PolicyFrameRecorder<'gate>) -> std::result::Result<(), StoreError> {
+        self.verify(check, recorder).map_err(into_store_error)
+    }
+
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct OwnedTransitionDecisionContext {
     pub prepared: PreparedOwnedTransitionV2,
@@ -350,47 +419,21 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                             "owned transition rehearsal changed".into(),
                         ));
                     }
+                    if let Some(capsule) = archive_policy {
+                        check.charge(const { policy_frame_continuation_payment::<R>() })?;
+                        let capture = RecordContinuationCapture {
+                            engine: self, store, current, fresh, next, plan, candidate, change, capsule,
+                        };
+                        let dispatch = crate::product_store::scope::RecordContinuationDispatch {
+                            capture, run: RecordContinuationCapture::run,
+                        };
+                        return capsule.with_policy_frame_recorder(check, dispatch);
+                    }
                     let mut verify = || -> Result<()> {
-                        #[cfg(test)]
-                        crate::product_store::scope::adoption_diagnostic::phase(
-                            crate::product_store::scope::adoption_diagnostic::Phase::WithdrawalGraph,
-                        );
-                        validate_withdrawal_history(current)?;
-                        validate_withdrawal_delta(current, next, plan)?;
-                        if fresh.is_withdrawal() {
-                            #[cfg(test)]
-                            crate::product_store::scope::adoption_diagnostic::phase(
-                                crate::product_store::scope::adoption_diagnostic::Phase::Policy,
-                            );
-                            check.charge(6)?;
+                        locked_verification_body!(self, store, current, fresh, next, plan, candidate, change, check, ids, [
                             let ids = owned_policy::check_withdrawal(&self.archive, check)
                                 .map_err(into_store_error)?;
-                            if ids != plan.retire_decisions {
-                                return Err(invalid("locked owned retirement union changed"));
-                            }
-                        } else if next != &current.decisions || !plan.retire_decisions.is_empty() {
-                            return Err(invalid("implementation transition changed intentions"));
-                        }
-                        #[cfg(test)]
-                        crate::product_store::scope::adoption_diagnostic::phase(
-                            crate::product_store::scope::adoption_diagnostic::Phase::Packages,
-                        );
-                        self.verify_destination_packages(store, current, next, plan)?;
-                        #[cfg(test)]
-                        crate::product_store::scope::adoption_diagnostic::phase(
-                            crate::product_store::scope::adoption_diagnostic::Phase::RemainingReplay,
-                        );
-                        let report = self.check_bound(next, fresh.target(), &change.mappings)?;
-                        if report.disposition != CheckDisposition::Ready {
-                            return Err(DecisionError::Unverified(
-                                "owned transition fails independent remaining-intention replay"
-                                    .into(),
-                            ));
-                        }
-                        #[cfg(test)]
-                        crate::product_store::scope::adoption_diagnostic::phase(
-                            crate::product_store::scope::adoption_diagnostic::Phase::Bundle,
-                        );
+                        ], [
                         if let Some(capsule) = archive_policy {
                             check.charge(super::bundle::LOCKED_ARCHIVE_EXPORT_PAYMENT)?;
                             IntentArchive::new(store.clone())
@@ -398,7 +441,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                         } else {
                             IntentArchive::new(store.clone()).export_for(candidate)?;
                         }
-                        Ok(())
+                        ])
                     };
                     verify().map_err(into_store_error)
                 },
@@ -461,3 +504,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             if reason == "Common factual admission: budget: cancelled or cumulative elapsed budget exhausted"));
     }
 }
+
+#[cfg(test)]
+#[path = "owned_policy_frame_reuse_tests.rs"]
+mod policy_frame_reuse_tests;

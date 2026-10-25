@@ -4,18 +4,17 @@
 use super::common_fact_admission::{refuse, ProofMeter};
 use super::owned_epoch::OwnedExecutionRecipe;
 use super::*;
-use crate::product_runtime::ProjectionValidation;
 use std::sync::{atomic::AtomicBool, Arc};
-fn err(message: &str) -> StoreError {
+pub(super) fn err(message: &str) -> StoreError {
     refuse("owned protected history", message)
 }
-fn flag(row: &Record, key: &str) -> Result<bool> {
+pub(super) fn flag(row: &Record, key: &str) -> Result<bool> {
     match row.values.get(key) {
         Some(DataValue::Boolean { value }) => Ok(*value),
         _ => Err(err("missing protected Boolean cell")),
     }
 }
-fn member(proof: &VerifiedOwnedPreviewPlan, row: &Record, existing: bool) -> bool {
+pub(super) fn member(proof: &VerifiedOwnedPreviewPlan, row: &Record, existing: bool) -> bool {
     let reference = history::row_ref(row);
     !proof.request.excluded_records.contains(&reference)
         && match &proof.request.population {
@@ -26,7 +25,135 @@ fn member(proof: &VerifiedOwnedPreviewPlan, row: &Record, existing: bool) -> boo
             }
         }
 }
-fn protected_row(
+macro_rules! protected_row_body {
+    ($prepared:ident, $data:expr, $row:ident, $prior:ident, $day:expr, $meter:expr, $limits:expr, [$($early_success:tt)*], [$($finish:tt)*]) => {
+        crate::product_store::scope::owned_replay::protected_row_body!($prepared, $data, $row, $prior, $day, $meter, $limits,
+            [$($early_success)*], [$($finish)*], metadata, [
+        let runtime = LocalRuntime::with_cancellation($meter.cancelled());
+        let mut checks = crate::product_runtime::ProjectionValidation::default();
+        let mut captured = BTreeSet::new();
+        for (i, projection) in $prepared.projections().iter().enumerate() {
+            if !captured.insert(&metadata.saved[i]) {
+                continue;
+            }
+            let value = runtime.evaluate_record_projection_with(
+                &mut checks,
+                $limits,
+                $prepared.target(),
+                $data,
+                &history::row_ref($row),
+                &projection.binding,
+                &$prepared.capture_expression(projection)?,
+                &projection.host_value_type,
+                $day,
+            )?;
+            if $row.values.get(&metadata.saved[i]) != Some(&value) {
+                return Err(crate::product_store::scope::owned_replay::err(
+                    "saved completion value does not regenerate from its historical frame",
+                ));
+            }
+        }
+            ])
+    };
+    ($prepared:ident, $data:expr, $row:ident, $prior:ident, $day:expr, $meter:expr, $limits:expr, [$($early_success:tt)*], [$($finish:tt)*], $metadata:ident, [$($projection:tt)*]) => {{
+    let proof = &$prepared.initial().proof;
+    let $metadata = $prepared.metadata();
+    for field in $metadata.fields(proof) {
+        validate_value(
+            $row.values
+                .get(&field.id)
+                .ok_or_else(|| crate::product_store::scope::owned_replay::err("missing capture cell is not captured Null"))?,
+            &field.value_type,
+            0,
+        )?;
+    }
+    if let Some(key) = &$metadata.revision {
+        if $row.values.get(key)
+            != Some(&DataValue::Integer {
+                value: i64::try_from($row.revision)
+                    .map_err(|_| crate::product_store::scope::owned_replay::err("root revision exceeds counter"))?,
+            })
+        {
+            return Err(crate::product_store::scope::owned_replay::err("root revision differs from protected event counter"));
+        }
+    }
+    let expected = $prior
+        .map(|r| crate::product_store::scope::owned_replay::flag(r, &$metadata.member))
+        .transpose()?
+        .unwrap_or_else(|| $prepared.active() && crate::product_store::scope::owned_replay::member(proof, $row, false));
+    if crate::product_store::scope::owned_replay::flag($row, &$metadata.member)? != expected {
+        return Err(crate::product_store::scope::owned_replay::err("immutable owned population changed"));
+    }
+    if let Some($prior) = $prior {
+        if $row.archived != $prior.archived || $row.created_program != $prior.created_program {
+            return Err(crate::product_store::scope::owned_replay::err("owned identity/archive changed"));
+        }
+        if crate::product_store::scope::owned_replay::flag($prior, &$metadata.sealed)? {
+            if $row != $prior {
+                return Err(crate::product_store::scope::owned_replay::err("sealed business row or capture changed"));
+            }
+            $($early_success)*
+        }
+    } else if $row.archived || $row.created_program != $prepared.target().artifact.program_digest {
+        return Err(crate::product_store::scope::owned_replay::err("future root lacks actual compiler provenance"));
+    }
+    if crate::product_store::scope::owned_replay::flag($row, &$metadata.sealed)? {
+        if !$prepared.completed($row)?
+            || $row.values.get(&$metadata.day) != Some(&DataValue::Date { days: $day })
+            || $row.values.get(&$metadata.origin)
+                != Some(&DataValue::Text {
+                    value: $metadata.identity.as_str().into(),
+                })
+        {
+            return Err(crate::product_store::scope::owned_replay::err("seal lacks exact completion provenance"));
+        }
+        $($projection)*
+    } else {
+        if $prepared.completed($row)?
+            || $metadata
+                .defaults(proof, expected)?
+                .iter()
+                .any(|(k, v)| Some(k) != $metadata.revision.as_ref() && $row.values.get(k) != Some(v))
+        {
+            return Err(crate::product_store::scope::owned_replay::err("unsealed root has completed or altered capture state"));
+        }
+    }
+    $($finish)*
+    }};
+}
+
+macro_rules! native_completed_projection {
+    ($prepared:ident, $data:expr, $row:ident, $day:expr, $meter:expr, $limits:expr, $metadata:ident) => {{
+        let runtime = LocalRuntime::with_cancellation($meter.cancelled());
+        let mut checks = crate::product_runtime::ProjectionValidation::default();
+        let mut captured = BTreeSet::new();
+        for (i, projection) in $prepared.projections().iter().enumerate() {
+            if !captured.insert(&$metadata.saved[i]) {
+                continue;
+            }
+            let value = runtime.evaluate_record_projection_with(
+                &mut checks,
+                $limits,
+                $prepared.target(),
+                $data,
+                &history::row_ref($row),
+                &projection.binding,
+                &$prepared.capture_expression(projection)?,
+                &projection.host_value_type,
+                $day,
+            )?;
+            if $row.values.get(&$metadata.saved[i]) != Some(&value) {
+                return Err(crate::product_store::scope::owned_replay::err(
+                    "saved completion value does not regenerate from its historical frame",
+                ));
+            }
+        }
+    }};
+}
+pub(super) use native_completed_projection;
+pub(super) use protected_row_body;
+
+pub(super) fn protected_row(
     prepared: &OwnedExecutionRecipe,
     data: &DataSnapshot,
     row: &Record,
@@ -34,94 +161,10 @@ fn protected_row(
     day: i32,
     meter: &mut ProofMeter,
 ) -> Result<()> {
-    let proof = &prepared.initial().proof;
-    let metadata = prepared.metadata();
-    for field in metadata.fields(proof) {
-        validate_value(
-            row.values
-                .get(&field.id)
-                .ok_or_else(|| err("missing capture cell is not captured Null"))?,
-            &field.value_type,
-            0,
-        )?;
-    }
-    if let Some(key) = &metadata.revision {
-        if row.values.get(key)
-            != Some(&DataValue::Integer {
-                value: i64::try_from(row.revision)
-                    .map_err(|_| err("root revision exceeds counter"))?,
-            })
-        {
-            return Err(err("root revision differs from protected event counter"));
-        }
-    }
-    let expected = prior
-        .map(|r| flag(r, &metadata.member))
-        .transpose()?
-        .unwrap_or_else(|| prepared.active() && member(proof, row, false));
-    if flag(row, &metadata.member)? != expected {
-        return Err(err("immutable owned population changed"));
-    }
-    if let Some(prior) = prior {
-        if row.archived != prior.archived || row.created_program != prior.created_program {
-            return Err(err("owned identity/archive changed"));
-        }
-        if flag(prior, &metadata.sealed)? {
-            if row != prior {
-                return Err(err("sealed business row or capture changed"));
-            }
-            return Ok(());
-        }
-    } else if row.archived || row.created_program != prepared.target().artifact.program_digest {
-        return Err(err("future root lacks actual compiler provenance"));
-    }
-    if flag(row, &metadata.sealed)? {
-        if !prepared.completed(row)?
-            || row.values.get(&metadata.day) != Some(&DataValue::Date { days: day })
-            || row.values.get(&metadata.origin)
-                != Some(&DataValue::Text {
-                    value: metadata.identity.as_str().into(),
-                })
-        {
-            return Err(err("seal lacks exact completion provenance"));
-        }
-        let runtime = LocalRuntime::with_cancellation(meter.cancelled());
-        let mut checks = ProjectionValidation::default();
-        let mut captured = BTreeSet::new();
-        for (i, projection) in prepared.projections().iter().enumerate() {
-            if !captured.insert(&metadata.saved[i]) {
-                continue;
-            }
-            let value = runtime.evaluate_record_projection_with(
-                &mut checks,
-                meter.runtime()?,
-                prepared.target(),
-                data,
-                &history::row_ref(row),
-                &projection.binding,
-                &prepared.capture_expression(projection)?,
-                &projection.host_value_type,
-                day,
-            )?;
-            if row.values.get(&metadata.saved[i]) != Some(&value) {
-                return Err(err(
-                    "saved completion value does not regenerate from its historical frame",
-                ));
-            }
-        }
-    } else {
-        if prepared.completed(row)?
-            || metadata
-                .defaults(proof, expected)?
-                .iter()
-                .any(|(k, v)| Some(k) != metadata.revision.as_ref() && row.values.get(k) != Some(v))
-        {
-            return Err(err("unsealed root has completed or altered capture state"));
-        }
-    }
-    Ok(())
+    protected_row_body!(prepared, data, row, prior, day, meter, meter.runtime()?, [return Ok(());], [Ok(())])
 }
-fn owned_entity(prepared: &OwnedExecutionRecipe, entity: &str) -> bool {
+
+pub(super) fn owned_entity(prepared: &OwnedExecutionRecipe, entity: &str) -> bool {
     entity == prepared.metadata().root
         || prepared
             .request()
@@ -129,7 +172,7 @@ fn owned_entity(prepared: &OwnedExecutionRecipe, entity: &str) -> bool {
             .iter()
             .any(|a| a.entity == entity)
 }
-fn event_revision(prepared: &OwnedExecutionRecipe, values: &Values, previous: u64) -> Result<u64> {
+pub(super) fn event_revision(prepared: &OwnedExecutionRecipe, values: &Values, previous: u64) -> Result<u64> {
     let key = prepared
         .metadata()
         .revision
@@ -178,6 +221,259 @@ pub(super) fn validate_recipe_history_from(
 }
 /// The visitor receives the same complete authenticated frames as capture and
 /// owner validation. It cannot replace or skip any history proof.
+macro_rules! recipe_history_body {
+    ($prepared:ident, $seed:expr, $seed_day:expr, $data:expr, $day:expr, $meter:expr,
+     [$($seed_call:tt)*], [$($row_call:tt)*], [$($event_call:tt)*], [$($final_call:tt)*], $frame:ident, $row:ident, $old:ident, $event:ident) => {
+        crate::product_store::scope::owned_replay::recipe_history_body!($prepared, $seed, $seed_day, $data, $day, $meter,
+            [$($seed_call)*], [$($row_call)*], [$($event_call)*], [$($final_call)*], $frame, $row, $old, $event,
+            [$meter.charge(canonical_bytes($data)?.len() as u64)?;])
+    };
+    ($prepared:ident, $seed:expr, $seed_day:expr, $data:expr, $day:expr, $meter:expr,
+     [$($seed_call:tt)*], [$($row_call:tt)*], [$($event_call:tt)*], [$($final_call:tt)*], $frame:ident, $row:ident, $old:ident, $event:ident,
+     [$($serialization:tt)*]) => {{
+    $($serialization)*
+    $data.validate()?;
+    validate_day($day)?;
+    if $data.schema != $seed.schema
+        || $data.project_id != $seed.project_id
+        || !$data.events.starts_with(&$seed.events)
+        || $data.generation < $seed.generation
+        || $day < $seed_day
+    {
+        return Err(crate::product_store::scope::owned_replay::err(
+            "source schema, original events or historical clock changed",
+        ));
+    }
+    $($seed_call)*
+    let mut $frame = $seed.clone();
+    let mut revisions =
+        revision_history::RevisionHistory::new($seed, |r| !crate::product_store::scope::owned_replay::owned_entity($prepared, &r.entity));
+    let mut prior_day = $seed_day;
+    for $event in &$data.events[$seed.events.len()..] {
+        $meter.charge(1)?;
+        let event_id = canonical_digest(
+            IdentityDomain::Input,
+            &(
+                &$event.operation_id,
+                &$prepared.target().artifact.program_digest,
+            ),
+        )?;
+        if $frame.generation.checked_add(1) != Some($event.sequence)
+            || $event.day < prior_day
+            || $event.id != format!("event-{}", &event_id.as_str()[..32])
+        {
+            return Err(crate::product_store::scope::owned_replay::err(
+                "event sequence/day/identity differs from the actual runtime chain",
+            ));
+        }
+        prior_day = $event.day;
+        if $event.program != $prepared.target().artifact.program_digest
+            || $event.day > $day
+            || !$prepared
+                .target()
+                .program
+                .actions
+                .iter()
+                .any(|a| a.id == $event.action)
+            || !$event.outputs.is_empty()
+        {
+            return Err(crate::product_store::scope::owned_replay::err(
+                "event has unsupported producer, action, clock or output",
+            ));
+        }
+        let prior = $frame.clone();
+        let mut shared_writes = Vec::new();
+        let mut exact_writes = 0u64;
+        for change in &$event.changes {
+            $meter.charge(1)?;
+            if !$prepared.active()
+                && $prepared
+                    .request()
+                    .auxiliary
+                    .iter()
+                    .any(|a| a.entity == change.entity)
+            {
+                return Err(crate::product_store::scope::owned_replay::err("inactive producer mutated dormant auxiliary history"));
+            }
+            if let Some($row) = $frame
+                .records
+                .iter_mut()
+                .find(|r| r.entity == change.entity && r.id == change.record)
+            {
+                if change.before.as_ref() != Some(&$row.values) || $row.archived {
+                    return Err(crate::product_store::scope::owned_replay::err("event before-values or archived facts changed"));
+                }
+                if $row.entity == $prepared.metadata().root && crate::product_store::scope::owned_replay::flag($row, &$prepared.metadata().sealed)?
+                {
+                    return Err(crate::product_store::scope::owned_replay::err("event attempted an Update on an already sealed root"));
+                }
+                $row.values = change.after.clone();
+                $row.archived = change.archived;
+                let old_revision = $row.revision;
+                $row.revision = if crate::product_store::scope::owned_replay::owned_entity($prepared, &$row.entity) {
+                    crate::product_store::scope::owned_replay::event_revision($prepared, &change.after, old_revision)?
+                } else {
+                    old_revision
+                        .checked_add(1)
+                        .ok_or_else(|| crate::product_store::scope::owned_replay::err("record revision overflow"))?
+                };
+                if crate::product_store::scope::owned_replay::owned_entity($prepared, &$row.entity) {
+                    exact_writes = exact_writes
+                        .checked_add($row.revision - old_revision)
+                        .ok_or_else(|| crate::product_store::scope::owned_replay::err("owned write count overflow"))?;
+                } else {
+                    shared_writes.push(($row.entity.clone(), $row.id.clone()));
+                }
+            } else {
+                if change.before.is_some() || change.archived {
+                    return Err(crate::product_store::scope::owned_replay::err("record birth is missing or archived"));
+                }
+                let revision = if crate::product_store::scope::owned_replay::owned_entity($prepared, &change.entity) {
+                    crate::product_store::scope::owned_replay::event_revision($prepared, &change.after, 0)?
+                } else {
+                    1
+                };
+                if crate::product_store::scope::owned_replay::owned_entity($prepared, &change.entity) {
+                    exact_writes = exact_writes
+                        .checked_add(revision)
+                        .ok_or_else(|| crate::product_store::scope::owned_replay::err("owned birth write count overflow"))?;
+                } else {
+                    shared_writes.push((change.entity.clone(), change.record.clone()));
+                }
+                $frame.records.push(Record {
+                    entity: change.entity.clone(),
+                    id: change.record.clone(),
+                    revision,
+                    created_program: $event.program.clone(),
+                    archived: false,
+                    values: change.after.clone(),
+                });
+            }
+        }
+        revisions.event(shared_writes, exact_writes, $meter)?;
+        $frame.generation = $event.sequence;
+        $frame.events.push($event.clone());
+        $frame.validate()?;
+        for change in &$event.changes {
+            let $row = $frame
+                .records
+                .iter()
+                .find(|r| r.entity == change.entity && r.id == change.record)
+                .ok_or_else(|| crate::product_store::scope::owned_replay::err("changed row missing"))?;
+            let $old = prior
+                .records
+                .iter()
+                .find(|r| r.entity == $row.entity && r.id == $row.id);
+            if $row.entity == $prepared.metadata().root {
+                $($row_call)*
+            }
+            for auxiliary in $prepared
+                .request()
+                .auxiliary
+                .iter()
+                .filter(|a| a.entity == $row.entity)
+            {
+                let Some(DataValue::Reference { entity, record }) =
+                    $row.values.get(&auxiliary.owner_field)
+                else {
+                    return Err(crate::product_store::scope::owned_replay::err("auxiliary owner is not a required reference"));
+                };
+                let owner = $frame
+                    .records
+                    .iter()
+                    .find(|r| {
+                        &r.entity == entity
+                            && &r.id == record
+                            && r.entity == $prepared.metadata().root
+                    })
+                    .ok_or_else(|| crate::product_store::scope::owned_replay::err("auxiliary root missing or foreign"))?;
+                if !crate::product_store::scope::owned_replay::flag(owner, &$prepared.metadata().member)? {
+                    return Err(crate::product_store::scope::owned_replay::err("auxiliary escaped its frozen cohort"));
+                }
+                if let Some($old) = $old {
+                    if $old.values.get(&auxiliary.owner_field)
+                        != $row.values.get(&auxiliary.owner_field)
+                        || $row.archived != $old.archived
+                        || $row.created_program != $old.created_program
+                    {
+                        return Err(crate::product_store::scope::owned_replay::err("auxiliary immutable owner/identity changed"));
+                    }
+                    if prior.records.iter().any(|r| {
+                        &r.entity == entity
+                            && &r.id == record
+                            && crate::product_store::scope::owned_replay::flag(r, &$prepared.metadata().sealed).unwrap_or(false)
+                    }) {
+                        return Err(crate::product_store::scope::owned_replay::err("sealed owner's auxiliary was updated"));
+                    }
+                } else if $row.archived
+                    || crate::product_store::scope::owned_replay::flag(owner, &$prepared.metadata().sealed)?
+                    || $row.created_program != $prepared.target().artifact.program_digest
+                {
+                    return Err(crate::product_store::scope::owned_replay::err("auxiliary birth lacks live owned provenance"));
+                }
+            }
+        }
+        $($event_call)*
+    }
+    if $frame.generation != $data.generation
+        || $frame
+            .records
+            .iter()
+            .map(|r| (&r.entity, &r.id))
+            .collect::<Vec<_>>()
+            != $data
+                .records
+                .iter()
+                .map(|r| (&r.entity, &r.id))
+                .collect::<Vec<_>>()
+    {
+        return Err(crate::product_store::scope::owned_replay::err(
+            "current generation or record order differs from event history",
+        ));
+    }
+    if $frame.records.len() != $data.records.len() {
+        return Err(crate::product_store::scope::owned_replay::err("record disappeared or lacks event provenance"));
+    }
+    for expected in &$frame.records {
+        let actual = $data
+            .records
+            .iter()
+            .find(|r| r.entity == expected.entity && r.id == expected.id)
+            .ok_or_else(|| crate::product_store::scope::owned_replay::err("retained record missing"))?;
+        if actual.values != expected.values
+            || actual.archived != expected.archived
+            || actual.created_program != expected.created_program
+            || actual.revision < expected.revision
+        {
+            return Err(crate::product_store::scope::owned_replay::err("current row differs from authenticated event history"));
+        }
+        // Owned revision stamps are emitted in the same actual business Update,
+        // including the completion capture Update. They add no write or ordinal.
+        if crate::product_store::scope::owned_replay::owned_entity($prepared, &expected.entity)
+            && (actual.revision != expected.revision
+                || actual.revision > (i64::MAX as u64).saturating_sub(10_000_000))
+        {
+            return Err(crate::product_store::scope::owned_replay::err(
+                "current owned revision differs from its exact protected history",
+            ));
+        }
+        // Initial sealed rows never receive any business write at all.
+        if $seed.records.iter().any(|r| {
+            r.entity == expected.entity
+                && r.id == expected.id
+                && r.entity == $prepared.metadata().root
+                && crate::product_store::scope::owned_replay::flag(r, &$prepared.metadata().sealed).unwrap_or(false)
+                && actual != r
+        }) {
+            return Err(crate::product_store::scope::owned_replay::err("initial completed record/revision changed"));
+        }
+    }
+    revisions.validate($data, $meter)?;
+    $($final_call)*
+    }};
+}
+pub(super) use recipe_history_body;
+
 pub(super) fn validate_recipe_history_with(
     prepared: &OwnedExecutionRecipe,
     seed: &DataSnapshot,
@@ -187,245 +483,9 @@ pub(super) fn validate_recipe_history_with(
     meter: &mut ProofMeter,
     visit: &mut dyn FnMut(&DataSnapshot, &mut ProofMeter) -> Result<()>,
 ) -> Result<()> {
-    meter.charge(canonical_bytes(data)?.len() as u64)?;
-    data.validate()?;
-    validate_day(day)?;
-    if data.schema != seed.schema
-        || data.project_id != seed.project_id
-        || !data.events.starts_with(&seed.events)
-        || data.generation < seed.generation
-        || day < seed_day
-    {
-        return Err(err(
-            "source schema, original events or historical clock changed",
-        ));
-    }
-    visit(seed, meter)?;
-    let mut frame = seed.clone();
-    let mut revisions =
-        revision_history::RevisionHistory::new(seed, |r| !owned_entity(prepared, &r.entity));
-    let mut prior_day = seed_day;
-    for event in &data.events[seed.events.len()..] {
-        meter.charge(1)?;
-        let event_id = canonical_digest(
-            IdentityDomain::Input,
-            &(
-                &event.operation_id,
-                &prepared.target().artifact.program_digest,
-            ),
-        )?;
-        if frame.generation.checked_add(1) != Some(event.sequence)
-            || event.day < prior_day
-            || event.id != format!("event-{}", &event_id.as_str()[..32])
-        {
-            return Err(err(
-                "event sequence/day/identity differs from the actual runtime chain",
-            ));
-        }
-        prior_day = event.day;
-        if event.program != prepared.target().artifact.program_digest
-            || event.day > day
-            || !prepared
-                .target()
-                .program
-                .actions
-                .iter()
-                .any(|a| a.id == event.action)
-            || !event.outputs.is_empty()
-        {
-            return Err(err(
-                "event has unsupported producer, action, clock or output",
-            ));
-        }
-        let prior = frame.clone();
-        let mut shared_writes = Vec::new();
-        let mut exact_writes = 0u64;
-        for change in &event.changes {
-            meter.charge(1)?;
-            if !prepared.active()
-                && prepared
-                    .request()
-                    .auxiliary
-                    .iter()
-                    .any(|a| a.entity == change.entity)
-            {
-                return Err(err("inactive producer mutated dormant auxiliary history"));
-            }
-            if let Some(row) = frame
-                .records
-                .iter_mut()
-                .find(|r| r.entity == change.entity && r.id == change.record)
-            {
-                if change.before.as_ref() != Some(&row.values) || row.archived {
-                    return Err(err("event before-values or archived facts changed"));
-                }
-                if row.entity == prepared.metadata().root && flag(row, &prepared.metadata().sealed)?
-                {
-                    return Err(err("event attempted an Update on an already sealed root"));
-                }
-                row.values = change.after.clone();
-                row.archived = change.archived;
-                let old_revision = row.revision;
-                row.revision = if owned_entity(prepared, &row.entity) {
-                    event_revision(prepared, &change.after, old_revision)?
-                } else {
-                    old_revision
-                        .checked_add(1)
-                        .ok_or_else(|| err("record revision overflow"))?
-                };
-                if owned_entity(prepared, &row.entity) {
-                    exact_writes = exact_writes
-                        .checked_add(row.revision - old_revision)
-                        .ok_or_else(|| err("owned write count overflow"))?;
-                } else {
-                    shared_writes.push((row.entity.clone(), row.id.clone()));
-                }
-            } else {
-                if change.before.is_some() || change.archived {
-                    return Err(err("record birth is missing or archived"));
-                }
-                let revision = if owned_entity(prepared, &change.entity) {
-                    event_revision(prepared, &change.after, 0)?
-                } else {
-                    1
-                };
-                if owned_entity(prepared, &change.entity) {
-                    exact_writes = exact_writes
-                        .checked_add(revision)
-                        .ok_or_else(|| err("owned birth write count overflow"))?;
-                } else {
-                    shared_writes.push((change.entity.clone(), change.record.clone()));
-                }
-                frame.records.push(Record {
-                    entity: change.entity.clone(),
-                    id: change.record.clone(),
-                    revision,
-                    created_program: event.program.clone(),
-                    archived: false,
-                    values: change.after.clone(),
-                });
-            }
-        }
-        revisions.event(shared_writes, exact_writes, meter)?;
-        frame.generation = event.sequence;
-        frame.events.push(event.clone());
-        frame.validate()?;
-        for change in &event.changes {
-            let row = frame
-                .records
-                .iter()
-                .find(|r| r.entity == change.entity && r.id == change.record)
-                .ok_or_else(|| err("changed row missing"))?;
-            let old = prior
-                .records
-                .iter()
-                .find(|r| r.entity == row.entity && r.id == row.id);
-            if row.entity == prepared.metadata().root {
-                protected_row(prepared, &frame, row, old, event.day, meter)?;
-            }
-            for auxiliary in prepared
-                .request()
-                .auxiliary
-                .iter()
-                .filter(|a| a.entity == row.entity)
-            {
-                let Some(DataValue::Reference { entity, record }) =
-                    row.values.get(&auxiliary.owner_field)
-                else {
-                    return Err(err("auxiliary owner is not a required reference"));
-                };
-                let owner = frame
-                    .records
-                    .iter()
-                    .find(|r| {
-                        &r.entity == entity
-                            && &r.id == record
-                            && r.entity == prepared.metadata().root
-                    })
-                    .ok_or_else(|| err("auxiliary root missing or foreign"))?;
-                if !flag(owner, &prepared.metadata().member)? {
-                    return Err(err("auxiliary escaped its frozen cohort"));
-                }
-                if let Some(old) = old {
-                    if old.values.get(&auxiliary.owner_field)
-                        != row.values.get(&auxiliary.owner_field)
-                        || row.archived != old.archived
-                        || row.created_program != old.created_program
-                    {
-                        return Err(err("auxiliary immutable owner/identity changed"));
-                    }
-                    if prior.records.iter().any(|r| {
-                        &r.entity == entity
-                            && &r.id == record
-                            && flag(r, &prepared.metadata().sealed).unwrap_or(false)
-                    }) {
-                        return Err(err("sealed owner's auxiliary was updated"));
-                    }
-                } else if row.archived
-                    || flag(owner, &prepared.metadata().sealed)?
-                    || row.created_program != prepared.target().artifact.program_digest
-                {
-                    return Err(err("auxiliary birth lacks live owned provenance"));
-                }
-            }
-        }
-        visit(&frame, meter)?;
-    }
-    if frame.generation != data.generation
-        || frame
-            .records
-            .iter()
-            .map(|r| (&r.entity, &r.id))
-            .collect::<Vec<_>>()
-            != data
-                .records
-                .iter()
-                .map(|r| (&r.entity, &r.id))
-                .collect::<Vec<_>>()
-    {
-        return Err(err(
-            "current generation or record order differs from event history",
-        ));
-    }
-    if frame.records.len() != data.records.len() {
-        return Err(err("record disappeared or lacks event provenance"));
-    }
-    for expected in &frame.records {
-        let actual = data
-            .records
-            .iter()
-            .find(|r| r.entity == expected.entity && r.id == expected.id)
-            .ok_or_else(|| err("retained record missing"))?;
-        if actual.values != expected.values
-            || actual.archived != expected.archived
-            || actual.created_program != expected.created_program
-            || actual.revision < expected.revision
-        {
-            return Err(err("current row differs from authenticated event history"));
-        }
-        // Owned revision stamps are emitted in the same actual business Update,
-        // including the completion capture Update. They add no write or ordinal.
-        if owned_entity(prepared, &expected.entity)
-            && (actual.revision != expected.revision
-                || actual.revision > (i64::MAX as u64).saturating_sub(10_000_000))
-        {
-            return Err(err(
-                "current owned revision differs from its exact protected history",
-            ));
-        }
-        // Initial sealed rows never receive any business write at all.
-        if seed.records.iter().any(|r| {
-            r.entity == expected.entity
-                && r.id == expected.id
-                && r.entity == prepared.metadata().root
-                && flag(r, &prepared.metadata().sealed).unwrap_or(false)
-                && actual != r
-        }) {
-            return Err(err("initial completed record/revision changed"));
-        }
-    }
-    revisions.validate(data, meter)?;
-    visit(data, meter)
+    recipe_history_body!(prepared, seed, seed_day, data, day, meter,
+        [visit(seed, meter)?;], [protected_row(prepared, &frame, row, old, event.day, meter)?;],
+        [visit(&frame, meter)?;], [visit(data, meter)], frame, row, old, event)
 }
 
 #[derive(Clone)]
