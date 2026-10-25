@@ -67,6 +67,24 @@ fn reconstruction_payments_enforce_exact_fit_and_refusal() {
 
 #[test]
 fn actual_reconstruction_layouts_cover_complete_headers() {
+    // These independent 64-bit pins are also used by the route oracles below.
+    // In particular, all four Result<Self::Output> transports include the
+    // transition's extra Arc, not only the successful output payload.
+    assert_eq!(RegistryOnly::FRAME_PAYMENT, REGISTRY_FRAME);
+    assert_eq!(RegistryOnly::FINISH_PAYMENT, REGISTRY_FINISH);
+    assert_eq!(RegistryOnly::PREFIX_SCOPE_PAYMENT, REGISTRY_PREFIX_SCOPE);
+    assert_eq!(RegistryOnly::PREFIX_INTERVAL_PAYMENT, REGISTRY_PREFIX_INTERVAL);
+    assert_eq!(TRANSITION_RECONSTRUCT_PAYMENT, TRANSITION_FRAME);
+    assert_eq!(TransitionFinish::FINISH_PAYMENT, TRANSITION_FINISH);
+    assert_eq!(TransitionFinish::PREFIX_SCOPE_PAYMENT, TRANSITION_PREFIX_SCOPE);
+    assert_eq!(TransitionFinish::PREFIX_INTERVAL_PAYMENT, TRANSITION_PREFIX_INTERVAL);
+    assert_eq!(GENERAL_TRANSITION_PAYMENT, GENERAL_TRANSPORT);
+    assert_eq!(owned_continuation::STRUCTURAL_ENTRY_PAYMENT, STRUCTURAL_ENTRY);
+    assert_eq!(owned_continuation::RECONSTRUCTED_STRUCTURAL_ENTRY_PAYMENT, RECONSTRUCTED_ENTRY);
+    assert_eq!(owned_continuation::STRUCTURAL_PAIR_PAYMENT, STRUCTURAL_PAIR);
+    assert_eq!(RECONSTRUCTED_ORIGIN_PAYMENT, RECONSTRUCTED_ORIGIN);
+    assert_eq!(COLD_HISTORICAL_SERIALIZATION_PAYMENT, COLD_SERIALIZATION);
+    assert_eq!(owned_continuation::COMPARISON_DISPATCH_PAYMENT, COMPARISON_DISPATCH);
     println!(
         "RECONSTRUCTION_LAYOUTS {}",
         serde_json::json!({
@@ -392,7 +410,64 @@ fn fresh_first_evolution_matches_general() {
         "after-alternatives",
         false,
         true,
+        1,
     );
+}
+
+// Frozen packet ledger, independent of production formulas and final balances.
+// Values are pinned separately above so a production accounting change cannot
+// silently update either normalization or the short/exact boundary oracle.
+const REGISTRY_FRAME: u64 = 1312;
+const REGISTRY_FINISH: u64 = 1376;
+const REGISTRY_PREFIX_SCOPE: u64 = 5296;
+const REGISTRY_PREFIX_INTERVAL: u64 = 21148;
+const TRANSITION_FRAME: u64 = 1456;
+const TRANSITION_FINISH: u64 = 1664;
+const TRANSITION_PREFIX_SCOPE: u64 = 5328;
+const TRANSITION_PREFIX_INTERVAL: u64 = 21180;
+const GENERAL_TRANSPORT: u64 = 1028;
+const STRUCTURAL_ENTRY: u64 = 97216;
+const RECONSTRUCTED_ENTRY: u64 = 43136;
+const STRUCTURAL_PAIR: u64 = 25104;
+const RECONSTRUCTED_ORIGIN: u64 = 4736;
+const COLD_SERIALIZATION: u64 = 8980;
+// Two complete continuation results grew by one Arc (8 bytes) each.
+const COMPARISON_DISPATCH: u64 = 6016;
+const DISPATCH_GROWTH: u64 = COMPARISON_DISPATCH - 6000;
+// The immutable fixture/input digests asserted below bind these independently
+// pinned Before/After evidence lengths, including historical/later pairs.
+// Canonical reuse replaced 1 + 2*bytes with 16_785 + bytes per comparison;
+// derive the removed work, never calibrate from a completed route's balance.
+// The complete 16_785 packet is pinned by the continuation layout controls.
+const CANONICAL_EVIDENCE_BYTES: [u64; 2] = [119_626, 104_174];
+const CANONICAL_SAVING_PER_PAIR: u64 =
+    CANONICAL_EVIDENCE_BYTES[0] + CANONICAL_EVIDENCE_BYTES[1] - 2 * (16_785 - 1);
+
+fn assert_accounting_fixture(
+    current: &ProjectSnapshot, before: &CapturedProgram, after: &CapturedProgram,
+    sources: &OwnedSourceRequest, expected: &str,
+) {
+    // Bind all canonical-evidence inputs, not a meter result, to the frozen
+    // byte-length ledger. Fixture/source drift requires explicit reconciliation.
+    assert_eq!(
+        canonical_digest(IdentityDomain::Evidence, &(current, before, after, sources))
+            .unwrap().as_str(),
+        expected,
+        "accounting fixture/input identity changed",
+    );
+}
+
+fn assert_epoch_topology(current: &ProjectSnapshot, registry: &ReconstructedOwned, expected: usize) {
+    let state = current.owned_scope().unwrap();
+    assert_eq!(state.layers.len(), 1);
+    assert_eq!(state.initializations.len(), 1);
+    assert_eq!(state.adoptions.len(), expected);
+    assert_eq!(state.compositions.len(), expected);
+    assert_eq!(registry.epochs.len(), expected);
+    for (epoch, receipt) in registry.epochs.iter().zip(&state.adoptions) {
+        assert_eq!(epoch.adoption_revision, receipt.revision);
+        assert_eq!(epoch.output, state.compositions[&receipt.composition].output);
+    }
 }
 
 fn compare_routes(
@@ -403,6 +478,7 @@ fn compare_routes(
     operation: &str,
     withdrawal: bool,
     hit: bool,
+    epochs: usize,
 ) -> Arc<VerifiedOwnedTransitionExecution> {
     let layer = current.owned_scope().unwrap().layers.keys().next().unwrap();
     let mut fresh_meter = meter();
@@ -433,18 +509,26 @@ fn compare_routes(
     )
     .unwrap();
     assert_execution_equal(&fresh, &general);
-    assert_eq!(fresh_registry.epochs.len(), registry.epochs.len());
-    let wrapper_saving =
-        RegistryOnly::FRAME_PAYMENT + RegistryOnly::FINISH_PAYMENT + GENERAL_TRANSITION_PAYMENT
-            - TRANSITION_RECONSTRUCT_PAYMENT
-            - TransitionFinish::FINISH_PAYMENT;
+    assert_epoch_topology(current, &fresh_registry, epochs);
+    assert_epoch_topology(current, &registry, epochs);
+    // Prefixes contain 1..k-1 epochs at historical reconstruction and k at
+    // the final endpoint: k scopes and k(k+1)/2 intervals. Prospective
+    // rehearsals are not committed producer epochs.
+    let k = epochs as u64;
+    let intervals = k * (k + 1) / 2;
+    let registry_wrappers = REGISTRY_FRAME + REGISTRY_FINISH
+        + k * REGISTRY_PREFIX_SCOPE + intervals * REGISTRY_PREFIX_INTERVAL;
+    let transition_wrappers = TRANSITION_FRAME + TRANSITION_FINISH
+        + k * TRANSITION_PREFIX_SCOPE + intervals * TRANSITION_PREFIX_INTERVAL;
+    let wrapper_saving = registry_wrappers as i64 + GENERAL_TRANSPORT as i64
+        - transition_wrappers as i64;
     let saving = fresh_meter.remaining_units_for_test() as i64
         - general_meter.remaining_units_for_test() as i64;
     if hit {
-        assert!(saving > wrapper_saving as i64);
+        assert!(saving > wrapper_saving);
     } else {
         assert_eq!(
-            saving, wrapper_saving as i64,
+            saving, wrapper_saving,
             "missing provenance must retain all four comparisons"
         );
     }
@@ -558,13 +642,14 @@ fn historical_and_later_routes_preserve_fallback() {
         "first-withdrawal-control",
         true,
         false,
+        1,
     );
     let dir = tempfile::tempdir().unwrap();
     let store =
         ProductStore::create_recovered_with(dir.path().join("history"), &initial, |_| Ok(()))
             .unwrap();
     let (a1, b1, s1) = evolved(&a0, &b0, &s0, "one");
-    let expected = compare_routes(&initial, &a1, &b1, &s1, "evolve-one", false, true);
+    let expected = compare_routes(&initial, &a1, &b1, &s1, "evolve-one", false, true, 1);
     let first = adopt_component(&store, &a1, &b1, &s1, "evolve-one", false);
     let registry = reconstruct(&first, &mut meter()).unwrap();
     let OwnedExecutionRecipe::Transition(actual) =
@@ -586,13 +671,13 @@ fn historical_and_later_routes_preserve_fallback() {
     );
     assert_eq!(row(&current, "after-first").entity, "job");
     let (a2, b2, s2) = evolved(&a1, &b1, &s1, "two");
-    compare_routes(&current, &a2, &b2, &s2, "evolve-two", false, false);
+    compare_routes(&current, &a2, &b2, &s2, "evolve-two", false, false, 2);
     assert_historical_route_boundaries(&current, &a2, &b2, &s2);
     let second = adopt_component(&store, &a2, &b2, &s2, "evolve-two", false);
-    compare_routes(&second, &a2, &b2, &s2, "withdraw", true, false);
+    compare_routes(&second, &a2, &b2, &s2, "withdraw", true, false, 3);
     let withdrawn = adopt_component(&store, &a2, &b2, &s2, "withdraw", true);
     let (a3, b3, s3) = evolved(&a2, &b2, &s2, "three");
-    compare_routes(&withdrawn, &a3, &b3, &s3, "re-evolve", false, false);
+    compare_routes(&withdrawn, &a3, &b3, &s3, "re-evolve", false, false, 4);
     let last = adopt_component(&store, &a3, &b3, &s3, "re-evolve", false);
     let registry = reconstruct(&last, &mut meter()).unwrap();
     assert_eq!(registry.epochs.len(), 5);
@@ -604,10 +689,11 @@ fn historical_and_later_routes_preserve_fallback() {
     assert!(reconstruct(&bad, &mut meter()).is_err());
 }
 
-// Frozen actual-prefix vectors were observed on the real closed/general routes,
-// not inferred from a successful final balance. These are deliberately independent
-// of the packet formulas: removing or moving a production debit breaks the oracle.
-// They include ProofMeter::new's unit and use the original host without refunds.
+// Frozen prior-prefix vectors were observed on the real closed/general routes,
+// not inferred from a successful final balance. Compose later packet additions
+// explicitly from the independent ledger above, rather than remeasuring balances.
+// They include ProofMeter::new's unit and use the original host without refunds:
+// removing or moving an upstream production debit must still break the oracle.
 #[allow(clippy::too_many_arguments)]
 fn assert_route_boundary(
     current: &ProjectSnapshot, before: &CapturedProgram, after: &CapturedProgram,
@@ -628,7 +714,7 @@ fn assert_route_boundary(
         };
         if exact && exact_success { assert!(result.is_ok(), "{label}"); }
         else {
-            assert!(result.unwrap_err().to_string().contains("cumulative proof/initialization budget exhausted"), "{label}");
+            assert!(result.expect_err(label).to_string().contains("cumulative proof/initialization budget exhausted"), "{label}");
         }
         assert_eq!(limited.remaining_units_for_test(), if exact { 0 } else { cost - 1 }, "{label}: refused debit is not paid and no later debit runs");
         assert_eq!(canonical_bytes(current).unwrap(), frozen);
@@ -645,33 +731,70 @@ fn assert_route_boundary(
 }
 fn assert_initial_route_boundaries(current: &ProjectSnapshot, before: &CapturedProgram, after: &CapturedProgram,
     sources: &OwnedSourceRequest, registry: &ReconstructedOwned) {
+    assert_accounting_fixture(current, before, after, sources,
+        "20bac07bcd3177776d9f2bfd7fa547e8e12162c65e2f35911eb59f93042b9ab7");
+    assert_epoch_topology(current, registry, 1);
+    let registry_prefix = REGISTRY_PREFIX_SCOPE + REGISTRY_PREFIX_INTERVAL;
+    let transition_prefix = TRANSITION_PREFIX_SCOPE + TRANSITION_PREFIX_INTERVAL;
+    let fresh_entry = transition_prefix + STRUCTURAL_ENTRY;
+    let fresh_pair = fresh_entry + DISPATCH_GROWTH + STRUCTURAL_PAIR;
+    let general_pair = STRUCTURAL_ENTRY + DISPATCH_GROWTH + STRUCTURAL_PAIR;
     for (label, prefix, cost, end) in [
         ("registry-r1", 1, 1312, false),
         ("registry-r2", 2_555_127, 208, false),
-        ("registry-r4", 2_562_272, 1376, true),
+        ("registry-r4", 2_562_272 + registry_prefix, 1376, true),
     ] { assert_route_boundary(current, before, after, sources, None, "drop-control", 0, label, prefix, cost, end); }
     for (label, prefix, cost) in [
         ("fresh-r1", 1, 1456), ("fresh-r2", 2_555_271, 208),
-        ("fresh-r4", 2_562_416, 1664), ("fresh-r5", 2_564_080, 6000),
-        ("fresh-r6", 2_570_080, 8128), ("fresh-first-hit", 3_248_886, 328),
-        ("fresh-second-hit", 3_249_214, 328), ("fresh-r8-view", 3_249_552, 704),
-        ("fresh-r8-query", 3_250_256, 1840),
+        ("fresh-r4", 2_562_416 + transition_prefix, 1664), ("fresh-r5", 2_564_080 + fresh_entry, COMPARISON_DISPATCH),
+        ("fresh-r6", 2_570_080 + fresh_entry + DISPATCH_GROWTH, 8128), ("fresh-first-hit", 3_248_886 + fresh_pair - CANONICAL_SAVING_PER_PAIR, 328),
+        ("fresh-second-hit", 3_249_214 + fresh_pair - CANONICAL_SAVING_PER_PAIR, 328), ("fresh-r8-view", 3_249_552 + fresh_pair - CANONICAL_SAVING_PER_PAIR, 704),
+        ("fresh-r8-query", 3_250_256 + fresh_pair - CANONICAL_SAVING_PER_PAIR, 1840),
     ] { assert_route_boundary(current, before, after, sources, None, "drop-control", 1, label, prefix, cost, false); }
     for (label, prefix, cost) in [
-        ("general-transport", 1, 1028), ("general-r5", 1029, 6000),
-        ("general-r6", 7029, 8128), ("general-r8-view", 1_315_405, 704),
-        ("general-r8-query", 1_316_109, 1840),
+        ("general-transport", 1, 1028), ("general-r5", 1029 + STRUCTURAL_ENTRY, COMPARISON_DISPATCH),
+        ("general-r6", 7029 + STRUCTURAL_ENTRY + DISPATCH_GROWTH, 8128), ("general-r8-view", 1_315_405 + general_pair - 2 * CANONICAL_SAVING_PER_PAIR, 704),
+        ("general-r8-query", 1_316_109 + general_pair - 2 * CANONICAL_SAVING_PER_PAIR, 1840),
     ] { assert_route_boundary(current, before, after, sources, Some(registry), "ordinary", 2, label, prefix, cost, false); }
 }
 fn assert_historical_route_boundaries(current: &ProjectSnapshot, before: &CapturedProgram, after: &CapturedProgram,
     sources: &OwnedSourceRequest) {
+    assert_accounting_fixture(current, before, after, sources,
+        "fed424ae9e77bdb90745bbed2ae89f4c3d2741ccdc259ebf59d88fccca913718");
+    let registry = reconstruct(current, &mut meter()).unwrap();
+    assert_epoch_topology(current, &registry, 2);
+    let state = current.owned_scope().unwrap();
+    let historical = &state.compositions[&state.adoptions[1].composition].basis.frozen.data;
+    // Independently pin the fixture bytes whose formerly redundant native
+    // serialization was removed. This is not a measured route debit/balance.
+    const HISTORICAL_DATA_BYTES: u64 = 6934;
+    assert_eq!(canonical_bytes(historical).unwrap().len() as u64, HISTORICAL_DATA_BYTES);
+    let first_recipe = &registry.recipes[&registry.epochs[0].output];
+    let next_recipe = &registry.recipes[&registry.epochs[1].output];
+    assert_eq!(first_recipe.seed(), historical);
+    assert_eq!(next_recipe.seed(), historical);
+    assert_eq!(historical.records.len(), 2);
+    assert!(historical.records.iter().all(|row| owned_replay::owned_entity(first_recipe, &row.entity)));
+    // The final default-window traversal reuses this completed interval:
+    // no new events/shared rows, two record-inventory units and one empty
+    // revision-allocation unit, in addition to its canonical data bytes.
+    let reused_interval = HISTORICAL_DATA_BYTES + 2 + 1;
+    let historical_prefix = TRANSITION_PREFIX_SCOPE + TRANSITION_PREFIX_INTERVAL
+        + COLD_SERIALIZATION - HISTORICAL_DATA_BYTES;
+    let historical_entry = historical_prefix + (RECONSTRUCTED_ORIGIN - 3584) + RECONSTRUCTED_ENTRY;
+    let historical_pair = historical_entry + DISPATCH_GROWTH + STRUCTURAL_PAIR;
+    // The second traversal adds one scope and two intervals before final R4.
+    let final_prefix = historical_pair + TRANSITION_PREFIX_SCOPE + 2 * TRANSITION_PREFIX_INTERVAL
+        - reused_interval;
+    let final_entry = final_prefix + STRUCTURAL_ENTRY;
+    let final_pair = final_entry + DISPATCH_GROWTH + STRUCTURAL_PAIR;
     for (label, prefix, cost) in [
-        ("history-r3", 2_576_424, 3584), ("history-r5", 2_580_008, 6000),
-        ("history-r6", 2_586_008, 8128), ("history-first-hit", 3_264_820, 328),
-        ("history-second-hit", 3_265_148, 328), ("history-r8-view", 3_267_126, 704),
-        ("history-r8-query", 3_267_830, 1840), ("later-r4", 3_348_552, 1664),
-        ("later-general-r5", 3_350_216, 6000), ("later-general-r6", 3_356_216, 8128),
-        ("later-general-r8-view", 4_666_238, 704), ("later-general-r8-query", 4_666_942, 1840),
+        ("history-r3", 2_576_424 + historical_prefix, RECONSTRUCTED_ORIGIN), ("history-r5", 2_580_008 + historical_entry, COMPARISON_DISPATCH),
+        ("history-r6", 2_586_008 + historical_entry + DISPATCH_GROWTH, 8128), ("history-first-hit", 3_264_820 + historical_pair - CANONICAL_SAVING_PER_PAIR, 328),
+        ("history-second-hit", 3_265_148 + historical_pair - CANONICAL_SAVING_PER_PAIR, 328), ("history-r8-view", 3_267_126 + historical_pair - CANONICAL_SAVING_PER_PAIR, 704),
+        ("history-r8-query", 3_267_830 + historical_pair - CANONICAL_SAVING_PER_PAIR, 1840), ("later-r4", 3_348_552 + final_prefix - CANONICAL_SAVING_PER_PAIR, 1664),
+        ("later-general-r5", 3_350_216 + final_entry - CANONICAL_SAVING_PER_PAIR, COMPARISON_DISPATCH), ("later-general-r6", 3_356_216 + final_entry + DISPATCH_GROWTH - CANONICAL_SAVING_PER_PAIR, 8128),
+        ("later-general-r8-view", 4_666_238 + final_pair - 3 * CANONICAL_SAVING_PER_PAIR, 704), ("later-general-r8-query", 4_666_942 + final_pair - 3 * CANONICAL_SAVING_PER_PAIR, 1840),
     ] { assert_route_boundary(current, before, after, sources, None, "evolve-two", 1, label, prefix, cost, false); }
 }
 
