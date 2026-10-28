@@ -2,6 +2,20 @@
 mod owned_wire;
 pub use owned_wire::*;
 mod owned_choice;
+mod owned_transition;
+mod owned_continuation;
+mod owned_transition_lowering;
+mod owned_epoch;
+pub use owned_transition::PreparedOwnedTransitionV2;
+pub(crate) use owned_transition::{PolicyFrameRecorder, SurfaceRecordCall, SurfaceConsumeCall,
+    policy_frame_open_payment, policy_frame_retained_payment, RecordContinuationDispatch, RetainedPolicyDispatch,
+    POLICY_FRAME_RECORD_PAYMENT, POLICY_FRAME_CONSUME_PAYMENT,
+    check_retained_transition_policies_with_frames, LockedArchivePolicy, check_retained_transition_policies_locked, OwnedPolicyCheck,prepare_owned_evolution, prepare_owned_withdrawal, transition_policy_surface, transition_policy_scope, transition_layer, check_retained_transition_policies};
+pub(crate) use owned_continuation::VerifiedOwnedPolicySurface;
+pub(crate) use common_fact_admission::ProofMeter;
+#[cfg(test)]
+pub(crate) use common_fact_admission::adoption_diagnostic;
+pub(crate) use owned_persist::VerifiedOwnedTransitionExecution;
 mod owned_persist;
 pub use owned_choice::PreparedOwnedScopedChangeV2;
 pub(crate) use owned_choice::{prepare_owned, OwnedChoiceMode};
@@ -881,3 +895,5 @@ impl ProjectSnapshot {
         }))
     }
 }
+
+pub(crate) use owned_persist::{HistoricalInitialLoan, check_retained_transition_policies_with_initials, HISTORICAL_INITIAL_SURFACE_PAYMENT};

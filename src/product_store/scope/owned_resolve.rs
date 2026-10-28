@@ -511,41 +511,34 @@ fn writers(
     Ok(())
 }
 
-/// Resolve suggestions into a complete, ordered structural report. Success is
-/// not evidence of partition independence, ownership, valid completed history,
-/// fresh auxiliary storage, or executable/adoptable scoped behavior.
-pub fn analyze_owned_sources(
-    before: &CapturedProgram,
-    after: &CapturedProgram,
-    request: &OwnedSourceRequest,
-) -> Result<OwnedStructuralReport> {
-    before.validate()?;
-    after.validate()?;
+macro_rules! analyze_owned_source_tail {
+    ($before:ident, $after:ident, $request:ident) => {{
+    $after.validate()?;
     require(
-        request.before == canonical_digest(IdentityDomain::Source, before)?
-            && request.after == canonical_digest(IdentityDomain::Source, after)?,
+        $request.before == canonical_digest(IdentityDomain::Source, $before)?
+            && $request.after == canonical_digest(IdentityDomain::Source, $after)?,
         "stale exact source identity",
     )?;
     require(
-        before.binding.project_id == after.binding.project_id,
+        $before.binding.project_id == $after.binding.project_id,
         "source projects differ",
     )?;
     require(
-        before
+        $before
             .program
             .entities
             .iter()
-            .any(|e| e.id == request.root_entity)
-            && after
+            .any(|e| e.id == $request.root_entity)
+            && $after
                 .program
                 .entities
                 .iter()
-                .any(|e| e.id == request.root_entity),
+                .any(|e| e.id == $request.root_entity),
         "root entity is missing",
     )?;
-    require(request.edits.len() <= MAX_ITEMS, "too many edit spans")?;
+    require($request.edits.len() <= MAX_ITEMS, "too many edit spans")?;
     let mut ids = BTreeSet::new();
-    for (index, edit) in request.edits.iter().enumerate() {
+    for (index, edit) in $request.edits.iter().enumerate() {
         require(
             valid_id(&edit.id) && ids.insert(&edit.id),
             "invalid or duplicate edit ID",
@@ -554,8 +547,8 @@ pub fn analyze_owned_sources(
             edit.before.action == edit.after.action && (edit.before.len > 0 || edit.after.len > 0),
             format!("cross-action or empty correspondence {}", edit.id),
         )?;
-        let old = resolve(before, &request.before, &request.root_entity, &edit.before)?;
-        let new = resolve(after, &request.after, &request.root_entity, &edit.after)?;
+        let old = resolve($before, &$request.before, &$request.root_entity, &edit.before)?;
+        let new = resolve($after, &$request.after, &$request.root_entity, &edit.after)?;
         require(
             old.env == new.env && edit.before.root == edit.after.root,
             format!("unsupported author binder correspondence in {}", edit.id),
@@ -563,9 +556,9 @@ pub fn analyze_owned_sources(
         if !old.steps.is_empty() && !new.steps.is_empty() {
             require(
                 super::owned_bindings::correspond(
-                    &before.program,
+                    &$before.program,
                     old.steps,
-                    &after.program,
+                    &$after.program,
                     new.steps,
                     &old.env,
                 )?,
@@ -575,7 +568,7 @@ pub fn analyze_owned_sources(
                 ),
             )?;
         }
-        for prior in &request.edits[..index] {
+        for prior in &$request.edits[..index] {
             require(
                 !overlaps(&prior.before, &edit.before) && !overlaps(&prior.after, &edit.after),
                 format!("overlapping edit spans {} and {}", prior.id, edit.id),
@@ -583,20 +576,20 @@ pub fn analyze_owned_sources(
         }
     }
     let mut common_statements = vec![];
-    for action in &before.program.actions {
-        let candidate = after
+    for action in &$before.program.actions {
+        let candidate = $after
             .program
             .actions
             .iter()
             .find(|a| a.id == action.id)
             .ok_or_else(|| error(format!("removed action {}", action.id)))?;
-        let old: Vec<_> = request
+        let old: Vec<_> = $request
             .edits
             .iter()
             .filter(|e| e.before.action == action.id)
             .map(|e| (&e.id, &e.before))
             .collect();
-        let new: Vec<_> = request
+        let new: Vec<_> = $request
             .edits
             .iter()
             .filter(|e| e.after.action == action.id)
@@ -609,11 +602,11 @@ pub fn analyze_owned_sources(
             &mut common_statements,
         )?;
     }
-    let changes = passive_changes(&before.program, &after.program)?;
+    let changes = passive_changes(&$before.program, &$after.program)?;
     let mut inventory = vec![];
     for (source, identity, side) in [
-        (before, &request.before, OwnedSourceSide::Before),
-        (after, &request.after, OwnedSourceSide::After),
+        ($before, &$request.before, OwnedSourceSide::Before),
+        ($after, &$request.after, OwnedSourceSide::After),
     ] {
         for action in &source.program.actions {
             writers(
@@ -628,13 +621,52 @@ pub fn analyze_owned_sources(
             )?;
         }
     }
-    Ok(OwnedStructuralReport {
-        before: request.before.clone(),
-        after: request.after.clone(),
-        root_entity: request.root_entity.clone(),
-        edits: request.edits.clone(),
+    Ok::<_, ContractError>(OwnedStructuralReport {
+        before: $request.before.clone(),
+        after: $request.after.clone(),
+        root_entity: $request.root_entity.clone(),
+        edits: $request.edits.clone(),
         common_statements,
         writers: inventory,
         changes,
     })
+
+    }};
+}
+
+/// Resolve suggestions into a complete, ordered structural report. Success is
+/// not evidence of partition independence, ownership, valid completed history,
+/// fresh auxiliary storage, or executable/adoptable scoped behavior.
+pub fn analyze_owned_sources(
+    before: &CapturedProgram,
+    after: &CapturedProgram,
+    request: &OwnedSourceRequest,
+) -> Result<OwnedStructuralReport> {
+    before.validate()?;
+    analyze_owned_source_tail!(before, after, request)
+}
+
+pub(super) struct StructuralTail<'s> {
+    before: &'s CapturedProgram,
+    after: &'s CapturedProgram,
+    request: &'s OwnedSourceRequest,
+    inventory: super::common_fact_inventory::InventoryTail<'s>,
+}
+impl SourcePreparation<super::common_fact_admission::ProofMeter> for StructuralTail<'_> {
+    type Prepared = super::common_fact_admission::PreparedRetainedCapture;
+    type Error = crate::product_store::StoreError;
+    fn prepare(self, meter: &mut super::common_fact_admission::ProofMeter) -> super::common_fact_admission::AdmissionResult<Self::Prepared> {
+        let Self { before, after, request, inventory } = self;
+        let structure = analyze_owned_source_tail!(before, after, request)?;
+        inventory.prepare(structure, meter)
+    }
+}
+pub(super) fn analyze_retained_sources<'s>(
+    before: &'s CapturedProgram, after: &'s CapturedProgram, request: &'s OwnedSourceRequest,
+    meter: &mut super::common_fact_admission::ProofMeter,
+    inventory: super::common_fact_inventory::InventoryTail<'s>,
+    consume: super::common_fact_admission::CaptureTail<'s>,
+) -> super::common_fact_admission::AdmissionResult<super::common_fact_admission::CapturedRetainedCapture> {
+    with_ordinary_source_facts(before, meter,
+        StructuralTail { before, after, request, inventory }, consume)
 }

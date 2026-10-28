@@ -2,6 +2,8 @@
 mod fixture;
 #[path = "../src/product_contract.rs"]
 mod product_contract;
+#[path = "../src/product_decisions/mod.rs"]
+mod product_decisions;
 #[path = "../src/product_protocol.rs"]
 mod product_protocol;
 #[path = "../src/product_runtime/mod.rs"]

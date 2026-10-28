@@ -4,6 +4,8 @@ mod files;
 #[cfg(test)]
 pub(crate) use files::file_sync_testing;
 mod json;
+mod pointer;
+use pointer::Pointer;
 mod recovery_destination;
 pub(crate) use recovery_destination::RecoveryDestination;
 pub mod scope;
@@ -77,6 +79,8 @@ pub enum FaultPoint {
     AfterPointer,
     AfterUpgradeObject,
     AfterUpgradeJournal,
+    CancelPrimaryBeforePointer,
+    CancelSecondaryBeforePointer,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,15 +224,6 @@ impl ProjectSnapshot {
         Ok(())
     }
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Pointer {
-    magic: String,
-    version: u32,
-    project_id: Id,
-    revision: u64,
-    object: Digest,
-}
 /// Prepared locally against exact current identities. This is a rehearsal, not
 /// authorization: the host must obtain the user's choice before calling adopt.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -258,6 +253,7 @@ struct ValidationIdentity {
     family: &'static str,
     compiler: u32,
     verifier: u32,
+    owned_lowerings: [u32;2],
     limits: RuntimeLimits,
 }
 struct ValidatedSnapshot {
@@ -615,6 +611,7 @@ impl ProductStore {
                 scope::ScopeEnvelope::OwnedV2(_) => scope::OWNED_LOWERING_VERSION,
             },
             verifier: scope::SCOPE_VERIFIER_REVISION,
+            owned_lowerings: scope::SUPPORTED_OWNED_LOWERINGS,
             limits: RuntimeLimits::default(),
         };
         let reused = {
@@ -665,6 +662,17 @@ impl ProductStore {
         replace_current: bool,
         #[cfg(test)] fault: Option<FaultPoint>,
     ) -> Result<()> {
+        self.save_with_checkpoint(snapshot, replace_current, || Ok(()), #[cfg(test)] fault)
+    }
+    // Only the transition writer supplies a live guard. The ordinary save
+    // wrapper retains its exact validation/publication/error order.
+    fn save_with_checkpoint(
+        &self,
+        snapshot: &ProjectSnapshot,
+        replace_current: bool,
+        checkpoint: impl FnOnce() -> Result<()>,
+        #[cfg(test)] fault: Option<FaultPoint>,
+    ) -> Result<()> {
         self.clear_validation_cache();
         self.pinned()?;
         if !replace_current {
@@ -707,7 +715,7 @@ impl ProductStore {
         // The preflight avoids staging into a known competing project; only
         // atomic no-clobber publication closes a subsequent activation race.
         self.root
-            .publish("CURRENT", &canonical_bytes(&pointer)?, replace_current)?;
+            .publish_with_checkpoint("CURRENT", &canonical_bytes(&pointer)?, replace_current, checkpoint)?;
         #[cfg(test)]
         if fault == Some(FaultPoint::AfterPointer) {
             return Err(StoreError::Interrupted(FaultPoint::AfterPointer));
