@@ -225,6 +225,17 @@ impl Digest {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Validate and consume the original String without allocating an error.
+    pub(crate) fn from_owned_lower_hex(value: String) -> Option<Self> {
+        if value.len() == 64
+            && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            Some(Self(value))
+        } else {
+            None
+        }
+    }
 }
 impl TryFrom<String> for Digest {
     type Error = ContractError;
@@ -245,26 +256,9 @@ impl From<Digest> for String {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum IdentityDomain {
-    Source,
-    Program,
-    SemanticProgram,
-    Data,
-    Schema,
-    Input,
-    Session,
-    Observation,
-    Output,
-    OutputBytes,
-    Request,
-    Scenario,
-    Decision,
-    Evolution,
-    Adoption,
-    Evidence,
-}
+#[path = "product_contract/identity_domain.rs"]
+mod identity_domain;
+pub use self::identity_domain::IdentityDomain;
 fn bytes_digest(domain: IdentityDomain, bytes: &[u8]) -> Digest {
     let mut input = b"gitmanager.product.v1\0".to_vec();
     input.extend(serde_json::to_vec(&domain).expect("finite enum"));

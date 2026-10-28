@@ -1,0 +1,372 @@
+// TEST ONLY. Mechanically frozen declarations and attributes from product_contract.rs.
+// No methods, custom Deserialize, or production dependency. Provenance in unit state.
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+pub type Id = String;
+pub type Values = BTreeMap<Id, DataValue>;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Type {
+    Boolean,
+    Integer,
+    Text,
+    Date,
+    Reference { entity: Id },
+    List { item: Box<Type> },
+    Optional { item: Box<Type> },
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DataValue {
+    Null,
+    Boolean {
+        value: bool,
+    },
+    Integer {
+        value: i64,
+    },
+    Text {
+        value: String,
+    },
+    /// Gregorian day number relative to 1970-01-01; arithmetic must be checked.
+    Date {
+        days: i32,
+    },
+    Reference {
+        entity: Id,
+        record: Id,
+    },
+    List {
+        item_type: Type,
+        items: Vec<DataValue>,
+    },
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Expr {
+    Literal {
+        value_type: Type,
+        value: DataValue,
+    },
+    Variable {
+        name: Id,
+    },
+    Field {
+        record: Box<Expr>,
+        field: Id,
+    },
+    State {
+        state: Id,
+    },
+    Today,
+    Query {
+        entity: Id,
+        binding: Id,
+        predicate: Box<Expr>,
+        sort: Vec<SortKey>,
+        limit: usize,
+        include_archived: bool,
+    },
+    Filter {
+        items: Box<Expr>,
+        binding: Id,
+        predicate: Box<Expr>,
+    },
+    Map {
+        items: Box<Expr>,
+        binding: Id,
+        value: Box<Expr>,
+    },
+    Count {
+        items: Box<Expr>,
+    },
+    Any {
+        items: Box<Expr>,
+        binding: Id,
+        predicate: Box<Expr>,
+    },
+    All {
+        items: Box<Expr>,
+        binding: Id,
+        predicate: Box<Expr>,
+    },
+    Sum {
+        items: Box<Expr>,
+    },
+    Contains {
+        items: Box<Expr>,
+        value: Box<Expr>,
+    },
+    Equal {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    Less {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    Add {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    Subtract {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    Concat {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    TextContains {
+        text: Box<Expr>,
+        search: Box<Expr>,
+    },
+    Lower {
+        value: Box<Expr>,
+    },
+    And {
+        values: Vec<Expr>,
+    },
+    Or {
+        values: Vec<Expr>,
+    },
+    Not {
+        value: Box<Expr>,
+    },
+    If {
+        condition: Box<Expr>,
+        then_value: Box<Expr>,
+        else_value: Box<Expr>,
+    },
+    Coalesce {
+        value: Box<Expr>,
+        fallback: Box<Expr>,
+    },
+    DateAdd {
+        date: Box<Expr>,
+        days: Box<Expr>,
+    },
+    DateDifference {
+        later: Box<Expr>,
+        earlier: Box<Expr>,
+    },
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SortKey {
+    pub value: Expr,
+    pub descending: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FieldDefinition {
+    pub id: Id,
+    pub label: String,
+    pub value_type: Type,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EntityDefinition {
+    pub id: Id,
+    pub label: String,
+    pub fields: Vec<FieldDefinition>,
+    /// Unique tuples among non-archived records, excluding tuples containing null.
+    pub unique: Vec<Vec<Id>>,
+    /// Boolean expressions with `record` bound to each non-archived row. No state.
+    pub constraints: Vec<Expr>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateDefinition {
+    pub id: Id,
+    pub label: String,
+    pub value_type: Type,
+    pub initial: DataValue,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActionDefinition {
+    pub id: Id,
+    pub label: String,
+    pub parameters: BTreeMap<Id, Type>,
+    pub guards: Vec<Expr>,
+    pub steps: Vec<Statement>,
+    pub ensures: Vec<Expr>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Statement {
+    Create {
+        entity: Id,
+        values: BTreeMap<Id, Expr>,
+        bind: Id,
+    },
+    Update {
+        record: Expr,
+        values: BTreeMap<Id, Expr>,
+    },
+    Archive {
+        record: Expr,
+    },
+    SetState {
+        state: Id,
+        value: Expr,
+    },
+    Collection {
+        target: CollectionTarget,
+        operation: CollectionOperation,
+        items: Expr,
+    },
+    ForEach {
+        items: Expr,
+        binding: Id,
+        steps: Vec<Statement>,
+    },
+    Assert {
+        condition: Expr,
+        message: String,
+    },
+    Emit {
+        output: Id,
+        items: Expr,
+        binding: Id,
+        columns: BTreeMap<Id, Expr>,
+    },
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CollectionTarget {
+    State { state: Id },
+    Field { record: Expr, field: Id },
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollectionOperation {
+    Insert,
+    Remove,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputFormat {
+    Csv,
+    Json,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutputDefinition {
+    pub id: Id,
+    pub label: String,
+    pub format: OutputFormat,
+    pub columns: Vec<FieldDefinition>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservableDefinition {
+    pub id: Id,
+    pub label: String,
+    pub value: Expr,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Column {
+    pub id: Id,
+    pub label: String,
+    pub value: Expr,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateControl {
+    pub id: Id,
+    pub label: String,
+    pub state: Id,
+    pub on_change: Option<Id>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelectionBinding {
+    pub id: Id,
+    pub state: Id,
+    pub on_change: Option<Id>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FormInput {
+    pub parameter: Id,
+    pub label: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ViewKind {
+    List {
+        entity: Id,
+        rows: Expr,
+        columns: Vec<Column>,
+        controls: Vec<StateControl>,
+        selection: Option<SelectionBinding>,
+    },
+    Detail {
+        entity: Id,
+        record: Expr,
+        columns: Vec<Column>,
+    },
+    Form {
+        action: Id,
+        fields: Vec<FormInput>,
+        defaults: Values,
+    },
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionPlacement {
+    Toolbar,
+    Row,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActionBinding {
+    pub id: Id,
+    pub label: String,
+    pub placement: ActionPlacement,
+    pub action: Id,
+    pub arguments: BTreeMap<Id, Expr>,
+    pub enabled: Expr,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyModifier {
+    Control,
+    Alt,
+    Shift,
+    Command,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyBinding {
+    pub key: String,
+    pub modifiers: BTreeSet<KeyModifier>,
+    pub binding: Id,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewDefinition {
+    pub id: Id,
+    pub label: String,
+    pub kind: ViewKind,
+    pub actions: Vec<ActionBinding>,
+    pub keys: Vec<KeyBinding>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppDefinition {
+    pub version: u32,
+    pub id: Id,
+    pub label: String,
+    pub entities: Vec<EntityDefinition>,
+    pub state: Vec<StateDefinition>,
+    pub actions: Vec<ActionDefinition>,
+    pub outputs: Vec<OutputDefinition>,
+    pub observables: Vec<ObservableDefinition>,
+    pub views: Vec<ViewDefinition>,
+    pub initial_view: Id,
+}

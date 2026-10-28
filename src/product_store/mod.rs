@@ -4,6 +4,8 @@ mod files;
 #[cfg(test)]
 pub(crate) use files::file_sync_testing;
 mod json;
+mod pointer;
+use pointer::Pointer;
 mod recovery_destination;
 pub(crate) use recovery_destination::RecoveryDestination;
 pub mod scope;
@@ -221,15 +223,6 @@ impl ProjectSnapshot {
         }
         Ok(())
     }
-}
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Pointer {
-    magic: String,
-    version: u32,
-    project_id: Id,
-    revision: u64,
-    object: Digest,
 }
 /// Prepared locally against exact current identities. This is a rehearsal, not
 /// authorization: the host must obtain the user's choice before calling adopt.
