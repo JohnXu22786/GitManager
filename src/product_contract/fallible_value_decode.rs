@@ -5,7 +5,7 @@
 use crate::product_alloc::{self, AllocationContext, AllocationFailure, AllocationSite};
 use crate::product_json::{Number, Value};
 
-use super::{DataValue, FallibleValues, Type, MAX_COLLECTION};
+use super::{DataValue, FallibleValues, Type, MAX_COLLECTION, MAX_TYPE_DEPTH};
 
 const TYPE_VARIANTS: &[&str] = &["boolean", "integer", "text", "date", "reference", "list", "optional"];
 const VALUE_VARIANTS: &[&str] = &["null", "boolean", "integer", "text", "date", "reference", "list"];
@@ -57,6 +57,13 @@ impl From<AllocationFailure> for ValueDecodeError {
 }
 
 pub(super) fn decode_type(value: Value, cx: &mut AllocationContext) -> Result<Type, ValueDecodeError> {
+    decode_type_at(value, cx, 0)
+}
+
+fn decode_type_at(value: Value, cx: &mut AllocationContext, depth: usize) -> Result<Type, ValueDecodeError> {
+    if depth > MAX_TYPE_DEPTH {
+        return Err(ValueDecodeError::LimitExceeded { resource: "type nesting depth", limit: MAX_TYPE_DEPTH });
+    }
     let (tag, fields) = tagged(value, TYPE_VARIANTS, "internally tagged enum Type")?;
     match tag.as_str() {
         "boolean" => unit(fields, NO_FIELDS).map(|()| Type::Boolean),
@@ -68,11 +75,11 @@ pub(super) fn decode_type(value: Value, cx: &mut AllocationContext) -> Result<Ty
             Ok(Type::Reference { entity })
         }
         "list" => {
-            let item = type_field(fields, "item", LIST_TYPE_FIELDS, cx)?;
+            let item = type_field(fields, "item", LIST_TYPE_FIELDS, cx, depth + 1)?;
             Ok(Type::List { item })
         }
         "optional" => {
-            let item = type_field(fields, "item", OPTIONAL_TYPE_FIELDS, cx)?;
+            let item = type_field(fields, "item", OPTIONAL_TYPE_FIELDS, cx, depth + 1)?;
             Ok(Type::Optional { item })
         }
         _ => unreachable!("tag comes from the closed Type variant table"),
@@ -168,11 +175,12 @@ fn type_field(
     field: &'static str,
     expected: &'static [&'static str],
     cx: &mut AllocationContext,
+    depth: usize,
 ) -> Result<Box<Type>, ValueDecodeError> {
     let mut decoded = None;
     for (key, value) in fields.into_entries() {
         if key == field {
-            let item = decode_type(value, cx)?;
+            let item = decode_type_at(value, cx, depth)?;
             decoded = Some(product_alloc::try_box(item, cx)?);
         } else {
             return Err(ValueDecodeError::UnknownField { key, expected });
