@@ -299,7 +299,8 @@ impl SurfaceRecordCall<'_, '_> {
         check.meter.charge(POLICY_FRAME_SCOPE_PAYMENT)?;
         {
             let scope = PolicyFrameScope { snapshot: execution.current(), meter: check.meter };
-            owned_persist::policy_frames_body!(registry, scope.snapshot, surface, scope.meter, [], [
+            owned_persist::policy_frames_body!(registry, scope.snapshot, surface, scope.meter,
+            [registry.check_snapshot(scope.snapshot)?;], [registry.epochs.as_slice()], [], [
                 scope.meter.charge(POLICY_FRAME_EPOCH_PAYMENT)?;
                 scope.meter.charge(POLICY_CHRONOLOGY_SEED_PAYMENT)?;
             ], [

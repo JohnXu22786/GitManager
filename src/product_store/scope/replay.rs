@@ -153,6 +153,22 @@ impl ScopedExecutionContext {
                 .collect(),
         )
     }
+    pub(crate) fn committed_with_validated_registry(
+        validated: &super::ValidatedOwnedSnapshot,
+    ) -> Result<Self> {
+        let snapshot = validated.snapshot();
+        if !matches!(&snapshot.scope, ScopeEnvelope::OwnedV2(_)) {
+            return Self::committed(snapshot);
+        }
+        snapshot.validate_container()?;
+        Ok(Self {
+            snapshot: snapshot.clone(),
+            owned: Some(owned_replay::OwnedExecutionContext::from_validated_registry(validated)?),
+            adoption_target: snapshot.active_revision.clone(),
+            projected_seeds: BTreeSet::new(),
+            correspondences: BTreeMap::new(),
+        })
+    }
     pub(crate) fn owned_prepared(
         snapshot: &ProjectSnapshot,
         prepared: &PreparedOwnedScopedChangeV2,

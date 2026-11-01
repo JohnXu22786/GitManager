@@ -286,7 +286,6 @@ pub fn canonical_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
 pub fn canonical_digest<T: Serialize>(domain: IdentityDomain, value: &T) -> Result<Digest> {
     Ok(bytes_digest(domain, &canonical_bytes(value)?))
 }
-
 /// A fresh canonical encoding, not a semantic proof or admission capability.
 /// No raw-byte constructor, mutable view, extraction, clone or wire format exists.
 pub(crate) struct CanonicalEvidenceBytes(Vec<u8>);

@@ -60,6 +60,13 @@ impl IntentArchive {
     pub(super) fn snapshot(&self) -> Result<ProjectSnapshot> {
         Ok(self.store.load()?)
     }
+    pub(super) fn snapshot_with_validated_registry(
+        &self,
+    ) -> Result<(ProjectSnapshot, Option<crate::product_store::scope::ValidatedOwnedSnapshot>)> {
+        Ok(self.store.with_verified_snapshot(|snapshot, archive| {
+            Ok::<_, DecisionError>((snapshot.clone(), archive.map(|archive| archive.retain_snapshot())))
+        })?)
+    }
     pub fn new(store: ProductStore) -> Self {
         Self { store }
     }

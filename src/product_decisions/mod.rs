@@ -26,6 +26,7 @@ use crate::product_store::scope::{
 use crate::product_store::{PreparedAdoption, ProductStore, ProjectSnapshot, StoreError};
 pub use archive::IntentArchive;
 pub(crate) use bundle::upgrade_bundle_binding;
+pub(crate) use bundle::validate_bundle_with_archive;
 pub use bundle::{validate_bundle, IntentionBundle};
 pub use context::VerifiedDiscoveryScene;
 pub use evolution::{EvolutionDraft, ReconciliationRequest};
@@ -236,7 +237,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         }
     }
     fn scope_context(&self) -> Result<ScopedExecutionContext> {
-        let current = match self.archive.snapshot() {
+        let (current, validated_registry) = match self.archive.snapshot_with_validated_registry() {
             Ok(current) => current,
             Err(error) => {
                 self.clear_admission_cache();
@@ -304,7 +305,10 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         } else if let Some((prepared, _)) = &key.rehearsal {
             ScopedExecutionContext::rehearsals(&key.current, prepared)?
         } else {
-            ScopedExecutionContext::committed(&key.current)?
+            match &validated_registry {
+                Some(validated) => ScopedExecutionContext::committed_with_validated_registry(validated)?,
+                None => ScopedExecutionContext::committed(&key.current)?,
+            }
         };
         let context = context.with_correspondences(&key.correspondences)?;
         self.admission_cache.replace(Some(AdmissionCache {

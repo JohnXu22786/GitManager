@@ -710,7 +710,8 @@ fn run_chronological_frames_for_test(
     assert!(registry.epochs.len() <= 2, "bounded genuine fixture");
     let mut costs = [0; 2];
     let mut previous_endpoint: Option<&DataSnapshot> = None;
-    owned_persist::policy_frames_body!(registry, snapshot, surface, meter, [], [
+    owned_persist::policy_frames_body!(registry, snapshot, surface, meter,
+        [registry.check_snapshot(snapshot)?;], [registry.epochs.as_slice()], [], [
         if let Some(previous) = previous_endpoint { assert!(std::ptr::eq(previous, recipe.seed())); }
         let before = meter.remaining_units_for_test();
         meter.charge(POLICY_FRAME_EPOCH_PAYMENT)?;

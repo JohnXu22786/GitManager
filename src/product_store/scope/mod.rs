@@ -16,6 +16,97 @@ pub(crate) use common_fact_admission::ProofMeter;
 #[cfg(test)]
 pub(crate) use common_fact_admission::adoption_diagnostic;
 pub(crate) use owned_persist::VerifiedOwnedTransitionExecution;
+
+/// The callback-scoped view of a complete owned reconstruction. Its token can
+/// be retained only by ProductStore's validation cache for the exact immutable
+/// pointer, bytes and validation identity that produced it.
+pub(crate) struct ValidatedOwnedArchive<'snapshot> {
+    snapshot: &'snapshot ProjectSnapshot,
+    registry: ValidatedOwnedRegistry,
+}
+
+/// Owned snapshot/registry pair retained from one successful validation.
+pub(crate) struct ValidatedOwnedSnapshot {
+    snapshot: ProjectSnapshot,
+    registry: ValidatedOwnedRegistry,
+}
+impl ValidatedOwnedSnapshot {
+    pub(crate) fn snapshot(&self) -> &ProjectSnapshot {
+        &self.snapshot
+    }
+    pub(crate) fn registry(&self) -> &ValidatedOwnedRegistry {
+        &self.registry
+    }
+}
+
+/// Opaque validation result bound to one immutable owned snapshot.
+#[derive(Clone)]
+pub(crate) struct ValidatedOwnedRegistry(Arc<owned_persist::ReconstructedOwned>);
+impl ValidatedOwnedRegistry {
+    pub(crate) fn registry(&self) -> Arc<owned_persist::ReconstructedOwned> {
+        self.0.clone()
+    }
+}
+
+pub(crate) fn verify_snapshot_with_archive(
+    snapshot: &ProjectSnapshot,
+) -> Result<Option<ValidatedOwnedArchive<'_>>> {
+    match snapshot.current_scope()? {
+        family::CurrentScope::ScalarV1(_) => {
+            verify::validate(snapshot)?;
+            Ok(None)
+        }
+        family::CurrentScope::OwnedV2(_) => {
+            let mut meter = ProofMeter::new(
+                ProofBudget::default(),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )?;
+            let registry = ValidatedOwnedRegistry(Arc::new(owned_persist::reconstruct(snapshot, &mut meter)?));
+            Ok(Some(ValidatedOwnedArchive { snapshot, registry }))
+        }
+    }
+}
+
+pub(crate) fn check_retained_transition_policies_with_archive<C>(
+    snapshot: &ProjectSnapshot,
+    archive: &ValidatedOwnedArchive<'_>,
+    check: C,
+) -> Result<()>
+where
+    C: for<'gate, 'loan> FnMut(
+        &mut OwnedPolicyCheck<'gate>,
+        &owned_persist::HistoricalInitialLoan<'loan>,
+    ) -> Result<()>,
+{
+    if !std::ptr::eq(snapshot, archive.snapshot) {
+        return Err(StoreError::Invalid(
+            "validated owned archive belongs to another snapshot".into(),
+        ));
+    }
+    owned_persist::check_retained_transition_policies_with_registry(&archive.registry.0, check)
+}
+
+pub(crate) fn validated_archive<'snapshot>(
+    snapshot: &'snapshot ProjectSnapshot,
+    registry: ValidatedOwnedRegistry,
+) -> ValidatedOwnedArchive<'snapshot> {
+    ValidatedOwnedArchive { snapshot, registry }
+}
+
+impl ValidatedOwnedArchive<'_> {
+    pub(crate) fn belongs_to(&self, snapshot: &ProjectSnapshot) -> bool {
+        std::ptr::eq(self.snapshot, snapshot)
+    }
+    pub(crate) fn registry(&self) -> ValidatedOwnedRegistry {
+        self.registry.clone()
+    }
+    pub(crate) fn retain_snapshot(&self) -> ValidatedOwnedSnapshot {
+        ValidatedOwnedSnapshot {
+            snapshot: self.snapshot.clone(),
+            registry: self.registry.clone(),
+        }
+    }
+}
 mod owned_persist;
 pub use owned_choice::PreparedOwnedScopedChangeV2;
 pub(crate) use owned_choice::{prepare_owned, OwnedChoiceMode};
@@ -793,13 +884,39 @@ pub(super) fn verify_snapshot(snapshot: &ProjectSnapshot) -> Result<()> {
 pub(super) fn verify_transition(before: &ProjectSnapshot, after: &ProjectSnapshot) -> Result<()> {
     if matches!(&before.scope, ScopeEnvelope::OwnedV2(_)) {
         if before.scope != after.scope {
-            return Err(compiler::error(
-                "ordinary action changed owned proof history",
-            ));
+            return Err(compiler::error("ordinary action changed owned proof history"));
         }
-        return owned_persist::validate(after);
+        owned_persist::validate(after)
+    } else {
+        verify::preserve(before, after)
     }
-    verify::preserve(before, after)
+}
+pub(super) fn verify_transition_after_apply(
+    before: &ProjectSnapshot,
+    after: &ProjectSnapshot,
+    operation: &str,
+    step: &TraceStep,
+    request: &Digest,
+) -> Result<Option<ValidatedOwnedRegistry>> {
+    if !matches!(&before.scope, ScopeEnvelope::OwnedV2(_)) {
+        verify_transition(before, after)?;
+        return Ok(None);
+    }
+    let mut meter = ProofMeter::new(
+        common_fact_admission::ProofBudget::default(),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )?;
+    let Some(evidence) = owned_replay::AppliedTransitionEvidence::new(
+        before, after, operation, step, request, &mut meter,
+    )? else {
+        verify_transition(before, after)?;
+        return Ok(None);
+    };
+    // `apply_inner` is the sole caller and builds `after` from a clone of
+    // `before`, mutating only runtime-owned fields. Full reconstruction below
+    // revalidates the resulting scope and policy history.
+    let registry = owned_persist::validate_with_applied_transition(after, &evidence, &mut meter)?;
+    Ok(Some(ValidatedOwnedRegistry(Arc::new(registry))))
 }
 pub(super) fn reject_unmanaged_target(
     snapshot: &ProjectSnapshot,

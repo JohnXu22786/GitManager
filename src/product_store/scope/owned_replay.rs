@@ -8,6 +8,96 @@ use std::sync::{atomic::AtomicBool, Arc};
 pub(super) fn err(message: &str) -> StoreError {
     refuse("owned protected history", message)
 }
+fn metered_text_equal(left: &str, right: &str, meter: &mut ProofMeter) -> Result<bool> {
+    meter.charge(1 + left.len() as u64 + right.len() as u64)?;
+    Ok(left == right)
+}
+fn metered_type_equal(left: &Type, right: &Type, meter: &mut ProofMeter) -> Result<bool> {
+    meter.charge(1)?;
+    Ok(match (left, right) {
+        (Type::Boolean, Type::Boolean)
+        | (Type::Integer, Type::Integer)
+        | (Type::Text, Type::Text)
+        | (Type::Date, Type::Date) => true,
+        (Type::Reference { entity: a }, Type::Reference { entity: b }) => metered_text_equal(a,b,meter)?,
+        (Type::List { item: a }, Type::List { item: b })
+        | (Type::Optional { item: a }, Type::Optional { item: b }) => metered_type_equal(a,b,meter)?,
+        _ => false,
+    })
+}
+fn metered_data_value_equal(left: &DataValue, right: &DataValue, meter: &mut ProofMeter) -> Result<bool> {
+    meter.charge(1)?;
+    Ok(match (left, right) {
+        (DataValue::Null, DataValue::Null) => true,
+        (DataValue::Boolean { value: a }, DataValue::Boolean { value: b }) => a == b,
+        (DataValue::Integer { value: a }, DataValue::Integer { value: b }) => a == b,
+        (DataValue::Text { value: a }, DataValue::Text { value: b }) => metered_text_equal(a,b,meter)?,
+        (DataValue::Date { days: a }, DataValue::Date { days: b }) => a == b,
+        (DataValue::Reference { entity: ae, record: ar }, DataValue::Reference { entity: be, record: br }) => {
+            metered_text_equal(ae,be,meter)? && metered_text_equal(ar,br,meter)?
+        }
+        (DataValue::List { item_type: at, items: av }, DataValue::List { item_type: bt, items: bv }) => {
+            if !metered_type_equal(at,bt,meter)? || av.len() != bv.len() { false }
+            else {
+                meter.charge(av.len() as u64)?;
+                let mut equal = true;
+                for (a,b) in av.iter().zip(bv) { if !metered_data_value_equal(a,b,meter)? { equal=false; break; } }
+                equal
+            }
+        }
+        _ => false,
+    })
+}
+fn metered_values_equal(left: &Values, right: &Values, meter: &mut ProofMeter) -> Result<bool> {
+    meter.charge(left.len().saturating_add(right.len()) as u64)?;
+    if left.len() != right.len() { return Ok(false); }
+    for ((ak,av),(bk,bv)) in left.iter().zip(right) {
+        if !metered_text_equal(ak,bk,meter)? || !metered_data_value_equal(av,bv,meter)? { return Ok(false); }
+    }
+    Ok(true)
+}
+fn metered_record_equal(left: &Record, right: &Record, meter: &mut ProofMeter) -> Result<bool> {
+    meter.charge(4)?;
+    Ok(metered_text_equal(&left.entity,&right.entity,meter)?
+        && metered_text_equal(&left.id,&right.id,meter)?
+        && left.revision == right.revision
+        && metered_text_equal(left.created_program.as_str(),right.created_program.as_str(),meter)?
+        && left.archived == right.archived
+        && metered_values_equal(&left.values,&right.values,meter)?)
+}
+fn metered_record_option_equal(left: Option<&Record>, right: Option<&Record>, meter: &mut ProofMeter) -> Result<bool> {
+    meter.charge(1)?;
+    match (left,right) { (None,None) => Ok(true), (Some(a),Some(b)) => metered_record_equal(a,b,meter), _ => Ok(false) }
+}
+fn metered_event_equal(left: &crate::product_contract::BusinessEvent, right: &crate::product_contract::BusinessEvent, meter: &mut ProofMeter) -> Result<bool> {
+    meter.charge(6 + left.changes.len().saturating_add(right.changes.len()) as u64)?;
+    if !metered_text_equal(&left.id,&right.id,meter)?
+        || left.sequence != right.sequence
+        || !metered_text_equal(&left.operation_id,&right.operation_id,meter)?
+        || !metered_text_equal(&left.action,&right.action,meter)?
+        || left.day != right.day
+        || !metered_text_equal(left.program.as_str(),right.program.as_str(),meter)?
+        || left.changes.len() != right.changes.len()
+        || left.outputs.len() != right.outputs.len() { return Ok(false); }
+    for (a,b) in left.changes.iter().zip(&right.changes) {
+        meter.charge(1)?;
+        if !metered_text_equal(&a.entity,&b.entity,meter)? || !metered_text_equal(&a.record,&b.record,meter)?
+            || !match (&a.before,&b.before) { (None,None)=>true, (Some(x),Some(y))=>metered_values_equal(x,y,meter)?, _=>false }
+            || !metered_values_equal(&a.after,&b.after,meter)? || a.archived != b.archived { return Ok(false); }
+    }
+    for (a,b) in left.outputs.iter().zip(&right.outputs) {
+        if !metered_text_equal(a.as_str(),b.as_str(),meter)? { return Ok(false); }
+    }
+    Ok(true)
+}
+fn metered_flag(row: &Record, key: &str, meter: &mut ProofMeter) -> Result<Option<bool>> {
+    for (candidate, value) in &row.values {
+        if metered_text_equal(candidate, key, meter)? {
+            return Ok(match value { DataValue::Boolean { value } => Some(*value), _ => None });
+        }
+    }
+    Ok(None)
+}
 pub(super) fn flag(row: &Record, key: &str) -> Result<bool> {
     match row.values.get(key) {
         Some(DataValue::Boolean { value }) => Ok(*value),
@@ -25,9 +115,207 @@ pub(super) fn member(proof: &VerifiedOwnedPreviewPlan, row: &Record, existing: b
             }
         }
 }
+
+/// A private receipt for a transition from a fully validated snapshot. It can
+/// reuse projections only for unchanged prior-validated events/rows or for a
+/// row sealed by the exact instrumented action represented by its trace step.
+pub(super) struct AppliedTransitionEvidence<'a> {
+    before: &'a ProjectSnapshot,
+    after: &'a ProjectSnapshot,
+    operation: &'a str,
+    step: &'a TraceStep,
+}
+impl<'a> AppliedTransitionEvidence<'a> {
+    pub(super) fn new(
+        before: &'a ProjectSnapshot,
+        after: &'a ProjectSnapshot,
+        operation: &'a str,
+        step: &'a TraceStep,
+        request: &Digest,
+        meter: &mut ProofMeter,
+    ) -> Result<Option<Self>> {
+        macro_rules! charged {
+            ($condition:expr) => {{
+                meter.charge(1)?;
+                $condition
+            }};
+        }
+        meter.charge(12)?;
+        let receipt = after.operations.get(operation);
+        let receipt_matches = match receipt {
+            Some(receipt) => {
+                meter.charge(1)?;
+                let operation_matches = metered_text_equal(&receipt.operation, operation, meter)?;
+                meter.charge(1)?;
+                let request_matches = metered_text_equal(receipt.request.as_str(), request.as_str(), meter)?;
+                meter.charge(1)?;
+                operation_matches && request_matches && receipt.revision == after.revision
+            }
+            None => false,
+        };
+        // This receipt is constructed only by ProductStore::apply_inner,
+        // which clones `before` and writes runtime data/session/day/artifacts,
+        // revision and one operation receipt. The retained source, decision,
+        // adoption and owned-proof fields are therefore unchanged by the
+        // trusted transition construction; the runtime itself applies to a
+        // cloned state and appends to its immutable event history. The trace
+        // step comes from that exact runtime call using `input` on these exact
+        // data/session objects; the operation receipt's request digest was
+        // derived from that same input. The trace identity digests were
+        // already computed under the runtime meter, so this receipt does not
+        // hash them a second time. An empty output receipt means the runtime
+        // did not emit an action output.
+        if !charged!(step.outcome == StepOutcome::Applied)
+            || !charged!(before.clock_day == after.clock_day)
+            || !charged!(step.outputs.is_empty())
+            || !charged!(before.revision.checked_add(1) == Some(after.revision))
+            || !charged!(after.operations.len() == before.operations.len().saturating_add(1))
+            || !charged!(receipt_matches)
+            || !charged!(after.data.events.len() > before.data.events.len())
+        {
+            return Ok(None);
+        }
+        Ok(Some(Self { before, after, operation, step }))
+    }
+
+    pub(super) fn binds_after(&self, snapshot: &ProjectSnapshot) -> bool {
+        std::ptr::eq(self.after, snapshot)
+    }
+
+    pub(crate) fn matches_sealed_row(
+        &self,
+        recipe: &OwnedExecutionRecipe,
+        event: &crate::product_contract::BusinessEvent,
+        row: &Record,
+        prior: Option<&Record>,
+        day: i32,
+        meter: &mut ProofMeter,
+    ) -> Result<bool> {
+        let Some(prior) = prior else {
+            return Ok(false);
+        };
+        // `before` was loaded through ProductStore's full snapshot validator.
+        // If this exact completion event and its final row are unchanged in
+        // both snapshots, that validation already checked the projection over
+        // the deterministically replayed event-time frame. Reuse only that
+        // row's evidence; all current protected-row and policy checks above
+        // this call still run. The private apply path obtains this event from
+        // the runtime result whose input history is the validated `before`
+        // snapshot, so its prior event prefix is preserved by construction.
+        let row_ref = history::row_ref(row);
+        let mut prior_validated_event = false;
+        for candidate in &self.before.data.events {
+            if metered_text_equal(&candidate.operation_id, &event.operation_id, meter)?
+                && metered_text_equal(&candidate.id, &event.id, meter)?
+            {
+                prior_validated_event = metered_event_equal(candidate, event, meter)?;
+                break;
+            }
+        }
+        let mut before_row = None;
+        for candidate in &self.before.data.records {
+            if metered_text_equal(&candidate.entity, &row_ref.entity, meter)?
+                && metered_text_equal(&candidate.id, &row_ref.record, meter)?
+            {
+                before_row = Some(candidate);
+                break;
+            }
+        }
+        let mut after_row = None;
+        for candidate in &self.after.data.records {
+            if metered_text_equal(&candidate.entity, &row_ref.entity, meter)?
+                && metered_text_equal(&candidate.id, &row_ref.record, meter)?
+            {
+                after_row = Some(candidate);
+                break;
+            }
+        }
+        let mut matching_change = false;
+        for change in &event.changes {
+            meter.charge(1)?;
+            if metered_text_equal(&change.entity, &row_ref.entity, meter)?
+                && metered_text_equal(&change.record, &row_ref.record, meter)?
+                && metered_values_equal(&change.after, &row.values, meter)?
+            {
+                matching_change = true;
+                break;
+            }
+        }
+        if prior_validated_event
+            && event.day == day
+            && matching_change
+            && metered_record_option_equal(before_row, Some(row), meter)?
+            && metered_record_option_equal(after_row, Some(row), meter)?
+        {
+            return Ok(true);
+        }
+        let row_preconditions = self.step.outcome == StepOutcome::Applied
+            // Both snapshots were fully validated, and `apply_inner` retains
+            // the active revision while it executes this exact target. The
+            // content-addressed revision binds the program without serializing
+            // its full source again for every protected row.
+            && metered_text_equal(self.before.active_revision.as_str(), recipe.target().artifact.program_digest.as_str(), meter)?
+            && metered_text_equal(self.after.active_revision.as_str(), recipe.target().artifact.program_digest.as_str(), meter)?
+            && day == self.after.clock_day
+            && !prior.archived
+            && !row.archived
+            && metered_text_equal(prior.created_program.as_str(), row.created_program.as_str(), meter)?
+            && metered_flag(prior, &recipe.metadata().sealed, meter)? == Some(false)
+            && metered_flag(row, &recipe.metadata().sealed, meter)? == Some(true);
+        if !row_preconditions {
+            return Ok(false);
+        }
+        let mut old = None;
+        for candidate in &self.before.data.records {
+            if metered_text_equal(&candidate.entity, &row_ref.entity, meter)?
+                && metered_text_equal(&candidate.id, &row_ref.record, meter)?
+            {
+                old = Some(candidate);
+                break;
+            }
+        }
+        let mut current = None;
+        for candidate in &self.after.data.records {
+            if metered_text_equal(&candidate.entity, &row_ref.entity, meter)?
+                && metered_text_equal(&candidate.id, &row_ref.record, meter)?
+            {
+                current = Some(candidate);
+                break;
+            }
+        }
+        if !metered_record_option_equal(old, Some(prior), meter)?
+            || !metered_record_option_equal(current, Some(row), meter)?
+        {
+            return Ok(false);
+        }
+        let mut matched = false;
+        for event in self.after.data.events.iter().skip(self.before.data.events.len()) {
+            meter.charge(1)?;
+            let mut changed = false;
+            for change in &event.changes {
+                meter.charge(1)?;
+                if metered_text_equal(&change.entity, &row_ref.entity, meter)?
+                    && metered_text_equal(&change.record, &row_ref.record, meter)?
+                    && metered_values_equal(&change.after, &row.values, meter)?
+                {
+                    changed = true;
+                    break;
+                }
+            }
+            if metered_text_equal(&event.operation_id, self.operation, meter)?
+                && event.day == day
+                && changed
+            {
+                matched = true;
+                break;
+            }
+        }
+        Ok(matched)
+    }
+}
 macro_rules! protected_row_body {
-    ($prepared:ident, $data:expr, $row:ident, $prior:ident, $day:expr, $meter:expr, $limits:expr, [$($early_success:tt)*], [$($finish:tt)*]) => {
-        crate::product_store::scope::owned_replay::protected_row_body!($prepared, $data, $row, $prior, $day, $meter, $limits,
+    ($prepared:ident, $data:expr, $row:ident, $prior:ident, $day:expr, $meter:ident, $evidence:expr, $event:expr, [$($early_success:tt)*], [$($finish:tt)*]) => {
+        crate::product_store::scope::owned_replay::protected_row_body!($prepared, $data, $row, $prior, $day, $meter, $evidence, $event,
             [$($early_success)*], [$($finish)*], metadata, [
         let runtime = LocalRuntime::with_cancellation($meter.cancelled());
         let mut checks = crate::product_runtime::ProjectionValidation::default();
@@ -36,9 +324,10 @@ macro_rules! protected_row_body {
             if !captured.insert(&metadata.saved[i]) {
                 continue;
             }
+            let limits = $meter.runtime()?;
             let value = runtime.evaluate_record_projection_with(
                 &mut checks,
-                $limits,
+                limits,
                 $prepared.target(),
                 $data,
                 &history::row_ref($row),
@@ -55,7 +344,7 @@ macro_rules! protected_row_body {
         }
             ])
     };
-    ($prepared:ident, $data:expr, $row:ident, $prior:ident, $day:expr, $meter:expr, $limits:expr, [$($early_success:tt)*], [$($finish:tt)*], $metadata:ident, [$($projection:tt)*]) => {{
+    ($prepared:ident, $data:expr, $row:ident, $prior:ident, $day:expr, $meter:ident, $evidence:expr, $event:expr, [$($early_success:tt)*], [$($finish:tt)*], $metadata:ident, [$($projection:tt)*]) => {{
     let proof = &$prepared.initial().proof;
     let $metadata = $prepared.metadata();
     for field in $metadata.fields(proof) {
@@ -107,7 +396,15 @@ macro_rules! protected_row_body {
         {
             return Err(crate::product_store::scope::owned_replay::err("seal lacks exact completion provenance"));
         }
-        $($projection)*
+        let applied_evidence: Option<&crate::product_store::scope::owned_replay::AppliedTransitionEvidence<'_>> = $evidence;
+        let reused_projection = match applied_evidence {
+            Some(evidence) => match $event {
+                Some(event) => evidence.matches_sealed_row($prepared, event, $row, $prior, $day, $meter)?,
+                None => false,
+            },
+            None => false,
+        };
+        if !reused_projection { $($projection)* }
     } else {
         if $prepared.completed($row)?
             || $metadata
@@ -161,7 +458,19 @@ pub(super) fn protected_row(
     day: i32,
     meter: &mut ProofMeter,
 ) -> Result<()> {
-    protected_row_body!(prepared, data, row, prior, day, meter, meter.runtime()?, [return Ok(());], [Ok(())])
+    protected_row_with_evidence(prepared, data, row, prior, day, meter, None, None)
+}
+pub(super) fn protected_row_with_evidence(
+    prepared: &OwnedExecutionRecipe,
+    data: &DataSnapshot,
+    row: &Record,
+    prior: Option<&Record>,
+    day: i32,
+    meter: &mut ProofMeter,
+    evidence: Option<&AppliedTransitionEvidence<'_>>,
+    event: Option<&crate::product_contract::BusinessEvent>,
+) -> Result<()> {
+    protected_row_body!(prepared, data, row, prior, day, meter, evidence, event, [return Ok(());], [Ok(())])
 }
 
 pub(super) fn owned_entity(prepared: &OwnedExecutionRecipe, entity: &str) -> bool {
@@ -503,6 +812,20 @@ impl OwnedExecutionContext {
         Ok(Self {
             snapshot: snapshot.clone(),
             registry: Arc::new(owned_persist::reconstruct(snapshot, &mut meter)?),
+            budget: ProofBudget::default(),
+            prepared_target: None,
+            proposed_graph: None,
+            preparation_cancelled: None,
+        })
+    }
+    pub(crate) fn from_validated_registry(
+        validated: &super::ValidatedOwnedSnapshot,
+    ) -> Result<Self> {
+        let snapshot = validated.snapshot();
+        let registry = validated.registry();
+        Ok(Self {
+            snapshot: snapshot.clone(),
+            registry: registry.registry(),
             budget: ProofBudget::default(),
             prepared_target: None,
             proposed_graph: None,

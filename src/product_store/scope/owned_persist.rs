@@ -6,7 +6,7 @@ use std::sync::{atomic::AtomicBool, Arc};
 
 pub(crate) use super::owned_epoch::VerifiedOwnedTransitionExecution;
 pub(super) use super::owned_epoch::{OwnedExecutionRecipe, OwnedProducerEpoch};
-pub(super) struct ReconstructedOwned {
+pub(crate) struct ReconstructedOwned {
     pub snapshot: Digest,
     pub recipes: BTreeMap<Digest, OwnedExecutionRecipe>,
     pub epochs: Vec<OwnedProducerEpoch>,
@@ -253,6 +253,7 @@ const HISTORICAL_INITIAL_ARC_PAYMENT: u64 = comparison_payment(448, [
 pub(crate) struct HistoricalInitialLoan<'gate> {
     registry: &'gate ReconstructedOwned,
     execution: &'gate VerifiedOwnedTransitionExecution,
+    reuse_registry: bool,
 }
 // V12 complete fixed transport packets. All old floors remain unchanged;
 // the whole duplicate native interval is removed only by its one-use proof.
@@ -435,26 +436,56 @@ where C: for<'gate, 'loan> FnMut(&mut owned_transition::OwnedPolicyCheck<'gate>,
     let registry = reconstruct(snapshot, &mut meter)?;
     #[cfg(test)]
     adoption_diagnostic::phase(adoption_diagnostic::Phase::ArchivePolicy);
+    check_retained_transition_policies_in_registry(&registry, &mut meter, check, false)
+}
+
+pub(crate) fn check_retained_transition_policies_with_registry<C>(
+    registry: &ReconstructedOwned,
+    mut check: C,
+) -> Result<()>
+where
+    C: for<'gate, 'loan> FnMut(
+        &mut owned_transition::OwnedPolicyCheck<'gate>,
+        &HistoricalInitialLoan<'loan>,
+    ) -> Result<()>,
+{
+    let mut meter = ProofMeter::new(ProofBudget::default(), Arc::new(AtomicBool::new(false)))?;
+    check_retained_transition_policies_in_registry(registry, &mut meter, check, true)
+}
+
+fn check_retained_transition_policies_in_registry<C>(
+    registry: &ReconstructedOwned,
+    meter: &mut ProofMeter,
+    mut check: C,
+    reuse_registry: bool,
+) -> Result<()>
+where
+    C: for<'gate, 'loan> FnMut(
+        &mut owned_transition::OwnedPolicyCheck<'gate>,
+        &HistoricalInitialLoan<'loan>,
+    ) -> Result<()>,
+{
     for execution in registry.checked_withdrawals() {
         meter.charge(1)?;
         meter.charge(6)?;
         meter.charge(const { historical_initial_callback_payment::<C>() })?;
-        let loan = HistoricalInitialLoan { registry: &registry, execution };
+        let loan = HistoricalInitialLoan { registry, execution, reuse_registry };
         #[cfg(test)]
-        combined_transition_reuse_tests::accounting("before-policy", &meter);
-        owned_transition::invoke_historical_initial_policy(execution, &loan, &mut meter, &mut check)?;
+        combined_transition_reuse_tests::accounting("before-policy", meter);
+        owned_transition::invoke_historical_initial_policy(execution, &loan, meter, &mut check)?;
         #[cfg(test)]
-        combined_transition_reuse_tests::accounting("after-policy", &meter);
+        combined_transition_reuse_tests::accounting("after-policy", meter);
     }
     Ok(())
 }
 macro_rules! policy_frames_body {
     ($self:ident, $snapshot:expr, $surface:ident, $meter:expr,
-     [$($select:tt)*], [$($visitor:tt)*], [$($replay:tt)*],
+     [$($guard:tt)*], [$($epochs:tt)*], [$($select:tt)*], [$($visitor:tt)*], [$($replay:tt)*],
      $index:ident, $recipe:ident, $endpoint:ident, $day:ident, $visit:ident, [$($finish:tt)*]) => {{
-        $self.check_snapshot($snapshot)?;
+        $($guard)*
+        let epochs = { $($epochs)* };
         let state = $snapshot.owned_scope()?;
-        if !state.layers.contains_key($surface.original_layer()) || $self.epochs.is_empty() {
+        if !state.layers.contains_key($surface.original_layer()) || epochs.is_empty() {
             return Err(crate::product_store::scope::owned_persist::err(
                 "policy surface is not bound to this committed original layer",
             ));
@@ -464,12 +495,12 @@ macro_rules! policy_frames_body {
         let source = crate::product_store::scope::program($snapshot, $surface.source())?;
         $self.resolve(source)?;
         $($select)*
-        for ($index, epoch) in $self.epochs.iter().enumerate() {
+        for ($index, epoch) in epochs.iter().enumerate() {
             let $recipe = $self
                 .recipes
                 .get(&epoch.output)
                 .ok_or_else(|| crate::product_store::scope::owned_persist::err("policy producer recipe missing"))?;
-            let ($endpoint, $day) = if let Some(next) = $self.epochs.get($index + 1) {
+            let ($endpoint, $day) = if let Some(next) = epochs.get($index + 1) {
                 let next_recipe = $self
                     .recipes
                     .get(&next.output)
@@ -573,7 +604,9 @@ macro_rules! completed_surface_body {
         #[cfg(test)] adoption_diagnostic::phase(adoption_diagnostic::Phase::SurfaceFrames);
         {
             let surface_ref = &surface;
-            policy_frames_body!($registry, $pair.loan.execution.current(), surface_ref, $meter, [], [
+        policy_frames_body!($registry, $pair.loan.execution.current(), surface_ref, $meter, [],
+        [$registry.epochs.get(..2).ok_or_else(|| crate::product_store::scope::owned_persist::err(
+            "completed historical prefix is missing its two verified epochs"))?], [], [
                 let mut visit = |frame: &DataSnapshot, meter: &mut ProofMeter| {
                     meter.charge(canonical_bytes(frame)?.len() as u64)?;
                     #[cfg(test)] completed_interval_tests::visit(index,frame);
@@ -626,7 +659,7 @@ macro_rules! completed_interval_replay_body {
                 $surface.validate_frame(seed)?;
             ], [
                 'completed_row: {
-                    owned_replay::protected_row_body!($recipe, &frame, row, old, event.day, $meter, $meter.runtime()?,
+                    owned_replay::protected_row_body!($recipe, &frame, row, old, event.day, $meter, None, Some(event),
                         [break 'completed_row;], [()], metadata, [
                             // NEW administration exists only at the native new-seal slot.
                             // All original row checks and early success precede it.
@@ -674,7 +707,9 @@ impl HistoricalInitialLoan<'_> {
         #[cfg(test)]
         adoption_diagnostic::phase(adoption_diagnostic::Phase::SurfaceReconstruct);
         meter.charge(HISTORICAL_INITIAL_WORKER_PAYMENT)?;
-        meter.charge(HISTORICAL_INITIAL_INTERVAL_ENTRY_PAYMENT)?;
+        if !self.reuse_registry {
+            meter.charge(HISTORICAL_INITIAL_INTERVAL_ENTRY_PAYMENT)?;
+        }
         // New owner/lookup/enclosing transports are paid before any mint attempt.
         let mut completed = None;
         let failure = 'completed_mint_failure: {
@@ -707,15 +742,30 @@ impl HistoricalInitialLoan<'_> {
         None
         };
         completed_failure!(failure);
-        let registry = self.reconstruct(completed.as_ref(), meter)?;
         completed_charge!(meter, COMPLETED_INTERVAL_SURFACE_PAYMENT);
         match completed.as_ref() {
+            Some(pair) if self.reuse_registry => {
+                // The completed interval was already reconstructed from this
+                // exact snapshot to mint `self`. Keep that registry and its
+                // verified recipes; rebuilding the same registry here repeats
+                // the entire historical proof before checking this surface.
+                let registry = self.registry;
+                #[cfg(test)] completed_interval_tests::guard_cases(pair, registry);
+                completed_surface_body!(pair,registry,source,layer,meter)
+            },
             Some(pair) => {
+                let registry = self.reconstruct(Some(pair), meter)?;
                 let registry = &registry;
                 #[cfg(test)] completed_interval_tests::guard_cases(pair, registry);
                 completed_surface_body!(pair,registry,source,layer,meter)
             },
-            None => owned_transition::policy_surface_from_registry(execution, &registry, source, layer, meter),
+            None => {
+                if self.reuse_registry {
+                    meter.charge(HISTORICAL_INITIAL_INTERVAL_ENTRY_PAYMENT)?;
+                }
+                let registry = self.reconstruct(None, meter)?;
+                owned_transition::policy_surface_from_registry(execution, &registry, source, layer, meter)
+            },
         }
     }
     // Only this private R/E loan reaches the selected H reconstruction. Its
@@ -1816,7 +1866,19 @@ pub(super) fn reconstruct(
     meter: &mut ProofMeter,
 ) -> Result<ReconstructedOwned> {
     meter.charge(RegistryOnly::FRAME_PAYMENT)?;
-    reconstruct_with(snapshot, meter, RegistryOnly)
+    reconstruct_with(snapshot, meter, RegistryOnly, None)
+}
+pub(super) fn validate_with_applied_transition(
+    snapshot: &ProjectSnapshot,
+    evidence: &owned_replay::AppliedTransitionEvidence<'_>,
+    meter: &mut ProofMeter,
+) -> Result<ReconstructedOwned> {
+    if !evidence.binds_after(snapshot) {
+        return Err(err("applied transition evidence belongs to another snapshot"));
+    }
+    snapshot.validate_container()?;
+    meter.charge(RegistryOnly::FRAME_PAYMENT)?;
+    reconstruct_with(snapshot, meter, RegistryOnly, Some(evidence))
 }
 macro_rules! reconstruct_body {
     ($snapshot:ident, $meter:ident, $finish:ident, $F:ident, $origin:ident, $layer:ident, $manifest:ident, $init:ident, $graphs:ident, $result:ident, $historical:ident, $proof:ident, $prepared:ident, $transition:ident, $initial:ident, $tail_index:ident, $tail_epoch:ident, $tail_recipe:ident, $tail_revision:ident, $tail_data:ident, $tail_day:ident, $state:ident, [$($state_serialization:tt)*], [$($completed_scope:tt)*], [$($initial_slot:tt)*], [$($transition_slot:tt)*], [$($prospective_slot:tt)*], [$($prospective_arc:tt)*], [$($completed_finish:tt)*], [$($tail_slot:tt)*], [$($final_tail_slot:tt)*]) => {{
@@ -2351,7 +2413,10 @@ const COLD_HISTORICAL_SERIALIZATION_PAYMENT: u64 = comparison_payment(64 * 14, [
 
 fn reconstruct_with<'s, F: ReconstructionFinish<'s>>(
     snapshot: &'s ProjectSnapshot, meter: &mut ProofMeter, finish: F,
-) -> Result<F::Output> {    reconstruct_body!(snapshot, meter, finish, F, origin, layer, manifest, init, graphs, result, historical, proof, prepared, transition, initial, index, epoch, recipe, revision, data, day, state, [
+    evidence: Option<&owned_replay::AppliedTransitionEvidence<'_>>,
+) -> Result<F::Output> {
+    let applied_transition_evidence = evidence;
+    reconstruct_body!(snapshot, meter, finish, F, origin, layer, manifest, init, graphs, result, historical, proof, prepared, transition, initial, index, epoch, recipe, revision, data, day, state, [
     meter.charge(canonical_bytes(state)?.len() as u64)?;
     ], [], [
             let initial = Arc::new(reconstruct_recipe(
@@ -2398,7 +2463,7 @@ fn reconstruct_with<'s, F: ReconstructionFinish<'s>>(
                 };
                 owned_replay::recipe_history_body!(recipe, seed, seed_day, data, day, meter,
                     [visit(seed, meter)?;],
-                    [owned_replay::protected_row(recipe, &frame, row, old, event.day, meter)?;],
+                    [owned_replay::protected_row_with_evidence(recipe, &frame, row, old, event.day, meter, applied_transition_evidence, Some(event))?;],
                     [visit(&frame, meter)?;], [visit(data, meter)], frame, row, old, event, [
                         #[cfg(test)] cold_serialization_tests::poll(meter);
                         meter.charge(0)?;
@@ -3188,7 +3253,7 @@ impl ReconstructedOwned {
         surface: &owned_continuation::VerifiedOwnedPolicySurface,
         meter: &mut ProofMeter,
     ) -> Result<()> {
-        policy_frames_body!(self, snapshot, surface, meter, [], [
+        policy_frames_body!(self, snapshot, surface, meter, [self.check_snapshot(snapshot)?;], [self.epochs.as_slice()], [], [
             let mut visit = |frame: &DataSnapshot, meter: &mut ProofMeter| {
                 meter.charge(canonical_bytes(frame)?.len() as u64)?;
                 #[cfg(test)] completed_interval_tests::visit(index,frame);
@@ -3212,7 +3277,7 @@ impl ReconstructedOwned {
         source_recipe: &OwnedExecutionRecipe,
         recorder: &owned_transition::PolicyFrameRecorder<'_>, meter: &mut ProofMeter,
     ) -> Result<()> {
-        policy_frames_body!(self, snapshot, surface, meter, [
+        policy_frames_body!(self, snapshot, surface, meter, [self.check_snapshot(snapshot)?;], [self.epochs.as_slice()], [
             meter.charge(owned_transition::POLICY_FRAME_SELECT_PAYMENT)?;
             if recorder.eligible(owned_transition::SelectedFrameCall {
                 registry: self, snapshot, recipe: source_recipe, surface, layer, meter,
@@ -3426,7 +3491,7 @@ pub(super) fn reconstruct_and_transition(
 ) -> Result<(ReconstructedOwned, Arc<VerifiedOwnedTransitionExecution>)> {
     reconstruct_with(current, meter, TransitionFinish {
         before, after, sources, layer, operation, withdrawal,
-    })
+    }, None)
 }
 pub(super) fn transition_from_registry(
     current: &ProjectSnapshot,
@@ -3881,7 +3946,7 @@ mod ordinary_prefix_controls {
 const _: [(); 12160] = [(); HISTORICAL_INITIAL_ARC_PAYMENT as usize];
 
 #[cfg(all(test, target_pointer_width = "64"))]
-const _: [(); 10304] = [(); historical_initial_callback_payment::<()>() as usize];
+const _: [(); 10336] = [(); historical_initial_callback_payment::<()>() as usize];
 
 #[cfg(all(test, target_pointer_width = "64"))]
 const _: [(); 7492] = [(); HISTORICAL_INITIAL_COMPARE_PAYMENT as usize];
