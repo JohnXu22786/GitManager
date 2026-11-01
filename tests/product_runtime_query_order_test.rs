@@ -3,6 +3,7 @@
 // standalone validation uses that same unchanged contract compiled without tests.
 #[path = "../src/product_runtime/query_order.rs"] mod query_order;
 #[path = "../src/product_alloc.rs"] mod product_alloc;
+#[path = "../src/product_json.rs"] mod product_json;
 #[cfg(query_contract_external)]
 use query_contract::product_contract;
 #[cfg(not(query_contract_external))]

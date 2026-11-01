@@ -130,6 +130,9 @@ use std::sync::Arc;
 #[path = "product_contract/values_map.rs"]
 #[allow(dead_code)]
 mod values_map;
+#[path = "product_contract/fallible_value_decode.rs"]
+#[allow(dead_code)]
+mod fallible_value_decode;
 #[allow(unused_imports)]
 pub(crate) use values_map::FallibleValues;
 

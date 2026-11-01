@@ -5,6 +5,8 @@ mod discovery_fixture;
 mod fixture;
 #[path = "../src/product_alloc.rs"]
 mod product_alloc;
+#[path = "../src/product_json.rs"]
+mod product_json;
 #[path = "../src/product_contract.rs"]
 mod product_contract;
 #[path = "../src/product_protocol.rs"]
