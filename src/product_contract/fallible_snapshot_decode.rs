@@ -28,14 +28,14 @@ pub(super) fn decode_data_snapshot(
     value: Value,
     cx: &mut AllocationContext,
 ) -> Result<DecodedDataSnapshot, ValueDecodeError> {
-    let fields = object(value, "a struct DataSnapshot")?;
+    let fields = object(value, "a struct DataSnapshot", DATA_SNAPSHOT_FIELDS, cx)?;
     let mut version = None;
     let mut project_id = None;
     let mut generation = None;
     let mut schema = None;
     let mut record_values = None;
     let mut event_values = None;
-    for (key, value) in fields.into_entries() {
+    for (key, value) in fields.into_iter() {
         match key.as_str() {
             "version" => version = Some(integer_u32(value)?),
             "project_id" => project_id = Some(string(value)?),
@@ -92,9 +92,23 @@ fn events(value: Value, cx: &mut AllocationContext) -> Result<Vec<DecodedBusines
 fn object(
     value: Value,
     expected: &'static str,
-) -> Result<crate::product_alloc::ordered::OrderedMap<String, Value>, ValueDecodeError> {
+    names: &'static [&'static str],
+    cx: &mut AllocationContext,
+) -> Result<std::vec::IntoIter<(String, Value)>, ValueDecodeError> {
     match value {
-        Value::Object(fields) => Ok(fields),
+        Value::Object(fields) => Ok(fields.into_entries()),
+        Value::Array(values) => {
+            if values.len() != names.len() {
+                return Err(ValueDecodeError::InvalidLength { actual: values.len(), expected: names.len() });
+            }
+            let mut fields = Vec::new();
+            product_alloc::try_reserve(&mut fields, values.len(), cx, AllocationSite::Vector)?;
+            for (name, value) in names.iter().zip(values) {
+                let name = product_alloc::try_copy_str(name, cx, AllocationSite::String)?;
+                fields.push((name, value));
+            }
+            Ok(fields.into_iter())
+        }
         value => Err(invalid_type(value, expected)),
     }
 }
@@ -202,6 +216,14 @@ mod tests {
         let decoded = decode_data_snapshot(syntax(&source), &mut cx).unwrap();
         assert_eq!(super::super::canonical_bytes(&expected).unwrap(), super::super::canonical_bytes(&decoded).unwrap());
         assert_eq!(decoded.version, super::super::CONTRACT_VERSION);
+
+        let fields = serde_json::to_value(&expected).unwrap();
+        let sequence = serde_json::json!([
+            fields["version"].clone(), fields["project_id"].clone(), fields["generation"].clone(),
+            fields["schema"].clone(), fields["records"].clone(), fields["events"].clone(), {"ignored": [1, 2]},
+        ]).to_string();
+        assert!(serde_json::from_value::<DataSnapshot>(serde_json::from_str(&sequence).unwrap()).is_err());
+        assert!(matches!(decode_data_snapshot(syntax(&sequence), &mut AllocationContext::new()), Err(ValueDecodeError::InvalidLength { actual: 7, expected: 6 })));
     }
 
     #[test]
@@ -224,7 +246,7 @@ mod tests {
     #[test]
     fn shape_version_range_duplicate_and_unknown_errors_remain_distinct() {
         assert!(matches!(decode_data_snapshot(syntax(r#"{"version":1}"#), &mut AllocationContext::new()), Err(ValueDecodeError::MissingField("project_id"))));
-        assert!(matches!(decode_data_snapshot(syntax(r#"[]"#), &mut AllocationContext::new()), Err(ValueDecodeError::InvalidType { actual: JsonKind::Sequence, .. })));
+        assert!(matches!(decode_data_snapshot(syntax(r#"[]"#), &mut AllocationContext::new()), Err(ValueDecodeError::InvalidLength { actual: 0, expected: 6 })));
         assert!(matches!(decode_data_snapshot(syntax(r#"{"version":4294967296,"project_id":"p","generation":0,"schema":[],"records":[],"events":[]}"#), &mut AllocationContext::new()), Err(ValueDecodeError::InvalidValue { expected: "u32", .. })));
         assert!(matches!(decode_data_snapshot(syntax(r#"{"version":-1,"project_id":"p","generation":0,"schema":[],"records":[],"events":[]}"#), &mut AllocationContext::new()), Err(ValueDecodeError::InvalidValue { expected: "u32", .. })));
 

@@ -145,6 +145,30 @@ mod fallible_persisted_decode;
 #[path = "product_contract/fallible_snapshot_decode.rs"]
 #[allow(dead_code)]
 mod fallible_snapshot_decode;
+/// Opaque bridge into fallible persisted data/session DTOs for sibling decoders.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct FallibleDecodedDataSnapshot(fallible_snapshot_decode::DecodedDataSnapshot);
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct FallibleDecodedSessionState(fallible_persisted_decode::DecodedSessionState);
+pub(crate) fn decode_data_snapshot_fallible(
+    value: crate::product_json::Value,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<FallibleDecodedDataSnapshot, fallible_value_decode::ValueDecodeError> {
+    fallible_snapshot_decode::decode_data_snapshot(value, cx).map(FallibleDecodedDataSnapshot)
+}
+pub(crate) fn decode_session_state_fallible(
+    value: crate::product_json::Value,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<FallibleDecodedSessionState, fallible_value_decode::ValueDecodeError> {
+    fallible_persisted_decode::decode_session_state(value, cx).map(FallibleDecodedSessionState)
+}
+pub(crate) fn decode_record_ref_fallible(
+    value: crate::product_json::Value,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<RecordRef, fallible_value_decode::ValueDecodeError> {
+    fallible_persisted_decode::decode_record_ref(value, cx)
+}
+
 #[path = "product_contract/fallible_decision_decode.rs"]
 #[allow(dead_code)]
 mod fallible_decision_decode;

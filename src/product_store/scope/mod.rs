@@ -139,6 +139,8 @@ pub use common_fact_inventory::{
 };
 mod compiler;
 mod contract;
+#[allow(dead_code)]
+mod fallible_scalar_decode;
 mod correspondence;
 mod family;
 pub use family::ScopeEnvelope;

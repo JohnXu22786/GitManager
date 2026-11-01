@@ -55,14 +55,14 @@ pub(super) struct DecodedSessionState {
 }
 
 pub(super) fn decode_record(value: Value, cx: &mut AllocationContext) -> Result<DecodedRecord, ValueDecodeError> {
-    let fields = object(value, "a struct Record")?;
+    let fields = object(value, "a struct Record", RECORD_FIELDS, cx)?;
     let mut entity = None;
     let mut id = None;
     let mut revision = None;
     let mut created_program = None;
     let mut archived = None;
     let mut values = None;
-    for (key, value) in fields.into_entries() {
+    for (key, value) in fields.into_iter() {
         match key.as_str() {
             "entity" => entity = Some(string(value)?),
             "id" => id = Some(string(value)?),
@@ -87,13 +87,13 @@ pub(super) fn decode_record_change(
     value: Value,
     cx: &mut AllocationContext,
 ) -> Result<DecodedRecordChange, ValueDecodeError> {
-    let fields = object(value, "a struct RecordChange")?;
+    let fields = object(value, "a struct RecordChange", RECORD_CHANGE_FIELDS, cx)?;
     let mut entity = None;
     let mut record = None;
     let mut before = None;
     let mut after = None;
     let mut archived = None;
-    for (key, value) in fields.into_entries() {
+    for (key, value) in fields.into_iter() {
         match key.as_str() {
             "entity" => entity = Some(string(value)?),
             "record" => record = Some(string(value)?),
@@ -116,7 +116,7 @@ pub(super) fn decode_business_event(
     value: Value,
     cx: &mut AllocationContext,
 ) -> Result<DecodedBusinessEvent, ValueDecodeError> {
-    let fields = object(value, "a struct BusinessEvent")?;
+    let fields = object(value, "a struct BusinessEvent", BUSINESS_EVENT_FIELDS, cx)?;
     let mut id = None;
     let mut sequence = None;
     let mut operation_id = None;
@@ -125,7 +125,7 @@ pub(super) fn decode_business_event(
     let mut program = None;
     let mut record_changes = None;
     let mut outputs = None;
-    for (key, value) in fields.into_entries() {
+    for (key, value) in fields.into_iter() {
         match key.as_str() {
             "id" => id = Some(string(value)?),
             "sequence" => sequence = Some(integer_u64(value)?),
@@ -159,7 +159,7 @@ pub(super) fn decode_record_ref(value: Value, cx: &mut AllocationContext) -> Res
             }
             let mut fields = crate::product_alloc::ordered::OrderedMap::new();
             fields.try_reserve(RECORD_REF_FIELDS.len(), cx)?;
-            for (name, value) in RECORD_REF_FIELDS.iter().zip(values) {
+            for (name, value) in RECORD_REF_FIELDS.iter().zip(values.into_iter().take(RECORD_REF_FIELDS.len())) {
                 let name = product_alloc::try_copy_str(name, cx, AllocationSite::String)?;
                 fields.try_insert(name, value, cx)?;
             }
@@ -183,11 +183,11 @@ pub(super) fn decode_session_state(
     value: Value,
     cx: &mut AllocationContext,
 ) -> Result<DecodedSessionState, ValueDecodeError> {
-    let fields = object(value, "a struct SessionState")?;
+    let fields = object(value, "a struct SessionState", SESSION_STATE_FIELDS, cx)?;
     let mut view = None;
     let mut values = None;
     let mut focused_record = None;
-    for (key, value) in fields.into_entries() {
+    for (key, value) in fields.into_iter() {
         match key.as_str() {
             "view" => view = Some(string(value)?),
             "values" => values = Some(values_map(value, cx)?),
@@ -255,9 +255,23 @@ fn digest(value: Value) -> Result<Digest, ValueDecodeError> {
 fn object(
     value: Value,
     expected: &'static str,
-) -> Result<crate::product_alloc::ordered::OrderedMap<String, Value>, ValueDecodeError> {
+    names: &'static [&'static str],
+    cx: &mut AllocationContext,
+) -> Result<std::vec::IntoIter<(String, Value)>, ValueDecodeError> {
     match value {
-        Value::Object(fields) => Ok(fields),
+        Value::Object(fields) => Ok(fields.into_entries()),
+        Value::Array(values) => {
+            if values.len() != names.len() {
+                return Err(ValueDecodeError::InvalidLength { actual: values.len(), expected: names.len() });
+            }
+            let mut fields = Vec::new();
+            product_alloc::try_reserve(&mut fields, names.len(), cx, AllocationSite::Vector)?;
+            for (name, value) in names.iter().zip(values.into_iter().take(names.len())) {
+                let name = product_alloc::try_copy_str(name, cx, AllocationSite::String)?;
+                fields.push((name, value));
+            }
+            Ok(fields.into_iter())
+        }
         value => Err(invalid_type(value, expected)),
     }
 }
@@ -374,6 +388,11 @@ mod tests {
         let decoded_session = decode_session_state(syntax(&session_source), &mut cx).unwrap();
         assert_eq!(super::super::canonical_bytes(&expected_session).unwrap(), super::super::canonical_bytes(&decoded_session).unwrap());
         assert!(decode_session_state(syntax(r#"{"view":"people","values":{}}"#), &mut AllocationContext::new()).unwrap().focused_record.is_none());
+
+        let fields = serde_json::to_value(&expected_session).unwrap();
+        let sequence = serde_json::json!([fields["view"].clone(), fields["values"].clone(), fields["focused_record"].clone(), false]).to_string();
+        assert!(serde_json::from_value::<SessionState>(serde_json::from_str(&sequence).unwrap()).is_err());
+        assert!(matches!(decode_session_state(syntax(&sequence), &mut AllocationContext::new()), Err(ValueDecodeError::InvalidLength { actual: 4, expected: 3 })));
     }
 
     #[test]
@@ -481,6 +500,8 @@ mod tests {
         let mut baseline = AllocationContext::new();
         let decoded = decode_record_ref(syntax(source), &mut baseline).unwrap();
         assert_eq!(super::super::canonical_bytes(&expected).unwrap(), super::super::canonical_bytes(&decoded).unwrap());
+        assert!(serde_json::from_value::<RecordRef>(serde_json::json!(["person", "p1", null])).is_err());
+        assert!(matches!(decode_record_ref(syntax(r#"["person","p1",null]"#), &mut AllocationContext::new()), Err(ValueDecodeError::InvalidLength { actual: 3, expected: 2 })));
         let growths = baseline.growth_requests();
         assert!(growths > 0);
         for nth in 1..=growths {
