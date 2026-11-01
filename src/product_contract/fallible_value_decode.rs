@@ -5,7 +5,7 @@
 use crate::product_alloc::{self, AllocationContext, AllocationFailure, AllocationSite};
 use crate::product_json::{Number, Value};
 
-use super::{DataValue, FallibleValues, Type};
+use super::{DataValue, FallibleValues, Type, MAX_COLLECTION};
 
 const TYPE_VARIANTS: &[&str] = &["boolean", "integer", "text", "date", "reference", "list", "optional"];
 const VALUE_VARIANTS: &[&str] = &["null", "boolean", "integer", "text", "date", "reference", "list"];
@@ -45,6 +45,7 @@ pub(crate) enum ValueDecodeError {
     MissingField(&'static str),
     UnknownField { key: String, expected: &'static [&'static str] },
     UnknownVariant { tag: String, expected: &'static [&'static str] },
+    InvalidFormat(&'static str),
     InvalidType { actual: JsonKind, expected: &'static str },
     InvalidValue { actual: NumericValue, expected: &'static str },
 }
@@ -281,6 +282,9 @@ fn data_values(value: Value, cx: &mut AllocationContext) -> Result<Vec<DataValue
         Value::Array(values) => values,
         value => return Err(invalid_type(value, "a sequence")),
     };
+    if values.len() > MAX_COLLECTION {
+        return Err(ValueDecodeError::LimitExceeded { resource: "list item count", limit: MAX_COLLECTION });
+    }
     let mut decoded = Vec::new();
     product_alloc::try_reserve(&mut decoded, values.len(), cx, AllocationSite::Vector)?;
     for value in values {
