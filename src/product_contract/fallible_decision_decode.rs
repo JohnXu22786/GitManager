@@ -322,7 +322,7 @@ fn accepted_properties(value: Value, cx: &mut AllocationContext) -> Result<Vec<A
     Ok(decoded)
 }
 
-fn decode_accepted_property(value: Value, cx: &mut AllocationContext) -> Result<AcceptedProperty, ValueDecodeError> {
+pub(super) fn decode_accepted_property(value: Value, cx: &mut AllocationContext) -> Result<AcceptedProperty, ValueDecodeError> {
     let fields = object(value, "a struct AcceptedProperty")?;
     let mut id = None;
     let mut description = None;
