@@ -1,4 +1,6 @@
 //! Host-owned scoped executable composition and protected completion history.
+#[allow(dead_code)]
+mod fallible_owned_lifecycle_decode;
 mod owned_wire;
 pub use owned_wire::*;
 mod owned_choice;
