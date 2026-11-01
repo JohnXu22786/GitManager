@@ -74,6 +74,7 @@ fn verified_backups_recover_later_work_and_outputs_in_a_fresh_process() {
     let store = backup_source(&root);
     let saved = store.load().unwrap();
     let backup = VerifiedBackup::capture(&store).unwrap();
+    assert!(backup.test_fallible_codec_oracles() > 0);
     assert_eq!(backup.snapshot(), &saved);
     let file = root.join("my-tool.gmbak");
     backup.export_new(&file).unwrap();

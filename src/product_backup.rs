@@ -21,6 +21,9 @@ const MAX_AUTOMATIC_CHECKS: usize = 64;
 const MAGIC: &str = "gitmanager.generated-tool-backup";
 #[path = "tool_proposal_input.rs"]
 mod bounded_input;
+#[path = "product_backup/fallible_codec.rs"]
+#[allow(dead_code)]
+mod fallible_codec;
 fn backup_header(bytes: &[u8]) -> Result<serde_json::Value> {
     bounded_input::parse_json_bytes_with_limit(bytes, MAX_BACKUP_BYTES)
         .map_err(|e| OperationIssue::new(IssueKind::Corrupt, e))
@@ -82,6 +85,10 @@ pub struct BackupSummary {
     pub intention_objects: usize,
 }
 impl VerifiedBackup {
+    #[cfg(test)]
+    pub(crate) fn test_fallible_codec_oracles(&self) -> usize {
+        fallible_codec::test_full_backup_oracles(self)
+    }
     pub fn capture(store: &ProductStore) -> Result<Self> {
         // CURRENT selects one immutable committed snapshot. Do not enumerate
         // the project directory: orphan/interrupted writes are not commits.

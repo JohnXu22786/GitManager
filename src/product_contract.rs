@@ -218,9 +218,17 @@ fn version(version: u32) -> Result<()> {
     require(version == CONTRACT_VERSION, "unsupported contract version")
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(try_from = "String")]
 pub struct Digest(String);
+impl Serialize for Digest {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        // `into = String` cloned the digest before reaching the serializer.
+        // A borrowed string has identical wire bytes and permits fallible
+        // serializers to account for every owned output buffer themselves.
+        serializer.serialize_str(&self.0)
+    }
+}
 impl Digest {
     pub fn as_str(&self) -> &str {
         &self.0

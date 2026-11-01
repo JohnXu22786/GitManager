@@ -23,6 +23,7 @@ pub enum Invariant { NumberFormat, WorkspaceCapacity, OutputBounds, OutputLength
 pub enum EncodeError {
     Allocation(AllocationFailure),
     EncodedLengthOverflow,
+    OutputLimitExceeded,
     Invariant(Invariant),
 }
 impl From<AllocationFailure> for EncodeError {
@@ -33,6 +34,7 @@ impl fmt::Display for EncodeError {
         match self {
             Self::Allocation(error) => fmt::Display::fmt(error,f),
             Self::EncodedLengthOverflow => f.write_str("canonical JSON encoded length overflow"),
+            Self::OutputLimitExceeded => f.write_str("canonical JSON output exceeds the caller limit"),
             Self::Invariant(cause) => f.write_str(match cause {
                 Invariant::NumberFormat => "canonical JSON numeric format invariant",
                 Invariant::WorkspaceCapacity => "canonical JSON workspace capacity invariant",
@@ -186,10 +188,20 @@ pub(crate) fn reserve_output(length: usize, cx: &mut AllocationContext) -> Resul
 /// fixed). Failure drops only local borrowed frames and byte storage. Nothing
 /// is published, retried, reformatted into heap storage or routed to old Serde.
 pub fn try_canonical_bytes(value: &Value, cx: &mut AllocationContext) -> Result<Vec<u8>, EncodeError> {
+    try_canonical_bytes_bounded(value, usize::MAX, cx)
+}
+/// Encode only after proving the measured canonical length fits the caller's
+/// existing wire limit. The limit rejects before output reservation.
+pub(crate) fn try_canonical_bytes_bounded(
+    value: &Value,
+    max_bytes: usize,
+    cx: &mut AllocationContext,
+) -> Result<Vec<u8>, EncodeError> {
     let mut stack=Vec::new();
     let mut measure=Sink{mode:Mode::Measure,cursor:0};
     walk(value,&mut stack,&mut measure,cx)?;
     let length=measure.cursor;
+    if length > max_bytes { return Err(EncodeError::OutputLimitExceeded); }
     let mut output=reserve_output(length,cx)?;
     let mut emit=Sink{mode:Mode::Emit(&mut output),cursor:0};
     walk(value,&mut stack,&mut emit,cx)?;
@@ -219,6 +231,15 @@ mod tests {
             requested_bytes:Some(isize::MAX as usize+1)}));
         assert_eq!(cx.growth_requests(),0);
         assert_eq!(cx.first_failure(),match err {EncodeError::Allocation(f)=>Some(f),_=>None});
+    }
+    #[test]
+    fn bounded_output_rejects_before_reserving_encoded_bytes() {
+        let value = Value::String("x".into());
+        let mut cx = AllocationContext::new();
+        assert_eq!(try_canonical_bytes_bounded(&value, 2, &mut cx),
+            Err(EncodeError::OutputLimitExceeded));
+        assert_eq!(cx.growth_requests(), 0);
+        assert_eq!(cx.first_failure(), None);
     }
     #[test]
     fn scratch_cursor_and_workspace_invariants_fail_without_growth() {

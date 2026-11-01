@@ -1,6 +1,9 @@
 //! Synthetic negative controls for the real transition decision/writer boundary.
 #[path = "fixtures/common_fact/mod.rs"] mod common;
 #[path = "fixtures/owned_recovery/mod.rs"] mod fixture;
+#[path = "../src/product_alloc.rs"] mod product_alloc;
+#[path = "../src/product_json.rs"] mod product_json;
+#[path = "../src/product_app.rs"] mod product_app;
 #[path = "../src/product_backup.rs"] mod product_backup;
 #[path = "../src/product_contract.rs"] mod product_contract;
 #[path = "../src/product_decisions/mod.rs"] mod product_decisions;
