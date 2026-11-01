@@ -636,6 +636,9 @@ fn operation_set(value: Value, cx: &mut AllocationContext) -> Result<FallibleIdS
     let values = array(value)?; let mut out = FallibleIdSet::new();
     for value in values { out.insert(string(value, "a string")?, cx)?; } Ok(out)
 }
+pub(crate) fn decode_operation_set(value: Value, cx: &mut AllocationContext) -> Result<FallibleIdSet, ValueDecodeError> {
+    operation_set(value, cx)
+}
 fn path_indices(value: Value, cx: &mut AllocationContext) -> Result<Vec<usize>, ValueDecodeError> {
     let values = array(value)?; bounded(values.len(), MAX_EXPR_DEPTH, "effect destination path length")?;
     let mut out = Vec::new(); product_alloc::try_reserve(&mut out, values.len(), cx, AllocationSite::Vector)?;
