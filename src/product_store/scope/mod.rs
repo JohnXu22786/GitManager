@@ -145,6 +145,8 @@ mod fallible_scalar_decode;
 mod fallible_owned_source_decode;
 #[allow(dead_code)]
 mod fallible_owned_request_decode;
+#[allow(dead_code)]
+mod fallible_owned_inventory_decode;
 mod correspondence;
 mod family;
 pub use family::ScopeEnvelope;

@@ -199,14 +199,14 @@ pub(crate) struct DecodedCompatibilityReport {
 }
 pub(crate) struct FallibleScopeMap<K, V>(OrderedMap<K, V>);
 impl<K, V> FallibleScopeMap<K, V> {
-    fn new() -> Self { Self(OrderedMap::new()) }
+    pub(crate) fn new() -> Self { Self(OrderedMap::new()) }
     pub(crate) fn len(&self) -> usize { self.0.len() }
     pub(crate) fn is_empty(&self) -> bool { self.0.is_empty() }
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&K, &V)> { self.0.iter() }
     pub(crate) fn keys(&self) -> impl Iterator<Item = &K> { self.0.iter().map(|(key, _)| key) }
 }
 impl<K: Ord, V> FallibleScopeMap<K, V> {
-    fn insert(&mut self, key: K, value: V, cx: &mut AllocationContext) -> Result<Option<V>, ValueDecodeError> {
+    pub(crate) fn insert(&mut self, key: K, value: V, cx: &mut AllocationContext) -> Result<Option<V>, ValueDecodeError> {
         self.0.try_insert(key, value, cx).map_err(ValueDecodeError::Allocation)
     }
 }
