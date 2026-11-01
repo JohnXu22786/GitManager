@@ -52,7 +52,7 @@ pub(super) fn decode_scenario_spec(
     value: Value,
     cx: &mut AllocationContext,
 ) -> Result<DecodedScenarioSpec, ValueDecodeError> {
-    let fields = object(value, "a struct ScenarioSpec")?;
+    let mut fields = struct_fields(value, "a struct ScenarioSpec", SCENARIO_FIELDS)?;
     let mut version = None;
     let mut id = None;
     let mut label = None;
@@ -62,7 +62,7 @@ pub(super) fn decode_scenario_spec(
     let mut random_seed = None;
     let mut inputs = None;
     let mut validity = None;
-    for (key, value) in fields.into_entries() {
+    while let Some((key, value)) = fields.next(cx)? {
         match key.as_str() {
             "version" => version = Some(unsigned_u32(value)?),
             "id" => id = Some(string(value, "a string")?),
@@ -222,6 +222,49 @@ fn tagged(value: Value) -> Result<(String, OrderedMap<String, Value>), ValueDeco
 fn object(value: Value, expected: &'static str) -> Result<OrderedMap<String, Value>, ValueDecodeError> {
     match value {
         Value::Object(fields) => Ok(fields),
+        value => Err(invalid_type(value, expected)),
+    }
+}
+
+enum StructFields {
+    Object(std::vec::IntoIter<(String, Value)>),
+    Sequence {
+        names: &'static [&'static str],
+        values: std::vec::IntoIter<Value>,
+        index: usize,
+        actual: usize,
+    },
+}
+
+impl StructFields {
+    fn next(&mut self, cx: &mut AllocationContext) -> Result<Option<(String, Value)>, ValueDecodeError> {
+        match self {
+            Self::Object(fields) => Ok(fields.next()),
+            Self::Sequence { names, values, index, actual } => {
+                if let Some(name) = names.get(*index) {
+                    let Some(value) = values.next() else {
+                        return Err(ValueDecodeError::InvalidLength { actual: *actual, expected: names.len() });
+                    };
+                    *index += 1;
+                    let name = product_alloc::try_copy_str(name, cx, AllocationSite::String)?;
+                    Ok(Some((name, value)))
+                } else if values.next().is_some() {
+                    Err(ValueDecodeError::InvalidLength { actual: *actual, expected: names.len() })
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
+}
+
+fn struct_fields(value: Value, expected: &'static str, names: &'static [&'static str]) -> Result<StructFields, ValueDecodeError> {
+    match value {
+        Value::Object(fields) => Ok(StructFields::Object(fields.into_entries())),
+        Value::Array(values) => {
+            let actual = values.len();
+            Ok(StructFields::Sequence { names, values: values.into_iter(), index: 0, actual })
+        }
         value => Err(invalid_type(value, expected)),
     }
 }

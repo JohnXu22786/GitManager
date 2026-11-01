@@ -345,9 +345,9 @@ pub(crate) fn decode_scope_request(value: Value, cx: &mut AllocationContext) -> 
 }
 
 pub(crate) fn decode_frozen_basis(value: Value, cx: &mut AllocationContext) -> Result<DecodedFrozenBasis, ValueDecodeError> {
-    let fields = struct_fields(value, "a struct FrozenBasis", BASIS_FIELDS, cx)?;
+    let mut fields = struct_fields_ordered(value, "a struct FrozenBasis", BASIS_FIELDS)?;
     let (mut snapshot, mut revision, mut active, mut data, mut session, mut day, mut decisions) = (None, None, None, None, None, None, None);
-    for (key, value) in fields.into_iter() { match key.as_str() {
+    while let Some((key, value)) = fields.next(cx)? { match key.as_str() {
         "snapshot" => snapshot = Some(digest(value)?), "revision" => revision = Some(u64_value(value)?),
         "active" => active = Some(digest(value)?), "data" => data = Some(decode_data_snapshot_fallible(value, cx)?),
         "session" => session = Some(decode_session_state_fallible(value, cx)?), "day" => day = Some(i32_value(value)?),
@@ -663,6 +663,33 @@ fn struct_fields(value: Value, expected: &'static str, names: &'static [&'static
             for (name, value) in names.iter().zip(values.into_iter().take(names.len())) { fields.push((product_alloc::try_copy_str(name, cx, AllocationSite::String)?, value)); }
             Ok(fields.into_iter())
         }
+        value => Err(invalid_type(value, expected)),
+    }
+}
+enum OrderedStructFields {
+    Object(std::vec::IntoIter<(String, Value)>),
+    Sequence { names: &'static [&'static str], values: std::vec::IntoIter<Value>, index: usize, actual: usize },
+}
+impl OrderedStructFields {
+    fn next(&mut self, cx: &mut AllocationContext) -> Result<Option<(String, Value)>, ValueDecodeError> {
+        match self {
+            Self::Object(fields) => Ok(fields.next()),
+            Self::Sequence { names, values, index, actual } => {
+                if let Some(name) = names.get(*index) {
+                    let Some(value) = values.next() else { return Err(ValueDecodeError::InvalidLength { actual: *actual, expected: names.len() }); };
+                    *index += 1;
+                    Ok(Some((product_alloc::try_copy_str(name, cx, AllocationSite::String)?, value)))
+                } else if values.next().is_some() {
+                    Err(ValueDecodeError::InvalidLength { actual: *actual, expected: names.len() })
+                } else { Ok(None) }
+            }
+        }
+    }
+}
+fn struct_fields_ordered(value: Value, expected: &'static str, names: &'static [&'static str]) -> Result<OrderedStructFields, ValueDecodeError> {
+    match value {
+        Value::Object(fields) => Ok(OrderedStructFields::Object(fields.into_entries())),
+        Value::Array(values) => { let actual = values.len(); Ok(OrderedStructFields::Sequence { names, values: values.into_iter(), index: 0, actual }) }
         value => Err(invalid_type(value, expected)),
     }
 }

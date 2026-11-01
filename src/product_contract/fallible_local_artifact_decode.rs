@@ -3,7 +3,6 @@
 //! The private DTO uses the existing fallible field/value leaves and keeps
 //! semantic artifact validation in the existing caller.
 use crate::product_alloc::{self, AllocationContext, AllocationSite};
-use crate::product_alloc::ordered::OrderedMap;
 use crate::product_json::{Number, Value};
 use serde::Serialize;
 
@@ -29,7 +28,7 @@ pub(crate) fn decode_local_artifact(
     value: Value,
     cx: &mut AllocationContext,
 ) -> Result<DecodedLocalArtifact, ValueDecodeError> {
-    let fields = struct_fields(value, "a struct LocalArtifact", LOCAL_ARTIFACT_FIELDS, cx)?;
+    let mut fields = struct_fields(value, "a struct LocalArtifact", LOCAL_ARTIFACT_FIELDS)?;
     let mut output = None;
     let mut format = None;
     let mut columns = None;
@@ -37,7 +36,7 @@ pub(crate) fn decode_local_artifact(
     let mut bytes = None;
     let mut bytes_digest = None;
     let mut digest_value = None;
-    for (key, value) in fields.into_entries() {
+    while let Some((key, value)) = fields.next(cx)? {
         match key.as_str() {
             "output" => output = Some(string(value, "a string")?),
             "format" => format = Some(output_format(value)?),
@@ -140,20 +139,37 @@ fn digest(value: Value) -> Result<Digest, ValueDecodeError> {
     Digest::from_owned_lower_hex(value).ok_or(ValueDecodeError::InvalidFormat("invalid lowercase digest"))
 }
 
-fn struct_fields(value: Value, expected: &'static str, names: &'static [&'static str], cx: &mut AllocationContext) -> Result<OrderedMap<String, Value>, ValueDecodeError> {
+enum StructFields {
+    Object(std::vec::IntoIter<(String, Value)>),
+    Sequence { names: &'static [&'static str], values: std::vec::IntoIter<Value>, index: usize, actual: usize },
+}
+impl StructFields {
+    fn next(&mut self, cx: &mut AllocationContext) -> Result<Option<(String, Value)>, ValueDecodeError> {
+        match self {
+            Self::Object(fields) => Ok(fields.next()),
+            Self::Sequence { names, values, index, actual } => {
+                if let Some(name) = names.get(*index) {
+                    let Some(value) = values.next() else {
+                        return Err(ValueDecodeError::InvalidLength { actual: *actual, expected: names.len() });
+                    };
+                    *index += 1;
+                    let name = product_alloc::try_copy_str(name, cx, AllocationSite::String)?;
+                    Ok(Some((name, value)))
+                } else if values.next().is_some() {
+                    Err(ValueDecodeError::InvalidLength { actual: *actual, expected: names.len() })
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
+}
+fn struct_fields(value: Value, expected: &'static str, names: &'static [&'static str]) -> Result<StructFields, ValueDecodeError> {
     match value {
-        Value::Object(fields) => Ok(fields),
+        Value::Object(fields) => Ok(StructFields::Object(fields.into_entries())),
         Value::Array(values) => {
-            if values.len() != names.len() {
-                return Err(ValueDecodeError::InvalidLength { actual: values.len(), expected: names.len() });
-            }
-            let mut fields = OrderedMap::new();
-            fields.try_reserve(names.len(), cx)?;
-            for (name, value) in names.iter().zip(values) {
-                let key = product_alloc::try_copy_str(name, cx, AllocationSite::String)?;
-                fields.try_insert(key, value, cx)?;
-            }
-            Ok(fields)
+            let actual = values.len();
+            Ok(StructFields::Sequence { names, values: values.into_iter(), index: 0, actual })
         }
         value => Err(invalid_type(value, expected)),
     }
@@ -301,15 +317,31 @@ mod tests {
     fn struct_sequence_rejects_missing_and_trailing_elements_like_from_value() {
         let mut cx = AllocationContext::new();
         assert!(matches!(
-            decode_local_artifact(Value::Array(vec![Value::Null]), &mut cx),
+            decode_local_artifact(Value::Array(vec![Value::String("output".into())]), &mut cx),
             Err(ValueDecodeError::InvalidLength { actual: 1, expected: 7 })
         ));
-        let trailing = Value::Array(std::iter::repeat_with(|| Value::Null).take(8).collect());
+        let [artifact, _] = artifacts();
+        let serde_json::Value::Object(fields) = serde_json::to_value(&artifact).unwrap() else { unreachable!() };
+        let mut trailing_values: Vec<_> = LOCAL_ARTIFACT_FIELDS.iter().map(|name| fields[*name].clone()).collect();
+        trailing_values.push(serde_json::Value::Null);
+        let trailing_source = serde_json::to_vec(&serde_json::Value::Array(trailing_values)).unwrap();
+        let trailing = syntax(&trailing_source);
         assert!(matches!(
             decode_local_artifact(trailing, &mut AllocationContext::new()),
             Err(ValueDecodeError::InvalidLength { actual: 8, expected: 7 })
         ));
         assert!(serde_json::from_value::<LocalArtifact>(serde_json::json!([null,null,null,null,null,null,null,null])).is_err());
+
+        let mut sequence = serde_json::json!(artifacts()[0]);
+        let serde_json::Value::Object(fields) = sequence else { unreachable!() };
+        let mut values: Vec<_> = LOCAL_ARTIFACT_FIELDS.iter().map(|name| fields[*name].clone()).collect();
+        values[0] = serde_json::Value::Bool(false);
+        values.push(serde_json::Value::Null);
+        let sequence = serde_json::Value::Array(values);
+        let serde_error = serde_json::from_value::<LocalArtifact>(sequence.clone()).unwrap_err().to_string();
+        assert!(serde_error.contains("string"), "Serde validates the first field before trailing length: {serde_error}");
+        let input = serde_json::to_vec(&sequence).unwrap();
+        assert!(matches!(decode_local_artifact(syntax(&input), &mut AllocationContext::new()), Err(ValueDecodeError::InvalidType { expected: "a string", .. })));
     }
 
     #[test]

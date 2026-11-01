@@ -3,7 +3,6 @@
 //! This stays disconnected from production persistence. Nested scenario and
 //! run evidence graphs are composed from their Product Contract DTO decoders.
 use crate::product_alloc::{self, AllocationContext, AllocationSite};
-use crate::product_alloc::ordered::OrderedMap;
 use crate::product_contract::{
     decode_record_ref_fallible, decode_run_evidence_fallible,
     decode_scenario_spec_fallible, Digest, FallibleDecodedRunEvidence,
@@ -17,7 +16,6 @@ use super::owned_contract::OwnedSourceSide;
 
 const WITNESS_FIELDS: &[&str] = &["side", "scenario", "completed", "unfinished"];
 const LIFECYCLE_FIELDS: &[&str] = &["version", "witnesses", "evidence", "disclosure", "event", "origin"];
-const SCENARIO_FIELDS: &[&str] = &["version", "id", "label", "seed", "session", "clock_day", "random_seed", "inputs", "validity"];
 const ORIGINS: &[&str] = &["explicit_host_ui", "synthetic_operator_fixture"];
 const SOURCE_SIDES: &[&str] = &["before", "after"];
 
@@ -50,10 +48,10 @@ pub(crate) fn decode_owned_lifecycle_v2(
     value: Value,
     cx: &mut AllocationContext,
 ) -> Result<DecodedOwnedLifecycleV2, ValueDecodeError> {
-    let fields = struct_fields(value, "a struct OwnedLifecycleV2", LIFECYCLE_FIELDS, cx)?;
+    let mut fields = struct_fields(value, "a struct OwnedLifecycleV2", LIFECYCLE_FIELDS)?;
     let (mut version, mut witnesses, mut evidence, mut disclosure, mut event, mut decoded_origin) =
         (None, None, None, None, None, None);
-    for (key, value) in fields.into_entries() {
+    while let Some((key, value)) = fields.next(cx)? {
         match key.as_str() {
             "version" => version = Some(u32_value(value)?),
             "witnesses" => witnesses = Some(decode_vec(value, "lifecycle witness count", cx, decode_witness)?),
@@ -75,9 +73,9 @@ pub(crate) fn decode_owned_lifecycle_v2(
 }
 
 fn decode_witness(value: Value, cx: &mut AllocationContext) -> Result<DecodedLifecycleWitness, ValueDecodeError> {
-    let fields = struct_fields(value, "a struct LifecycleWitness", WITNESS_FIELDS, cx)?;
+    let mut fields = struct_fields(value, "a struct LifecycleWitness", WITNESS_FIELDS)?;
     let (mut side, mut scenario, mut completed, mut unfinished) = (None, None, None, None);
-    for (key, value) in fields.into_entries() {
+    while let Some((key, value)) = fields.next(cx)? {
         match key.as_str() {
             "side" => side = Some(source_side(value)?),
             "scenario" => scenario = Some(decode_scenario(value, cx)?),
@@ -116,21 +114,7 @@ fn decode_vec<T>(
 }
 
 fn decode_scenario(value: Value, cx: &mut AllocationContext) -> Result<FallibleDecodedScenarioSpec, ValueDecodeError> {
-    match value {
-        Value::Array(values) => {
-            if values.len() != SCENARIO_FIELDS.len() {
-                return Err(ValueDecodeError::InvalidLength { actual: values.len(), expected: SCENARIO_FIELDS.len() });
-            }
-            let mut fields = OrderedMap::new();
-            fields.try_reserve(SCENARIO_FIELDS.len(), cx)?;
-            for (name, value) in SCENARIO_FIELDS.iter().zip(values) {
-                let name = product_alloc::try_copy_str(name, cx, AllocationSite::String)?;
-                fields.try_insert(name, value, cx)?;
-            }
-            decode_scenario_spec_fallible(Value::Object(fields), cx)
-        }
-        value => decode_scenario_spec_fallible(value, cx),
-    }
+    decode_scenario_spec_fallible(value, cx)
 }
 
 fn source_side(value: Value) -> Result<OwnedSourceSide, ValueDecodeError> {
@@ -174,20 +158,44 @@ fn unit_variant(value: Value, variants: &'static [&'static str], expected: &'sta
     }
 }
 
-fn struct_fields(value: Value, expected: &'static str, names: &'static [&'static str], cx: &mut AllocationContext) -> Result<OrderedMap<String, Value>, ValueDecodeError> {
+enum StructFields {
+    Object(std::vec::IntoIter<(String, Value)>),
+    Sequence {
+        names: &'static [&'static str],
+        values: std::vec::IntoIter<Value>,
+        index: usize,
+        actual: usize,
+    },
+}
+
+impl StructFields {
+    fn next(&mut self, cx: &mut AllocationContext) -> Result<Option<(String, Value)>, ValueDecodeError> {
+        match self {
+            Self::Object(fields) => Ok(fields.next()),
+            Self::Sequence { names, values, index, actual } => {
+                if let Some(name) = names.get(*index) {
+                    let Some(value) = values.next() else {
+                        return Err(ValueDecodeError::InvalidLength { actual: *actual, expected: names.len() });
+                    };
+                    *index += 1;
+                    let name = product_alloc::try_copy_str(name, cx, AllocationSite::String)?;
+                    Ok(Some((name, value)))
+                } else if values.next().is_some() {
+                    Err(ValueDecodeError::InvalidLength { actual: *actual, expected: names.len() })
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
+}
+
+fn struct_fields(value: Value, expected: &'static str, names: &'static [&'static str]) -> Result<StructFields, ValueDecodeError> {
     match value {
-        Value::Object(fields) => Ok(fields),
+        Value::Object(fields) => Ok(StructFields::Object(fields.into_entries())),
         Value::Array(values) => {
-            if values.len() != names.len() {
-                return Err(ValueDecodeError::InvalidLength { actual: values.len(), expected: names.len() });
-            }
-            let mut fields = OrderedMap::new();
-            fields.try_reserve(names.len(), cx)?;
-            for (name, value) in names.iter().zip(values) {
-                let name = product_alloc::try_copy_str(name, cx, AllocationSite::String)?;
-                fields.try_insert(name, value, cx)?;
-            }
-            Ok(fields)
+            let actual = values.len();
+            Ok(StructFields::Sequence { names, values: values.into_iter(), index: 0, actual })
         }
         value => Err(invalid_type(value, expected)),
     }
@@ -311,6 +319,17 @@ mod tests {
         value = SerdeValue::Array(root_sequence);
         let expected: OwnedLifecycleV2 = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(canonical(&expected), canonical(&decode(&value, &mut AllocationContext::new()).unwrap()));
+
+        let mut baseline = AllocationContext::new();
+        decode(&value, &mut baseline).unwrap();
+        let growths = baseline.growth_requests();
+        assert!(growths > 0);
+        for ordinal in 1..=growths {
+            let mut cx = AllocationContext::fail_nth_growth(NonZeroUsize::new(ordinal).unwrap(), true);
+            assert!(matches!(decode(&value, &mut cx), Err(ValueDecodeError::Allocation(_))), "growth {ordinal}/{growths}");
+            let retry = decode(&value, &mut AllocationContext::new()).unwrap();
+            assert_eq!(canonical(&expected), canonical(&retry));
+        }
     }
 
     #[test]
@@ -339,6 +358,24 @@ mod tests {
         let value = SerdeValue::Array(sequence);
         assert!(serde_json::from_value::<OwnedLifecycleV2>(value.clone()).is_err());
         assert!(matches!(decode(&value, &mut AllocationContext::new()), Err(ValueDecodeError::InvalidLength { actual: 7, expected: 6 })));
+    }
+
+    #[test]
+    fn nested_scenario_sequence_errors_follow_declared_field_order() {
+        let mut value = fixture("explicit_host_ui");
+        let scenario = value["witnesses"][0]["scenario"].as_object().unwrap();
+        let fields = ["version", "id", "label", "seed", "session", "clock_day", "random_seed", "inputs", "validity"];
+        let mut sequence: Vec<_> = fields.iter().map(|field| scenario[*field].clone()).collect();
+        sequence[0] = json!("bad version");
+        sequence[6] = json!(-1);
+        value["witnesses"][0]["scenario"] = SerdeValue::Array(sequence);
+        assert!(matches!(decode(&value, &mut AllocationContext::new()), Err(ValueDecodeError::InvalidType { expected: "u32", .. })));
+
+        let value = fixture("explicit_host_ui");
+        let root = value.as_object().unwrap();
+        let sequence = vec![json!("bad version"), root["witnesses"].clone(), root["evidence"].clone(), root["disclosure"].clone(), root["event"].clone(), root["origin"].clone(), json!(null)];
+        let value = SerdeValue::Array(sequence);
+        assert!(matches!(decode(&value, &mut AllocationContext::new()), Err(ValueDecodeError::InvalidType { expected: "u32", .. })));
     }
 
     #[test]

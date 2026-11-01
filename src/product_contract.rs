@@ -156,6 +156,10 @@ pub(crate) struct FallibleDecodedCapturedProgram(fallible_capture_decode::Decode
 pub(crate) struct FallibleDecodedScenarioSpec(fallible_scenario_decode::DecodedScenarioSpec);
 #[derive(Debug, Serialize)]
 pub(crate) struct FallibleDecodedRunEvidence(fallible_run_evidence_decode::DecodedRunEvidence);
+#[derive(Debug, Serialize)]
+pub(crate) struct FallibleDecodedDecisionGraph(fallible_decision_decode::DecodedDecisionGraph);
+#[derive(Debug, Serialize)]
+pub(crate) struct FallibleDecodedLocalArtifact(fallible_local_artifact_decode::DecodedLocalArtifact);
 pub(crate) fn decode_data_snapshot_fallible(
     value: crate::product_json::Value,
     cx: &mut crate::product_alloc::AllocationContext,
@@ -191,6 +195,18 @@ pub(crate) fn decode_run_evidence_fallible(
     cx: &mut crate::product_alloc::AllocationContext,
 ) -> std::result::Result<FallibleDecodedRunEvidence, fallible_value_decode::ValueDecodeError> {
     fallible_run_evidence_decode::decode_run_evidence(value, cx).map(FallibleDecodedRunEvidence)
+}
+pub(crate) fn decode_decision_graph_fallible(
+    value: crate::product_json::Value,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<FallibleDecodedDecisionGraph, fallible_value_decode::ValueDecodeError> {
+    fallible_decision_decode::decode_decision_graph(value, cx).map(FallibleDecodedDecisionGraph)
+}
+pub(crate) fn decode_local_artifact_fallible(
+    value: crate::product_json::Value,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<FallibleDecodedLocalArtifact, fallible_value_decode::ValueDecodeError> {
+    fallible_local_artifact_decode::decode_local_artifact(value, cx).map(FallibleDecodedLocalArtifact)
 }
 
 #[path = "product_contract/fallible_decision_decode.rs"]

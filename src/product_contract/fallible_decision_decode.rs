@@ -111,11 +111,11 @@ pub(super) fn decode_decision_graph(
     value: Value,
     cx: &mut AllocationContext,
 ) -> Result<DecodedDecisionGraph, ValueDecodeError> {
-    let fields = object(value, "a struct DecisionGraph")?;
+    let mut fields = struct_fields(value, "a struct DecisionGraph", GRAPH_FIELDS)?;
     let mut version = None;
     let mut revision = None;
     let mut decoded_decisions = None;
-    for (key, value) in fields.into_entries() {
+    while let Some((key, value)) = fields.next(cx)? {
         match key.as_str() {
             "version" => version = Some(integer_u32(value)?),
             "revision" => revision = Some(integer_u64(value)?),
@@ -142,7 +142,7 @@ fn decisions(value: Value, cx: &mut AllocationContext) -> Result<Vec<DecodedScop
 }
 
 fn decode_scoped_decision(value: Value, cx: &mut AllocationContext) -> Result<DecodedScopedDecision, ValueDecodeError> {
-    let fields = object(value, "a struct ScopedDecision")?;
+    let mut fields = struct_fields(value, "a struct ScopedDecision", SCOPED_DECISION_FIELDS)?;
     let mut id = None;
     let mut revision = None;
     let mut request = None;
@@ -154,7 +154,7 @@ fn decode_scoped_decision(value: Value, cx: &mut AllocationContext) -> Result<De
     let mut scenarios = None;
     let mut witness = None;
     let mut supersedes = None;
-    for (key, value) in fields.into_entries() {
+    while let Some((key, value)) = fields.next(cx)? {
         match key.as_str() {
             "id" => id = Some(string(value)?),
             "revision" => revision = Some(integer_u64(value)?),
@@ -186,13 +186,13 @@ fn decode_scoped_decision(value: Value, cx: &mut AllocationContext) -> Result<De
 }
 
 fn decode_decision_scope(value: Value, cx: &mut AllocationContext) -> Result<DecodedDecisionScope, ValueDecodeError> {
-    let fields = object(value, "a struct DecisionScope")?;
+    let mut fields = struct_fields(value, "a struct DecisionScope", DECISION_SCOPE_FIELDS)?;
     let mut operations = None;
     let mut population = None;
     let mut conditions = None;
     let mut excluded_records = None;
     let mut unknowns = None;
-    for (key, value) in fields.into_entries() {
+    while let Some((key, value)) = fields.next(cx)? {
         match key.as_str() {
             "operations" => operations = Some(string_set(value, cx, "decision operation count")?),
             "population" => population = Some(decode_population(value, cx)?),
@@ -212,11 +212,11 @@ fn decode_decision_scope(value: Value, cx: &mut AllocationContext) -> Result<Dec
 }
 
 fn decode_unknown_boundary(value: Value, cx: &mut AllocationContext) -> Result<DecodedUnknownBoundary, ValueDecodeError> {
-    let fields = object(value, "a struct UnknownBoundary")?;
+    let mut fields = struct_fields(value, "a struct UnknownBoundary", UNKNOWN_BOUNDARY_FIELDS)?;
     let mut id = None;
     let mut operations = None;
     let mut description = None;
-    for (key, value) in fields.into_entries() {
+    while let Some((key, value)) = fields.next(cx)? {
         match key.as_str() {
             "id" => id = Some(string(value)?),
             "operations" => operations = Some(string_set(value, cx, "unknown boundary operation count")?),
@@ -323,12 +323,12 @@ fn accepted_properties(value: Value, cx: &mut AllocationContext) -> Result<Vec<A
 }
 
 pub(super) fn decode_accepted_property(value: Value, cx: &mut AllocationContext) -> Result<AcceptedProperty, ValueDecodeError> {
-    let fields = object(value, "a struct AcceptedProperty")?;
+    let mut fields = struct_fields(value, "a struct AcceptedProperty", ACCEPTED_PROPERTY_FIELDS)?;
     let mut id = None;
     let mut description = None;
     let mut predicate = None;
     let mut budget = PropertyBudget { nodes: 0 };
-    for (key, value) in fields.into_entries() {
+    while let Some((key, value)) = fields.next(cx)? {
         match key.as_str() {
             "id" => id = Some(string(value)?),
             "description" => description = Some(string(value)?),
@@ -707,6 +707,53 @@ fn digest_field(
     required(decoded, field)
 }
 
+enum StructFields {
+    Object(std::vec::IntoIter<(String, Value)>),
+    Sequence {
+        names: &'static [&'static str],
+        values: std::vec::IntoIter<Value>,
+        index: usize,
+        actual: usize,
+    },
+}
+
+impl StructFields {
+    fn next(&mut self, cx: &mut AllocationContext) -> Result<Option<(String, Value)>, ValueDecodeError> {
+        match self {
+            Self::Object(fields) => Ok(fields.next()),
+            Self::Sequence { names, values, index, actual } => {
+                if let Some(name) = names.get(*index) {
+                    let Some(value) = values.next() else {
+                        return Err(ValueDecodeError::InvalidLength { actual: *actual, expected: names.len() });
+                    };
+                    *index += 1;
+                    let name = product_alloc::try_copy_str(name, cx, AllocationSite::String)?;
+                    Ok(Some((name, value)))
+                } else if values.next().is_some() {
+                    Err(ValueDecodeError::InvalidLength { actual: *actual, expected: names.len() })
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
+}
+
+fn struct_fields(
+    value: Value,
+    expected: &'static str,
+    names: &'static [&'static str],
+) -> Result<StructFields, ValueDecodeError> {
+    match value {
+        Value::Object(fields) => Ok(StructFields::Object(fields.into_entries())),
+        Value::Array(values) => {
+            let actual = values.len();
+            Ok(StructFields::Sequence { names, values: values.into_iter(), index: 0, actual })
+        }
+        value => Err(invalid_type(value, expected)),
+    }
+}
+
 fn object(
     value: Value,
     expected: &'static str,
@@ -801,7 +848,7 @@ mod tests {
         let ValueDecodeError::Allocation(failure) = error else { panic!("expected allocation refusal") };
         assert_eq!(Some(failure), cx.first_failure());
         assert_eq!(failure.kind, AllocationFailureKind::Injected);
-        assert!(matches!(failure.site, AllocationSite::Vector | AllocationSite::OrderedMap | AllocationSite::OrderedSet | AllocationSite::Box));
+        assert!(matches!(failure.site, AllocationSite::Vector | AllocationSite::Bytes | AllocationSite::String | AllocationSite::OrderedMap | AllocationSite::OrderedSet | AllocationSite::Box));
     }
 
     fn graph_source() -> String {
@@ -815,6 +862,51 @@ mod tests {
         let mut cx = AllocationContext::new();
         let decoded = decode_decision_graph(syntax(&source), &mut cx).unwrap();
         assert_eq!(super::super::canonical_bytes(&expected).unwrap(), super::super::canonical_bytes(&decoded).unwrap());
+    }
+
+    fn struct_sequence(value: &mut serde_json::Value, fields: &[&str]) {
+        let object = value.as_object().expect("fixture struct object");
+        let sequence = fields.iter().map(|field| object[*field].clone()).collect();
+        *value = serde_json::Value::Array(sequence);
+    }
+
+    #[test]
+    fn nested_struct_sequences_match_serde_and_canonical_bytes() {
+        let mut value: serde_json::Value = serde_json::from_str(&graph_source()).unwrap();
+        let decision = &mut value["decisions"][0];
+        let scope = &mut decision["scope"];
+        struct_sequence(&mut scope["excluded_records"][0], &["entity", "record"]);
+        struct_sequence(&mut scope["unknowns"][0], &["id", "operations", "description"]);
+        struct_sequence(scope, &["operations", "population", "conditions", "excluded_records", "unknowns"]);
+        struct_sequence(&mut decision["obligations"][0], &["id", "description", "predicate"]);
+        struct_sequence(decision, &["id", "revision", "request", "rationale", "scope", "outcome", "status", "obligations", "scenarios", "witness", "supersedes"]);
+        struct_sequence(&mut value, &["version", "revision", "decisions"]);
+
+        let expected: super::super::DecisionGraph = serde_json::from_value(value.clone()).unwrap();
+        let source = serde_json::to_vec(&value).unwrap();
+        let decoded = decode_decision_graph(
+            product_json::parse_json_bytes(&source, &mut AllocationContext::new()).unwrap(),
+            &mut AllocationContext::new(),
+        ).unwrap();
+        assert_eq!(super::super::canonical_bytes(&expected).unwrap(), super::super::canonical_bytes(&decoded).unwrap());
+
+        let source = String::from_utf8(source).unwrap();
+        let mut baseline = AllocationContext::new();
+        decode_decision_graph(syntax(&source), &mut baseline).unwrap();
+        let growths = baseline.growth_requests();
+        assert!(growths > 0);
+        for ordinal in 1..=growths {
+            let mut cx = AllocationContext::fail_nth_growth(NonZeroUsize::new(ordinal).unwrap(), true);
+            allocation(decode_decision_graph(syntax(&source), &mut cx).unwrap_err(), &cx);
+            let retry = decode_decision_graph(syntax(&source), &mut AllocationContext::new()).unwrap();
+            assert_eq!(super::super::canonical_bytes(&expected).unwrap(), super::super::canonical_bytes(&retry).unwrap());
+        }
+    }
+
+    #[test]
+    fn decision_graph_sequence_errors_follow_declared_field_order() {
+        let value = Value::Array(vec![Value::String("bad version".into()), Value::Number(Number::I64(-1)), Value::Array(vec![]), Value::Null]);
+        assert!(matches!(decode_decision_graph(value, &mut AllocationContext::new()), Err(ValueDecodeError::InvalidType { expected: "u32", .. })));
     }
 
     #[test]
