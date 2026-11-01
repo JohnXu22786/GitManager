@@ -150,6 +150,10 @@ mod fallible_snapshot_decode;
 pub(crate) struct FallibleDecodedDataSnapshot(fallible_snapshot_decode::DecodedDataSnapshot);
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct FallibleDecodedSessionState(fallible_persisted_decode::DecodedSessionState);
+#[derive(Debug, Serialize)]
+pub(crate) struct FallibleDecodedCapturedProgram(fallible_capture_decode::DecodedCapturedProgram);
+#[derive(Debug, Serialize)]
+pub(crate) struct FallibleDecodedScenarioSpec(fallible_scenario_decode::DecodedScenarioSpec);
 pub(crate) fn decode_data_snapshot_fallible(
     value: crate::product_json::Value,
     cx: &mut crate::product_alloc::AllocationContext,
@@ -167,6 +171,18 @@ pub(crate) fn decode_record_ref_fallible(
     cx: &mut crate::product_alloc::AllocationContext,
 ) -> std::result::Result<RecordRef, fallible_value_decode::ValueDecodeError> {
     fallible_persisted_decode::decode_record_ref(value, cx)
+}
+pub(crate) fn decode_captured_program_fallible(
+    value: crate::product_json::Value,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<FallibleDecodedCapturedProgram, fallible_value_decode::ValueDecodeError> {
+    fallible_capture_decode::decode_captured_program(value, cx).map(FallibleDecodedCapturedProgram)
+}
+pub(crate) fn decode_scenario_spec_fallible(
+    value: crate::product_json::Value,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<FallibleDecodedScenarioSpec, fallible_value_decode::ValueDecodeError> {
+    fallible_scenario_decode::decode_scenario_spec(value, cx).map(FallibleDecodedScenarioSpec)
 }
 
 #[path = "product_contract/fallible_decision_decode.rs"]

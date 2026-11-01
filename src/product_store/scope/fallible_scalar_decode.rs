@@ -3,13 +3,13 @@
 //! These DTOs are intentionally not connected to production persistence yet.
 //! They compose the existing Product Contract fallible decoders and retain
 //! ordered fallible ownership where the persisted model uses BTreeSet.
-use crate::product_alloc::{self, ordered::OrderedSet, AllocationContext, AllocationSite};
+use crate::product_alloc::{self, ordered::{OrderedMap, OrderedSet}, AllocationContext, AllocationSite};
 use crate::product_contract::fallible_expr_decode::decode_expr;
 use crate::product_contract::fallible_value_decode::{decode_type, decode_values, JsonKind, NumericValue, ValueDecodeError};
-use crate::product_contract::{decode_data_snapshot_fallible, decode_record_ref_fallible, decode_session_state_fallible, CompatibilityState, Digest, Expr, FallibleDecodedDataSnapshot, FallibleDecodedSessionState, FallibleValues, RecordRef, SemanticKind, Type, MAX_COLLECTION, MAX_EVENTS, MAX_EXPR_DEPTH, MAX_ITEMS};
+use crate::product_contract::{decode_captured_program_fallible, decode_data_snapshot_fallible, decode_record_ref_fallible, decode_scenario_spec_fallible, decode_session_state_fallible, CompatibilityState, Digest, Expr, FallibleDecodedCapturedProgram, FallibleDecodedDataSnapshot, FallibleDecodedScenarioSpec, FallibleDecodedSessionState, FallibleValues, RecordRef, SemanticKind, Type, MAX_COLLECTION, MAX_EVENTS, MAX_EXPR_DEPTH, MAX_ITEMS};
 use super::contract::ScopeTransition;
 use crate::product_json::{Number, Value};
-use serde::ser::SerializeSeq;
+use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Serialize, Serializer};
 
 const POPULATION_VARIANTS: &[&str] = &["all", "future_work", "selected_unfinished"];
@@ -35,6 +35,12 @@ const SEMANTIC_KEY_FIELDS: &[&str] = &["kind", "entity", "id"];
 const COMPATIBILITY_FIELDS: &[&str] = &["state", "current_data", "target_program", "retained_records", "retained_events", "retained_fields", "issues"];
 const SEMANTIC_KINDS: &[&str] = &["entity", "field", "action", "observable", "output", "view"];
 const COMPATIBILITY_STATES: &[&str] = &["compatible", "retained_but_unavailable", "incompatible", "unknown"];
+const SCOPED_ADOPTION_FIELDS: &[&str] = &["decisions", "plan", "composition", "initialization", "initialized_compatibility", "revision"];
+const MANAGED_REHEARSAL_FIELDS: &[&str] = &["version", "manifest", "seed", "layer", "initialization", "compatibility", "recorded_by", "recorded_revision", "witnesses"];
+const SCOPE_CORRESPONDENCE_FIELDS: &[&str] = &["source", "original", "target", "day", "projected", "operation_seed", "scenario"];
+const SCENARIO_CORRESPONDENCE_FIELDS: &[&str] = &["original", "projected"];
+const CORRESPONDENCE_RECEIPT_FIELDS: &[&str] = &["proof", "operation", "revision"];
+const SCOPE_STATE_FIELDS: &[&str] = &["version", "layers", "compositions", "initializations", "adoptions", "rehearsals", "correspondences"];
 const MAX_SCOPE_REWRITES: usize = super::contract::MAX_LAYERS * MAX_ITEMS;
 
 /// BTreeSet-compatible unique Id sequence with allocation-aware growth.
@@ -190,6 +196,69 @@ pub(crate) struct DecodedCompatibilityReport {
     state: CompatibilityState, current_data: Digest, target_program: Digest,
     retained_records: Vec<RecordRef>, retained_events: Vec<String>,
     retained_fields: Vec<DecodedSemanticKey>, issues: Vec<String>,
+}
+pub(crate) struct FallibleScopeMap<K, V>(OrderedMap<K, V>);
+impl<K, V> FallibleScopeMap<K, V> {
+    fn new() -> Self { Self(OrderedMap::new()) }
+    pub(crate) fn len(&self) -> usize { self.0.len() }
+    pub(crate) fn is_empty(&self) -> bool { self.0.is_empty() }
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&K, &V)> { self.0.iter() }
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &K> { self.0.iter().map(|(key, _)| key) }
+}
+impl<K: Ord, V> FallibleScopeMap<K, V> {
+    fn insert(&mut self, key: K, value: V, cx: &mut AllocationContext) -> Result<Option<V>, ValueDecodeError> {
+        self.0.try_insert(key, value, cx).map_err(ValueDecodeError::Allocation)
+    }
+}
+impl<K: std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug for FallibleScopeMap<K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map().entries(self.0.iter()).finish()
+    }
+}
+impl<K: Serialize, V: Serialize> Serialize for FallibleScopeMap<K, V> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (key, value) in self.0.iter() { map.serialize_entry(key, value)?; }
+        map.end()
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DecodedScopedAdoptionReceipt {
+    decisions: Vec<String>, plan: Digest, composition: Digest,
+    initialization: Option<Digest>, initialized_compatibility: DecodedCompatibilityReport,
+    revision: u64,
+}
+#[derive(Debug, Serialize)]
+pub(crate) struct DecodedManagedRehearsal {
+    version: u32, manifest: DecodedCompositionManifest, seed: Digest,
+    layer: Option<DecodedScopeLayer>, initialization: Option<DecodedMetadataInitializationReceipt>,
+    compatibility: DecodedCompatibilityReport, recorded_by: String, recorded_revision: u64,
+    witnesses: FallibleScopeMap<String, Digest>,
+}
+#[derive(Debug, Serialize)]
+pub(crate) struct DecodedScopeScenarioCorrespondence {
+    original: FallibleDecodedScenarioSpec, projected: FallibleDecodedScenarioSpec,
+}
+#[derive(Debug, Serialize)]
+pub(crate) struct DecodedScopeCorrespondence {
+    source: FallibleDecodedCapturedProgram, original: FallibleDecodedDataSnapshot,
+    target: Digest, day: i32, projected: Digest, operation_seed: Digest,
+    scenario: Option<DecodedScopeScenarioCorrespondence>,
+}
+#[derive(Debug, Serialize)]
+pub(crate) struct DecodedScopeCorrespondenceReceipt {
+    proof: DecodedScopeCorrespondence, operation: String, revision: u64,
+}
+#[derive(Debug, Serialize)]
+pub(crate) struct DecodedScopeState {
+    version: u32,
+    layers: FallibleScopeMap<Digest, DecodedScopeLayer>,
+    compositions: FallibleScopeMap<Digest, DecodedCompositionManifest>,
+    initializations: Vec<DecodedMetadataInitializationReceipt>,
+    adoptions: Vec<DecodedScopedAdoptionReceipt>,
+    rehearsals: FallibleScopeMap<Digest, DecodedManagedRehearsal>,
+    correspondences: FallibleScopeMap<Digest, DecodedScopeCorrespondenceReceipt>,
 }
 
 pub(crate) fn decode_scope_population(value: Value, cx: &mut AllocationContext) -> Result<ScopePopulationDto, ValueDecodeError> {
@@ -424,6 +493,88 @@ pub(crate) fn decode_compatibility_report(value: Value, cx: &mut AllocationConte
     Ok(DecodedCompatibilityReport { state: required(state, "state")?, current_data: required(current_data, "current_data")?, target_program: required(target_program, "target_program")?, retained_records: required(retained_records, "retained_records")?, retained_events: required(retained_events, "retained_events")?, retained_fields: required(retained_fields, "retained_fields")?, issues: required(issues, "issues")? })
 }
 
+pub(crate) fn decode_scoped_adoption_receipt(value: Value, cx: &mut AllocationContext) -> Result<DecodedScopedAdoptionReceipt, ValueDecodeError> {
+    let fields = struct_fields(value, "a struct ScopedAdoptionReceipt", SCOPED_ADOPTION_FIELDS, cx)?;
+    let (mut decisions, mut plan, mut composition, mut initialization, mut initialized_compatibility, mut revision) = (None, None, None, None, None, None);
+    for (key, value) in fields { match key.as_str() {
+        "decisions" => decisions = Some(decode_vec(value, MAX_ITEMS, "scoped adoption decision count", cx, |value, _| string(value, "a string"))?),
+        "plan" => plan = Some(digest(value)?), "composition" => composition = Some(digest(value)?),
+        "initialization" => initialization = Some(optional_digest(value)?),
+        "initialized_compatibility" => initialized_compatibility = Some(decode_compatibility_report(value, cx)?),
+        "revision" => revision = Some(u64_value(value)?), _ => return Err(unknown(key, SCOPED_ADOPTION_FIELDS)),
+    }}
+    Ok(DecodedScopedAdoptionReceipt { decisions: required(decisions, "decisions")?, plan: required(plan, "plan")?, composition: required(composition, "composition")?, initialization: initialization.unwrap_or(None), initialized_compatibility: required(initialized_compatibility, "initialized_compatibility")?, revision: required(revision, "revision")? })
+}
+
+pub(crate) fn decode_managed_rehearsal(value: Value, cx: &mut AllocationContext) -> Result<DecodedManagedRehearsal, ValueDecodeError> {
+    let fields = struct_fields(value, "a struct ManagedRehearsal", MANAGED_REHEARSAL_FIELDS, cx)?;
+    let (mut version, mut manifest, mut seed, mut layer, mut initialization, mut compatibility, mut recorded_by, mut recorded_revision, mut witnesses) = (None, None, None, None, None, None, None, None, None);
+    for (key, value) in fields { match key.as_str() {
+        "version" => version = Some(u32_value(value)?), "manifest" => manifest = Some(decode_composition_manifest(value, cx)?),
+        "seed" => seed = Some(digest(value)?),
+        "layer" => layer = Some(optional_decoded(value, cx, decode_scope_layer)?),
+        "initialization" => initialization = Some(optional_decoded(value, cx, decode_metadata_initialization_receipt)?),
+        "compatibility" => compatibility = Some(decode_compatibility_report(value, cx)?),
+        "recorded_by" => recorded_by = Some(string(value, "a string")?),
+        "recorded_revision" => recorded_revision = Some(u64_value(value)?),
+        "witnesses" => witnesses = Some(id_digest_map(value, MAX_ITEMS, "managed rehearsal witness count", cx)?),
+        _ => return Err(unknown(key, MANAGED_REHEARSAL_FIELDS)),
+    }}
+    Ok(DecodedManagedRehearsal { version: required(version, "version")?, manifest: required(manifest, "manifest")?, seed: required(seed, "seed")?, layer: layer.unwrap_or(None), initialization: initialization.unwrap_or(None), compatibility: required(compatibility, "compatibility")?, recorded_by: required(recorded_by, "recorded_by")?, recorded_revision: required(recorded_revision, "recorded_revision")?, witnesses: required(witnesses, "witnesses")? })
+}
+
+pub(crate) fn decode_scope_scenario_correspondence(value: Value, cx: &mut AllocationContext) -> Result<DecodedScopeScenarioCorrespondence, ValueDecodeError> {
+    let fields = struct_fields(value, "a struct ScopeScenarioCorrespondence", SCENARIO_CORRESPONDENCE_FIELDS, cx)?;
+    let (mut original, mut projected) = (None, None);
+    for (key, value) in fields { match key.as_str() {
+        "original" => original = Some(decode_scenario_spec_fallible(value, cx)?),
+        "projected" => projected = Some(decode_scenario_spec_fallible(value, cx)?),
+        _ => return Err(unknown(key, SCENARIO_CORRESPONDENCE_FIELDS)),
+    }}
+    Ok(DecodedScopeScenarioCorrespondence { original: required(original, "original")?, projected: required(projected, "projected")? })
+}
+
+pub(crate) fn decode_scope_correspondence(value: Value, cx: &mut AllocationContext) -> Result<DecodedScopeCorrespondence, ValueDecodeError> {
+    let fields = struct_fields(value, "a struct ScopeCorrespondence", SCOPE_CORRESPONDENCE_FIELDS, cx)?;
+    let (mut source, mut original, mut target, mut day, mut projected, mut operation_seed, mut scenario) = (None, None, None, None, None, None, None);
+    for (key, value) in fields { match key.as_str() {
+        "source" => source = Some(decode_captured_program_fallible(value, cx)?),
+        "original" => original = Some(decode_data_snapshot_fallible(value, cx)?),
+        "target" => target = Some(digest(value)?), "day" => day = Some(i32_value(value)?),
+        "projected" => projected = Some(digest(value)?), "operation_seed" => operation_seed = Some(digest(value)?),
+        "scenario" => scenario = Some(optional_decoded(value, cx, decode_scope_scenario_correspondence)?),
+        _ => return Err(unknown(key, SCOPE_CORRESPONDENCE_FIELDS)),
+    }}
+    Ok(DecodedScopeCorrespondence { source: required(source, "source")?, original: required(original, "original")?, target: required(target, "target")?, day: required(day, "day")?, projected: required(projected, "projected")?, operation_seed: required(operation_seed, "operation_seed")?, scenario: scenario.unwrap_or(None) })
+}
+
+pub(crate) fn decode_scope_correspondence_receipt(value: Value, cx: &mut AllocationContext) -> Result<DecodedScopeCorrespondenceReceipt, ValueDecodeError> {
+    let fields = struct_fields(value, "a struct ScopeCorrespondenceReceipt", CORRESPONDENCE_RECEIPT_FIELDS, cx)?;
+    let (mut proof, mut operation, mut revision) = (None, None, None);
+    for (key, value) in fields { match key.as_str() {
+        "proof" => proof = Some(decode_scope_correspondence(value, cx)?),
+        "operation" => operation = Some(string(value, "a string")?), "revision" => revision = Some(u64_value(value)?),
+        _ => return Err(unknown(key, CORRESPONDENCE_RECEIPT_FIELDS)),
+    }}
+    Ok(DecodedScopeCorrespondenceReceipt { proof: required(proof, "proof")?, operation: required(operation, "operation")?, revision: required(revision, "revision")? })
+}
+
+pub(crate) fn decode_scope_state(value: Value, cx: &mut AllocationContext) -> Result<DecodedScopeState, ValueDecodeError> {
+    let fields = struct_fields(value, "a struct ScopeState", SCOPE_STATE_FIELDS, cx)?;
+    let (mut version, mut layers, mut compositions, mut initializations, mut adoptions, mut rehearsals, mut correspondences) = (None, None, None, None, None, None, None);
+    for (key, value) in fields { match key.as_str() {
+        "version" => version = Some(u32_value(value)?),
+        "layers" => layers = Some(digest_map(value, super::contract::MAX_LAYERS, "scope-state layer count", cx, decode_scope_layer)?),
+        "compositions" => compositions = Some(digest_map(value, MAX_ITEMS, "scope-state composition count", cx, decode_composition_manifest)?),
+        "initializations" => initializations = Some(decode_vec(value, super::contract::MAX_LAYERS, "scope-state initialization receipt count", cx, decode_metadata_initialization_receipt)?),
+        "adoptions" => adoptions = Some(decode_vec(value, MAX_ITEMS, "scope-state adoption receipt count", cx, decode_scoped_adoption_receipt)?),
+        "rehearsals" => rehearsals = Some(digest_map(value, MAX_ITEMS, "scope-state rehearsal count", cx, decode_managed_rehearsal)?),
+        "correspondences" => correspondences = Some(digest_map(value, MAX_ITEMS, "scope-state correspondence count", cx, decode_scope_correspondence_receipt)?),
+        _ => return Err(unknown(key, SCOPE_STATE_FIELDS)),
+    }}
+    Ok(DecodedScopeState { version: required(version, "version")?, layers: required(layers, "layers")?, compositions: required(compositions, "compositions")?, initializations: required(initializations, "initializations")?, adoptions: required(adoptions, "adoptions")?, rehearsals: required(rehearsals, "rehearsals")?, correspondences: required(correspondences, "correspondences")? })
+}
+
 fn lifecycle_bindings(value: Value, cx: &mut AllocationContext) -> Result<Vec<LifecycleBindingDto>, ValueDecodeError> {
     decode_vec(value, MAX_ITEMS, "scope lifecycle count", cx, decode_lifecycle_binding)
 }
@@ -441,6 +592,26 @@ fn metadata_additions(value: Value, cx: &mut AllocationContext) -> Result<Vec<De
 }
 fn digest_vec(value: Value, limit: usize, resource: &'static str, cx: &mut AllocationContext) -> Result<Vec<Digest>, ValueDecodeError> {
     decode_vec(value, limit, resource, cx, |value, _| digest(value))
+}
+fn digest_map<V>(value: Value, limit: usize, resource: &'static str, cx: &mut AllocationContext, mut decode: impl FnMut(Value, &mut AllocationContext) -> Result<V, ValueDecodeError>) -> Result<FallibleScopeMap<Digest, V>, ValueDecodeError> {
+    decode_scope_map(value, limit, resource, cx, |key| Digest::from_owned_lower_hex(key).ok_or(ValueDecodeError::InvalidFormat("lowercase SHA-256 digest")), |value, cx| decode(value, cx))
+}
+fn id_digest_map(value: Value, limit: usize, resource: &'static str, cx: &mut AllocationContext) -> Result<FallibleScopeMap<String, Digest>, ValueDecodeError> {
+    decode_scope_map(value, limit, resource, cx, Ok, |value, _| digest(value))
+}
+fn decode_scope_map<K: Ord, V>(value: Value, limit: usize, resource: &'static str, cx: &mut AllocationContext, mut decode_key: impl FnMut(String) -> Result<K, ValueDecodeError>, mut decode_value: impl FnMut(Value, &mut AllocationContext) -> Result<V, ValueDecodeError>) -> Result<FallibleScopeMap<K, V>, ValueDecodeError> {
+    let entries = match value { Value::Object(entries) => entries, value => return Err(invalid_type(value, "a map")) };
+    bounded(entries.len(), limit, resource)?;
+    let mut out = FallibleScopeMap::new();
+    for (key, value) in entries.into_entries() {
+        let key = decode_key(key)?;
+        let value = decode_value(value, cx)?;
+        out.insert(key, value, cx)?;
+    }
+    Ok(out)
+}
+fn optional_decoded<T>(value: Value, cx: &mut AllocationContext, decode: impl FnOnce(Value, &mut AllocationContext) -> Result<T, ValueDecodeError>) -> Result<Option<T>, ValueDecodeError> {
+    match value { Value::Null => Ok(None), value => decode(value, cx).map(Some) }
 }
 fn digest_set(value: Value, limit: usize, resource: &'static str, cx: &mut AllocationContext) -> Result<FallibleDigestSet, ValueDecodeError> {
     let values = array(value)?; let mut set = FallibleDigestSet::new();
@@ -512,9 +683,10 @@ fn bounded(len: usize, limit: usize, resource: &'static str) -> Result<(), Value
 mod tests {
     use super::*;
     use crate::product_contract::canonical_bytes;
-    use crate::product_contract::{CompatibilityReport as ModelCompatibilityReport, CompatibilityState, SemanticKey as ModelSemanticKey, SemanticKind};
-    use super::super::contract::{CompositionManifest as ModelCompositionManifest, EffectDestination, EffectPatch as ModelEffectPatch, EffectPatchRequest, LifecycleBinding as ModelLifecycleBinding, MetadataAddition as ModelMetadataAddition, MetadataInitializationReceipt as ModelMetadataInitializationReceipt, ScopeLayer as ModelScopeLayer, ScopePopulation as ModelPopulation, ScopeRequest as ModelScopeRequest, ScopeSlotMapping as ModelScopeSlotMapping, ScopeTransition};
+    use crate::product_contract::{CapturedProgram, CompatibilityReport as ModelCompatibilityReport, CompatibilityState, Producer, SemanticKey as ModelSemanticKey, SemanticKind};
+    use super::super::contract::{CompositionManifest as ModelCompositionManifest, EffectDestination, EffectPatch as ModelEffectPatch, EffectPatchRequest, LifecycleBinding as ModelLifecycleBinding, MetadataAddition as ModelMetadataAddition, MetadataInitializationReceipt as ModelMetadataInitializationReceipt, ScopeLayer as ModelScopeLayer, ScopePopulation as ModelPopulation, ScopeRequest as ModelScopeRequest, ScopeSlotMapping as ModelScopeSlotMapping, ScopeState as ModelScopeState, ScopeTransition};
     use crate::product_json;
+    use std::collections::BTreeMap;
     use std::num::NonZeroUsize;
 
     fn syntax(source: &str) -> Value {
@@ -526,6 +698,58 @@ mod tests {
 
     fn basis_text(d: &str) -> String {
         format!(r#"{{"snapshot":"{d}","revision":4,"active":"{d}","data":{{"version":1,"project_id":"project","generation":2,"schema":[],"records":[],"events":[]}},"session":{{"view":"main","values":{{}},"focused_record":null}},"day":-3,"decisions":"{d}"}}"#)
+    }
+
+    fn empty_data(_d: &str) -> serde_json::Value {
+        serde_json::from_str(&format!(r#"{{"version":1,"project_id":"project","generation":2,"schema":[],"records":[],"events":[]}}"#)).unwrap()
+    }
+
+    fn empty_session() -> serde_json::Value {
+        serde_json::json!({"view":"main","values":{},"focused_record":null})
+    }
+
+    fn scope_layer_value(d: &str) -> serde_json::Value {
+        serde_json::from_str(&format!(r#"{{"version":1,"operation":"layer-op","basis":{},"candidate":"{d}","request":{{"population":{{"kind":"all"}},"operations":[],"excluded_records":[],"lifecycles":[],"patches":[]}},"patches":[]}}"#, basis_text(d))).unwrap()
+    }
+
+    fn composition_value(d: &str) -> serde_json::Value {
+        serde_json::from_str(&format!(r#"{{"version":1,"basis":{},"transition":"adoption","rewrites":[],"business":"{d}","layers":["{d}"],"active":["{d}"],"previous":null,"operation":"op","runtime":"runtime","driver":"driver","output":"{d}"}}"#, basis_text(d))).unwrap()
+    }
+
+    fn initialization_value(d: &str) -> serde_json::Value {
+        serde_json::from_str(&format!(r#"{{"operation":"init","layer":"{d}","before_data":"{d}","after_data":"{d}","before_schema":"{d}","after_schema":"{d}","additions":[],"business_projection":"{d}","original_events":"{d}","original_records":0,"capture_day":2,"capture_program":"{d}","prior_snapshot":"{d}","adoption_revision":1}}"#)).unwrap()
+    }
+
+    fn compatibility_value(d: &str) -> serde_json::Value {
+        serde_json::json!({"state":"compatible","current_data":d,"target_program":d,"retained_records":[],"retained_events":[],"retained_fields":[],"issues":[]})
+    }
+
+    fn scenario_value(d: &str) -> serde_json::Value {
+        serde_json::json!({"version":1,"id":"scenario","label":"Scenario","seed":empty_data(d),"session":empty_session(),"clock_day":2,"random_seed":3,"inputs":[],"validity":[]})
+    }
+
+    fn capture_value() -> serde_json::Value {
+        const APP: &str = r#"{"version":1,"id":"source_fixture","label":"Source fixture","entities":[{"id":"row","label":"Rows","fields":[{"id":"name","label":"Name","value_type":{"kind":"text"}}],"unique":[],"constraints":[]}],"state":[],"actions":[{"id":"check","label":"Check","parameters":{},"guards":[],"steps":[{"kind":"assert","condition":{"kind":"literal","value_type":{"kind":"boolean"},"value":{"kind":"boolean","value":true}},"message":"yes"}],"ensures":[]}],"outputs":[],"observables":[{"id":"yes","label":"Yes","value":{"kind":"literal","value_type":{"kind":"boolean"},"value":{"kind":"boolean","value":true}}}],"views":[{"id":"rows","label":"Rows","kind":{"kind":"list","entity":"row","rows":{"kind":"query","entity":"row","binding":"item","predicate":{"kind":"literal","value_type":{"kind":"boolean"},"value":{"kind":"boolean","value":true}},"sort":[],"limit":1,"include_archived":false},"columns":[{"id":"name","label":"Name","value":{"kind":"field","record":{"kind":"variable","name":"row"},"field":"name"}}],"controls":[],"selection":null},"actions":[],"keys":[]}],"initial_view":"rows"}"#;
+        serde_json::to_value(CapturedProgram::capture(APP.as_bytes(), "project", Producer::Fixture { name: "fixture".into() }, None).unwrap()).unwrap()
+    }
+
+    fn populated_scope_state_value() -> serde_json::Value {
+        let d1 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let d2 = "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let d3 = "2123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let d4 = "3123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let data = empty_data(d1);
+        let scenario = scenario_value(d1);
+        let proof = serde_json::json!({"source":capture_value(),"original":data,"target":d3,"day":2,"projected":d4,"operation_seed":d1,"scenario":{"original":scenario,"projected":scenario}});
+        serde_json::json!({
+            "version":1,
+            "layers":{d2:scope_layer_value(d1),d1:scope_layer_value(d2)},
+            "compositions":{d2:composition_value(d2),d1:composition_value(d1)},
+            "initializations":[initialization_value(d1)],
+            "adoptions":[{"decisions":["decision_b","decision_a"],"plan":d1,"composition":d2,"initialization":d3,"initialized_compatibility":compatibility_value(d1),"revision":1}],
+            "rehearsals":{d3:{"version":1,"manifest":composition_value(d3),"seed":d1,"layer":scope_layer_value(d3),"initialization":initialization_value(d3),"compatibility":compatibility_value(d2),"recorded_by":"operation","recorded_revision":1,"witnesses":{"decision_b":d2,"decision_a":d1}}},
+            "correspondences":{d4:{"proof":proof,"operation":"operation","revision":1}}
+        })
     }
 
     #[test]
@@ -839,6 +1063,84 @@ mod tests {
             let mut cx = AllocationContext::fail_nth_growth(NonZeroUsize::new(n).unwrap(), true);
             assert!(matches!(decode_compatibility_report(syntax(source), &mut cx), Err(ValueDecodeError::Allocation(_))), "growth {n}/{growths}");
             decode_compatibility_report(syntax(source), &mut AllocationContext::new()).unwrap();
+        }
+    }
+
+    #[test]
+    fn empty_and_populated_scope_state_match_canonical_serde_bytes() {
+        let empty = ModelScopeState::default();
+        let empty_value: serde_json::Value = serde_json::from_slice(&serde_json::to_vec(&empty).unwrap()).unwrap();
+        let decoded_empty = decode_scope_state(syntax(&serde_json::to_string(&empty_value).unwrap()), &mut AllocationContext::new()).unwrap();
+        assert_eq!(canonical(&empty), canonical(&decoded_empty));
+
+        let value = populated_scope_state_value();
+        let expected: ModelScopeState = serde_json::from_value(value.clone()).unwrap();
+        let decoded = decode_scope_state(syntax(&serde_json::to_string(&value).unwrap()), &mut AllocationContext::new()).unwrap();
+        assert_eq!(canonical(&expected), canonical(&decoded));
+        assert_eq!(decoded.layers.keys().map(Digest::as_str).collect::<Vec<_>>(), [
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ]);
+        assert_eq!(decoded.compositions.len(), 2);
+        assert_eq!(decoded.rehearsals.len(), 1);
+        assert_eq!(decoded.correspondences.len(), 1);
+    }
+
+    #[test]
+    fn scope_state_option_defaults_sequence_forms_and_map_replacement_match_serde() {
+        let mut value = populated_scope_state_value();
+        value["adoptions"][0].as_object_mut().unwrap().remove("initialization");
+        value["rehearsals"]["2123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"].as_object_mut().unwrap().remove("layer");
+        value["rehearsals"]["2123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"].as_object_mut().unwrap().remove("initialization");
+        value["correspondences"]["3123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"]["proof"].as_object_mut().unwrap().remove("scenario");
+        let expected: ModelScopeState = serde_json::from_value(value.clone()).unwrap();
+        let decoded = decode_scope_state(syntax(&serde_json::to_string(&value).unwrap()), &mut AllocationContext::new()).unwrap();
+        assert_eq!(canonical(&expected), canonical(&decoded));
+
+        let sequence = serde_json::json!([1, {}, {}, [], [], {}, {}]);
+        let expected_sequence: ModelScopeState = serde_json::from_value(sequence.clone()).unwrap();
+        let decoded_sequence = decode_scope_state(syntax(&serde_json::to_string(&sequence).unwrap()), &mut AllocationContext::new()).unwrap();
+        assert_eq!(canonical(&expected_sequence), canonical(&decoded_sequence));
+
+        let mut map = FallibleScopeMap::<String, Digest>::new();
+        let mut cx = AllocationContext::new();
+        let first = Digest::from_owned_lower_hex(format!("{}", digest_text())).unwrap();
+        let last = Digest::from_owned_lower_hex("1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into()).unwrap();
+        map.insert("same".into(), first, &mut cx).unwrap();
+        map.insert("same".into(), last.clone(), &mut cx).unwrap();
+        let expected = BTreeMap::from([("same".to_string(), last)]);
+        assert_eq!(canonical(&expected), canonical(&map));
+    }
+
+    #[test]
+    fn scope_state_bad_fields_keys_ranges_and_collection_limits_are_rejected() {
+        assert!(matches!(decode_scope_state(syntax(r#"{"layers":{},"compositions":{},"initializations":[],"adoptions":[],"rehearsals":{},"correspondences":{}}"#), &mut AllocationContext::new()), Err(ValueDecodeError::MissingField("version"))));
+        assert!(matches!(decode_scope_state(syntax(r#"{"version":1,"layers":{},"compositions":{},"initializations":[],"adoptions":[],"rehearsals":{},"correspondences":{},"future":0}"#), &mut AllocationContext::new()), Err(ValueDecodeError::UnknownField { .. })));
+        assert!(matches!(decode_scope_state(syntax(r#"{"version":1,"layers":{"not-a-digest":null},"compositions":{},"initializations":[],"adoptions":[],"rehearsals":{},"correspondences":{}}"#), &mut AllocationContext::new()), Err(ValueDecodeError::InvalidFormat("lowercase SHA-256 digest"))));
+        assert!(matches!(decode_scope_state(syntax(r#"{"version":4294967296,"layers":{},"compositions":{},"initializations":[],"adoptions":[],"rehearsals":{},"correspondences":{}}"#), &mut AllocationContext::new()), Err(ValueDecodeError::InvalidValue { expected: "u32", .. })));
+        assert!(matches!(decode_scope_state(syntax(r#"[1,{}, {}, [], [], {}, {} , 0]"#), &mut AllocationContext::new()), Err(ValueDecodeError::InvalidLength { actual: 8, expected: 7 })));
+        assert!(product_json::parse_json_bytes(br#"{"version":1,"layers":{"x":null,"x":null}}"#, &mut AllocationContext::new()).is_err());
+
+        let too_many_layers = serde_json::json!({"version":1,"layers":(0..=super::super::contract::MAX_LAYERS).map(|n| (format!("{n:064x}"), serde_json::Value::Null)).collect::<serde_json::Map<_,_>>(),"compositions":{},"initializations":[],"adoptions":[],"rehearsals":{},"correspondences":{}});
+        let mut cx = AllocationContext::new();
+        assert!(matches!(decode_scope_state(syntax(&serde_json::to_string(&too_many_layers).unwrap()), &mut cx), Err(ValueDecodeError::LimitExceeded { resource: "scope-state layer count", limit: super::super::contract::MAX_LAYERS })));
+        assert_eq!(cx.growth_requests(), 0, "scope-state map bound is checked before map growth");
+        let too_many_adoptions = serde_json::json!({"version":1,"layers":{},"compositions":{},"initializations":[],"adoptions":std::iter::repeat(serde_json::Value::Null).take(MAX_ITEMS+1).collect::<Vec<_>>(),"rehearsals":{},"correspondences":{}});
+        assert!(matches!(decode_scope_state(syntax(&serde_json::to_string(&too_many_adoptions).unwrap()), &mut AllocationContext::new()), Err(ValueDecodeError::LimitExceeded { resource: "scope-state adoption receipt count", limit: MAX_ITEMS })));
+    }
+
+    #[test]
+    fn scope_state_allocation_refusal_retries_and_cleans_up() {
+        let value = populated_scope_state_value();
+        let source = serde_json::to_string(&value).unwrap();
+        let mut count = AllocationContext::new();
+        decode_scope_state(syntax(&source), &mut count).unwrap();
+        let growths = count.growth_requests();
+        assert!(growths > 0);
+        for nth in 1..=growths {
+            let mut cx = AllocationContext::fail_nth_growth(NonZeroUsize::new(nth).unwrap(), true);
+            assert!(matches!(decode_scope_state(syntax(&source), &mut cx), Err(ValueDecodeError::Allocation(_))), "growth {nth}/{growths}");
+            assert_eq!(canonical(&serde_json::from_value::<ModelScopeState>(value.clone()).unwrap()), canonical(&decode_scope_state(syntax(&source), &mut AllocationContext::new()).unwrap()));
         }
     }
 }
