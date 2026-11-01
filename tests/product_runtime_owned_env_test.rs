@@ -284,12 +284,7 @@ fn binding_schedule(key: &str, t: &Type, v: &Value) -> Vec<(Site,usize)> {
     if !key.is_empty() { result.push((Site::String,key.len())); }
     result.extend(schedule(t,None)); result.extend(schedule(t,Some(v))); result
 }
-// All current fields have alignment equal to usize. The test verifies actual
-// requested bytes against this independent composition on the exact target.
-fn entry_bytes() -> usize {
-    size_of::<String>() + size_of::<product_app::OwnedAppGraph<Type>>()
-        + size_of::<product_app::OwnedAppGraph<Value>>()
-}
+fn entry_bytes() -> usize { ManagedEnv::entry_bytes() }
 fn snapshot_schedule(env: &ManagedEnv) -> Vec<(Site,usize)> {
     let mut out = Vec::new();
     if env.len() != 0 { out.push((Site::OrderedMap,env.len().checked_mul(entry_bytes()).unwrap())); }
@@ -490,6 +485,46 @@ fn wide_nested_values_preserve_all_elements_and_failure_prefixes() {
             items:vec![Value::Null,Value::Text { value:format!("item-{i}") }] }).collect() };
     for op in [Operation::Vacant,Operation::Replace,Operation::Snapshot] { sweep(&Type::Text,&value,op,false); }
 }
+
+#[test]
+fn leased_binding_sweeps_refusals_and_keeps_exact_pair_until_last_drop() {
+    let _lock=LOCK.lock().unwrap();
+    let ty=Type::Text; let value=Value::Text{value:"lease-value".into()};
+    let mut probe=Cx::new(); let mut probe_env=ManagedEnv::new();
+    let probe_lease=probe_env.try_bind_leased("lease",&ty,&value,&mut probe).unwrap();
+    let growths=probe.growth_requests(); assert!(growths>0);
+    drop(probe_lease); drop(probe_env);
+
+    for ordinal in 1..=growths {
+        let mut cx=fault(ordinal,true); let mut env=ManagedEnv::new();
+        let watch=Watch::begin();
+        let result=env.try_bind_leased("lease",&ty,&value,&mut cx);
+        let err=match result { Err(error)=>error, Ok(lease)=>{drop(lease);panic!("expected refusal at {ordinal}")} };
+        assert_eq!(err.kind,Kind::Injected);
+        assert_eq!(cx.first_failure(),Some(err));
+        assert_eq!(cx.growth_requests(),ordinal);
+        assert_eq!(env.len(),0);
+        watch.empty(ordinal-1);
+    }
+
+    for release_env_first in [false,true] {
+        let mut cx=Cx::new(); let mut env=ManagedEnv::new();
+        let watch=Watch::begin();
+        let lease=env.try_bind_leased("lease",&ty,&value,&mut cx).unwrap();
+        let allocations=cx.growth_requests(); watch.clean(allocations); watch.resume();
+        if release_env_first {
+            drop(env);
+            assert_eq!(lease.get().1,&value);
+            drop(lease);
+        } else {
+            drop(lease);
+            assert_eq!(env.get("lease").unwrap().1,&value);
+            drop(env);
+        }
+        watch.empty(allocations);
+    }
+}
+
 #[test]
 fn shared_context_prefix_and_one_shot_recovery_keep_the_first_failure() {
     let _lock=LOCK.lock().unwrap();

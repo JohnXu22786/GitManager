@@ -190,9 +190,11 @@ impl Eval<'_> {
                 };
                 let mut local = env.try_managed_copy(&mut self.meter.allocations)
                     .map_err(|_| failed("expression binding allocation failed"))?;
-                local.try_bind(binding, &item, &DataValue::Null, &mut self.meter.allocations)
+                let type_lease = local.try_bind_leased(binding, &item, &DataValue::Null, &mut self.meter.allocations)
                     .map_err(|_| failed("expression binding allocation failed"))?;
-                Type::list(self.typ(value, &local)?)
+                let result_type = self.typ(value, &local)?;
+                drop(type_lease);
+                Type::list(result_type)
             }
             Expr::If { then_value, .. } => self.typ(then_value, env)?,
             Expr::Coalesce { fallback, .. } => self.typ(fallback, env)?,
@@ -355,13 +357,14 @@ impl Eval<'_> {
                 let (typ, items) = list(self.eval(items, env)?)?;
                 let mut local = env.try_managed_copy(&mut self.meter.allocations)
                     .map_err(|_| failed("expression binding allocation failed"))?;
-                local.try_bind(binding, &typ, &DataValue::Null, &mut self.meter.allocations)
+                let type_lease = local.try_bind_leased(binding, &typ, &DataValue::Null, &mut self.meter.allocations)
                     .map_err(|_| failed("expression binding allocation failed"))?;
                 let result_type = self.typ(value, &local)?;
+                drop(type_lease);
                 let mut mapped = Vec::new();
                 for item in items {
                     self.meter.tick(1)?;
-                    local.try_bind(binding, &typ, &item, &mut self.meter.allocations)
+                    let _lease = local.try_bind_leased(binding, &typ, &item, &mut self.meter.allocations)
                         .map_err(|_| failed("expression binding allocation failed"))?;
                     mapped.push(self.eval(value, &local)?);
                 }

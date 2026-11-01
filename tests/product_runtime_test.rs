@@ -42,21 +42,38 @@ fn map_binding_uses_managed_env_and_propagates_each_growth_refusal() {
         "kind": "map",
         "items": query("person"),
         "binding": "row",
-        "value": field(var("row"), "name"),
+        "value": {
+            "kind": "map",
+            "items": {
+                "kind": "literal",
+                "value_type": {"kind": "list", "item": {"kind": "integer"}},
+                "value": {"kind": "list", "item_type": {"kind": "integer"}, "items": [
+                    {"kind": "integer", "value": 2},
+                    {"kind": "integer", "value": 3}
+                ]}
+            },
+            "binding": "n",
+            "value": field(var("row"), "name")
+        },
     });
     let program = capture(definition);
     let mut run = start(&program);
     apply(&mut run, add("Ada"), "add-map-binding");
 
     let runtime = LocalRuntime::default();
+    let before_data = runtime.data(&run).clone();
+    let before_session = runtime.session(&run).clone();
     let (observed, growths) = runtime.observe_with_allocations(
         &run,
         "managed-map",
         product_alloc::AllocationContext::new(),
     );
     assert_eq!(observed.unwrap().values["selected_count"], DataValue::List {
-        item_type: Type::Text,
-        items: vec![string("Ada")],
+        item_type: Type::list(Type::Text),
+        items: vec![DataValue::List {
+            item_type: Type::Text,
+            items: vec![string("Ada"), string("Ada")],
+        }],
     });
     assert!(growths > 0);
 
@@ -79,12 +96,30 @@ fn map_binding_uses_managed_env_and_propagates_each_growth_refusal() {
         assert_eq!(
             runtime.observe(&run, "managed-map").unwrap().values["selected_count"],
             DataValue::List {
-                item_type: Type::Text,
-                items: vec![string("Ada")],
+                item_type: Type::list(Type::Text),
+                items: vec![DataValue::List {
+                    item_type: Type::Text,
+                    items: vec![string("Ada"), string("Ada")],
+                }],
             },
             "runtime remains usable after refusal at growth {ordinal}",
         );
+        assert_eq!(runtime.data(&run), &before_data);
+        assert_eq!(runtime.session(&run), &before_session);
     }
+
+    let cancelled = Arc::new(AtomicBool::new(true));
+    let cancelled_runtime = LocalRuntime::with_cancellation(cancelled);
+    let (cancelled_result, cancelled_growths) = cancelled_runtime.observe_with_allocations(
+        &run,
+        "managed-map",
+        product_alloc::AllocationContext::fail_nth_growth(
+            NonZeroUsize::new(1).unwrap(),
+            false,
+        ),
+    );
+    assert_eq!(cancelled_result.unwrap_err(), AdapterError::Cancelled);
+    assert_eq!(cancelled_growths, 0, "cancellation precedes Shared allocation");
 }
 fn apply(r: &mut ProductRun, input: SemanticInput, id: &str) {
     LocalRuntime::default().apply(r, &input, id).unwrap();
