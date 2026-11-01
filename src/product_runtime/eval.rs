@@ -1,9 +1,46 @@
 use super::*;
 use std::cmp::Ordering as Compare;
+use super::owned_env::ManagedEnv;
 use super::product_alloc::AllocationContext;
 use super::query_order::{try_sort_candidate_ids, try_sort_rows, QueryOrderError};
 
 pub(super) type Env = BTreeMap<Id, (Type, DataValue)>;
+pub(super) trait EnvAccess {
+    fn len(&self) -> usize;
+    fn get(&self, name: &str) -> Option<(&Type, &DataValue)>;
+    fn visit(&self, visit: &mut dyn FnMut(&str, &Type, &DataValue) -> Result<()>) -> Result<()>;
+    fn try_managed_copy(&self, allocations: &mut AllocationContext)
+        -> std::result::Result<ManagedEnv, super::product_alloc::AllocationFailure>;
+}
+impl EnvAccess for Env {
+    fn len(&self) -> usize { BTreeMap::len(self) }
+    fn get(&self, name: &str) -> Option<(&Type, &DataValue)> {
+        BTreeMap::get(self, name).map(|(ty, value)| (ty, value))
+    }
+    fn visit(&self, visit: &mut dyn FnMut(&str, &Type, &DataValue) -> Result<()>) -> Result<()> {
+        for (key, (ty, value)) in self { visit(key, ty, value)?; }
+        Ok(())
+    }
+    fn try_managed_copy(&self, allocations: &mut AllocationContext)
+        -> std::result::Result<ManagedEnv, super::product_alloc::AllocationFailure> {
+        ManagedEnv::try_from_iter(
+            self.iter().map(|(key, (ty, value))| (key.as_str(), ty, value)),
+            allocations,
+        )
+    }
+}
+impl EnvAccess for ManagedEnv {
+    fn len(&self) -> usize { ManagedEnv::len(self) }
+    fn get(&self, name: &str) -> Option<(&Type, &DataValue)> { ManagedEnv::get(self, name) }
+    fn visit(&self, visit: &mut dyn FnMut(&str, &Type, &DataValue) -> Result<()>) -> Result<()> {
+        for (key, ty, value) in self.iter() { visit(key, ty, value)?; }
+        Ok(())
+    }
+    fn try_managed_copy(&self, allocations: &mut AllocationContext)
+        -> std::result::Result<ManagedEnv, super::product_alloc::AllocationFailure> {
+        ManagedEnv::try_copy(self, allocations)
+    }
+}
 pub(super) struct Eval<'a> {
     pub app: &'a AppDefinition,
     pub data: &'a DataSnapshot,
@@ -110,7 +147,7 @@ impl Eval<'_> {
     }
 
     /// Static result types are needed even when map/filter receives no values.
-    pub(super) fn typ(&mut self, expr: &Expr, env: &Env) -> Result<Type> {
+    pub(super) fn typ(&mut self, expr: &Expr, env: &dyn EnvAccess) -> Result<Type> {
         if self.meter.row.is_some() { return self.typ_paid(expr, env); }
         self.meter.tick(1)?;
         Ok(match expr {
@@ -151,8 +188,10 @@ impl Eval<'_> {
                 let Type::List { item } = self.typ(items, env)? else {
                     return Err(failed("invalid map type"));
                 };
-                let mut local = env.clone();
-                local.insert(binding.clone(), (*item, DataValue::Null));
+                let mut local = env.try_managed_copy(&mut self.meter.allocations)
+                    .map_err(|_| failed("expression binding allocation failed"))?;
+                local.try_bind(binding, &item, &DataValue::Null, &mut self.meter.allocations)
+                    .map_err(|_| failed("expression binding allocation failed"))?;
                 Type::list(self.typ(value, &local)?)
             }
             Expr::If { then_value, .. } => self.typ(then_value, env)?,
@@ -167,19 +206,19 @@ impl Eval<'_> {
             _ => Type::Boolean,
         })
     }
-    pub fn eval(&mut self, expr: &Expr, env: &Env) -> Result<DataValue> {
+    pub fn eval(&mut self, expr: &Expr, env: &dyn EnvAccess) -> Result<DataValue> {
         if self.meter.row.is_some() { return self.eval_paid(expr, env); }
         self.meter.tick(1)?;
         let value = match expr {
             Expr::Literal { value, .. } => {
                 self.meter.value(value)?;
                 self.literal_references(value)?;
-                value.clone()
+                (*value).clone()
             }
             Expr::Variable { name } => {
                 let value = &env.get(name).ok_or_else(|| failed("unbound variable"))?.1;
                 self.meter.value(value)?;
-                value.clone()
+                (*value).clone()
             }
             Expr::Field {
                 record: expr,
@@ -234,8 +273,10 @@ impl Eval<'_> {
                 for record in candidates {
                     self.meter.tick(1)?;
                     let value = value_ref(record);
-                    let mut local = env.clone();
-                    local.insert(binding.clone(), (Type::reference(entity), value.clone()));
+                    let mut local = env.try_managed_copy(&mut self.meter.allocations)
+                        .map_err(|_| failed("expression binding allocation failed"))?;
+                    local.try_bind_reference(binding, entity, &record.entity, &record.id, &mut self.meter.allocations)
+                        .map_err(|_| failed("expression binding allocation failed"))?;
                     if boolean(self.eval(predicate, &local)?)? {
                         let keys = sort
                             .iter()
@@ -280,8 +321,10 @@ impl Eval<'_> {
                 let mut result = all;
                 for item in items {
                     self.meter.tick(1)?;
-                    let mut local = env.clone();
-                    local.insert(binding.clone(), (typ.clone(), item.clone()));
+                    let mut local = env.try_managed_copy(&mut self.meter.allocations)
+                        .map_err(|_| failed("expression binding allocation failed"))?;
+                    local.try_bind(binding, &typ, &item, &mut self.meter.allocations)
+                        .map_err(|_| failed("expression binding allocation failed"))?;
                     let yes = boolean(self.eval(predicate, &local)?)?;
                     if any && yes {
                         result = true;
@@ -310,13 +353,16 @@ impl Eval<'_> {
                 value,
             } => {
                 let (typ, items) = list(self.eval(items, env)?)?;
-                let mut local = env.clone();
-                local.insert(binding.clone(), (typ.clone(), DataValue::Null));
+                let mut local = env.try_managed_copy(&mut self.meter.allocations)
+                    .map_err(|_| failed("expression binding allocation failed"))?;
+                local.try_bind(binding, &typ, &DataValue::Null, &mut self.meter.allocations)
+                    .map_err(|_| failed("expression binding allocation failed"))?;
                 let result_type = self.typ(value, &local)?;
                 let mut mapped = Vec::new();
                 for item in items {
                     self.meter.tick(1)?;
-                    local.insert(binding.clone(), (typ.clone(), item));
+                    local.try_bind(binding, &typ, &item, &mut self.meter.allocations)
+                        .map_err(|_| failed("expression binding allocation failed"))?;
                     mapped.push(self.eval(value, &local)?);
                 }
                 DataValue::List {

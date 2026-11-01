@@ -17,14 +17,14 @@ impl Eval<'_> {
             _=>{}
         }Ok(())
     }
-    pub(super) fn typ_paid(&mut self,expr:&Expr,env:&Env)->Result<Type> {
+    pub(super) fn typ_paid(&mut self,expr:&Expr,env:&dyn EnvAccess)->Result<Type> {
         self.meter.tick(1)?;cost::pay(self.meter,3)?;
         Ok(match expr {
             Expr::Literal{value_type,..}=>{cost::typ(value_type,self.meter)?;value_type.clone()}
             Expr::Variable{name}=>{
                 cost::search(env.len(),name.len(),self.meter)?;
                 let t=&env.get(name).ok_or_else(||failed("missing variable type"))?.0;
-                cost::typ(t,self.meter)?;t.clone()
+                cost::typ(t,self.meter)?;(*t).clone()
             }
             Expr::State{state}=>{
                 cost::pay(self.meter,1)?;let mut found=None;
@@ -51,8 +51,13 @@ impl Eval<'_> {
             Expr::Filter{items,..}=>self.typ(items,env)?,
             Expr::Map{items,binding,value}=>{
                 let Type::List{item}=self.typ(items,env)? else{return Err(failed("invalid map type"))};
-                cost::env(env,self.meter)?;let mut local=env.clone();cost::pay(self.meter,2)?;
-                cost::bind(&mut local,binding,*item,DataValue::Null,self.meter)?;
+                cost::env(env,self.meter)?;
+                let mut local=env.try_managed_copy(&mut self.meter.allocations)
+                    .map_err(|_|failed("expression binding allocation failed"))?;
+                cost::pay(self.meter,2)?;cost::typ(&item,self.meter)?;cost::value(&DataValue::Null,self.meter)?;
+                cost::bind_precharge(local.len(),binding,self.meter)?;
+                local.try_bind(binding,&item,&DataValue::Null,&mut self.meter.allocations)
+                    .map_err(|_|failed("expression binding allocation failed"))?;
                 let t=self.typ(value,&local)?;cost::list_type(t,self.meter)?
             }
             Expr::If{then_value,..}=>self.typ(then_value,env)?,
@@ -63,7 +68,7 @@ impl Eval<'_> {
             _=>Type::Boolean,
         })
     }
-    pub(super) fn eval_paid(&mut self,expr:&Expr,env:&Env)->Result<DataValue> {
+    pub(super) fn eval_paid(&mut self,expr:&Expr,env:&dyn EnvAccess)->Result<DataValue> {
         self.meter.tick(1)?;cost::pay(self.meter,4)?;
         let value=match expr {
             Expr::Literal{value,..}=>{
@@ -73,7 +78,7 @@ impl Eval<'_> {
             Expr::Variable{name}=>{
                 cost::search(env.len(),name.len(),self.meter)?;
                 let value=&env.get(name).ok_or_else(||failed("unbound variable"))?.1;
-                self.meter.value(value)?;cost::value(value,self.meter)?;value.clone()
+                self.meter.value(value)?;cost::value(value,self.meter)?;(*value).clone()
             }
             Expr::Field{record:expr,field}=>{
                 let key=self.eval(expr,env)?;self.meter.tick(self.data.records.len() as u64)?;
@@ -109,10 +114,15 @@ impl Eval<'_> {
                 for record in candidates {
                     self.meter.tick(1)?;cost::pay(self.meter,3)?;
                     let value=cost::reference(&record.entity,&record.id,self.meter)?;
-                    cost::env(env,self.meter)?;let mut local=env.clone();
+                    cost::env(env,self.meter)?;
+                    let mut local=env.try_managed_copy(&mut self.meter.allocations)
+                        .map_err(|_|failed("expression binding allocation failed"))?;
                     let typ=cost::reference_type(entity,self.meter)?;
                     cost::value(&value,self.meter)?;
-                    cost::bind(&mut local,binding,typ,value.clone(),self.meter)?;
+                    cost::typ(&typ,self.meter)?;cost::value(&value,self.meter)?;
+                    cost::bind_precharge(local.len(),binding,self.meter)?;
+                    local.try_bind(binding,&typ,&value,&mut self.meter.allocations)
+                        .map_err(|_|failed("expression binding allocation failed"))?;
                     cost::pay(self.meter,2)?;
                     if boolean(self.eval(predicate,&local)?)? {
                         cost::pay(self.meter,3)?;let mut keys=Vec::new();
@@ -137,8 +147,13 @@ impl Eval<'_> {
                 let mut kept=Vec::new();let all=matches!(expr,Expr::All{..});let any=matches!(expr,Expr::Any{..});let mut result=all;
                 for item in items {
                     self.meter.tick(1)?;cost::pay(self.meter,3)?;
-                    cost::env(env,self.meter)?;let mut local=env.clone();cost::typ(&typ,self.meter)?;cost::value(&item,self.meter)?;
-                    cost::bind(&mut local,binding,typ.clone(),item.clone(),self.meter)?;
+                    cost::env(env,self.meter)?;
+                    let mut local=env.try_managed_copy(&mut self.meter.allocations)
+                        .map_err(|_|failed("expression binding allocation failed"))?;
+                    cost::typ(&typ,self.meter)?;cost::value(&item,self.meter)?;
+                    cost::bind_precharge(local.len(),binding,self.meter)?;
+                    local.try_bind(binding,&typ,&item,&mut self.meter.allocations)
+                        .map_err(|_|failed("expression binding allocation failed"))?;
                     cost::pay(self.meter,5)?;let yes=boolean(self.eval(predicate,&local)?)?;
                     if any&&yes{result=true;break}if all&&!yes{result=false;break}
                     if yes{cost::push(&mut kept,item,self.meter)?;}
@@ -148,12 +163,19 @@ impl Eval<'_> {
             }
             Expr::Map{items,binding,value}=>{
                 cost::pay(self.meter,5)?;let(typ,items)=list(self.eval(items,env)?)?;
-                cost::env(env,self.meter)?;let mut local=env.clone();cost::typ(&typ,self.meter)?;cost::pay(self.meter,2)?;
-                cost::bind(&mut local,binding,typ.clone(),DataValue::Null,self.meter)?;
+                cost::env(env,self.meter)?;
+                let mut local=env.try_managed_copy(&mut self.meter.allocations)
+                    .map_err(|_|failed("expression binding allocation failed"))?;
+                cost::typ(&typ,self.meter)?;cost::pay(self.meter,2)?;cost::value(&DataValue::Null,self.meter)?;
+                cost::bind_precharge(local.len(),binding,self.meter)?;
+                local.try_bind(binding,&typ,&DataValue::Null,&mut self.meter.allocations)
+                    .map_err(|_|failed("expression binding allocation failed"))?;
                 let result_type=self.typ(value,&local)?;cost::pay(self.meter,3)?;let mut mapped=Vec::new();
                 for item in items {
                     self.meter.tick(1)?;cost::pay(self.meter,3)?;cost::typ(&typ,self.meter)?;
-                    cost::bind(&mut local,binding,typ.clone(),item,self.meter)?;
+                    cost::value(&item,self.meter)?;cost::bind_precharge(local.len(),binding,self.meter)?;
+                    local.try_bind(binding,&typ,&item,&mut self.meter.allocations)
+                        .map_err(|_|failed("expression binding allocation failed"))?;
                     let result=self.eval(value,&local)?;cost::push(&mut mapped,result,self.meter)?;
                 }
                 cost::pay(self.meter,1)?;DataValue::List{item_type:result_type,items:mapped}

@@ -22,6 +22,12 @@ mod product_discovery;
 #[path = "../src/product_protocol.rs"]
 mod product_protocol;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "../src/product_alloc.rs"]
+mod product_alloc;
+#[path = "../src/product_json.rs"]
+mod product_json;
+#[path = "../src/product_app.rs"]
+mod product_app;
 #[path = "../src/product_runtime/mod.rs"]
 mod product_runtime;
 #[cfg(any(target_os = "linux", target_os = "macos"))]

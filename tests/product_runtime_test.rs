@@ -4,6 +4,12 @@ mod fixture;
 mod product_contract;
 #[path = "../src/product_protocol.rs"]
 mod product_protocol;
+#[path = "../src/product_alloc.rs"]
+mod product_alloc;
+#[path = "../src/product_json.rs"]
+mod product_json;
+#[path = "../src/product_app.rs"]
+mod product_app;
 #[path = "../src/product_runtime/mod.rs"]
 mod product_runtime;
 use fixture::*;
@@ -14,6 +20,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use std::num::NonZeroUsize;
 
 fn start(p: &CapturedProgram) -> ProductRun {
     LocalRuntime::default()
@@ -26,6 +33,58 @@ fn start(p: &CapturedProgram) -> ProductRun {
             RuntimeLimits::default(),
         )
         .unwrap()
+}
+
+#[test]
+fn map_binding_uses_managed_env_and_propagates_each_growth_refusal() {
+    let mut definition = organizer();
+    definition["observables"][0]["value"] = json!({
+        "kind": "map",
+        "items": query("person"),
+        "binding": "row",
+        "value": field(var("row"), "name"),
+    });
+    let program = capture(definition);
+    let mut run = start(&program);
+    apply(&mut run, add("Ada"), "add-map-binding");
+
+    let runtime = LocalRuntime::default();
+    let (observed, growths) = runtime.observe_with_allocations(
+        &run,
+        "managed-map",
+        product_alloc::AllocationContext::new(),
+    );
+    assert_eq!(observed.unwrap().values["selected_count"], DataValue::List {
+        item_type: Type::Text,
+        items: vec![string("Ada")],
+    });
+    assert!(growths > 0);
+
+    for ordinal in 1..=growths {
+        let context = product_alloc::AllocationContext::fail_nth_growth(
+            NonZeroUsize::new(ordinal).unwrap(),
+            false,
+        );
+        let (result, observed_growths) = runtime.observe_with_allocations(
+            &run,
+            "managed-map",
+            context,
+        );
+        assert_eq!(observed_growths, ordinal);
+        assert_eq!(
+            result.unwrap_err(),
+            AdapterError::Failed("expression binding allocation failed".into()),
+            "allocation refusal at growth {ordinal}",
+        );
+        assert_eq!(
+            runtime.observe(&run, "managed-map").unwrap().values["selected_count"],
+            DataValue::List {
+                item_type: Type::Text,
+                items: vec![string("Ada")],
+            },
+            "runtime remains usable after refusal at growth {ordinal}",
+        );
+    }
 }
 fn apply(r: &mut ProductRun, input: SemanticInput, id: &str) {
     LocalRuntime::default().apply(r, &input, id).unwrap();

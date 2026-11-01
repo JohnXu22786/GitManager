@@ -19,6 +19,12 @@ mod product_locations;
 mod product_protocol;
 #[path = "../src/product_provider/mod.rs"]
 mod product_provider;
+#[path = "../src/product_alloc.rs"]
+mod product_alloc;
+#[path = "../src/product_json.rs"]
+mod product_json;
+#[path = "../src/product_app.rs"]
+mod product_app;
 #[path = "../src/product_runtime/mod.rs"]
 mod product_runtime;
 #[path = "../src/ui/product_runtime_view.rs"]

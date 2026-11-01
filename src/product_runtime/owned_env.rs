@@ -4,7 +4,7 @@
 //! helper performs no validation, metering, cancellation polling or error
 //! rendering, and adds no input limits. Caller inputs are borrowed; their own
 //! teardown remains the caller's responsibility. No mutable/raw owner escape.
-use crate::product_alloc::{ordered::OrderedMap, try_copy_str, AllocationContext,
+use crate::product_alloc::{ordered::OrderedMap, try_append_str, try_copy_str, AllocationContext,
     AllocationFailure, AllocationSite};
 use crate::product_app::OwnedAppGraph;
 use crate::product_contract::{DataValue, Type};
@@ -23,6 +23,21 @@ impl Binding {
     }
     fn try_copy(&self, cx: &mut AllocationContext) -> Result<Self, AllocationFailure> {
         Self::try_new(self.ty.as_ref(), self.value.as_ref(), cx)
+    }
+    fn try_reference(type_entity: &str, value_entity: &str, record: &str, cx: &mut AllocationContext)
+        -> Result<Self, AllocationFailure> {
+        let mut owned_type_entity = String::new();
+        try_append_str(&mut owned_type_entity, type_entity, cx, AllocationSite::String)?;
+        let ty = Type::Reference { entity: owned_type_entity };
+        let ty = OwnedAppGraph::<Type>::try_copy(&ty, cx)?;
+
+        let mut owned_value_entity = String::new();
+        try_append_str(&mut owned_value_entity, value_entity, cx, AllocationSite::String)?;
+        let mut value_record = String::new();
+        try_append_str(&mut value_record, record, cx, AllocationSite::String)?;
+        let value = DataValue::Reference { entity: owned_value_entity, record: value_record };
+        let value = OwnedAppGraph::<DataValue>::try_copy(&value, cx)?;
+        Ok(Self { ty, value })
     }
     fn get(&self) -> (&Type, &DataValue) { (self.ty.as_ref(), self.value.as_ref()) }
 }
@@ -49,6 +64,20 @@ impl ManagedEnv {
         drop(old);
         Ok(())
     }
+    pub(super) fn try_bind_reference(
+        &mut self,
+        name: &str,
+        type_entity: &str,
+        value_entity: &str,
+        record: &str,
+        cx: &mut AllocationContext,
+    ) -> Result<(), AllocationFailure> {
+        let key = try_copy_str(name, cx, AllocationSite::String)?;
+        let binding = Binding::try_reference(type_entity, value_entity, record, cx)?;
+        let old = self.bindings.try_insert(key, binding, cx)?;
+        drop(old);
+        Ok(())
+    }
     /// Independent snapshot: reserve map storage first, then copy entries in
     /// String order. These callbacks are fixed closed operations, never caller
     /// callbacks; all copied prefixes contain managed bindings only.
@@ -58,9 +87,18 @@ impl ManagedEnv {
             |key, cx| try_copy_str(key, cx, AllocationSite::String), Binding::try_copy)?;
         Ok(Self { bindings })
     }
+    pub(super) fn try_from_iter<'a>(
+        entries: impl IntoIterator<Item = (&'a str, &'a Type, &'a DataValue)>,
+        cx: &mut AllocationContext,
+    ) -> Result<Self, AllocationFailure> {
+        let mut env = Self::new();
+        for (key, ty, value) in entries {
+            env.try_bind(key, ty, value, cx)?;
+        }
+        Ok(env)
+    }
     #[cfg(test)]
     pub(super) fn capacity(&self) -> usize { self.bindings.capacity() }
-    #[cfg(test)]
     pub(super) fn iter(&self) -> impl Iterator<Item = (&str, &Type, &DataValue)> {
         self.bindings.iter().map(|(key, binding)| {
             let (ty, value) = binding.get(); (key.as_str(), ty, value)

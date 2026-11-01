@@ -68,18 +68,20 @@ pub(super) fn value(v:&DataValue,work:&mut dyn ContractWork)->Result<()> {
         _=>Ok(())
     }
 }
-pub(super) fn env(env:&Env,work:&mut dyn ContractWork)->Result<()> {
+pub(super) fn env(env:&dyn EnvAccess,work:&mut dyn ContractWork)->Result<()> {
     pay(work,64)?;
     let n=capture_payment::btree_clone::<Id,(Type,DataValue)>(env.len(),0).map_err(contract)?;
     pay(work,n)?;
     pay(work,8)?;
     pay(work,add(8,mul(27,number(env.len())?)?)?)?;
-    for (key,(t,v)) in env {string(key,work)?;typ(t,work)?;value(v,work)?;}
-    Ok(())
+    env.visit(&mut |key,t,v| {string(key,work)?;typ(t,work)?;value(v,work)})
+}
+pub(super) fn bind_precharge(len:usize,name:&str,work:&mut dyn ContractWork)->Result<()> {
+    string(name,work)?;
+    insert::<Id,(Type,DataValue)>(len,name.len(),work)
 }
 pub(super) fn bind(env:&mut Env,name:&str,t:Type,v:DataValue,work:&mut dyn ContractWork)->Result<()> {
-    string(name,work)?;
-    insert::<Id,(Type,DataValue)>(env.len(),name.len(),work)?;
+    bind_precharge(env.len(),name,work)?;
     env.insert(name.to_owned(),(t,v));
     Ok(())
 }

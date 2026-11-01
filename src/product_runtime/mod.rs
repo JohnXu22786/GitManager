@@ -7,22 +7,16 @@ mod capture_eval;
 mod capture_key;
 mod fallible_lower;
 mod query_order;
+mod owned_env;
 pub(crate) use capture::{ProjectionHost, ProjectionReservation};
 mod eval;
 mod execute;
 mod view;
-// Integration tests compile this module as a nested source module and do not
-// declare every production crate-root module. Keep their allocator types local
-// to the runtime test harness while production reuses the crate's shared module.
-#[cfg(test)]
-#[path = "../product_alloc.rs"]
-mod product_alloc;
-#[cfg(not(test))]
 use crate::product_alloc;
 
 use crate::product_contract::*;
 use crate::product_protocol::RuntimeView;
-use eval::{Env, Eval};
+use eval::{Env, EnvAccess, Eval};
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
@@ -266,10 +260,19 @@ struct Meter {
     writes: usize,
     started: Instant,
     cancelled: Arc<AtomicBool>,
+    allocations: product_alloc::AllocationContext,
     row: Option<capture::RowStop>,
 }
 impl Meter {
     fn new(limits: RuntimeLimits, fuel: u64, cancelled: Arc<AtomicBool>) -> Self {
+        Self::with_allocations(limits, fuel, cancelled, product_alloc::AllocationContext::new())
+    }
+    fn with_allocations(
+        limits: RuntimeLimits,
+        fuel: u64,
+        cancelled: Arc<AtomicBool>,
+        allocations: product_alloc::AllocationContext,
+    ) -> Self {
         Self {
             limits,
             fuel,
@@ -277,6 +280,7 @@ impl Meter {
             writes: 0,
             started: Instant::now(),
             cancelled,
+            allocations,
             row: None,
         }
     }
@@ -354,6 +358,24 @@ impl LocalRuntime {
     pub fn with_admission(mut self, admission: Arc<dyn ReplayAdmission>) -> Self {
         self.admission = Some(admission);
         self
+    }
+    #[cfg(test)]
+    pub(crate) fn observe_with_allocations(
+        &self,
+        run: &ProductRun,
+        point: &str,
+        allocations: product_alloc::AllocationContext,
+    ) -> (Result<Observation>, usize) {
+        let mut meter = Meter::with_allocations(
+            run.limits.clone(),
+            run.fuel.get(),
+            self.cancelled.clone(),
+            allocations,
+        );
+        let result = view::observe(&run.program, &run.state, point, &mut meter);
+        let requests = meter.allocations.growth_requests();
+        run.fuel.set(meter.fuel);
+        (result, requests)
     }
     /// Host-only bounded evaluation for metadata initialization. This uses the
     /// production evaluator, validates the expression in a typed action, and

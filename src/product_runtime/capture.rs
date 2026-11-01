@@ -67,6 +67,7 @@ impl Meter{
         row_check(&reservation.cancelled,reservation.additional_cancelled.as_ref(),reservation.host_deadline,reservation.row_deadline,&mut fuel,header).map_err(cost::resource)?;
         let ProjectionReservation{limits,host_deadline,row_deadline,cancelled,additional_cancelled}=reservation;
         let mut meter=Self{limits,fuel,steps:0,writes:0,started:host_deadline,cancelled,
+            allocations:super::product_alloc::AllocationContext::new(),
             row:Some(RowStop{host_deadline,row_deadline,additional_cancelled})};
         meter.row_charge(272).map_err(cost::resource)?;
         Ok(meter)
