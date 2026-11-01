@@ -5,8 +5,9 @@
 //! ordered fallible ownership where the persisted model uses BTreeSet.
 use crate::product_alloc::{self, ordered::OrderedSet, AllocationContext, AllocationSite};
 use crate::product_contract::fallible_expr_decode::decode_expr;
-use crate::product_contract::fallible_value_decode::{decode_type, JsonKind, NumericValue, ValueDecodeError};
-use crate::product_contract::{decode_data_snapshot_fallible, decode_record_ref_fallible, decode_session_state_fallible, Digest, Expr, FallibleDecodedDataSnapshot, FallibleDecodedSessionState, RecordRef, Type, MAX_COLLECTION, MAX_EXPR_DEPTH, MAX_ITEMS};
+use crate::product_contract::fallible_value_decode::{decode_type, decode_values, JsonKind, NumericValue, ValueDecodeError};
+use crate::product_contract::{decode_data_snapshot_fallible, decode_record_ref_fallible, decode_session_state_fallible, Digest, Expr, FallibleDecodedDataSnapshot, FallibleDecodedSessionState, FallibleValues, RecordRef, Type, MAX_COLLECTION, MAX_EXPR_DEPTH, MAX_ITEMS};
+use super::contract::ScopeTransition;
 use crate::product_json::{Number, Value};
 use serde::ser::SerializeSeq;
 use serde::{Serialize, Serializer};
@@ -25,6 +26,12 @@ const REQUEST_FIELDS: &[&str] = &["population", "operations", "excluded_records"
 const BASIS_FIELDS: &[&str] = &["snapshot", "revision", "active", "data", "session", "day", "decisions"];
 const PATCH_FIELDS: &[&str] = &["request", "before", "after"];
 const LAYER_FIELDS: &[&str] = &["version", "operation", "basis", "candidate", "request", "patches"];
+const TRANSITIONS: &[&str] = &["adoption", "withdrawal", "evolution"];
+const SLOT_MAPPING_FIELDS: &[&str] = &["layer", "patch", "from_source", "from", "to_source", "to", "subject"];
+const COMPOSITION_FIELDS: &[&str] = &["version", "basis", "transition", "rewrites", "business", "layers", "active", "previous", "operation", "runtime", "driver", "output"];
+const ADDITION_FIELDS: &[&str] = &["record", "values"];
+const INITIALIZATION_FIELDS: &[&str] = &["operation", "layer", "before_data", "after_data", "before_schema", "after_schema", "additions", "business_projection", "original_events", "original_records", "capture_day", "capture_program", "prior_snapshot", "adoption_revision"];
+const MAX_SCOPE_REWRITES: usize = super::contract::MAX_LAYERS * MAX_ITEMS;
 
 /// BTreeSet-compatible unique Id sequence with allocation-aware growth.
 pub(crate) struct FallibleIdSet(OrderedSet<String>);
@@ -49,6 +56,35 @@ impl FallibleIdSet {
     }
 }
 impl Serialize for FallibleIdSet {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+        for value in self.0.iter() { seq.serialize_element(value)?; }
+        seq.end()
+    }
+}
+
+pub(crate) struct FallibleDigestSet(OrderedSet<Digest>);
+impl std::fmt::Debug for FallibleDigestSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_set().entries(self.0.iter()).finish()
+    }
+}
+impl FallibleDigestSet {
+    fn new() -> Self { Self(OrderedSet::new()) }
+    fn insert(&mut self, value: Digest, limit: usize, resource: &'static str, cx: &mut AllocationContext) -> Result<(), ValueDecodeError> {
+        if !self.0.contains(&value) && self.0.len() == limit {
+            return Err(ValueDecodeError::LimitExceeded { resource, limit });
+        }
+        self.0.try_insert(value, cx)?;
+        Ok(())
+    }
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &Digest> { self.0.iter() }
+}
+impl PartialEq for FallibleDigestSet {
+    fn eq(&self, other: &Self) -> bool { self.0.iter().eq(other.0.iter()) }
+}
+impl Eq for FallibleDigestSet {}
+impl Serialize for FallibleDigestSet {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
         for value in self.0.iter() { seq.serialize_element(value)?; }
@@ -121,6 +157,27 @@ pub(crate) struct DecodedEffectPatch { request: EffectPatchRequestDto, before: E
 pub(crate) struct DecodedScopeLayer {
     version: u32, operation: String, basis: DecodedFrozenBasis, candidate: Digest,
     request: DecodedScopeRequest, patches: Vec<DecodedEffectPatch>,
+}
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct DecodedScopeSlotMapping {
+    layer: Digest, patch: usize, from_source: Digest, from: EffectDestinationDto,
+    to_source: Digest, to: EffectDestinationDto, subject: String,
+}
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct DecodedCompositionManifest {
+    version: u32, basis: DecodedFrozenBasis, transition: ScopeTransition,
+    rewrites: Vec<DecodedScopeSlotMapping>, business: Digest, layers: Vec<Digest>,
+    active: FallibleDigestSet, previous: Option<Digest>, operation: String,
+    runtime: String, driver: String, output: Digest,
+}
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct DecodedMetadataAddition { record: RecordRef, values: FallibleValues }
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct DecodedMetadataInitializationReceipt {
+    operation: String, layer: Digest, before_data: Digest, after_data: Digest,
+    before_schema: Digest, after_schema: Digest, additions: Vec<DecodedMetadataAddition>,
+    business_projection: Digest, original_events: Digest, original_records: usize,
+    capture_day: i32, capture_program: Digest, prior_snapshot: Digest, adoption_revision: u64,
 }
 
 pub(crate) fn decode_scope_population(value: Value, cx: &mut AllocationContext) -> Result<ScopePopulationDto, ValueDecodeError> {
@@ -240,6 +297,72 @@ pub(crate) fn decode_scope_layer(value: Value, cx: &mut AllocationContext) -> Re
     Ok(DecodedScopeLayer { version: required(version, "version")?, operation: required(operation, "operation")?, basis: required(basis, "basis")?, candidate: required(candidate, "candidate")?, request: required(request, "request")?, patches: required(patches, "patches")? })
 }
 
+pub(crate) fn decode_scope_transition(value: Value) -> Result<ScopeTransition, ValueDecodeError> {
+    let name = string(value, "a string variant identifier")?;
+    match name.as_str() {
+        "adoption" => Ok(ScopeTransition::Adoption),
+        "withdrawal" => Ok(ScopeTransition::Withdrawal),
+        "evolution" => Ok(ScopeTransition::Evolution),
+        _ => Err(ValueDecodeError::UnknownVariant { tag: name, expected: TRANSITIONS }),
+    }
+}
+
+pub(crate) fn decode_scope_slot_mapping(value: Value, cx: &mut AllocationContext) -> Result<DecodedScopeSlotMapping, ValueDecodeError> {
+    let fields = struct_fields(value, "a struct ScopeSlotMapping", SLOT_MAPPING_FIELDS, cx)?;
+    let (mut layer, mut patch, mut from_source, mut from, mut to_source, mut to, mut subject) = (None, None, None, None, None, None, None);
+    for (key, value) in fields { match key.as_str() {
+        "layer" => layer = Some(digest(value)?), "patch" => patch = Some(usize_value(value)?),
+        "from_source" => from_source = Some(digest(value)?), "from" => from = Some(decode_effect_destination(value, cx)?),
+        "to_source" => to_source = Some(digest(value)?), "to" => to = Some(decode_effect_destination(value, cx)?),
+        "subject" => subject = Some(string(value, "a string")?), _ => return Err(unknown(key, SLOT_MAPPING_FIELDS)),
+    }}
+    Ok(DecodedScopeSlotMapping { layer: required(layer, "layer")?, patch: required(patch, "patch")?, from_source: required(from_source, "from_source")?, from: required(from, "from")?, to_source: required(to_source, "to_source")?, to: required(to, "to")?, subject: required(subject, "subject")? })
+}
+
+pub(crate) fn decode_composition_manifest(value: Value, cx: &mut AllocationContext) -> Result<DecodedCompositionManifest, ValueDecodeError> {
+    let fields = struct_fields(value, "a struct CompositionManifest", COMPOSITION_FIELDS, cx)?;
+    let (mut version, mut basis, mut transition, mut rewrites, mut business, mut layers, mut active, mut previous, mut operation, mut runtime, mut driver, mut output) = (None, None, None, None, None, None, None, None, None, None, None, None);
+    for (key, value) in fields { match key.as_str() {
+        "version" => version = Some(u32_value(value)?), "basis" => basis = Some(decode_frozen_basis(value, cx)?),
+        "transition" => transition = Some(decode_scope_transition(value)?),
+        "rewrites" => rewrites = Some(slot_mappings(value, cx)?), "business" => business = Some(digest(value)?),
+        "layers" => layers = Some(digest_vec(value, super::contract::MAX_LAYERS, "composition layer count", cx)?),
+        "active" => active = Some(digest_set(value, super::contract::MAX_LAYERS, "active composition layer count", cx)?),
+        "previous" => previous = Some(optional_digest(value)?), "operation" => operation = Some(string(value, "a string")?),
+        "runtime" => runtime = Some(string(value, "a string")?), "driver" => driver = Some(string(value, "a string")?),
+        "output" => output = Some(digest(value)?), _ => return Err(unknown(key, COMPOSITION_FIELDS)),
+    }}
+    Ok(DecodedCompositionManifest { version: required(version, "version")?, basis: required(basis, "basis")?, transition: required(transition, "transition")?, rewrites: required(rewrites, "rewrites")?, business: required(business, "business")?, layers: required(layers, "layers")?, active: required(active, "active")?, previous: previous.unwrap_or(None), operation: required(operation, "operation")?, runtime: required(runtime, "runtime")?, driver: required(driver, "driver")?, output: required(output, "output")? })
+}
+
+pub(crate) fn decode_metadata_addition(value: Value, cx: &mut AllocationContext) -> Result<DecodedMetadataAddition, ValueDecodeError> {
+    let fields = struct_fields(value, "a struct MetadataAddition", ADDITION_FIELDS, cx)?;
+    let (mut record, mut values) = (None, None);
+    for (key, value) in fields { match key.as_str() {
+        "record" => record = Some(decode_record_ref_fallible(value, cx)?),
+        "values" => values = Some(decode_values(value, cx)?), _ => return Err(unknown(key, ADDITION_FIELDS)),
+    }}
+    Ok(DecodedMetadataAddition { record: required(record, "record")?, values: required(values, "values")? })
+}
+
+pub(crate) fn decode_metadata_initialization_receipt(value: Value, cx: &mut AllocationContext) -> Result<DecodedMetadataInitializationReceipt, ValueDecodeError> {
+    let fields = struct_fields(value, "a struct MetadataInitializationReceipt", INITIALIZATION_FIELDS, cx)?;
+    let (mut operation, mut layer, mut before_data, mut after_data, mut before_schema, mut after_schema, mut additions, mut business_projection, mut original_events, mut original_records, mut capture_day, mut capture_program, mut prior_snapshot, mut adoption_revision) = (None, None, None, None, None, None, None, None, None, None, None, None, None, None);
+    for (key, value) in fields { match key.as_str() {
+        "operation" => operation = Some(string(value, "a string")?), "layer" => layer = Some(digest(value)?),
+        "before_data" => before_data = Some(digest(value)?), "after_data" => after_data = Some(digest(value)?),
+        "before_schema" => before_schema = Some(digest(value)?), "after_schema" => after_schema = Some(digest(value)?),
+        "additions" => additions = Some(metadata_additions(value, cx)?),
+        "business_projection" => business_projection = Some(digest(value)?), "original_events" => original_events = Some(digest(value)?),
+        "original_records" => original_records = Some(usize_value(value)?), "capture_day" => capture_day = Some(i32_value(value)?),
+        "capture_program" => capture_program = Some(digest(value)?), "prior_snapshot" => prior_snapshot = Some(digest(value)?),
+        "adoption_revision" => adoption_revision = Some(u64_value(value)?), _ => return Err(unknown(key, INITIALIZATION_FIELDS)),
+    }}
+    let original_records = required(original_records, "original_records")?;
+    bounded(original_records, MAX_COLLECTION, "initialization original record count")?;
+    Ok(DecodedMetadataInitializationReceipt { operation: required(operation, "operation")?, layer: required(layer, "layer")?, before_data: required(before_data, "before_data")?, after_data: required(after_data, "after_data")?, before_schema: required(before_schema, "before_schema")?, after_schema: required(after_schema, "after_schema")?, additions: required(additions, "additions")?, business_projection: required(business_projection, "business_projection")?, original_events: required(original_events, "original_events")?, original_records, capture_day: required(capture_day, "capture_day")?, capture_program: required(capture_program, "capture_program")?, prior_snapshot: required(prior_snapshot, "prior_snapshot")?, adoption_revision: required(adoption_revision, "adoption_revision")? })
+}
+
 fn lifecycle_bindings(value: Value, cx: &mut AllocationContext) -> Result<Vec<LifecycleBindingDto>, ValueDecodeError> {
     decode_vec(value, MAX_ITEMS, "scope lifecycle count", cx, decode_lifecycle_binding)
 }
@@ -248,6 +371,23 @@ fn patch_requests(value: Value, cx: &mut AllocationContext) -> Result<Vec<Effect
 }
 fn effect_patches(value: Value, cx: &mut AllocationContext) -> Result<Vec<DecodedEffectPatch>, ValueDecodeError> {
     decode_vec(value, MAX_ITEMS, "scope effect patch count", cx, decode_effect_patch)
+}
+fn slot_mappings(value: Value, cx: &mut AllocationContext) -> Result<Vec<DecodedScopeSlotMapping>, ValueDecodeError> {
+    decode_vec(value, MAX_SCOPE_REWRITES, "scope slot mapping count", cx, decode_scope_slot_mapping)
+}
+fn metadata_additions(value: Value, cx: &mut AllocationContext) -> Result<Vec<DecodedMetadataAddition>, ValueDecodeError> {
+    decode_vec(value, MAX_COLLECTION, "metadata addition count", cx, decode_metadata_addition)
+}
+fn digest_vec(value: Value, limit: usize, resource: &'static str, cx: &mut AllocationContext) -> Result<Vec<Digest>, ValueDecodeError> {
+    decode_vec(value, limit, resource, cx, |value, _| digest(value))
+}
+fn digest_set(value: Value, limit: usize, resource: &'static str, cx: &mut AllocationContext) -> Result<FallibleDigestSet, ValueDecodeError> {
+    let values = array(value)?; let mut set = FallibleDigestSet::new();
+    for value in values { set.insert(digest(value)?, limit, resource, cx)?; }
+    Ok(set)
+}
+fn optional_digest(value: Value) -> Result<Option<Digest>, ValueDecodeError> {
+    match value { Value::Null => Ok(None), value => digest(value).map(Some) }
 }
 fn record_refs(value: Value, cx: &mut AllocationContext, resource: &'static str) -> Result<Vec<RecordRef>, ValueDecodeError> {
     decode_vec(value, MAX_COLLECTION, resource, cx, decode_record_ref_fallible)
@@ -308,7 +448,7 @@ fn bounded(len: usize, limit: usize, resource: &'static str) -> Result<(), Value
 mod tests {
     use super::*;
     use crate::product_contract::canonical_bytes;
-    use super::super::contract::{EffectDestination, EffectPatch as ModelEffectPatch, EffectPatchRequest, LifecycleBinding as ModelLifecycleBinding, ScopeLayer as ModelScopeLayer, ScopePopulation as ModelPopulation, ScopeRequest as ModelScopeRequest};
+    use super::super::contract::{CompositionManifest as ModelCompositionManifest, EffectDestination, EffectPatch as ModelEffectPatch, EffectPatchRequest, LifecycleBinding as ModelLifecycleBinding, MetadataAddition as ModelMetadataAddition, MetadataInitializationReceipt as ModelMetadataInitializationReceipt, ScopeLayer as ModelScopeLayer, ScopePopulation as ModelPopulation, ScopeRequest as ModelScopeRequest, ScopeSlotMapping as ModelScopeSlotMapping, ScopeTransition};
     use crate::product_json;
     use std::num::NonZeroUsize;
 
@@ -316,6 +456,12 @@ mod tests {
         product_json::parse_json_bytes(source.as_bytes(), &mut AllocationContext::new()).unwrap()
     }
     fn canonical<T: Serialize>(value: &T) -> Vec<u8> { canonical_bytes(value).unwrap() }
+
+    fn digest_text() -> &'static str { "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" }
+
+    fn basis_text(d: &str) -> String {
+        format!(r#"{{"snapshot":"{d}","revision":4,"active":"{d}","data":{{"version":1,"project_id":"project","generation":2,"schema":[],"records":[],"events":[]}},"session":{{"view":"main","values":{{}},"focused_record":null}},"day":-3,"decisions":"{d}"}}"#)
+    }
 
     #[test]
     fn destination_and_population_variants_match_serde_canonical_bytes() {
@@ -439,6 +585,106 @@ mod tests {
             decode(syntax(source), &mut count).unwrap();
             let growths = count.growth_requests();
             if growths == 0 { continue; }
+            for n in 1..=growths {
+                let mut cx = AllocationContext::fail_nth_growth(NonZeroUsize::new(n).unwrap(), true);
+                assert!(matches!(decode(syntax(source), &mut cx), Err(ValueDecodeError::Allocation(_))), "growth {n}/{growths} in {source}");
+                decode(syntax(source), &mut AllocationContext::new()).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn slot_mapping_and_composition_manifest_match_canonical_serde_bytes() {
+        let d = digest_text();
+        let mapping_source = format!(r#"{{"layer":"{d}","patch":2,"from_source":"{d}","from":{{"kind":"update","action":"save","path":[1,3],"field":"name"}},"to_source":"{d}","to":{{"kind":"view_column","view":"summary","column":"name"}},"subject":"person/r1"}}"#);
+        let expected: ModelScopeSlotMapping = serde_json::from_str(&mapping_source).unwrap();
+        let actual = decode_scope_slot_mapping(syntax(&mapping_source), &mut AllocationContext::new()).unwrap();
+        assert_eq!(canonical(&expected), canonical(&actual));
+        let mapping_sequence = format!(r#"["{d}",2,"{d}",{{"kind":"observable","observable":"x"}},"{d}",{{"kind":"observable","observable":"y"}},"person/r1"]"#);
+        let expected_sequence: ModelScopeSlotMapping = serde_json::from_str(&mapping_sequence).unwrap();
+        let actual_sequence = decode_scope_slot_mapping(syntax(&mapping_sequence), &mut AllocationContext::new()).unwrap();
+        assert_eq!(canonical(&expected_sequence), canonical(&actual_sequence));
+
+        for transition in [ScopeTransition::Adoption, ScopeTransition::Withdrawal, ScopeTransition::Evolution] {
+            let transition_json = serde_json::to_string(&transition).unwrap();
+            let source = format!(r#"{{"version":1,"basis":{},"transition":{},"rewrites":[{}],"business":"{d}","layers":["{d}","{d}"],"active":["{d}","{d}"],"previous":"{d}","operation":"op","runtime":"engine","driver":"host","output":"{d}"}}"#,
+                basis_text(d), transition_json, mapping_source);
+            let expected: ModelCompositionManifest = serde_json::from_str(&source).unwrap();
+            let actual = decode_composition_manifest(syntax(&source), &mut AllocationContext::new()).unwrap();
+            assert_eq!(actual.active.iter().count(), 1, "duplicate BTreeSet entries collapse");
+            assert_eq!(canonical(&expected), canonical(&actual));
+        }
+
+        let omitted_previous = format!(r#"{{"version":1,"basis":{},"transition":"adoption","rewrites":[],"business":"{d}","layers":[],"active":[],"operation":"op","runtime":"engine","driver":"host","output":"{d}"}}"#, basis_text(d));
+        let expected: ModelCompositionManifest = serde_json::from_str(&omitted_previous).unwrap();
+        let actual = decode_composition_manifest(syntax(&omitted_previous), &mut AllocationContext::new()).unwrap();
+        assert_eq!(expected.previous, None);
+        assert_eq!(canonical(&expected), canonical(&actual));
+    }
+
+    #[test]
+    fn metadata_addition_and_initialization_receipt_match_canonical_bytes() {
+        let d = digest_text();
+        let addition_source = format!(r#"{{"record":{{"entity":"person","record":"r1"}},"values":{{"label":{{"kind":"text","value":"Zoë"}},"active":{{"kind":"boolean","value":true}}}}}}"#);
+        let expected_addition: ModelMetadataAddition = serde_json::from_str(&addition_source).unwrap();
+        let actual_addition = decode_metadata_addition(syntax(&addition_source), &mut AllocationContext::new()).unwrap();
+        assert_eq!(canonical(&expected_addition), canonical(&actual_addition));
+        let addition_sequence = r#"[["person","r1"],{"label":{"kind":"text","value":"Zoë"},"active":{"kind":"boolean","value":true}}]"#;
+        let expected_sequence: ModelMetadataAddition = serde_json::from_str(addition_sequence).unwrap();
+        let actual_sequence = decode_metadata_addition(syntax(addition_sequence), &mut AllocationContext::new()).unwrap();
+        assert_eq!(canonical(&expected_sequence), canonical(&actual_sequence));
+
+        let source = format!(r#"{{"operation":"initialize","layer":"{d}","before_data":"{d}","after_data":"{d}","before_schema":"{d}","after_schema":"{d}","additions":[{addition_source}],"business_projection":"{d}","original_events":"{d}","original_records":1,"capture_day":-5,"capture_program":"{d}","prior_snapshot":"{d}","adoption_revision":9}}"#);
+        let expected: ModelMetadataInitializationReceipt = serde_json::from_str(&source).unwrap();
+        let actual = decode_metadata_initialization_receipt(syntax(&source), &mut AllocationContext::new()).unwrap();
+        assert_eq!(canonical(&expected), canonical(&actual));
+    }
+
+    #[test]
+    fn receipt_decoders_reject_invalid_fields_ranges_and_bounds() {
+        let d = digest_text();
+        let source = format!(r#"{{"version":1,"basis":{},"transition":"adoption","rewrites":[],"business":"{d}","layers":[],"active":[],"operation":"op","runtime":"engine","driver":"host","output":"{d}"}}"#, basis_text(d));
+        let mut unknown = serde_json::from_str::<serde_json::Value>(&source).unwrap();
+        unknown.as_object_mut().unwrap().insert("z_unknown".into(), serde_json::json!(1));
+        let unknown = serde_json::to_string(&unknown).unwrap();
+        assert!(matches!(decode_composition_manifest(syntax(&unknown), &mut AllocationContext::new()), Err(ValueDecodeError::UnknownField { .. })));
+        assert!(matches!(decode_scope_transition(syntax("\"new_transition\"")), Err(ValueDecodeError::UnknownVariant { .. })));
+        let invalid_patch = format!(r#"{{"layer":"{d}","patch":-1,"from_source":"{d}","from":{{"kind":"observable","observable":"x"}},"to_source":"{d}","to":{{"kind":"observable","observable":"y"}},"subject":"s"}}"#);
+        assert!(matches!(decode_scope_slot_mapping(syntax(&invalid_patch), &mut AllocationContext::new()), Err(ValueDecodeError::InvalidValue { .. })));
+        let too_many_layers = format!(r#"{{"version":1,"basis":{},"transition":"adoption","rewrites":[],"business":"{d}","layers":[{}],"active":[],"operation":"op","runtime":"engine","driver":"host","output":"{d}"}}"#,
+            basis_text(d), std::iter::repeat(format!("\"{d}\"")).take(super::super::contract::MAX_LAYERS + 1).collect::<Vec<_>>().join(","));
+        assert!(matches!(decode_composition_manifest(syntax(&too_many_layers), &mut AllocationContext::new()), Err(ValueDecodeError::LimitExceeded { resource: "composition layer count", .. })));
+
+        let too_many_records = format!(r#"{{"operation":"op","layer":"{d}","before_data":"{d}","after_data":"{d}","before_schema":"{d}","after_schema":"{d}","additions":[],"business_projection":"{d}","original_events":"{d}","original_records":{},"capture_day":0,"capture_program":"{d}","prior_snapshot":"{d}","adoption_revision":0}}"#,
+            MAX_COLLECTION + 1);
+        assert!(matches!(decode_metadata_initialization_receipt(syntax(&too_many_records), &mut AllocationContext::new()), Err(ValueDecodeError::LimitExceeded { resource: "initialization original record count", .. })));
+        let too_many_additions = format!(r#"{{"operation":"op","layer":"{d}","before_data":"{d}","after_data":"{d}","before_schema":"{d}","after_schema":"{d}","additions":[{}],"business_projection":"{d}","original_events":"{d}","original_records":0,"capture_day":0,"capture_program":"{d}","prior_snapshot":"{d}","adoption_revision":0}}"#,
+            std::iter::repeat("null").take(MAX_COLLECTION + 1).collect::<Vec<_>>().join(","));
+        let mut cx = AllocationContext::new();
+        assert!(matches!(decode_metadata_initialization_receipt(syntax(&too_many_additions), &mut cx), Err(ValueDecodeError::LimitExceeded { resource: "metadata addition count", .. })));
+        assert_eq!(cx.growth_requests(), 0, "addition count is checked before vector reservation");
+        assert!(product_json::parse_json_bytes(br#"{"patch":0,"patch":1}"#, &mut AllocationContext::new()).is_err(), "duplicate object keys remain rejected by the bounded syntax parser");
+    }
+
+    #[test]
+    fn every_reached_receipt_growth_refusal_is_fixed_and_retryable() {
+        let d = digest_text();
+        let basis = basis_text(d);
+        let mapping = format!(r#"{{"layer":"{d}","patch":0,"from_source":"{d}","from":{{"kind":"update","action":"a","path":[1],"field":"x"}},"to_source":"{d}","to":{{"kind":"observable","observable":"y"}},"subject":"s"}}"#);
+        let addition = r#"{"record":{"entity":"person","record":"r1"},"values":{"name":{"kind":"text","value":"Ada"}}}"#;
+        let manifest = format!(r#"{{"version":1,"basis":{basis},"transition":"adoption","rewrites":[{mapping}],"business":"{d}","layers":["{d}"],"active":["{d}","{d}"],"previous":null,"operation":"op","runtime":"runtime","driver":"driver","output":"{d}"}}"#);
+        let receipt = format!(r#"{{"operation":"op","layer":"{d}","before_data":"{d}","after_data":"{d}","before_schema":"{d}","after_schema":"{d}","additions":[{addition}],"business_projection":"{d}","original_events":"{d}","original_records":1,"capture_day":1,"capture_program":"{d}","prior_snapshot":"{d}","adoption_revision":1}}"#);
+        let cases: [(&str, fn(Value, &mut AllocationContext) -> Result<(), ValueDecodeError>); 4] = [
+            (&mapping, |v, c| decode_scope_slot_mapping(v, c).map(|_| ())),
+            (&manifest, |v, c| decode_composition_manifest(v, c).map(|_| ())),
+            (addition, |v, c| decode_metadata_addition(v, c).map(|_| ())),
+            (&receipt, |v, c| decode_metadata_initialization_receipt(v, c).map(|_| ())),
+        ];
+        for (source, decode) in cases {
+            let mut count = AllocationContext::new();
+            decode(syntax(source), &mut count).unwrap();
+            let growths = count.growth_requests();
+            assert!(growths > 0, "fixture contains no decoder growth: {source}");
             for n in 1..=growths {
                 let mut cx = AllocationContext::fail_nth_growth(NonZeroUsize::new(n).unwrap(), true);
                 assert!(matches!(decode(syntax(source), &mut cx), Err(ValueDecodeError::Allocation(_))), "growth {n}/{growths} in {source}");
