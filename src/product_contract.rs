@@ -142,6 +142,9 @@ mod fallible_entity_decode;
 #[path = "product_contract/fallible_persisted_decode.rs"]
 #[allow(dead_code)]
 mod fallible_persisted_decode;
+#[path = "product_contract/fallible_snapshot_decode.rs"]
+#[allow(dead_code)]
+mod fallible_snapshot_decode;
 #[allow(unused_imports)]
 pub(crate) use values_map::FallibleValues;
 
