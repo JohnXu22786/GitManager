@@ -141,6 +141,8 @@ mod compiler;
 mod contract;
 #[allow(dead_code)]
 mod fallible_scalar_decode;
+#[allow(dead_code)]
+mod fallible_owned_source_decode;
 mod correspondence;
 mod family;
 pub use family::ScopeEnvelope;
