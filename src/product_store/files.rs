@@ -6,6 +6,14 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "native_buffers.rs"]
+mod native_buffers;
+#[cfg(test)]
+#[path = "../product_alloc.rs"]
+mod product_alloc;
+#[cfg(not(test))]
+use crate::product_alloc;
 static TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(test)]
@@ -338,14 +346,22 @@ impl Directory {
         }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            let temp = OsString::from(format!(
-                ".pending-{}-{}",
+            let mut allocations = product_alloc::AllocationContext::new();
+            let names = native_buffers::try_prepared_unix_names(
+                OsStr::new(name),
                 std::process::id(),
-                TEMP_ID.fetch_add(1, Ordering::Relaxed)
-            ));
-            let mut file = unix::open(
+                TEMP_ID.fetch_add(1, Ordering::Relaxed),
+                &mut allocations,
+            )
+            .map_err(|error| match error {
+                native_buffers::NativeBufferFailure::Allocation(_) => {
+                    io::Error::other("project path buffer allocation failed")
+                }
+                native_buffers::NativeBufferFailure::UnsafeName => unsafe_path(),
+            })?;
+            let mut file = unix::open_prepared(
                 &self.file,
-                &temp,
+                names.temporary(),
                 unix::RDWR | unix::CREATE | unix::EXCLUSIVE,
                 0o600,
             )?;
@@ -354,13 +370,13 @@ impl Directory {
                 file.sync_all()?;
                 checkpoint()?;
                 if replace {
-                    unix::rename(&self.file, &temp, OsStr::new(name))?;
+                    unix::rename_prepared(&self.file, names.temporary(), names.target())?;
                 } else {
-                    unix::rename_new(&self.file, &temp, OsStr::new(name))?;
+                    unix::rename_new_prepared(&self.file, names.temporary(), names.target())?;
                 }
                 self.sync().map_err(E::from)
             })();
-            let _ = unix::unlink(&self.file, &temp);
+            let _ = unix::unlink_prepared(&self.file, names.temporary());
             result
         }
         #[cfg(windows)]
@@ -392,7 +408,8 @@ impl Directory {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod unix {
     use super::*;
-    use std::ffi::CString;
+    use super::native_buffers::UnixName;
+    use std::ffi::{CStr, CString};
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::raw::{c_char, c_int, c_uint};
     use std::os::unix::ffi::OsStrExt;
@@ -434,6 +451,12 @@ mod unix {
     }
     pub fn open(parent: &File, path: &OsStr, flags: c_int, mode: c_uint) -> io::Result<File> {
         let path = name(path)?;
+        open_cstr(parent, &path, flags, mode)
+    }
+    pub fn open_prepared(parent: &File, path: &UnixName, flags: c_int, mode: c_uint) -> io::Result<File> {
+        open_cstr(parent, path.as_c_str(), flags, mode)
+    }
+    fn open_cstr(parent: &File, path: &CStr, flags: c_int, mode: c_uint) -> io::Result<File> {
         let fd = unsafe {
             openat(
                 parent.as_raw_fd(),
@@ -452,6 +475,12 @@ mod unix {
     pub fn rename(parent: &File, a: &OsStr, b: &OsStr) -> io::Result<()> {
         let a = name(a)?;
         let b = name(b)?;
+        rename_cstr(parent, &a, &b)
+    }
+    pub fn rename_prepared(parent: &File, a: &UnixName, b: &UnixName) -> io::Result<()> {
+        rename_cstr(parent, a.as_c_str(), b.as_c_str())
+    }
+    fn rename_cstr(parent: &File, a: &CStr, b: &CStr) -> io::Result<()> {
         status(unsafe {
             renameat(
                 parent.as_raw_fd(),
@@ -466,6 +495,12 @@ mod unix {
     pub fn rename_new(parent: &File, a: &OsStr, b: &OsStr) -> io::Result<()> {
         let a = name(a)?;
         let b = name(b)?;
+        rename_new_cstr(parent, &a, &b)
+    }
+    pub fn rename_new_prepared(parent: &File, a: &UnixName, b: &UnixName) -> io::Result<()> {
+        rename_new_cstr(parent, a.as_c_str(), b.as_c_str())
+    }
+    fn rename_new_cstr(parent: &File, a: &CStr, b: &CStr) -> io::Result<()> {
         #[cfg(target_os = "linux")]
         {
             extern "C" {
@@ -513,6 +548,12 @@ mod unix {
     }
     pub fn unlink(parent: &File, path: &OsStr) -> io::Result<()> {
         let path = name(path)?;
+        unlink_cstr(parent, &path)
+    }
+    pub fn unlink_prepared(parent: &File, path: &UnixName) -> io::Result<()> {
+        unlink_cstr(parent, path.as_c_str())
+    }
+    fn unlink_cstr(parent: &File, path: &CStr) -> io::Result<()> {
         status(unsafe { unlinkat(parent.as_raw_fd(), path.as_ptr(), 0) })
     }
 }
@@ -699,6 +740,30 @@ mod tests {
         });
         assert!(result.is_err());
         other.lock().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_store_names_cleanup_temporary_after_checkpoint_failure() {
+        let temp = TestDirectory::new();
+        let directory = temp.open();
+        directory.publish("backup", b"original", false).unwrap();
+
+        let result = directory.publish_with_checkpoint::<io::Error>(
+            "backup",
+            b"replacement",
+            true,
+            || Err(io::Error::other("injected checkpoint failure")),
+        );
+        assert_eq!(result.unwrap_err().to_string(), "injected checkpoint failure");
+        assert_eq!(directory.read("backup", 32).unwrap(), b"original");
+
+        let mut names = fs::read_dir(&temp.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, vec![OsString::from("backup")]);
     }
 
     #[cfg(unix)]

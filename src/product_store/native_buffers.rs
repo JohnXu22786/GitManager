@@ -5,7 +5,7 @@
 //! preserving that predicate does not prove the original bytes contain no slash.
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
-use crate::product_alloc::{try_extend_bytes, try_reserve, AllocationContext,
+use super::product_alloc::{try_extend_bytes, try_reserve, AllocationContext,
     AllocationFailure, AllocationFailureKind, AllocationSite};
 use std::{ffi::{CStr, OsStr, OsString}, os::unix::ffi::{OsStrExt, OsStringExt},
     path::{Component, Path, PathBuf}};
