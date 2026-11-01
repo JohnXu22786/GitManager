@@ -41,6 +41,7 @@ pub(crate) enum NumericValue {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ValueDecodeError {
     Allocation(AllocationFailure),
+    LimitExceeded { resource: &'static str, limit: usize },
     MissingField(&'static str),
     UnknownField { key: String, expected: &'static [&'static str] },
     UnknownVariant { tag: String, expected: &'static [&'static str] },

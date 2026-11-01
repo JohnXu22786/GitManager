@@ -133,6 +133,9 @@ mod values_map;
 #[path = "product_contract/fallible_value_decode.rs"]
 #[allow(dead_code)]
 mod fallible_value_decode;
+#[path = "product_contract/fallible_expr_decode.rs"]
+#[allow(dead_code)]
+mod fallible_expr_decode;
 #[allow(unused_imports)]
 pub(crate) use values_map::FallibleValues;
 
