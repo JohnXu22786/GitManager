@@ -144,7 +144,7 @@ fn decode_semantic_input(value: Value, cx: &mut AllocationContext) -> Result<Dec
                 match key.as_str() {
                     "view" => view = Some(string(value, "a string")?),
                     "binding" => binding = Some(string(value, "a string")?),
-                    "row" => row = Some(optional_record_ref(value)?),
+                    "row" => row = Some(optional_record_ref(value, cx)?),
                     _ => return Err(unknown_field(key, ACTIVATE_FIELDS)),
                 }
             }
@@ -233,10 +233,10 @@ fn array(value: Value) -> Result<Vec<Value>, ValueDecodeError> {
     }
 }
 
-fn optional_record_ref(value: Value) -> Result<Option<RecordRef>, ValueDecodeError> {
+fn optional_record_ref(value: Value, cx: &mut AllocationContext) -> Result<Option<RecordRef>, ValueDecodeError> {
     match value {
         Value::Null => Ok(None),
-        value => decode_record_ref(value).map(Some),
+        value => decode_record_ref(value, cx).map(Some),
     }
 }
 

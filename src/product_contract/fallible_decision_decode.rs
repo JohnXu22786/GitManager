@@ -612,7 +612,7 @@ fn record_refs(
     bounded_length(values.len(), limit, resource)?;
     let mut decoded = Vec::new();
     product_alloc::try_reserve(&mut decoded, values.len(), cx, AllocationSite::Vector)?;
-    for value in values { decoded.push(decode_record_ref(value)?); }
+    for value in values { decoded.push(decode_record_ref(value, cx)?); }
     Ok(decoded)
 }
 

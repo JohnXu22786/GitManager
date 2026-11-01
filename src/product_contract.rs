@@ -160,6 +160,9 @@ mod fallible_local_artifact_decode;
 #[path = "product_contract/fallible_scenario_decode.rs"]
 #[allow(dead_code)]
 mod fallible_scenario_decode;
+#[path = "product_contract/fallible_observation_decode.rs"]
+#[allow(dead_code)]
+mod fallible_observation_decode;
 #[allow(unused_imports)]
 pub(crate) use values_map::FallibleValues;
 

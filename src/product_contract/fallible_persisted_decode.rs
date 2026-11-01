@@ -150,8 +150,23 @@ pub(super) fn decode_business_event(
     })
 }
 
-pub(super) fn decode_record_ref(value: Value) -> Result<RecordRef, ValueDecodeError> {
-    let fields = object(value, "a struct RecordRef")?;
+pub(super) fn decode_record_ref(value: Value, cx: &mut AllocationContext) -> Result<RecordRef, ValueDecodeError> {
+    let fields = match value {
+        Value::Object(fields) => fields,
+        Value::Array(values) => {
+            if values.len() != RECORD_REF_FIELDS.len() {
+                return Err(ValueDecodeError::InvalidLength { actual: values.len(), expected: RECORD_REF_FIELDS.len() });
+            }
+            let mut fields = crate::product_alloc::ordered::OrderedMap::new();
+            fields.try_reserve(RECORD_REF_FIELDS.len(), cx)?;
+            for (name, value) in RECORD_REF_FIELDS.iter().zip(values) {
+                let name = product_alloc::try_copy_str(name, cx, AllocationSite::String)?;
+                fields.try_insert(name, value, cx)?;
+            }
+            fields
+        }
+        value => return Err(invalid_type(value, "a struct RecordRef")),
+    };
     let mut entity = None;
     let mut record = None;
     for (key, value) in fields.into_entries() {
@@ -176,7 +191,7 @@ pub(super) fn decode_session_state(
         match key.as_str() {
             "view" => view = Some(string(value)?),
             "values" => values = Some(values_map(value, cx)?),
-            "focused_record" => focused_record = Some(optional_record_ref(value)?),
+            "focused_record" => focused_record = Some(optional_record_ref(value, cx)?),
             _ => return Err(unknown_field(key, SESSION_STATE_FIELDS)),
         }
     }
@@ -203,10 +218,10 @@ fn optional_values(value: Value, cx: &mut AllocationContext) -> Result<Option<Fa
     }
 }
 
-fn optional_record_ref(value: Value) -> Result<Option<RecordRef>, ValueDecodeError> {
+fn optional_record_ref(value: Value, cx: &mut AllocationContext) -> Result<Option<RecordRef>, ValueDecodeError> {
     match value {
         Value::Null => Ok(None),
-        value => decode_record_ref(value).map(Some),
+        value => decode_record_ref(value, cx).map(Some),
     }
 }
 
@@ -342,7 +357,7 @@ mod tests {
         let ValueDecodeError::Allocation(failure) = error else { panic!("expected allocation refusal") };
         assert_eq!(Some(failure), cx.first_failure());
         assert_eq!(failure.kind, AllocationFailureKind::Injected);
-        assert!(matches!(failure.site, AllocationSite::OrderedMap | AllocationSite::Vector | AllocationSite::Box));
+        assert!(matches!(failure.site, AllocationSite::String | AllocationSite::OrderedMap | AllocationSite::Vector | AllocationSite::Box));
     }
 
     #[test]
@@ -382,7 +397,7 @@ mod tests {
 
         let record_ref_source = r#"{"entity":"person","record":"p1"}"#;
         let expected_ref: RecordRef = typed(record_ref_source);
-        let decoded_ref = decode_record_ref(syntax(record_ref_source)).unwrap();
+        let decoded_ref = decode_record_ref(syntax(record_ref_source), &mut AllocationContext::new()).unwrap();
         assert_eq!(super::super::canonical_bytes(&expected_ref).unwrap(), super::super::canonical_bytes(&decoded_ref).unwrap());
     }
 
@@ -412,8 +427,8 @@ mod tests {
     #[test]
     fn malformed_unknown_duplicate_and_numeric_inputs_are_rejected() {
         assert!(matches!(decode_record(syntax(r#"{"id":"x"}"#), &mut AllocationContext::new()), Err(ValueDecodeError::MissingField("entity"))));
-        assert!(matches!(decode_record_ref(syntax(r#"{"entity":"e","record":"r","extra":true}"#)), Err(ValueDecodeError::UnknownField { key, expected: RECORD_REF_FIELDS }) if key == "extra"));
-        assert!(matches!(decode_record_ref(syntax(r#"{"entity":1,"record":"x"}"#)), Err(ValueDecodeError::InvalidType { actual: JsonKind::UnsignedInteger, .. })));
+        assert!(matches!(decode_record_ref(syntax(r#"{"entity":"e","record":"r","extra":true}"#), &mut AllocationContext::new()), Err(ValueDecodeError::UnknownField { key, expected: RECORD_REF_FIELDS }) if key == "extra"));
+        assert!(matches!(decode_record_ref(syntax(r#"{"entity":1,"record":"x"}"#), &mut AllocationContext::new()), Err(ValueDecodeError::InvalidType { actual: JsonKind::UnsignedInteger, .. })));
         assert!(matches!(decode_record(syntax(&format!(r#"{{"entity":"e","id":"r","revision":-1,"created_program":"{D}","archived":false,"values":{{}}}}"#)), &mut AllocationContext::new()), Err(ValueDecodeError::InvalidValue { expected: "u64", .. })));
         assert!(matches!(decode_business_event(syntax(&format!(r#"{{"id":"e","sequence":1,"operation_id":"o","action":"a","day":2147483648,"program":"{D}","changes":[],"outputs":[]}}"#)), &mut AllocationContext::new()), Err(ValueDecodeError::InvalidValue { expected: "i32", .. })));
         assert!(matches!(decode_record(syntax(r#"{"entity":"e","id":"r","revision":1,"created_program":"bad","archived":false,"values":{}}"#), &mut AllocationContext::new()), Err(ValueDecodeError::InvalidFormat("lowercase SHA-256 digest"))));
@@ -455,7 +470,27 @@ mod tests {
 
     #[test]
     fn string_owners_transfer_without_string_growth() {
-        let value = decode_record_ref(syntax(r#"{"entity":"é","record":"雪"}"#)).unwrap();
+        let value = decode_record_ref(syntax(r#"{"entity":"é","record":"雪"}"#), &mut AllocationContext::new()).unwrap();
         assert_eq!(value.entity, "é");
+    }
+
+    #[test]
+    fn record_ref_struct_sequence_matches_serde_and_reserves_fallibly() {
+        let source = r#"["person","p1"]"#;
+        let expected: RecordRef = typed(source);
+        let mut baseline = AllocationContext::new();
+        let decoded = decode_record_ref(syntax(source), &mut baseline).unwrap();
+        assert_eq!(super::super::canonical_bytes(&expected).unwrap(), super::super::canonical_bytes(&decoded).unwrap());
+        let growths = baseline.growth_requests();
+        assert!(growths > 0);
+        for nth in 1..=growths {
+            let mut fail = AllocationContext::fail_nth_growth(NonZeroUsize::new(nth).unwrap(), true);
+            allocation(decode_record_ref(syntax(source), &mut fail).unwrap_err(), &fail);
+            let mut retry = AllocationContext::new();
+            assert_eq!(
+                super::super::canonical_bytes(&expected).unwrap(),
+                super::super::canonical_bytes(&decode_record_ref(syntax(source), &mut retry).unwrap()).unwrap(),
+            );
+        }
     }
 }
