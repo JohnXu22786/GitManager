@@ -6,7 +6,7 @@
 use crate::product_alloc::{self, ordered::OrderedSet, AllocationContext, AllocationSite};
 use crate::product_contract::fallible_expr_decode::decode_expr;
 use crate::product_contract::fallible_value_decode::{decode_type, decode_values, JsonKind, NumericValue, ValueDecodeError};
-use crate::product_contract::{decode_data_snapshot_fallible, decode_record_ref_fallible, decode_session_state_fallible, Digest, Expr, FallibleDecodedDataSnapshot, FallibleDecodedSessionState, FallibleValues, RecordRef, Type, MAX_COLLECTION, MAX_EXPR_DEPTH, MAX_ITEMS};
+use crate::product_contract::{decode_data_snapshot_fallible, decode_record_ref_fallible, decode_session_state_fallible, CompatibilityState, Digest, Expr, FallibleDecodedDataSnapshot, FallibleDecodedSessionState, FallibleValues, RecordRef, SemanticKind, Type, MAX_COLLECTION, MAX_EVENTS, MAX_EXPR_DEPTH, MAX_ITEMS};
 use super::contract::ScopeTransition;
 use crate::product_json::{Number, Value};
 use serde::ser::SerializeSeq;
@@ -31,6 +31,10 @@ const SLOT_MAPPING_FIELDS: &[&str] = &["layer", "patch", "from_source", "from", 
 const COMPOSITION_FIELDS: &[&str] = &["version", "basis", "transition", "rewrites", "business", "layers", "active", "previous", "operation", "runtime", "driver", "output"];
 const ADDITION_FIELDS: &[&str] = &["record", "values"];
 const INITIALIZATION_FIELDS: &[&str] = &["operation", "layer", "before_data", "after_data", "before_schema", "after_schema", "additions", "business_projection", "original_events", "original_records", "capture_day", "capture_program", "prior_snapshot", "adoption_revision"];
+const SEMANTIC_KEY_FIELDS: &[&str] = &["kind", "entity", "id"];
+const COMPATIBILITY_FIELDS: &[&str] = &["state", "current_data", "target_program", "retained_records", "retained_events", "retained_fields", "issues"];
+const SEMANTIC_KINDS: &[&str] = &["entity", "field", "action", "observable", "output", "view"];
+const COMPATIBILITY_STATES: &[&str] = &["compatible", "retained_but_unavailable", "incompatible", "unknown"];
 const MAX_SCOPE_REWRITES: usize = super::contract::MAX_LAYERS * MAX_ITEMS;
 
 /// BTreeSet-compatible unique Id sequence with allocation-aware growth.
@@ -178,6 +182,14 @@ pub(crate) struct DecodedMetadataInitializationReceipt {
     before_schema: Digest, after_schema: Digest, additions: Vec<DecodedMetadataAddition>,
     business_projection: Digest, original_events: Digest, original_records: usize,
     capture_day: i32, capture_program: Digest, prior_snapshot: Digest, adoption_revision: u64,
+}
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct DecodedSemanticKey { kind: SemanticKind, entity: Option<String>, id: String }
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct DecodedCompatibilityReport {
+    state: CompatibilityState, current_data: Digest, target_program: Digest,
+    retained_records: Vec<RecordRef>, retained_events: Vec<String>,
+    retained_fields: Vec<DecodedSemanticKey>, issues: Vec<String>,
 }
 
 pub(crate) fn decode_scope_population(value: Value, cx: &mut AllocationContext) -> Result<ScopePopulationDto, ValueDecodeError> {
@@ -363,6 +375,55 @@ pub(crate) fn decode_metadata_initialization_receipt(value: Value, cx: &mut Allo
     Ok(DecodedMetadataInitializationReceipt { operation: required(operation, "operation")?, layer: required(layer, "layer")?, before_data: required(before_data, "before_data")?, after_data: required(after_data, "after_data")?, before_schema: required(before_schema, "before_schema")?, after_schema: required(after_schema, "after_schema")?, additions: required(additions, "additions")?, business_projection: required(business_projection, "business_projection")?, original_events: required(original_events, "original_events")?, original_records, capture_day: required(capture_day, "capture_day")?, capture_program: required(capture_program, "capture_program")?, prior_snapshot: required(prior_snapshot, "prior_snapshot")?, adoption_revision: required(adoption_revision, "adoption_revision")? })
 }
 
+pub(crate) fn decode_semantic_kind(value: Value) -> Result<SemanticKind, ValueDecodeError> {
+    let name = string(value, "a string variant identifier")?;
+    match name.as_str() {
+        "entity" => Ok(SemanticKind::Entity), "field" => Ok(SemanticKind::Field),
+        "action" => Ok(SemanticKind::Action), "observable" => Ok(SemanticKind::Observable),
+        "output" => Ok(SemanticKind::Output), "view" => Ok(SemanticKind::View),
+        _ => Err(ValueDecodeError::UnknownVariant { tag: name, expected: SEMANTIC_KINDS }),
+    }
+}
+
+pub(crate) fn decode_compatibility_state(value: Value) -> Result<CompatibilityState, ValueDecodeError> {
+    let name = string(value, "a string variant identifier")?;
+    match name.as_str() {
+        "compatible" => Ok(CompatibilityState::Compatible),
+        "retained_but_unavailable" => Ok(CompatibilityState::RetainedButUnavailable),
+        "incompatible" => Ok(CompatibilityState::Incompatible),
+        "unknown" => Ok(CompatibilityState::Unknown),
+        _ => Err(ValueDecodeError::UnknownVariant { tag: name, expected: COMPATIBILITY_STATES }),
+    }
+}
+
+pub(crate) fn decode_semantic_key(value: Value, cx: &mut AllocationContext) -> Result<DecodedSemanticKey, ValueDecodeError> {
+    let fields = struct_fields(value, "a struct SemanticKey", SEMANTIC_KEY_FIELDS, cx)?;
+    let (mut kind, mut entity, mut id) = (None, None, None);
+    for (key, value) in fields { match key.as_str() {
+        "kind" => kind = Some(decode_semantic_kind(value)?),
+        "entity" => entity = Some(optional_string(value, "a string")?),
+        "id" => id = Some(string(value, "a string")?),
+        _ => return Err(unknown(key, SEMANTIC_KEY_FIELDS)),
+    }}
+    Ok(DecodedSemanticKey { kind: required(kind, "kind")?, entity: entity.unwrap_or(None), id: required(id, "id")? })
+}
+
+pub(crate) fn decode_compatibility_report(value: Value, cx: &mut AllocationContext) -> Result<DecodedCompatibilityReport, ValueDecodeError> {
+    let fields = struct_fields(value, "a struct CompatibilityReport", COMPATIBILITY_FIELDS, cx)?;
+    let (mut state, mut current_data, mut target_program, mut retained_records, mut retained_events, mut retained_fields, mut issues) = (None, None, None, None, None, None, None);
+    for (key, value) in fields { match key.as_str() {
+        "state" => state = Some(decode_compatibility_state(value)?),
+        "current_data" => current_data = Some(digest(value)?),
+        "target_program" => target_program = Some(digest(value)?),
+        "retained_records" => retained_records = Some(record_refs(value, cx, "compatibility retained record count")?),
+        "retained_events" => retained_events = Some(decode_vec(value, MAX_EVENTS, "compatibility retained event count", cx, |value, _| string(value, "a string"))?),
+        "retained_fields" => retained_fields = Some(decode_vec(value, MAX_COLLECTION, "compatibility retained field count", cx, decode_semantic_key)?),
+        "issues" => issues = Some(decode_vec(value, MAX_ITEMS, "compatibility issue count", cx, |value, _| string(value, "a string"))?),
+        _ => return Err(unknown(key, COMPATIBILITY_FIELDS)),
+    }}
+    Ok(DecodedCompatibilityReport { state: required(state, "state")?, current_data: required(current_data, "current_data")?, target_program: required(target_program, "target_program")?, retained_records: required(retained_records, "retained_records")?, retained_events: required(retained_events, "retained_events")?, retained_fields: required(retained_fields, "retained_fields")?, issues: required(issues, "issues")? })
+}
+
 fn lifecycle_bindings(value: Value, cx: &mut AllocationContext) -> Result<Vec<LifecycleBindingDto>, ValueDecodeError> {
     decode_vec(value, MAX_ITEMS, "scope lifecycle count", cx, decode_lifecycle_binding)
 }
@@ -388,6 +449,9 @@ fn digest_set(value: Value, limit: usize, resource: &'static str, cx: &mut Alloc
 }
 fn optional_digest(value: Value) -> Result<Option<Digest>, ValueDecodeError> {
     match value { Value::Null => Ok(None), value => digest(value).map(Some) }
+}
+fn optional_string(value: Value, expected: &'static str) -> Result<Option<String>, ValueDecodeError> {
+    match value { Value::Null => Ok(None), value => string(value, expected).map(Some) }
 }
 fn record_refs(value: Value, cx: &mut AllocationContext, resource: &'static str) -> Result<Vec<RecordRef>, ValueDecodeError> {
     decode_vec(value, MAX_COLLECTION, resource, cx, decode_record_ref_fallible)
@@ -448,6 +512,7 @@ fn bounded(len: usize, limit: usize, resource: &'static str) -> Result<(), Value
 mod tests {
     use super::*;
     use crate::product_contract::canonical_bytes;
+    use crate::product_contract::{CompatibilityReport as ModelCompatibilityReport, CompatibilityState, SemanticKey as ModelSemanticKey, SemanticKind};
     use super::super::contract::{CompositionManifest as ModelCompositionManifest, EffectDestination, EffectPatch as ModelEffectPatch, EffectPatchRequest, LifecycleBinding as ModelLifecycleBinding, MetadataAddition as ModelMetadataAddition, MetadataInitializationReceipt as ModelMetadataInitializationReceipt, ScopeLayer as ModelScopeLayer, ScopePopulation as ModelPopulation, ScopeRequest as ModelScopeRequest, ScopeSlotMapping as ModelScopeSlotMapping, ScopeTransition};
     use crate::product_json;
     use std::num::NonZeroUsize;
@@ -690,6 +755,90 @@ mod tests {
                 assert!(matches!(decode(syntax(source), &mut cx), Err(ValueDecodeError::Allocation(_))), "growth {n}/{growths} in {source}");
                 decode(syntax(source), &mut AllocationContext::new()).unwrap();
             }
+        }
+    }
+
+    #[test]
+    fn compatibility_enums_and_semantic_keys_match_canonical_serde_bytes() {
+        for (source, expected) in [
+            ("\"compatible\"", CompatibilityState::Compatible),
+            ("\"retained_but_unavailable\"", CompatibilityState::RetainedButUnavailable),
+            ("\"incompatible\"", CompatibilityState::Incompatible),
+            ("\"unknown\"", CompatibilityState::Unknown),
+        ] {
+            assert_eq!(decode_compatibility_state(syntax(source)).unwrap(), expected);
+            assert_eq!(canonical(&expected), canonical(&decode_compatibility_state(syntax(source)).unwrap()));
+        }
+        let kinds = ["entity", "field", "action", "observable", "output", "view"];
+        for name in kinds {
+            let expected: SemanticKind = serde_json::from_str(&format!("\"{name}\"")).unwrap();
+            let actual = decode_semantic_kind(syntax(&format!("\"{name}\""))).unwrap();
+            assert_eq!(canonical(&expected), canonical(&actual));
+            let entity = if name == "field" { "\"customer\"" } else { "null" };
+            let key_source = format!(r#"{{"kind":"{name}","entity":{entity},"id":"name"}}"#);
+            let expected_key: ModelSemanticKey = serde_json::from_str(&key_source).unwrap();
+            let actual_key = decode_semantic_key(syntax(&key_source), &mut AllocationContext::new()).unwrap();
+            assert_eq!(canonical(&expected_key), canonical(&actual_key));
+        }
+        let omitted_entity: ModelSemanticKey = serde_json::from_str(r#"{"kind":"entity","id":"customer"}"#).unwrap();
+        let decoded = decode_semantic_key(syntax(r#"{"kind":"entity","id":"customer"}"#), &mut AllocationContext::new()).unwrap();
+        assert_eq!(omitted_entity.entity, None);
+        assert_eq!(canonical(&omitted_entity), canonical(&decoded));
+        let omitted_field_entity: ModelSemanticKey = serde_json::from_str(r#"{"kind":"field","id":"name"}"#).unwrap();
+        let decoded_field_entity = decode_semantic_key(syntax(r#"{"kind":"field","id":"name"}"#), &mut AllocationContext::new()).unwrap();
+        assert_eq!(omitted_field_entity.entity, None);
+        assert_eq!(canonical(&omitted_field_entity), canonical(&decoded_field_entity));
+    }
+
+    #[test]
+    fn complete_compatibility_report_preserves_nested_order_and_canonical_bytes() {
+        let source = r#"{"state":"retained_but_unavailable","current_data":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","target_program":"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789","retained_records":[{"entity":"person","record":"r1"},{"entity":"order","record":"r2"}],"retained_events":["event_a","event_b"],"retained_fields":[{"kind":"field","entity":"person","id":"name"},{"kind":"field","entity":"order","id":"total"}],"issues":["field unavailable","record retained"]}"#;
+        let expected: ModelCompatibilityReport = serde_json::from_str(source).unwrap();
+        let actual = decode_compatibility_report(syntax(source), &mut AllocationContext::new()).unwrap();
+        assert_eq!(canonical(&expected), canonical(&actual));
+        assert_eq!(actual.retained_records.len(), 2);
+        assert_eq!(actual.retained_events.len(), 2);
+        assert_eq!(actual.retained_fields.len(), 2);
+        assert_eq!(actual.issues.len(), 2);
+    }
+
+    #[test]
+    fn compatibility_decoders_reject_malformed_fields_and_limits() {
+        assert!(matches!(decode_compatibility_state(syntax("\"unknown_state\"")), Err(ValueDecodeError::UnknownVariant { .. })));
+        assert!(matches!(decode_semantic_kind(syntax("\"unknown_kind\"")), Err(ValueDecodeError::UnknownVariant { .. })));
+        assert!(matches!(decode_semantic_key(syntax(r#"{"kind":"field","entity":7,"id":"name"}"#), &mut AllocationContext::new()), Err(ValueDecodeError::InvalidType { .. })));
+        assert!(matches!(decode_semantic_key(syntax(r#"{"kind":"entity","entity":null}"#), &mut AllocationContext::new()), Err(ValueDecodeError::MissingField("id"))));
+        assert!(matches!(decode_semantic_key(syntax(r#"{"kind":"entity","entity":null,"id":"x","extra":0}"#), &mut AllocationContext::new()), Err(ValueDecodeError::UnknownField { .. })));
+        assert!(product_json::parse_json_bytes(br#"{"state":"compatible","state":"unknown"}"#, &mut AllocationContext::new()).is_err());
+
+        let too_many_events = format!(r#"{{"state":"compatible","current_data":"{}","target_program":"{}","retained_records":[],"retained_events":[{}],"retained_fields":[],"issues":[]}}"#,
+            digest_text(), digest_text(), std::iter::repeat("\"event\"").take(crate::product_contract::MAX_EVENTS + 1).collect::<Vec<_>>().join(","));
+        let mut cx = AllocationContext::new();
+        assert!(matches!(decode_compatibility_report(syntax(&too_many_events), &mut cx), Err(ValueDecodeError::LimitExceeded { resource: "compatibility retained event count", limit: crate::product_contract::MAX_EVENTS })));
+        assert_eq!(cx.growth_requests(), 0, "retained event count is checked before vector reservation");
+
+        let too_many_records = format!(r#"{{"state":"compatible","current_data":"{}","target_program":"{}","retained_records":[{}],"retained_events":[],"retained_fields":[],"issues":[]}}"#,
+            digest_text(), digest_text(), std::iter::repeat("null").take(MAX_COLLECTION + 1).collect::<Vec<_>>().join(","));
+        assert!(matches!(decode_compatibility_report(syntax(&too_many_records), &mut AllocationContext::new()), Err(ValueDecodeError::LimitExceeded { resource: "compatibility retained record count", limit: MAX_COLLECTION })));
+        let too_many_fields = format!(r#"{{"state":"compatible","current_data":"{}","target_program":"{}","retained_records":[],"retained_events":[],"retained_fields":[{}],"issues":[]}}"#,
+            digest_text(), digest_text(), std::iter::repeat("null").take(MAX_COLLECTION + 1).collect::<Vec<_>>().join(","));
+        assert!(matches!(decode_compatibility_report(syntax(&too_many_fields), &mut AllocationContext::new()), Err(ValueDecodeError::LimitExceeded { resource: "compatibility retained field count", limit: MAX_COLLECTION })));
+        let too_many_issues = format!(r#"{{"state":"compatible","current_data":"{}","target_program":"{}","retained_records":[],"retained_events":[],"retained_fields":[],"issues":[{}]}}"#,
+            digest_text(), digest_text(), std::iter::repeat("\"issue\"").take(MAX_ITEMS + 1).collect::<Vec<_>>().join(","));
+        assert!(matches!(decode_compatibility_report(syntax(&too_many_issues), &mut AllocationContext::new()), Err(ValueDecodeError::LimitExceeded { resource: "compatibility issue count", limit: MAX_ITEMS })));
+    }
+
+    #[test]
+    fn compatibility_report_allocation_refusal_cleans_up_and_retries() {
+        let source = r#"{"state":"unknown","current_data":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","target_program":"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789","retained_records":[{"entity":"person","record":"r1"}],"retained_events":["event"],"retained_fields":[{"kind":"field","entity":"person","id":"name"}],"issues":["issue"]}"#;
+        let mut count = AllocationContext::new();
+        decode_compatibility_report(syntax(source), &mut count).unwrap();
+        let growths = count.growth_requests();
+        assert!(growths > 0);
+        for n in 1..=growths {
+            let mut cx = AllocationContext::fail_nth_growth(NonZeroUsize::new(n).unwrap(), true);
+            assert!(matches!(decode_compatibility_report(syntax(source), &mut cx), Err(ValueDecodeError::Allocation(_))), "growth {n}/{growths}");
+            decode_compatibility_report(syntax(source), &mut AllocationContext::new()).unwrap();
         }
     }
 }
