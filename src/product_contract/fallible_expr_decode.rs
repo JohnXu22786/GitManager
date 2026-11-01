@@ -7,7 +7,7 @@ use crate::product_alloc::{self, AllocationContext, AllocationSite};
 use crate::product_json::{Number, Value};
 
 use super::fallible_value_decode::{decode_data_value, decode_type, JsonKind, NumericValue, ValueDecodeError};
-use super::{Expr, SortKey, MAX_AST_NODES, MAX_EXPR_DEPTH};
+use super::{Expr, SortKey, MAX_AST_NODES, MAX_EXPR_DEPTH, MAX_ITEMS};
 
 const EXPR_VARIANTS: &[&str] = &[
     "literal", "variable", "field", "state", "today", "query", "filter", "map", "count",
@@ -34,12 +34,22 @@ const COALESCE_FIELDS: &[&str] = &["fallback", "value"];
 const DATE_ADD_FIELDS: &[&str] = &["date", "days"];
 const DATE_DIFFERENCE_FIELDS: &[&str] = &["earlier", "later"];
 const SORT_KEY_FIELDS: &[&str] = &["descending", "value"];
+const SORT_KEY_SEQUENCE_FIELDS: &[&str] = &["value", "descending"];
 
 /// Decode one expression and enforce the existing Product Contract AST bounds
 /// before constructing each node. Depth is zero-based, like check_expr_shape.
-pub(super) fn decode_expr(value: Value, cx: &mut AllocationContext) -> Result<Expr, ValueDecodeError> {
+pub(crate) fn decode_expr(value: Value, cx: &mut AllocationContext) -> Result<Expr, ValueDecodeError> {
     let mut nodes = 0usize;
-    decode_expr_at(value, 0, &mut nodes, cx)
+    decode_expr_with_budget(value, 0, &mut nodes, cx)
+}
+
+pub(crate) fn decode_expr_with_budget(
+    value: Value,
+    depth: usize,
+    nodes: &mut usize,
+    cx: &mut AllocationContext,
+) -> Result<Expr, ValueDecodeError> {
+    decode_expr_at(value, depth, nodes, cx)
 }
 
 fn decode_expr_at(
@@ -268,6 +278,7 @@ fn expr_sequence(value: Value, depth: usize, nodes: &mut usize, cx: &mut Allocat
         Value::Array(values) => values,
         value => return Err(invalid_type(value, "a sequence")),
     };
+    ensure_item_count(values.len(), "expression item count")?;
     ensure_possible_node_count(values.len(), *nodes)?;
     let mut decoded = Vec::new();
     product_alloc::try_reserve(&mut decoded, values.len(), cx, AllocationSite::Vector)?;
@@ -282,6 +293,7 @@ fn sort_keys(value: Value, depth: usize, nodes: &mut usize, cx: &mut AllocationC
         Value::Array(values) => values,
         value => return Err(invalid_type(value, "a sequence")),
     };
+    ensure_item_count(values.len(), "sort key count")?;
     ensure_possible_node_count(values.len(), *nodes)?;
     let mut decoded = Vec::new();
     product_alloc::try_reserve(&mut decoded, values.len(), cx, AllocationSite::Vector)?;
@@ -294,6 +306,20 @@ fn sort_keys(value: Value, depth: usize, nodes: &mut usize, cx: &mut AllocationC
 fn sort_key(value: Value, depth: usize, nodes: &mut usize, cx: &mut AllocationContext) -> Result<SortKey, ValueDecodeError> {
     let fields = match value {
         Value::Object(fields) => fields,
+        Value::Array(values) => {
+            let names = SORT_KEY_SEQUENCE_FIELDS;
+            if values.len() != names.len() {
+                return Err(ValueDecodeError::InvalidLength { actual: values.len(), expected: names.len() });
+            }
+            let count = values.len().min(names.len());
+            let mut fields = crate::product_alloc::ordered::OrderedMap::new();
+            fields.try_reserve(count, cx)?;
+            for (name, value) in names.iter().take(count).zip(values) {
+                let key = product_alloc::try_copy_str(name, cx, AllocationSite::String)?;
+                fields.try_insert(key, value, cx)?;
+            }
+            fields
+        }
         value => return Err(invalid_type(value, "a struct SortKey")),
     };
     let mut decoded_value = None;
@@ -385,6 +411,14 @@ fn unit_expr(fields: crate::product_alloc::ordered::OrderedMap<String, Value>) -
 fn ensure_possible_node_count(additional: usize, nodes: usize) -> Result<(), ValueDecodeError> {
     if additional > MAX_AST_NODES.saturating_sub(nodes) {
         Err(ValueDecodeError::LimitExceeded { resource: "expression node count", limit: MAX_AST_NODES })
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_item_count(count: usize, resource: &'static str) -> Result<(), ValueDecodeError> {
+    if count > MAX_ITEMS {
+        Err(ValueDecodeError::LimitExceeded { resource, limit: MAX_ITEMS })
     } else {
         Ok(())
     }
@@ -530,6 +564,17 @@ mod tests {
     }
 
     #[test]
+    fn expression_and_sort_collections_are_bounded_before_reserve_or_decode() {
+        let invalid_members = vec!["false"; MAX_ITEMS + 1].join(",");
+        let expression = format!(r#"{{"kind":"and","values":[{invalid_members}]}}"#);
+        assert!(matches!(decode_expr(syntax(&expression), &mut AllocationContext::new()), Err(ValueDecodeError::LimitExceeded { resource: "expression item count", limit: MAX_ITEMS })));
+
+        let invalid_keys = vec!["false"; MAX_ITEMS + 1].join(",");
+        let query = format!(r#"{{"kind":"query","entity":"e","binding":"b","predicate":{{"kind":"today"}},"sort":[{invalid_keys}],"limit":1,"include_archived":false}}"#);
+        assert!(matches!(decode_expr(syntax(&query), &mut AllocationContext::new()), Err(ValueDecodeError::LimitExceeded { resource: "sort key count", limit: MAX_ITEMS })));
+    }
+
+    #[test]
     fn expression_depth_and_node_limits_match_contract_bounds() {
         fn nested_not(depth: usize) -> String {
             let mut source = String::from(r#"{"kind":"today"}"#);
@@ -542,9 +587,10 @@ mod tests {
         assert!(decode_expr(syntax(&nested_not(MAX_EXPR_DEPTH)), &mut cx).is_ok());
         assert!(matches!(decode_expr(syntax(&nested_not(MAX_EXPR_DEPTH + 1)), &mut AllocationContext::new()), Err(ValueDecodeError::LimitExceeded { resource: "expression depth", limit: MAX_EXPR_DEPTH })));
 
-        let below = format!(r#"{{"kind":"and","values":[{}]}}"#, vec![r#"{"kind":"today"}"#; MAX_AST_NODES - 1].join(","));
+        let group = || format!(r#"{{"kind":"and","values":[{}]}}"#, vec![r#"{"kind":"today"}"#; 63].join(","));
+        let below = format!(r#"{{"kind":"and","values":[{}]}}"#, vec![group(); 127].join(","));
         assert!(decode_expr(syntax(&below), &mut AllocationContext::new()).is_ok());
-        let above = format!(r#"{{"kind":"and","values":[{}]}}"#, vec![r#"{"kind":"today"}"#; MAX_AST_NODES].join(","));
+        let above = format!(r#"{{"kind":"and","values":[{}]}}"#, vec![group(); 128].join(","));
         assert!(matches!(decode_expr(syntax(&above), &mut AllocationContext::new()), Err(ValueDecodeError::LimitExceeded { resource: "expression node count", limit: MAX_AST_NODES })));
     }
 

@@ -132,13 +132,13 @@ use std::sync::Arc;
 mod values_map;
 #[path = "product_contract/fallible_value_decode.rs"]
 #[allow(dead_code)]
-mod fallible_value_decode;
+pub(crate) mod fallible_value_decode;
 #[path = "product_contract/fallible_expr_decode.rs"]
 #[allow(dead_code)]
-mod fallible_expr_decode;
+pub(crate) mod fallible_expr_decode;
 #[path = "product_contract/fallible_entity_decode.rs"]
 #[allow(dead_code)]
-mod fallible_entity_decode;
+pub(crate) mod fallible_entity_decode;
 #[path = "product_contract/fallible_persisted_decode.rs"]
 #[allow(dead_code)]
 mod fallible_persisted_decode;
@@ -148,6 +148,9 @@ mod fallible_snapshot_decode;
 #[path = "product_contract/fallible_decision_decode.rs"]
 #[allow(dead_code)]
 mod fallible_decision_decode;
+#[path = "product_contract/fallible_app_decode.rs"]
+#[allow(dead_code)]
+pub(crate) mod fallible_app_decode;
 #[allow(unused_imports)]
 pub(crate) use values_map::FallibleValues;
 

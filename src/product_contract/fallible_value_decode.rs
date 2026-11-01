@@ -45,6 +45,7 @@ pub(crate) enum ValueDecodeError {
     MissingField(&'static str),
     UnknownField { key: String, expected: &'static [&'static str] },
     UnknownVariant { tag: String, expected: &'static [&'static str] },
+    InvalidLength { actual: usize, expected: usize },
     InvalidFormat(&'static str),
     InvalidType { actual: JsonKind, expected: &'static str },
     InvalidValue { actual: NumericValue, expected: &'static str },
@@ -56,7 +57,7 @@ impl From<AllocationFailure> for ValueDecodeError {
     }
 }
 
-pub(super) fn decode_type(value: Value, cx: &mut AllocationContext) -> Result<Type, ValueDecodeError> {
+pub(crate) fn decode_type(value: Value, cx: &mut AllocationContext) -> Result<Type, ValueDecodeError> {
     decode_type_at(value, cx, 0)
 }
 
@@ -86,7 +87,7 @@ fn decode_type_at(value: Value, cx: &mut AllocationContext, depth: usize) -> Res
     }
 }
 
-pub(super) fn decode_data_value(value: Value, cx: &mut AllocationContext) -> Result<DataValue, ValueDecodeError> {
+pub(crate) fn decode_data_value(value: Value, cx: &mut AllocationContext) -> Result<DataValue, ValueDecodeError> {
     let (tag, fields) = tagged(value, VALUE_VARIANTS, "internally tagged enum DataValue")?;
     match tag.as_str() {
         "null" => unit(fields, NO_FIELDS).map(|()| DataValue::Null),
@@ -128,11 +129,14 @@ pub(super) fn decode_data_value(value: Value, cx: &mut AllocationContext) -> Res
     }
 }
 
-pub(super) fn decode_values(value: Value, cx: &mut AllocationContext) -> Result<FallibleValues, ValueDecodeError> {
+pub(crate) fn decode_values(value: Value, cx: &mut AllocationContext) -> Result<FallibleValues, ValueDecodeError> {
     let entries = match value {
         Value::Object(entries) => entries,
         value => return Err(invalid_type(value, "a map")),
     };
+    if entries.len() > super::MAX_ITEMS {
+        return Err(ValueDecodeError::LimitExceeded { resource: "value count", limit: super::MAX_ITEMS });
+    }
     let mut decoded = FallibleValues::new();
     for (key, value) in entries.into_entries() {
         let value = decode_data_value(value, cx)?;

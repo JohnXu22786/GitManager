@@ -6,18 +6,18 @@
 use crate::product_alloc::{self, AllocationContext, AllocationSite};
 use crate::product_json::Value;
 
-use super::fallible_expr_decode::decode_expr;
+use super::fallible_expr_decode::decode_expr_with_budget;
 use super::fallible_value_decode::{decode_type, JsonKind, ValueDecodeError};
 use super::{EntityDefinition, Expr, FieldDefinition, MAX_ITEMS};
 
 const FIELD_DEFINITION_FIELDS: &[&str] = &["id", "label", "value_type"];
 const ENTITY_DEFINITION_FIELDS: &[&str] = &["id", "label", "fields", "unique", "constraints"];
 
-pub(super) fn decode_field_definition(
+pub(crate) fn decode_field_definition(
     value: Value,
     cx: &mut AllocationContext,
 ) -> Result<FieldDefinition, ValueDecodeError> {
-    let fields = object(value, "a struct FieldDefinition")?;
+    let fields = struct_fields(value, "a struct FieldDefinition", FIELD_DEFINITION_FIELDS, cx)?;
     let mut id = None;
     let mut label = None;
     let mut value_type = None;
@@ -36,11 +36,19 @@ pub(super) fn decode_field_definition(
     })
 }
 
-pub(super) fn decode_entity_definition(
+pub(crate) fn decode_entity_definition(
     value: Value,
     cx: &mut AllocationContext,
 ) -> Result<EntityDefinition, ValueDecodeError> {
-    let fields = object(value, "a struct EntityDefinition")?;
+    decode_entity_definition_with_budget(value, cx, &mut 0)
+}
+
+pub(crate) fn decode_entity_definition_with_budget(
+    value: Value,
+    cx: &mut AllocationContext,
+    nodes: &mut usize,
+) -> Result<EntityDefinition, ValueDecodeError> {
+    let fields = struct_fields(value, "a struct EntityDefinition", ENTITY_DEFINITION_FIELDS, cx)?;
     let mut constraints = None;
     let mut declared_fields = None;
     let mut id = None;
@@ -48,7 +56,7 @@ pub(super) fn decode_entity_definition(
     let mut unique = None;
     for (key, value) in fields.into_entries() {
         match key.as_str() {
-            "constraints" => constraints = Some(exprs(value, cx)?),
+            "constraints" => constraints = Some(exprs(value, cx, nodes)?),
             "fields" => declared_fields = Some(field_definitions(value, cx)?),
             "id" => id = Some(string(value, "a string")?),
             "label" => label = Some(string(value, "a string")?),
@@ -94,23 +102,38 @@ fn unique_tuples(value: Value, cx: &mut AllocationContext) -> Result<Vec<Vec<Str
     Ok(decoded)
 }
 
-fn exprs(value: Value, cx: &mut AllocationContext) -> Result<Vec<Expr>, ValueDecodeError> {
+fn exprs(value: Value, cx: &mut AllocationContext, nodes: &mut usize) -> Result<Vec<Expr>, ValueDecodeError> {
     let values = array(value)?;
     bounded_length(values.len(), "entity constraint count")?;
     let mut decoded = Vec::new();
     product_alloc::try_reserve(&mut decoded, values.len(), cx, AllocationSite::Vector)?;
     for value in values {
-        decoded.push(decode_expr(value, cx)?);
+        decoded.push(decode_expr_with_budget(value, 0, nodes, cx)?);
     }
     Ok(decoded)
 }
 
-fn object(
+fn struct_fields(
     value: Value,
     expected: &'static str,
+    names: &'static [&'static str],
+    cx: &mut AllocationContext,
 ) -> Result<crate::product_alloc::ordered::OrderedMap<String, Value>, ValueDecodeError> {
     match value {
         Value::Object(fields) => Ok(fields),
+        Value::Array(values) => {
+            if values.len() != names.len() {
+                return Err(ValueDecodeError::InvalidLength { actual: values.len(), expected: names.len() });
+            }
+            let count = values.len().min(names.len());
+            let mut fields = crate::product_alloc::ordered::OrderedMap::new();
+            fields.try_reserve(count, cx)?;
+            for (name, value) in names.iter().take(count).zip(values) {
+                let key = product_alloc::try_copy_str(name, cx, AllocationSite::String)?;
+                fields.try_insert(key, value, cx)?;
+            }
+            Ok(fields)
+        }
         value => Err(invalid_type(value, expected)),
     }
 }
@@ -196,6 +219,14 @@ mod tests {
         let decoded_entity = decode_entity_definition(syntax(entity_source), &mut cx).unwrap();
         assert_eq!(decoded_entity, expected_entity);
         assert_eq!(super::super::canonical_bytes(&expected_entity).unwrap(), super::super::canonical_bytes(&decoded_entity).unwrap());
+
+        let field_with_tail = r#"["name","Name",{"kind":"text"},"ignored"]"#;
+        assert!(serde_json::from_str::<FieldDefinition>(field_with_tail).is_err());
+        assert!(matches!(decode_field_definition(syntax(field_with_tail), &mut AllocationContext::new()), Err(ValueDecodeError::InvalidLength { actual: 4, expected: 3 })));
+
+        let entity_with_tail = r#"["person","Person",[],[],[],"ignored"]"#;
+        assert!(serde_json::from_str::<EntityDefinition>(entity_with_tail).is_err());
+        assert!(matches!(decode_entity_definition(syntax(entity_with_tail), &mut AllocationContext::new()), Err(ValueDecodeError::InvalidLength { actual: 6, expected: 5 })));
     }
 
     #[test]
@@ -218,7 +249,7 @@ mod tests {
     fn malformed_unknown_wrong_type_and_duplicate_object_members_are_rejected() {
         assert!(matches!(decode_field_definition(syntax(r#"{"id":"x","label":"X"}"#), &mut AllocationContext::new()), Err(ValueDecodeError::MissingField("value_type"))));
         assert!(matches!(decode_field_definition(syntax(r#"{"id":"x","label":"X","value_type":{"kind":"text"},"extra":null}"#), &mut AllocationContext::new()), Err(ValueDecodeError::UnknownField { .. })));
-        assert!(matches!(decode_field_definition(syntax(r#"[]"#), &mut AllocationContext::new()), Err(ValueDecodeError::InvalidType { actual: JsonKind::Sequence, .. })));
+        assert!(matches!(decode_field_definition(syntax(r#"[]"#), &mut AllocationContext::new()), Err(ValueDecodeError::InvalidLength { actual: 0, expected: 3 })));
         assert!(matches!(decode_entity_definition(syntax(r#"{"id":false}"#), &mut AllocationContext::new()), Err(ValueDecodeError::InvalidType { actual: JsonKind::Boolean, .. })));
         let error = decode_entity_definition(syntax(r#"{"constraints":[],"fields":[],"id":"e","label":"E","unique":[],"extra":1}"#), &mut AllocationContext::new()).unwrap_err();
         let ValueDecodeError::UnknownField { expected, .. } = error else { panic!("expected unknown field") };
