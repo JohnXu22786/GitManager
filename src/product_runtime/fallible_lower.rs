@@ -3,7 +3,7 @@
 // Final-sigma logic adapted from Rust's alloc/str.rs, copyright (c) The Rust
 // Project Contributors. See third_party/rust-unicode-1.99.0 for MIT permission,
 // Unicode data permission, exact provenance and modifications.
-use crate::product_alloc::{try_reserve_string, AllocationContext,
+use super::product_alloc::{try_reserve_string, AllocationContext,
     AllocationFailure, AllocationSite};
 use std::{char::ToLowercase, str::CharIndices};
 #[path = "unicode_lower_1_99.rs"]

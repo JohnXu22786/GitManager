@@ -397,7 +397,9 @@ impl Eval<'_> {
             Expr::Lower { value } => {
                 let value = text(self.eval(value, env)?)?;
                 self.meter.tick(value.len() as u64)?;
-                let value = value.to_lowercase();
+                let mut allocations = AllocationContext::new();
+                let value = super::fallible_lower::try_lowercase(&value, &mut allocations)
+                    .map_err(|_| failed("lowercase allocation failed"))?;
                 if value.len() > MAX_TEXT_BYTES {
                     return Err(exhausted("text byte limit"));
                 }

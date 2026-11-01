@@ -106,6 +106,21 @@ fn filtered_selection_exports_actual_rows_and_independent_counts() {
 }
 
 #[test]
+fn unicode_lowercase_runs_through_the_real_observation_evaluator() {
+    let mut source = organizer();
+    source["views"][0]["kind"]["columns"][0]["value"] = json!({
+        "kind": "lower",
+        "value": {"kind": "field", "record": {"kind": "variable", "name": "row"}, "field": "name"}
+    });
+    let program = capture(source);
+    let runtime = LocalRuntime::default();
+    let mut run = start(&program);
+    apply(&mut run, add("ΟΣ İ"), "add-unicode");
+    let observation = runtime.observe(&run, "unicode-lowercase").unwrap();
+    assert_eq!(observation.view.rows[0].cells["name"], string("ος i\u{307}"));
+}
+
+#[test]
 fn related_loans_guard_duplicate_borrow_and_return_atomically() {
     let p = capture(equipment());
     let data = equipment_seed(&p);

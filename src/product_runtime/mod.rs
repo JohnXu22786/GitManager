@@ -5,6 +5,7 @@ mod capture_cost;
 mod capture_native;
 mod capture_eval;
 mod capture_key;
+mod fallible_lower;
 mod query_order;
 pub(crate) use capture::{ProjectionHost, ProjectionReservation};
 mod eval;
