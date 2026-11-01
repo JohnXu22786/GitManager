@@ -38,7 +38,7 @@ pub(super) struct DecodedScenarioSpec {
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-enum DecodedSemanticInput {
+pub(super) enum DecodedSemanticInput {
     Invoke { action: String, arguments: FallibleValues },
     Control { view: String, control: String, value: DataValue },
     Activate { view: String, binding: String, row: Option<RecordRef> },
@@ -100,7 +100,7 @@ fn decode_inputs(value: Value, cx: &mut AllocationContext) -> Result<Vec<Decoded
     Ok(decoded)
 }
 
-fn decode_semantic_input(value: Value, cx: &mut AllocationContext) -> Result<DecodedSemanticInput, ValueDecodeError> {
+pub(super) fn decode_semantic_input(value: Value, cx: &mut AllocationContext) -> Result<DecodedSemanticInput, ValueDecodeError> {
     let (tag, fields) = tagged(value)?;
     match tag.as_str() {
         "invoke" => {

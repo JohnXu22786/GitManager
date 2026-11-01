@@ -56,7 +56,7 @@ pub(crate) fn decode_captured_program(
     })
 }
 
-fn decode_artifact(value: Value, cx: &mut AllocationContext) -> Result<ArtifactRef, ValueDecodeError> {
+pub(super) fn decode_artifact(value: Value, cx: &mut AllocationContext) -> Result<ArtifactRef, ValueDecodeError> {
     let fields = struct_fields(value, "a struct ArtifactRef", ARTIFACT_FIELDS, cx)?;
     let mut kind = None;
     let mut version = None;
@@ -86,7 +86,23 @@ fn decode_artifact(value: Value, cx: &mut AllocationContext) -> Result<ArtifactR
 }
 
 fn decode_artifact_kind(value: Value) -> Result<ArtifactKind, ValueDecodeError> {
-    let tag = string(value, "a string variant identifier")?;
+    let tag = match value {
+        Value::String(tag) => tag,
+        Value::Object(fields) => {
+            if fields.len() != 1 {
+                return Err(ValueDecodeError::InvalidLength { actual: fields.len(), expected: 1 });
+            }
+            let (tag, payload) = fields.into_entries().next().expect("one field was checked");
+            if !ARTIFACT_KINDS.contains(&tag.as_str()) {
+                return Err(ValueDecodeError::UnknownVariant { tag, expected: ARTIFACT_KINDS });
+            }
+            match payload {
+                Value::Null => tag,
+                payload => return Err(invalid_type(payload, "unit")),
+            }
+        }
+        value => return Err(invalid_type(value, "a string variant identifier")),
+    };
     match tag.as_str() {
         "generated_app" => Ok(ArtifactKind::GeneratedApp),
         "legacy_order" => Ok(ArtifactKind::LegacyOrder),
@@ -95,7 +111,7 @@ fn decode_artifact_kind(value: Value) -> Result<ArtifactKind, ValueDecodeError> 
     }
 }
 
-fn decode_source_binding(value: Value, cx: &mut AllocationContext) -> Result<SourceBinding, ValueDecodeError> {
+pub(super) fn decode_source_binding(value: Value, cx: &mut AllocationContext) -> Result<SourceBinding, ValueDecodeError> {
     let fields = struct_fields(value, "a struct SourceBinding", SOURCE_BINDING_FIELDS, cx)?;
     let mut project_id = None;
     let mut program_path = None;
@@ -362,6 +378,30 @@ mod tests {
         let decoded = decode_captured_program(syntax(&input), &mut cx).unwrap();
         assert_eq!(capture.source_bytes, decoded.source_bytes);
         assert_eq!(super::super::canonical_bytes(&capture).unwrap(), super::super::canonical_bytes(&decoded).unwrap());
+    }
+
+    #[test]
+    fn artifact_kind_accepts_both_derived_serde_unit_forms() {
+        for (tag, expected) in [
+            ("generated_app", ArtifactKind::GeneratedApp),
+            ("legacy_order", ArtifactKind::LegacyOrder),
+            ("external_web", ArtifactKind::ExternalWeb),
+        ] {
+            let string = SerdeValue::String(tag.into());
+            let oracle: ArtifactKind = serde_json::from_value(string.clone()).unwrap();
+            assert_eq!(expected, oracle);
+            assert_eq!(expected, decode_artifact_kind(syntax(&serde_json::to_vec(&string).unwrap())).unwrap());
+
+            let mut map = serde_json::Map::new();
+            map.insert(tag.into(), SerdeValue::Null);
+            let map = SerdeValue::Object(map);
+            let oracle: ArtifactKind = serde_json::from_value(map.clone()).unwrap();
+            assert_eq!(expected, oracle);
+            assert_eq!(expected, decode_artifact_kind(syntax(&serde_json::to_vec(&map).unwrap())).unwrap());
+        }
+        assert!(matches!(decode_artifact_kind(syntax(br#"{"future":null}"#)), Err(ValueDecodeError::UnknownVariant { tag, .. }) if tag == "future"));
+        assert!(matches!(decode_artifact_kind(syntax(br#"{"generated_app":true}"#)), Err(ValueDecodeError::InvalidType { expected: "unit", .. })));
+        assert!(matches!(decode_artifact_kind(syntax(br#"{"generated_app":null,"external_web":null}"#)), Err(ValueDecodeError::InvalidLength { actual: 2, expected: 1 })));
     }
 
     #[test]

@@ -163,6 +163,9 @@ mod fallible_scenario_decode;
 #[path = "product_contract/fallible_observation_decode.rs"]
 #[allow(dead_code)]
 mod fallible_observation_decode;
+#[path = "product_contract/fallible_run_evidence_decode.rs"]
+#[allow(dead_code)]
+mod fallible_run_evidence_decode;
 #[allow(unused_imports)]
 pub(crate) use values_map::FallibleValues;
 
