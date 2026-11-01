@@ -5,10 +5,19 @@ mod capture_cost;
 mod capture_native;
 mod capture_eval;
 mod capture_key;
+mod query_order;
 pub(crate) use capture::{ProjectionHost, ProjectionReservation};
 mod eval;
 mod execute;
 mod view;
+// Integration tests compile this module as a nested source module and do not
+// declare every production crate-root module. Keep their allocator types local
+// to the runtime test harness while production reuses the crate's shared module.
+#[cfg(test)]
+#[path = "../product_alloc.rs"]
+mod product_alloc;
+#[cfg(not(test))]
+use crate::product_alloc;
 
 use crate::product_contract::*;
 use crate::product_protocol::RuntimeView;

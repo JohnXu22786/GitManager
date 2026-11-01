@@ -5,7 +5,7 @@
 //! `_ => Equal` comparator is intentionally retained even on non-total inputs.
 //! This module does not validate product inputs, meter work, or close caller
 //! construction/destruction, routing, paid execution, or default-budget fit.
-use crate::product_alloc::{try_reserve, AllocationContext, AllocationFailure, AllocationSite};
+use super::product_alloc::{try_reserve, AllocationContext, AllocationFailure, AllocationSite};
 use crate::product_contract::{DataValue, Id, Record, SortKey};
 use std::cmp::Ordering;
 

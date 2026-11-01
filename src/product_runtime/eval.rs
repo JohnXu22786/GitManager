@@ -1,5 +1,7 @@
 use super::*;
 use std::cmp::Ordering as Compare;
+use super::product_alloc::AllocationContext;
+use super::query_order::{try_sort_candidate_ids, try_sort_rows, QueryOrderError};
 
 pub(super) type Env = BTreeMap<Id, (Type, DataValue)>;
 pub(super) struct Eval<'a> {
@@ -79,6 +81,13 @@ pub(super) fn value_ref(r: &Record) -> DataValue {
     DataValue::Reference {
         entity: r.entity.clone(),
         record: r.id.clone(),
+    }
+}
+
+fn query_order_error(error: QueryOrderError) -> AdapterError {
+    match error {
+        QueryOrderError::Allocation(_) => failed("query ordering allocation failed"),
+        QueryOrderError::MissingKeySlots { .. } => failed("query ordering key slots missing"),
     }
 }
 
@@ -216,7 +225,9 @@ impl Eval<'_> {
                     (usize::BITS - candidates.len().max(1).leading_zeros()) as usize,
                 );
                 self.meter.tick(comparisons as u64)?;
-                candidates.sort_by(|a, b| a.id.cmp(&b.id));
+                let mut allocations = AllocationContext::new();
+                try_sort_candidate_ids(&mut candidates, &mut allocations)
+                    .map_err(|error| query_order_error(QueryOrderError::Allocation(error)))?;
                 // Predicate and key failures must follow ID order too, not just
                 // successful result rows after the final explicit-key sort.
                 let mut rows = Vec::new();
@@ -240,19 +251,7 @@ impl Eval<'_> {
                     .saturating_mul((usize::BITS - rows.len().max(1).leading_zeros()) as usize)
                     .saturating_mul(sort.len().max(1));
                 self.meter.tick(comparisons as u64)?;
-                rows.sort_by(|a, b| {
-                    for (i, key) in sort.iter().enumerate() {
-                        let order = compare(&a.1[i], &b.1[i]);
-                        if order != Compare::Equal {
-                            return if key.descending {
-                                order.reverse()
-                            } else {
-                                order
-                            };
-                        }
-                    }
-                    a.0.cmp(&b.0)
-                });
+                try_sort_rows(&mut rows, sort, &mut allocations).map_err(query_order_error)?;
                 self.meter.tick(1)?;
                 DataValue::List {
                     item_type: Type::reference(entity),
