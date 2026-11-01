@@ -1,8 +1,9 @@
 //! Fallible structural codec for the actual persisted Pointer.
 //!
-//! Deliberately unregistered in production: this does not route CURRENT reads,
-//! writes, upgrades or diagnostics. Callers must still fund all work from their
-//! original budget; measuring output creates no credit or new input limit.
+//! Used only by the ProductStore CURRENT Pointer path. Snapshot objects,
+//! upgrade journals and backups retain their separate codecs. Callers must fund
+//! all work from their original budget; measuring output creates no credit or
+//! new input limit.
 use super::pointer::Pointer;
 use crate::product_alloc::{AllocationContext, AllocationSite, FallibleStringWriter, FormatFailure};
 use crate::product_app::{Expected, SchemaFailure, UnexpectedOwned};
@@ -133,11 +134,9 @@ fn from_parsed(value: Value) -> Result<Pointer, PointerDecodeError> {
             let project_id = string(next_element(&mut values, length)?)?;
             let revision = unsigned(next_element(&mut values, length)?, u64::MAX, "u64")?;
             let object = digest(next_element(&mut values, length)?)?;
-            if length > 5 {
-                return Err(SchemaFailure::InvalidLength {
-                    actual: length, expected: Expected::Text("fewer elements in array"),
-                }.into());
-            }
+            // Derived struct deserialization reads exactly its declared fields
+            // from a sequence and ignores trailing elements. Preserve that
+            // legacy behavior; dropping the remaining iterator is allocation-free.
             Ok(Pointer { magic, version, project_id, revision, object })
         }
         value => Err(invalid_type(value, "struct Pointer")),

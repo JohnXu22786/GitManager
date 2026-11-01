@@ -6,6 +6,9 @@ pub(crate) use files::file_sync_testing;
 mod json;
 mod pointer;
 use pointer::Pointer;
+mod pointer_codec;
+use crate::product_alloc::{try_copy_str, AllocationContext, AllocationFailure, AllocationSite};
+use pointer_codec::PointerDecodeError;
 mod recovery_destination;
 pub(crate) use recovery_destination::RecoveryDestination;
 pub mod scope;
@@ -30,6 +33,12 @@ const MAX_STORE_BYTES: usize = 16 * 1024 * 1024;
 /// individual source/provider document still has its separate 1 MiB cap.
 pub(crate) const MAX_INTENTION_OBJECT_BYTES: usize = MAX_STORE_BYTES;
 type Result<T> = std::result::Result<T, StoreError>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointerCodecFailure {
+    Allocation(AllocationFailure),
+    Malformed,
+    EncodingInvariant,
+}
 #[derive(Debug)]
 pub enum StoreError {
     Io(io::Error),
@@ -42,6 +51,7 @@ pub enum StoreError {
     Incompatible(CompatibilityReport),
     Runtime(AdapterError),
     Corrupt(String),
+    PointerCodec(PointerCodecFailure),
     #[cfg(test)]
     Interrupted(FaultPoint),
 }
@@ -69,6 +79,32 @@ impl From<AdapterError> for StoreError {
 impl From<serde_json::Error> for StoreError {
     fn from(e: serde_json::Error) -> Self {
         Self::Corrupt(e.to_string())
+    }
+}
+impl From<AllocationFailure> for StoreError {
+    fn from(failure: AllocationFailure) -> Self {
+        Self::PointerCodec(PointerCodecFailure::Allocation(failure))
+    }
+}
+impl From<PointerDecodeError> for StoreError {
+    fn from(error: PointerDecodeError) -> Self {
+        match error {
+            PointerDecodeError::Json(error) => match error.cause {
+                crate::product_json::Cause::Allocation(failure) => failure.into(),
+                _ => Self::PointerCodec(PointerCodecFailure::Malformed),
+            },
+            PointerDecodeError::Schema(_) | PointerDecodeError::InvalidDigest => {
+                Self::PointerCodec(PointerCodecFailure::Malformed)
+            }
+        }
+    }
+}
+impl From<crate::product_json::canonical::EncodeError> for StoreError {
+    fn from(error: crate::product_json::canonical::EncodeError) -> Self {
+        match error {
+            crate::product_json::canonical::EncodeError::Allocation(failure) => failure.into(),
+            _ => Self::PointerCodec(PointerCodecFailure::EncodingInvariant),
+        }
     }
 }
 #[cfg(test)]
@@ -616,6 +652,24 @@ impl ProductStore {
         }
         result
     }
+    #[cfg(test)]
+    pub(crate) fn load_with_allocation_context(
+        &self,
+        allocations: &mut AllocationContext,
+    ) -> Result<ProjectSnapshot> {
+        let result = self
+            .load_current_with_archive_allocations(false, allocations, |snapshot, _| {
+                Ok(snapshot.clone())
+            })
+            .and_then(|snapshot| {
+                self.require_upgrade_complete(&snapshot)?;
+                Ok(snapshot)
+            });
+        if result.is_err() {
+            self.clear_validation_cache();
+        }
+        result
+    }
     fn load_current(&self) -> Result<ProjectSnapshot> {
         self.load_current_with_archive(false, |snapshot, _| Ok(snapshot.clone()))
     }
@@ -649,6 +703,21 @@ impl ProductStore {
     where
         E: From<StoreError>,
     {
+        let mut allocations = AllocationContext::new();
+        self.load_current_with_archive_allocations(include_archive, &mut allocations, consume)
+    }
+    fn load_current_with_archive_allocations<T, E>(
+        &self,
+        include_archive: bool,
+        allocations: &mut AllocationContext,
+        consume: impl FnOnce(
+            &ProjectSnapshot,
+            Option<&scope::ValidatedOwnedArchive<'_>>,
+        ) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E>
+    where
+        E: From<StoreError>,
+    {
         if self
             .upgrade_requires_reopen
             .load(std::sync::atomic::Ordering::Acquire)
@@ -657,7 +726,7 @@ impl ProductStore {
         }
         self.pinned()?;
         let pointer_bytes = self.root.read("CURRENT", 16 * 1024).map_err(StoreError::from)?;
-        let pointer: Pointer = json::parse(&pointer_bytes)
+        let pointer = pointer_codec::decode_pointer(&pointer_bytes, allocations)
             .map_err(StoreError::from)?;
         if pointer.magic != MAGIC {
             return Err(StoreError::Corrupt("not a generated-tool project".into()).into());
@@ -799,6 +868,44 @@ impl ProductStore {
         owned_registry: Option<scope::ValidatedOwnedRegistry>,
         #[cfg(test)] fault: Option<FaultPoint>,
     ) -> Result<()> {
+        let mut allocations = AllocationContext::new();
+        self.save_with_checkpoint_mode_allocations(
+            snapshot,
+            replace_current,
+            checkpoint,
+            applied_transition_verified,
+            owned_registry,
+            &mut allocations,
+            #[cfg(test)]
+            fault,
+        )
+    }
+    #[cfg(test)]
+    pub(crate) fn save_with_allocation_context(
+        &self,
+        snapshot: &ProjectSnapshot,
+        allocations: &mut AllocationContext,
+    ) -> Result<()> {
+        self.save_with_checkpoint_mode_allocations(
+            snapshot,
+            true,
+            || Ok(()),
+            false,
+            None,
+            allocations,
+            None,
+        )
+    }
+    fn save_with_checkpoint_mode_allocations(
+        &self,
+        snapshot: &ProjectSnapshot,
+        replace_current: bool,
+        checkpoint: impl FnOnce() -> Result<()>,
+        applied_transition_verified: bool,
+        owned_registry: Option<scope::ValidatedOwnedRegistry>,
+        allocations: &mut AllocationContext,
+        #[cfg(test)] fault: Option<FaultPoint>,
+    ) -> Result<()> {
         self.clear_validation_cache();
         self.pinned()?;
         if !replace_current {
@@ -832,9 +939,13 @@ impl ProductStore {
         }
         self.pinned()?;
         let pointer = Pointer {
-            magic: MAGIC.into(),
+            magic: try_copy_str(MAGIC, allocations, AllocationSite::String)?,
             version: FORMAT,
-            project_id: snapshot.data.project_id.clone(),
+            project_id: try_copy_str(
+                &snapshot.data.project_id,
+                allocations,
+                AllocationSite::String,
+            )?,
             revision: snapshot.revision,
             object,
         };
@@ -844,8 +955,14 @@ impl ProductStore {
         }
         // The preflight avoids staging into a known competing project; only
         // atomic no-clobber publication closes a subsequent activation race.
-        self.root
-            .publish_with_checkpoint("CURRENT", &canonical_bytes(&pointer)?, replace_current, checkpoint)?;
+        let pointer_bytes = pointer_codec::encode_pointer(&pointer, allocations)
+            .map_err(StoreError::from)?;
+        self.root.publish_with_checkpoint(
+            "CURRENT",
+            &pointer_bytes,
+            replace_current,
+            checkpoint,
+        )?;
         #[cfg(test)]
         if fault == Some(FaultPoint::AfterPointer) {
             return Err(StoreError::Interrupted(FaultPoint::AfterPointer));

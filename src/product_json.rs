@@ -126,8 +126,9 @@ pub fn parse_json_bytes(bytes: &[u8], cx: &mut AllocationContext) -> Result<Valu
 /// CURRENT reads use 16 KiB, store objects use 16 MiB. Those bounds also keep
 /// the inherited i32 number counters below i32::MAX. A future differently
 /// bounded caller must close that obligation separately (not use proposal's
-/// 1 MiB cap). This does not read files, decode a typed snapshot, or route any
-/// existing store/backup call; those allocation paths remain separate work.
+/// 1 MiB cap). This does not read files or decode typed snapshots. The separate
+/// closed Pointer codec uses it for CURRENT; snapshot objects and backup paths
+/// remain separate work.
 /// Errors keep Strict's unprefixed, line/column-aware text without allocating.
 pub fn parse_store_json_bytes(bytes: &[u8], cx: &mut AllocationContext) -> Result<Value, Error> {
     parser::parse_store(bytes, cx)
