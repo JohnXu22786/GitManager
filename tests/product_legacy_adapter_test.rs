@@ -1,5 +1,7 @@
 #[path = "fixtures/tool_project_fixture.rs"]
 mod fixture;
+#[path = "../src/product_alloc.rs"]
+mod product_alloc;
 #[path = "../src/product_contract.rs"]
 mod product_contract;
 #[path = "../src/product_legacy_adapter.rs"]

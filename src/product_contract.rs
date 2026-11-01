@@ -127,6 +127,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
+#[path = "product_contract/values_map.rs"]
+#[allow(dead_code)]
+mod values_map;
+#[allow(unused_imports)]
+pub(crate) use values_map::FallibleValues;
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ValidationCounts {
