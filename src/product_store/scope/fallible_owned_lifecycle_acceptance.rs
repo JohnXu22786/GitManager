@@ -47,7 +47,34 @@ pub(crate) struct FallibleAcceptedPreviewLifecycle {
 }
 
 impl FallibleAcceptedPreviewLifecycle {
+    #[cfg(test)]
+    pub(crate) fn test_inventory_binding(
+        snapshot: &crate::product_store::fallible_project_snapshot_decode::DecodedProjectSnapshot,
+        before: &FallibleDecodedCapturedProgram,
+        after: &FallibleDecodedCapturedProgram,
+        request: &DecodedOwnedPreviewRequest,
+        cx: &mut AllocationContext,
+    ) -> Result<Self, LifecycleAcceptanceFailure> {
+        let snapshot = snapshot_identity(snapshot, cx)?;
+        let request = request_identity(request, cx)?;
+        let source = before.revision_with(cx).map_err(app_error)?;
+        let candidate = after.revision_with(cx).map_err(app_error)?;
+        let placeholder = crate::product_contract::Digest::from_owned_lower_hex("0".repeat(64)).expect("test digest");
+        Ok(Self { snapshot, request, source, candidate, layer: placeholder.clone(), disclosure: placeholder.clone(), event: placeholder, origin: "test" })
+    }
+
     pub(crate) fn identity(&self) -> &crate::product_contract::Digest { &self.event }
+
+    pub(crate) fn matches_inventory_inputs(
+        &self,
+        snapshot: &crate::product_contract::Digest,
+        request: &crate::product_contract::Digest,
+        source: &crate::product_contract::Digest,
+        candidate: &crate::product_contract::Digest,
+    ) -> bool {
+        &self.snapshot == snapshot && &self.request == request
+            && &self.source == source && &self.candidate == candidate
+    }
 
     pub(crate) fn reconstruct(
         snapshot: &DecodedProjectSnapshot,

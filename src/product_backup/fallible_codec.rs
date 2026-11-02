@@ -90,6 +90,7 @@ impl BackupWire for crate::product_contract::FallibleJsonScalar<'_> {}
 impl BackupWire for crate::product_contract::FallibleArtifactReceipt<'_> {}
 impl BackupWire for crate::product_contract::FallibleDataValueTuple<'_> {}
 impl BackupWire for crate::product_contract::Expr {}
+impl BackupWire for crate::product_contract::EntityDefinition {}
 impl BackupWire for crate::product_store::scope::EffectDestinationDto {}
 impl BackupWire for crate::product_contract::fallible_app_decode::DecodedStatement {}
 impl BackupWire for crate::product_contract::Statement {}

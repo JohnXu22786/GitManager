@@ -18,6 +18,7 @@ pub(crate) use fallible_replay_registry::{replay_snapshot_fallible, ReplayRegist
 mod fallible_replay_context;
 mod owned_source_shared;
 mod fallible_owned_source_analysis;
+pub(crate) mod fallible_common_fact_inventory;
 pub(crate) use fallible_owned_source_analysis::{analyze_owned_sources_fallible, SourceAnalysisFailure};
 pub(crate) use fallible_owned_source_decode::decode_owned_source_request as decode_owned_source_request_fallible;
 pub(crate) use fallible_owned_source_decode::DecodedOwnedStructuralReport;
@@ -193,7 +194,7 @@ mod fallible_scalar_decode;
 #[allow(dead_code)]
 mod fallible_owned_source_decode;
 #[allow(dead_code)]
-mod fallible_owned_request_decode;
+pub(crate) mod fallible_owned_request_decode;
 #[allow(dead_code)]
 mod fallible_owned_inventory_decode;
 mod correspondence;

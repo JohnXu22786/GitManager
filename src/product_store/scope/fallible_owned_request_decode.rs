@@ -19,9 +19,9 @@ const AUXILIARY_FIELDS: &[&str] = &["entity", "owner_field"];
 const AVAILABILITY_VARIANTS: &[&str] = &["nullable_added_boolean"];
 
 #[derive(Debug, Serialize)]
-struct DecodedCommonFactLifecycleSuggestion { entity: String, before: Expr, after: Expr, meaning: String }
+pub(crate) struct DecodedCommonFactLifecycleSuggestion { pub(crate) entity: String, pub(crate) before: Expr, pub(crate) after: Expr, pub(crate) meaning: String }
 #[derive(Debug, Serialize)]
-struct DecodedCommonFactInventoryRequest { snapshot: Digest, sources: DecodedOwnedSourceRequest, lifecycle: DecodedCommonFactLifecycleSuggestion }
+pub(crate) struct DecodedCommonFactInventoryRequest { pub(crate) snapshot: Digest, pub(crate) sources: DecodedOwnedSourceRequest, pub(crate) lifecycle: DecodedCommonFactLifecycleSuggestion }
 #[derive(Debug, Serialize)]
 struct DecodedOwnedAuxiliary { entity: String, owner_field: String }
 #[derive(Debug, Serialize)]
@@ -34,6 +34,7 @@ pub(crate) struct DecodedOwnedPreviewRequest {
     availability: DecodedOwnedPreviewAvailability, purpose: String,
 }
 impl DecodedOwnedPreviewRequest {
+    pub(crate) fn inventory(&self) -> &DecodedCommonFactInventoryRequest { &self.inventory }
     pub(crate) fn snapshot(&self) -> &Digest { &self.inventory.snapshot }
     pub(crate) fn source_before(&self) -> &Digest { self.inventory.sources.before() }
     pub(crate) fn source_after(&self) -> &Digest { self.inventory.sources.after() }
@@ -104,7 +105,7 @@ fn decode_common_fact_lifecycle_suggestion(value: Value, cx: &mut AllocationCont
     Ok(DecodedCommonFactLifecycleSuggestion { entity: required(entity, "entity")?, before: required(before, "before")?, after: required(after, "after")?, meaning: required(meaning, "meaning")? })
 }
 
-fn decode_common_fact_inventory_request(value: Value, cx: &mut AllocationContext) -> Result<DecodedCommonFactInventoryRequest, ValueDecodeError> {
+pub(crate) fn decode_common_fact_inventory_request(value: Value, cx: &mut AllocationContext) -> Result<DecodedCommonFactInventoryRequest, ValueDecodeError> {
     let fields = struct_fields(value, "a struct CommonFactInventoryRequest", INVENTORY_REQUEST_FIELDS, cx)?;
     let (mut snapshot, mut sources, mut lifecycle) = (None, None, None);
     for (key, value) in fields { match key.as_str() {
