@@ -352,6 +352,7 @@ impl Meter {
         }
         Ok(())
     }
+    fn into_allocations(self) -> product_alloc::AllocationContext { self.allocations }
 }
 impl LocalRuntime {
     pub fn with_cancellation(cancelled: Arc<AtomicBool>) -> Self {
@@ -438,47 +439,87 @@ impl LocalRuntime {
         expected: &Type,
         day: i32,
         limits: RuntimeLimits,
-        mut allocations: product_alloc::AllocationContext,
+        allocations: product_alloc::AllocationContext,
     ) -> Result<DataValue> {
+        self.evaluate_decoded_record_projection_and_allocations(
+            program, data, row, binding, expression, expected, day, limits, allocations,
+        ).map(|(value, _)| value).map_err(|(error, _)| error)
+    }
+    /// Variant for callers that perform several projections in one fallible
+    /// operation. Returning the charged context keeps all projection work on
+    /// the caller's single refusal counter rather than resetting it per row.
+    pub(crate) fn evaluate_decoded_record_projection_and_allocations(
+        &self,
+        program: &FallibleDecodedCapturedProgram,
+        data: &FallibleDecodedDataSnapshot,
+        row: &RecordRef,
+        binding: &str,
+        expression: &Expr,
+        expected: &Type,
+        day: i32,
+        limits: RuntimeLimits,
+        mut allocations: product_alloc::AllocationContext,
+    ) -> std::result::Result<
+        (DataValue, product_alloc::AllocationContext),
+        (AdapterError, product_alloc::AllocationContext),
+    > {
         fn app_error(error: AppValidationError) -> AdapterError {
             match error {
                 AppValidationError::Contract(error) => AdapterError::Invalid(error),
                 AppValidationError::Allocation(failure) => AdapterError::Allocation(failure),
             }
         }
-        validate_day(day)?;
-        limits.validate()?;
-        program.validate_with(&mut allocations).map_err(app_error)?;
-        data.validate_with(&mut allocations).map_err(app_error)?;
-        if program.project_id() != data.project_id() || !valid_id(binding) {
-            return Err(invalid("projection project or binding mismatch"));
-        }
-        let view = DataSnapshotView::from(data);
-        if view.record(&row.entity, &row.record).is_none() {
-            return Err(invalid("record reference does not exist"));
-        }
-        let actual = crate::product_contract::decoded_expression_type_with(
-            program.app(), expression, binding, &row.entity, &mut allocations,
-        ).map_err(app_error)?;
-        if actual != *expected { return Err(invalid("projection result type mismatch")); }
-        let session = program.initial_session_with(&mut allocations).map_err(AdapterError::Allocation)?;
-        program.validate_session_with(&session, &mut allocations).map_err(app_error)?;
-        let value = DataValue::Reference {
-            entity: product_alloc::try_copy_str(&row.entity, &mut allocations, product_alloc::AllocationSite::String).map_err(AdapterError::Allocation)?,
-            record: product_alloc::try_copy_str(&row.record, &mut allocations, product_alloc::AllocationSite::String).map_err(AdapterError::Allocation)?,
+        // Keep the caller's complete allocation accounting available on every
+        // error path, including preflight failures before the evaluator meter
+        // is constructed.
+        let prepared = (|| -> Result<(FallibleDecodedSessionState, ManagedEnv)> {
+            validate_day(day)?;
+            limits.validate()?;
+            program.validate_with(&mut allocations).map_err(app_error)?;
+            data.validate_with(&mut allocations).map_err(app_error)?;
+            if program.project_id() != data.project_id() || !valid_id(binding) {
+                return Err(invalid("projection project or binding mismatch"));
+            }
+            let view = DataSnapshotView::from(data);
+            if view.record(&row.entity, &row.record).is_none() {
+                return Err(invalid("record reference does not exist"));
+            }
+            let actual = crate::product_contract::decoded_expression_type_with(
+                program.app(), expression, binding, &row.entity, &mut allocations,
+            ).map_err(app_error)?;
+            if actual != *expected { return Err(invalid("projection result type mismatch")); }
+            let session = program.initial_session_with(&mut allocations).map_err(AdapterError::Allocation)?;
+            program.validate_session_with(&session, &mut allocations).map_err(app_error)?;
+            let value = DataValue::Reference {
+                entity: product_alloc::try_copy_str(&row.entity, &mut allocations, product_alloc::AllocationSite::String).map_err(AdapterError::Allocation)?,
+                record: product_alloc::try_copy_str(&row.record, &mut allocations, product_alloc::AllocationSite::String).map_err(AdapterError::Allocation)?,
+            };
+            let mut managed = ManagedEnv::new();
+            let env_entity = product_alloc::try_copy_str(&row.entity, &mut allocations, product_alloc::AllocationSite::String)
+                .map_err(AdapterError::Allocation)?;
+            let typ = Type::Reference { entity: env_entity };
+            let binding = product_alloc::try_copy_str(binding, &mut allocations, product_alloc::AllocationSite::String)
+                .map_err(AdapterError::Allocation)?;
+            managed.try_bind(&binding, &typ, &value, &mut allocations).map_err(AdapterError::Allocation)?;
+            Ok((session, managed))
+        })();
+        let (session, managed) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => return Err((error, allocations)),
         };
-        let mut managed = ManagedEnv::new();
-        let env_entity = product_alloc::try_copy_str(&row.entity, &mut allocations, product_alloc::AllocationSite::String)
-            .map_err(AdapterError::Allocation)?;
-        let typ = Type::Reference { entity: env_entity };
-        let binding = product_alloc::try_copy_str(binding, &mut allocations, product_alloc::AllocationSite::String)
-            .map_err(AdapterError::Allocation)?;
-        managed.try_bind(&binding, &typ, &value, &mut allocations).map_err(AdapterError::Allocation)?;
         let mut meter = Meter::with_allocations(limits.clone(), limits.fuel, self.cancelled.clone(), allocations);
-        let mut evaluator = Eval::fallible(program.app(), data, &session, day, &mut meter);
-        let result = evaluator.eval(expression, &managed)?;
-        validate_value(&result, expected, 0)?;
-        Ok(result)
+        let result = {
+            let mut evaluator = Eval::fallible(program.app(), data, &session, day, &mut meter);
+            evaluator.eval(expression, &managed).and_then(|result| {
+                validate_value(&result, expected, 0)?;
+                Ok(result)
+            })
+        };
+        let allocations = meter.into_allocations();
+        match result {
+            Ok(value) => Ok((value, allocations)),
+            Err(error) => Err((error, allocations)),
+        }
     }
     pub(crate) fn evaluate_decoded_historical_record_projection_with(
         &self,

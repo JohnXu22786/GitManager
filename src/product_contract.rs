@@ -174,6 +174,15 @@ impl StringValueMap<DataValue> for FallibleValues {
 /// Opaque bridge into fallible persisted data/session DTOs for sibling decoders.
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct FallibleDecodedDataSnapshot(fallible_snapshot_decode::DecodedDataSnapshot);
+#[derive(Serialize)]
+#[serde(transparent)]
+pub(crate) struct FallibleEntitySchemaIdentity<'a>(&'a [EntityDefinition]);
+#[derive(Serialize)]
+#[serde(transparent)]
+pub(crate) struct FallibleBusinessRecordsIdentity<'a>(&'a [fallible_persisted_decode::DecodedRecord]);
+#[derive(Serialize)]
+#[serde(transparent)]
+pub(crate) struct FallibleBusinessEventsIdentity<'a>(&'a [fallible_persisted_decode::DecodedBusinessEvent]);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FallibleDataSnapshotCloneError {
     Allocation(crate::product_alloc::AllocationFailure),
@@ -226,6 +235,40 @@ impl FallibleDecodedDataSnapshot {
         cx: &mut crate::product_alloc::AllocationContext,
     ) -> std::result::Result<Digest, crate::product_backup::fallible_codec::CodecError> {
         crate::product_backup::fallible_codec::canonical_digest(domain, self, cx)
+    }
+    pub(crate) fn identity_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Digest, AppValidationError> {
+        self.validate_with(cx)?;
+        crate::product_backup::fallible_codec::canonical_digest(IdentityDomain::Data, self, cx)
+            .map_err(|error| match error {
+                crate::product_backup::fallible_codec::CodecError::Allocation(failure) => AppValidationError::Allocation(failure),
+                _ => AppValidationError::Contract(ContractError("data identity encoding failed".into())),
+            })
+    }
+    pub(crate) fn schema_identity_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Digest, AppValidationError> {
+        self.validate_with(cx)?;
+        crate::product_backup::fallible_codec::canonical_digest(IdentityDomain::Schema, &FallibleEntitySchemaIdentity(&self.0.schema), cx)
+            .map_err(|error| match error {
+                crate::product_backup::fallible_codec::CodecError::Allocation(failure) => AppValidationError::Allocation(failure),
+                _ => AppValidationError::Contract(ContractError("schema identity encoding failed".into())),
+            })
+    }
+    pub(crate) fn business_projection_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Digest, crate::product_backup::fallible_codec::CodecError> {
+        crate::product_backup::fallible_codec::canonical_digest(IdentityDomain::Data, &FallibleBusinessRecordsIdentity(&self.0.records), cx)
+    }
+    pub(crate) fn events_digest_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Digest, crate::product_backup::fallible_codec::CodecError> {
+        crate::product_backup::fallible_codec::canonical_digest(IdentityDomain::Data, &FallibleBusinessEventsIdentity(&self.0.events), cx)
     }
     pub(crate) fn try_clone_with(
         &self,
@@ -292,6 +335,7 @@ impl FallibleDecodedDataSnapshot {
     }
     pub(crate) fn project_id(&self) -> &str { &self.0.project_id }
     pub(crate) fn generation(&self) -> u64 { self.0.generation }
+    pub(crate) fn record_count(&self) -> usize { self.0.records.len() }
     pub(crate) fn records(&self) -> &[fallible_persisted_decode::DecodedRecord] { &self.0.records }
     pub(crate) fn events(&self) -> &[fallible_persisted_decode::DecodedBusinessEvent] { &self.0.events }
     pub(crate) fn schema(&self) -> &[EntityDefinition] { &self.0.schema }
@@ -303,6 +347,29 @@ impl FallibleDecodedDataSnapshot {
     }
     pub(crate) fn output_digests(&self) -> impl Iterator<Item = &Digest> {
         self.0.events.iter().flat_map(|event| event.outputs.iter())
+    }
+    pub(crate) fn record_values_mut(&mut self, entity: &str, id: &str) -> Option<&mut FallibleValues> {
+        self.0.records.iter_mut().find(|record| record.entity == entity && record.id == id).map(|record| &mut record.values)
+    }
+    pub(crate) fn business_projection_matches_after_removing<'a, I>(
+        &self,
+        before: &Self,
+        additions: I,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<bool, FallibleDataSnapshotCloneError>
+    where
+        I: IntoIterator<Item = (&'a RecordRef, &'a FallibleValues)>,
+    {
+        let mut business = self.try_clone_with(cx)?;
+        for (reference, values) in additions {
+            let Some(record) = business.0.records.iter_mut().find(|record| {
+                record.entity == reference.entity && record.id == reference.record
+            }) else { return Ok(false) };
+            for (key, _) in values.iter() { record.values.remove(key); }
+        }
+        Ok(business.0.records == before.0.records
+            && self.0.events == before.0.events
+            && self.0.generation == before.0.generation)
     }
 }
 #[derive(Debug, PartialEq, Eq, Serialize)]

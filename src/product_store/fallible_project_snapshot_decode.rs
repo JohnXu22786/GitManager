@@ -250,6 +250,26 @@ impl DecodedProjectSnapshot {
         }
         Ok(None)
     }
+    /// Match the historical scalar `program()` lookup: non-allocation
+    /// revision failures do not mask a later match and ultimately classify as
+    /// a missing retained source, while bounded reservation refusal propagates.
+    pub(crate) fn retained_source_program_with(
+        &self,
+        revision: &Digest,
+        cx: &mut AllocationContext,
+    ) -> Result<Option<&FallibleDecodedCapturedProgram>, crate::product_contract::AppValidationError> {
+        for program in &self.programs {
+            match program.revision_with(cx) {
+                Ok(actual) if &actual == revision => return Ok(Some(program)),
+                Ok(_) => {}
+                Err(crate::product_contract::AppValidationError::Allocation(failure)) => {
+                    return Err(crate::product_contract::AppValidationError::Allocation(failure));
+                }
+                Err(crate::product_contract::AppValidationError::Contract(_)) => {}
+            }
+        }
+        Ok(None)
+    }
 
     pub(crate) fn active_revision(&self) -> &Digest { &self.active_revision }
 

@@ -9,6 +9,9 @@ mod fallible_owned_composition_decode;
 mod fallible_owned_history_decode;
 #[allow(dead_code)]
 mod fallible_scope_envelope_decode;
+mod fallible_history;
+pub(crate) use fallible_history::{initialize as initialize_scalar_fallible, initialize_frame as initialize_scalar_frame_fallible,
+    initialization_receipt as scalar_initialization_receipt, InitializationFailure};
 pub(crate) use fallible_scope_envelope_decode::{decode_scope_envelope as decode_scope_envelope_fallible, DecodedScopeEnvelope as FallibleDecodedScopeEnvelope};
 pub(crate) use fallible_scalar_decode::{decode_compatibility_report as decode_compatibility_report_fallible, DecodedCompatibilityReport, DecodedSemanticKey};
 pub(crate) use fallible_scalar_decode::{
@@ -16,7 +19,8 @@ pub(crate) use fallible_scalar_decode::{
     decode_effect_patch as decode_effect_patch_fallible,
     decode_effect_patch_request as decode_effect_patch_request_fallible,
     decode_scope_slot_mapping as decode_scope_slot_mapping_fallible,
-    DecodedCompositionCompilerIdentity, DecodedCompilerKeyIdentity, DecodedCompositionManifest, DecodedEffectPatch, DecodedScopeState as FallibleDecodedScopeState,
+    DecodedCompositionCompilerIdentity, DecodedCompilerKeyIdentity, DecodedCompositionManifest, DecodedEffectPatch, DecodedScopeLayer, DecodedScopeState as FallibleDecodedScopeState,
+    DecodedMetadataAddition, DecodedMetadataInitializationReceipt,
     ScopePopulationDto,
     EffectDestinationDto, EffectPatchRequestDto,
 };

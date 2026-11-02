@@ -208,7 +208,7 @@ pub(super) fn slot_fallible<'a>(
     }
 }
 
-fn slot_fallible_ref<'a>(
+pub(super) fn slot_fallible_ref<'a>(
     app: &'a crate::product_contract::fallible_app_decode::DecodedAppDefinition,
     destination: &super::fallible_scalar_decode::EffectDestinationDto,
 ) -> Result<&'a Expr> {
@@ -2120,6 +2120,24 @@ pub(super) fn compile(
     )?)
 }
 
+enum FallibleCompositionBuild {
+    Envelope(crate::product_contract::fallible_app_decode::DecodedAppDefinition),
+    Capture(crate::product_contract::FallibleDecodedCapturedProgram),
+}
+
+/// Build the pre-instrumentation app envelope used for historical projection
+/// evaluation. This is the decoded counterpart of `envelope_app`.
+pub(super) fn envelope_app_fallible(
+    snapshot: &crate::product_store::fallible_project_snapshot_decode::DecodedProjectSnapshot,
+    manifest: &super::DecodedCompositionManifest,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<crate::product_contract::fallible_app_decode::DecodedAppDefinition, CompilerFailure> {
+    match build_fallible(snapshot, manifest, cx, false)? {
+        FallibleCompositionBuild::Envelope(app) => Ok(app),
+        FallibleCompositionBuild::Capture(_) => unreachable!("envelope build returned a capture"),
+    }
+}
+
 /// Fallible scalar composition compiler for the promoted decoded owner graph.
 /// This mirrors `compile` without materializing the legacy BTreeMap model.
 pub(super) fn compile_fallible(
@@ -2127,6 +2145,18 @@ pub(super) fn compile_fallible(
     manifest: &super::DecodedCompositionManifest,
     cx: &mut crate::product_alloc::AllocationContext,
 ) -> std::result::Result<crate::product_contract::FallibleDecodedCapturedProgram, CompilerFailure> {
+    match build_fallible(snapshot, manifest, cx, true)? {
+        FallibleCompositionBuild::Capture(program) => Ok(program),
+        FallibleCompositionBuild::Envelope(_) => unreachable!("capture build returned an envelope"),
+    }
+}
+
+fn build_fallible(
+    snapshot: &crate::product_store::fallible_project_snapshot_decode::DecodedProjectSnapshot,
+    manifest: &super::DecodedCompositionManifest,
+    cx: &mut crate::product_alloc::AllocationContext,
+    capture: bool,
+) -> std::result::Result<FallibleCompositionBuild, CompilerFailure> {
     use crate::product_alloc::{try_append_str, try_reserve, try_push, AllocationSite};
     use crate::product_contract::{AppValidationError, Producer};
 
@@ -2290,6 +2320,10 @@ pub(super) fn compile_fallible(
         }
     }
 
+    if !capture {
+        return Ok(FallibleCompositionBuild::Envelope(app));
+    }
+
     // Instrument original action steps from the projected graph, then append
     // seal passes and provenance in the same order as the legacy compiler.
     let projected = app.try_clone_with(cx).map_err(app_error)?;
@@ -2326,6 +2360,7 @@ pub(super) fn compile_fallible(
     try_append_str(&mut description, suffix, cx, AllocationSite::String).map_err(CompilerFailure::Allocation)?;
     let producer = Producer::ExternalAuthor { description };
     crate::product_contract::capture_generated_app_fallible(app, snapshot.data().project_id(), producer, cx)
+        .map(FallibleCompositionBuild::Capture)
         .map_err(app_error)
 }
 
@@ -2343,7 +2378,7 @@ fn clone_statement_fallible(
     })
 }
 
-fn key_fallible(
+pub(super) fn key_fallible(
     layer: &Digest,
     entity: &str,
     suffix: &str,
@@ -2368,7 +2403,7 @@ fn key_fallible(
     Ok(result)
 }
 
-fn saved_key_fallible(
+pub(super) fn saved_key_fallible(
     layer: &Digest,
     patch: &super::DecodedEffectPatch,
     cx: &mut crate::product_alloc::AllocationContext,
@@ -3242,6 +3277,94 @@ mod borrowed_view_tests {
         snapshot
     }
 
+    fn initialization_snapshot() -> ProjectSnapshot {
+        let mut snapshot = minimal_snapshot();
+        let mut app = snapshot.programs[0].program.clone();
+        app.views[0].kind = crate::product_contract::ViewKind::List {
+            entity: "item".into(),
+            rows: Expr::Query { entity: "item".into(), binding: "row".into(),
+                predicate: Box::new(Expr::Literal { value_type: Type::Boolean, value: DataValue::Boolean { value: true } }),
+                sort: vec![], limit: MAX_COLLECTION, include_archived: false },
+            columns: vec![crate::product_contract::Column { id: "name".into(), label: "Name".into(),
+                value: Expr::Field { record: Box::new(Expr::Variable { name: "row".into() }), field: "name".into() } }],
+            controls: vec![], selection: None,
+        };
+        let capture = crate::product_contract::CapturedProgram::capture(
+            &crate::product_contract::canonical_bytes(&app).unwrap(), "project",
+            crate::product_contract::Producer::Fixture { name: "initialization-test".into() }, None,
+        ).unwrap();
+        snapshot.programs = vec![capture.clone()];
+        snapshot.active_revision = crate::product_contract::canonical_digest(IdentityDomain::Source, &capture).unwrap();
+        snapshot.data = crate::product_contract::DataSnapshot::empty("project", &capture.program).unwrap();
+        snapshot.session = crate::product_contract::SessionState::initial(&capture.program).unwrap();
+        let mut record_values = BTreeMap::new();
+        record_values.insert("name".into(), DataValue::Text { value: "Ada".into() });
+        snapshot.data.records.push(crate::product_contract::Record {
+            entity: "item".into(), id: "row-1".into(), revision: 1,
+            created_program: capture.artifact.program_digest.clone(), archived: false,
+            values: record_values,
+        });
+        snapshot.data.validate().unwrap();
+        let active = snapshot.active_revision.clone();
+        let decision_identity = crate::product_contract::canonical_digest(IdentityDomain::Decision, &snapshot.decisions).unwrap();
+        let basis = super::super::FrozenBasis {
+            snapshot: crate::product_contract::canonical_digest(IdentityDomain::Data, &snapshot).unwrap(),
+            revision: snapshot.revision, active: active.clone(), data: snapshot.data.clone(),
+            session: snapshot.session.clone(), day: 3, decisions: decision_identity,
+        };
+        let destination = EffectDestination::ViewColumn { view: "main".into(), column: "name".into() };
+        let request = EffectPatchRequest { destination: destination.clone(), entity: "item".into(), subject: "row".into(), value_type: Type::Text };
+        let layer = super::super::ScopeLayer {
+            version: super::super::COMPILER_VERSION, operation: "adopt-row".into(), basis: basis.clone(),
+            candidate: active.clone(),
+            request: ScopeRequest {
+                population: ScopePopulation::All, operations: BTreeSet::from(["noop".into()]),
+                excluded_records: vec![],
+                lifecycles: vec![super::super::LifecycleBinding {
+                    entity: "item".into(),
+                    completed: Expr::Literal { value_type: Type::Boolean, value: DataValue::Boolean { value: true } },
+                    source: crate::product_contract::canonical_digest(IdentityDomain::Adoption, &"lifecycle-source").unwrap(),
+                }],
+                patches: vec![request.clone()],
+            },
+            patches: vec![EffectPatch {
+                request,
+                before: Expr::Field { record: Box::new(Expr::Variable { name: "row".into() }), field: "name".into() },
+                after: Expr::Literal { value_type: Type::Text, value: DataValue::Text { value: "new".into() } },
+            }],
+        };
+        let layer_id = layer.identity().unwrap();
+        let mut scope = super::super::ScopeState::default();
+        scope.layers.insert(layer_id, layer);
+        snapshot.scope = super::super::ScopeEnvelope::ScalarV1(scope);
+        snapshot.clock_day = 3;
+        snapshot
+    }
+
+    fn initialization_target(snapshot: &ProjectSnapshot) -> crate::product_contract::CapturedProgram {
+        let layer = snapshot.scalar_scope().unwrap().layers.values().next().unwrap();
+        let id = layer.identity().unwrap();
+        let mut app = snapshot.programs[0].program.clone();
+        for (suffix, typ, label) in [
+            ("member", Type::Boolean, "Scope membership"),
+            ("sealed", Type::Boolean, "Preserved result"),
+            ("day", Type::Date, "Result capture day"),
+            ("origin", Type::Text, "Result provenance"),
+        ] {
+            app.entities[0].fields.push(FieldDefinition {
+                id: compiler::key(&id, "item", suffix), label: label.into(), value_type: optional(&typ),
+            });
+        }
+        app.entities[0].fields.push(FieldDefinition {
+            id: compiler::saved_key(&id, &layer.patches[0]).unwrap(),
+            label: "Preserved completed result".into(), value_type: optional(&Type::Text),
+        });
+        crate::product_contract::CapturedProgram::capture(
+            &crate::product_contract::canonical_bytes(&app).unwrap(), "project",
+            crate::product_contract::Producer::Fixture { name: "initialization-target".into() }, None,
+        ).unwrap()
+    }
+
     fn captured_program_with_observable(value: &str) -> crate::product_contract::CapturedProgram {
         let source = format!(r#"{{"version":1,"id":"app","label":"App","entities":[{{"id":"item","label":"Item","fields":[{{"id":"name","label":"Name","value_type":{{"kind":"text"}}}}],"unique":[],"constraints":[]}}],"state":[],"actions":[{{"id":"noop","label":"No-op","parameters":{{}},"guards":[],"steps":[{{"kind":"create","entity":"item","values":{{"name":{{"kind":"literal","value_type":{{"kind":"text"}},"value":{{"kind":"text","value":"x"}}}}}},"bind":"created"}}],"ensures":[]}}],"outputs":[],"observables":[{{"id":"status","label":"Status","value":{{"kind":"literal","value_type":{{"kind":"text"}},"value":{{"kind":"text","value":"{value}"}}}}}}],"views":[{{"id":"main","label":"Main","kind":{{"kind":"form","action":"noop","fields":[],"defaults":{{}}}},"actions":[],"keys":[]}}],"initial_view":"main"}}"#);
         crate::product_contract::CapturedProgram::capture(
@@ -3550,6 +3673,132 @@ mod borrowed_view_tests {
     }
 
     #[test]
+    fn fallible_scalar_initialization_matches_legacy_frame_and_receipt() {
+        let snapshot = initialization_snapshot();
+        let scope = snapshot.scalar_scope().unwrap();
+        let (layer_id, layer) = scope.layers.iter().next().unwrap();
+        let target = initialization_target(&snapshot);
+        let (legacy_after, legacy_receipt) = super::super::history::initialize(&snapshot, layer, &target).unwrap();
+        let decoded = decoded_snapshot(&snapshot);
+        let decoded_layer = decoded.scalar_scope().unwrap().layer(layer_id).unwrap();
+        let decoded_target = decoded_capture(&target.program);
+
+        let mut cx = AllocationContext::new();
+        let (after, additions) = crate::product_store::scope::initialize_scalar_fallible(
+            &decoded, decoded_layer, &decoded_target, &mut cx,
+        ).unwrap();
+        assert_eq!(after.canonical_bytes_with(&mut AllocationContext::new()).unwrap(), crate::product_contract::canonical_bytes(&legacy_after).unwrap());
+        assert_eq!(crate::product_contract::canonical_bytes(&additions).unwrap(), crate::product_contract::canonical_bytes(&legacy_receipt.additions).unwrap());
+
+        let mut receipt_cx = AllocationContext::new();
+        let receipt = crate::product_store::scope::scalar_initialization_receipt(
+            &decoded, decoded_layer, decoded_layer.basis().data(), &after, &additions, &mut receipt_cx,
+        ).unwrap();
+        assert_eq!(crate::product_backup::fallible_codec::canonical_bytes(
+            &receipt, &mut AllocationContext::new(),
+        ).unwrap(), crate::product_contract::canonical_bytes(&legacy_receipt).unwrap());
+        let member = compiler::key(layer_id, "item", "member");
+        let sealed = compiler::key(layer_id, "item", "sealed");
+        let day = compiler::key(layer_id, "item", "day");
+        let origin = compiler::key(layer_id, "item", "origin");
+        let record = DataSnapshotView::from(&after).record("item", "row-1").unwrap();
+        assert_eq!(record.values().get(&member), Some(&DataValue::Boolean { value: true }));
+        assert_eq!(record.values().get(&sealed), Some(&DataValue::Boolean { value: true }));
+        assert_eq!(record.values().get(&day), Some(&DataValue::Date { days: 3 }));
+        assert_eq!(record.values().get(&origin), Some(&DataValue::Text { value: "CapturedAtAdoption".into() }));
+        let saved = compiler::saved_key(layer_id, &layer.patches[0]).unwrap();
+        assert_eq!(record.values().get(&saved), Some(&DataValue::Text { value: "Ada".into() }));
+    }
+
+    #[test]
+    fn fallible_scalar_initialization_refusal_is_atomic_and_retryable() {
+        use std::num::NonZeroUsize;
+        let snapshot = initialization_snapshot();
+        let before = crate::product_contract::canonical_bytes(&snapshot).unwrap();
+        let scope = snapshot.scalar_scope().unwrap();
+        let (layer_id, layer) = scope.layers.iter().next().unwrap();
+        let decoded = decoded_snapshot(&snapshot);
+        let decoded_layer = decoded.scalar_scope().unwrap().layer(layer_id).unwrap();
+        let target_capture = initialization_target(&snapshot);
+        let target = decoded_capture(&target_capture.program);
+        let decoded_before = crate::product_backup::fallible_codec::canonical_bytes(&decoded, &mut AllocationContext::new()).unwrap();
+        let mut counter = AllocationContext::new();
+        crate::product_store::scope::initialize_scalar_fallible(&decoded, decoded_layer, &target, &mut counter).unwrap();
+        let growths = counter.growth_requests();
+        assert!(growths > 0);
+        for nth in 1..=growths {
+            let mut refused = AllocationContext::fail_nth_growth(NonZeroUsize::new(nth).unwrap(), false);
+            assert!(matches!(crate::product_store::scope::initialize_scalar_fallible(
+                &decoded, decoded_layer, &target, &mut refused,
+            ), Err(crate::product_store::scope::InitializationFailure::Allocation(_))), "growth {nth}/{growths}");
+            assert!(refused.first_failure().is_some(), "allocation context must retain refusal at growth {nth}");
+            assert_eq!(crate::product_contract::canonical_bytes(&snapshot).unwrap(), before);
+            assert_eq!(crate::product_backup::fallible_codec::canonical_bytes(&decoded, &mut AllocationContext::new()).unwrap(), decoded_before);
+            let mut retry = AllocationContext::new();
+            crate::product_store::scope::initialize_scalar_fallible(&decoded, decoded_layer, &target, &mut retry).unwrap();
+        }
+
+        let mut success_cx = AllocationContext::new();
+        let (after, additions) = crate::product_store::scope::initialize_scalar_fallible(
+            &decoded, decoded_layer, &target, &mut success_cx,
+        ).unwrap();
+        let mut count_cx = AllocationContext::new();
+        crate::product_store::scope::scalar_initialization_receipt(
+            &decoded, decoded_layer, decoded_layer.basis().data(), &after, &additions, &mut count_cx,
+        ).unwrap();
+        let receipt_growths = count_cx.growth_requests();
+        assert!(receipt_growths > 0);
+        let after_bytes = crate::product_backup::fallible_codec::canonical_bytes(&after, &mut AllocationContext::new()).unwrap();
+        let additions_bytes: Vec<_> = additions.iter().map(|addition|
+            crate::product_backup::fallible_codec::canonical_bytes(addition, &mut AllocationContext::new()).unwrap()
+        ).collect();
+        for nth in 1..=receipt_growths {
+            let mut refused = AllocationContext::fail_nth_growth(NonZeroUsize::new(nth).unwrap(), false);
+            assert!(matches!(crate::product_store::scope::scalar_initialization_receipt(
+                &decoded, decoded_layer, decoded_layer.basis().data(), &after, &additions, &mut refused,
+            ), Err(crate::product_store::scope::InitializationFailure::Allocation(_))), "receipt growth {nth}/{receipt_growths}");
+            assert!(refused.first_failure().is_some(), "receipt allocation context must retain refusal at growth {nth}");
+            assert_eq!(crate::product_contract::canonical_bytes(&snapshot).unwrap(), before);
+            assert_eq!(crate::product_backup::fallible_codec::canonical_bytes(&after, &mut AllocationContext::new()).unwrap(), after_bytes);
+            assert_eq!(additions.len(), additions_bytes.len());
+            for (addition, expected) in additions.iter().zip(&additions_bytes) {
+                assert_eq!(crate::product_backup::fallible_codec::canonical_bytes(addition, &mut AllocationContext::new()).unwrap(), *expected);
+            }
+            let mut retry = AllocationContext::new();
+            crate::product_store::scope::scalar_initialization_receipt(
+                &decoded, decoded_layer, decoded_layer.basis().data(), &after, &additions, &mut retry,
+            ).unwrap();
+        }
+    }
+
+    #[test]
+    fn fallible_scalar_initialization_rejects_bad_completion_without_input_mutation() {
+        let mut snapshot = initialization_snapshot();
+        let old_layer_id = snapshot.scalar_scope().unwrap().layers.keys().next().unwrap().clone();
+        let scope = snapshot.scalar_scope_mut().unwrap();
+        let mut layer = scope.layers.remove(&old_layer_id).unwrap();
+        layer.request.lifecycles[0].completed = Expr::Literal {
+            value_type: Type::Text, value: DataValue::Text { value: "not boolean".into() },
+        };
+        let layer_id = layer.identity().unwrap();
+        scope.layers.insert(layer_id.clone(), layer);
+        let before = crate::product_contract::canonical_bytes(&snapshot).unwrap();
+        let legacy_layer = snapshot.scalar_scope().unwrap().layers.get(&layer_id).unwrap();
+        let target_capture = initialization_target(&snapshot);
+        let target = &target_capture;
+        assert!(super::super::history::initialize(&snapshot, legacy_layer, target).is_err());
+
+        let decoded = decoded_snapshot(&snapshot);
+        let decoded_layer = decoded.scalar_scope().unwrap().layer(&layer_id).unwrap();
+        let target_capture = initialization_target(&snapshot);
+        let target = decoded_capture(&target_capture.program);
+        assert!(matches!(crate::product_store::scope::initialize_scalar_fallible(
+            &decoded, decoded_layer, &target, &mut AllocationContext::new(),
+        ), Err(crate::product_store::scope::InitializationFailure::Store(StoreError::Runtime(_)))));
+        assert_eq!(crate::product_contract::canonical_bytes(&snapshot).unwrap(), before);
+    }
+
+    #[test]
     fn decoded_composition_compiler_and_capture_match_legacy_with_refusal_retry() {
         let snapshot = composed_snapshot_with_observable_patch();
         let decoded = decoded_snapshot(&snapshot);
@@ -3645,6 +3894,46 @@ mod borrowed_view_tests {
             crate::product_backup::fallible_codec::canonical_bytes(&actual, &mut AllocationContext::new()).unwrap(),
             crate::product_contract::canonical_bytes(&expected).unwrap(),
         );
+    }
+
+    #[test]
+    fn decoded_envelope_app_matches_pre_instrumentation_legacy_and_refuses_safely() {
+        use std::num::NonZeroUsize;
+
+        let snapshot = composed_snapshot_with_view_projection_patch();
+        let state = snapshot.scalar_scope().unwrap();
+        let manifest = state.compositions.get(&snapshot.active_revision).unwrap();
+        let expected = envelope_app(&snapshot, manifest).unwrap();
+        let decoded = decoded_snapshot(&snapshot);
+        let decoded_manifest = decoded.scalar_scope().unwrap().composition(&snapshot.active_revision).unwrap();
+        let mut baseline = AllocationContext::new();
+        let actual = envelope_app_fallible(&decoded, decoded_manifest, &mut baseline).unwrap();
+        let expected_bytes = crate::product_contract::canonical_bytes(&expected).unwrap();
+        let actual_bytes = crate::product_backup::fallible_codec::canonical_bytes(&actual, &mut AllocationContext::new()).unwrap();
+        assert_eq!(actual_bytes, expected_bytes);
+
+        // Instrumentation and provenance belong only to the captured program,
+        // not the envelope queried by historical projection destinations.
+        let compiled = compile_fallible(&decoded, decoded_manifest, &mut AllocationContext::new()).unwrap();
+        assert_ne!(
+            crate::product_backup::fallible_codec::canonical_bytes(compiled.app(), &mut AllocationContext::new()).unwrap(),
+            actual_bytes,
+        );
+
+        let growths = baseline.growth_requests();
+        assert!(growths > 0);
+        let before = crate::product_backup::fallible_codec::canonical_bytes(&decoded, &mut AllocationContext::new()).unwrap();
+        for nth in 1..=growths {
+            let mut refused = AllocationContext::fail_nth_growth(NonZeroUsize::new(nth).unwrap(), false);
+            assert!(matches!(envelope_app_fallible(&decoded, decoded_manifest, &mut refused), Err(CompilerFailure::Allocation(_))), "envelope allocation refusal {nth}/{growths}");
+            let mut retry = AllocationContext::new();
+            let retried = envelope_app_fallible(&decoded, decoded_manifest, &mut retry).unwrap();
+            assert_eq!(
+                crate::product_backup::fallible_codec::canonical_bytes(&retried, &mut AllocationContext::new()).unwrap(),
+                expected_bytes,
+            );
+            assert_eq!(crate::product_backup::fallible_codec::canonical_bytes(&decoded, &mut AllocationContext::new()).unwrap(), before);
+        }
     }
 
     #[test]

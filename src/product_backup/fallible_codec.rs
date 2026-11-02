@@ -74,6 +74,9 @@ pub(crate) trait BackupWire: Serialize {}
 impl BackupWire for super::Payload {}
 impl BackupWire for super::Envelope {}
 impl BackupWire for crate::product_contract::FallibleDecodedDataSnapshot {}
+impl BackupWire for crate::product_contract::FallibleEntitySchemaIdentity<'_> {}
+impl BackupWire for crate::product_contract::FallibleBusinessRecordsIdentity<'_> {}
+impl BackupWire for crate::product_contract::FallibleBusinessEventsIdentity<'_> {}
 impl BackupWire for crate::product_contract::FallibleDecodedDecisionGraph {}
 impl BackupWire for crate::product_store::fallible_project_snapshot_decode::DecodedProjectSnapshot {}
 impl BackupWire for crate::product_contract::fallible_app_decode::DecodedAppDefinition {}
@@ -89,6 +92,9 @@ impl BackupWire for crate::product_contract::fallible_app_decode::DecodedStateme
 impl BackupWire for crate::product_store::scope::DecodedSemanticKey {}
 impl BackupWire for crate::product_store::scope::DecodedCompositionCompilerIdentity<'_> {}
 impl BackupWire for crate::product_store::scope::DecodedCompilerKeyIdentity<'_> {}
+impl BackupWire for crate::product_store::scope::DecodedScopeLayer {}
+impl BackupWire for crate::product_store::scope::DecodedMetadataAddition {}
+impl BackupWire for crate::product_store::scope::DecodedMetadataInitializationReceipt {}
 
 pub(crate) fn canonical_bytes<T: BackupWire + ?Sized>(
     value: &T,

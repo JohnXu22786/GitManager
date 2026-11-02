@@ -175,6 +175,13 @@ pub(crate) struct DecodedFrozenBasis {
     snapshot: Digest, revision: u64, active: Digest, data: FallibleDecodedDataSnapshot,
     session: FallibleDecodedSessionState, day: i32, decisions: Digest,
 }
+impl DecodedFrozenBasis {
+    pub(crate) fn snapshot(&self) -> &Digest { &self.snapshot }
+    pub(crate) fn revision(&self) -> u64 { self.revision }
+    pub(crate) fn active(&self) -> &Digest { &self.active }
+    pub(crate) fn data(&self) -> &FallibleDecodedDataSnapshot { &self.data }
+    pub(crate) fn day(&self) -> i32 { self.day }
+}
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct DecodedEffectPatch { pub(crate) request: EffectPatchRequestDto, pub(crate) before: Expr, pub(crate) after: Expr }
 impl DecodedEffectPatch {
@@ -190,6 +197,14 @@ pub(crate) struct DecodedScopeLayer {
 impl DecodedScopeLayer {
     pub(crate) fn patches(&self) -> &[DecodedEffectPatch] { &self.patches }
     pub(crate) fn request(&self) -> &DecodedScopeRequest { &self.request }
+    pub(crate) fn operation(&self) -> &str { &self.operation }
+    pub(crate) fn basis(&self) -> &DecodedFrozenBasis { &self.basis }
+    pub(crate) fn identity_with(
+        &self,
+        cx: &mut AllocationContext,
+    ) -> Result<Digest, crate::product_backup::fallible_codec::CodecError> {
+        crate::product_backup::fallible_codec::canonical_digest(IdentityDomain::Adoption, self, cx)
+    }
 }
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct DecodedScopeSlotMapping {
@@ -275,12 +290,30 @@ impl Serialize for DecodedCompilerKeyIdentity<'_> {
 }
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct DecodedMetadataAddition { record: RecordRef, values: FallibleValues }
+impl DecodedMetadataAddition {
+    pub(crate) fn new(record: RecordRef, values: FallibleValues) -> Self { Self { record, values } }
+    pub(crate) fn record(&self) -> &RecordRef { &self.record }
+    pub(crate) fn values(&self) -> &FallibleValues { &self.values }
+}
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct DecodedMetadataInitializationReceipt {
     operation: String, layer: Digest, before_data: Digest, after_data: Digest,
     before_schema: Digest, after_schema: Digest, additions: Vec<DecodedMetadataAddition>,
     business_projection: Digest, original_events: Digest, original_records: usize,
     capture_day: i32, capture_program: Digest, prior_snapshot: Digest, adoption_revision: u64,
+}
+impl DecodedMetadataInitializationReceipt {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        operation: String, layer: Digest, before_data: Digest, after_data: Digest,
+        before_schema: Digest, after_schema: Digest, additions: Vec<DecodedMetadataAddition>,
+        business_projection: Digest, original_events: Digest, original_records: usize,
+        capture_day: i32, capture_program: Digest, prior_snapshot: Digest, adoption_revision: u64,
+    ) -> Self {
+        Self { operation, layer, before_data, after_data, before_schema, after_schema, additions,
+            business_projection, original_events, original_records, capture_day, capture_program,
+            prior_snapshot, adoption_revision }
+    }
 }
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct DecodedSemanticKey { kind: SemanticKind, entity: Option<String>, id: String }
