@@ -378,6 +378,7 @@ impl FallibleDecodedDataSnapshot {
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct FallibleDecodedSessionState(fallible_persisted_decode::DecodedSessionState);
 impl FallibleDecodedSessionState {
+    pub(crate) fn view(&self) -> &str { self.0.view() }
     pub(crate) fn values(&self) -> &FallibleValues { self.0.values() }
     pub(crate) fn focused_record(&self) -> Option<&RecordRef> { self.0.focused_record() }
     pub(crate) fn identity_with(
@@ -2659,6 +2660,23 @@ pub(crate) fn decoded_expression_type_with(
     }
     result.map_err(AppValidationError::Contract)
 }
+
+/// Type-check a decoded expression in the empty environment, preserving the
+/// allocation accounting used by view observables and other host projections.
+pub(crate) fn decoded_expression_type_empty_with(
+    app: &fallible_app_decode::DecodedAppDefinition,
+    expression: &Expr,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<Type, AppValidationError> {
+    let env = fallible_app_decode::FallibleMap::new();
+    let mut validator = Validator::new_app(AppRef::Decoded(app), Audit::none(), cx);
+    let result = validator.expr(expression, &env, 0, true);
+    if let Some(failure) = validator.allocation_failure.take() {
+        return Err(AppValidationError::Allocation(failure));
+    }
+    result.map_err(AppValidationError::Contract)
+}
+
 pub(crate) fn validate_decoded_app(
     app: &fallible_app_decode::DecodedAppDefinition,
     cx: &mut crate::product_alloc::AllocationContext,

@@ -57,7 +57,7 @@ pub(crate) struct DecodedAppDefinition {
     pub(super) id: String,
     pub(super) label: String,
     pub(crate) entities: Vec<EntityDefinition>,
-    pub(super) state: Vec<StateDefinition>,
+    pub(crate) state: Vec<StateDefinition>,
     pub(crate) actions: Vec<DecodedActionDefinition>,
     pub(crate) outputs: Vec<OutputDefinition>,
     pub(crate) observables: Vec<ObservableDefinition>,
@@ -282,19 +282,19 @@ pub(crate) enum DecodedViewKind {
 #[derive(Debug, Serialize)]
 pub(crate) struct DecodedColumn { pub(crate) id: String, pub(crate) label: String, pub(crate) value: Expr }
 #[derive(Debug, Serialize)]
-pub(super) struct DecodedStateControl { pub(super) id: String, pub(super) label: String, pub(super) state: String, pub(super) on_change: Option<String> }
+pub(crate) struct DecodedStateControl { pub(crate) id: String, pub(crate) label: String, pub(crate) state: String, pub(crate) on_change: Option<String> }
 #[derive(Debug, Serialize)]
-pub(super) struct DecodedSelectionBinding { pub(super) id: String, pub(super) state: String, pub(super) on_change: Option<String> }
+pub(crate) struct DecodedSelectionBinding { pub(crate) id: String, pub(crate) state: String, pub(crate) on_change: Option<String> }
 #[derive(Debug, Serialize)]
-pub(super) struct DecodedFormInput { pub(super) parameter: String, pub(super) label: String }
+pub(crate) struct DecodedFormInput { pub(crate) parameter: String, pub(crate) label: String }
 #[derive(Debug, Serialize)]
-pub(super) struct DecodedActionBinding {
-    pub(super) id: String,
-    pub(super) label: String,
-    pub(super) placement: ActionPlacement,
-    pub(super) action: String,
-    pub(super) arguments: FallibleMap<Expr>,
-    pub(super) enabled: Expr,
+pub(crate) struct DecodedActionBinding {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) placement: ActionPlacement,
+    pub(crate) action: String,
+    pub(crate) arguments: FallibleMap<Expr>,
+    pub(crate) enabled: Expr,
 }
 #[derive(Debug, Serialize)]
 pub(super) struct DecodedKeyBinding { pub(super) key: String, pub(super) modifiers: FallibleKeyModifiers, pub(super) binding: String }
