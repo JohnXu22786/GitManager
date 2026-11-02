@@ -238,6 +238,10 @@ impl DecodedProjectSnapshot {
         }
     }
 
+    pub(crate) fn scalar_scope_mut(&mut self) -> Option<&mut crate::product_store::scope::FallibleDecodedScopeState> {
+        self.scope.scalar_mut()
+    }
+
     pub(crate) fn captured_program_by_revision_with(
         &self,
         revision: &Digest,

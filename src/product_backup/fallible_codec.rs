@@ -93,6 +93,7 @@ impl BackupWire for crate::product_store::scope::DecodedSemanticKey {}
 impl BackupWire for crate::product_store::scope::DecodedCompositionCompilerIdentity<'_> {}
 impl BackupWire for crate::product_store::scope::DecodedCompilerKeyIdentity<'_> {}
 impl BackupWire for crate::product_store::scope::DecodedScopeLayer {}
+impl BackupWire for crate::product_store::scope::DecodedCompositionManifest {}
 impl BackupWire for crate::product_store::scope::DecodedMetadataAddition {}
 impl BackupWire for crate::product_store::scope::DecodedMetadataInitializationReceipt {}
 

@@ -30,6 +30,9 @@ impl DecodedScopeEnvelope {
     pub(crate) fn scalar(&self) -> Option<&DecodedScopeState> {
         match self { Self::ScalarV1(state) => Some(state), Self::OwnedV2(_) => None }
     }
+    pub(crate) fn scalar_mut(&mut self) -> Option<&mut DecodedScopeState> {
+        match self { Self::ScalarV1(state) => Some(state), Self::OwnedV2(_) => None }
+    }
 }
 
 pub(crate) fn decode_scope_envelope(

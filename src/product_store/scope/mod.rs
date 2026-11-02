@@ -10,6 +10,8 @@ mod fallible_owned_history_decode;
 #[allow(dead_code)]
 mod fallible_scope_envelope_decode;
 mod fallible_history;
+mod fallible_replay_registry;
+pub(crate) use fallible_replay_registry::{replay_snapshot_fallible, ReplayRegistryError};
 pub(crate) use fallible_history::{initialize as initialize_scalar_fallible, initialize_frame as initialize_scalar_frame_fallible,
     initialization_receipt as scalar_initialization_receipt, InitializationFailure};
 pub(crate) use fallible_scope_envelope_decode::{decode_scope_envelope as decode_scope_envelope_fallible, DecodedScopeEnvelope as FallibleDecodedScopeEnvelope};
