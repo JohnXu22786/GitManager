@@ -96,7 +96,7 @@ pub(super) fn decode_run_evidence(
     })
 }
 
-fn decode_run_binding(value: Value, cx: &mut AllocationContext) -> Result<RunBinding, ValueDecodeError> {
+pub(super) fn decode_run_binding(value: Value, cx: &mut AllocationContext) -> Result<RunBinding, ValueDecodeError> {
     let fields = struct_fields(value, "a struct RunBinding", RUN_BINDING_FIELDS, cx)?;
     let mut source = None;
     let mut artifact = None;

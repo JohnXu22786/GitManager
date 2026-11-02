@@ -160,6 +160,8 @@ pub(crate) struct FallibleDecodedRunEvidence(fallible_run_evidence_decode::Decod
 pub(crate) struct FallibleDecodedDecisionGraph(fallible_decision_decode::DecodedDecisionGraph);
 #[derive(Debug, Serialize)]
 pub(crate) struct FallibleDecodedLocalArtifact(fallible_local_artifact_decode::DecodedLocalArtifact);
+#[derive(Debug, Serialize)]
+pub(crate) struct FallibleDecodedAdoptionPlan(fallible_decision_decode::DecodedAdoptionPlan);
 pub(crate) fn decode_data_snapshot_fallible(
     value: crate::product_json::Value,
     cx: &mut crate::product_alloc::AllocationContext,
@@ -207,6 +209,30 @@ pub(crate) fn decode_local_artifact_fallible(
     cx: &mut crate::product_alloc::AllocationContext,
 ) -> std::result::Result<FallibleDecodedLocalArtifact, fallible_value_decode::ValueDecodeError> {
     fallible_local_artifact_decode::decode_local_artifact(value, cx).map(FallibleDecodedLocalArtifact)
+}
+pub(crate) fn decode_adoption_plan_fallible(
+    value: crate::product_json::Value,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<FallibleDecodedAdoptionPlan, fallible_value_decode::ValueDecodeError> {
+    fallible_decision_decode::decode_adoption_plan(value, cx).map(FallibleDecodedAdoptionPlan)
+}
+pub(crate) fn decode_source_binding_fallible(
+    value: crate::product_json::Value,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<SourceBinding, fallible_value_decode::ValueDecodeError> {
+    fallible_capture_decode::decode_source_binding(value, cx)
+}
+pub(crate) fn decode_artifact_ref_fallible(
+    value: crate::product_json::Value,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<ArtifactRef, fallible_value_decode::ValueDecodeError> {
+    fallible_capture_decode::decode_artifact(value, cx)
+}
+pub(crate) fn decode_run_binding_fallible(
+    value: crate::product_json::Value,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<RunBinding, fallible_value_decode::ValueDecodeError> {
+    fallible_run_evidence_decode::decode_run_binding(value, cx)
 }
 
 #[path = "product_contract/fallible_decision_decode.rs"]

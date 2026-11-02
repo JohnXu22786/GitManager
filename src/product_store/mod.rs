@@ -7,6 +7,8 @@ mod json;
 mod pointer;
 use pointer::Pointer;
 mod pointer_codec;
+#[allow(dead_code)]
+mod fallible_project_snapshot_decode;
 use crate::product_alloc::{try_copy_str, AllocationContext, AllocationFailure, AllocationSite};
 use pointer_codec::PointerDecodeError;
 mod recovery_destination;

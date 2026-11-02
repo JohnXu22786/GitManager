@@ -18,6 +18,8 @@ use super::{
 };
 
 const GRAPH_FIELDS: &[&str] = &["version", "revision", "decisions"];
+const ADOPTION_PLAN_FIELDS: &[&str] = &["version", "id", "project_id", "expected_generation", "expected_data", "expected_decisions", "expected_session", "current_source", "target", "scope", "compatibility", "required_decisions", "checks", "evidence", "retire_decisions"];
+const DECISION_CHECK_FIELDS: &[&str] = &["decision", "decision_digest", "property_digest", "scope", "state", "binding", "evidence", "explanation"];
 const SCOPED_DECISION_FIELDS: &[&str] = &[
     "id", "revision", "request", "rationale", "scope", "outcome", "status", "obligations", "scenarios", "witness", "supersedes",
 ];
@@ -26,6 +28,8 @@ const UNKNOWN_BOUNDARY_FIELDS: &[&str] = &["id", "operations", "description"];
 const POPULATION_VARIANTS: &[&str] = &["all", "new_work", "created_after", "records", "entity", "where"];
 const OUTCOME_VARIANTS: &[&str] = &["accept", "keep_current", "either_acceptable", "both_needed", "neither_fits", "deferred"];
 const STATUS_VARIANTS: &[&str] = &["active", "pending", "superseded", "withdrawn"];
+const SCOPE_MATCH_VARIANTS: &[&str] = &["applies", "outside", "unknown"];
+const CHECK_STATE_VARIANTS: &[&str] = &["satisfied", "violated", "unknown", "outside", "unsupported", "stale", "failed"];
 const ACCEPTED_PROPERTY_FIELDS: &[&str] = &["id", "description", "predicate"];
 const PROPERTY_TERM_VARIANTS: &[&str] = &[
     "literal", "observed", "view_rows", "row_action_rows", "view_column", "output_count", "output_column", "count",
@@ -83,6 +87,37 @@ pub(super) struct DecodedDecisionScope {
 }
 
 #[derive(Debug, Serialize)]
+pub(super) struct DecodedAdoptionPlan {
+    version: u32,
+    id: String,
+    project_id: String,
+    expected_generation: u64,
+    expected_data: Digest,
+    expected_decisions: Digest,
+    expected_session: Digest,
+    current_source: super::SourceBinding,
+    target: super::ArtifactRef,
+    scope: DecodedDecisionScope,
+    compatibility: crate::product_store::scope::DecodedCompatibilityReport,
+    required_decisions: Vec<String>,
+    checks: Vec<DecodedDecisionCheck>,
+    evidence: Vec<Digest>,
+    retire_decisions: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DecodedDecisionCheck {
+    decision: String,
+    decision_digest: Digest,
+    property_digest: Digest,
+    scope: super::ScopeMatch,
+    state: super::CheckState,
+    binding: super::RunBinding,
+    evidence: Option<Digest>,
+    explanation: String,
+}
+
+#[derive(Debug, Serialize)]
 pub(super) struct DecodedUnknownBoundary {
     pub(super) id: String,
     pub(super) operations: FallibleStringSet,
@@ -128,6 +163,168 @@ pub(super) fn decode_decision_graph(
         revision: required(revision, "revision")?,
         decisions: required(decoded_decisions, "decisions")?,
     })
+}
+
+pub(super) fn decode_adoption_plan(
+    value: Value,
+    cx: &mut AllocationContext,
+) -> Result<DecodedAdoptionPlan, ValueDecodeError> {
+    let mut fields = struct_fields(value, "a struct AdoptionPlan", ADOPTION_PLAN_FIELDS)?;
+    let mut version = None;
+    let mut id = None;
+    let mut project_id = None;
+    let mut expected_generation = None;
+    let mut expected_data = None;
+    let mut expected_decisions = None;
+    let mut expected_session = None;
+    let mut current_source = None;
+    let mut target = None;
+    let mut scope = None;
+    let mut compatibility = None;
+    let mut required_decisions = None;
+    let mut checks = None;
+    let mut evidence = None;
+    let mut retire_decisions = None;
+    while let Some((key, value)) = fields.next(cx)? {
+        match key.as_str() {
+            "version" => version = Some(integer_u32(value)?),
+            "id" => id = Some(string(value)?),
+            "project_id" => project_id = Some(string(value)?),
+            "expected_generation" => expected_generation = Some(integer_u64(value)?),
+            "expected_data" => expected_data = Some(digest(value)?),
+            "expected_decisions" => expected_decisions = Some(digest(value)?),
+            "expected_session" => expected_session = Some(digest(value)?),
+            "current_source" => current_source = Some(super::decode_source_binding_fallible(value, cx)?),
+            "target" => target = Some(super::decode_artifact_ref_fallible(value, cx)?),
+            "scope" => scope = Some(decode_decision_scope(value, cx)?),
+            "compatibility" => compatibility = Some(crate::product_store::scope::decode_compatibility_report_fallible(value, cx)?),
+            "required_decisions" => required_decisions = Some(strings(value, cx, "adoption required decision count")?),
+            "checks" => checks = Some(adoption_checks(value, cx)?),
+            "evidence" => evidence = Some(digests(value, cx, "adoption evidence count")?),
+            "retire_decisions" => retire_decisions = Some(strings(value, cx, "adoption retired decision count")?),
+            _ => return Err(unknown_field(key, ADOPTION_PLAN_FIELDS)),
+        }
+    }
+    Ok(DecodedAdoptionPlan {
+        version: required(version, "version")?,
+        id: required(id, "id")?,
+        project_id: required(project_id, "project_id")?,
+        expected_generation: required(expected_generation, "expected_generation")?,
+        expected_data: required(expected_data, "expected_data")?,
+        expected_decisions: required(expected_decisions, "expected_decisions")?,
+        expected_session: required(expected_session, "expected_session")?,
+        current_source: required(current_source, "current_source")?,
+        target: required(target, "target")?,
+        scope: required(scope, "scope")?,
+        compatibility: required(compatibility, "compatibility")?,
+        required_decisions: required(required_decisions, "required_decisions")?,
+        checks: required(checks, "checks")?,
+        evidence: required(evidence, "evidence")?,
+        retire_decisions: required(retire_decisions, "retire_decisions")?,
+    })
+}
+
+fn adoption_checks(value: Value, cx: &mut AllocationContext) -> Result<Vec<DecodedDecisionCheck>, ValueDecodeError> {
+    let values = array(value)?;
+    bounded_length(values.len(), MAX_ITEMS, "adoption decision check count")?;
+    let mut decoded = Vec::new();
+    product_alloc::try_reserve(&mut decoded, values.len(), cx, AllocationSite::Vector)?;
+    for value in values {
+        decoded.push(decode_adoption_check(value, cx)?);
+    }
+    Ok(decoded)
+}
+
+fn decode_adoption_check(value: Value, cx: &mut AllocationContext) -> Result<DecodedDecisionCheck, ValueDecodeError> {
+    let mut fields = struct_fields(value, "a struct DecisionCheck", DECISION_CHECK_FIELDS)?;
+    let mut decision = None;
+    let mut decision_digest = None;
+    let mut property_digest = None;
+    let mut scope = None;
+    let mut state = None;
+    let mut binding = None;
+    // Serde treats missing Option fields in object maps as None.
+    let mut evidence = None;
+    let mut explanation = None;
+    while let Some((key, value)) = fields.next(cx)? {
+        match key.as_str() {
+            "decision" => decision = Some(string(value)?),
+            "decision_digest" => decision_digest = Some(digest(value)?),
+            "property_digest" => property_digest = Some(digest(value)?),
+            "scope" => scope = Some(decode_scope_match(value)?),
+            "state" => state = Some(decode_check_state(value)?),
+            "binding" => binding = Some(super::decode_run_binding_fallible(value, cx)?),
+            "evidence" => evidence = Some(optional_digest(value)?),
+            "explanation" => explanation = Some(string(value)?),
+            _ => return Err(unknown_field(key, DECISION_CHECK_FIELDS)),
+        }
+    }
+    Ok(DecodedDecisionCheck {
+        decision: required(decision, "decision")?,
+        decision_digest: required(decision_digest, "decision_digest")?,
+        property_digest: required(property_digest, "property_digest")?,
+        scope: required(scope, "scope")?,
+        state: required(state, "state")?,
+        binding: required(binding, "binding")?,
+        evidence: evidence.unwrap_or(None),
+        explanation: required(explanation, "explanation")?,
+    })
+}
+
+fn optional_digest(value: Value) -> Result<Option<Digest>, ValueDecodeError> {
+    match value {
+        Value::Null => Ok(None),
+        value => digest(value).map(Some),
+    }
+}
+
+fn decode_scope_match(value: Value) -> Result<super::ScopeMatch, ValueDecodeError> {
+    let tag = unit_variant(value, SCOPE_MATCH_VARIANTS)?;
+    match tag.as_str() {
+        "applies" => Ok(super::ScopeMatch::Applies),
+        "outside" => Ok(super::ScopeMatch::Outside),
+        "unknown" => Ok(super::ScopeMatch::Unknown),
+        _ => unreachable!("variant helper checked the closed list"),
+    }
+}
+
+fn decode_check_state(value: Value) -> Result<super::CheckState, ValueDecodeError> {
+    let tag = unit_variant(value, CHECK_STATE_VARIANTS)?;
+    match tag.as_str() {
+        "satisfied" => Ok(super::CheckState::Satisfied),
+        "violated" => Ok(super::CheckState::Violated),
+        "unknown" => Ok(super::CheckState::Unknown),
+        "outside" => Ok(super::CheckState::Outside),
+        "unsupported" => Ok(super::CheckState::Unsupported),
+        "stale" => Ok(super::CheckState::Stale),
+        "failed" => Ok(super::CheckState::Failed),
+        _ => unreachable!("variant helper checked the closed list"),
+    }
+}
+
+fn unit_variant(value: Value, variants: &'static [&'static str]) -> Result<String, ValueDecodeError> {
+    let tag = match value {
+        Value::String(tag) => tag,
+        Value::Object(fields) => {
+            if fields.len() != 1 {
+                return Err(ValueDecodeError::InvalidLength { actual: fields.len(), expected: 1 });
+            }
+            let (tag, payload) = fields.into_entries().next().expect("one enum map entry checked");
+            if !variants.iter().any(|variant| *variant == tag) {
+                return Err(ValueDecodeError::UnknownVariant { tag, expected: variants });
+            }
+            if !matches!(payload, Value::Null) {
+                return Err(invalid_type(payload, "unit"));
+            }
+            return Ok(tag);
+        }
+        value => return Err(invalid_type(value, "a string variant identifier or map")),
+    };
+    if variants.iter().any(|variant| *variant == tag) {
+        Ok(tag)
+    } else {
+        Err(ValueDecodeError::UnknownVariant { tag, expected: variants })
+    }
 }
 
 fn decisions(value: Value, cx: &mut AllocationContext) -> Result<Vec<DecodedScopedDecision>, ValueDecodeError> {
