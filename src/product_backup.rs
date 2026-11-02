@@ -23,7 +23,7 @@ const MAGIC: &str = "gitmanager.generated-tool-backup";
 mod bounded_input;
 #[path = "product_backup/fallible_codec.rs"]
 #[allow(dead_code)]
-mod fallible_codec;
+pub(crate) mod fallible_codec;
 fn backup_header(bytes: &[u8]) -> Result<serde_json::Value> {
     bounded_input::parse_json_bytes_with_limit(bytes, MAX_BACKUP_BYTES)
         .map_err(|e| OperationIssue::new(IssueKind::Corrupt, e))

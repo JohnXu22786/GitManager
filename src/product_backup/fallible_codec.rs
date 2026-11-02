@@ -22,7 +22,7 @@ const MAX_SERIALIZED_BYTES: usize = super::MAX_BACKUP_BYTES;
 mod digest_impl;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum CodecError {
+pub(crate) enum CodecError {
     Allocation(AllocationFailure),
     DepthLimit,
     InvalidNumber,
@@ -70,20 +70,32 @@ impl fmt::Display for CodecError {
 impl std::error::Error for CodecError {}
 
 /// Sealed by module privacy: the only callers are the modern backup graph.
-pub(super) trait BackupWire: Serialize {}
+pub(crate) trait BackupWire: Serialize {}
 impl BackupWire for super::Payload {}
 impl BackupWire for super::Envelope {}
+impl BackupWire for crate::product_contract::FallibleDecodedDataSnapshot {}
 
-pub(super) fn canonical_bytes<T: BackupWire + ?Sized>(
+pub(crate) fn canonical_bytes<T: BackupWire + ?Sized>(
     value: &T,
     cx: &mut AllocationContext,
 ) -> Result<Vec<u8>, CodecError> {
-    let value = value.serialize(ValueSerializer { cx, depth: 0 })?;
+    let value = try_serialize_value(value, cx)?;
     product_json::canonical::try_canonical_bytes_bounded(&value, MAX_SERIALIZED_BYTES, cx)
         .map_err(Into::into)
 }
 
-pub(super) fn canonical_digest<T: BackupWire + ?Sized>(
+/// Build the same closed, allocation-aware JSON value used by the canonical
+/// writer. This stays inside the sealed backup graph and is used by typed
+/// fallible owner copies, which decode the returned tree with their domain
+/// decoder rather than converting to a legacy model.
+pub(crate) fn try_serialize_value<T: BackupWire + ?Sized>(
+    value: &T,
+    cx: &mut AllocationContext,
+) -> Result<Value, CodecError> {
+    value.serialize(ValueSerializer { cx, depth: 0 })
+}
+
+pub(crate) fn canonical_digest<T: BackupWire + ?Sized>(
     domain: IdentityDomain,
     value: &T,
     cx: &mut AllocationContext,

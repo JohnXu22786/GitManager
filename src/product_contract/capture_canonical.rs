@@ -1004,7 +1004,7 @@ fn reserve_synthetic_count(shape: &Shape<'_>) -> Result<()> {
     a.pay(amount)
 }
 
-pub(super) trait ManualShape {
+pub(super) trait ManualShape: Serialize {
     fn describe(&self, shape: &mut Shape<'_>) -> Result<()>;
 }
 impl ManualShape for String {
@@ -1071,9 +1071,21 @@ impl<T: ManualShape> ManualShape for BTreeMap<String, T> {
         c.end()
     }
 }
+impl ManualShape for super::values_map::FallibleValues {
+    fn describe(&self, s: &mut Shape<'_>) -> Result<()> {
+        s.audit.map_iter(self.len())?;
+        s.audit.pay(8)?;
+        s.add(0, native::btree_iter(self.len()).ok_or_else(|| s.audit.overflow())?)?;
+        let mut c = s.object()?;
+        for (key, value) in self.iter() {
+            c.manual_field(key, value)?;
+        }
+        c.end()
+    }
+}
 
 #[cfg_attr(test, track_caller)]
-pub(super) fn data_serialized_bound_audited(data: &DataSnapshot, a: Audit<'_>) -> Result<()> {
+pub(super) fn data_serialized_bound_audited<T: ManualShape>(data: &T, a: Audit<'_>) -> Result<()> {
     #[cfg(test)]
     let _diagnostic = super::capture_work::diagnostic::enter(
         super::capture_work::diagnostic::Phase::DataWriter,
@@ -1484,7 +1496,32 @@ impl ManualShape for Record {
         c.end()
     }
 }
+impl ManualShape for super::fallible_persisted_decode::DecodedRecord {
+    fn describe(&self, s: &mut Shape<'_>) -> Result<()> {
+        s.audit.pay(2)?;
+        let mut c = s.object()?;
+        c.manual_field("entity", &self.entity)?;
+        c.manual_field("id", &self.id)?;
+        c.manual_field("revision", &self.revision)?;
+        c.manual_field("created_program", &self.created_program)?;
+        c.manual_field("archived", &self.archived)?;
+        c.manual_field("values", &self.values)?;
+        c.end()
+    }
+}
 impl ManualShape for RecordChange {
+    fn describe(&self, s: &mut Shape<'_>) -> Result<()> {
+        s.audit.pay(2)?;
+        let mut c = s.object()?;
+        c.manual_field("entity", &self.entity)?;
+        c.manual_field("record", &self.record)?;
+        c.manual_field("before", &self.before)?;
+        c.manual_field("after", &self.after)?;
+        c.manual_field("archived", &self.archived)?;
+        c.end()
+    }
+}
+impl ManualShape for super::fallible_persisted_decode::DecodedRecordChange {
     fn describe(&self, s: &mut Shape<'_>) -> Result<()> {
         s.audit.pay(2)?;
         let mut c = s.object()?;
@@ -1511,7 +1548,35 @@ impl ManualShape for BusinessEvent {
         c.end()
     }
 }
+impl ManualShape for super::fallible_persisted_decode::DecodedBusinessEvent {
+    fn describe(&self, s: &mut Shape<'_>) -> Result<()> {
+        s.audit.pay(2)?;
+        let mut c = s.object()?;
+        c.manual_field("id", &self.id)?;
+        c.manual_field("sequence", &self.sequence)?;
+        c.manual_field("operation_id", &self.operation_id)?;
+        c.manual_field("action", &self.action)?;
+        c.manual_field("day", &self.day)?;
+        c.manual_field("program", &self.program)?;
+        c.manual_field("changes", &self.changes)?;
+        c.manual_field("outputs", &self.outputs)?;
+        c.end()
+    }
+}
 impl ManualShape for DataSnapshot {
+    fn describe(&self, s: &mut Shape<'_>) -> Result<()> {
+        s.audit.pay(2)?;
+        let mut c = s.object()?;
+        c.manual_field("version", &self.version)?;
+        c.manual_field("project_id", &self.project_id)?;
+        c.manual_field("generation", &self.generation)?;
+        c.manual_field("schema", &self.schema)?;
+        c.manual_field("records", &self.records)?;
+        c.manual_field("events", &self.events)?;
+        c.end()
+    }
+}
+impl ManualShape for super::fallible_snapshot_decode::DecodedDataSnapshot {
     fn describe(&self, s: &mut Shape<'_>) -> Result<()> {
         s.audit.pay(2)?;
         let mut c = s.object()?;

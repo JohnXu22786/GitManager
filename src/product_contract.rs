@@ -145,9 +145,58 @@ mod fallible_persisted_decode;
 #[path = "product_contract/fallible_snapshot_decode.rs"]
 #[allow(dead_code)]
 mod fallible_snapshot_decode;
+#[path = "product_contract/fallible_snapshot_validate.rs"]
+mod fallible_snapshot_validate;
 /// Opaque bridge into fallible persisted data/session DTOs for sibling decoders.
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct FallibleDecodedDataSnapshot(fallible_snapshot_decode::DecodedDataSnapshot);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FallibleDataSnapshotCloneError {
+    Allocation(crate::product_alloc::AllocationFailure),
+    Invariant,
+}
+impl FallibleDecodedDataSnapshot {
+    pub(crate) fn validate(&self) -> std::result::Result<(), ContractError> {
+        self.0.validate()
+    }
+    pub(crate) fn canonical_bytes_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Vec<u8>, crate::product_backup::fallible_codec::CodecError> {
+        crate::product_backup::fallible_codec::canonical_bytes(self, cx)
+    }
+    pub(crate) fn canonical_digest_with(
+        &self,
+        domain: IdentityDomain,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Digest, crate::product_backup::fallible_codec::CodecError> {
+        crate::product_backup::fallible_codec::canonical_digest(domain, self, cx)
+    }
+    pub(crate) fn try_clone_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Self, FallibleDataSnapshotCloneError> {
+        let value = crate::product_backup::fallible_codec::try_serialize_value(self, cx)
+            .map_err(|error| match error {
+                crate::product_backup::fallible_codec::CodecError::Allocation(failure) => {
+                    FallibleDataSnapshotCloneError::Allocation(failure)
+                }
+                _ => FallibleDataSnapshotCloneError::Invariant,
+            })?;
+        fallible_snapshot_decode::decode_data_snapshot(value, cx)
+            .map(Self)
+            .map_err(|error| match error {
+                fallible_value_decode::ValueDecodeError::Allocation(failure) => {
+                    FallibleDataSnapshotCloneError::Allocation(failure)
+                }
+                _ => FallibleDataSnapshotCloneError::Invariant,
+            })
+    }
+    pub(crate) fn project_id(&self) -> &str { &self.0.project_id }
+    pub(crate) fn generation(&self) -> u64 { self.0.generation }
+    pub(crate) fn records(&self) -> &[fallible_persisted_decode::DecodedRecord] { &self.0.records }
+    pub(crate) fn events(&self) -> &[fallible_persisted_decode::DecodedBusinessEvent] { &self.0.events }
+}
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct FallibleDecodedSessionState(fallible_persisted_decode::DecodedSessionState);
 #[derive(Debug, Serialize)]
@@ -2046,144 +2095,9 @@ impl DataSnapshot {
     }
     pub fn validate(&self) -> Result<()> { self.validate_audited(Audit::none()) }
     fn validate_audited(&self, a: Audit<'_>) -> Result<()> {
-        a.pay(8)?;
-        a.version(self.version)?;
-        a.check_id(&self.project_id)?;
-        a.require(
-            self.records.len() <= MAX_COLLECTION && self.events.len() <= MAX_EVENTS,
-            "data record/event budget exceeded",
-        )?;
-        a.pay(8)?;
-        let mut validator = Validator { entities: &self.schema, state: &[], actions: &[],
-            outputs: &[], nodes: 0, audit: a };
-        validate_entities(&self.schema, &mut validator)?;
-        a.pay(8)?;
-        let mut records = BTreeSet::new();
-        a.slice(self.records.len())?;
-        for record in &self.records {
-            a.pay(12)?;
-            a.check_id(&record.id)?;
-            a.require(record.revision > 0, "record revision must be positive")?;
-            a.insert::<(&str, &str), ()>(records.len(), a.pair_comparator(&record.entity, &record.id)?)?;
-            a.require(
-                records.insert((record.entity.as_str(), record.id.as_str())),
-                "duplicate record identity",
-            )?;
-            validate_record_values(&validator, &record.entity, &record.values)?;
-        }
-        a.slice(self.records.len())?;
-        for record in &self.records {
-            a.pay(12)?;
-            a.map_iter(record.values.len())?;
-        for value in record.values.values() {
-            a.pay(12)?;
-                validate_references_audited(value, &records, a)?;
-            }
-        }
-        a.slice(self.schema.len())?;
-        for entity in &self.schema {
-            a.pay(12)?;
-            a.slice(entity.unique.len())?;
-        for fields in &entity.unique {
-            a.pay(12)?;
-                a.pay(8)?;
-                let mut tuples = BTreeSet::new();
-                a.slice(self.records.len())?;
-        for record in &self.records {
-            a.pay(12)?;
-                    if !(a.eq_str(&record.entity, &entity.id)? && !record.archived) { continue; }
-                    a.pay(12)?;
-                    a.scaled(fields.len(), (2 * std::mem::size_of::<&DataValue>()) as u64, 4)?;
-                    if a.enabled() {
-                        a.slice(fields.len())?;
-                        for field in fields {
-                            a.pay(5)?; // Native collect element dispatch/transfer/cleanup.
-                            a.map_search(record.values.len(),field.len())?;
-                        }
-                    }
-                    let tuple: Vec<_> = fields.iter()
-                        .map(|field|record.values.get(field).unwrap_or(&DataValue::Null)).collect();
-                    let mut has_null = false;
-                    a.pay(1)?;
-                    for value in &tuple {
-            a.pay(12)?;
-                        a.pay(4)?;
-                        if matches!(value, DataValue::Null) { has_null = true; break; }
-                    }
-                    a.pay(1)?;
-                    if has_null { continue; }
-                    let bytes = capture_canonical::canonical_bytes_audited(&tuple, a)?;
-                    a.insert::<Vec<u8>, ()>(tuples.len(), a.comparator(bytes.len())?)?;
-                    a.require(tuples.insert(bytes), "duplicate unique field tuple")?;
-                }
-            }
-        }
-        a.pay(17)?;
-        let mut events = BTreeSet::new();
-        let mut operations = BTreeSet::new();
-        let mut previous = 0;
-        a.slice(self.events.len())?;
-        for event in &self.events {
-            a.pay(12)?;
-            a.check_id(&event.id)?;
-            a.check_id(&event.operation_id)?;
-            a.check_id(&event.action)?;
-            a.day(event.day)?;
-            a.insert::<&String, ()>(events.len(), a.comparator(event.id.len())?)?;
-            let new_event = events.insert(&event.id);
-            let distinct = if new_event {
-                a.insert::<&String, ()>(operations.len(), a.comparator(event.operation_id.len())?)?;
-                operations.insert(&event.operation_id)
-            } else { false };
-            a.require(
-                distinct,
-                "duplicate event or operation receipt",
-            )?;
-            a.require(
-                event.sequence > previous && event.sequence <= self.generation,
-                "event sequence is not ordered within generation",
-            )?;
-            previous = event.sequence;
-            a.bounded(event.changes.len())?;
-            a.bounded(event.outputs.len())?;
-            a.pay(8)?;
-            let mut changed = BTreeSet::new();
-            a.slice(event.changes.len())?;
-        for change in &event.changes {
-            a.pay(12)?;
-                a.check_id(&change.record)?;
-                a.insert::<(&String, &String), ()>(changed.len(), a.pair_comparator(&change.entity, &change.record)?)?;
-                a.require(
-                    changed.insert((&change.entity, &change.record)),
-                    "duplicate event record change",
-                )?;
-                validator.entity(&change.entity)?;
-                if a.enabled() {
-                    a.pay(bounded_input::capture_payment_core::SEARCH_DESCRIPTOR)?;
-                    a.amount(bounded_input::capture_payment_core::btree_search(records.len(), a.pair_comparator(&change.entity, &change.record)?))?;
-                }
-                a.require(
-                    records.contains(&(change.entity.as_str(), change.record.as_str())),
-                    "event record is missing",
-                )?;
-                // Historical maps may omit later-added fields, but never change
-                // the meaning/type of values that were actually recorded.
-                a.pay(8)?;
-        for values in change.before.iter().chain(std::iter::once(&change.after)) {
-            a.pay(12)?;
-                    a.bounded(values.len())?;
-                    a.map_iter(values.len())?;
-        for (id, value) in values {
-            a.pay(12)?;
-                        validate_value_audited(value, &validator.field(&change.entity, id)?.value_type, 0, a)?;
-                        validate_references_audited(value, &records, a)?;
-                    }
-                }
-            }
-        }
-        capture_canonical::data_serialized_bound_audited(self, a)?;
-        Ok(())
+        fallible_snapshot_validate::validate(self, a)
     }
+
     pub fn identity(&self) -> Result<Digest> {
         self.validate()?;
         canonical_digest(IdentityDomain::Data, self)
@@ -2192,24 +2106,6 @@ impl DataSnapshot {
         self.validate()?;
         canonical_digest(IdentityDomain::Schema, &self.schema)
     }
-}
-fn validate_record_values(validator: &Validator<'_, '_>, entity: &str, values: &Values) -> Result<()> {
-    let a = validator.audit;
-    a.pay(4)?;
-    let entity = validator.entity(entity)?;
-    a.bounded(values.len())?;
-    a.map_iter(values.len())?;
-    for (id, value) in values {
-        validate_value_audited(value, &validator.field(&entity.id, id)?.value_type, 0, a)?;
-    }
-    a.slice(entity.fields.len())?;
-    for field in &entity.fields {
-        a.require(
-            a.has(values, &field.id)? || matches!(field.value_type, Type::Optional { .. }),
-            "record lacks required field",
-        )?;
-    }
-    Ok(())
 }
 fn validate_references(value: &DataValue, records: &BTreeSet<(&str, &str)>) -> Result<()> {
     validate_references_audited(value, records, Audit::none())

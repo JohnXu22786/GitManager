@@ -6,6 +6,7 @@
 use crate::product_alloc::{self, AllocationContext, AllocationSite};
 use crate::product_json::{Number, Value};
 use serde::Serialize;
+use std::collections::BTreeSet;
 
 use super::fallible_entity_decode::decode_entity_definition;
 use super::fallible_persisted_decode::{decode_business_event, decode_record, DecodedBusinessEvent, DecodedRecord};
@@ -22,6 +23,16 @@ pub(super) struct DecodedDataSnapshot {
     pub(super) schema: Vec<EntityDefinition>,
     pub(super) records: Vec<DecodedRecord>,
     pub(super) events: Vec<DecodedBusinessEvent>,
+}
+
+impl DecodedDataSnapshot {
+    /// Run the same persisted-state semantic checks as `DataSnapshot` while
+    /// retaining Values in their fallibly ordered owner. This intentionally
+    /// mirrors the legacy validation order; it does not materialize a legacy
+    /// BTreeMap-backed snapshot.
+    pub(crate) fn validate(&self) -> Result<(), super::ContractError> {
+        super::fallible_snapshot_validate::validate(self, super::Audit::none())
+    }
 }
 
 pub(super) fn decode_data_snapshot(
@@ -216,6 +227,7 @@ mod tests {
         let decoded = decode_data_snapshot(syntax(&source), &mut cx).unwrap();
         assert_eq!(super::super::canonical_bytes(&expected).unwrap(), super::super::canonical_bytes(&decoded).unwrap());
         assert_eq!(decoded.version, super::super::CONTRACT_VERSION);
+        assert_eq!(expected.validate(), decoded.validate());
 
         let fields = serde_json::to_value(&expected).unwrap();
         let sequence = serde_json::json!([
@@ -224,6 +236,91 @@ mod tests {
         ]).to_string();
         assert!(serde_json::from_value::<DataSnapshot>(serde_json::from_str(&sequence).unwrap()).is_err());
         assert!(matches!(decode_data_snapshot(syntax(&sequence), &mut AllocationContext::new()), Err(ValueDecodeError::InvalidLength { actual: 7, expected: 6 })));
+    }
+
+    #[test]
+    fn promoted_snapshot_owner_uses_fallible_canonical_and_digest_bridge() {
+        let source = snapshot_source();
+        let expected: DataSnapshot = typed(&source);
+        let mut decode_cx = AllocationContext::new();
+        let decoded = crate::product_contract::decode_data_snapshot_fallible(
+            syntax(&source),
+            &mut decode_cx,
+        ).unwrap();
+        assert_eq!(decoded.validate(), expected.validate());
+
+        let mut bytes_cx = AllocationContext::new();
+        let actual_bytes = decoded.canonical_bytes_with(&mut bytes_cx).unwrap();
+        assert_eq!(actual_bytes, super::super::canonical_bytes(&expected).unwrap());
+        let byte_growths = bytes_cx.growth_requests();
+        assert!(byte_growths > 0);
+        for nth in 1..=byte_growths {
+            let mut cx = AllocationContext::fail_nth_growth(NonZeroUsize::new(nth).unwrap(), true);
+            let error = decoded.canonical_bytes_with(&mut cx).unwrap_err();
+            assert!(matches!(error, crate::product_backup::fallible_codec::CodecError::Allocation(_)));
+        }
+
+        let mut digest_cx = AllocationContext::new();
+        let actual_digest = decoded.canonical_digest_with(
+            super::super::IdentityDomain::Data,
+            &mut digest_cx,
+        ).unwrap();
+        assert_eq!(actual_digest, super::super::canonical_digest(
+            super::super::IdentityDomain::Data,
+            &expected,
+        ).unwrap());
+    }
+
+    #[test]
+    fn promoted_snapshot_try_clone_is_atomic_refusal_safe_and_retryable() {
+        let source_text = snapshot_source();
+        let mut decode_cx = AllocationContext::new();
+        let source = crate::product_contract::decode_data_snapshot_fallible(
+            syntax(&source_text),
+            &mut decode_cx,
+        ).unwrap();
+        let original = source.canonical_bytes_with(&mut AllocationContext::new()).unwrap();
+
+        let mut count = AllocationContext::new();
+        let cloned = source.try_clone_with(&mut count).unwrap();
+        assert_eq!(source, cloned);
+        assert_eq!(original, cloned.canonical_bytes_with(&mut AllocationContext::new()).unwrap());
+        let growths = count.growth_requests();
+        assert!(growths > 0);
+        for nth in 1..=growths {
+            let mut refused = AllocationContext::fail_nth_growth(NonZeroUsize::new(nth).unwrap(), true);
+            let error = source.try_clone_with(&mut refused).unwrap_err();
+            let crate::product_contract::FallibleDataSnapshotCloneError::Allocation(failure) = error else {
+                panic!("allocation refusal was not preserved: {error:?}");
+            };
+            assert_eq!(refused.first_failure(), Some(failure));
+            assert_eq!(original, source.canonical_bytes_with(&mut AllocationContext::new()).unwrap());
+
+            let mut retry = AllocationContext::new();
+            let retried = source.try_clone_with(&mut retry).unwrap();
+            assert_eq!(source, retried);
+        }
+    }
+
+    #[test]
+    fn decoded_snapshot_validation_matches_legacy_error_order() {
+        for (source, message) in [
+            (
+                snapshot_source().replace(r#""record":"p1""#, r#""record":"missing""#),
+                "event record is missing",
+            ),
+            (
+                snapshot_source().replace(r#""revision":1"#, r#""revision":0"#),
+                "record revision must be positive",
+            ),
+        ] {
+            let legacy: DataSnapshot = typed(&source);
+            let decoded = decode_data_snapshot(syntax(&source), &mut AllocationContext::new()).unwrap();
+            let expected = legacy.validate().unwrap_err();
+            let actual = decoded.validate().unwrap_err();
+            assert_eq!(actual, expected);
+            assert!(actual.0.contains(message), "{actual:?}");
+        }
     }
 
     #[test]
