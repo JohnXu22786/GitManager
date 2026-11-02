@@ -12,7 +12,7 @@ use std::fmt;
 use super::fallible_local_artifact_decode::{decode_local_artifact, DecodedLocalArtifact};
 use super::fallible_persisted_decode::decode_record_ref;
 use super::fallible_value_decode::{decode_type, decode_values, JsonKind, ValueDecodeError};
-use super::{Digest, FallibleValues, RecordRef, Type, MAX_COLLECTION, MAX_ITEMS};
+use super::{AppValidationError, Digest, FallibleValues, RecordRef, RuntimeLimits, Type, MAX_COLLECTION, MAX_ITEMS};
 
 const OBSERVATION_FIELDS: &[&str] = &["point", "data_digest", "session_digest", "values", "value_types", "view", "view_schema", "outputs"];
 const VIEW_OBSERVATION_FIELDS: &[&str] = &["view", "rows", "controls", "selected", "enabled_actions", "form_values"];
@@ -30,6 +30,139 @@ pub(super) struct DecodedObservation {
     #[serde(skip_serializing_if = "Option::is_none")]
     view_schema: Option<DecodedViewSchema>,
     outputs: Vec<DecodedLocalArtifact>,
+}
+impl DecodedObservation {
+    pub(super) fn point(&self) -> &str { &self.point }
+    pub(super) fn data_digest(&self) -> &Digest { &self.data_digest }
+    pub(super) fn session_digest(&self) -> &Digest { &self.session_digest }
+    pub(super) fn outputs_empty(&self) -> bool { self.outputs.is_empty() }
+
+    pub(super) fn validate_with(
+        &self,
+        limits: &RuntimeLimits,
+        cx: &mut AllocationContext,
+    ) -> std::result::Result<(), AppValidationError> {
+        use super::{check_id, require, standalone_type, validate_record_refs, validate_untyped_value, validate_value, ContractError};
+        let contract = AppValidationError::Contract;
+        check_id(&self.point).map_err(contract)?;
+        if self.values.len() > MAX_ITEMS {
+            return Err(contract(ContractError("collection limit exceeded".into())));
+        }
+        for (id, value) in self.values.iter() {
+            check_id(id).map_err(contract)?;
+            validate_untyped_value(value, 0).map_err(contract)?;
+        }
+        require(self.values.len() == self.value_types.0.len(), "observed values lack matching declared types")
+            .map_err(contract)?;
+        for (id, value_type) in self.value_types.0.iter() {
+            check_id(id).map_err(contract)?;
+            standalone_type(value_type, 0).map_err(contract)?;
+            let value = self.values.get(id)
+                .ok_or_else(|| contract(ContractError("declared observable has no value".into())))?;
+            validate_value(value, value_type, 0).map_err(contract)?;
+        }
+
+        let view = &self.view;
+        check_id(&view.view).map_err(contract)?;
+        validate_record_refs(&view.selected).map_err(contract)?;
+        require(view.controls.len() <= MAX_ITEMS, "too many definitions or steps").map_err(contract)?;
+        validate_values(view.controls.iter()).map_err(contract)?;
+        require(view.form_values.len() <= MAX_ITEMS, "too many definitions or steps").map_err(contract)?;
+        validate_values(view.form_values.iter()).map_err(contract)?;
+        for binding in view.enabled_actions.0.iter() {
+            check_id(binding).map_err(contract)?;
+        }
+        require(view.rows.len() <= MAX_COLLECTION, "too many observed rows").map_err(contract)?;
+        let mut rows = OrderedSet::new();
+        for row in &view.rows {
+            validate_record_refs(std::slice::from_ref(&row.record)).map_err(contract)?;
+            let entity = product_alloc::try_copy_str(&row.record.entity, cx, AllocationSite::String)
+                .map_err(AppValidationError::Allocation)?;
+            let record = product_alloc::try_copy_str(&row.record.record, cx, AllocationSite::String)
+                .map_err(AppValidationError::Allocation)?;
+            require(rows.try_insert((entity, record), cx).map_err(AppValidationError::Allocation)?,
+                "duplicate observed row").map_err(contract)?;
+            require(row.cells.len() <= MAX_ITEMS, "too many definitions or steps").map_err(contract)?;
+            validate_values(row.cells.iter()).map_err(contract)?;
+            for binding in row.enabled_actions.0.iter() {
+                check_id(binding).map_err(contract)?;
+            }
+        }
+
+        if let Some(schema) = &self.view_schema {
+            check_id(&schema.entity).map_err(contract)?;
+            require(schema.columns.0.len() <= MAX_ITEMS, "collection limit exceeded").map_err(contract)?;
+            for (column, typ) in schema.columns.0.iter() {
+                check_id(column).map_err(contract)?;
+                standalone_type(typ, 0).map_err(contract)?;
+            }
+            if let Some(actions) = &schema.row_actions {
+                require(actions.0.len() <= MAX_ITEMS, "collection limit exceeded").map_err(contract)?;
+                for (binding, action) in actions.0.iter() {
+                    check_id(binding).map_err(contract)?;
+                    check_id(action).map_err(contract)?;
+                }
+                require(view.rows.iter().all(|row| row.enabled_actions.0.iter().all(|binding| actions.0.contains_key(binding))),
+                    "enabled row binding lacks declared provenance").map_err(contract)?;
+            }
+            for row in &view.rows {
+                require(row.record.entity == schema.entity && row.cells.len() == schema.columns.0.len(),
+                    "view row/schema mismatch").map_err(contract)?;
+                for (column, typ) in schema.columns.0.iter() {
+                    let value = row.cells.get(column)
+                        .ok_or_else(|| contract(ContractError("view schema column missing".into())))?;
+                    validate_value(value, typ, 0).map_err(contract)?;
+                }
+            }
+        }
+
+        require(self.outputs.len() <= MAX_ITEMS, "collection limit exceeded").map_err(contract)?;
+        for output in &self.outputs { output.validate_with(cx)?; }
+        require(view.rows.len() <= limits.collection_items && view.selected.len() <= limits.collection_items,
+            "observed view exceeds selected collection limit").map_err(contract)?;
+        for value in self.values.iter().map(|(_, value)| value)
+            .chain(view.controls.iter().map(|(_, value)| value))
+            .chain(view.form_values.iter().map(|(_, value)| value))
+            .chain(view.rows.iter().flat_map(|row| row.cells.iter().map(|(_, value)| value)))
+        {
+            validate_selected_value_limit(value, limits.collection_items, 0).map_err(contract)?;
+        }
+        let mut bytes = 0usize;
+        for output in &self.outputs {
+            require(output.row_count() <= limits.collection_items,
+                "output rows exceed selected collection limit").map_err(contract)?;
+            bytes = bytes.saturating_add(output.byte_len());
+        }
+        require(bytes <= limits.output_bytes, "cumulative emitted bytes exceed selected limit")
+            .map_err(contract)
+    }
+}
+
+fn validate_values<'a>(values: impl Iterator<Item = (&'a String, &'a super::DataValue)>)
+    -> std::result::Result<(), super::ContractError>
+{
+    use super::{check_id, validate_untyped_value};
+    let mut count = 0usize;
+    for (id, value) in values {
+        count = count.saturating_add(1);
+        super::require(count <= MAX_ITEMS, "collection limit exceeded")?;
+        check_id(id)?;
+        validate_untyped_value(value, 0)?;
+    }
+    Ok(())
+}
+
+fn validate_selected_value_limit(
+    value: &super::DataValue,
+    limit: usize,
+    depth: usize,
+) -> std::result::Result<(), super::ContractError> {
+    super::require(depth <= super::MAX_TYPE_DEPTH, "observed value nesting exceeds limit")?;
+    if let super::DataValue::List { items, .. } = value {
+        super::require(items.len() <= limit, "observed collection exceeds selected limit")?;
+        for item in items { validate_selected_value_limit(item, limit, depth + 1)?; }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]

@@ -575,3 +575,287 @@ fn decoded_projection_allocation_refusal_is_typed_and_retryable() {
     assert_eq!(serde_json::to_vec(&capture).unwrap(), before_capture);
     assert_eq!(serde_json::to_vec(&data).unwrap(), before_data);
 }
+
+fn replay_scenario_owners(
+    seed: &DataSnapshot,
+    session: &SessionState,
+    inputs: Vec<SemanticInput>,
+    validity: Vec<AcceptedProperty>,
+) -> (ScenarioSpec, FallibleDecodedScenarioSpec) {
+    let legacy = ScenarioSpec {
+        version: CONTRACT_VERSION,
+        id: "observe_scenario".into(),
+        label: "Observe scenario".into(),
+        seed: seed.clone(),
+        session: session.clone(),
+        clock_day: 7,
+        random_seed: 42,
+        inputs,
+        validity,
+    };
+    let mut cx = AllocationContext::new();
+    let wire = serde_json::to_vec(&legacy).unwrap();
+    let value = crate::product_json::parse_json_bytes(&wire, &mut cx).unwrap();
+    let decoded = decode_scenario_spec_fallible(value, &mut cx).unwrap();
+    (legacy, decoded)
+}
+
+fn decoded_empty_decisions() -> (DecisionGraph, FallibleDecodedDecisionGraph) {
+    let legacy = DecisionGraph { version: CONTRACT_VERSION, revision: 0, decisions: vec![] };
+    let mut cx = AllocationContext::new();
+    let wire = serde_json::to_vec(&legacy).unwrap();
+    let value = crate::product_json::parse_json_bytes(&wire, &mut cx).unwrap();
+    let decoded = decode_decision_graph_fallible(value, &mut cx).unwrap();
+    (legacy, decoded)
+}
+
+#[test]
+fn decoded_observe_replay_matches_legacy_run_evidence_on_source_and_candidate() {
+    for candidate in [false, true] {
+        let (capture, data, decoded_capture, _, session, _) = observation_owners(json!({
+            "kind":"list","entity":"row",
+            "rows":{"kind":"query","entity":"row","binding":"item","predicate":{"kind":"literal","value_type":{"kind":"boolean"},"value":{"kind":"boolean","value":true}},"sort":[],"limit":10,"include_archived":false},
+            "columns":[{"id":"name","label":"Name","value":{"kind":"field","record":{"kind":"variable","name":"row"},"field":"name"}}],
+            "controls":[],"selection":null
+        }));
+        let (capture, decoded_capture) = if candidate {
+            let mut app = capture.program.clone();
+            app.label = "Candidate source".into();
+            let candidate = CapturedProgram::capture(
+                &serde_json::to_vec(&app).unwrap(), "project", Producer::UserAuthored, None,
+            ).unwrap();
+            let mut cx = AllocationContext::new();
+            let value = crate::product_json::parse_json_bytes(
+                &serde_json::to_vec(&candidate).unwrap(), &mut cx,
+            ).unwrap();
+            (candidate, decode_captured_program_fallible(value, &mut cx).unwrap())
+        } else {
+            (capture, decoded_capture)
+        };
+        let (legacy_scenario, decoded_scenario) = replay_scenario_owners(
+            &data,
+            &session,
+            vec![SemanticInput::Observe { point: "observed_view".into() }],
+            vec![],
+        );
+        let (legacy_decisions, decoded_decisions) = decoded_empty_decisions();
+        let limits = RuntimeLimits { fuel: 2_000_000, ..RuntimeLimits::default() };
+        let id = if candidate { "candidate_replay" } else { "source_replay" };
+        let legacy = LocalRuntime::default().replay(
+            &capture, &legacy_scenario, &legacy_decisions, limits.clone(), id,
+        ).unwrap();
+        let mut allocations = AllocationContext::new();
+        let decoded = LocalRuntime::default().replay_decoded_observe_with(
+            &decoded_capture, &decoded_scenario, &decoded_decisions, limits, id, &mut allocations,
+        ).unwrap();
+        assert_eq!(serde_json::to_value(&legacy).unwrap(), serde_json::to_value(&decoded).unwrap());
+        assert_eq!(legacy.identity().unwrap(), decoded.identity_with(&mut AllocationContext::new()).unwrap());
+    }
+}
+
+#[test]
+fn decoded_observe_replay_rejects_invalid_or_non_single_observe_scenarios() {
+    let (_, data, decoded_capture, _, session, _) = observation_owners(json!({
+        "kind":"list","entity":"row","rows":{"kind":"query","entity":"row","binding":"item","predicate":{"kind":"literal","value_type":{"kind":"boolean"},"value":{"kind":"boolean","value":true}},"sort":[],"limit":10,"include_archived":false},"columns":[],"controls":[],"selection":null
+    }));
+    let (_, decisions) = decoded_empty_decisions();
+    let limits = RuntimeLimits::default();
+    for inputs in [
+        vec![],
+        vec![SemanticInput::Observe { point: "first".into() }, SemanticInput::Observe { point: "second".into() }],
+        vec![SemanticInput::Observe { point: "INVALID".into() }],
+    ] {
+        let (_, scenario) = replay_scenario_owners(&data, &session, inputs, vec![]);
+        let actual = LocalRuntime::default().replay_decoded_observe_with(
+            &decoded_capture, &scenario, &decisions, limits.clone(), "invalid_replay", &mut AllocationContext::new(),
+        );
+        assert!(matches!(actual, Err(AdapterError::Invalid(_))), "unexpected scenario result: {actual:?}");
+    }
+    let (_, scenario_with_validity) = replay_scenario_owners(
+        &data, &session, vec![SemanticInput::Observe { point: "one".into() }],
+        vec![AcceptedProperty {
+            id: "must_be_true".into(), description: "A valid but forbidden property".into(),
+            predicate: PropertyPredicate::Equal {
+                left: PropertyTerm::Literal { value_type: Type::Boolean, value: DataValue::Boolean { value: true } },
+                right: PropertyTerm::Literal { value_type: Type::Boolean, value: DataValue::Boolean { value: true } },
+            },
+        }],
+    );
+    let actual = LocalRuntime::default().replay_decoded_observe_with(
+        &decoded_capture, &scenario_with_validity, &decisions, limits, "invalid_replay", &mut AllocationContext::new(),
+    );
+    assert!(matches!(actual, Err(AdapterError::Invalid(_))), "unexpected validity result: {actual:?}");
+}
+
+#[test]
+fn decoded_observe_replay_matches_failure_state_and_diagnostic() {
+    let (capture, data, decoded_capture, _, session, _) = observation_owners(json!({
+        "kind":"list","entity":"row","rows":{"kind":"query","entity":"row","binding":"item","predicate":{"kind":"literal","value_type":{"kind":"boolean"},"value":{"kind":"boolean","value":true}},"sort":[],"limit":10,"include_archived":false},"columns":[],"controls":[],"selection":null
+    }));
+    let (legacy_scenario, decoded_scenario) = replay_scenario_owners(
+        &data, &session, vec![SemanticInput::Observe { point: "point".into() }], vec![],
+    );
+    let (legacy_decisions, decisions) = decoded_empty_decisions();
+    for (limits, cancelled) in [
+        (RuntimeLimits { fuel: 1, ..RuntimeLimits::default() }, false),
+        (RuntimeLimits::default(), true),
+    ] {
+        let cancelled_token = Arc::new(AtomicBool::new(cancelled));
+        let runtime = LocalRuntime::with_cancellation(cancelled_token);
+        let legacy = runtime.replay(
+            &capture, &legacy_scenario, &legacy_decisions, limits.clone(), "failed_replay",
+        ).unwrap();
+        let decoded = runtime.replay_decoded_observe_with(
+            &decoded_capture, &decoded_scenario, &decisions, limits, "failed_replay", &mut AllocationContext::new(),
+        ).unwrap();
+        assert_eq!(serde_json::to_value(legacy).unwrap(), serde_json::to_value(decoded).unwrap());
+    }
+
+    let duplicate_rows = json!({
+        "kind":"literal",
+        "value_type":{"kind":"list","item":{"kind":"reference","entity":"row"}},
+        "value":{"kind":"list","item_type":{"kind":"reference","entity":"row"},"items":[
+            {"kind":"reference","entity":"row","record":"r1"},
+            {"kind":"reference","entity":"row","record":"r1"}
+        ]}
+    });
+    let (capture, data, decoded_capture, _, session, _) = observation_owners(json!({
+        "kind":"list","entity":"row","rows":duplicate_rows,
+        "columns":[{"id":"name","label":"Name","value":{"kind":"field","record":{"kind":"variable","name":"row"},"field":"name"}}],
+        "controls":[],"selection":null
+    }));
+    let (legacy_scenario, decoded_scenario) = replay_scenario_owners(
+        &data, &session, vec![SemanticInput::Observe { point: "duplicate_rows".into() }], vec![],
+    );
+    let (legacy_decisions, decoded_decisions) = decoded_empty_decisions();
+    let limits = RuntimeLimits { fuel: 2_000_000, ..RuntimeLimits::default() };
+    let legacy = LocalRuntime::default().replay(
+        &capture, &legacy_scenario, &legacy_decisions, limits.clone(), "runtime_failure",
+    ).unwrap();
+    let decoded = LocalRuntime::default().replay_decoded_observe_with(
+        &decoded_capture, &decoded_scenario, &decoded_decisions, limits, "runtime_failure",
+        &mut AllocationContext::new(),
+    ).unwrap();
+    assert_eq!(serde_json::to_value(legacy).unwrap(), serde_json::to_value(decoded).unwrap());
+}
+
+#[test]
+fn decoded_observe_evidence_validator_rejects_tampered_frame_and_observation_order() {
+    let (capture, data, decoded_capture, _, session, _) = observation_owners(json!({
+        "kind":"list","entity":"row","rows":{"kind":"query","entity":"row","binding":"item","predicate":{"kind":"literal","value_type":{"kind":"boolean"},"value":{"kind":"boolean","value":true}},"sort":[],"limit":10,"include_archived":false},"columns":[],"controls":[],"selection":null
+    }));
+    let (_, scenario) = replay_scenario_owners(
+        &data, &session, vec![SemanticInput::Observe { point: "point".into() }], vec![],
+    );
+    let (_, decisions) = decoded_empty_decisions();
+    let evidence = LocalRuntime::default().replay_decoded_observe_with(
+        &decoded_capture, &scenario, &decisions,
+        RuntimeLimits { fuel: 2_000_000, ..RuntimeLimits::default() },
+        "evidence_validation", &mut AllocationContext::new(),
+    ).unwrap();
+    let canonical = serde_json::to_value(&evidence).unwrap();
+
+    let mut missing_observation = canonical.clone();
+    missing_observation["observations"] = json!([]);
+    let mut duplicate_observation = canonical.clone();
+    let observation = duplicate_observation["observations"][0].clone();
+    duplicate_observation["observations"] = json!([observation.clone(), observation]);
+    let mut wrong_frame = canonical.clone();
+    wrong_frame["trace"][0]["before_data"] = json!("0".repeat(64));
+    let mut wrong_point = canonical.clone();
+    wrong_point["trace"][0]["input"]["point"] = json!("INVALID");
+    let mut applied_diagnostic = canonical.clone();
+    applied_diagnostic["trace"][0]["diagnostic"] = json!("unexpected failure");
+    let mut wrong_input = canonical;
+    wrong_input["trace"][0]["input"] = json!({"kind":"advance_clock","days":1});
+    let mut mismatched_observation_value = serde_json::to_value(&evidence).unwrap();
+    mismatched_observation_value["observations"][0]["view_schema"]["columns"] =
+        json!({"tampered":{"kind":"boolean"}});
+    mismatched_observation_value["observations"][0]["view"]["rows"][0]["cells"]["tampered"] =
+        json!({"kind":"text","value":"wrong type"});
+    let mut rejected_as_cancelled = serde_json::to_value(&evidence).unwrap();
+    rejected_as_cancelled["state"] = json!("inconclusive");
+    rejected_as_cancelled["observations"] = json!([]);
+    rejected_as_cancelled["trace"][0]["outcome"] = json!("rejected");
+    rejected_as_cancelled["trace"][0]["diagnostic"] = json!("Cancelled");
+    rejected_as_cancelled["errors"] = json!(["Cancelled"]);
+    let mut failed_as_invalid = serde_json::to_value(&evidence).unwrap();
+    failed_as_invalid["state"] = json!("failed");
+    failed_as_invalid["observations"] = json!([]);
+    failed_as_invalid["trace"][0]["outcome"] = json!("failed");
+    failed_as_invalid["trace"][0]["diagnostic"] = json!("Invalid(ContractError(\"bad input\"))");
+    failed_as_invalid["errors"] = json!(["Invalid(ContractError(\"bad input\"))"]);
+
+    for wire in [missing_observation, duplicate_observation, wrong_frame, wrong_point, wrong_input, applied_diagnostic, mismatched_observation_value, rejected_as_cancelled, failed_as_invalid] {
+        let bytes = serde_json::to_vec(&wire).unwrap();
+        let mut cx = AllocationContext::new();
+        let value = crate::product_json::parse_json_bytes(&bytes, &mut cx).unwrap();
+        let decoded = decode_run_evidence_fallible(value, &mut cx).unwrap();
+        assert!(decoded.validate_single_observe(&mut cx).is_err(), "tampered runtime evidence was accepted: {wire}");
+    }
+
+    let mut early_duplicate = serde_json::to_value(&evidence).unwrap();
+    early_duplicate["state"] = json!("failed");
+    early_duplicate["trace"] = json!([]);
+    early_duplicate["observations"] = json!([]);
+    early_duplicate["errors"] = json!([
+        "Stale(\"Operation already committed; resolve its persisted receipt before retrying\")"
+    ]);
+    let bytes = serde_json::to_vec(&early_duplicate).unwrap();
+    let mut cx = AllocationContext::new();
+    let value = crate::product_json::parse_json_bytes(&bytes, &mut cx).unwrap();
+    let decoded = decode_run_evidence_fallible(value, &mut cx).unwrap();
+    assert!(decoded.validate_single_observe(&mut cx).is_ok());
+
+    let _ = capture;
+}
+
+#[test]
+fn decoded_observe_replay_allocation_refusal_is_typed_and_retryable() {
+    let (capture, data, decoded_capture, decoded_data, session, decoded_session) = observation_owners(json!({
+        "kind":"list","entity":"row","rows":{"kind":"query","entity":"row","binding":"item","predicate":{"kind":"literal","value_type":{"kind":"boolean"},"value":{"kind":"boolean","value":true}},"sort":[],"limit":10,"include_archived":false},"columns":[{"id":"name","label":"Name","value":{"kind":"field","record":{"kind":"variable","name":"row"},"field":"name"}}],"controls":[],"selection":null
+    }));
+    let (legacy_scenario, decoded_scenario) = replay_scenario_owners(
+        &data, &session, vec![SemanticInput::Observe { point: "point".into() }], vec![],
+    );
+    let (legacy_decisions, decisions) = decoded_empty_decisions();
+    let limits = RuntimeLimits { fuel: 2_000_000, ..RuntimeLimits::default() };
+    let before_capture = serde_json::to_vec(&decoded_capture).unwrap();
+    let before_data = serde_json::to_vec(&decoded_data).unwrap();
+    let before_session = serde_json::to_vec(&decoded_session).unwrap();
+    let before_scenario = serde_json::to_vec(&decoded_scenario).unwrap();
+    let expected = LocalRuntime::default().replay(
+        &capture, &legacy_scenario, &legacy_decisions, limits.clone(), "refusal_replay",
+    ).unwrap();
+    let mut success_allocations = AllocationContext::new();
+    let success = LocalRuntime::default().replay_decoded_observe_with(
+        &decoded_capture, &decoded_scenario, &decisions, limits.clone(), "refusal_replay", &mut success_allocations,
+    ).unwrap();
+    assert_eq!(serde_json::to_value(expected).unwrap(), serde_json::to_value(&success).unwrap());
+    let growth_count = success_allocations.growth_requests();
+    let mut refusals = 0;
+    for n in 1..=growth_count {
+        let mut allocations = AllocationContext::fail_nth_growth(NonZeroUsize::new(n).unwrap(), false);
+        match LocalRuntime::default().replay_decoded_observe_with(
+            &decoded_capture, &decoded_scenario, &decisions, limits.clone(), "refusal_replay", &mut allocations,
+        ) {
+            Err(AdapterError::Allocation(_)) => refusals += 1,
+            Ok(actual) => panic!("allocation refusal at growth {n} was not reached: {actual:?}"),
+            other => panic!("unexpected replay result at growth {n}: {other:?}"),
+        }
+        assert_eq!(serde_json::to_vec(&decoded_capture).unwrap(), before_capture);
+        assert_eq!(serde_json::to_vec(&decoded_data).unwrap(), before_data);
+        assert_eq!(serde_json::to_vec(&decoded_session).unwrap(), before_session);
+        assert_eq!(serde_json::to_vec(&decoded_scenario).unwrap(), before_scenario);
+        let mut retry_allocations = AllocationContext::new();
+        let retry = LocalRuntime::default().replay_decoded_observe_with(
+            &decoded_capture, &decoded_scenario, &decisions, limits.clone(), "refusal_replay", &mut retry_allocations,
+        ).unwrap();
+        assert_eq!(serde_json::to_value(&success).unwrap(), serde_json::to_value(retry).unwrap());
+    }
+    assert!(refusals > 0);
+    assert_eq!(serde_json::to_vec(&decoded_capture).unwrap(), before_capture);
+    assert_eq!(serde_json::to_vec(&decoded_data).unwrap(), before_data);
+    assert_eq!(serde_json::to_vec(&decoded_session).unwrap(), before_session);
+    assert_eq!(serde_json::to_vec(&decoded_scenario).unwrap(), before_scenario);
+}

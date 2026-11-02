@@ -35,6 +35,136 @@ pub(super) struct DecodedRunEvidence {
     errors: Vec<String>,
     uncovered: Vec<String>,
 }
+impl DecodedRunEvidence {
+    /// Validate the exact bounded form minted by the decoded single-Observe
+    /// replay driver. This is intentionally not a general persisted-evidence
+    /// validator: its one trace frame is tied to the validated current seed,
+    /// source, decisions, session, and runtime-produced observation.
+    pub(super) fn validate_single_observe(
+        &self,
+        cx: &mut AllocationContext,
+    ) -> std::result::Result<(), super::AppValidationError> {
+        super::version(self.version)?;
+        super::check_id(&self.id)?;
+        self.binding.validate()?;
+        self.source_after.validate()?;
+        self.limits.validate()?;
+        super::require(self.state != EvidenceState::NoDifferenceFound,
+            "no-difference classification belongs to a completed comparison, not a single run")?;
+        super::bounded(self.trace.len())?;
+        super::bounded(self.observations.len())?;
+        super::bounded(self.errors.len())?;
+        super::bounded(self.uncovered.len())?;
+        super::require(self.uncovered.is_empty(),
+            "single Observe replay has no uncovered validity obligations")?;
+        if self.trace.is_empty() {
+            super::require(
+                self.state == EvidenceState::Failed
+                    && self.observations.is_empty()
+                    && self.errors.len() == 1
+                    && self.errors[0] == "Stale(\"Operation already committed; resolve its persisted receipt before retrying\")",
+                "trace-less single Observe evidence is not an early duplicate-operation failure",
+            )?;
+            super::require(self.source_after == self.binding.source,
+                "changed source cannot have current observed status")?;
+            return Ok(());
+        }
+        super::require(self.trace.len() == 1,
+            "decoded Observe replay must contain exactly one trace step")?;
+        let step = &self.trace[0];
+        super::require(step.index == 0, "trace index is out of order")?;
+        let DecodedSemanticInput::Observe { point } = &step.input else {
+            return Err(super::ContractError("decoded runtime evidence input is not Observe".into()).into());
+        };
+        super::check_id(point)?;
+        super::bounded(step.outputs.len())?;
+        if let Some(message) = &step.diagnostic { super::nonempty(message)?; }
+        super::require(
+            step.before_data == self.binding.data_digest
+                && step.before_session == self.binding.session_digest,
+            "trace does not start from bound seed",
+        )?;
+        super::require(
+            step.before_data == step.after_data
+                && step.before_session == step.after_session
+                && step.outputs.is_empty(),
+            "observation/clock input cannot mutate data or session",
+        )?;
+        super::require(self.source_after == self.binding.source,
+            "changed source cannot have current observed status")?;
+        match step.outcome {
+            StepOutcome::Applied => {
+                super::require(self.state == EvidenceState::Observed,
+                    "applied observation does not have observed run status")?;
+                super::require(step.diagnostic.is_none(),
+                    "applied observation cannot carry a failure diagnostic")?;
+                super::require(self.errors.is_empty() && self.observations.len() == 1,
+                    "observed run contains failure or lacks observations")?;
+                let observation = &self.observations[0];
+                super::require(
+                    observation.point() == point
+                        && observation.data_digest() == &step.after_data
+                        && observation.session_digest() == &step.after_session
+                        && observation.outputs_empty(),
+                    "observation belongs to another runtime state",
+                )?;
+                observation.validate_with(&self.limits, cx)?;
+            }
+            StepOutcome::BudgetExhausted => {
+                super::require(self.state == EvidenceState::Inconclusive,
+                    "exhausted run must remain inconclusive")?;
+                super::require(self.observations.is_empty(),
+                    "failed step claims a completed observation")?;
+                require_diagnostic_variant(step, "BudgetExhausted")?;
+                validate_failed_step(step, &self.errors)?;
+            }
+            StepOutcome::Rejected | StepOutcome::Failed => {
+                super::require(self.observations.is_empty(),
+                    "failed step claims a completed observation")?;
+                match step.outcome {
+                    StepOutcome::Rejected => require_diagnostic_variant(step, "Invalid")?,
+                    StepOutcome::Failed => super::require(
+                        is_diagnostic_variant(step, "Unsupported")
+                            || is_diagnostic_variant(step, "Stale")
+                            || is_diagnostic_variant(step, "Failed")
+                            || step.diagnostic.as_deref() == Some("Cancelled"),
+                        "failed step diagnostic does not match a runtime failure",
+                    )?,
+                    _ => unreachable!(),
+                }
+                validate_failed_step(step, &self.errors)?;
+                let cancelled = step.diagnostic.as_deref() == Some("Cancelled");
+                let expected = if cancelled { EvidenceState::Inconclusive } else { EvidenceState::Failed };
+                super::require(self.state == expected,
+                    "failed observation has the wrong run classification")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn is_diagnostic_variant(step: &DecodedTraceStep, variant: &str) -> bool {
+    step.diagnostic.as_deref().is_some_and(|text| {
+        text.strip_prefix(variant).is_some_and(|suffix| suffix.starts_with('('))
+    })
+}
+
+fn require_diagnostic_variant(
+    step: &DecodedTraceStep,
+    variant: &str,
+) -> std::result::Result<(), super::ContractError> {
+    super::require(is_diagnostic_variant(step, variant),
+        "step outcome does not match runtime error diagnostic")
+}
+
+fn validate_failed_step(
+    step: &DecodedTraceStep,
+    errors: &[String],
+) -> std::result::Result<(), super::ContractError> {
+    super::require(step.diagnostic.is_some(), "failed trace step lacks a diagnostic")?;
+    super::require(errors.len() == 1 && errors[0] == step.diagnostic.as_deref().unwrap_or_default(),
+        "run errors do not match the failed trace diagnostic")
+}
 
 #[derive(Debug, Serialize)]
 struct DecodedTraceStep {

@@ -203,6 +203,12 @@ pub(crate) struct DecodedRuntimeObservation {
     view_schema: Option<DecodedViewSchema>,
     outputs: Vec<()>,
 }
+impl DecodedRuntimeObservation {
+    pub(super) fn point(&self) -> &str { &self.point }
+    pub(super) fn data_digest(&self) -> &Digest { &self.data_digest }
+    pub(super) fn session_digest(&self) -> &Digest { &self.session_digest }
+    pub(super) fn outputs_empty(&self) -> bool { self.outputs.is_empty() }
+}
 
 #[derive(Debug, Serialize)]
 struct DecodedViewObservation {
@@ -325,48 +331,62 @@ pub(super) fn observe_decoded(
 
     let owned_allocations = std::mem::replace(allocations, AllocationContext::new());
     let mut meter = Meter::with_allocations(limits.clone(), limits.fuel, cancelled, owned_allocations);
-    let result = (|| {
-        meter.tick(1)?;
-        let app = program.app();
-        let mut values = FallibleValues::new();
-        for observable in &app.observables {
-            let mut evaluator = Eval::fallible(app, data, session, day, &mut meter);
-            let value = evaluator.eval(&observable.value, &ManagedEnv::new())?;
-            meter.value(&value)?;
-            decoded_insert_value(&mut values, &observable.id, value, &mut meter)?;
-        }
-
-        let view = render_decoded(program, data, session, day, &mut meter)?;
-        let data_digest = data.identity_with(&mut meter.allocations).map_err(decoded_app_error)?;
-        let session_digest = session.identity_with(&mut meter.allocations).map_err(|error| match error {
-            crate::product_backup::fallible_codec::CodecError::Allocation(failure) => AdapterError::Allocation(failure),
-            _ => invalid("observation session identity failed"),
-        })?;
-        let mut value_types = OrderedMap::new();
-        for observable in &app.observables {
-            let value_type = crate::product_contract::decoded_expression_type_empty_with(
-                app, &observable.value, &mut meter.allocations,
-            ).map_err(decoded_app_error)?;
-            let key = decoded_copy_str(&observable.id, &mut meter)?;
-            value_types.try_insert(key, value_type, &mut meter.allocations)
-                .map_err(AdapterError::Allocation)?;
-        }
-        let view_schema = decoded_view_schema(program, &view.view, &mut meter)?;
-        let observation = DecodedRuntimeObservation {
-            point: decoded_copy_str(point, &mut meter)?,
-            data_digest,
-            session_digest,
-            values,
-            value_types: DecodedTypeMap(value_types),
-            view,
-            view_schema,
-            outputs: Vec::new(),
-        };
-        meter.tick(1)?;
-        Ok(observation)
-    })();
+    let result = observe_decoded_with_meter(program, data, session, day, point, &mut meter);
     *allocations = meter.allocations;
     result
+}
+
+/// Decoded observation body used by both the standalone view API and the
+/// replay driver. The replay driver passes its existing meter so the input
+/// prefix, observation work, and input suffix spend one shared fuel/cancel
+/// budget without resetting elapsed time or allocation accounting.
+pub(super) fn observe_decoded_with_meter(
+    program: &FallibleDecodedCapturedProgram,
+    data: &FallibleDecodedDataSnapshot,
+    session: &FallibleDecodedSessionState,
+    day: i32,
+    point: &str,
+    meter: &mut Meter,
+) -> Result<DecodedRuntimeObservation> {
+    if !valid_id(point) { return Err(invalid("invalid observation point")); }
+    meter.tick(1)?;
+    let app = program.app();
+    let mut values = FallibleValues::new();
+    for observable in &app.observables {
+        let mut evaluator = Eval::fallible(app, data, session, day, meter);
+        let value = evaluator.eval(&observable.value, &ManagedEnv::new())?;
+        meter.value(&value)?;
+        decoded_insert_value(&mut values, &observable.id, value, meter)?;
+    }
+
+    let view = render_decoded(program, data, session, day, meter)?;
+    let data_digest = data.identity_with(&mut meter.allocations).map_err(decoded_app_error)?;
+    let session_digest = session.identity_with(&mut meter.allocations).map_err(|error| match error {
+        crate::product_backup::fallible_codec::CodecError::Allocation(failure) => AdapterError::Allocation(failure),
+        _ => invalid("observation session identity failed"),
+    })?;
+    let mut value_types = OrderedMap::new();
+    for observable in &app.observables {
+        let value_type = crate::product_contract::decoded_expression_type_empty_with(
+            app, &observable.value, &mut meter.allocations,
+        ).map_err(decoded_app_error)?;
+        let key = decoded_copy_str(&observable.id, meter)?;
+        value_types.try_insert(key, value_type, &mut meter.allocations)
+            .map_err(AdapterError::Allocation)?;
+    }
+    let view_schema = decoded_view_schema(program, &view.view, meter)?;
+    let observation = DecodedRuntimeObservation {
+        point: decoded_copy_str(point, meter)?,
+        data_digest,
+        session_digest,
+        values,
+        value_types: DecodedTypeMap(value_types),
+        view,
+        view_schema,
+        outputs: Vec::new(),
+    };
+    meter.tick(1)?;
+    Ok(observation)
 }
 impl Serialize for DecodedStringSet {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {

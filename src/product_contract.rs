@@ -429,6 +429,11 @@ impl FallibleDecodedCapturedProgram {
     pub(crate) fn artifact(&self) -> &ArtifactRef { self.0.artifact() }
     pub(crate) fn program_digest(&self) -> &Digest { self.0.program_digest() }
     pub(crate) fn app(&self) -> &fallible_app_decode::DecodedAppDefinition { self.0.app() }
+    pub(crate) fn has_protected_fields(&self) -> bool {
+        self.0.app().entities.iter().any(|entity| {
+            entity.fields.iter().any(|field| field.id.starts_with(crate::product_runtime::PROTECTED_FIELD_PREFIX))
+        })
+    }
     pub(crate) fn revision_with(
         &self,
         cx: &mut crate::product_alloc::AllocationContext,
@@ -464,7 +469,66 @@ impl FallibleDecodedScenarioSpec {
     pub(crate) fn id(&self) -> &str { self.0.id() }
     pub(crate) fn clock_day(&self) -> i32 { self.0.clock_day() }
     pub(crate) fn random_seed(&self) -> u64 { self.0.random_seed() }
+    pub(crate) fn input_count(&self) -> usize { self.0.input_count() }
+    pub(crate) fn has_validity(&self) -> bool { self.0.has_validity() }
+    pub(crate) fn single_observe_point(&self) -> Option<&str> { self.0.single_observe_point() }
     pub(crate) fn matches_frame(&self, scenario: &Self) -> bool { self.0.matches_frame(&scenario.0) }
+
+    pub(crate) fn validate_replay_input(
+        &self,
+        program: &FallibleDecodedCapturedProgram,
+    ) -> std::result::Result<(), AppValidationError> {
+        self.0.validate_replay_input(program.app())
+    }
+
+    pub(crate) fn validate_seed_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), AppValidationError> {
+        self.0.validate_seed_with(cx)
+    }
+
+    pub(crate) fn validate_session_with(
+        &self,
+        program: &FallibleDecodedCapturedProgram,
+    ) -> std::result::Result<(), AppValidationError> {
+        self.0.validate_session_with(program.app())
+    }
+
+    pub(crate) fn input_identity_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Digest, crate::product_backup::fallible_codec::CodecError> {
+        self.0.input_identity_with(cx)
+    }
+
+    pub(crate) fn seed_identity_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Digest, crate::product_backup::fallible_codec::CodecError> {
+        self.0.seed_identity_with(cx)
+    }
+
+    pub(crate) fn session_identity_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Digest, crate::product_backup::fallible_codec::CodecError> {
+        self.0.session_identity_with(cx)
+    }
+
+    pub(crate) fn session_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<FallibleDecodedSessionState, AppValidationError> {
+        self.0.session_with(cx).map(FallibleDecodedSessionState)
+    }
+
+    pub(crate) fn observe_operation_id_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<String, AppValidationError> {
+        self.0.observe_operation_id_with(cx)
+    }
 
     pub(crate) fn validate_with(
         &self,
@@ -566,6 +630,35 @@ impl FallibleDecodedScenarioSpec {
 }
 #[derive(Debug, Serialize)]
 pub(crate) struct FallibleDecodedRunEvidence(fallible_run_evidence_decode::DecodedRunEvidence);
+impl crate::product_backup::fallible_codec::BackupWire for FallibleDecodedRunEvidence {}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RuntimeEvidenceError {
+    Contract(ContractError),
+    Allocation(crate::product_alloc::AllocationFailure),
+}
+impl FallibleDecodedRunEvidence {
+    pub(crate) fn validate_single_observe(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), RuntimeEvidenceError> {
+        self.0.validate_single_observe(cx).map_err(|error| match error {
+            AppValidationError::Contract(error) => RuntimeEvidenceError::Contract(error),
+            AppValidationError::Allocation(failure) => RuntimeEvidenceError::Allocation(failure),
+        })
+    }
+
+    pub(crate) fn identity_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Digest, RuntimeEvidenceError> {
+        self.validate_single_observe(cx)?;
+        crate::product_backup::fallible_codec::canonical_digest(IdentityDomain::Evidence, self, cx)
+            .map_err(|error| match error {
+                crate::product_backup::fallible_codec::CodecError::Allocation(failure) => RuntimeEvidenceError::Allocation(failure),
+                _ => RuntimeEvidenceError::Contract(ContractError("runtime evidence identity encoding failed".into())),
+            })
+    }
+}
 #[derive(Debug, Serialize)]
 pub(crate) struct FallibleDecodedDecisionGraph(fallible_decision_decode::DecodedDecisionGraph);
 impl FallibleDecodedDecisionGraph {
@@ -797,6 +890,17 @@ pub(crate) fn decode_run_evidence_fallible(
 ) -> std::result::Result<FallibleDecodedRunEvidence, fallible_value_decode::ValueDecodeError> {
     fallible_run_evidence_decode::decode_run_evidence(value, cx).map(FallibleDecodedRunEvidence)
 }
+pub(crate) fn decode_run_evidence_runtime(
+    value: crate::product_json::Value,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<FallibleDecodedRunEvidence, AppValidationError> {
+    fallible_run_evidence_decode::decode_run_evidence(value, cx)
+        .map(FallibleDecodedRunEvidence)
+        .map_err(|error| match error {
+            fallible_value_decode::ValueDecodeError::Allocation(failure) => AppValidationError::Allocation(failure),
+            _ => AppValidationError::Contract(ContractError("decoded runtime evidence construction invariant".into())),
+        })
+}
 pub(crate) fn decode_decision_graph_fallible(
     value: crate::product_json::Value,
     cx: &mut crate::product_alloc::AllocationContext,
@@ -839,6 +943,7 @@ pub(crate) fn decode_run_binding_fallible(
 mod fallible_decision_decode;
 impl crate::product_backup::fallible_codec::BackupWire for fallible_decision_decode::DecodedDecisionGraph {}
 impl crate::product_backup::fallible_codec::BackupWire for fallible_decision_decode::DecodedAdoptionPlan {}
+impl crate::product_backup::fallible_codec::BackupWire for fallible_persisted_decode::DecodedSessionState {}
 #[path = "product_contract/fallible_app_decode.rs"]
 #[allow(dead_code)]
 pub(crate) mod fallible_app_decode;

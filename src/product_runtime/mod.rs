@@ -25,6 +25,7 @@ use std::sync::{
     Arc,
 };
 use std::time::Instant;
+use serde::Serialize;
 
 pub const PROTECTED_FIELD_PREFIX: &str = "gm_scope_";
 /// Host admission is separate from executable semantics. The interpreter still
@@ -81,6 +82,20 @@ mod fallible_projection_tests;
 pub const RUNTIME_VERSION: &str = "local-interpreter/4";
 pub const DRIVER_VERSION: &str = "semantic-input/3";
 type Result<T> = std::result::Result<T, AdapterError>;
+
+fn app_adapter_error(error: AppValidationError) -> AdapterError {
+    match error {
+        AppValidationError::Contract(error) => AdapterError::Invalid(error),
+        AppValidationError::Allocation(failure) => AdapterError::Allocation(failure),
+    }
+}
+
+fn codec_adapter_error(error: crate::product_backup::fallible_codec::CodecError) -> AdapterError {
+    match error {
+        crate::product_backup::fallible_codec::CodecError::Allocation(failure) => AdapterError::Allocation(failure),
+        _ => AdapterError::Failed("decoded runtime evidence codec invariant".into()),
+    }
+}
 
 /// Successful immutable checks retained only by one history-verification call.
 /// Borrowing captures prevents mutation or pointer reuse during this lifetime.
@@ -142,6 +157,54 @@ fn diagnostic(error: &AdapterError) -> String {
         message.push_str("...");
     }
     message
+}
+
+struct BoundedDiagnostic<'a> {
+    value: String,
+    truncated: bool,
+    allocations: &'a mut product_alloc::AllocationContext,
+    failure: Option<product_alloc::AllocationFailure>,
+}
+impl std::fmt::Write for BoundedDiagnostic<'_> {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        if self.truncated || value.is_empty() { return Ok(()); }
+        let remaining = MAX_TEXT_BYTES.saturating_sub(self.value.len());
+        let take = if value.len() <= remaining { value.len() } else { remaining };
+        let mut end = take;
+        while !value.is_char_boundary(end) { end -= 1; }
+        if let Err(failure) = product_alloc::try_reserve_string(
+            &mut self.value, end, self.allocations, product_alloc::AllocationSite::String,
+        ) {
+            self.failure = Some(failure);
+            return Err(std::fmt::Error);
+        }
+        self.value.push_str(&value[..end]);
+        if end < value.len() {
+            self.truncated = true;
+            let mut prefix = MAX_TEXT_BYTES.saturating_sub(3).min(self.value.len());
+            while !self.value.is_char_boundary(prefix) { prefix -= 1; }
+            self.value.truncate(prefix);
+        }
+        Ok(())
+    }
+}
+
+fn diagnostic_decoded(
+    error: &AdapterError,
+    allocations: &mut product_alloc::AllocationContext,
+) -> Result<String> {
+    let mut output = BoundedDiagnostic {
+        value: String::new(), truncated: false, allocations, failure: None,
+    };
+    let formatted = std::fmt::write(&mut output, format_args!("{error:?}"));
+    if let Some(failure) = output.failure { return Err(AdapterError::Allocation(failure)); }
+    if formatted.is_err() { return Err(failed("runtime diagnostic formatting failed")); }
+    if output.truncated {
+        product_alloc::try_append_str(
+            &mut output.value, "...", output.allocations, product_alloc::AllocationSite::String,
+        ).map_err(AdapterError::Allocation)?;
+    }
+    Ok(output.value)
 }
 
 /// The prepared branch owns its validation capability; it cannot be paired
@@ -244,6 +307,58 @@ pub struct ProductRun {
     observations: Vec<Observation>,
     receipts: BTreeMap<Id, (Digest, TraceStep)>,
 }
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum DecodedObserveInput<'a> {
+    Observe { point: &'a str },
+}
+
+#[derive(Serialize)]
+struct DecodedObserveTrace<'a> {
+    index: usize,
+    input: DecodedObserveInput<'a>,
+    before_data: &'a Digest,
+    after_data: &'a Digest,
+    before_session: &'a Digest,
+    after_session: &'a Digest,
+    outputs: &'a [Digest],
+    outcome: StepOutcome,
+    diagnostic: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct DecodedRunBindingWire<'a> {
+    source: &'a SourceBinding,
+    artifact: &'a ArtifactRef,
+    data_digest: &'a Digest,
+    input_digest: &'a Digest,
+    scenario_digest: &'a Digest,
+    decision_digest: &'a Digest,
+    session_digest: &'a Digest,
+    runtime_version: &'static str,
+    driver_version: &'static str,
+}
+
+#[derive(Serialize)]
+struct DecodedRunEvidenceWire<'a> {
+    version: u32,
+    id: &'a str,
+    origin: ExecutionOrigin,
+    binding: DecodedRunBindingWire<'a>,
+    source_after: &'a SourceBinding,
+    state: EvidenceState,
+    trace: &'a [DecodedObserveTrace<'a>],
+    observations: &'a [view::DecodedRuntimeObservation],
+    limits: &'a RuntimeLimits,
+    errors: &'a [String],
+    uncovered: &'a [String],
+}
+impl crate::product_backup::fallible_codec::BackupWire for DecodedRunEvidenceWire<'_> {}
+
+#[derive(Serialize)]
+struct DecodedObserveRequest<'a>(DecodedObserveInput<'a>, &'a ArtifactRef);
+impl crate::product_backup::fallible_codec::BackupWire for DecodedObserveRequest<'_> {}
 impl ProductRun {
     pub fn trace(&self) -> &[TraceStep] {
         &self.trace
@@ -1080,6 +1195,221 @@ impl LocalRuntime {
         };
         result.validate()?;
         Ok(result)
+    }
+
+    /// Replay the lifecycle runtime's strict one-Observe scenario directly over
+    /// fallible decoded owners. The returned RunEvidence DTO can only be minted
+    /// here after the shared-meter observation and the single-step evidence
+    /// invariants have both been checked.
+    pub(crate) fn replay_decoded_observe_with(
+        &self,
+        program: &FallibleDecodedCapturedProgram,
+        scenario: &FallibleDecodedScenarioSpec,
+        decisions: &FallibleDecodedDecisionGraph,
+        limits: RuntimeLimits,
+        id: &str,
+        allocations: &mut product_alloc::AllocationContext,
+    ) -> Result<FallibleDecodedRunEvidence> {
+        if program.has_protected_fields() {
+            return Err(AdapterError::Unsupported(
+                "Protected scope history needs a verified host admission context".into(),
+            ));
+        }
+        if !valid_id(id) { return Err(invalid("invalid run ID")); }
+        scenario.validate_with(program, allocations).map_err(|error| match error {
+            AppValidationError::Contract(error) => AdapterError::Invalid(error),
+            AppValidationError::Allocation(failure) => AdapterError::Allocation(failure),
+        })?;
+        decisions.validate_with(allocations).map_err(|error| match error {
+            DecisionValidationError::Contract(error) => AdapterError::Invalid(error),
+            DecisionValidationError::Allocation(failure) => AdapterError::Allocation(failure),
+        })?;
+        let Some(point) = scenario.single_observe_point() else {
+            return Err(invalid("decoded replay requires exactly one Observe input and no validity properties"));
+        };
+        if scenario.has_validity() {
+            return Err(invalid("decoded replay requires exactly one Observe input and no validity properties"));
+        }
+
+        // Keep the legacy binding construction order: seed, input, scenario,
+        // decisions, and session identities are computed before runtime start.
+        let data_digest = scenario.seed_identity_with(allocations).map_err(codec_adapter_error)?;
+        let input_digest = scenario.input_identity_with(allocations).map_err(codec_adapter_error)?;
+        let scenario_digest = scenario.identity_with(allocations).map_err(codec_adapter_error)?;
+        let decision_digest = decisions.identity_with(allocations).map_err(|error| match error {
+            DecisionValidationError::Contract(error) => AdapterError::Invalid(error),
+            DecisionValidationError::Allocation(failure) => AdapterError::Allocation(failure),
+        })?;
+        let session_digest = scenario.session_identity_with(allocations).map_err(codec_adapter_error)?;
+
+        // This is the decoded counterpart of start_source's complete preflight
+        // and initial compatibility/resource checks. It does not materialize
+        // or mutate a ProductRun copy.
+        program.validate_with(allocations).map_err(app_adapter_error)?;
+        scenario.validate_seed_with(allocations).map_err(app_adapter_error)?;
+        scenario.validate_session_with(program).map_err(app_adapter_error)?;
+        validate_day(scenario.clock_day()).map_err(AdapterError::Invalid)?;
+        limits.validate().map_err(AdapterError::Invalid)?;
+        let start_data = scenario.seed_with(allocations).map_err(app_adapter_error)?;
+        let start_session = scenario.session_with(allocations).map_err(app_adapter_error)?;
+        crate::product_store::scope::validate_initial_runtime_fallible(
+            program, &start_data, &start_session,
+            scenario.clock_day(), limits.clone(), allocations,
+        ).map_err(|error| match error {
+            crate::product_store::scope::CompatibilityFailure::Allocation(failure) => AdapterError::Allocation(failure),
+            crate::product_store::scope::CompatibilityFailure::Store(crate::product_store::StoreError::Runtime(error)) => error,
+            crate::product_store::scope::CompatibilityFailure::Store(crate::product_store::StoreError::Invalid(message)) => {
+                AdapterError::Invalid(ContractError(message))
+            }
+            crate::product_store::scope::CompatibilityFailure::Store(error) => {
+                AdapterError::Failed(format!("decoded runtime start failed: {error:?}"))
+            }
+        })?;
+
+        // ScenarioSpec::replay_operation_ids performs this after start. The
+        // single Observe path has a stable index-zero replay operation ID.
+        let operation_id = scenario.observe_operation_id_with(allocations).map_err(app_adapter_error)?;
+        if !valid_id(&operation_id) { return Err(invalid("invalid operation ID")); }
+        let observe_input = DecodedObserveInput::Observe { point };
+        // apply computes this request identity before checking persisted event
+        // collisions, even though Observe has no mutation receipt of its own.
+        crate::product_backup::fallible_codec::canonical_digest(
+            IdentityDomain::Input,
+            &DecodedObserveRequest(observe_input, program.artifact()),
+            allocations,
+        ).map_err(codec_adapter_error)?;
+
+        let apply_error = if start_data.events().iter()
+            .any(|event| event.operation_id() == operation_id)
+        {
+            Some(AdapterError::Stale(
+                "Operation already committed; resolve its persisted receipt before retrying".into(),
+            ))
+        } else {
+            None
+        };
+        let had_early_apply_error = apply_error.is_some();
+        let before_data = if had_early_apply_error { None } else {
+            Some(start_data.identity_with(allocations).map_err(app_adapter_error)?)
+        };
+        let before_session = if had_early_apply_error { None } else {
+            Some(start_session.identity_with(allocations).map_err(codec_adapter_error)?)
+        };
+        let before_data = before_data.as_ref().unwrap_or(&data_digest);
+        let before_session = before_session.as_ref().unwrap_or(&session_digest);
+        let mut observation = None;
+        let mut step_error = apply_error;
+        if step_error.is_none() {
+            // Prefix tick, input-shape/input validation, view observation, and
+            // suffix tick use one meter and one allocation context, matching
+            // LocalRuntime::apply's ordering.
+            let owned_allocations = std::mem::replace(allocations, product_alloc::AllocationContext::new());
+            let mut meter = Meter::with_allocations(
+                limits.clone(), limits.fuel, self.cancelled.clone(), owned_allocations,
+            );
+            let result = (|| {
+                meter.tick(1)?;
+                if !valid_id(point) { return Err(invalid("invalid observation point")); }
+                scenario.validate_replay_input(program).map_err(app_adapter_error)?;
+                if scenario.single_observe_point().is_none() {
+                    return Err(invalid("invalid observation input"));
+                }
+                let result = view::observe_decoded_with_meter(
+                    program, &start_data, &start_session, scenario.clock_day(), point, &mut meter,
+                )?;
+                meter.tick(1)?;
+                Ok(result)
+            })();
+            *allocations = meter.allocations;
+            match result {
+                Ok(value) => observation = Some(value),
+                Err(error @ AdapterError::Allocation(_)) => return Err(error),
+                Err(error) => step_error = Some(error),
+            }
+        }
+
+        let (outcome, diagnostic_text, state) = match (&observation, &step_error) {
+            (Some(_), None) => (StepOutcome::Applied, None, EvidenceState::Observed),
+            (None, Some(error)) => {
+                let text = diagnostic_decoded(error, allocations)?;
+                let outcome = match error {
+                    AdapterError::Invalid(_) => StepOutcome::Rejected,
+                    AdapterError::BudgetExhausted(_) => StepOutcome::BudgetExhausted,
+                    _ => StepOutcome::Failed,
+                };
+                let state = if matches!(error, AdapterError::Cancelled | AdapterError::BudgetExhausted(_)) {
+                    EvidenceState::Inconclusive
+                } else {
+                    EvidenceState::Failed
+                };
+                (outcome, Some(text), state)
+            }
+            _ => return Err(failed("decoded Observe replay state invariant")),
+        };
+        let after_data = if had_early_apply_error { None } else {
+            Some(start_data.identity_with(allocations).map_err(app_adapter_error)?)
+        };
+        let after_session = if had_early_apply_error { None } else {
+            Some(start_session.identity_with(allocations).map_err(codec_adapter_error)?)
+        };
+        let after_data = after_data.as_ref().unwrap_or(before_data);
+        let after_session = after_session.as_ref().unwrap_or(before_session);
+        let output_digests: [Digest; 0] = [];
+        let trace_step = DecodedObserveTrace {
+            index: 0,
+            input: DecodedObserveInput::Observe { point },
+            before_data,
+            after_data,
+            before_session,
+            after_session,
+            outputs: &output_digests,
+            outcome,
+            diagnostic: diagnostic_text.as_deref(),
+        };
+        let trace: &[DecodedObserveTrace<'_>] = if step_error.is_some() && observation.is_none() && had_early_apply_error {
+            &[]
+        } else {
+            std::slice::from_ref(&trace_step)
+        };
+        let observations: &[view::DecodedRuntimeObservation] = match observation.as_ref() {
+            Some(value) => std::slice::from_ref(value),
+            None => &[],
+        };
+        let errors: &[String] = match diagnostic_text.as_ref() {
+            Some(value) => std::slice::from_ref(value),
+            None => &[],
+        };
+        let wire = DecodedRunEvidenceWire {
+            version: CONTRACT_VERSION,
+            id,
+            origin: ExecutionOrigin::ProductionRuntime,
+            binding: DecodedRunBindingWire {
+                source: program.binding(),
+                artifact: program.artifact(),
+                data_digest: &data_digest,
+                input_digest: &input_digest,
+                scenario_digest: &scenario_digest,
+                decision_digest: &decision_digest,
+                session_digest: &session_digest,
+                runtime_version: RUNTIME_VERSION,
+                driver_version: DRIVER_VERSION,
+            },
+            source_after: program.binding(),
+            state,
+            trace,
+            observations,
+            limits: &limits,
+            errors,
+            uncovered: &[],
+        };
+        let value = crate::product_backup::fallible_codec::try_serialize_value(&wire, allocations)
+            .map_err(codec_adapter_error)?;
+        let evidence = decode_run_evidence_runtime(value, allocations).map_err(app_adapter_error)?;
+        evidence.validate_single_observe(allocations).map_err(|error| match error {
+            RuntimeEvidenceError::Contract(error) => AdapterError::Invalid(error),
+            RuntimeEvidenceError::Allocation(failure) => AdapterError::Allocation(failure),
+        })?;
+        Ok(evidence)
     }
 }
 impl LocalRuntime {

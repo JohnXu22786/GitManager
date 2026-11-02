@@ -28,6 +28,7 @@ pub(crate) struct DecodedLocalArtifact {
 impl DecodedLocalArtifact {
     pub(crate) fn digest(&self) -> &Digest { &self.digest }
     pub(crate) fn byte_len(&self) -> usize { self.bytes.len() }
+    pub(super) fn row_count(&self) -> usize { self.rows.len() }
 
     pub(crate) fn validate_with(
         &self,

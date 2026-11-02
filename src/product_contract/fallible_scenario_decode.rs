@@ -8,7 +8,7 @@ use crate::product_json::{Number, Value};
 use serde::Serialize;
 
 use super::fallible_decision_decode::decode_accepted_property;
-use super::fallible_persisted_decode::{decode_record_ref, DecodedSessionState};
+use super::fallible_persisted_decode::{decode_record_ref, decode_session_state, DecodedSessionState};
 use super::fallible_snapshot_decode::{decode_data_snapshot, DecodedDataSnapshot};
 use super::fallible_value_decode::{decode_data_value, decode_values, JsonKind, NumericValue, ValueDecodeError};
 use super::{AcceptedProperty, DataValue, FallibleValues, RecordRef, MAX_ITEMS};
@@ -36,6 +36,28 @@ pub(super) struct DecodedScenarioSpec {
     validity: Vec<AcceptedProperty>,
 }
 impl crate::product_backup::fallible_codec::BackupWire for DecodedScenarioSpec {}
+
+#[derive(Serialize)]
+struct ScenarioInputIdentity<'a>(
+    &'a DecodedDataSnapshot,
+    &'a DecodedSessionState,
+    i32,
+    u64,
+    &'a [DecodedSemanticInput],
+);
+impl crate::product_backup::fallible_codec::BackupWire for ScenarioInputIdentity<'_> {}
+
+#[derive(Serialize)]
+struct ScenarioOperationNamespace<'a>(
+    &'static str,
+    &'a str,
+    u64,
+    Vec<&'a super::fallible_persisted_decode::DecodedRecord>,
+    &'a [super::fallible_persisted_decode::DecodedBusinessEvent],
+    i32,
+    u64,
+);
+impl crate::product_backup::fallible_codec::BackupWire for ScenarioOperationNamespace<'_> {}
 
 #[derive(Serialize)]
 struct ScopeReplayNamespace<'a>(
@@ -70,6 +92,146 @@ impl DecodedScenarioSpec {
     pub(super) fn seed(&self) -> &DecodedDataSnapshot { &self.seed }
     pub(super) fn clock_day(&self) -> i32 { self.clock_day }
     pub(super) fn random_seed(&self) -> u64 { self.random_seed }
+    pub(super) fn input_count(&self) -> usize { self.inputs.len() }
+    pub(super) fn has_validity(&self) -> bool { !self.validity.is_empty() }
+    pub(super) fn single_observe_point(&self) -> Option<&str> {
+        match self.inputs.as_slice() {
+            [DecodedSemanticInput::Observe { point }] => Some(point),
+            _ => None,
+        }
+    }
+
+    pub(super) fn validate_replay_input(
+        &self,
+        app: &super::fallible_app_decode::DecodedAppDefinition,
+    ) -> Result<(), super::AppValidationError> {
+        let input = self.inputs.first().ok_or_else(|| super::AppValidationError::Contract(
+            super::ContractError("scenario input missing".into()),
+        ))?;
+        validate_input(input, app)
+    }
+
+    pub(super) fn validate_seed_with(
+        &self,
+        cx: &mut AllocationContext,
+    ) -> Result<(), super::AppValidationError> {
+        self.seed.validate_with(cx).map_err(|error| match error {
+            super::fallible_snapshot_validate::SnapshotValidationError::Allocation(failure) => super::AppValidationError::Allocation(failure),
+            super::fallible_snapshot_validate::SnapshotValidationError::Contract(error) => super::AppValidationError::Contract(error),
+        })
+    }
+
+    pub(super) fn validate_session_with(
+        &self,
+        app: &super::fallible_app_decode::DecodedAppDefinition,
+    ) -> Result<(), super::AppValidationError> {
+        app.validate_session_with(&self.session).map_err(super::AppValidationError::Contract)
+    }
+
+    pub(super) fn session_with(
+        &self,
+        cx: &mut AllocationContext,
+    ) -> Result<DecodedSessionState, super::AppValidationError> {
+        let value = crate::product_backup::fallible_codec::try_serialize_value(&self.session, cx)
+            .map_err(|error| match error {
+                crate::product_backup::fallible_codec::CodecError::Allocation(failure) => super::AppValidationError::Allocation(failure),
+                _ => super::AppValidationError::Contract(super::ContractError("scenario session copy invariant".into())),
+            })?;
+        decode_session_state(value, cx).map_err(|error| match error {
+            ValueDecodeError::Allocation(failure) => super::AppValidationError::Allocation(failure),
+            _ => super::AppValidationError::Contract(super::ContractError("scenario session copy invariant".into())),
+        })
+    }
+
+    pub(super) fn input_identity_with(
+        &self,
+        cx: &mut AllocationContext,
+    ) -> Result<super::Digest, crate::product_backup::fallible_codec::CodecError> {
+        crate::product_backup::fallible_codec::canonical_digest(
+            super::IdentityDomain::Input,
+            &ScenarioInputIdentity(&self.seed, &self.session, self.clock_day, self.random_seed, &self.inputs),
+            cx,
+        )
+    }
+
+    pub(super) fn seed_identity_with(
+        &self,
+        cx: &mut AllocationContext,
+    ) -> Result<super::Digest, crate::product_backup::fallible_codec::CodecError> {
+        self.seed.validate_with(cx).map_err(|error| match error {
+            super::fallible_snapshot_validate::SnapshotValidationError::Allocation(failure) => crate::product_backup::fallible_codec::CodecError::Allocation(failure),
+            _ => crate::product_backup::fallible_codec::CodecError::SerializationInvariant,
+        })?;
+        crate::product_backup::fallible_codec::canonical_digest(super::IdentityDomain::Data, &self.seed, cx)
+    }
+
+    pub(super) fn session_identity_with(
+        &self,
+        cx: &mut AllocationContext,
+    ) -> Result<super::Digest, crate::product_backup::fallible_codec::CodecError> {
+        crate::product_backup::fallible_codec::canonical_digest(super::IdentityDomain::Session, &self.session, cx)
+    }
+
+    pub(super) fn observe_operation_id_with(
+        &self,
+        cx: &mut AllocationContext,
+    ) -> Result<String, super::AppValidationError> {
+        use super::AppValidationError;
+        bounded(self.inputs.len(), "scenario input count")
+            .map_err(|error| match error {
+                ValueDecodeError::Allocation(failure) => AppValidationError::Allocation(failure),
+                _ => AppValidationError::Contract(super::ContractError("scenario input count exceeds limit".into())),
+            })?;
+        self.seed.validate_with(cx).map_err(|error| match error {
+            super::fallible_snapshot_validate::SnapshotValidationError::Allocation(failure) => AppValidationError::Allocation(failure),
+            super::fallible_snapshot_validate::SnapshotValidationError::Contract(error) => AppValidationError::Contract(error),
+        })?;
+        super::validate_day(self.clock_day).map_err(AppValidationError::Contract)?;
+
+        // Match ScenarioSpec::operation_namespace's lexical record ordering;
+        // row identity uniqueness means an unstable in-place sort has the same
+        // exact serialized order without allocating sort scratch storage.
+        let mut records = Vec::new();
+        product_alloc::try_reserve(&mut records, self.seed.records().len(), cx, AllocationSite::Vector)
+            .map_err(AppValidationError::Allocation)?;
+        for record in self.seed.records() {
+            product_alloc::try_push(&mut records, record, cx, AllocationSite::Vector)
+                .map_err(AppValidationError::Allocation)?;
+        }
+        records.sort_unstable_by(|left, right| {
+            (left.entity(), left.id()).cmp(&(right.entity(), right.id()))
+        });
+        let namespace = crate::product_backup::fallible_codec::canonical_digest(
+            super::IdentityDomain::Input,
+            &ScenarioOperationNamespace(
+                "semantic-replay/2",
+                self.seed.project_id.as_str(),
+                self.seed.generation,
+                records,
+                self.seed.events(),
+                self.clock_day,
+                self.random_seed,
+            ),
+            cx,
+        ).map_err(|error| match error {
+            crate::product_backup::fallible_codec::CodecError::Allocation(failure) => AppValidationError::Allocation(failure),
+            _ => AppValidationError::Contract(super::ContractError("scenario operation namespace failed".into())),
+        })?;
+        let mut id = String::new();
+        product_alloc::try_append_fmt(
+            &mut id,
+            format_args!("replay-step-{}-0", namespace.as_str()),
+            cx,
+            AllocationSite::String,
+        ).map_err(|error| match error {
+            product_alloc::FormatFailure::Allocation(failure) => AppValidationError::Allocation(failure),
+            product_alloc::FormatFailure::Formatter => AppValidationError::Contract(
+                super::ContractError("scenario operation ID formatting failed".into()),
+            ),
+        })?;
+        super::check_id(&id).map_err(AppValidationError::Contract)?;
+        Ok(id)
+    }
     pub(super) fn matches_frame(&self, scenario: &Self) -> bool {
         self.version == scenario.version
             && self.id == scenario.id
