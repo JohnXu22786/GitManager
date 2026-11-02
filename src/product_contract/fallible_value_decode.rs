@@ -44,6 +44,7 @@ pub(crate) enum ValueDecodeError {
     LimitExceeded { resource: &'static str, limit: usize },
     MissingField(&'static str),
     UnknownField { key: String, expected: &'static [&'static str] },
+    InvalidIdentifier { actual: String, expected: &'static [&'static str] },
     UnknownVariant { tag: String, expected: &'static [&'static str] },
     InvalidLength { actual: usize, expected: usize },
     InvalidFormat(&'static str),

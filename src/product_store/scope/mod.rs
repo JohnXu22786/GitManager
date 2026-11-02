@@ -7,6 +7,8 @@ mod fallible_owned_basis_layer_decode;
 mod fallible_owned_composition_decode;
 #[allow(dead_code)]
 mod fallible_owned_history_decode;
+#[allow(dead_code)]
+mod fallible_scope_envelope_decode;
 mod owned_wire;
 pub use owned_wire::*;
 mod owned_choice;
