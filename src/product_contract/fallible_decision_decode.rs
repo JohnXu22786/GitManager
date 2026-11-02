@@ -125,6 +125,10 @@ pub(super) struct DecodedUnknownBoundary {
 }
 
 pub(super) struct FallibleStringSet(crate::product_alloc::ordered::OrderedSet<String>);
+impl FallibleStringSet {
+    pub(super) fn is_empty(&self) -> bool { self.0.is_empty() }
+    pub(super) fn iter(&self) -> impl Iterator<Item = &String> { self.0.iter() }
+}
 
 impl std::fmt::Debug for FallibleStringSet {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1059,6 +1063,111 @@ mod tests {
         let mut cx = AllocationContext::new();
         let decoded = decode_decision_graph(syntax(&source), &mut cx).unwrap();
         assert_eq!(super::super::canonical_bytes(&expected).unwrap(), super::super::canonical_bytes(&decoded).unwrap());
+    }
+
+    fn supersession_source() -> String {
+        format!(r#"{{"version":1,"revision":5,"decisions":[
+          {{"id":"d0","revision":1,"request":"Prior","scope":{{"operations":["edit"],"population":{{"kind":"records","records":[{{"entity":"person","record":"included"}}]}},"conditions":{{}},"excluded_records":[{{"entity":"person","record":"ignored"}},{{"entity":"person","record":"other"}}],"unknowns":[]}},"outcome":{{"kind":"keep_current"}},"status":{{"kind":"superseded","by":"d1"}},"obligations":[],"scenarios":["{D}"],"witness":"{D}","supersedes":[]}},
+          {{"id":"d1","revision":2,"request":"Current","scope":{{"operations":["edit"],"population":{{"kind":"all"}},"conditions":{{}},"excluded_records":[],"unknowns":[]}},"outcome":{{"kind":"keep_current"}},"status":{{"kind":"active"}},"obligations":[],"scenarios":["{D}"],"witness":"{D}","supersedes":["d0"]}}
+        ]}}"#)
+    }
+
+    #[test]
+    fn fallible_graph_validation_and_identity_match_legacy_semantics() {
+        let source = supersession_source();
+        let expected: super::super::DecisionGraph = typed(&source);
+        expected.validate().unwrap();
+        let expected_identity = expected.identity().unwrap();
+        let mut decode_cx = AllocationContext::new();
+        let decoded = super::super::decode_decision_graph_fallible(syntax(&source), &mut decode_cx).unwrap();
+        let mut validate_cx = AllocationContext::new();
+        decoded.validate_with(&mut validate_cx).unwrap();
+        let mut identity_cx = AllocationContext::new();
+        assert_eq!(decoded.identity_with(&mut identity_cx).unwrap(), expected_identity);
+        let identity_growths = identity_cx.growth_requests();
+        for nth in 1..=identity_growths {
+            let mut cx = AllocationContext::fail_nth_growth(NonZeroUsize::new(nth).unwrap(), true);
+            let error = decoded.identity_with(&mut cx).unwrap_err();
+            let super::super::DecisionValidationError::Allocation(failure) = error else { panic!("expected identity allocation refusal") };
+            assert_eq!(Some(failure), cx.first_failure());
+            let mut retry = AllocationContext::new();
+            assert_eq!(decoded.identity_with(&mut retry).unwrap(), expected_identity);
+        }
+
+        let mut invalids = Vec::new();
+        let mut graph: serde_json::Value = serde_json::from_str(&source).unwrap();
+        graph["version"] = serde_json::json!(2);
+        graph["decisions"][0]["id"] = serde_json::json!("INVALID ID");
+        invalids.push((graph, "unsupported contract version"));
+        let mut graph: serde_json::Value = serde_json::from_str(&source).unwrap();
+        graph["decisions"][0]["status"] = serde_json::json!({"kind":"active"});
+        invalids.push((graph, "supersession graph is not reciprocal"));
+        let mut graph: serde_json::Value = serde_json::from_str(&source).unwrap();
+        graph["decisions"][0]["status"] = serde_json::json!({"kind":"active"});
+        graph["decisions"][1]["supersedes"] = serde_json::json!(["absent"]);
+        invalids.push((graph, "unknown superseded decision"));
+        let mut graph: serde_json::Value = serde_json::from_str(&source).unwrap();
+        graph["decisions"][1]["id"] = serde_json::json!("d0");
+        invalids.push((graph, "duplicate ID: d0"));
+        let mut graph: serde_json::Value = serde_json::from_str(&source).unwrap();
+        graph["decisions"][0]["scope"]["excluded_records"][1] = graph["decisions"][0]["scope"]["excluded_records"][0].clone();
+        invalids.push((graph, "duplicate selected record"));
+        let mut graph: serde_json::Value = serde_json::from_str(&source).unwrap();
+        graph["decisions"][0]["status"] = serde_json::json!({"kind":"superseded","by":"ghost"});
+        invalids.push((graph, "missing superseding decision"));
+        for (value, expected_error) in invalids {
+            let source = serde_json::to_string(&value).unwrap();
+            let legacy: super::super::DecisionGraph = typed(&source);
+            let legacy_error = legacy.validate().unwrap_err();
+            assert_eq!(legacy_error.0, expected_error);
+            let decoded = super::super::decode_decision_graph_fallible(syntax(&source), &mut AllocationContext::new()).unwrap();
+            let error = decoded.validate_with(&mut AllocationContext::new()).unwrap_err();
+            assert!(matches!(error, super::super::DecisionValidationError::Contract(ref error) if error.0 == expected_error));
+        }
+
+        let mut graph: serde_json::Value = serde_json::from_str(&source).unwrap();
+        graph["decisions"][1]["status"] = serde_json::json!({"kind":"superseded","by":"d0"});
+        graph["decisions"][0]["status"] = serde_json::json!({"kind":"superseded","by":"d1"});
+        graph["decisions"][1]["supersedes"] = serde_json::json!(["d0"]);
+        graph["decisions"][0]["supersedes"] = serde_json::json!(["d1"]);
+        let cycle_source = serde_json::to_string(&graph).unwrap();
+        let legacy: super::super::DecisionGraph = typed(&cycle_source);
+        assert_eq!(legacy.validate().unwrap_err().0, "cyclic decision supersession");
+        let decoded = super::super::decode_decision_graph_fallible(syntax(&cycle_source), &mut AllocationContext::new()).unwrap();
+        assert!(matches!(decoded.validate_with(&mut AllocationContext::new()), Err(super::super::DecisionValidationError::Contract(ref error)) if error.0 == "cyclic decision supersession"));
+    }
+
+    #[test]
+    fn decision_index_and_supersession_set_refusal_is_preserved_and_retryable() {
+        let source = supersession_source();
+        let decoded = super::super::decode_decision_graph_fallible(syntax(&source), &mut AllocationContext::new()).unwrap();
+        let mut baseline = AllocationContext::new();
+        decoded.validate_with(&mut baseline).unwrap();
+        let growths = baseline.growth_requests();
+        assert!(growths >= 3, "index and traversal set allocations are both charged");
+        for nth in 1..=growths {
+            let mut cx = AllocationContext::fail_nth_growth(NonZeroUsize::new(nth).unwrap(), true);
+            let error = decoded.validate_with(&mut cx).unwrap_err();
+            let super::super::DecisionValidationError::Allocation(failure) = error else { panic!("expected allocation refusal") };
+            assert_eq!(Some(failure), cx.first_failure());
+            let mut retry = AllocationContext::new();
+            decoded.validate_with(&mut retry).unwrap();
+        }
+    }
+
+    #[test]
+    fn fallible_record_reference_uniqueness_charges_and_retries() {
+        let refs = [
+            RecordRef { entity: "person".into(), record: "one".into() },
+            RecordRef { entity: "person".into(), record: "two".into() },
+        ];
+        let mut cx = AllocationContext::fail_nth_growth(NonZeroUsize::new(1).unwrap(), true);
+        let error = super::super::validate_record_refs_with(&refs, &mut cx).unwrap_err();
+        let super::super::DecisionValidationError::Allocation(failure) = error else { panic!("expected record reference allocation refusal") };
+        assert_eq!(failure.site, AllocationSite::OrderedSet);
+        assert_eq!(Some(failure), cx.first_failure());
+        let mut retry = AllocationContext::new();
+        super::super::validate_record_refs_with(&refs, &mut retry).unwrap();
     }
 
     fn struct_sequence(value: &mut serde_json::Value, fields: &[&str]) {

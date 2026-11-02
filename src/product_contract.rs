@@ -226,6 +226,41 @@ pub(crate) struct FallibleDecodedScenarioSpec(fallible_scenario_decode::DecodedS
 pub(crate) struct FallibleDecodedRunEvidence(fallible_run_evidence_decode::DecodedRunEvidence);
 #[derive(Debug, Serialize)]
 pub(crate) struct FallibleDecodedDecisionGraph(fallible_decision_decode::DecodedDecisionGraph);
+impl FallibleDecodedDecisionGraph {
+    pub(crate) fn validate_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), DecisionValidationError> {
+        validate_decision_graph_with(self.0.version, &self.0.decisions, cx)
+    }
+
+    pub(crate) fn identity_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Digest, DecisionValidationError> {
+        self.validate_with(cx)?;
+        crate::product_backup::fallible_codec::canonical_digest(
+            IdentityDomain::Decision,
+            self,
+            cx,
+        )
+        .map_err(|error| match error {
+            crate::product_backup::fallible_codec::CodecError::Allocation(failure) => {
+                DecisionValidationError::Allocation(failure)
+            }
+            _ => DecisionValidationError::Contract(ContractError("decision canonical encoding failed".into())),
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DecisionValidationError {
+    Contract(ContractError),
+    Allocation(crate::product_alloc::AllocationFailure),
+}
+impl From<ContractError> for DecisionValidationError {
+    fn from(value: ContractError) -> Self { Self::Contract(value) }
+}
 #[derive(Debug, Serialize)]
 pub(crate) struct FallibleDecodedLocalArtifact(fallible_local_artifact_decode::DecodedLocalArtifact);
 #[derive(Debug, Serialize)]
@@ -3912,43 +3947,202 @@ pub struct DecisionGraph {
 }
 impl DecisionGraph {
     pub fn validate(&self) -> Result<()> {
-        version(self.version)?;
-        unique(self.decisions.iter().map(|d| d.id.as_str()))?;
-        let index: BTreeMap<_, _> = self.decisions.iter().map(|d| (d.id.as_str(), d)).collect();
-        for decision in &self.decisions {
-            decision.validate()?;
-            for prior in &decision.supersedes {
-                let prior = index
-                    .get(prior.as_str())
-                    .ok_or_else(|| ContractError("unknown superseded decision".into()))?;
-                require(
-                    matches!(&prior.status,DecisionStatus::Superseded { by } if by == &decision.id),
-                    "supersession graph is not reciprocal",
-                )?;
-            }
-            let mut seen = BTreeSet::new();
-            let mut current = decision;
-            while let DecisionStatus::Superseded { by } = &current.status {
-                require(
-                    seen.insert(current.id.as_str()),
-                    "cyclic decision supersession",
-                )?;
-                let next = *index
-                    .get(by.as_str())
-                    .ok_or_else(|| ContractError("missing superseding decision".into()))?;
-                require(
-                    next.supersedes.contains(&current.id),
-                    "supersession history is missing",
-                )?;
-                current = next;
-            }
-        }
-        Ok(())
+        let mut cx = crate::product_alloc::AllocationContext::new();
+        self.validate_with(&mut cx).map_err(decision_contract_error)
+    }
+    pub(crate) fn validate_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), DecisionValidationError> {
+        validate_decision_graph_with(self.version, &self.decisions, cx)
     }
     pub fn identity(&self) -> Result<Digest> {
         self.validate()?;
         canonical_digest(IdentityDomain::Decision, self)
     }
+}
+
+trait DecisionGraphNode {
+    fn id(&self) -> &str;
+    fn supersedes(&self) -> &[String];
+    fn superseding_id(&self) -> Option<&str>;
+    fn validate_node(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), DecisionValidationError>;
+}
+
+impl DecisionGraphNode for ScopedDecision {
+    fn id(&self) -> &str { &self.id }
+    fn supersedes(&self) -> &[String] { &self.supersedes }
+    fn superseding_id(&self) -> Option<&str> {
+        match &self.status { DecisionStatus::Superseded { by } => Some(by), _ => None }
+    }
+    fn validate_node(
+        &self,
+        _cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), DecisionValidationError> {
+        self.validate().map_err(DecisionValidationError::Contract)
+    }
+}
+
+impl DecisionGraphNode for fallible_decision_decode::DecodedScopedDecision {
+    fn id(&self) -> &str { &self.id }
+    fn supersedes(&self) -> &[String] { &self.supersedes }
+    fn superseding_id(&self) -> Option<&str> {
+        match &self.status { DecisionStatus::Superseded { by } => Some(by), _ => None }
+    }
+    fn validate_node(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), DecisionValidationError> {
+        validate_decoded_decision(self, cx)
+    }
+}
+
+fn decision_contract_error(error: DecisionValidationError) -> ContractError {
+    match error {
+        DecisionValidationError::Contract(error) => error,
+        DecisionValidationError::Allocation(_) => ContractError("decision validation allocation failed".into()),
+    }
+}
+
+fn validate_decision_graph_with<D: DecisionGraphNode>(
+    graph_version: u32,
+    decisions: &[D],
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<(), DecisionValidationError> {
+    version(graph_version)?;
+    let mut index = crate::product_alloc::ordered::OrderedMap::<&str, usize>::new();
+    for (position, decision) in decisions.iter().enumerate() {
+        check_id(decision.id())?;
+        if index.try_insert(decision.id(), position, cx)
+            .map_err(DecisionValidationError::Allocation)?.is_some()
+        {
+            return Err(ContractError(format!("duplicate ID: {}", decision.id())).into());
+        }
+    }
+    bounded(index.len())?;
+
+    for decision in decisions {
+        decision.validate_node(cx)?;
+        for prior_id in decision.supersedes() {
+            let prior_position = *index.get(prior_id.as_str())
+                .ok_or_else(|| ContractError("unknown superseded decision".into()))?;
+            let prior = &decisions[prior_position];
+            require(
+                matches!(prior.superseding_id(), Some(by) if by == decision.id()),
+                "supersession graph is not reciprocal",
+            )?;
+        }
+        let mut seen = crate::product_alloc::ordered::OrderedSet::<&str>::new();
+        let mut current = decision;
+        while let Some(by) = current.superseding_id() {
+            require(
+                seen.try_insert(current.id(), cx).map_err(DecisionValidationError::Allocation)?,
+                "cyclic decision supersession",
+            )?;
+            let next_position = *index.get(by)
+                .ok_or_else(|| ContractError("missing superseding decision".into()))?;
+            let next = &decisions[next_position];
+            require(
+                next.supersedes().iter().any(|id| id == current.id()),
+                "supersession history is missing",
+            )?;
+            current = next;
+        }
+    }
+    Ok(())
+}
+
+fn unique_with<'a>(
+    ids: impl IntoIterator<Item = &'a str>,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<(), DecisionValidationError> {
+    let mut seen = crate::product_alloc::ordered::OrderedSet::new();
+    for id in ids {
+        check_id(id)?;
+        if !seen.try_insert(id, cx).map_err(DecisionValidationError::Allocation)? {
+            return Err(ContractError(format!("duplicate ID: {id}")).into());
+        }
+    }
+    bounded(seen.len())?;
+    Ok(())
+}
+
+fn validate_decoded_decision(
+    decision: &fallible_decision_decode::DecodedScopedDecision,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<(), DecisionValidationError> {
+    check_id(&decision.id)?;
+    require(decision.revision > 0, "decision revision must be positive")?;
+    nonempty(&decision.request)?;
+    if let Some(rationale) = &decision.rationale { text(rationale)?; }
+
+    let scope = &decision.scope;
+    require(!scope.operations.is_empty(), "decision scope needs explicit operations")?;
+    unique_with(scope.operations.iter().map(String::as_str), cx)?;
+    bounded(scope.conditions.len())?;
+    for (id, value) in scope.conditions.iter() {
+        check_id(id)?;
+        validate_untyped_value(value, 0)?;
+    }
+    validate_record_refs_with(&scope.excluded_records, cx)?;
+    match &scope.population {
+        Population::Entity { entity } => check_id(entity)?,
+        Population::Where { entity, predicate } => {
+            check_id(entity)?;
+            check_expr_shape(predicate, 0, &mut 0)?;
+        }
+        Population::Records { records } => {
+            require(!records.is_empty(), "empty record scope")?;
+            validate_record_refs_with(records, cx)?;
+        }
+        Population::All | Population::NewWork | Population::CreatedAfter { .. } => {}
+    }
+    unique_with(scope.unknowns.iter().map(|unknown| unknown.id.as_str()), cx)?;
+    for unknown in &scope.unknowns {
+        nonempty(&unknown.description)?;
+        unique_with(unknown.operations.iter().map(String::as_str), cx)?;
+        require(!unknown.operations.is_empty(), "unknown boundary needs affected operations")?;
+    }
+
+    unique_with(decision.obligations.iter().map(|property| property.id.as_str()), cx)?;
+    for property in &decision.obligations { property.validate()?; }
+    bounded(decision.scenarios.len())?;
+    require(!decision.scenarios.is_empty(), "decision lacks accepted scenario")?;
+    unique_with(decision.supersedes.iter().map(String::as_str), cx)?;
+    require(!decision.supersedes.contains(&decision.id), "decision supersedes itself")?;
+    match &decision.status {
+        DecisionStatus::Superseded { by } => {
+            check_id(by)?;
+            require(by != &decision.id, "decision retires itself")?;
+        }
+        DecisionStatus::Withdrawn { adoption } => check_id(adoption)?,
+        DecisionStatus::Active | DecisionStatus::Pending => {}
+    }
+    if matches!(decision.outcome, DecisionOutcome::BothNeeded | DecisionOutcome::NeitherFits | DecisionOutcome::Deferred) {
+        require(!matches!(decision.status, DecisionStatus::Active), "unresolved decision cannot activate behavior")?;
+    }
+    Ok(())
+}
+
+fn validate_record_refs_with(
+    records: &[RecordRef],
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<(), DecisionValidationError> {
+    require(records.len() <= MAX_COLLECTION, "record selection exceeds limit")?;
+    let mut seen = crate::product_alloc::ordered::OrderedSet::new();
+    for record in records {
+        check_id(&record.entity)?;
+        check_id(&record.record)?;
+        if !seen.try_insert((record.entity.as_str(), record.record.as_str()), cx)
+            .map_err(DecisionValidationError::Allocation)?
+        {
+            return Err(ContractError("duplicate selected record".into()).into());
+        }
+    }
+    Ok(())
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

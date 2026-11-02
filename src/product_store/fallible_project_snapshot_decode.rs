@@ -64,6 +64,20 @@ impl DecodedProjectSnapshot {
         crate::product_backup::fallible_codec::canonical_digest(domain, self, cx)
     }
 
+    pub(crate) fn validate_decisions_with(
+        &self,
+        cx: &mut AllocationContext,
+    ) -> Result<(), crate::product_contract::DecisionValidationError> {
+        self.decisions.validate_with(cx)
+    }
+
+    pub(crate) fn decision_identity_with(
+        &self,
+        cx: &mut AllocationContext,
+    ) -> Result<Digest, crate::product_contract::DecisionValidationError> {
+        self.decisions.identity_with(cx)
+    }
+
     pub(crate) fn try_clone_with(
         &self,
         cx: &mut AllocationContext,
@@ -451,6 +465,26 @@ mod tests {
         let expected: ProjectSnapshot = serde_json::from_value(unit_map.clone()).unwrap();
         let actual = decoded(&unit_map);
         assert_eq!(canonical_bytes(&expected).unwrap(), canonical_bytes(&actual).unwrap());
+    }
+
+    #[test]
+    fn project_snapshot_decision_wrappers_use_fallible_validation_and_identity() {
+        let mut input = fixture();
+        input["decisions"] = serde_json::json!({
+            "version":1,"revision":5,"decisions":[{
+                "id":"decision","revision":1,"request":"Keep this behavior",
+                "scope":{"operations":["edit"],"population":{"kind":"all"},"conditions":{},"excluded_records":[],"unknowns":[]},
+                "outcome":{"kind":"keep_current"},"status":{"kind":"active"},
+                "obligations":[],"scenarios":[D0],"witness":D1,"supersedes":[]
+            }]
+        });
+        let expected: ProjectSnapshot = serde_json::from_value(input.clone()).unwrap();
+        let decoded = decoded(&input);
+        let mut cx = AllocationContext::new();
+        decoded.validate_decisions_with(&mut cx).unwrap();
+        let mut cx = AllocationContext::new();
+        let actual_identity = decoded.decision_identity_with(&mut cx).unwrap();
+        assert_eq!(actual_identity, expected.decisions.identity().unwrap());
     }
 
     #[test]

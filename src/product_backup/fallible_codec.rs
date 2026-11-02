@@ -74,6 +74,7 @@ pub(crate) trait BackupWire: Serialize {}
 impl BackupWire for super::Payload {}
 impl BackupWire for super::Envelope {}
 impl BackupWire for crate::product_contract::FallibleDecodedDataSnapshot {}
+impl BackupWire for crate::product_contract::FallibleDecodedDecisionGraph {}
 impl BackupWire for crate::product_store::fallible_project_snapshot_decode::DecodedProjectSnapshot {}
 impl BackupWire for crate::product_contract::fallible_app_decode::DecodedAppDefinition {}
 
