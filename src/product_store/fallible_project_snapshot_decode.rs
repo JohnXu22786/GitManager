@@ -257,6 +257,8 @@ impl DecodedProjectSnapshot {
         &self.data
     }
 
+    pub(crate) fn programs(&self) -> &[FallibleDecodedCapturedProgram] { &self.programs }
+
     pub(crate) fn scalar_scope(&self) -> Option<&crate::product_store::scope::FallibleDecodedScopeState> {
         use crate::product_store::scope::FallibleDecodedScopeEnvelope;
         match &self.scope {
@@ -306,6 +308,20 @@ impl DecodedProjectSnapshot {
 
     pub(crate) fn revision(&self) -> u64 {
         self.revision
+    }
+
+    pub(crate) fn has_adoption_expected_data_for(
+        &self,
+        digest: &crate::product_contract::Digest,
+        active: &crate::product_contract::Digest,
+    ) -> bool {
+        self.adoptions.iter().any(|receipt| {
+            receipt.active == *active && receipt.plan.expected_data() == digest
+        })
+    }
+
+    pub(crate) fn has_adoption_expected_data(&self, digest: &crate::product_contract::Digest) -> bool {
+        self.adoptions.iter().any(|receipt| receipt.plan.expected_data() == digest)
     }
 }
 

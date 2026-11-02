@@ -533,72 +533,103 @@ impl LocalRuntime {
         expected: &Type,
         day: i32,
         limits: RuntimeLimits,
-        mut allocations: product_alloc::AllocationContext,
+        allocations: product_alloc::AllocationContext,
     ) -> Result<DataValue> {
+        self.evaluate_decoded_historical_record_projection_and_allocations(
+            program, data, row, values, archived, binding, expression, expected, day, limits,
+            allocations,
+        ).map(|(value, _)| value).map_err(|(error, _)| error)
+    }
+    pub(crate) fn evaluate_decoded_historical_record_projection_and_allocations(
+        &self,
+        program: &FallibleDecodedCapturedProgram,
+        data: &FallibleDecodedDataSnapshot,
+        row: &RecordRef,
+        values: &FallibleValues,
+        archived: bool,
+        binding: &str,
+        expression: &Expr,
+        expected: &Type,
+        day: i32,
+        limits: RuntimeLimits,
+        mut allocations: product_alloc::AllocationContext,
+    ) -> std::result::Result<(DataValue, product_alloc::AllocationContext), (AdapterError, product_alloc::AllocationContext)> {
         fn app_error(error: AppValidationError) -> AdapterError {
             match error {
                 AppValidationError::Contract(error) => AdapterError::Invalid(error),
                 AppValidationError::Allocation(failure) => AdapterError::Allocation(failure),
             }
         }
-        validate_day(day)?;
-        limits.validate()?;
-        program.validate_with(&mut allocations).map_err(app_error)?;
-        data.validate_with(&mut allocations).map_err(app_error)?;
-        if values.len() > MAX_ITEMS { return Err(invalid("historical projection row exceeds bounds")); }
-        let base = DataSnapshotView::from(data);
-        let storage = base.schema().iter().find(|entity| entity.id == row.entity)
-            .ok_or_else(|| invalid("historical projection storage entity missing"))?;
-        for (id, value) in values.iter() {
-            let field = storage.fields.iter().find(|field| field.id == *id)
-                .ok_or_else(|| invalid("historical projection field missing"))?;
-            validate_value(value, &field.value_type, 0)?;
-        }
-        let producer = AppRef::from(program.app()).entities().iter().find(|entity| entity.id == row.entity)
-            .ok_or_else(|| invalid("historical producer entity missing"))?;
-        for field in &producer.fields {
-            validate_value(values.get(&field.id).unwrap_or(&DataValue::Null), &field.value_type, 0)?;
-        }
-        let mut meter = Meter::with_allocations(limits.clone(), limits.fuel, self.cancelled.clone(), allocations);
-        let mut historical_record = None;
-        for candidate in base.records() {
-            let comparison_bytes = candidate.entity().len()
-                .saturating_add(row.entity.len())
-                .saturating_add(candidate.id().len())
-                .saturating_add(row.record.len());
-            meter.tick(u64::try_from(comparison_bytes).unwrap_or(u64::MAX))?;
-            if candidate.entity() == row.entity && candidate.id() == row.record {
-                historical_record = Some(candidate);
-                break;
+        let preflight = (|| -> std::result::Result<(), AdapterError> {
+            validate_day(day)?;
+            limits.validate()?;
+            program.validate_with(&mut allocations).map_err(app_error)?;
+            data.validate_with(&mut allocations).map_err(app_error)?;
+            if values.len() > MAX_ITEMS { return Err(invalid("historical projection row exceeds bounds")); }
+            let base = DataSnapshotView::from(data);
+            let storage = base.schema().iter().find(|entity| entity.id == row.entity)
+                .ok_or_else(|| invalid("historical projection storage entity missing"))?;
+            for (id, value) in values.iter() {
+                let field = storage.fields.iter().find(|field| field.id == *id)
+                    .ok_or_else(|| invalid("historical projection field missing"))?;
+                validate_value(value, &field.value_type, 0)?;
             }
+            let producer = AppRef::from(program.app()).entities().iter().find(|entity| entity.id == row.entity)
+                .ok_or_else(|| invalid("historical producer entity missing"))?;
+            for field in &producer.fields {
+                validate_value(values.get(&field.id).unwrap_or(&DataValue::Null), &field.value_type, 0)?;
+            }
+            if program.project_id() != data.project_id() || !valid_id(binding) {
+                return Err(invalid("projection project or binding mismatch"));
+            }
+            Ok(())
+        })();
+        if let Err(error) = preflight { return Err((error, allocations)); }
+        let base = DataSnapshotView::from(data);
+        let mut meter = Meter::with_allocations(limits.clone(), limits.fuel, self.cancelled.clone(), allocations);
+        let result = (|| -> Result<DataValue> {
+            let mut historical_record = None;
+            for candidate in base.records() {
+                let comparison_bytes = candidate.entity().len()
+                    .saturating_add(row.entity.len())
+                    .saturating_add(candidate.id().len())
+                    .saturating_add(row.record.len());
+                meter.tick(u64::try_from(comparison_bytes).unwrap_or(u64::MAX))?;
+                if candidate.entity() == row.entity && candidate.id() == row.record {
+                    historical_record = Some(candidate);
+                    break;
+                }
+            }
+            let historical_record = historical_record
+                .ok_or_else(|| invalid("historical projection record missing"))?;
+            let actual = crate::product_contract::decoded_expression_type_with(
+                program.app(), expression, binding, &row.entity, &mut meter.allocations,
+            ).map_err(app_error)?;
+            if actual != *expected { return Err(invalid("projection result type mismatch")); }
+            let session = program.initial_session_with(&mut meter.allocations).map_err(AdapterError::Allocation)?;
+            program.validate_session_with(&session, &mut meter.allocations).map_err(app_error)?;
+            let value = DataValue::Reference {
+                entity: product_alloc::try_copy_str(&row.entity, &mut meter.allocations, product_alloc::AllocationSite::String).map_err(AdapterError::Allocation)?,
+                record: product_alloc::try_copy_str(&row.record, &mut meter.allocations, product_alloc::AllocationSite::String).map_err(AdapterError::Allocation)?,
+            };
+            let env_entity = product_alloc::try_copy_str(&row.entity, &mut meter.allocations, product_alloc::AllocationSite::String)
+                .map_err(AdapterError::Allocation)?;
+            let typ = Type::Reference { entity: env_entity };
+            let env_binding = product_alloc::try_copy_str(binding, &mut meter.allocations, product_alloc::AllocationSite::String)
+                .map_err(AdapterError::Allocation)?;
+            let mut managed = ManagedEnv::new();
+            managed.try_bind(&env_binding, &typ, &value, &mut meter.allocations).map_err(AdapterError::Allocation)?;
+            let data_view = DataSnapshotView::fallible_historical(data, historical_record, values, archived);
+            let mut evaluator = Eval::fallible_view(program.app(), data_view, &session, day, &mut meter);
+            let result = evaluator.eval(expression, &managed)?;
+            validate_value(&result, expected, 0)?;
+            Ok(result)
+        })();
+        let allocations = meter.into_allocations();
+        match result {
+            Ok(value) => Ok((value, allocations)),
+            Err(error) => Err((error, allocations)),
         }
-        let historical_record = historical_record
-            .ok_or_else(|| invalid("historical projection record missing"))?;
-        if program.project_id() != data.project_id() || !valid_id(binding) {
-            return Err(invalid("projection project or binding mismatch"));
-        }
-        let actual = crate::product_contract::decoded_expression_type_with(
-            program.app(), expression, binding, &row.entity, &mut meter.allocations,
-        ).map_err(app_error)?;
-        if actual != *expected { return Err(invalid("projection result type mismatch")); }
-        let session = program.initial_session_with(&mut meter.allocations).map_err(AdapterError::Allocation)?;
-        program.validate_session_with(&session, &mut meter.allocations).map_err(app_error)?;
-        let value = DataValue::Reference {
-            entity: product_alloc::try_copy_str(&row.entity, &mut meter.allocations, product_alloc::AllocationSite::String).map_err(AdapterError::Allocation)?,
-            record: product_alloc::try_copy_str(&row.record, &mut meter.allocations, product_alloc::AllocationSite::String).map_err(AdapterError::Allocation)?,
-        };
-        let env_entity = product_alloc::try_copy_str(&row.entity, &mut meter.allocations, product_alloc::AllocationSite::String)
-            .map_err(AdapterError::Allocation)?;
-        let typ = Type::Reference { entity: env_entity };
-        let env_binding = product_alloc::try_copy_str(binding, &mut meter.allocations, product_alloc::AllocationSite::String)
-            .map_err(AdapterError::Allocation)?;
-        let mut managed = ManagedEnv::new();
-        managed.try_bind(&env_binding, &typ, &value, &mut meter.allocations).map_err(AdapterError::Allocation)?;
-        let data_view = DataSnapshotView::fallible_historical(data, historical_record, values, archived);
-        let mut evaluator = Eval::fallible_view(program.app(), data_view, &session, day, &mut meter);
-        let result = evaluator.eval(expression, &managed)?;
-        validate_value(&result, expected, 0)?;
-        Ok(result)
     }
     /// Evaluate an independently proven own-row historical expression. Validate
     /// the coherent current data and every producer-row value first; global

@@ -17,7 +17,7 @@ const RECORD_REF_FIELDS: &[&str] = &["entity", "record"];
 const SESSION_STATE_FIELDS: &[&str] = &["view", "values", "focused_record"];
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
-pub(super) struct DecodedRecord {
+pub(crate) struct DecodedRecord {
     pub(super) entity: String,
     pub(super) id: String,
     pub(super) revision: u64,
@@ -25,18 +25,33 @@ pub(super) struct DecodedRecord {
     pub(super) archived: bool,
     pub(super) values: FallibleValues,
 }
+impl DecodedRecord {
+    pub(crate) fn entity(&self) -> &str { &self.entity }
+    pub(crate) fn id(&self) -> &str { &self.id }
+    pub(crate) fn revision(&self) -> u64 { self.revision }
+    pub(crate) fn created_program(&self) -> &Digest { &self.created_program }
+    pub(crate) fn archived(&self) -> bool { self.archived }
+    pub(crate) fn values(&self) -> &FallibleValues { &self.values }
+}
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
-pub(super) struct DecodedRecordChange {
+pub(crate) struct DecodedRecordChange {
     pub(super) entity: String,
     pub(super) record: String,
     pub(super) before: Option<FallibleValues>,
     pub(super) after: FallibleValues,
     pub(super) archived: bool,
 }
+impl DecodedRecordChange {
+    pub(crate) fn entity(&self) -> &str { &self.entity }
+    pub(crate) fn record(&self) -> &str { &self.record }
+    pub(crate) fn before(&self) -> Option<&FallibleValues> { self.before.as_ref() }
+    pub(crate) fn after(&self) -> &FallibleValues { &self.after }
+    pub(crate) fn archived(&self) -> bool { self.archived }
+}
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
-pub(super) struct DecodedBusinessEvent {
+pub(crate) struct DecodedBusinessEvent {
     pub(super) id: String,
     pub(super) sequence: u64,
     pub(super) operation_id: String,
@@ -45,6 +60,15 @@ pub(super) struct DecodedBusinessEvent {
     pub(super) program: Digest,
     pub(super) changes: Vec<DecodedRecordChange>,
     pub(super) outputs: Vec<Digest>,
+}
+impl DecodedBusinessEvent {
+    pub(crate) fn id(&self) -> &str { &self.id }
+    pub(crate) fn sequence(&self) -> u64 { self.sequence }
+    pub(crate) fn operation_id(&self) -> &str { &self.operation_id }
+    pub(crate) fn action(&self) -> &str { &self.action }
+    pub(crate) fn day(&self) -> i32 { self.day }
+    pub(crate) fn program(&self) -> &Digest { &self.program }
+    pub(crate) fn changes(&self) -> &[DecodedRecordChange] { &self.changes }
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]

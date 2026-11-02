@@ -35,6 +35,146 @@ pub(super) struct DecodedScenarioSpec {
     inputs: Vec<DecodedSemanticInput>,
     validity: Vec<AcceptedProperty>,
 }
+impl crate::product_backup::fallible_codec::BackupWire for DecodedScenarioSpec {}
+
+#[derive(Serialize)]
+struct ScopeReplayNamespace<'a>(
+    &'static str,
+    &'a super::SourceBinding,
+    &'a super::SourceBinding,
+    super::Digest,
+    &'a DecodedSessionState,
+    &'a [DecodedSemanticInput],
+    &'a [AcceptedProperty],
+);
+impl crate::product_backup::fallible_codec::BackupWire for ScopeReplayNamespace<'_> {}
+
+pub(super) fn scope_replay_namespace(
+    original: &DecodedScenarioSpec,
+    mapped: &DecodedScenarioSpec,
+    source: &super::SourceBinding,
+    target: &super::SourceBinding,
+    cx: &mut AllocationContext,
+) -> Result<super::Digest, crate::product_backup::fallible_codec::CodecError> {
+    let original_identity = crate::product_backup::fallible_codec::canonical_digest(
+        super::IdentityDomain::Scenario, original, cx,
+    )?;
+    crate::product_backup::fallible_codec::canonical_digest(
+        super::IdentityDomain::Scenario,
+        &ScopeReplayNamespace("scope-replay/1", source, target, original_identity, &mapped.session, &mapped.inputs, &mapped.validity),
+        cx,
+    )
+}
+impl DecodedScenarioSpec {
+    pub(super) fn id(&self) -> &str { &self.id }
+    pub(super) fn seed(&self) -> &DecodedDataSnapshot { &self.seed }
+    pub(super) fn clock_day(&self) -> i32 { self.clock_day }
+    pub(super) fn random_seed(&self) -> u64 { self.random_seed }
+    pub(super) fn matches_frame(&self, scenario: &Self) -> bool {
+        self.version == scenario.version
+            && self.id == scenario.id
+            && self.seed == scenario.seed
+            && self.session == scenario.session
+            && self.clock_day == scenario.clock_day
+            && self.random_seed == scenario.random_seed
+            && self.validity == scenario.validity
+    }
+
+    pub(super) fn validate_with(
+        &self,
+        app: &super::fallible_app_decode::DecodedAppDefinition,
+        cx: &mut AllocationContext,
+    ) -> Result<(), super::AppValidationError> {
+        use super::{AppValidationError, ContractError};
+        super::version(self.version).map_err(AppValidationError::Contract)?;
+        super::check_id(&self.id).map_err(AppValidationError::Contract)?;
+        super::nonempty(&self.label).map_err(AppValidationError::Contract)?;
+        self.seed.validate_with(cx).map_err(|error| match error {
+            super::fallible_snapshot_validate::SnapshotValidationError::Allocation(failure) => AppValidationError::Allocation(failure),
+            super::fallible_snapshot_validate::SnapshotValidationError::Contract(error) => AppValidationError::Contract(error),
+        })?;
+        app.validate_session_with(&self.session).map_err(AppValidationError::Contract)?;
+        super::validate_day(self.clock_day).map_err(AppValidationError::Contract)?;
+        bounded(self.inputs.len(), "scenario input count").map_err(|_| AppValidationError::Contract(ContractError("scenario input count exceeds limit".into())))?;
+        bounded(self.validity.len(), "scenario validity property count").map_err(|_| AppValidationError::Contract(ContractError("scenario validity property count exceeds limit".into())))?;
+        let mut points = crate::product_alloc::ordered::OrderedSet::new();
+        for input in &self.inputs {
+            validate_input(input, app)?;
+            if let DecodedSemanticInput::Observe { point } = input {
+                if points.contains(point.as_str()) {
+                    return Err(AppValidationError::Contract(ContractError("duplicate observation point".into())));
+                }
+                let key = product_alloc::try_copy_str(point, cx, AllocationSite::String).map_err(AppValidationError::Allocation)?;
+                points.try_insert(key, cx).map_err(AppValidationError::Allocation)?;
+            }
+        }
+        for property in &self.validity {
+            property.validate().map_err(AppValidationError::Contract)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_input(
+    input: &DecodedSemanticInput,
+    app: &super::fallible_app_decode::DecodedAppDefinition,
+) -> Result<(), super::AppValidationError> {
+    use super::{AppValidationError, ContractError};
+    let contract = |error: ContractError| AppValidationError::Contract(error);
+    let action = |id: &str| app.actions.iter().find(|action| action.id == id)
+        .ok_or_else(|| contract(ContractError("unknown action".into())));
+    let view = |id: &str| app.views.iter().find(|view| view.id == id)
+        .ok_or_else(|| contract(ContractError("unknown input view".into())));
+    let arguments = |action: &super::fallible_app_decode::DecodedActionDefinition, values: &FallibleValues| -> Result<(), AppValidationError> {
+        super::require(values.len() == action.parameters.len(), "input argument count mismatch").map_err(contract)?;
+        for (id, typ) in action.parameters.iter() {
+            let value = values.get(id).ok_or_else(|| contract(ContractError("missing input argument".into())))?;
+            super::validate_value(value, typ, 0).map_err(contract)?;
+        }
+        Ok(())
+    };
+    match input {
+        DecodedSemanticInput::Invoke { action: id, arguments: values } => arguments(action(id)?, values),
+        DecodedSemanticInput::Submit { view: id, arguments: values } => {
+            let view = view(id)?;
+            let super::fallible_app_decode::DecodedViewKind::Form { action: action_id, .. } = &view.kind else {
+                return Err(contract(ContractError("submit requires form view".into())));
+            };
+            arguments(action(action_id)?, values)
+        }
+        DecodedSemanticInput::Control { view: id, control, value } => {
+            let view = view(id)?;
+            let super::fallible_app_decode::DecodedViewKind::List { controls, selection, .. } = &view.kind else {
+                return Err(contract(ContractError("control requires list view".into())));
+            };
+            let state_id = controls.iter().find(|item| item.id == *control).map(|item| item.state.as_str())
+                .or_else(|| selection.as_ref().filter(|item| item.id == *control).map(|item| item.state.as_str()))
+                .ok_or_else(|| contract(ContractError("unknown input control".into())))?;
+            let state = app.state.iter().find(|state| state.id == state_id)
+                .ok_or_else(|| contract(ContractError("unknown state".into())))?;
+            super::validate_value(value, &state.value_type, 0).map_err(contract)
+        }
+        DecodedSemanticInput::Activate { view: id, binding, row } => {
+            let view = view(id)?;
+            let binding = view.actions.iter().find(|item| item.id == *binding)
+                .ok_or_else(|| contract(ContractError("unknown input action binding".into())))?;
+            super::require((binding.placement == super::ActionPlacement::Row) == row.is_some(), "action row context does not match placement").map_err(contract)?;
+            if let Some(row) = row {
+                super::check_id(&row.record).map_err(contract)?;
+                let entity = match &view.kind {
+                    super::fallible_app_decode::DecodedViewKind::List { entity, .. }
+                    | super::fallible_app_decode::DecodedViewKind::Detail { entity, .. } => entity,
+                    _ => return Err(contract(ContractError("form action cannot bind row".into()))),
+                };
+                super::require(&row.entity == entity, "input row belongs to another entity").map_err(contract)?;
+            }
+            Ok(())
+        }
+        DecodedSemanticInput::Navigate { view: id } => { view(id)?; Ok(()) }
+        DecodedSemanticInput::AdvanceClock { days } => super::require(*days <= 3_652_058, "clock advance out of bounds").map_err(contract),
+        DecodedSemanticInput::Observe { point } => super::check_id(point).map_err(contract),
+    }
+}
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

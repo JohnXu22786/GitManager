@@ -12,8 +12,10 @@ mod fallible_scope_envelope_decode;
 mod fallible_history;
 mod fallible_replay_registry;
 pub(crate) use fallible_replay_registry::{replay_snapshot_fallible, ReplayRegistryError};
+mod fallible_replay_context;
+pub(crate) use fallible_replay_context::{FallibleScalarReplayContext, ScalarReplayFailure};
 mod fallible_correspondence;
-pub(crate) use fallible_correspondence::{derive as derive_correspondence_fallible, CorrespondenceFailure, DecodedReplayFrame, DecodedVerifiedCorrespondence};
+pub(crate) use fallible_correspondence::{derive as derive_correspondence_fallible, derive_with as derive_correspondence_with_fallible, CorrespondenceFailure, DecodedReplayFrame, DecodedVerifiedCorrespondence};
 pub(crate) use fallible_history::{initialize as initialize_scalar_fallible, initialize_frame as initialize_scalar_frame_fallible,
     initialization_receipt as scalar_initialization_receipt, InitializationFailure};
 pub(crate) use fallible_scope_envelope_decode::{decode_scope_envelope as decode_scope_envelope_fallible, DecodedScopeEnvelope as FallibleDecodedScopeEnvelope};

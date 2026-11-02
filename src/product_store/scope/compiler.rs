@@ -3176,7 +3176,7 @@ mod borrowed_view_tests {
             rewrites: vec![],
             business: program_revision,
             layers: vec![layer_id.clone()],
-            active: BTreeSet::from([layer_id]),
+            active: BTreeSet::from([layer_id.clone()]),
             previous: None,
             operation: "compose".into(),
             runtime: crate::product_runtime::RUNTIME_VERSION.into(),
@@ -3448,9 +3448,9 @@ mod borrowed_view_tests {
             basis,
             transition: super::super::ScopeTransition::Adoption,
             rewrites: vec![],
-            business: source_revision,
+            business: source_revision.clone(),
             layers: vec![layer_id.clone()],
-            active: BTreeSet::from([layer_id]),
+            active: BTreeSet::from([layer_id.clone()]),
             previous: None,
             operation: "historical-composition".into(),
             runtime: crate::product_runtime::RUNTIME_VERSION.into(),
@@ -3965,6 +3965,772 @@ mod borrowed_view_tests {
     fn fallible_scalar_correspondence_matches_direct_and_historical_legacy_derivation() {
         assert_correspondence_parity(false);
         assert_correspondence_parity(true);
+    }
+
+    fn stored_correspondence_snapshot(
+        historical: bool,
+    ) -> (ProjectSnapshot, crate::product_contract::CapturedProgram, crate::product_contract::DataSnapshot) {
+        let (mut snapshot, target, original, day) = correspondence_fixture(historical);
+        let layer = snapshot.scalar_scope().unwrap().layers.values().next().unwrap();
+        let (_, initialization) = super::super::history::initialize(&snapshot, layer, &target).unwrap();
+        snapshot.scalar_scope_mut().unwrap().initializations.push(initialization);
+        let source = snapshot.programs[0].clone();
+        let context = super::super::replay::ScopedExecutionContext::registry(&snapshot).unwrap();
+        let mapped = crate::product_runtime::merged_data(&target, &original).unwrap();
+        let (context, _) = context.project_seed(&source, &original, &target, &mapped, day).unwrap();
+        let proofs = context.correspondence_proofs();
+        let revision = snapshot.revision;
+        for (id, proof) in proofs {
+            snapshot.scalar_scope_mut().unwrap().correspondences.insert(id, super::super::ScopeCorrespondenceReceipt {
+                proof,
+                operation: "recorded-operation".into(),
+                revision,
+            });
+        }
+        (snapshot, target, original)
+    }
+
+    fn assert_scalar_replay_context_parity(historical: bool) {
+        let (snapshot, target_capture, original_legacy) = stored_correspondence_snapshot(historical);
+        let legacy_proofs: BTreeMap<_, _> = snapshot.scalar_scope().unwrap().correspondences.iter()
+            .map(|(id, receipt)| (id.clone(), receipt.proof.clone())).collect();
+        let registry = super::super::replay::ScopedExecutionContext::registry(&snapshot).unwrap();
+        let legacy = registry.with_correspondences(&legacy_proofs).unwrap();
+        let decoded = decoded_snapshot(&snapshot);
+        let source = decoded_captured(&snapshot.programs[0]);
+        let target = decoded_captured(&target_capture);
+        let original = crate::product_contract::decode_data_snapshot_fallible(
+            syntax(&serde_json::to_vec(&original_legacy).unwrap()), &mut AllocationContext::new(),
+        ).unwrap();
+        let day = legacy_proofs.values().next().expect("fixture proof exists").day;
+        let mapped_legacy = crate::product_runtime::merged_data(&target_capture, &original_legacy).unwrap();
+        let legacy_projection_registry = super::super::replay::ScopedExecutionContext::registry(&snapshot).unwrap();
+        let (_, expected_projection) = legacy_projection_registry.project_seed(
+            &snapshot.programs[0], &original_legacy, &target_capture, &mapped_legacy, day,
+        ).unwrap();
+        let mut decoded_registry_cx = AllocationContext::new();
+        let decoded_registry = super::super::FallibleScalarReplayContext::registry(
+            &decoded, &mut decoded_registry_cx,
+        ).unwrap();
+        let mapped_decoded = original.merge_app_with(target.app(), &mut decoded_registry_cx).unwrap();
+        let (projected_context, actual_projection) = decoded_registry.project_seed(
+            &source, &original, &target, &mapped_decoded, day, &mut decoded_registry_cx,
+        ).unwrap();
+        assert_eq!(
+            crate::product_contract::canonical_bytes(&expected_projection).unwrap(),
+            crate::product_backup::fallible_codec::canonical_bytes(
+                &actual_projection, &mut AllocationContext::new(),
+            ).unwrap(),
+        );
+        assert!(projected_context.verify_seed(
+            &target, &actual_projection, day, &mut AllocationContext::new(),
+        ).is_ok());
+        if day > 1 {
+            assert!(matches!(
+                projected_context.verify_seed(
+                    &target, &actual_projection, day - 1, &mut AllocationContext::new(),
+                ),
+                Err(super::super::ScalarReplayFailure::Store(StoreError::Invalid(_))),
+            ));
+        }
+        let mut cx = AllocationContext::new();
+        let context = super::super::FallibleScalarReplayContext::registry(&decoded, &mut cx).unwrap()
+            .with_correspondences(&mut cx).unwrap();
+        let actual = context.correspondence_proofs().collect::<Vec<_>>();
+        let [(id, proof)] = actual.as_slice() else {
+            panic!("expected one independently checked correspondence")
+        };
+        let expected = legacy.correspondence_proofs();
+        let expected = expected.get(*id).expect("legacy context has the same proof key");
+        let target_revision = expected.target.clone();
+        assert_eq!(
+            crate::product_contract::canonical_bytes(expected).unwrap(),
+            crate::product_backup::fallible_codec::canonical_bytes(*proof, &mut AllocationContext::new()).unwrap(),
+        );
+        assert!(context.projected_seed(proof.projected()));
+        assert!(context.frames_for_source_seed(&target_revision, proof.projected()).is_some());
+        assert!(target.validate_with(&mut AllocationContext::new()).is_ok());
+    }
+
+    #[test]
+    fn fallible_scalar_replay_context_matches_direct_history_proof() {
+        assert_scalar_replay_context_parity(false);
+    }
+
+    #[test]
+    fn fallible_scalar_replay_context_rejects_uninitialized_target_basis() {
+        let (snapshot, target_capture, original, day) = correspondence_fixture(false);
+        let decoded = decoded_snapshot(&snapshot);
+        let target = decoded_captured(&target_capture);
+        let original = crate::product_contract::decode_data_snapshot_fallible(
+            syntax(&serde_json::to_vec(&original).unwrap()), &mut AllocationContext::new(),
+        ).unwrap();
+        let before = crate::product_backup::fallible_codec::canonical_bytes(
+            &decoded, &mut AllocationContext::new(),
+        ).unwrap();
+        let mut cx = AllocationContext::new();
+        let context = super::super::FallibleScalarReplayContext::registry(&decoded, &mut cx).unwrap();
+        assert!(matches!(
+            context.verify_seed(&target, &original, day, &mut cx),
+            Err(super::super::ScalarReplayFailure::Store(StoreError::Invalid(_))),
+        ));
+        assert_eq!(crate::product_backup::fallible_codec::canonical_bytes(
+            &decoded, &mut AllocationContext::new(),
+        ).unwrap(), before);
+    }
+
+    #[test]
+    fn fallible_scalar_replay_context_rejects_fabricated_live_metadata_and_event_history() {
+        use crate::product_contract::{BusinessEvent, DataValue, RecordChange};
+
+        let make_initialized = || {
+            let (mut snapshot, target, _, day) = correspondence_fixture(false);
+            let layer = snapshot.scalar_scope().unwrap().layers.values().next().unwrap();
+            let (data, receipt) = super::super::history::initialize(&snapshot, layer, &target).unwrap();
+            (snapshot, target, data, receipt, day)
+        };
+
+        // A receipt digest cannot authorize fabricated protected cells. Even
+        // when its digest is changed to name the supplied data, the receipt's
+        // additions must regenerate from the frozen basis.
+        let (mut snapshot, target, mut data, mut receipt, day) = make_initialized();
+        let layer_id = snapshot.scalar_scope().unwrap().layers.keys().next().unwrap().clone();
+        let member = compiler::key(&layer_id, "item", "member");
+        data.records[0].values.insert(member, DataValue::Boolean { value: false });
+        receipt.after_data = data.identity().unwrap();
+        snapshot.data = data;
+        snapshot.scalar_scope_mut().unwrap().initializations.push(receipt);
+        let decoded = decoded_snapshot(&snapshot);
+        let target = decoded_captured(&target);
+        let mut cx = AllocationContext::new();
+        let context = super::super::FallibleScalarReplayContext::registry(&decoded, &mut cx).unwrap();
+        assert!(matches!(
+            context.verify_seed(&target, decoded.data(), day, &mut cx),
+            Err(super::super::ScalarReplayFailure::Store(StoreError::Invalid(_))),
+        ));
+
+        // A later event cannot rewrite membership while claiming an otherwise
+        // valid retained producer and refreshed target data digest.
+        let (mut snapshot, target, mut data, mut receipt, day) = make_initialized();
+        let layer_id = snapshot.scalar_scope().unwrap().layers.keys().next().unwrap().clone();
+        let member = compiler::key(&layer_id, "item", "member");
+        let before = data.records[0].values.clone();
+        let mut after = before.clone();
+        after.insert(member, DataValue::Boolean { value: false });
+        data.generation = data.generation.saturating_add(1);
+        data.records[0].revision = data.records[0].revision.saturating_add(1);
+        data.events.push(BusinessEvent {
+            id: "fabricated-member-change".into(),
+            sequence: data.generation,
+            operation_id: "event-operation".into(),
+            action: "noop".into(),
+            day,
+            program: target.artifact.program_digest.clone(),
+            changes: vec![RecordChange {
+                entity: "item".into(), record: "row-1".into(), before: Some(before),
+                after, archived: false,
+            }],
+            outputs: vec![],
+        });
+        receipt.after_data = data.identity().unwrap();
+        snapshot.data = data;
+        snapshot.scalar_scope_mut().unwrap().initializations.push(receipt);
+        let decoded = decoded_snapshot(&snapshot);
+        let target = decoded_captured(&target);
+        let mut cx = AllocationContext::new();
+        let context = super::super::FallibleScalarReplayContext::registry(&decoded, &mut cx).unwrap();
+        assert!(matches!(
+            context.verify_seed(&target, decoded.data(), day, &mut cx),
+            Err(super::super::ScalarReplayFailure::Store(StoreError::Invalid(_))),
+        ));
+    }
+
+    #[test]
+    fn fallible_scalar_replay_context_requires_a_frame_for_every_target_layer() {
+        let (snapshot, target_capture, original_legacy) = stored_correspondence_snapshot(false);
+        let decoded = decoded_snapshot(&snapshot);
+        let source = decoded_captured(&snapshot.programs[0]);
+        let target = decoded_captured(&target_capture);
+        let original = crate::product_contract::decode_data_snapshot_fallible(
+            syntax(&serde_json::to_vec(&original_legacy).unwrap()), &mut AllocationContext::new(),
+        ).unwrap();
+        let mut cx = AllocationContext::new();
+        let context = super::super::FallibleScalarReplayContext::registry(&decoded, &mut cx).unwrap();
+        let mapped = original.merge_app_with(target.app(), &mut cx).unwrap();
+        let (mut context, projected) = context.project_seed(
+            &source, &original, &target, &mapped, 3, &mut cx,
+        ).unwrap();
+        assert!(context.verify_seed(&target, &projected, 3, &mut cx).is_ok());
+        context.strip_history_evidence_for_test();
+        assert!(matches!(
+            context.verify_seed(&target, &projected, 3, &mut cx),
+            Err(super::super::ScalarReplayFailure::Store(StoreError::Invalid(_))),
+        ));
+    }
+
+    #[test]
+    fn fallible_scalar_replay_context_allows_arbitrary_seed_for_layerless_target() {
+        let mut snapshot = composed_snapshot_with_view_projection_patch();
+        let target = snapshot.programs.last().unwrap().clone();
+        snapshot.scalar_scope_mut().unwrap().layers.clear();
+        snapshot.scalar_scope_mut().unwrap().compositions.values_mut().next().unwrap().layers.clear();
+        snapshot.scalar_scope_mut().unwrap().compositions.values_mut().next().unwrap().active.clear();
+        let mut value: serde_json::Value = serde_json::from_slice(&serde_json::to_vec(&snapshot.data).unwrap()).unwrap();
+        value["generation"] = serde_json::json!(17);
+        let arbitrary = crate::product_contract::decode_data_snapshot_fallible(
+            syntax(&serde_json::to_vec(&value).unwrap()), &mut AllocationContext::new(),
+        ).unwrap();
+        let decoded = decoded_snapshot(&snapshot);
+        let target = decoded_captured(&target);
+        let mut cx = AllocationContext::new();
+        let context = super::super::FallibleScalarReplayContext::registry(&decoded, &mut cx).unwrap();
+        assert!(context.verify_seed(&target, &arbitrary, snapshot.clock_day, &mut cx).is_ok());
+    }
+
+    #[test]
+    fn fallible_scalar_replay_context_accepts_target_bound_evolution_rehearsal_seed() {
+        let mut snapshot = initialization_snapshot();
+        let layer = snapshot.scalar_scope().unwrap().layers.values().next().unwrap().clone();
+        let source_revision = snapshot.active_revision.clone();
+        let layer_id = layer.identity().unwrap();
+
+        // Build and retain a real adoption target with its live initialization
+        // receipt; the evolution rehearsal below inherits this exact layer
+        // lineage and frozen initialized state.
+        let adoption_manifest = super::super::CompositionManifest {
+            version: super::super::COMPILER_VERSION,
+            basis: layer.basis.clone(),
+            transition: super::super::ScopeTransition::Adoption,
+            rewrites: vec![],
+            business: source_revision.clone(),
+            layers: vec![layer_id.clone()],
+            active: BTreeSet::from([layer_id.clone()]),
+            previous: None,
+            operation: "initial-adoption".into(),
+            runtime: crate::product_runtime::RUNTIME_VERSION.into(),
+            driver: crate::product_runtime::DRIVER_VERSION.into(),
+            output: source_revision,
+        };
+        let adopted = compiler::compile(&snapshot, &adoption_manifest).unwrap();
+        let adoption_revision = crate::product_contract::canonical_digest(
+            IdentityDomain::Source, &adopted,
+        ).unwrap();
+        let mut adoption_manifest = adoption_manifest;
+        adoption_manifest.output = adoption_revision.clone();
+        let (initialized, receipt) = super::super::history::initialize(&snapshot, &layer, &adopted).unwrap();
+        snapshot.programs.push(adopted.clone());
+        snapshot.active_revision = adoption_revision.clone();
+        snapshot.data = initialized;
+        snapshot.session = crate::product_contract::SessionState::initial(&adopted.program).unwrap();
+        let scope = snapshot.scalar_scope_mut().unwrap();
+        scope.initializations.push(receipt);
+        scope.compositions.insert(adoption_revision.clone(), adoption_manifest.clone());
+
+        // An additive app evolution creates a distinct target program while
+        // preserving the inherited protected layer and its verified history.
+        let mut candidate_app = snapshot.programs[0].program.clone();
+        candidate_app.entities[0].fields.push(FieldDefinition {
+            id: "evolution_note".into(),
+            label: "Evolution note".into(),
+            value_type: Type::Optional { item: Box::new(Type::Text) },
+        });
+        candidate_app.entities.push(EntityDefinition {
+            id: "audit".into(),
+            label: "Audit".into(),
+            fields: vec![FieldDefinition { id: "note".into(), label: "Note".into(), value_type: Type::Text }],
+            unique: vec![],
+            constraints: vec![],
+        });
+        let candidate = crate::product_contract::CapturedProgram::capture(
+            &crate::product_contract::canonical_bytes(&candidate_app).unwrap(),
+            "project",
+            crate::product_contract::Producer::Fixture { name: "evolution-rehearsal-candidate".into() },
+            None,
+        ).unwrap();
+        let candidate_revision = crate::product_contract::canonical_digest(
+            IdentityDomain::Source, &candidate,
+        ).unwrap();
+        snapshot.programs.push(candidate.clone());
+
+        let decisions = crate::product_contract::canonical_digest(
+            IdentityDomain::Decision, &snapshot.decisions,
+        ).unwrap();
+        let evolution_basis = super::super::FrozenBasis {
+            snapshot: crate::product_contract::canonical_digest(IdentityDomain::Data, &snapshot).unwrap(),
+            revision: snapshot.revision,
+            active: adoption_revision.clone(),
+            data: snapshot.data.clone(),
+            session: snapshot.session.clone(),
+            day: snapshot.clock_day,
+            decisions,
+        };
+        let mut evolution = adoption_manifest;
+        evolution.basis = evolution_basis.clone();
+        evolution.transition = super::super::ScopeTransition::Evolution;
+        evolution.business = candidate_revision;
+        let protected_destination = layer.patches[0].request.destination.clone();
+        evolution.rewrites = vec![super::super::ScopeSlotMapping {
+            layer: layer_id.clone(),
+            patch: 0,
+            from_source: adoption_revision.clone(),
+            from: protected_destination.clone(),
+            to_source: evolution.business.clone(),
+            to: protected_destination.clone(),
+            subject: "row".into(),
+        }];
+        evolution.previous = Some(adoption_revision.clone());
+        evolution.operation = "retained-evolution".into();
+        // As in prepare_evolution, compile against the predecessor output and
+        // then bind the completed manifest to the resulting target revision.
+        let evolved = compiler::compile(&snapshot, &evolution).unwrap();
+        let evolved_revision = crate::product_contract::canonical_digest(
+            IdentityDomain::Source, &evolved,
+        ).unwrap();
+        evolution.output = evolved_revision.clone();
+        let seed = crate::product_runtime::merged_data(&evolved, &evolution_basis.data).unwrap();
+        let seed_digest = seed.identity().unwrap();
+        let compatibility = crate::product_runtime::LocalRuntime::default()
+            .compatibility_at(&evolved, &seed, evolution_basis.day).unwrap();
+        assert_eq!(compatibility.state, crate::product_contract::CompatibilityState::Compatible);
+        let rehearsal = super::super::ManagedRehearsal {
+            version: super::super::COMPILER_VERSION,
+            manifest: evolution.clone(),
+            seed: seed_digest.clone(),
+            layer: None,
+            initialization: None,
+            compatibility,
+            recorded_by: "record-evolution".into(),
+            recorded_revision: snapshot.revision + 1,
+            witnesses: BTreeMap::from([(
+                "retained-choice".into(),
+                crate::product_contract::canonical_digest(IdentityDomain::Decision, &"witness").unwrap(),
+            )]),
+        };
+        snapshot.programs.push(evolved.clone());
+        // A later Adoption inherits the same layer with a different app
+        // schema. Arrange its output to sort first so the old "first
+        // adoption containing this layer" receipt lookup would select the
+        // wrong target.
+        let mut other_candidate_app = snapshot.programs[0].program.clone();
+        other_candidate_app.entities[0].fields.push(FieldDefinition {
+            id: "other_evolution_note".into(),
+            label: "Other evolution note".into(),
+            value_type: Type::Optional { item: Box::new(Type::Text) },
+        });
+        let other_candidate = crate::product_contract::CapturedProgram::capture(
+            &crate::product_contract::canonical_bytes(&other_candidate_app).unwrap(),
+            "project",
+            crate::product_contract::Producer::Fixture { name: "other-evolution-candidate".into() },
+            None,
+        ).unwrap();
+        let other_candidate_revision = crate::product_contract::canonical_digest(
+            IdentityDomain::Source, &other_candidate,
+        ).unwrap();
+        snapshot.programs.push(other_candidate);
+        let mut other_evolution = evolution.clone();
+        other_evolution.business = other_candidate_revision;
+        other_evolution.transition = super::super::ScopeTransition::Adoption;
+        other_evolution.previous = Some(adoption_revision.clone());
+        other_evolution.rewrites[0].to_source = other_evolution.business.clone();
+        let (other_evolved, other_revision) = (0..128)
+            .find_map(|index| {
+                other_evolution.operation = format!("later-adoption-{index}");
+                let target = compiler::compile(&snapshot, &other_evolution).unwrap();
+                let revision = crate::product_contract::canonical_digest(IdentityDomain::Source, &target).unwrap();
+                (revision < adoption_revision).then_some((target, revision))
+            })
+            .expect("bounded fixture search should find an output that sorts before its predecessor");
+        other_evolution.output = other_revision.clone();
+        snapshot.programs.push(other_evolved.clone());
+        snapshot.scalar_scope_mut().unwrap().compositions.insert(other_revision, other_evolution);
+        let first_layer_adoption = snapshot.scalar_scope().unwrap().compositions.values()
+            .find(|manifest| manifest.transition == super::super::ScopeTransition::Adoption && manifest.layers.contains(&layer_id))
+            .unwrap();
+        assert_eq!(first_layer_adoption.output, crate::product_contract::canonical_digest(IdentityDomain::Source, &other_evolved).unwrap());
+        snapshot.scalar_scope_mut().unwrap().rehearsals.insert(evolved_revision.clone(), rehearsal);
+
+        let decoded = decoded_snapshot(&snapshot);
+        let target = decoded_captured(&evolved);
+        let decoded_seed = crate::product_contract::decode_data_snapshot_fallible(
+            syntax(&serde_json::to_vec(&seed).unwrap()), &mut AllocationContext::new(),
+        ).unwrap();
+        let before = crate::product_backup::fallible_codec::canonical_bytes(
+            &decoded, &mut AllocationContext::new(),
+        ).unwrap();
+        let mut cx = AllocationContext::new();
+        let context = super::super::FallibleScalarReplayContext::registry(&decoded, &mut cx).unwrap();
+        assert!(context.projected_seed(&seed_digest));
+        let evolution_manifest = context.snapshot().scalar_scope().unwrap().composition(&target.revision_with(&mut cx).unwrap()).unwrap();
+        let rebuilt_evolution = compiler::compile_fallible(context.snapshot(), evolution_manifest, &mut cx).unwrap();
+        assert_eq!(
+            crate::product_backup::fallible_codec::canonical_bytes(&rebuilt_evolution, &mut AllocationContext::new()).unwrap(),
+            crate::product_backup::fallible_codec::canonical_bytes(&target, &mut AllocationContext::new()).unwrap(),
+        );
+        let rebuilt_seed = evolution_manifest.basis().data().merge_app_with(target.app(), &mut cx).unwrap();
+        assert_eq!(rebuilt_seed.identity_with(&mut cx).unwrap(), seed_digest);
+        let seed_result = context.verify_seed(&target, &decoded_seed, evolution_basis.day, &mut cx);
+        assert!(seed_result.is_ok(), "target-bound evolution rehearsal seed rejected: {seed_result:?}");
+        assert_eq!(crate::product_backup::fallible_codec::canonical_bytes(
+            &decoded, &mut AllocationContext::new(),
+        ).unwrap(), before);
+
+        // A structurally decoded rehearsal cannot relabel altered unrelated
+        // business data with its stored seed digest. The added audit entity is
+        // outside the lifecycle layer; the per-layer checks alone leave it
+        // untouched, so exact frozen-basis seed regeneration must reject it.
+        let mut altered_seed = seed.clone();
+        altered_seed.records.push(crate::product_contract::Record {
+            entity: "audit".into(),
+            id: "untracked-audit-row".into(),
+            revision: 1,
+            created_program: evolved.artifact.program_digest.clone(),
+            archived: false,
+            values: BTreeMap::from([("note".into(), crate::product_contract::DataValue::Text { value: "forged".into() })]),
+        });
+        altered_seed.validate().unwrap();
+        let altered_digest = altered_seed.identity().unwrap();
+        let mut forged_snapshot = snapshot.clone();
+        forged_snapshot.scalar_scope_mut().unwrap().rehearsals
+            .get_mut(&evolved_revision).unwrap().seed = altered_digest;
+        let forged_decoded = decoded_snapshot(&forged_snapshot);
+        let altered_decoded = crate::product_contract::decode_data_snapshot_fallible(
+            syntax(&serde_json::to_vec(&altered_seed).unwrap()), &mut AllocationContext::new(),
+        ).unwrap();
+        let mut forged_cx = AllocationContext::new();
+        let forged_context = super::super::FallibleScalarReplayContext::registry(&forged_decoded, &mut forged_cx).unwrap();
+        assert!(matches!(
+            forged_context.verify_seed(&target, &altered_decoded, evolution_basis.day, &mut forged_cx),
+            Err(super::super::ScalarReplayFailure::Store(StoreError::Invalid(_))),
+        ));
+
+        // The same data digest cannot borrow this rehearsal's authority under
+        // the later Adoption output that shares the layer but has a different
+        // app schema and frozen basis.
+        let unrelated = decoded_captured(&other_evolved);
+        let unrelated_result = context.verify_seed(&unrelated, &decoded_seed, evolution_basis.day, &mut cx);
+        assert!(unrelated_result.is_err(), "unrelated retained output borrowed rehearsal authority: {unrelated_result:?}");
+
+        // Exercise refusal inside target-bound rehearsal regeneration, after
+        // the context itself has been constructed successfully.
+        let mut count_cx = AllocationContext::new();
+        let _count_context = super::super::FallibleScalarReplayContext::registry(&decoded, &mut count_cx).unwrap();
+        let registry_growths = count_cx.growth_requests();
+        let mut verify_cx = AllocationContext::new();
+        let verify_context = super::super::FallibleScalarReplayContext::registry(&decoded, &mut verify_cx).unwrap();
+        let verify_start = verify_cx.growth_requests();
+        verify_context.verify_seed(&target, &decoded_seed, evolution_basis.day, &mut verify_cx).unwrap();
+        let verify_growths = verify_cx.growth_requests() - verify_start;
+        assert!(verify_growths > 0);
+        for relative in [1, (verify_growths / 2).max(1), verify_growths] {
+            let mut refused = AllocationContext::fail_nth_growth(
+                std::num::NonZeroUsize::new(registry_growths + relative).unwrap(), true,
+            );
+            let retry_context = super::super::FallibleScalarReplayContext::registry(&decoded, &mut refused).unwrap();
+            assert!(matches!(
+                retry_context.verify_seed(&target, &decoded_seed, evolution_basis.day, &mut refused),
+                Err(super::super::ScalarReplayFailure::Allocation(_)),
+            ), "target seed verification refusal at growth {relative}/{verify_growths}");
+            assert_eq!(crate::product_backup::fallible_codec::canonical_bytes(
+                &decoded, &mut AllocationContext::new(),
+            ).unwrap(), before);
+            let mut retry = AllocationContext::new();
+            let retry_context = super::super::FallibleScalarReplayContext::registry(&decoded, &mut retry).unwrap();
+            retry_context.verify_seed(&target, &decoded_seed, evolution_basis.day, &mut retry).unwrap();
+        }
+    }
+
+    #[test]
+    fn fallible_scalar_replay_context_matches_scenario_projection_and_empty_registry() {
+        use crate::product_contract::ScenarioSpec;
+
+        let (empty_snapshot, _, _, _) = correspondence_fixture(false);
+        let empty_decoded = decoded_snapshot(&empty_snapshot);
+        let empty_before = crate::product_backup::fallible_codec::canonical_bytes(
+            &empty_decoded, &mut AllocationContext::new(),
+        ).unwrap();
+        let mut empty_cx = AllocationContext::new();
+        let empty = super::super::FallibleScalarReplayContext::registry(
+            &empty_decoded, &mut empty_cx,
+        ).unwrap().with_correspondences(&mut empty_cx).unwrap();
+        assert_eq!(empty.correspondence_proofs().count(), 0);
+        assert_eq!(crate::product_backup::fallible_codec::canonical_bytes(
+            &empty_decoded, &mut AllocationContext::new(),
+        ).unwrap(), empty_before);
+
+        let (snapshot, target_capture, _) = stored_correspondence_snapshot(false);
+        let legacy_proofs: BTreeMap<_, _> = snapshot.scalar_scope().unwrap().correspondences.iter()
+            .map(|(id, receipt)| (id.clone(), receipt.proof.clone())).collect();
+        let legacy = super::super::replay::ScopedExecutionContext::registry(&snapshot).unwrap()
+            .with_correspondences(&legacy_proofs).unwrap();
+        let decoded = decoded_snapshot(&snapshot);
+        let source = &snapshot.programs[0];
+        let decoded_source = decoded_captured(source);
+        let target = decoded_captured(&target_capture);
+        let original_scenario = ScenarioSpec {
+            version: 1,
+            id: "context-scenario".into(),
+            label: "Replay context parity".into(),
+            seed: snapshot.data.clone(),
+            session: snapshot.session.clone(),
+            clock_day: 3,
+            random_seed: 19,
+            inputs: vec![],
+            validity: vec![],
+        };
+        let mut mapped_scenario = original_scenario.clone();
+        mapped_scenario.seed = crate::product_runtime::merged_data(&target_capture, &original_scenario.seed).unwrap();
+        let (expected_context, expected) = legacy.project_scenario(
+            source, &original_scenario, &target_capture, &mapped_scenario,
+        ).unwrap();
+        assert!(expected_context.has_scenario_correspondence(&expected));
+
+        let mut scenario_snapshot = snapshot.clone();
+        let recorded_revision = scenario_snapshot.revision;
+        for (id, proof) in expected_context.correspondence_proofs() {
+            scenario_snapshot.scalar_scope_mut().unwrap().correspondences.insert(
+                id.clone(), super::super::ScopeCorrespondenceReceipt {
+                    proof: proof.clone(), operation: "scenario-replay".into(), revision: recorded_revision,
+                },
+            );
+        }
+        let decoded_scenario_snapshot = decoded_snapshot(&scenario_snapshot);
+        let mut stored_cx = AllocationContext::new();
+        let stored_context = super::super::FallibleScalarReplayContext::registry(
+            &decoded_scenario_snapshot, &mut stored_cx,
+        ).unwrap().with_correspondences(&mut stored_cx).unwrap();
+        let expected_frame = crate::product_contract::decode_scenario_spec_fallible(
+            syntax(&serde_json::to_vec(&expected).unwrap()), &mut stored_cx,
+        ).unwrap();
+        assert!(stored_context.has_scenario_correspondence(&expected_frame));
+
+        let mut decode_cx = AllocationContext::new();
+        let decoded_original = crate::product_contract::decode_scenario_spec_fallible(
+            syntax(&serde_json::to_vec(&original_scenario).unwrap()), &mut decode_cx,
+        ).unwrap();
+        let decoded_mapped = crate::product_contract::decode_scenario_spec_fallible(
+            syntax(&serde_json::to_vec(&mapped_scenario).unwrap()), &mut decode_cx,
+        ).unwrap();
+        let mut context_cx = AllocationContext::new();
+        let decoded_context = super::super::FallibleScalarReplayContext::registry(
+            &decoded, &mut context_cx,
+        ).unwrap().with_correspondences(&mut context_cx).unwrap();
+        let decoded_before = crate::product_backup::fallible_codec::canonical_bytes(
+            &decoded, &mut AllocationContext::new(),
+        ).unwrap();
+        let context_proofs_before: Vec<_> = decoded_context.correspondence_proofs()
+            .map(|(id, proof)| (id.clone(), crate::product_backup::fallible_codec::canonical_bytes(
+                proof, &mut AllocationContext::new(),
+            ).unwrap()))
+            .collect();
+        let scenario_before = crate::product_backup::fallible_codec::canonical_bytes(
+            &decoded_original, &mut AllocationContext::new(),
+        ).unwrap();
+        let mut scenario_cx = AllocationContext::new();
+        let (actual_context, actual) = decoded_context.project_scenario(
+            &decoded_source, &decoded_original, &target, &decoded_mapped, &mut scenario_cx,
+        ).unwrap();
+        assert!(actual_context.has_scenario_correspondence(&actual));
+        assert_eq!(
+            crate::product_contract::canonical_bytes(&expected).unwrap(),
+            crate::product_backup::fallible_codec::canonical_bytes(&actual, &mut AllocationContext::new()).unwrap(),
+        );
+        let scenario_growths = scenario_cx.growth_requests();
+        assert!(scenario_growths > 0);
+        for nth in [1, scenario_growths / 2, scenario_growths] {
+            let mut refused = AllocationContext::fail_nth_growth(NonZeroUsize::new(nth).unwrap(), true);
+            assert!(matches!(
+                decoded_context.project_scenario(
+                    &decoded_source, &decoded_original, &target, &decoded_mapped, &mut refused,
+                ),
+                Err(super::super::ScalarReplayFailure::Allocation(_)),
+            ), "scenario allocation refusal {nth}/{scenario_growths}");
+            assert!(refused.first_failure().is_some());
+            assert_eq!(crate::product_backup::fallible_codec::canonical_bytes(
+                &decoded, &mut AllocationContext::new(),
+            ).unwrap(), decoded_before);
+            assert_eq!(crate::product_backup::fallible_codec::canonical_bytes(
+                &decoded_original, &mut AllocationContext::new(),
+            ).unwrap(), scenario_before);
+            let context_proofs_after: Vec<_> = decoded_context.correspondence_proofs()
+                .map(|(id, proof)| (id.clone(), crate::product_backup::fallible_codec::canonical_bytes(
+                    proof, &mut AllocationContext::new(),
+                ).unwrap()))
+                .collect();
+            assert_eq!(context_proofs_after, context_proofs_before);
+            let mut retry_cx = AllocationContext::new();
+            let (_, retried) = decoded_context.project_scenario(
+                &decoded_source, &decoded_original, &target, &decoded_mapped, &mut retry_cx,
+            ).unwrap();
+            assert_eq!(
+                crate::product_contract::canonical_bytes(&expected).unwrap(),
+                crate::product_backup::fallible_codec::canonical_bytes(&retried, &mut AllocationContext::new()).unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn fallible_scalar_replay_context_registry_and_proofs_refuse_atomically_and_retry() {
+        use std::num::NonZeroUsize;
+        let (snapshot, _, _) = stored_correspondence_snapshot(false);
+        let decoded = decoded_snapshot(&snapshot);
+        let before = crate::product_backup::fallible_codec::canonical_bytes(&decoded, &mut AllocationContext::new()).unwrap();
+        let mut baseline = AllocationContext::new();
+        let context = super::super::FallibleScalarReplayContext::registry(&decoded, &mut baseline).unwrap()
+            .with_correspondences(&mut baseline).unwrap();
+        assert_eq!(context.correspondence_proofs().count(), 1);
+        let growths = baseline.growth_requests();
+        assert!(growths > 0);
+        for nth in [1, growths / 2, growths] {
+            let mut refused = AllocationContext::fail_nth_growth(NonZeroUsize::new(nth).unwrap(), true);
+            let result = match super::super::FallibleScalarReplayContext::registry(&decoded, &mut refused) {
+                Ok(context) => context.with_correspondences(&mut refused),
+                Err(error) => Err(error),
+            };
+            let Err(error) = result else { panic!("refusal {nth}/{growths} unexpectedly succeeded") };
+            assert!(matches!(error, super::super::ScalarReplayFailure::Allocation(_)), "growth {nth}/{growths}: {error:?}");
+            assert!(refused.first_failure().is_some());
+            assert_eq!(crate::product_backup::fallible_codec::canonical_bytes(&decoded, &mut AllocationContext::new()).unwrap(), before);
+            let mut retry = AllocationContext::new();
+            let retried = super::super::FallibleScalarReplayContext::registry(&decoded, &mut retry).unwrap()
+                .with_correspondences(&mut retry).unwrap();
+            assert_eq!(retried.correspondence_proofs().count(), 1);
+        }
+    }
+
+    #[test]
+    fn fallible_scalar_replay_context_rejects_cyclic_and_forged_correspondences() {
+        use crate::product_contract::{DataValue, IdentityDomain};
+        use super::super::ScopeCorrespondence;
+
+        let (base, target, _, day) = correspondence_fixture(false);
+        let source = base.programs[0].clone();
+        let target_revision = crate::product_contract::canonical_digest(IdentityDomain::Source, &target).unwrap();
+        let mut a = base.data.clone();
+        a.records[0].values.insert("name".into(), DataValue::Text { value: "untrusted-a".into() });
+        let mut b = base.data.clone();
+        b.records[0].values.insert("name".into(), DataValue::Text { value: "untrusted-b".into() });
+        let a_id = a.identity().unwrap();
+        let b_id = b.identity().unwrap();
+        let mut snapshot = base.clone();
+        let revision = snapshot.revision;
+        for (original, projected) in [(a, b_id), (b, a_id)] {
+            let operation_seed = original.identity().unwrap();
+            let proof = ScopeCorrespondence {
+                source: source.clone(), original, target: target_revision.clone(), day,
+                projected, operation_seed, scenario: None,
+            };
+            let id = proof.identity().unwrap();
+            snapshot.scalar_scope_mut().unwrap().correspondences.insert(id, super::super::ScopeCorrespondenceReceipt {
+                proof, operation: "cycle-probe".into(), revision,
+            });
+        }
+        let decoded = decoded_snapshot(&snapshot);
+        let cycle_before = crate::product_backup::fallible_codec::canonical_bytes(
+            &decoded, &mut AllocationContext::new(),
+        ).unwrap();
+        let mut cx = AllocationContext::new();
+        let context = super::super::FallibleScalarReplayContext::registry(&decoded, &mut cx).unwrap();
+        assert!(matches!(
+            context.with_correspondences(&mut cx),
+            Err(super::super::ScalarReplayFailure::Store(StoreError::Invalid(_))),
+        ));
+        assert_eq!(crate::product_backup::fallible_codec::canonical_bytes(
+            &decoded, &mut AllocationContext::new(),
+        ).unwrap(), cycle_before);
+
+        let (mut snapshot, target, original) = stored_correspondence_snapshot(false);
+        let scope = snapshot.scalar_scope_mut().unwrap();
+        let id = scope.correspondences.keys().next().unwrap().clone();
+        let mut receipt = scope.correspondences.remove(&id).unwrap();
+        receipt.proof.projected = crate::product_contract::canonical_digest(
+            IdentityDomain::Data, &"forged-projected-seed",
+        ).unwrap();
+        let forged_id = receipt.proof.identity().unwrap();
+        scope.correspondences.insert(forged_id, receipt);
+        let decoded = decoded_snapshot(&snapshot);
+        let forged_before = crate::product_backup::fallible_codec::canonical_bytes(
+            &decoded, &mut AllocationContext::new(),
+        ).unwrap();
+        let mut cx = AllocationContext::new();
+        let context = super::super::FallibleScalarReplayContext::registry(&decoded, &mut cx).unwrap();
+        assert!(matches!(
+            context.with_correspondences(&mut cx),
+            Err(super::super::ScalarReplayFailure::Store(StoreError::Invalid(_))),
+        ));
+        assert_eq!(crate::product_backup::fallible_codec::canonical_bytes(
+            &decoded, &mut AllocationContext::new(),
+        ).unwrap(), forged_before);
+        assert!(target.validate().is_ok());
+        assert!(original.identity().is_ok());
+    }
+
+    #[test]
+    fn fallible_scalar_replay_context_rejects_ambiguous_scenario_bindings() {
+        use crate::product_contract::{DataValue, IdentityDomain, ScenarioSpec};
+
+        let (snapshot, _, _) = stored_correspondence_snapshot(false);
+        let verified_snapshot = decoded_snapshot(&snapshot);
+        let mut source_cx = AllocationContext::new();
+        let verified = super::super::FallibleScalarReplayContext::registry(&verified_snapshot, &mut source_cx).unwrap()
+            .with_correspondences(&mut source_cx).unwrap();
+        let template = verified.correspondence_proofs().next().unwrap().1;
+
+        let scenario = ScenarioSpec {
+            version: 1,
+            id: "ambiguous-scenario".into(),
+            label: "Ambiguous test binding".into(),
+            seed: snapshot.data.clone(),
+            session: snapshot.session.clone(),
+            clock_day: 3,
+            random_seed: 23,
+            inputs: vec![],
+            validity: vec![],
+        };
+        let mut cx = AllocationContext::new();
+        let original = crate::product_contract::decode_scenario_spec_fallible(
+            syntax(&serde_json::to_vec(&scenario).unwrap()), &mut cx,
+        ).unwrap();
+        let projected = original.try_clone_with(&mut cx).unwrap();
+
+        let mut first_proof = template.copy_with(&mut cx).unwrap();
+        let first_operation_seed = verified_snapshot.data().try_clone_with(&mut cx).unwrap();
+        first_proof.bind_scenario(
+            original.try_clone_with(&mut cx).unwrap(), projected.try_clone_with(&mut cx).unwrap(),
+            first_operation_seed.identity_with(&mut cx).unwrap(),
+        );
+        let first = super::super::DecodedVerifiedCorrespondence::new_checked(
+            first_proof, verified_snapshot.data().try_clone_with(&mut cx).unwrap(), vec![],
+            first_operation_seed,
+        );
+
+        let mut altered = snapshot.data.clone();
+        altered.records[0].values.insert("name".into(), DataValue::Text { value: "different-operation-frame".into() });
+        let altered_bytes = crate::product_contract::canonical_bytes(&altered).unwrap();
+        let mut second_operation_seed = crate::product_contract::decode_data_snapshot_fallible(
+            syntax(&altered_bytes), &mut cx,
+        ).unwrap();
+        let second_operation_identity = second_operation_seed.identity_with(&mut cx).unwrap();
+        let mut second_proof = template.copy_with(&mut cx).unwrap();
+        second_proof.bind_scenario(
+            original.try_clone_with(&mut cx).unwrap(), projected.try_clone_with(&mut cx).unwrap(),
+            second_operation_identity,
+        );
+        let second = super::super::DecodedVerifiedCorrespondence::new_checked(
+            second_proof, verified_snapshot.data().try_clone_with(&mut cx).unwrap(), vec![],
+            second_operation_seed,
+        );
+
+        let mut empty_snapshot = snapshot.clone();
+        empty_snapshot.scalar_scope_mut().unwrap().correspondences.clear();
+        let empty_decoded = decoded_snapshot(&empty_snapshot);
+        let mut context = super::super::FallibleScalarReplayContext::registry(&empty_decoded, &mut cx).unwrap();
+        context.insert_correspondence(first, &mut cx).unwrap();
+        assert!(matches!(
+            context.insert_correspondence(second, &mut cx),
+            Err(super::super::ScalarReplayFailure::Store(StoreError::Invalid(message)))
+                if message.contains("ambiguous historical correspondence")
+        ));
+        assert_eq!(template.target(), &crate::product_contract::canonical_digest(IdentityDomain::Source, &snapshot.programs[1]).unwrap());
     }
 
     #[test]

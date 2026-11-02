@@ -105,6 +105,8 @@ pub(super) struct DecodedAdoptionPlan {
     retire_decisions: Vec<String>,
 }
 impl DecodedAdoptionPlan {
+    pub(crate) fn expected_data(&self) -> &Digest { &self.expected_data }
+
     pub(crate) fn validate_with(
         &self,
         cx: &mut AllocationContext,

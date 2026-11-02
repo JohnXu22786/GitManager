@@ -82,6 +82,7 @@ impl BackupWire for crate::product_store::fallible_project_snapshot_decode::Deco
 impl BackupWire for crate::product_contract::fallible_app_decode::DecodedAppDefinition {}
 impl BackupWire for crate::product_contract::DecodedCapturedProgramWire {}
 impl BackupWire for crate::product_contract::FallibleDecodedCapturedProgram {}
+impl BackupWire for crate::product_contract::FallibleDecodedScenarioSpec {}
 impl BackupWire for crate::product_contract::FallibleOutputRow<'_> {}
 impl BackupWire for crate::product_contract::FallibleJsonScalar<'_> {}
 impl BackupWire for crate::product_contract::FallibleArtifactReceipt<'_> {}

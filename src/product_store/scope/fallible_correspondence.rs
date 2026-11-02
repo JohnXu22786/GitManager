@@ -30,7 +30,7 @@ impl DecodedReplayFrame {
     pub(crate) fn before(&self) -> &FallibleDecodedDataSnapshot { &self.before }
     pub(crate) fn additions(&self) -> &[DecodedMetadataAddition] { &self.additions }
 
-    fn copy_with(&self, cx: &mut AllocationContext) -> Result<Self, CorrespondenceFailure> {
+    pub(crate) fn copy_with(&self, cx: &mut AllocationContext) -> Result<Self, CorrespondenceFailure> {
         let layer = copy_digest(&self.layer, cx)?;
         let before = self.before.try_clone_with(cx).map_err(data_copy_error)?;
         let mut additions = Vec::new();
@@ -54,7 +54,41 @@ impl DecodedVerifiedCorrespondence {
     pub(crate) fn proof(&self) -> &super::DecodedScopeCorrespondence { &self.proof }
     pub(crate) fn seed(&self) -> &FallibleDecodedDataSnapshot { &self.seed }
     pub(crate) fn frames(&self) -> &[DecodedReplayFrame] { &self.frames }
+    #[cfg(test)]
+    pub(crate) fn clear_frames_for_test(&mut self) { self.frames.clear(); }
     pub(crate) fn operation_seed(&self) -> &FallibleDecodedDataSnapshot { &self.operation_seed }
+
+    pub(crate) fn new_checked(
+        proof: super::DecodedScopeCorrespondence,
+        seed: FallibleDecodedDataSnapshot,
+        frames: Vec<DecodedReplayFrame>,
+        operation_seed: FallibleDecodedDataSnapshot,
+    ) -> Self { Self { proof, seed, frames, operation_seed } }
+
+    pub(crate) fn copy_with(&self, cx: &mut AllocationContext) -> Result<Self, CorrespondenceFailure> {
+        let proof = self.proof.copy_with(cx).map_err(map_decode)?;
+        let seed = self.seed.try_clone_with(cx).map_err(data_copy_error)?;
+        let operation_seed = self.operation_seed.try_clone_with(cx).map_err(data_copy_error)?;
+        let mut frames = Vec::new();
+        product_alloc::try_reserve(&mut frames, self.frames.len(), cx, AllocationSite::Vector)?;
+        for frame in &self.frames {
+            product_alloc::try_push(&mut frames, frame.copy_with(cx)?, cx, AllocationSite::Vector)?;
+        }
+        Ok(Self { proof, seed, frames, operation_seed })
+    }
+
+    pub(crate) fn bind_scenario(
+        &mut self,
+        original: crate::product_contract::FallibleDecodedScenarioSpec,
+        projected: crate::product_contract::FallibleDecodedScenarioSpec,
+        operation_seed: FallibleDecodedDataSnapshot,
+        cx: &mut AllocationContext,
+    ) -> Result<(), CorrespondenceFailure> {
+        let identity = operation_seed.identity_with(cx).map_err(copy_error)?;
+        self.proof.bind_scenario(original, projected, identity);
+        self.operation_seed = operation_seed;
+        Ok(())
+    }
 }
 
 fn copy_digest(value: &Digest, cx: &mut AllocationContext) -> Result<Digest, CorrespondenceFailure> {
@@ -98,7 +132,7 @@ fn codec_error(error: crate::product_backup::fallible_codec::CodecError) -> Corr
     }
 }
 
-fn metadata_keys(
+pub(super) fn metadata_keys(
     id: &Digest,
     layer: &DecodedScopeLayer,
     entity: &str,
@@ -142,12 +176,32 @@ pub(crate) fn derive(
     initialized: &FallibleDecodedDataSnapshot,
     cx: &mut AllocationContext,
 ) -> Result<DecodedVerifiedCorrespondence, CorrespondenceFailure> {
+    let working = super::replay_snapshot_fallible(snapshot, cx).map_err(|error| match error {
+        super::ReplayRegistryError::Store(error) => CorrespondenceFailure::Store(error),
+        super::ReplayRegistryError::Allocation(failure) => CorrespondenceFailure::Allocation(failure),
+    })?;
+    derive_with(&working, prior_frames, source, original, target, day, initialized, cx)
+}
+
+/// Derive using a replay registry already constructed by the caller. This is
+/// used by the fallible execution context so a sequence of proof checks shares
+/// one immutable replay owner instead of repeatedly rebuilding it.
+pub(crate) fn derive_with(
+    replay: &DecodedProjectSnapshot,
+    prior_frames: &[DecodedReplayFrame],
+    source: &FallibleDecodedCapturedProgram,
+    original: &FallibleDecodedDataSnapshot,
+    target: &FallibleDecodedCapturedProgram,
+    day: i32,
+    initialized: &FallibleDecodedDataSnapshot,
+    cx: &mut AllocationContext,
+) -> Result<DecodedVerifiedCorrespondence, CorrespondenceFailure> {
     if prior_frames.len() > super::contract::MAX_LAYERS {
         return Err(compiler::error("historical replay frame count exceeds bounds").into());
     }
-    let mut working = super::replay_snapshot_fallible(snapshot, cx).map_err(|error| match error {
-        super::ReplayRegistryError::Store(error) => CorrespondenceFailure::Store(error),
-        super::ReplayRegistryError::Allocation(failure) => CorrespondenceFailure::Allocation(failure),
+    let mut working = replay.try_clone_with(cx).map_err(|error| match error {
+        super::super::fallible_project_snapshot_decode::ProjectSnapshotCloneError::Allocation(failure) => CorrespondenceFailure::Allocation(failure),
+        super::super::fallible_project_snapshot_decode::ProjectSnapshotCloneError::Invariant => CorrespondenceFailure::Store(StoreError::Invalid("replay snapshot copy invariant".into())),
     })?;
     let source_id = working.retain_program_with(source, cx).map_err(copy_error)?;
     let target_id = target.revision_with(cx).map_err(copy_error)?;

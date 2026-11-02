@@ -24,8 +24,18 @@ pub(super) struct DecodedDataSnapshot {
     pub(super) records: Vec<DecodedRecord>,
     pub(super) events: Vec<DecodedBusinessEvent>,
 }
+impl crate::product_backup::fallible_codec::BackupWire for DecodedDataSnapshot {}
 
 impl DecodedDataSnapshot {
+    pub(crate) fn records(&self) -> &[DecodedRecord] { &self.records }
+    pub(crate) fn events(&self) -> &[DecodedBusinessEvent] { &self.events }
+    pub(crate) fn record(&self, entity: &str, id: &str) -> Option<&DecodedRecord> {
+        self.records.iter().find(|record| record.entity() == entity && record.id() == id)
+    }
+    pub(crate) fn events_start_with(&self, other: &Self) -> bool {
+        self.events.len() >= other.events.len()
+            && self.events[..other.events.len()] == other.events[..]
+    }
     /// Run the same persisted-state semantic checks as `DataSnapshot` while
     /// retaining Values in their fallibly ordered owner. This intentionally
     /// mirrors the legacy validation order; it does not materialize a legacy

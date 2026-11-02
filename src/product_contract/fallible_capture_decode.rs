@@ -45,6 +45,7 @@ impl DecodedCapturedProgram {
     }
 
     pub(crate) fn project_id(&self) -> &str { &self.binding.project_id }
+    pub(crate) fn binding(&self) -> &SourceBinding { &self.binding }
     pub(crate) fn program_digest(&self) -> &Digest { &self.artifact.program_digest }
 
     pub(crate) fn revision_with(&self, cx: &mut AllocationContext) -> Result<Digest, AppValidationError> {

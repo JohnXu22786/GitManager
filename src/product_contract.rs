@@ -400,6 +400,7 @@ impl FallibleDecodedCapturedProgram {
         self.0.validate_session_with(&session.0, cx)
     }
     pub(crate) fn project_id(&self) -> &str { self.0.project_id() }
+    pub(crate) fn binding(&self) -> &SourceBinding { self.0.binding() }
     pub(crate) fn program_digest(&self) -> &Digest { self.0.program_digest() }
     pub(crate) fn app(&self) -> &fallible_app_decode::DecodedAppDefinition { self.0.app() }
     pub(crate) fn revision_with(
@@ -433,6 +434,110 @@ impl FallibleDecodedCapturedProgram {
 }
 #[derive(Debug, Serialize)]
 pub(crate) struct FallibleDecodedScenarioSpec(fallible_scenario_decode::DecodedScenarioSpec);
+impl FallibleDecodedScenarioSpec {
+    pub(crate) fn id(&self) -> &str { self.0.id() }
+    pub(crate) fn clock_day(&self) -> i32 { self.0.clock_day() }
+    pub(crate) fn random_seed(&self) -> u64 { self.0.random_seed() }
+    pub(crate) fn matches_frame(&self, scenario: &Self) -> bool { self.0.matches_frame(&scenario.0) }
+
+    pub(crate) fn validate_with(
+        &self,
+        program: &FallibleDecodedCapturedProgram,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), AppValidationError> {
+        self.0.validate_with(program.app(), cx)
+    }
+
+    pub(crate) fn seed_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<FallibleDecodedDataSnapshot, AppValidationError> {
+        let value = crate::product_backup::fallible_codec::try_serialize_value(self.0.seed(), cx)
+            .map_err(|error| match error {
+                crate::product_backup::fallible_codec::CodecError::Allocation(failure) => AppValidationError::Allocation(failure),
+                _ => AppValidationError::Contract(ContractError("scenario seed copy invariant".into())),
+            })?;
+        fallible_snapshot_decode::decode_data_snapshot(value, cx)
+            .map(FallibleDecodedDataSnapshot)
+            .map_err(|error| match error {
+                fallible_value_decode::ValueDecodeError::Allocation(failure) => AppValidationError::Allocation(failure),
+                _ => AppValidationError::Contract(ContractError("scenario seed copy invariant".into())),
+            })
+    }
+
+    pub(crate) fn identity_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Digest, crate::product_backup::fallible_codec::CodecError> {
+        crate::product_backup::fallible_codec::canonical_digest(IdentityDomain::Scenario, self, cx)
+    }
+
+    pub(crate) fn try_clone_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Self, AppValidationError> {
+        let value = crate::product_backup::fallible_codec::try_serialize_value(self, cx)
+            .map_err(|error| match error {
+                crate::product_backup::fallible_codec::CodecError::Allocation(failure) => AppValidationError::Allocation(failure),
+                _ => AppValidationError::Contract(ContractError("scenario copy invariant".into())),
+            })?;
+        fallible_scenario_decode::decode_scenario_spec(value, cx).map(Self)
+            .map_err(|error| match error {
+                fallible_value_decode::ValueDecodeError::Allocation(failure) => AppValidationError::Allocation(failure),
+                _ => AppValidationError::Contract(ContractError("scenario copy invariant".into())),
+            })
+    }
+
+    pub(crate) fn with_seed_and_id(
+        &self,
+        seed: &FallibleDecodedDataSnapshot,
+        id: Option<&str>,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Self, AppValidationError> {
+        let mut value = crate::product_backup::fallible_codec::try_serialize_value(self, cx)
+            .map_err(|error| match error {
+                crate::product_backup::fallible_codec::CodecError::Allocation(failure) => AppValidationError::Allocation(failure),
+                _ => AppValidationError::Contract(ContractError("scenario projection copy invariant".into())),
+            })?;
+        let mut seed_value = crate::product_backup::fallible_codec::try_serialize_value(seed, cx)
+            .map_err(|error| match error {
+                crate::product_backup::fallible_codec::CodecError::Allocation(failure) => AppValidationError::Allocation(failure),
+                _ => AppValidationError::Contract(ContractError("scenario projection seed invariant".into())),
+            })?;
+        let crate::product_json::Value::Object(fields) = &mut value else {
+            return Err(AppValidationError::Contract(ContractError("scenario projection object invariant".into())));
+        };
+        let Some(seed_field) = fields.get_mut("seed") else {
+            return Err(AppValidationError::Contract(ContractError("scenario projection seed field invariant".into())));
+        };
+        std::mem::swap(seed_field, &mut seed_value);
+        if let Some(id) = id {
+            let copied = crate::product_alloc::try_copy_str(id, cx, crate::product_alloc::AllocationSite::String)
+                .map_err(AppValidationError::Allocation)?;
+            let Some(id_field) = fields.get_mut("id") else {
+                return Err(AppValidationError::Contract(ContractError("scenario projection id field invariant".into())));
+            };
+            *id_field = crate::product_json::Value::String(copied);
+        }
+        fallible_scenario_decode::decode_scenario_spec(value, cx).map(Self)
+            .map_err(|error| match error {
+                fallible_value_decode::ValueDecodeError::Allocation(failure) => AppValidationError::Allocation(failure),
+                _ => AppValidationError::Contract(ContractError("scenario projection decode invariant".into())),
+            })
+    }
+
+    pub(crate) fn scope_replay_namespace_with(
+        original: &Self,
+        mapped: &Self,
+        source: &FallibleDecodedCapturedProgram,
+        target: &FallibleDecodedCapturedProgram,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Digest, crate::product_backup::fallible_codec::CodecError> {
+        fallible_scenario_decode::scope_replay_namespace(
+            &original.0, &mapped.0, source.binding(), target.binding(), cx,
+        )
+    }
+}
 #[derive(Debug, Serialize)]
 pub(crate) struct FallibleDecodedRunEvidence(fallible_run_evidence_decode::DecodedRunEvidence);
 #[derive(Debug, Serialize)]
@@ -487,6 +592,8 @@ impl FallibleDecodedLocalArtifact {
 #[derive(Debug, Serialize)]
 pub(crate) struct FallibleDecodedAdoptionPlan(fallible_decision_decode::DecodedAdoptionPlan);
 impl FallibleDecodedAdoptionPlan {
+    pub(crate) fn expected_data(&self) -> &Digest { self.0.expected_data() }
+
     pub(crate) fn validate_with(
         &self,
         cx: &mut crate::product_alloc::AllocationContext,
