@@ -49,6 +49,12 @@ pub(crate) struct DecodedOwnedLayerV2 {
     lifecycle: DecodedOwnedLifecycleV2,
     inventory: DecodedOwnedInventoryV2,
 }
+impl DecodedOwnedLayerV2 {
+    pub(crate) fn candidate(&self) -> &Digest { &self.candidate }
+    pub(crate) fn request(&self) -> &DecodedOwnedPreviewRequest { &self.request }
+    pub(crate) fn lifecycle(&self) -> &DecodedOwnedLifecycleV2 { &self.lifecycle }
+}
+impl crate::product_backup::fallible_codec::BackupWire for DecodedOwnedLayerV2 {}
 
 pub(crate) fn decode_owned_basis_v2(value: Value, cx: &mut AllocationContext) -> Result<DecodedOwnedBasisV2, ValueDecodeError> {
     let mut fields = struct_fields(value, "a struct OwnedBasisV2", BASIS_FIELDS)?;

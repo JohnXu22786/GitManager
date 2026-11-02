@@ -346,6 +346,13 @@ impl LifecycleAcceptanceHost {
     ) -> AdmissionResult<AcceptedPreviewLifecycle> {
         self.record_event(store, "synthetic-operator-fixture")
     }
+    #[cfg(test)]
+    pub(crate) fn explicit_host_accept_for_test(
+        &mut self,
+        store: &ProductStore,
+    ) -> AdmissionResult<AcceptedPreviewLifecycle> {
+        self.record_event(store, "explicit-host-ui")
+    }
 }
 
 impl AcceptedPreviewLifecycle {

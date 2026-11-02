@@ -40,6 +40,11 @@ pub(crate) struct DecodedOwnedSourceRequest {
     root_entity: String,
     edits: Vec<DecodedOwnedSpanEdit>,
 }
+impl DecodedOwnedSourceRequest {
+    pub(crate) fn before(&self) -> &Digest { &self.before }
+    pub(crate) fn after(&self) -> &Digest { &self.after }
+    pub(crate) fn root_entity(&self) -> &str { &self.root_entity }
+}
 #[derive(Debug, Serialize)]
 struct DecodedOwnedSpanEdit {
     id: String,

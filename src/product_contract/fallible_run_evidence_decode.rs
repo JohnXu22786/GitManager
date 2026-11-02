@@ -36,6 +36,12 @@ pub(super) struct DecodedRunEvidence {
     uncovered: Vec<String>,
 }
 impl DecodedRunEvidence {
+    pub(super) fn state(&self) -> EvidenceState { self.state }
+    pub(super) fn trace_count(&self) -> usize { self.trace.len() }
+    pub(super) fn observation_count(&self) -> usize { self.observations.len() }
+    pub(super) fn limits(&self) -> &RuntimeLimits { &self.limits }
+}
+impl DecodedRunEvidence {
     /// Validate the exact bounded form minted by the decoded single-Observe
     /// replay driver. This is intentionally not a general persisted-evidence
     /// validator: its one trace frame is tied to the validated current seed,

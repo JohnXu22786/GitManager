@@ -197,6 +197,14 @@ impl ProductStore {
                 assert_eq!(guard_recipe, guard_input);
                 (reconstructed, proof)
             };
+            if case == "selected" {
+                self.assert_decoded_lifecycle_acceptance(candidate, request, &old_accepted, true);
+                let mut host = LifecycleAcceptanceHost::prepare(
+                    self, candidate, request, &crate::witnesses(self), ProofBudget::default(), crate::cancel(),
+                ).unwrap();
+                let explicit = host.explicit_host_accept_for_test(self).unwrap();
+                self.assert_decoded_lifecycle_acceptance(candidate, request, &explicit, false);
+            }
             assert_eq!(old_accepted.recipe(), lifecycle);
             assert_eq!(new_accepted.recipe(), old_accepted.recipe());
             assert_proof_eq(&old, &new);
@@ -221,6 +229,131 @@ impl ProductStore {
         assert_eq!((snapshot, candidate.clone(), request.clone(), accepted.recipe()), inputs);
         assert_eq!(self.load().unwrap(), inputs.0);
         assert_eq!(self.root.read("CURRENT", 16 * 1024).unwrap(), current);
+    }
+
+    fn assert_decoded_lifecycle_acceptance(
+        &self,
+        candidate: &CapturedProgram,
+        request: &OwnedPreviewRequest,
+        accepted: &AcceptedPreviewLifecycle,
+        probe_allocation_refusals: bool,
+    ) {
+        use crate::product_alloc::AllocationContext;
+        use crate::product_contract::{canonical_digest, IdentityDomain};
+        use crate::product_store::fallible_project_snapshot_decode::decode_project_snapshot;
+        use crate::product_store::scope::{FallibleAcceptedPreviewLifecycle, LifecycleAcceptanceFailure, ProofBudget};
+        let cancel = || Arc::new(AtomicBool::new(false));
+        let snapshot = self.load().unwrap();
+        let lifecycle = accepted.recipe();
+        let prepared = super::super::owned_persist::owned_retained_preview_for_test(
+            self, candidate, request, accepted,
+        ).unwrap();
+        let persisted = super::super::owned_persist::owned_snapshot_for_test(
+            &prepared, "decoded-lifecycle-acceptance", false,
+        ).unwrap();
+        let (layer_id, _) = match &persisted.scope {
+            ScopeEnvelope::OwnedV2(state) => state.layers.iter()
+                .find(|(_, layer)| layer.lifecycle == lifecycle)
+                .expect("the accepted lifecycle is persisted in a layer"),
+            _ => panic!("owned snapshot fixture expected"),
+        };
+        let mut decode_allocations = AllocationContext::new();
+        let bytes = serde_json::to_vec(&snapshot).unwrap();
+        let syntax = crate::product_json::parse_json_bytes(&bytes, &mut decode_allocations).unwrap();
+        let decoded = decode_project_snapshot(syntax, &mut decode_allocations).unwrap();
+        let bytes = serde_json::to_vec(&persisted).unwrap();
+        let syntax = crate::product_json::parse_json_bytes(&bytes, &mut decode_allocations).unwrap();
+        let decoded_persisted = decode_project_snapshot(syntax, &mut decode_allocations).unwrap();
+        let decoded_layer = decoded_persisted.owned_scope().unwrap().layer(layer_id).unwrap();
+        let revision = canonical_digest(IdentityDomain::Source, candidate).unwrap();
+        let decoded_candidate = decoded_persisted.captured_program_by_revision_with(&revision, &mut decode_allocations)
+            .unwrap().expect("retained candidate program");
+        let mut meter = ProofMeter::new(ProofBudget::default(), cancel()).unwrap();
+        let mut profile = InitialLimitsProfile::new(&mut meter).unwrap();
+        let mut allocations = AllocationContext::new();
+        let proof = FallibleAcceptedPreviewLifecycle::reconstruct(
+            &decoded, decoded_layer, &decoded_candidate, decoded_layer.request(),
+            &mut meter, Some(&mut profile), &mut allocations,
+        ).unwrap();
+        assert_eq!(proof.identity(), &lifecycle.event);
+
+        if !probe_allocation_refusals { return; }
+
+        // Rehashed lifecycle commitments cannot authorize a stale request
+        // snapshot or after-source. These conditions are checked by ordinary
+        // inventory authentication; the opaque capability must enforce the
+        // same binding before it can be minted on its own.
+        for stale_binding in ["snapshot", "source_after"] {
+            let mut altered_request = request.clone();
+            if stale_binding == "snapshot" {
+                altered_request.inventory.snapshot = canonical_digest(
+                    IdentityDomain::Data, &"different current frame",
+                ).unwrap();
+            } else {
+                altered_request.inventory.sources.after = canonical_digest(
+                    IdentityDomain::Source, &"different candidate",
+                ).unwrap();
+            }
+            let mut altered_lifecycle = lifecycle.clone();
+            rebind_negative_recipe(&snapshot, candidate, &altered_request, &mut altered_lifecycle);
+            let mut altered_persisted = persisted.clone();
+            let ScopeEnvelope::OwnedV2(state) = &mut altered_persisted.scope else {
+                panic!("owned snapshot fixture expected");
+            };
+            let altered_layer = state.layers.get_mut(layer_id).unwrap();
+            altered_layer.request = altered_request;
+            altered_layer.lifecycle = altered_lifecycle;
+            let bytes = serde_json::to_vec(&altered_persisted).unwrap();
+            let syntax = crate::product_json::parse_json_bytes(&bytes, &mut AllocationContext::new()).unwrap();
+            let mut altered_allocations = AllocationContext::new();
+            let decoded_altered = decode_project_snapshot(syntax, &mut altered_allocations).unwrap();
+            let altered_layer = decoded_altered.owned_scope().unwrap().layer(layer_id).unwrap();
+            let mut altered_meter = ProofMeter::new(ProofBudget::default(), cancel()).unwrap();
+            let result = FallibleAcceptedPreviewLifecycle::reconstruct(
+                &decoded, altered_layer, &decoded_candidate, altered_layer.request(),
+                &mut altered_meter, None, &mut altered_allocations,
+            );
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("stale {stale_binding} minted lifecycle acceptance"),
+            };
+            assert!(matches!(error, LifecycleAcceptanceFailure::Store(StoreError::Invalid(_))),
+                "stale {stale_binding} must not mint lifecycle acceptance: {error:?}");
+        }
+
+        let mut baseline = AllocationContext::new();
+        let mut meter = ProofMeter::new(ProofBudget::default(), cancel()).unwrap();
+        FallibleAcceptedPreviewLifecycle::reconstruct(
+            &decoded, decoded_layer, &decoded_candidate, decoded_layer.request(),
+            &mut meter, None, &mut baseline,
+        ).unwrap();
+        let growths = baseline.growth_requests();
+        assert!(growths > 0);
+        // Fault points span identity/evidence encoding, application merge and
+        // the later predicate projection while keeping this integration gate
+        // bounded; every failed run retains its typed refusal, followed by a
+        // clean-context retry below.
+        let mut fault_points = vec![1, (growths / 3).max(1), (growths.saturating_mul(2) / 3).max(1), growths];
+        fault_points.sort_unstable();
+        fault_points.dedup();
+        for ordinal in fault_points {
+            let mut allocations = AllocationContext::fail_nth_growth(
+                std::num::NonZeroUsize::new(ordinal).unwrap(), true,
+            );
+            let mut meter = ProofMeter::new(ProofBudget::default(), cancel()).unwrap();
+            let result = FallibleAcceptedPreviewLifecycle::reconstruct(
+                &decoded, decoded_layer, &decoded_candidate, decoded_layer.request(),
+                &mut meter, None, &mut allocations,
+            );
+            assert!(matches!(result, Err(LifecycleAcceptanceFailure::Allocation(_))), "growth {ordinal}/{growths}");
+        }
+        let mut retry_allocations = AllocationContext::new();
+        let mut retry_meter = ProofMeter::new(ProofBudget::default(), cancel()).unwrap();
+        let retry = FallibleAcceptedPreviewLifecycle::reconstruct(
+            &decoded, decoded_layer, &decoded_candidate, decoded_layer.request(),
+            &mut retry_meter, None, &mut retry_allocations,
+        ).unwrap();
+        assert_eq!(retry.identity(), &lifecycle.event);
     }
 
     pub(crate) fn assert_retained_lifecycle_error_for_test(

@@ -6,6 +6,8 @@ use crate::product_contract::fallible_value_decode::{JsonKind, ValueDecodeError}
 use crate::product_contract::{decode_record_ref_fallible, Digest, Expr, RecordRef, MAX_COLLECTION, MAX_ITEMS, MAX_TEXT_BYTES};
 use crate::product_json::{Number, Value};
 use serde::Serialize;
+use serde::ser::SerializeTuple;
+use serde::Serializer;
 use super::fallible_owned_source_decode::{decode_owned_source_request, DecodedOwnedSourceRequest};
 use super::fallible_scalar_decode::{decode_operation_set, decode_scope_population, FallibleIdSet, ScopePopulationDto};
 
@@ -31,6 +33,36 @@ pub(crate) struct DecodedOwnedPreviewRequest {
     population: ScopePopulationDto, excluded_records: Vec<RecordRef>, operations: FallibleIdSet,
     availability: DecodedOwnedPreviewAvailability, purpose: String,
 }
+impl DecodedOwnedPreviewRequest {
+    pub(crate) fn snapshot(&self) -> &Digest { &self.inventory.snapshot }
+    pub(crate) fn source_before(&self) -> &Digest { self.inventory.sources.before() }
+    pub(crate) fn source_after(&self) -> &Digest { self.inventory.sources.after() }
+    pub(crate) fn root_entity(&self) -> &str { self.inventory.sources.root_entity() }
+    pub(crate) fn lifecycle_predicates(&self) -> (&Expr, &Expr) {
+        (&self.inventory.lifecycle.before, &self.inventory.lifecycle.after)
+    }
+    pub(crate) fn identity_with(
+        &self,
+        cx: &mut AllocationContext,
+    ) -> std::result::Result<Digest, crate::product_backup::fallible_codec::CodecError> {
+        crate::product_backup::fallible_codec::canonical_digest(
+            crate::product_contract::IdentityDomain::Evidence,
+            &OwnedPreviewRequestIdentity(self),
+            cx,
+        )
+    }
+}
+struct OwnedPreviewRequestIdentity<'a>(&'a DecodedOwnedPreviewRequest);
+impl Serialize for OwnedPreviewRequestIdentity<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut tuple = serializer.serialize_tuple(2)?;
+        tuple.serialize_element("owned-preview-request/1")?;
+        tuple.serialize_element(self.0)?;
+        tuple.end()
+    }
+}
+impl crate::product_backup::fallible_codec::BackupWire for OwnedPreviewRequestIdentity<'_> {}
+impl crate::product_backup::fallible_codec::BackupWire for DecodedOwnedPreviewRequest {}
 #[derive(Debug, Serialize)]
 pub(crate) struct DecodedOwnedEffectRequest { snapshot: Digest, sources: DecodedOwnedSourceRequest, auxiliary: Vec<DecodedOwnedAuxiliary> }
 

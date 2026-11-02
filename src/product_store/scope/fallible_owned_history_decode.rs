@@ -87,6 +87,10 @@ pub(crate) struct DecodedOwnedScopeStateV2 {
     rehearsals: FallibleScopeMap<Digest, DecodedOwnedRehearsalV2>,
     correspondences: FallibleScopeMap<Digest, DecodedOwnedCorrespondenceReceiptV2>,
 }
+impl DecodedOwnedScopeStateV2 {
+    pub(crate) fn version(&self) -> u32 { self.version }
+    pub(crate) fn layer(&self, id: &Digest) -> Option<&DecodedOwnedLayerV2> { self.layers.get(id) }
+}
 
 pub(crate) fn decode_owned_rehearsal_v2(
     value: Value,

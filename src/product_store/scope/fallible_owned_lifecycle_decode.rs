@@ -28,13 +28,34 @@ pub(crate) struct DecodedOwnedLifecycleV2 {
     event: Digest,
     origin: DecodedOwnedAcceptanceOriginV2,
 }
+impl crate::product_backup::fallible_codec::BackupWire for DecodedOwnedLifecycleV2 {}
+
+impl DecodedOwnedLifecycleV2 {
+    pub(crate) fn version(&self) -> u32 { self.version }
+    pub(crate) fn witnesses(&self) -> &[DecodedLifecycleWitness] { &self.witnesses }
+    pub(crate) fn evidence(&self) -> &[FallibleDecodedRunEvidence] { &self.evidence }
+    pub(crate) fn disclosure(&self) -> &Digest { &self.disclosure }
+    pub(crate) fn event(&self) -> &Digest { &self.event }
+    pub(crate) fn origin_label(&self) -> &'static str {
+        match &self.origin {
+            DecodedOwnedAcceptanceOriginV2::ExplicitHostUi => "explicit-host-ui",
+            DecodedOwnedAcceptanceOriginV2::SyntheticOperatorFixture => "synthetic-operator-fixture",
+        }
+    }
+}
 
 #[derive(Debug, Serialize)]
-struct DecodedLifecycleWitness {
+pub(crate) struct DecodedLifecycleWitness {
     side: OwnedSourceSide,
     scenario: FallibleDecodedScenarioSpec,
     completed: crate::product_contract::RecordRef,
     unfinished: crate::product_contract::RecordRef,
+}
+impl DecodedLifecycleWitness {
+    pub(crate) fn side(&self) -> OwnedSourceSide { self.side }
+    pub(crate) fn scenario(&self) -> &FallibleDecodedScenarioSpec { &self.scenario }
+    pub(crate) fn completed(&self) -> &crate::product_contract::RecordRef { &self.completed }
+    pub(crate) fn unfinished(&self) -> &crate::product_contract::RecordRef { &self.unfinished }
 }
 
 #[derive(Debug, Serialize)]

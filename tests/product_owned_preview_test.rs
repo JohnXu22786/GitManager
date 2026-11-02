@@ -1,6 +1,10 @@
 //! Host acceptance is synthetic here, through the production controller boundary.
 #[path = "fixtures/common_fact/mod.rs"]
 mod fixture;
+#[path = "../src/product_locations.rs"]
+mod product_locations;
+#[path = "../src/product_backup.rs"]
+mod product_backup;
 #[path = "../src/product_contract.rs"]
 mod product_contract;
 #[path = "../src/product_decisions/mod.rs"]

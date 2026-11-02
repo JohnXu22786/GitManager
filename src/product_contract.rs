@@ -637,6 +637,10 @@ pub(crate) enum RuntimeEvidenceError {
     Allocation(crate::product_alloc::AllocationFailure),
 }
 impl FallibleDecodedRunEvidence {
+    pub(crate) fn state(&self) -> EvidenceState { self.0.state() }
+    pub(crate) fn trace_count(&self) -> usize { self.0.trace_count() }
+    pub(crate) fn observation_count(&self) -> usize { self.0.observation_count() }
+    pub(crate) fn limits(&self) -> &RuntimeLimits { self.0.limits() }
     pub(crate) fn validate_single_observe(
         &self,
         cx: &mut crate::product_alloc::AllocationContext,

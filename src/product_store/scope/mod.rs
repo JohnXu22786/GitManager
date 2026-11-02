@@ -1,6 +1,7 @@
 //! Host-owned scoped executable composition and protected completion history.
 #[allow(dead_code)]
 mod fallible_owned_lifecycle_decode;
+mod fallible_owned_lifecycle_acceptance;
 #[allow(dead_code)]
 mod fallible_owned_basis_layer_decode;
 #[allow(dead_code)]
@@ -23,6 +24,11 @@ pub(crate) use fallible_correspondence::{derive as derive_correspondence_fallibl
 pub(crate) use fallible_history::{initialize as initialize_scalar_fallible, initialize_frame as initialize_scalar_frame_fallible,
     initialization_receipt as scalar_initialization_receipt, InitializationFailure};
 pub(crate) use fallible_scope_envelope_decode::{decode_scope_envelope as decode_scope_envelope_fallible, DecodedScopeEnvelope as FallibleDecodedScopeEnvelope};
+pub(crate) use fallible_owned_history_decode::DecodedOwnedScopeStateV2;
+pub(crate) use fallible_owned_basis_layer_decode::DecodedOwnedLayerV2;
+pub(crate) use fallible_owned_lifecycle_decode::{DecodedOwnedLifecycleV2, DecodedLifecycleWitness};
+pub(crate) use fallible_owned_lifecycle_acceptance::{FallibleAcceptedPreviewLifecycle, LifecycleAcceptanceFailure};
+pub(crate) use fallible_owned_request_decode::DecodedOwnedPreviewRequest;
 pub(crate) use fallible_scalar_decode::{decode_compatibility_report as decode_compatibility_report_fallible, DecodedCompatibilityReport, DecodedSemanticKey};
 pub(crate) use fallible_scalar_decode::{
     decode_effect_destination as decode_effect_destination_fallible,

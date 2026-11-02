@@ -307,6 +307,10 @@ impl DecodedProjectSnapshot {
         }
     }
 
+    pub(crate) fn owned_scope(&self) -> Option<&crate::product_store::scope::DecodedOwnedScopeStateV2> {
+        self.scope.owned()
+    }
+
     pub(crate) fn scalar_scope_mut(&mut self) -> Option<&mut crate::product_store::scope::FallibleDecodedScopeState> {
         self.scope.scalar_mut()
     }
