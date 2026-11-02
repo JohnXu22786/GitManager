@@ -104,6 +104,44 @@ pub(super) struct DecodedAdoptionPlan {
     evidence: Vec<Digest>,
     retire_decisions: Vec<String>,
 }
+impl DecodedAdoptionPlan {
+    pub(crate) fn validate_with(
+        &self,
+        cx: &mut AllocationContext,
+    ) -> Result<(), super::DecisionValidationError> {
+        super::version(self.version)?;
+        super::check_id(&self.id)?;
+        super::check_id(&self.project_id)?;
+        self.current_source.validate()?;
+        self.target.validate()?;
+        super::validate_decoded_decision_scope(&self.scope, cx)?;
+        super::require(
+            self.project_id == self.current_source.project_id,
+            "plan project/source mismatch",
+        )?;
+        super::unique_with(self.required_decisions.iter().map(String::as_str), cx)?;
+        super::unique_with(self.retire_decisions.iter().map(String::as_str), cx)?;
+        super::bounded(self.checks.len())?;
+        super::bounded(self.evidence.len())?;
+        super::require(
+            self.compatibility.identity_matches(&self.expected_data, &self.target.program_digest),
+            "compatibility refers to different data/program",
+        )?;
+        self.compatibility.validate_with(cx)?;
+        for check in &self.checks {
+            super::check_id(&check.decision)?;
+            check.binding.validate()?;
+            super::text(&check.explanation)?;
+            if check.state == super::CheckState::Satisfied {
+                super::require(
+                    check.scope == super::ScopeMatch::Applies && check.evidence.is_some(),
+                    "satisfied decision has no applicable run evidence",
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Serialize)]
 struct DecodedDecisionCheck {

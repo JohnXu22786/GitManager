@@ -2,7 +2,9 @@
 //! fallible ordered-owner representations. The validator has one execution
 //! path so wire and error precedence cannot drift between the two models.
 use super::*;
-use std::collections::BTreeSet;
+use crate::product_alloc::{self, ordered::OrderedSet, AllocationContext, AllocationFailure, AllocationSite};
+use serde::ser::SerializeSeq;
+use serde::{Serialize, Serializer};
 
 trait ValueMap {
     fn len(&self) -> usize;
@@ -134,7 +136,38 @@ impl Snapshot for super::fallible_snapshot_decode::DecodedDataSnapshot {
     fn events(&self) -> &[Self::Event] { &self.events }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum SnapshotValidationError {
+    Contract(ContractError),
+    Allocation(AllocationFailure),
+}
+
 pub(super) fn validate<T: Snapshot>(snapshot: &T, a: Audit<'_>) -> Result<()> {
+    let mut cx = AllocationContext::new();
+    match validate_with(snapshot, a, &mut cx) {
+        Ok(()) => Ok(()),
+        Err(SnapshotValidationError::Contract(error)) => Err(error),
+        Err(SnapshotValidationError::Allocation(_)) => Err(ContractError(String::new())),
+    }
+}
+
+pub(super) fn validate_with<T: Snapshot>(
+    snapshot: &T,
+    a: Audit<'_>,
+    cx: &mut AllocationContext,
+) -> std::result::Result<(), SnapshotValidationError> {
+    if let Some(failure) = cx.first_failure() {
+        return Err(SnapshotValidationError::Allocation(failure));
+    }
+    validate_inner(snapshot, a, cx).map_err(|error| {
+        match cx.first_failure() {
+            Some(failure) => SnapshotValidationError::Allocation(failure),
+            None => SnapshotValidationError::Contract(error),
+        }
+    })
+}
+
+fn validate_inner<T: Snapshot>(snapshot: &T, a: Audit<'_>, cx: &mut AllocationContext) -> Result<()> {
     a.pay(8)?;
     a.version(snapshot.version())?;
     a.check_id(snapshot.project_id())?;
@@ -148,14 +181,15 @@ pub(super) fn validate<T: Snapshot>(snapshot: &T, a: Audit<'_>) -> Result<()> {
         outputs: &[], app: super::AppRef::Snapshot, allocation: None, allocation_failure: None, nodes: 0, audit: a };
     validate_entities(schema_slice, &mut validator)?;
     a.pay(8)?;
-    let mut records = BTreeSet::new();
+    let mut records = OrderedSet::new();
     a.slice(records_slice.len())?;
     for record in records_slice {
         a.pay(12)?;
         a.check_id(record.id())?;
         a.require(record.revision() > 0, "record revision must be positive")?;
         a.insert::<(&str, &str), ()>(records.len(), a.pair_comparator(record.entity(), record.id())?)?;
-        a.require(records.insert((record.entity(), record.id())), "duplicate record identity")?;
+        let inserted = records.try_insert((record.entity(), record.id()), cx).map_err(|_| ContractError(String::new()))?;
+        a.require(inserted, "duplicate record identity")?;
         let values = record.values();
         a.pay(4)?;
         let entity = validator.entity(record.entity())?;
@@ -186,7 +220,7 @@ pub(super) fn validate<T: Snapshot>(snapshot: &T, a: Audit<'_>) -> Result<()> {
         a.slice(entity.unique.len())?;
         for fields in &entity.unique {
             a.pay(8)?;
-            let mut tuples = BTreeSet::new();
+            let mut tuples = OrderedSet::new();
             a.slice(records_slice.len())?;
             for record in records_slice {
                 a.pay(12)?;
@@ -198,22 +232,32 @@ pub(super) fn validate<T: Snapshot>(snapshot: &T, a: Audit<'_>) -> Result<()> {
                     for field in fields { a.pay(5)?; a.map_search(record.values().len(), field.len())?; }
                 }
                 let null = DataValue::Null;
-                let tuple: Vec<_> = fields.iter().map(|field|
-                    record.values().get(field).unwrap_or(&null)).collect();
+                let mut tuple = Vec::new();
+                product_alloc::try_reserve(&mut tuple, fields.len(), cx, AllocationSite::Vector)
+                    .map_err(|_| ContractError(String::new()))?;
+                for field in fields {
+                    tuple.push(record.values().get(field).unwrap_or(&null));
+                }
                 let mut has_null = false;
                 a.pay(1)?;
                 for value in &tuple { a.pay(12)?; a.pay(4)?; if matches!(value, DataValue::Null) { has_null = true; break; } }
                 a.pay(1)?;
                 if has_null { continue; }
-                let bytes = capture_canonical::canonical_bytes_audited(&tuple, a)?;
+                let bytes = if a.enabled() {
+                    capture_canonical::canonical_bytes_audited(&tuple, a)?
+                } else {
+                    crate::product_backup::fallible_codec::canonical_bytes(&DataValueTuple(&tuple), cx)
+                        .map_err(|_| ContractError(String::new()))?
+                };
                 a.insert::<Vec<u8>, ()>(tuples.len(), a.comparator(bytes.len())?)?;
-                a.require(tuples.insert(bytes), "duplicate unique field tuple")?;
+                let inserted = tuples.try_insert(bytes, cx).map_err(|_| ContractError(String::new()))?;
+                a.require(inserted, "duplicate unique field tuple")?;
             }
         }
     }
     a.pay(17)?;
-    let mut event_ids = BTreeSet::new();
-    let mut operations = BTreeSet::new();
+    let mut event_ids = OrderedSet::new();
+    let mut operations = OrderedSet::new();
     let mut previous = 0;
     a.slice(events_slice.len())?;
     for event in events_slice {
@@ -223,10 +267,10 @@ pub(super) fn validate<T: Snapshot>(snapshot: &T, a: Audit<'_>) -> Result<()> {
         a.check_id(event.action())?;
         a.day(event.day())?;
         a.insert::<&String, ()>(event_ids.len(), a.comparator(event.id().len())?)?;
-        let new_event = event_ids.insert(event.id());
+        let new_event = event_ids.try_insert(event.id(), cx).map_err(|_| ContractError(String::new()))?;
         let distinct = if new_event {
             a.insert::<&String, ()>(operations.len(), a.comparator(event.operation().len())?)?;
-            operations.insert(event.operation())
+            operations.try_insert(event.operation(), cx).map_err(|_| ContractError(String::new()))?
         } else { false };
         a.require(distinct, "duplicate event or operation receipt")?;
         a.require(event.sequence() > previous && event.sequence() <= snapshot.generation(),
@@ -236,13 +280,14 @@ pub(super) fn validate<T: Snapshot>(snapshot: &T, a: Audit<'_>) -> Result<()> {
         a.bounded(changes.len())?;
         a.bounded(event.outputs_len())?;
         a.pay(8)?;
-        let mut changed = BTreeSet::new();
+        let mut changed = OrderedSet::new();
         a.slice(changes.len())?;
         for change in changes {
             a.pay(12)?;
             a.check_id(change.record())?;
             a.insert::<(&String, &String), ()>(changed.len(), a.pair_comparator(change.entity(), change.record())?)?;
-            a.require(changed.insert((change.entity(), change.record())), "duplicate event record change")?;
+            let inserted = changed.try_insert((change.entity(), change.record()), cx).map_err(|_| ContractError(String::new()))?;
+            a.require(inserted, "duplicate event record change")?;
             validator.entity(change.entity())?;
             if a.enabled() {
                 a.pay(bounded_input::capture_payment_core::SEARCH_DESCRIPTOR)?;
@@ -266,4 +311,13 @@ pub(super) fn validate<T: Snapshot>(snapshot: &T, a: Audit<'_>) -> Result<()> {
         }
     }
     capture_canonical::data_serialized_bound_audited(snapshot, a)
+}
+
+pub(crate) struct DataValueTuple<'a>(pub(crate) &'a [&'a DataValue]);
+impl Serialize for DataValueTuple<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for value in self.0 { sequence.serialize_element(value)?; }
+        sequence.end()
+    }
 }

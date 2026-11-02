@@ -30,6 +30,27 @@ pub(crate) struct DecodedCapturedProgram {
     program: DecodedAppDefinition,
 }
 impl DecodedCapturedProgram {
+    pub(crate) fn validate_app_with(&self, cx: &mut AllocationContext) -> Result<(), AppValidationError> {
+        self.program.validate_with(cx)
+    }
+
+    pub(crate) fn validate_session_with(
+        &self,
+        session: &super::fallible_persisted_decode::DecodedSessionState,
+        cx: &mut AllocationContext,
+    ) -> Result<(), AppValidationError> {
+        self.program.validate_with(cx)?;
+        self.program.validate_session_with(session).map_err(AppValidationError::Contract)
+    }
+
+    pub(crate) fn project_id(&self) -> &str { &self.binding.project_id }
+    pub(crate) fn program_digest(&self) -> &Digest { &self.artifact.program_digest }
+
+    pub(crate) fn revision_with(&self, cx: &mut AllocationContext) -> Result<Digest, AppValidationError> {
+        crate::product_backup::fallible_codec::canonical_digest(IdentityDomain::Source, self, cx)
+            .map_err(codec_validation_error)
+    }
+
     pub(crate) fn validate_with(&self, cx: &mut AllocationContext) -> Result<(), AppValidationError> {
         self.binding.validate().map_err(AppValidationError::Contract)?;
         if self.artifact.version != super::CONTRACT_VERSION

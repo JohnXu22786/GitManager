@@ -6,7 +6,7 @@
 use crate::product_alloc::{self, ordered::{OrderedMap, OrderedSet}, AllocationContext, AllocationSite};
 use crate::product_contract::fallible_expr_decode::decode_expr;
 use crate::product_contract::fallible_value_decode::{decode_type, decode_values, JsonKind, NumericValue, ValueDecodeError};
-use crate::product_contract::{decode_captured_program_fallible, decode_data_snapshot_fallible, decode_record_ref_fallible, decode_scenario_spec_fallible, decode_session_state_fallible, CompatibilityState, Digest, Expr, FallibleDecodedCapturedProgram, FallibleDecodedDataSnapshot, FallibleDecodedScenarioSpec, FallibleDecodedSessionState, FallibleValues, RecordRef, SemanticKind, Type, MAX_COLLECTION, MAX_EVENTS, MAX_EXPR_DEPTH, MAX_ITEMS};
+use crate::product_contract::{decode_captured_program_fallible, decode_data_snapshot_fallible, decode_record_ref_fallible, decode_scenario_spec_fallible, decode_session_state_fallible, AppValidationError, CompatibilityState, ContractError, DecisionValidationError, Digest, Expr, FallibleDecodedCapturedProgram, FallibleDecodedDataSnapshot, FallibleDecodedScenarioSpec, FallibleDecodedSessionState, FallibleValues, RecordRef, SemanticKind, Type, MAX_COLLECTION, MAX_EVENTS, MAX_EXPR_DEPTH, MAX_ITEMS, MAX_TEXT_BYTES};
 use super::contract::ScopeTransition;
 use crate::product_json::{Number, Value};
 use serde::ser::{SerializeMap, SerializeSeq};
@@ -196,6 +196,85 @@ pub(crate) struct DecodedCompatibilityReport {
     state: CompatibilityState, current_data: Digest, target_program: Digest,
     retained_records: Vec<RecordRef>, retained_events: Vec<String>,
     retained_fields: Vec<DecodedSemanticKey>, issues: Vec<String>,
+}
+impl DecodedCompatibilityReport {
+    pub(crate) fn identity_matches(&self, current_data: &Digest, target_program: &Digest) -> bool {
+        &self.current_data == current_data && &self.target_program == target_program
+    }
+
+    pub(crate) fn validate_with(
+        &self,
+        cx: &mut AllocationContext,
+    ) -> Result<(), DecisionValidationError> {
+        if self.retained_records.len() > MAX_COLLECTION {
+            return Err(DecisionValidationError::Contract(ContractError("record selection exceeds limit".into())));
+        }
+        let mut records = OrderedSet::new();
+        for record in &self.retained_records {
+            check_fallible_id(&record.entity)?;
+            check_fallible_id(&record.record)?;
+            if !records.try_insert((record.entity.as_str(), record.record.as_str()), cx)
+                .map_err(DecisionValidationError::Allocation)?
+            {
+                return Err(DecisionValidationError::Contract(ContractError("duplicate selected record".into())));
+            }
+        }
+        if self.retained_events.len() > MAX_EVENTS || self.retained_fields.len() > MAX_COLLECTION {
+            return Err(DecisionValidationError::Contract(ContractError("compatibility retention inventory exceeds bounds".into())));
+        }
+        let mut events = OrderedSet::new();
+        for event in &self.retained_events {
+            check_fallible_id(event)?;
+            if !events.try_insert(event.as_str(), cx).map_err(DecisionValidationError::Allocation)? {
+                return Err(DecisionValidationError::Contract(ContractError("duplicate retained event".into())));
+            }
+        }
+        let mut fields = OrderedSet::new();
+        for field in &self.retained_fields {
+            field.validate()?;
+            if field.kind != SemanticKind::Field {
+                return Err(DecisionValidationError::Contract(ContractError("retained field inventory contains a non-field key".into())));
+            }
+            let key = crate::product_backup::fallible_codec::canonical_bytes(field, cx)
+                .map_err(|error| match error {
+                    crate::product_backup::fallible_codec::CodecError::Allocation(failure) => {
+                        DecisionValidationError::Allocation(failure)
+                    }
+                    _ => DecisionValidationError::Contract(ContractError("semantic key encoding failed".into())),
+                })?;
+            if !fields.try_insert(key, cx).map_err(DecisionValidationError::Allocation)? {
+                return Err(DecisionValidationError::Contract(ContractError("duplicate retained semantic key".into())));
+            }
+        }
+        if self.issues.len() > MAX_ITEMS {
+            return Err(DecisionValidationError::Contract(ContractError("too many definitions or steps".into())));
+        }
+        for issue in &self.issues {
+            if issue.len() > MAX_TEXT_BYTES {
+                return Err(DecisionValidationError::Contract(ContractError("text exceeds byte limit".into())));
+            }
+            if issue.trim().is_empty() {
+                return Err(DecisionValidationError::Contract(ContractError("empty required text".into())));
+            }
+        }
+        Ok(())
+    }
+}
+impl DecodedSemanticKey {
+    fn validate(&self) -> Result<(), DecisionValidationError> {
+        check_fallible_id(&self.id)?;
+        if let Some(entity) = &self.entity { check_fallible_id(entity)?; }
+        if (self.kind == SemanticKind::Field) != self.entity.is_some() {
+            return Err(DecisionValidationError::Contract(ContractError("only field keys require an entity namespace".into())));
+        }
+        Ok(())
+    }
+}
+fn check_fallible_id(id: &str) -> Result<(), DecisionValidationError> {
+    if !crate::product_contract::valid_id(id) {
+        return Err(DecisionValidationError::Contract(ContractError(format!("invalid stable ID: {id}"))));
+    }
+    Ok(())
 }
 pub(crate) struct FallibleScopeMap<K, V>(OrderedMap<K, V>);
 impl<K, V> FallibleScopeMap<K, V> {
@@ -1082,6 +1161,51 @@ mod tests {
         assert_eq!(actual.retained_events.len(), 2);
         assert_eq!(actual.retained_fields.len(), 2);
         assert_eq!(actual.issues.len(), 2);
+    }
+
+    #[test]
+    fn compatibility_validation_preserves_duplicate_parity_and_accounts_field_index() {
+        use crate::product_contract::{ContractError, DecisionValidationError, MAX_COLLECTION};
+
+        let fields: Vec<_> = (0..256)
+            .map(|index| serde_json::json!({
+                "kind":"field", "entity":"person", "id":format!("field{index:04}")
+            }))
+            .collect();
+        let value = serde_json::json!({
+            "state":"compatible", "current_data":digest_text(), "target_program":digest_text(),
+            "retained_records":[], "retained_events":[], "retained_fields":fields, "issues":[]
+        });
+        assert!(value["retained_fields"].as_array().unwrap().len() <= MAX_COLLECTION);
+        let expected: ModelCompatibilityReport = serde_json::from_value(value.clone()).unwrap();
+        expected.validate().unwrap();
+        let decoded = decode_compatibility_report(syntax(&value.to_string()), &mut AllocationContext::new()).unwrap();
+
+        let mut baseline = AllocationContext::new();
+        decoded.validate_with(&mut baseline).unwrap();
+        let growths = baseline.growth_requests();
+        assert!(growths > 0);
+        for ordinal in 1..=growths {
+            let mut cx = AllocationContext::fail_nth_growth(NonZeroUsize::new(ordinal).unwrap(), true);
+            let error = decoded.validate_with(&mut cx).unwrap_err();
+            let DecisionValidationError::Allocation(failure) = error else {
+                panic!("field-index allocation refusal {ordinal}/{growths} must stay typed")
+            };
+            assert_eq!(Some(failure), cx.first_failure());
+            decoded.validate_with(&mut AllocationContext::new()).unwrap();
+        }
+
+        let mut duplicate = value;
+        let retained_fields = duplicate["retained_fields"].as_array_mut().unwrap();
+        retained_fields[255] = retained_fields[0].clone();
+        let expected: ModelCompatibilityReport = serde_json::from_value(duplicate.clone()).unwrap();
+        let expected_error = expected.validate().unwrap_err();
+        assert_eq!(expected_error, ContractError("duplicate retained semantic key".into()));
+        let decoded = decode_compatibility_report(syntax(&duplicate.to_string()), &mut AllocationContext::new()).unwrap();
+        assert!(matches!(
+            decoded.validate_with(&mut AllocationContext::new()),
+            Err(DecisionValidationError::Contract(error)) if error == expected_error
+        ));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //!
 //! The decoder composes the bounded Product Contract and scope DTO leaves;
 //! production parsing and semantic validation remain separate.
-use crate::product_alloc::{self, ordered::OrderedMap, AllocationContext, AllocationSite};
+use crate::product_alloc::{self, ordered::{OrderedMap, OrderedSet}, AllocationContext, AllocationSite};
 use crate::product_contract::{
     decode_adoption_plan_fallible, decode_captured_program_fallible,
     decode_data_snapshot_fallible, decode_decision_graph_fallible,
@@ -10,7 +10,7 @@ use crate::product_contract::{
     FallibleDecodedAdoptionPlan, FallibleDecodedCapturedProgram,
     FallibleDecodedDataSnapshot, FallibleDecodedDecisionGraph,
     FallibleDecodedLocalArtifact, FallibleDecodedSessionState, IdentityDomain, MAX_COLLECTION,
-    MAX_ITEMS,
+    MAX_ITEMS, MAX_OUTPUT_BYTES,
 };
 use crate::product_contract::fallible_value_decode::{JsonKind, NumericValue, ValueDecodeError};
 use crate::product_json::{Number, Value};
@@ -49,6 +49,137 @@ pub(crate) enum ProjectSnapshotCloneError {
 }
 
 impl DecodedProjectSnapshot {
+    pub(crate) fn validate_container_with(
+        &self,
+        cx: &mut AllocationContext,
+    ) -> Result<(), super::StoreError> {
+        use super::{PointerCodecFailure, StoreError};
+        use crate::product_contract::{AppValidationError, DecisionValidationError};
+
+        let allocation = |failure| StoreError::PointerCodec(PointerCodecFailure::Allocation(failure));
+        if self.magic != super::MAGIC {
+            return Err(StoreError::Corrupt("not a generated-tool project".into()));
+        }
+        if matches!(self.version, 1 | 2) {
+            return Err(StoreError::UpgradeRequired);
+        }
+        if self.version != super::FORMAT {
+            return Err(StoreError::UnsupportedFormat(self.version));
+        }
+        if self.programs.is_empty()
+            || self.programs.len() > MAX_ITEMS
+            || self.adoptions.len() > MAX_ITEMS
+            || self.operations.0.len() > MAX_COLLECTION
+            || self.artifacts.len() > MAX_ITEMS
+        {
+            return Err(StoreError::Invalid("project history size limit reached".into()));
+        }
+        self.data.validate_with(cx).map_err(|error| match error {
+            AppValidationError::Contract(error) => StoreError::Invalid(error.0),
+            AppValidationError::Allocation(failure) => allocation(failure),
+        })?;
+        self.decisions.validate_with(cx).map_err(|error| match error {
+            DecisionValidationError::Contract(error) => StoreError::Invalid(error.0),
+            DecisionValidationError::Allocation(failure) => allocation(failure),
+        })?;
+        crate::product_contract::validate_day(self.clock_day)
+            .map_err(|error| StoreError::Invalid(error.0))?;
+
+        let mut revisions: OrderedSet<String> = OrderedSet::new();
+        let mut digests: OrderedSet<&str> = OrderedSet::new();
+        let mut active_program = None;
+        for program in &self.programs {
+            program.validate_with(cx).map_err(|error| match error {
+                AppValidationError::Contract(error) => StoreError::Invalid(error.0),
+                AppValidationError::Allocation(failure) => allocation(failure),
+            })?;
+            if program.project_id() != self.data.project_id() {
+                return Err(StoreError::Corrupt("duplicate or foreign program revision".into()));
+            }
+            let revision = program.revision_with(cx).map_err(|error| match error {
+                AppValidationError::Contract(error) => StoreError::Invalid(error.0),
+                AppValidationError::Allocation(failure) => allocation(failure),
+            })?;
+            if revisions.contains(revision.as_str()) {
+                return Err(StoreError::Corrupt("duplicate or foreign program revision".into()));
+            }
+            let revision_key = product_alloc::try_copy_str(revision.as_str(), cx, AllocationSite::String).map_err(allocation)?;
+            revisions.try_insert(revision_key, cx).map_err(allocation)?;
+            digests.try_insert(program.program_digest().as_str(), cx).map_err(allocation)?;
+            if revision == self.active_revision {
+                active_program = Some(program);
+            }
+        }
+        for producer in self.data.record_producers() {
+            if !digests.contains(producer.as_str()) {
+                return Err(StoreError::Corrupt("record producer revision missing".into()));
+            }
+        }
+        for producer in self.data.event_producers() {
+            if !digests.contains(producer.as_str()) {
+                return Err(StoreError::Corrupt("event producer revision missing".into()));
+            }
+        }
+        let active_program = active_program
+            .ok_or_else(|| StoreError::Corrupt("active program revision missing".into()))?;
+        active_program.validate_session_with(&self.session, cx).map_err(|error| match error {
+            AppValidationError::Contract(error) => StoreError::Invalid(error.0),
+            AppValidationError::Allocation(failure) => allocation(failure),
+        })?;
+        for (id, receipt) in self.operations.0.iter() {
+            if !crate::product_contract::valid_id(id)
+                || id != &receipt.operation
+                || receipt.revision == 0
+                || receipt.revision > self.revision
+            {
+                return Err(StoreError::Corrupt("invalid operation receipt".into()));
+            }
+        }
+        let mut last = 0;
+        for adoption in &self.adoptions {
+            adoption.plan.validate_with(cx).map_err(|error| match error {
+                DecisionValidationError::Contract(error) => StoreError::Invalid(error.0),
+                DecisionValidationError::Allocation(failure) => allocation(failure),
+            })?;
+            if adoption.revision <= last
+                || adoption.revision > self.revision
+                || !revisions.contains(adoption.previous.as_str())
+                || !revisions.contains(adoption.active.as_str())
+            {
+                return Err(StoreError::Corrupt("invalid adoption history".into()));
+            }
+            last = adoption.revision;
+        }
+        for artifact in &self.artifacts {
+            artifact.validate_with(cx).map_err(|error| match error {
+                AppValidationError::Contract(error) => StoreError::Invalid(error.0),
+                AppValidationError::Allocation(failure) => allocation(failure),
+            })?;
+        }
+        let mut emitted = self.data.output_digests();
+        let mut retained = self.artifacts.iter().map(|artifact| artifact.digest());
+        let mut inventory_matches = true;
+        loop {
+            match (emitted.next(), retained.next()) {
+                (Some(output), Some(artifact)) if output == artifact => {}
+                (None, None) => break,
+                _ => { inventory_matches = false; break; }
+            }
+        }
+        if !inventory_matches {
+            return Err(StoreError::Corrupt(
+                "artifact inventory differs from committed output history".into(),
+            ));
+        }
+        let retained_bytes = self.artifacts.iter().fold(0usize, |total, artifact| {
+            total.saturating_add(artifact.byte_len())
+        });
+        if retained_bytes > MAX_OUTPUT_BYTES {
+            return Err(StoreError::Invalid("retained output byte limit".into()));
+        }
+        Ok(())
+    }
+
     pub(crate) fn canonical_bytes_with(
         &self,
         cx: &mut AllocationContext,
@@ -420,6 +551,157 @@ mod tests {
 
     fn decoded(source: &serde_json::Value) -> DecodedProjectSnapshot {
         decode_project_snapshot(syntax(source), &mut AllocationContext::new()).unwrap()
+    }
+
+    fn valid_container_snapshot() -> ProjectSnapshot {
+        let source = r#"{"version":1,"id":"app","label":"App","entities":[{"id":"record","label":"Record","fields":[{"id":"name","label":"Name","value_type":{"kind":"text"}}],"unique":[],"constraints":[]}],"state":[],"actions":[{"id":"noop","label":"No-op","parameters":{},"guards":[],"steps":[{"kind":"create","entity":"record","values":{"name":{"kind":"literal","value_type":{"kind":"text"},"value":{"kind":"text","value":"seed"}}},"bind":"created"}],"ensures":[]}],"outputs":[],"observables":[],"views":[{"id":"main","label":"Main","kind":{"kind":"form","action":"noop","fields":[],"defaults":{}},"actions":[],"keys":[]}],"initial_view":"main"}"#;
+        let program = crate::product_contract::CapturedProgram::capture(
+            source.as_bytes(),
+            "project",
+            crate::product_contract::Producer::Fixture { name: "container-test".into() },
+            None,
+        ).unwrap();
+        let data = crate::product_contract::DataSnapshot::empty("project", &program.program).unwrap();
+        let session = crate::product_contract::SessionState::initial(&program.program).unwrap();
+        let active_revision = crate::product_contract::canonical_digest(
+            IdentityDomain::Source,
+            &program,
+        ).unwrap();
+        ProjectSnapshot {
+            magic: crate::product_store::MAGIC.into(),
+            version: crate::product_store::GENERATED_PROJECT_FORMAT,
+            revision: 1,
+            programs: vec![program],
+            active_revision,
+            data,
+            session,
+            clock_day: 0,
+            decisions: crate::product_contract::DecisionGraph {
+                version: crate::product_contract::CONTRACT_VERSION,
+                revision: 0,
+                decisions: Vec::new(),
+            },
+            adoptions: Vec::new(),
+            operations: std::collections::BTreeMap::new(),
+            artifacts: Vec::new(),
+            scope: ScopeEnvelope::ScalarV1(ScopeState::default()),
+        }
+    }
+
+    #[test]
+    fn container_validation_matches_legacy_success_and_error_order() {
+        let valid = valid_container_snapshot();
+        valid.validate_container().unwrap();
+        let value = serde_json::to_value(&valid).unwrap();
+        decoded(&value).validate_container_with(&mut AllocationContext::new()).unwrap();
+
+        let cases: Vec<(serde_json::Value, fn(&super::super::StoreError) -> bool)> = {
+            use crate::product_store::StoreError;
+            let mut cases = Vec::new();
+            let mut value = serde_json::to_value(&valid).unwrap();
+            value["magic"] = serde_json::json!("wrong");
+            cases.push((value, (|error| matches!(error, StoreError::Corrupt(message) if message == "not a generated-tool project")) as fn(&StoreError) -> bool));
+            let mut value = serde_json::to_value(&valid).unwrap();
+            value["version"] = serde_json::json!(1);
+            cases.push((value, (|error| matches!(error, StoreError::UpgradeRequired)) as fn(&StoreError) -> bool));
+            let mut value = serde_json::to_value(&valid).unwrap();
+            value["version"] = serde_json::json!(99);
+            cases.push((value, (|error| matches!(error, StoreError::UnsupportedFormat(99))) as fn(&StoreError) -> bool));
+            let mut value = serde_json::to_value(&valid).unwrap();
+            value["clock_day"] = serde_json::json!(i32::MAX);
+            cases.push((value, (|error| matches!(error, StoreError::Invalid(message) if message == "date outside years 0001 through 9999")) as fn(&StoreError) -> bool));
+            let mut value = serde_json::to_value(&valid).unwrap();
+            value["session"]["view"] = serde_json::json!("missing");
+            cases.push((value, (|error| matches!(error, StoreError::Invalid(message) if message == "unknown session view")) as fn(&StoreError) -> bool));
+            let mut value = serde_json::to_value(&valid).unwrap();
+            value["active_revision"] = serde_json::json!(D3);
+            cases.push((value, (|error| matches!(error, StoreError::Corrupt(message) if message == "active program revision missing")) as fn(&StoreError) -> bool));
+            cases
+        };
+        for (value, expected_error) in cases {
+            let legacy: ProjectSnapshot = serde_json::from_value(value.clone()).unwrap();
+            let legacy_error = legacy.validate_container().unwrap_err();
+            assert!(expected_error(&legacy_error), "unexpected legacy error: {legacy_error:?}");
+            let fallible_error = decoded(&value).validate_container_with(&mut AllocationContext::new()).unwrap_err();
+            assert!(expected_error(&fallible_error), "unexpected fallible error: {fallible_error:?}");
+        }
+    }
+
+    #[test]
+    fn container_validation_matches_producer_receipt_and_artifact_failures() {
+        let mut missing_producer = stateful_container_value();
+        missing_producer["data"]["records"][0]["created_program"] = serde_json::json!(D3);
+        let mut invalid_receipt = stateful_container_value();
+        invalid_receipt["operations"]["operation1"] = serde_json::json!({
+            "operation":"different","request":D0,"revision":0
+        });
+        let mut invalid_adoption = serde_json::to_value(valid_container_snapshot()).unwrap();
+        let mut plan = fixture()["adoptions"][0]["plan"].clone();
+        plan["version"] = serde_json::json!(2);
+        let active = invalid_adoption["active_revision"].clone();
+        invalid_adoption["adoptions"] = serde_json::json!([{
+            "plan":plan,"previous":active,"active":active,"revision":1
+        }]);
+        let mut invalid_artifact = stateful_container_value();
+        let mut columns = std::collections::BTreeMap::new();
+        columns.insert("name".to_owned(), crate::product_contract::DataValue::Text { value: "Ada".into() });
+        let artifact = crate::product_contract::LocalArtifact::from_rows(
+            "report",
+            crate::product_contract::OutputFormat::Csv,
+            vec![crate::product_contract::FieldDefinition {
+                id: "name".into(), label: "Name".into(), value_type: crate::product_contract::Type::Text,
+            }],
+            vec![columns],
+        ).unwrap();
+        let mut artifact = serde_json::to_value(artifact).unwrap();
+        artifact["bytes_digest"] = serde_json::json!(D0);
+        invalid_artifact["artifacts"] = serde_json::json!([artifact]);
+
+        for value in [missing_producer, invalid_receipt, invalid_adoption, invalid_artifact] {
+            let legacy: ProjectSnapshot = serde_json::from_value(value.clone()).unwrap();
+            let expected = format!("{:?}", legacy.validate_container().unwrap_err());
+            let actual = format!("{:?}", decoded(&value).validate_container_with(&mut AllocationContext::new()).unwrap_err());
+            assert_eq!(expected, actual);
+        }
+    }
+
+    #[test]
+    fn container_validation_allocation_refusal_is_typed_and_retryable() {
+        let value = stateful_container_value();
+        let decoded = decoded(&value);
+        let mut baseline = AllocationContext::new();
+        decoded.validate_container_with(&mut baseline).unwrap();
+        let growths = baseline.growth_requests();
+        assert!(growths > 0);
+        for ordinal in 1..=growths {
+            let mut cx = AllocationContext::fail_nth_growth(NonZeroUsize::new(ordinal).unwrap(), true);
+            let error = decoded.validate_container_with(&mut cx).unwrap_err();
+            let crate::product_store::StoreError::PointerCodec(crate::product_store::PointerCodecFailure::Allocation(failure)) = error else {
+                panic!("allocation refusal {ordinal}/{growths} must remain typed")
+            };
+            assert_eq!(Some(failure), cx.first_failure());
+            let mut retry = AllocationContext::new();
+            decoded.validate_container_with(&mut retry).unwrap();
+        }
+    }
+
+    fn stateful_container_value() -> serde_json::Value {
+        let valid = valid_container_snapshot();
+        let producer = valid.programs[0].artifact.program_digest.as_str();
+        let mut value = serde_json::to_value(&valid).unwrap();
+        value["data"]["generation"] = serde_json::json!(1);
+        value["data"]["records"] = serde_json::json!([{
+            "entity":"record","id":"r1","revision":1,"created_program":producer,
+            "archived":false,"values":{"name":{"kind":"text","value":"Ada"}}
+        }]);
+        value["data"]["events"] = serde_json::json!([{
+            "id":"event1","operation_id":"operation1","action":"noop","program":producer,
+            "day":0,"sequence":1,"changes":[{
+                "entity":"record","record":"r1","before":null,
+                "after":{"name":{"kind":"text","value":"Ada"}},"archived":false
+            }],"outputs":[]
+        }]);
+        value
     }
 
     fn struct_sequence(value: &mut serde_json::Value, fields: &[&str]) {

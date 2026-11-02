@@ -125,6 +125,7 @@ mod fallible_persisted_decode;
 mod fallible_snapshot_decode;
 #[path = "product_contract/fallible_snapshot_validate.rs"]
 mod fallible_snapshot_validate;
+pub(crate) use fallible_snapshot_validate::DataValueTuple as FallibleDataValueTuple;
 /// Read-only lexical map view shared by legacy BTreeMap owners and fallible
 /// sorted owners. Validation uses it without materializing either model.
 pub(super) trait StringValueMap<V> {
@@ -170,6 +171,15 @@ impl FallibleDecodedDataSnapshot {
     pub(crate) fn validate(&self) -> std::result::Result<(), ContractError> {
         self.0.validate()
     }
+    pub(crate) fn validate_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), AppValidationError> {
+        self.0.validate_with(cx).map_err(|error| match error {
+            fallible_snapshot_validate::SnapshotValidationError::Contract(error) => AppValidationError::Contract(error),
+            fallible_snapshot_validate::SnapshotValidationError::Allocation(failure) => AppValidationError::Allocation(failure),
+        })
+    }
     pub(crate) fn canonical_bytes_with(
         &self,
         cx: &mut crate::product_alloc::AllocationContext,
@@ -207,6 +217,15 @@ impl FallibleDecodedDataSnapshot {
     pub(crate) fn generation(&self) -> u64 { self.0.generation }
     pub(crate) fn records(&self) -> &[fallible_persisted_decode::DecodedRecord] { &self.0.records }
     pub(crate) fn events(&self) -> &[fallible_persisted_decode::DecodedBusinessEvent] { &self.0.events }
+    pub(crate) fn record_producers(&self) -> impl Iterator<Item = &Digest> {
+        self.0.records.iter().map(|record| &record.created_program)
+    }
+    pub(crate) fn event_producers(&self) -> impl Iterator<Item = &Digest> {
+        self.0.events.iter().map(|event| &event.program)
+    }
+    pub(crate) fn output_digests(&self) -> impl Iterator<Item = &Digest> {
+        self.0.events.iter().flat_map(|event| event.outputs.iter())
+    }
 }
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct FallibleDecodedSessionState(fallible_persisted_decode::DecodedSessionState);
@@ -218,6 +237,27 @@ impl FallibleDecodedCapturedProgram {
         cx: &mut crate::product_alloc::AllocationContext,
     ) -> std::result::Result<(), AppValidationError> {
         self.0.validate_with(cx)
+    }
+    pub(crate) fn validate_app_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), AppValidationError> {
+        self.0.validate_app_with(cx)
+    }
+    pub(crate) fn validate_session_with(
+        &self,
+        session: &FallibleDecodedSessionState,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), AppValidationError> {
+        self.0.validate_session_with(&session.0, cx)
+    }
+    pub(crate) fn project_id(&self) -> &str { self.0.project_id() }
+    pub(crate) fn program_digest(&self) -> &Digest { self.0.program_digest() }
+    pub(crate) fn revision_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Digest, AppValidationError> {
+        self.0.revision_with(cx)
     }
 }
 #[derive(Debug, Serialize)]
@@ -263,8 +303,26 @@ impl From<ContractError> for DecisionValidationError {
 }
 #[derive(Debug, Serialize)]
 pub(crate) struct FallibleDecodedLocalArtifact(fallible_local_artifact_decode::DecodedLocalArtifact);
+impl FallibleDecodedLocalArtifact {
+    pub(crate) fn validate_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), AppValidationError> {
+        self.0.validate_with(cx)
+    }
+    pub(crate) fn digest(&self) -> &Digest { self.0.digest() }
+    pub(crate) fn byte_len(&self) -> usize { self.0.byte_len() }
+}
 #[derive(Debug, Serialize)]
 pub(crate) struct FallibleDecodedAdoptionPlan(fallible_decision_decode::DecodedAdoptionPlan);
+impl FallibleDecodedAdoptionPlan {
+    pub(crate) fn validate_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), DecisionValidationError> {
+        self.0.validate_with(cx)
+    }
+}
 pub(crate) fn decode_data_snapshot_fallible(
     value: crate::product_json::Value,
     cx: &mut crate::product_alloc::AllocationContext,
@@ -347,9 +405,11 @@ pub(crate) mod fallible_app_decode;
 #[path = "product_contract/fallible_capture_decode.rs"]
 #[allow(dead_code)]
 mod fallible_capture_decode;
+pub(crate) use fallible_capture_decode::DecodedCapturedProgram as DecodedCapturedProgramWire;
 #[path = "product_contract/fallible_local_artifact_decode.rs"]
 #[allow(dead_code)]
 mod fallible_local_artifact_decode;
+pub(crate) use fallible_local_artifact_decode::{ArtifactReceipt as FallibleArtifactReceipt, JsonScalar as FallibleJsonScalar, OutputRow as FallibleOutputRow};
 #[path = "product_contract/fallible_scenario_decode.rs"]
 #[allow(dead_code)]
 mod fallible_scenario_decode;
@@ -2474,10 +2534,22 @@ impl DataSnapshot {
         canonical_digest(IdentityDomain::Schema, &self.schema)
     }
 }
+trait RecordLookup {
+    fn len(&self) -> usize;
+    fn contains_pair(&self, entity: &str, record: &str) -> bool;
+}
+impl RecordLookup for BTreeSet<(&str, &str)> {
+    fn len(&self) -> usize { BTreeSet::len(self) }
+    fn contains_pair(&self, entity: &str, record: &str) -> bool { self.contains(&(entity, record)) }
+}
+impl RecordLookup for crate::product_alloc::ordered::OrderedSet<(&str, &str)> {
+    fn len(&self) -> usize { crate::product_alloc::ordered::OrderedSet::len(self) }
+    fn contains_pair(&self, entity: &str, record: &str) -> bool { self.contains(&(entity, record)) }
+}
 fn validate_references(value: &DataValue, records: &BTreeSet<(&str, &str)>) -> Result<()> {
     validate_references_audited(value, records, Audit::none())
 }
-fn validate_references_audited(value: &DataValue, records: &BTreeSet<(&str, &str)>, a: Audit<'_>) -> Result<()> {
+fn validate_references_audited<R: RecordLookup>(value: &DataValue, records: &R, a: Audit<'_>) -> Result<()> {
     a.pay(4)?;
     match value {
         DataValue::Reference { entity, record } => {
@@ -2485,7 +2557,7 @@ fn validate_references_audited(value: &DataValue, records: &BTreeSet<(&str, &str
                 a.pay(bounded_input::capture_payment_core::SEARCH_DESCRIPTOR)?;
                 a.amount(bounded_input::capture_payment_core::btree_search(records.len(), a.pair_comparator(entity, record)?))?;
             }
-            a.require(records.contains(&(entity.as_str(), record.as_str())), "dangling record reference")
+            a.require(records.contains_pair(entity, record), "dangling record reference")
         },
         DataValue::List { items, .. } => {
             a.slice(items.len())?;
@@ -4079,7 +4151,31 @@ fn validate_decoded_decision(
     nonempty(&decision.request)?;
     if let Some(rationale) = &decision.rationale { text(rationale)?; }
 
-    let scope = &decision.scope;
+    validate_decoded_decision_scope(&decision.scope, cx)?;
+    unique_with(decision.obligations.iter().map(|property| property.id.as_str()), cx)?;
+    for property in &decision.obligations { property.validate()?; }
+    bounded(decision.scenarios.len())?;
+    require(!decision.scenarios.is_empty(), "decision lacks accepted scenario")?;
+    unique_with(decision.supersedes.iter().map(String::as_str), cx)?;
+    require(!decision.supersedes.contains(&decision.id), "decision supersedes itself")?;
+    match &decision.status {
+        DecisionStatus::Superseded { by } => {
+            check_id(by)?;
+            require(by != &decision.id, "decision retires itself")?;
+        }
+        DecisionStatus::Withdrawn { adoption } => check_id(adoption)?,
+        DecisionStatus::Active | DecisionStatus::Pending => {}
+    }
+    if matches!(decision.outcome, DecisionOutcome::BothNeeded | DecisionOutcome::NeitherFits | DecisionOutcome::Deferred) {
+        require(!matches!(decision.status, DecisionStatus::Active), "unresolved decision cannot activate behavior")?;
+    }
+    Ok(())
+}
+
+fn validate_decoded_decision_scope(
+    scope: &fallible_decision_decode::DecodedDecisionScope,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<(), DecisionValidationError> {
     require(!scope.operations.is_empty(), "decision scope needs explicit operations")?;
     unique_with(scope.operations.iter().map(String::as_str), cx)?;
     bounded(scope.conditions.len())?;
@@ -4107,23 +4203,6 @@ fn validate_decoded_decision(
         require(!unknown.operations.is_empty(), "unknown boundary needs affected operations")?;
     }
 
-    unique_with(decision.obligations.iter().map(|property| property.id.as_str()), cx)?;
-    for property in &decision.obligations { property.validate()?; }
-    bounded(decision.scenarios.len())?;
-    require(!decision.scenarios.is_empty(), "decision lacks accepted scenario")?;
-    unique_with(decision.supersedes.iter().map(String::as_str), cx)?;
-    require(!decision.supersedes.contains(&decision.id), "decision supersedes itself")?;
-    match &decision.status {
-        DecisionStatus::Superseded { by } => {
-            check_id(by)?;
-            require(by != &decision.id, "decision retires itself")?;
-        }
-        DecisionStatus::Withdrawn { adoption } => check_id(adoption)?,
-        DecisionStatus::Active | DecisionStatus::Pending => {}
-    }
-    if matches!(decision.outcome, DecisionOutcome::BothNeeded | DecisionOutcome::NeitherFits | DecisionOutcome::Deferred) {
-        require(!matches!(decision.status, DecisionStatus::Active), "unresolved decision cannot activate behavior")?;
-    }
     Ok(())
 }
 

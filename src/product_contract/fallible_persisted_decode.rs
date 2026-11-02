@@ -54,6 +54,12 @@ pub(super) struct DecodedSessionState {
     pub(super) focused_record: Option<RecordRef>,
 }
 
+impl DecodedSessionState {
+    pub(super) fn view(&self) -> &str { &self.view }
+    pub(super) fn values(&self) -> &FallibleValues { &self.values }
+    pub(super) fn focused_record(&self) -> Option<&RecordRef> { self.focused_record.as_ref() }
+}
+
 pub(super) fn decode_record(value: Value, cx: &mut AllocationContext) -> Result<DecodedRecord, ValueDecodeError> {
     let fields = object(value, "a struct Record", RECORD_FIELDS, cx)?;
     let mut entity = None;

@@ -65,6 +65,26 @@ pub(crate) struct DecodedAppDefinition {
     pub(super) initial_view: String,
 }
 impl DecodedAppDefinition {
+    pub(crate) fn validate_session_with(
+        &self,
+        session: &super::fallible_persisted_decode::DecodedSessionState,
+    ) -> Result<(), super::ContractError> {
+        super::require(self.views.iter().any(|view| view.id == session.view()), "unknown session view")?;
+        super::require(session.values().len() == self.state.len(), "session state differs from program")?;
+        for state in &self.state {
+            super::validate_value(
+                session.values().get(&state.id).ok_or_else(|| super::ContractError("missing session state".into()))?,
+                &state.value_type,
+                0,
+            )?;
+        }
+        if let Some(record) = session.focused_record() {
+            super::check_id(&record.record)?;
+            super::require(self.entities.iter().any(|entity| entity.id == record.entity), "focused record entity is unknown")?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_with(
         &self,
         cx: &mut AllocationContext,

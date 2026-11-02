@@ -33,6 +33,13 @@ impl DecodedDataSnapshot {
     pub(crate) fn validate(&self) -> Result<(), super::ContractError> {
         super::fallible_snapshot_validate::validate(self, super::Audit::none())
     }
+
+    pub(crate) fn validate_with(
+        &self,
+        cx: &mut AllocationContext,
+    ) -> std::result::Result<(), super::fallible_snapshot_validate::SnapshotValidationError> {
+        super::fallible_snapshot_validate::validate_with(self, super::Audit::none(), cx)
+    }
 }
 
 pub(super) fn decode_data_snapshot(

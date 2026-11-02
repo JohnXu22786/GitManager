@@ -77,13 +77,27 @@ impl BackupWire for crate::product_contract::FallibleDecodedDataSnapshot {}
 impl BackupWire for crate::product_contract::FallibleDecodedDecisionGraph {}
 impl BackupWire for crate::product_store::fallible_project_snapshot_decode::DecodedProjectSnapshot {}
 impl BackupWire for crate::product_contract::fallible_app_decode::DecodedAppDefinition {}
+impl BackupWire for crate::product_contract::DecodedCapturedProgramWire {}
+impl BackupWire for crate::product_contract::FallibleOutputRow<'_> {}
+impl BackupWire for crate::product_contract::FallibleJsonScalar<'_> {}
+impl BackupWire for crate::product_contract::FallibleArtifactReceipt<'_> {}
+impl BackupWire for crate::product_contract::FallibleDataValueTuple<'_> {}
+impl BackupWire for crate::product_store::scope::DecodedSemanticKey {}
 
 pub(crate) fn canonical_bytes<T: BackupWire + ?Sized>(
     value: &T,
     cx: &mut AllocationContext,
 ) -> Result<Vec<u8>, CodecError> {
+    canonical_bytes_bounded(value, MAX_SERIALIZED_BYTES, cx)
+}
+
+pub(crate) fn canonical_bytes_bounded<T: BackupWire + ?Sized>(
+    value: &T,
+    max_bytes: usize,
+    cx: &mut AllocationContext,
+) -> Result<Vec<u8>, CodecError> {
     let value = try_serialize_value(value, cx)?;
-    product_json::canonical::try_canonical_bytes_bounded(&value, MAX_SERIALIZED_BYTES, cx)
+    product_json::canonical::try_canonical_bytes_bounded(&value, max_bytes, cx)
         .map_err(Into::into)
 }
 

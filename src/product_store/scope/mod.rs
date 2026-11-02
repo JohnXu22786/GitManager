@@ -10,7 +10,7 @@ mod fallible_owned_history_decode;
 #[allow(dead_code)]
 mod fallible_scope_envelope_decode;
 pub(crate) use fallible_scope_envelope_decode::{decode_scope_envelope as decode_scope_envelope_fallible, DecodedScopeEnvelope as FallibleDecodedScopeEnvelope};
-pub(crate) use fallible_scalar_decode::{decode_compatibility_report as decode_compatibility_report_fallible, DecodedCompatibilityReport};
+pub(crate) use fallible_scalar_decode::{decode_compatibility_report as decode_compatibility_report_fallible, DecodedCompatibilityReport, DecodedSemanticKey};
 mod owned_wire;
 pub use owned_wire::*;
 mod owned_choice;
