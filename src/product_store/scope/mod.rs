@@ -3,6 +3,8 @@
 mod fallible_owned_lifecycle_decode;
 #[allow(dead_code)]
 mod fallible_owned_basis_layer_decode;
+#[allow(dead_code)]
+mod fallible_owned_composition_decode;
 mod owned_wire;
 pub use owned_wire::*;
 mod owned_choice;

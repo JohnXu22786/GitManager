@@ -379,7 +379,7 @@ pub(crate) fn decode_scope_layer(value: Value, cx: &mut AllocationContext) -> Re
 }
 
 pub(crate) fn decode_scope_transition(value: Value) -> Result<ScopeTransition, ValueDecodeError> {
-    let name = string(value, "a string variant identifier")?;
+    let name = unit_enum_variant(value, TRANSITIONS, "a unit enum variant identifier")?;
     match name.as_str() {
         "adoption" => Ok(ScopeTransition::Adoption),
         "withdrawal" => Ok(ScopeTransition::Withdrawal),
@@ -455,13 +455,38 @@ pub(crate) fn decode_semantic_kind(value: Value) -> Result<SemanticKind, ValueDe
 }
 
 pub(crate) fn decode_compatibility_state(value: Value) -> Result<CompatibilityState, ValueDecodeError> {
-    let name = string(value, "a string variant identifier")?;
+    let name = unit_enum_variant(value, COMPATIBILITY_STATES, "a unit enum variant identifier")?;
     match name.as_str() {
         "compatible" => Ok(CompatibilityState::Compatible),
         "retained_but_unavailable" => Ok(CompatibilityState::RetainedButUnavailable),
         "incompatible" => Ok(CompatibilityState::Incompatible),
         "unknown" => Ok(CompatibilityState::Unknown),
         _ => Err(ValueDecodeError::UnknownVariant { tag: name, expected: COMPATIBILITY_STATES }),
+    }
+}
+
+fn unit_enum_variant(value: Value, variants: &'static [&'static str], expected: &'static str) -> Result<String, ValueDecodeError> {
+    let name = match value {
+        Value::String(name) => name,
+        Value::Object(fields) => {
+            if fields.len() != 1 {
+                return Err(ValueDecodeError::InvalidLength { actual: fields.len(), expected: 1 });
+            }
+            let (name, payload) = fields.into_entries().next().expect("one enum map entry was checked");
+            if !variants.contains(&name.as_str()) {
+                return Err(ValueDecodeError::UnknownVariant { tag: name, expected: variants });
+            }
+            if !matches!(payload, Value::Null) {
+                return Err(invalid_type(payload, "unit"));
+            }
+            name
+        }
+        value => return Err(invalid_type(value, expected)),
+    };
+    if variants.contains(&name.as_str()) {
+        Ok(name)
+    } else {
+        Err(ValueDecodeError::UnknownVariant { tag: name, expected: variants })
     }
 }
 
@@ -617,6 +642,9 @@ fn digest_set(value: Value, limit: usize, resource: &'static str, cx: &mut Alloc
     let values = array(value)?; let mut set = FallibleDigestSet::new();
     for value in values { set.insert(digest(value)?, limit, resource, cx)?; }
     Ok(set)
+}
+pub(crate) fn decode_digest_set(value: Value, limit: usize, resource: &'static str, cx: &mut AllocationContext) -> Result<FallibleDigestSet, ValueDecodeError> {
+    digest_set(value, limit, resource, cx)
 }
 fn optional_digest(value: Value) -> Result<Option<Digest>, ValueDecodeError> {
     match value { Value::Null => Ok(None), value => digest(value).map(Some) }
