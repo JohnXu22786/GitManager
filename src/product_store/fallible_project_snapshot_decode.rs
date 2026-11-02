@@ -9,7 +9,7 @@ use crate::product_contract::{
     decode_local_artifact_fallible, decode_session_state_fallible, Digest,
     FallibleDecodedAdoptionPlan, FallibleDecodedCapturedProgram,
     FallibleDecodedDataSnapshot, FallibleDecodedDecisionGraph,
-    FallibleDecodedLocalArtifact, FallibleDecodedSessionState, MAX_COLLECTION,
+    FallibleDecodedLocalArtifact, FallibleDecodedSessionState, IdentityDomain, MAX_COLLECTION,
     MAX_ITEMS,
 };
 use crate::product_contract::fallible_value_decode::{JsonKind, NumericValue, ValueDecodeError};
@@ -40,6 +40,54 @@ pub(crate) struct DecodedProjectSnapshot {
     operations: DecodedOperationMap,
     artifacts: Vec<FallibleDecodedLocalArtifact>,
     scope: FallibleDecodedScopeEnvelope,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProjectSnapshotCloneError {
+    Allocation(crate::product_alloc::AllocationFailure),
+    Invariant,
+}
+
+impl DecodedProjectSnapshot {
+    pub(crate) fn canonical_bytes_with(
+        &self,
+        cx: &mut AllocationContext,
+    ) -> Result<Vec<u8>, crate::product_backup::fallible_codec::CodecError> {
+        crate::product_backup::fallible_codec::canonical_bytes(self, cx)
+    }
+
+    pub(crate) fn canonical_digest_with(
+        &self,
+        domain: IdentityDomain,
+        cx: &mut AllocationContext,
+    ) -> Result<Digest, crate::product_backup::fallible_codec::CodecError> {
+        crate::product_backup::fallible_codec::canonical_digest(domain, self, cx)
+    }
+
+    pub(crate) fn try_clone_with(
+        &self,
+        cx: &mut AllocationContext,
+    ) -> Result<Self, ProjectSnapshotCloneError> {
+        let value = crate::product_backup::fallible_codec::try_serialize_value(self, cx)
+            .map_err(|error| match error {
+                crate::product_backup::fallible_codec::CodecError::Allocation(failure) => {
+                    ProjectSnapshotCloneError::Allocation(failure)
+                }
+                _ => ProjectSnapshotCloneError::Invariant,
+            })?;
+        decode_project_snapshot(value, cx).map_err(|error| match error {
+            ValueDecodeError::Allocation(failure) => ProjectSnapshotCloneError::Allocation(failure),
+            _ => ProjectSnapshotCloneError::Invariant,
+        })
+    }
+
+    pub(crate) fn data(&self) -> &FallibleDecodedDataSnapshot {
+        &self.data
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -403,6 +451,50 @@ mod tests {
         let expected: ProjectSnapshot = serde_json::from_value(unit_map.clone()).unwrap();
         let actual = decoded(&unit_map);
         assert_eq!(canonical_bytes(&expected).unwrap(), canonical_bytes(&actual).unwrap());
+    }
+
+    #[test]
+    fn promoted_project_snapshot_has_fallible_bytes_digest_and_clone() {
+        let input = fixture();
+        let expected: ProjectSnapshot = serde_json::from_value(input.clone()).unwrap();
+        let actual = decoded(&input);
+        let expected_bytes = canonical_bytes(&expected).unwrap();
+
+        let mut bytes_cx = AllocationContext::new();
+        assert_eq!(actual.canonical_bytes_with(&mut bytes_cx).unwrap(), expected_bytes);
+        let byte_growths = bytes_cx.growth_requests();
+        assert!(byte_growths > 0);
+        for nth in 1..=byte_growths {
+            let mut cx = AllocationContext::fail_nth_growth(NonZeroUsize::new(nth).unwrap(), true);
+            assert!(matches!(
+                actual.canonical_bytes_with(&mut cx),
+                Err(crate::product_backup::fallible_codec::CodecError::Allocation(_))
+            ));
+        }
+
+        let mut digest_cx = AllocationContext::new();
+        assert_eq!(
+            actual.canonical_digest_with(IdentityDomain::Data, &mut digest_cx).unwrap(),
+            crate::product_contract::canonical_digest(IdentityDomain::Data, &expected).unwrap(),
+        );
+
+        let mut clone_cx = AllocationContext::new();
+        let cloned = actual.try_clone_with(&mut clone_cx).unwrap();
+        assert_eq!(actual.canonical_bytes_with(&mut AllocationContext::new()).unwrap(),
+                   cloned.canonical_bytes_with(&mut AllocationContext::new()).unwrap());
+        let clone_growths = clone_cx.growth_requests();
+        assert!(clone_growths > 0);
+        for nth in 1..=clone_growths {
+            let mut cx = AllocationContext::fail_nth_growth(NonZeroUsize::new(nth).unwrap(), true);
+            let error = actual.try_clone_with(&mut cx).unwrap_err();
+            let ProjectSnapshotCloneError::Allocation(failure) = error else {
+                panic!("allocation refusal was not preserved: {error:?}");
+            };
+            assert_eq!(cx.first_failure(), Some(failure));
+            assert_eq!(expected_bytes, actual.canonical_bytes_with(&mut AllocationContext::new()).unwrap());
+            let retried = actual.try_clone_with(&mut AllocationContext::new()).unwrap();
+            assert_eq!(expected_bytes, retried.canonical_bytes_with(&mut AllocationContext::new()).unwrap());
+        }
     }
 
     #[test]
