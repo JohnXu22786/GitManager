@@ -220,7 +220,7 @@ impl<'c,'v,'a,'s,H:ProjectionHost+?Sized> ProjectionCapture<'c,'v,'a,'s,H>{
                 Err(StepError::Local(error))=>{self.first_failure=Some(error.clone());return Err(E::from(error))},
             };
             let session=self.validation.initial_session(&mut meter).map_err(|error|E::from(cost::contract(error)))?;
-            let evaluator=Eval{app:&self.program.program,data:self.data,session:&session,day:self.day,meter:&mut meter};
+            let evaluator=Eval::legacy(&self.program.program,self.data,&session,self.day,&mut meter);
             // This is the only actual Eval constructor in the paid-row path.
             let mut row=ProjectionRow{evaluator,capture:self,reference,output_bytes:0,first_failure:None};
             let first=match row.finish_expression(first_binding,first_expression,first_expected,key){
@@ -299,7 +299,7 @@ impl<H:ProjectionHost+?Sized> ProjectionRow<'_,'_,'_,'_,'_,H>{
     }
     #[cfg(test)]
     pub(super) fn snapshot_for_test(&self)->(usize,usize,usize,u64,usize){
-        (&self.evaluator as *const Eval<'_> as usize,self.evaluator.session as *const SessionState as usize,
+        (&self.evaluator as *const Eval<'_> as usize,self.evaluator.session.legacy().expect("capture evaluator uses legacy session") as *const SessionState as usize,
             &*self.evaluator.meter as *const Meter as usize,self.evaluator.meter.fuel,self.output_bytes)
     }
 }

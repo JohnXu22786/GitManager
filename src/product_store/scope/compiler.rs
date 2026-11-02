@@ -1487,6 +1487,136 @@ pub(super) fn derive_patches(
     }
     Ok(patches)
 }
+
+/// Derive protected result patches over the bounded fallible graph while
+/// sharing every semantic check with the legacy compiler. All temporary app,
+/// request, patch and destination owners are charged to the caller's context;
+/// no fallible owner is materialized as a BTreeMap-backed model.
+pub(super) fn derive_patches_fallible(
+    baseline: &crate::product_contract::FallibleDecodedCapturedProgram,
+    candidate: &crate::product_contract::FallibleDecodedCapturedProgram,
+    request: &super::fallible_scalar_decode::DecodedScopeRequest,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<Vec<super::DecodedEffectPatch>, CompilerFailure> {
+    use crate::product_contract::fallible_app_decode::DecodedAppDefinition;
+    use crate::product_contract::AppValidationError;
+    use crate::product_store::scope::fallible_scalar_decode::ScopePopulationDto;
+    use crate::product_alloc::{try_push, AllocationSite};
+
+    fn app_error(failure: AppValidationError) -> CompilerFailure {
+        match failure {
+            AppValidationError::Allocation(failure) => CompilerFailure::Allocation(failure),
+            AppValidationError::Contract(error) => CompilerFailure::Store(StoreError::Invalid(error.0)),
+        }
+    }
+    fn codec_error(failure: crate::product_backup::fallible_codec::CodecError) -> CompilerFailure {
+        match failure {
+            crate::product_backup::fallible_codec::CodecError::Allocation(failure) => CompilerFailure::Allocation(failure),
+            _ => CompilerFailure::Store(error("compiler codec invariant")),
+        }
+    }
+    fn values_contain_reserved(value: &crate::product_json::Value) -> bool {
+        use crate::product_json::Value;
+        match value {
+            Value::String(value) => value.starts_with(RESERVED_PREFIX),
+            Value::Array(values) => values.iter().any(values_contain_reserved),
+            Value::Object(values) => values.iter().any(|(key, value)| {
+                key.starts_with(RESERVED_PREFIX) || values_contain_reserved(value)
+            }),
+            _ => false,
+        }
+    }
+
+    // Preserve the legacy reserved-namespace walk over the exact Serde graph,
+    // but build that temporary tree through the bounded private serializer.
+    let value = crate::product_backup::fallible_codec::try_serialize_value(candidate.app(), cx)
+        .map_err(codec_error)?;
+    if values_contain_reserved(&value) {
+        return Err(error("authored source uses the reserved metadata namespace").into());
+    }
+
+    if request.patches.is_empty()
+        || request.patches.len() > MAX_ITEMS
+        || request.lifecycles.len() > MAX_ITEMS
+    {
+        return Err(error("empty or oversized effect specification").into());
+    }
+    if !request.lifecycles.is_empty() {
+        check_completion_order_ref(crate::product_contract::AppRef::from(baseline.app()))?;
+        check_completion_order_ref(crate::product_contract::AppRef::from(candidate.app()))?;
+    }
+    check_output_coverage_fallible(baseline.app(), request.patches(), cx)?;
+    check_output_coverage_fallible(candidate.app(), request.patches(), cx)?;
+    check_durable_writers_fallible(baseline.app(), request.patches(), cx)?;
+    check_durable_writers_fallible(candidate.app(), request.patches(), cx)?;
+
+    let mut masked: DecodedAppDefinition = baseline.app().try_clone_with(cx).map_err(app_error)?;
+    let mut seen = crate::product_alloc::ordered::OrderedSet::new();
+    let mut patches = Vec::new();
+    crate::product_alloc::try_reserve(&mut patches, request.patches().len(), cx, AllocationSite::Vector)
+        .map_err(CompilerFailure::Allocation)?;
+    for p in request.patches() {
+        let destination = crate::product_backup::fallible_codec::canonical_bytes(&p.destination, cx)
+            .map_err(codec_error)?;
+        if !seen.try_insert(destination, cx).map_err(CompilerFailure::Allocation)? {
+            return Err(error("duplicate effect destination").into());
+        }
+        if let Some((action, _)) = p.destination.action_path() {
+            if !request.operations.iter().any(|operation| operation == action) {
+                return Err(error("effect falls outside the named operations").into());
+            }
+        }
+        let baseline_env = locate_context_fallible(baseline.app(), p, cx)?;
+        let _candidate_env = locate_context_fallible(candidate.app(), p, cx)?;
+        let before = clone_expr_fallible(slot_fallible_ref(baseline.app(), &p.destination)?, cx)?;
+        let after = clone_expr_fallible(slot_fallible_ref(candidate.app(), &p.destination)?, cx)?;
+        let global = matches!(
+            &p.destination,
+            super::fallible_scalar_decode::EffectDestinationDto::EmitItems { .. }
+                | super::fallible_scalar_decode::EffectDestinationDto::Observable { .. }
+        );
+        if global {
+            if !matches!(&request.population, ScopePopulationDto::All)
+                || !request.excluded_records.is_empty()
+            {
+                return Err(error("global operation expression needs the whole population").into());
+            }
+        } else {
+            own_row(&before, &p.subject, &p.entity, crate::product_contract::AppRef::from(baseline.app()), &baseline_env, true)?;
+            own_row(&after, &p.subject, &p.entity, crate::product_contract::AppRef::from(candidate.app()), &_candidate_env, true)?;
+            if !request.lifecycles().iter().any(|lifecycle| lifecycle.entity() == p.entity) {
+                return Err(error("row effect needs an explicit completed-work meaning").into());
+            }
+            let typ = match &p.value_type { Type::Optional { item } => item.as_ref(), typ => typ };
+            inert(typ)?;
+            if p.destination.is_projection()
+                && baseline_env.iter().any(|(id, _)| {
+                    id != &p.subject && (expression_variable(&before, id) || expression_variable(&after, id))
+                })
+            {
+                return Err(error("saved projection depends on an action parameter").into());
+            }
+        }
+        if let Some(field) = p.destination.update_field() {
+            check_dependencies_fallible(baseline.app(), &p.entity, field)?;
+            check_dependencies_fallible(candidate.app(), &p.entity, field)?;
+        }
+        *slot_fallible(&mut masked, &p.destination)? = clone_expr_fallible(&after, cx)?;
+        let cloned = clone_request_fallible(p, cx)?;
+        try_push(&mut patches, super::DecodedEffectPatch { request: cloned, before, after }, cx, AllocationSite::Vector)
+            .map_err(CompilerFailure::Allocation)?;
+    }
+
+    masked.clear_display_labels();
+    let mut target = candidate.app().try_clone_with(cx).map_err(app_error)?;
+    target.clear_display_labels();
+    let masked = crate::product_backup::fallible_codec::canonical_bytes(&masked, cx).map_err(codec_error)?;
+    let target = crate::product_backup::fallible_codec::canonical_bytes(&target, cx).map_err(codec_error)?;
+    if masked != target {
+        return Err(error("partial adoption changes the action/view shell outside enumerated effect expressions").into());
+    }
+    Ok(patches)
+}
 fn expression_variable(expr: &Expr, id: &str) -> bool {
     use Expr::*;
     match expr {
@@ -2339,7 +2469,19 @@ mod borrowed_view_tests {
             }],
             outputs: vec![],
             observables: vec![],
-            views: vec![],
+            views: vec![crate::product_contract::ViewDefinition {
+                id: "main".into(),
+                label: "Main".into(),
+                kind: crate::product_contract::ViewKind::Form {
+                    action: "edit".into(),
+                    fields: vec![],
+                    defaults: BTreeMap::from([("items".into(), DataValue::List {
+                        item_type: Type::reference("item"), items: vec![],
+                    })]),
+                },
+                actions: vec![],
+                keys: vec![],
+            }],
             initial_view: "main".into(),
         };
         let request = EffectPatchRequest {
@@ -2364,6 +2506,21 @@ mod borrowed_view_tests {
         let bytes = serde_json::to_vec(request).unwrap();
         super::super::fallible_scalar_decode::decode_effect_patch_request(
             syntax(&bytes),
+            &mut AllocationContext::new(),
+        ).unwrap()
+    }
+
+    fn decoded_capture(app: &AppDefinition) -> crate::product_contract::FallibleDecodedCapturedProgram {
+        let bytes = serde_json::to_vec(app).unwrap();
+        let captured = crate::product_contract::CapturedProgram::capture(
+            &bytes,
+            "project",
+            crate::product_contract::Producer::Fixture { name: "compiler-fallible-test".into() },
+            None,
+        ).unwrap();
+        let wire = serde_json::to_vec(&captured).unwrap();
+        crate::product_contract::decode_captured_program_fallible(
+            syntax(&wire),
             &mut AllocationContext::new(),
         ).unwrap()
     }
@@ -2520,6 +2677,79 @@ mod borrowed_view_tests {
             let mut retry = AllocationContext::new();
             locate_context_fallible(&decoded, &request, &mut retry).unwrap();
         }
+    }
+
+    #[test]
+    fn decoded_patch_derivation_matches_legacy_and_refuses_atomically() {
+        let (baseline_app, patch) = fixture();
+        let mut candidate_app = baseline_app.clone();
+        let Statement::ForEach { steps, .. } = &mut candidate_app.actions[0].steps[0] else { panic!("fixture loop") };
+        let Statement::Update { values, .. } = &mut steps[0] else { panic!("fixture update") };
+        values.insert("name".into(), Expr::Literal {
+            value: DataValue::Text { value: "new".into() },
+            value_type: Type::Text,
+        });
+        let request = ScopeRequest {
+            population: ScopePopulation::All,
+            operations: BTreeSet::from(["edit".into()]),
+            excluded_records: vec![],
+            lifecycles: vec![LifecycleBinding {
+                entity: "item".into(),
+                completed: Expr::Literal { value: DataValue::Boolean { value: true }, value_type: Type::Boolean },
+                source: canonical_digest(IdentityDomain::Adoption, &"test").unwrap(),
+            }],
+            patches: vec![patch],
+        };
+        let baseline = decoded_capture(&baseline_app);
+        let candidate = decoded_capture(&candidate_app);
+        let request_wire = serde_json::to_vec(&request).unwrap();
+        let request = super::super::fallible_scalar_decode::decode_scope_request(
+            syntax(&request_wire), &mut AllocationContext::new(),
+        ).unwrap();
+        let expected = derive_patches(&baseline_app, &candidate_app, &serde_json::from_slice::<ScopeRequest>(&request_wire).unwrap()).unwrap();
+        let mut success = AllocationContext::new();
+        let actual = derive_patches_fallible(&baseline, &candidate, &request, &mut success).unwrap();
+        assert_eq!(crate::product_contract::canonical_bytes(&expected).unwrap(), crate::product_contract::canonical_bytes(&actual).unwrap());
+        let growths = success.growth_requests();
+        assert!(growths > 0, "expected bounded fallible compiler growth");
+        for nth in 1..=growths {
+            let mut refused = AllocationContext::fail_nth_growth(std::num::NonZeroUsize::new(nth).unwrap(), true);
+            assert!(matches!(derive_patches_fallible(&baseline, &candidate, &request, &mut refused), Err(CompilerFailure::Allocation(_))), "growth refusal {nth}/{growths}");
+            let mut retry = AllocationContext::new();
+            let retried = derive_patches_fallible(&baseline, &candidate, &request, &mut retry).unwrap();
+            assert_eq!(crate::product_contract::canonical_bytes(&expected).unwrap(), crate::product_contract::canonical_bytes(&retried).unwrap());
+        }
+    }
+
+    #[test]
+    fn fallible_patch_derivation_preserves_reserved_namespace_error_priority() {
+        let (baseline_app, _) = fixture();
+        let mut reserved_candidate = baseline_app.clone();
+        reserved_candidate.label = format!("{}test", super::RESERVED_PREFIX);
+        let baseline = decoded_capture(&baseline_app);
+        let candidate = decoded_capture(&reserved_candidate);
+        let empty = ScopeRequest {
+            population: ScopePopulation::All,
+            operations: BTreeSet::new(),
+            excluded_records: vec![],
+            lifecycles: vec![],
+            patches: vec![],
+        };
+        let expected = derive_patches(&baseline_app, &reserved_candidate, &empty).unwrap_err();
+        let empty_wire = serde_json::to_vec(&empty).unwrap();
+        let empty_dto = super::super::fallible_scalar_decode::decode_scope_request(
+            syntax(&empty_wire), &mut AllocationContext::new(),
+        ).unwrap();
+        let actual = derive_patches_fallible(&baseline, &candidate, &empty_dto, &mut AllocationContext::new()).unwrap_err();
+        let expected_message = match expected {
+            StoreError::Invalid(message) => message,
+            other => panic!("unexpected legacy classification: {other:?}"),
+        };
+        let actual_message = match actual {
+            CompilerFailure::Store(StoreError::Invalid(message)) => message,
+            other => panic!("unexpected fallible classification: {other:?}"),
+        };
+        assert_eq!(actual_message, expected_message);
     }
 
     #[test]

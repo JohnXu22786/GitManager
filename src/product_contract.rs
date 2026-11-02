@@ -180,6 +180,28 @@ pub(crate) enum FallibleDataSnapshotCloneError {
     Invariant,
 }
 impl FallibleDecodedDataSnapshot {
+    pub(crate) fn empty_with(
+        project: &str,
+        app: &fallible_app_decode::DecodedAppDefinition,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Self, AppValidationError> {
+        app.validate_with(cx)?;
+        check_id(project).map_err(AppValidationError::Contract)?;
+        let project_id = crate::product_alloc::try_copy_str(project, cx, crate::product_alloc::AllocationSite::String)
+            .map_err(AppValidationError::Allocation)?;
+        let app = app.try_clone_with(cx)?;
+        let value = fallible_snapshot_decode::DecodedDataSnapshot {
+            version: CONTRACT_VERSION,
+            project_id,
+            generation: 0,
+            schema: app.entities,
+            records: Vec::new(),
+            events: Vec::new(),
+        };
+        let snapshot = Self(value);
+        snapshot.validate_with(cx)?;
+        Ok(snapshot)
+    }
     pub(crate) fn validate(&self) -> std::result::Result<(), ContractError> {
         self.0.validate()
     }
@@ -225,10 +247,54 @@ impl FallibleDecodedDataSnapshot {
                 _ => FallibleDataSnapshotCloneError::Invariant,
             })
     }
+    pub(crate) fn merge_app_with(
+        &self,
+        app: &fallible_app_decode::DecodedAppDefinition,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Self, AppValidationError> {
+        use crate::product_alloc::{try_push, try_reserve, AllocationSite};
+        app.validate_with(cx)?;
+        let mut next = self.try_clone_with(cx).map_err(|error| match error {
+            FallibleDataSnapshotCloneError::Allocation(failure) => AppValidationError::Allocation(failure),
+            FallibleDataSnapshotCloneError::Invariant => AppValidationError::Contract(ContractError("data snapshot copy invariant".into())),
+        })?;
+        let app = app.try_clone_with(cx)?;
+        let missing_entities = app.entities.iter().filter(|entity| !next.0.schema.iter().any(|stored| stored.id == entity.id)).count();
+        try_reserve(&mut next.0.schema, missing_entities, cx, AllocationSite::Vector).map_err(AppValidationError::Allocation)?;
+        for mut entity in app.entities {
+            if let Some(stored) = next.0.schema.iter_mut().find(|stored| stored.id == entity.id) {
+                for field in &entity.fields {
+                    if let Some(old) = stored.fields.iter().find(|old| old.id == field.id) {
+                        if old.value_type != field.value_type {
+                            return Err(AppValidationError::Contract(ContractError(format!("Field {}.{} changes its recorded type; a compatible forward repair is required", entity.id, field.id))));
+                        }
+                    }
+                }
+                let added = entity.fields.iter().filter(|field| !stored.fields.iter().any(|old| old.id == field.id)).count();
+                try_reserve(&mut stored.fields, added, cx, AllocationSite::Vector).map_err(AppValidationError::Allocation)?;
+                for field in entity.fields.drain(..) {
+                    if !stored.fields.iter().any(|old| old.id == field.id) {
+                        try_push(&mut stored.fields, field, cx, AllocationSite::Vector).map_err(AppValidationError::Allocation)?;
+                    }
+                }
+                stored.label = entity.label;
+                stored.unique = entity.unique;
+                stored.constraints = entity.constraints;
+            } else {
+                try_push(&mut next.0.schema, entity, cx, AllocationSite::Vector).map_err(AppValidationError::Allocation)?;
+            }
+        }
+        next.0.validate_with(cx).map_err(|error| match error {
+            fallible_snapshot_validate::SnapshotValidationError::Contract(error) => AppValidationError::Contract(error),
+            fallible_snapshot_validate::SnapshotValidationError::Allocation(failure) => AppValidationError::Allocation(failure),
+        })?;
+        Ok(next)
+    }
     pub(crate) fn project_id(&self) -> &str { &self.0.project_id }
     pub(crate) fn generation(&self) -> u64 { self.0.generation }
     pub(crate) fn records(&self) -> &[fallible_persisted_decode::DecodedRecord] { &self.0.records }
     pub(crate) fn events(&self) -> &[fallible_persisted_decode::DecodedBusinessEvent] { &self.0.events }
+    pub(crate) fn schema(&self) -> &[EntityDefinition] { &self.0.schema }
     pub(crate) fn record_producers(&self) -> impl Iterator<Item = &Digest> {
         self.0.records.iter().map(|record| &record.created_program)
     }
@@ -271,6 +337,12 @@ impl FallibleDecodedCapturedProgram {
         cx: &mut crate::product_alloc::AllocationContext,
     ) -> std::result::Result<Digest, AppValidationError> {
         self.0.revision_with(cx)
+    }
+    pub(crate) fn initial_session_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<FallibleDecodedSessionState, crate::product_alloc::AllocationFailure> {
+        self.0.app().initial_session_with(cx).map(FallibleDecodedSessionState)
     }
 }
 #[derive(Debug, Serialize)]
@@ -1234,10 +1306,18 @@ impl<'a> StatementSlice<'a> {
 }
 impl<'a> AppRef<'a> {
     pub(crate) fn is_fallible(&self) -> bool { matches!(self, Self::Decoded(_)) }
+    pub(crate) fn legacy(&self) -> Option<&'a AppDefinition> { match self { Self::Legacy(app) => Some(app), _ => None } }
     pub(crate) fn entities(&self) -> &'a [EntityDefinition] {
         match self {
             Self::Legacy(app) => &app.entities,
             Self::Decoded(app) => &app.entities,
+            Self::Snapshot => &[],
+        }
+    }
+    pub(crate) fn states(&self) -> &'a [StateDefinition] {
+        match self {
+            Self::Legacy(app) => &app.state,
+            Self::Decoded(app) => &app.state,
             Self::Snapshot => &[],
         }
     }
@@ -2202,6 +2282,29 @@ impl AppDefinition {
         canonical_digest(IdentityDomain::SemanticProgram, &app)
     }
 }
+
+pub(crate) fn decoded_expression_type_with(
+    app: &fallible_app_decode::DecodedAppDefinition,
+    expression: &Expr,
+    binding: &str,
+    entity: &str,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<Type, AppValidationError> {
+    let mut env = fallible_app_decode::FallibleMap::new();
+    let key = crate::product_alloc::try_copy_str(binding, cx, crate::product_alloc::AllocationSite::String)
+        .map_err(AppValidationError::Allocation)?;
+    let entity = crate::product_alloc::try_copy_str(entity, cx, crate::product_alloc::AllocationSite::String)
+        .map_err(AppValidationError::Allocation)?;
+    let reference = Type::Reference { entity };
+    let reference = values_map::try_clone_type(&reference, cx).map_err(AppValidationError::Allocation)?;
+    env.try_insert(key, reference, cx).map_err(AppValidationError::Allocation)?;
+    let mut validator = Validator::new_app(AppRef::Decoded(app), Audit::none(), cx);
+    let result = validator.expr(expression, &env, 0, true);
+    if let Some(failure) = validator.allocation_failure.take() {
+        return Err(AppValidationError::Allocation(failure));
+    }
+    result.map_err(AppValidationError::Contract)
+}
 pub(crate) fn validate_decoded_app(
     app: &fallible_app_decode::DecodedAppDefinition,
     cx: &mut crate::product_alloc::AllocationContext,
@@ -2710,6 +2813,172 @@ impl DataSnapshot {
         self.validate()?;
         canonical_digest(IdentityDomain::Schema, &self.schema)
     }
+}
+
+/// Borrowed read-only view over either persisted snapshot owner. Runtime
+/// proof evaluation uses this to share the same evaluator without converting
+/// fallible `Values` back into BTreeMap-backed legacy records.
+#[derive(Clone, Copy)]
+pub(crate) enum DataSnapshotView<'a> {
+    Legacy(&'a DataSnapshot),
+    Fallible(&'a FallibleDecodedDataSnapshot),
+    FallibleHistorical { data: &'a FallibleDecodedDataSnapshot, override_record: DataRecordView<'a>, values: &'a FallibleValues, archived: bool },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DataRecordView<'a> {
+    inner: DataRecordKind<'a>,
+}
+#[derive(Clone, Copy)]
+enum DataRecordKind<'a> {
+    Legacy(&'a Record),
+    Fallible(&'a fallible_persisted_decode::DecodedRecord),
+    FallibleOverride(&'a fallible_persisted_decode::DecodedRecord, &'a FallibleValues, bool),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum DataValuesView<'a> {
+    Legacy(&'a Values),
+    Fallible(&'a FallibleValues),
+}
+
+pub(crate) struct DataRecordIter<'a>(DataRecordIterKind<'a>);
+enum DataRecordIterKind<'a> {
+    Legacy(std::slice::Iter<'a, Record>),
+    Fallible(std::slice::Iter<'a, fallible_persisted_decode::DecodedRecord>),
+    FallibleHistorical { iter: std::slice::Iter<'a, fallible_persisted_decode::DecodedRecord>, override_record: DataRecordView<'a>, values: &'a FallibleValues, archived: bool },
+}
+
+impl<'a> Iterator for DataRecordIter<'a> {
+    type Item = DataRecordView<'a>;
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.0 {
+            DataRecordIterKind::Legacy(iter) => iter.next().map(|row| DataRecordView { inner: DataRecordKind::Legacy(row) }),
+            DataRecordIterKind::Fallible(iter) => iter.next().map(|row| DataRecordView { inner: DataRecordKind::Fallible(row) }),
+            DataRecordIterKind::FallibleHistorical { iter, override_record, values, archived } => iter.next().map(|row| {
+                // The historical overlay has already resolved its target record.
+                // Compare owners by address here so each evaluator row step does
+                // constant work instead of rescanning long entity/record IDs.
+                let view = DataRecordView { inner: DataRecordKind::Fallible(row) };
+                if view.same_fallible_record(override_record) { DataRecordView { inner: DataRecordKind::FallibleOverride(row, values, *archived) } }
+                else { view }
+            }),
+        }
+    }
+}
+
+pub(crate) enum DataValueIter<'a> {
+    Legacy(std::collections::btree_map::Iter<'a, String, DataValue>),
+    Fallible(values_map::FallibleValuesIter<'a>),
+}
+impl<'a> Iterator for DataValueIter<'a> {
+    type Item = (&'a String, &'a DataValue);
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Legacy(iter) => iter.next(),
+            Self::Fallible(iter) => iter.next(),
+        }
+    }
+}
+impl ExactSizeIterator for DataValueIter<'_> {}
+
+impl<'a> DataSnapshotView<'a> {
+    pub(crate) fn legacy(&self) -> Option<&'a DataSnapshot> { match self { Self::Legacy(data) => Some(data), _ => None } }
+    pub(crate) fn fallible_historical(data: &'a FallibleDecodedDataSnapshot, override_record: DataRecordView<'a>, values: &'a FallibleValues, archived: bool) -> Self {
+        Self::FallibleHistorical { data, override_record, values, archived }
+    }
+    pub(crate) fn project_id(&self) -> &str {
+        match self { Self::Legacy(data) => &data.project_id, Self::Fallible(data) | Self::FallibleHistorical { data, .. } => data.project_id() }
+    }
+    pub(crate) fn generation(&self) -> u64 {
+        match self { Self::Legacy(data) => data.generation, Self::Fallible(data) | Self::FallibleHistorical { data, .. } => data.generation() }
+    }
+    pub(crate) fn record_count(&self) -> usize {
+        match self { Self::Legacy(data) => data.records.len(), Self::Fallible(data) | Self::FallibleHistorical { data, .. } => data.records().len() }
+    }
+    pub(crate) fn schema(&self) -> &[EntityDefinition] {
+        match self { Self::Legacy(data) => &data.schema, Self::Fallible(data) | Self::FallibleHistorical { data, .. } => data.schema() }
+    }
+    pub(crate) fn records(&self) -> DataRecordIter<'a> {
+        match self {
+            Self::Legacy(data) => DataRecordIter(DataRecordIterKind::Legacy(data.records.iter())),
+            Self::Fallible(data) => DataRecordIter(DataRecordIterKind::Fallible(data.0.records.iter())),
+            Self::FallibleHistorical { data, override_record, values, archived } => DataRecordIter(DataRecordIterKind::FallibleHistorical { iter: data.0.records.iter(), override_record: *override_record, values, archived: *archived }),
+        }
+    }
+    pub(crate) fn record(&self, entity: &str, id: &str) -> Option<DataRecordView<'a>> {
+        self.records().find(|record| record.entity() == entity && record.id() == id)
+    }
+    pub(crate) fn validate_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), AppValidationError> {
+        match self {
+            Self::Legacy(data) => data.validate().map_err(AppValidationError::Contract),
+            Self::Fallible(data) | Self::FallibleHistorical { data, .. } => data.validate_with(cx),
+        }
+    }
+}
+impl<'a> From<&'a DataSnapshot> for DataSnapshotView<'a> {
+    fn from(value: &'a DataSnapshot) -> Self { Self::Legacy(value) }
+}
+impl<'a> From<&'a FallibleDecodedDataSnapshot> for DataSnapshotView<'a> {
+    fn from(value: &'a FallibleDecodedDataSnapshot) -> Self { Self::Fallible(value) }
+}
+impl<'a> DataRecordView<'a> {
+    pub(crate) fn entity(&self) -> &str {
+        match self.inner { DataRecordKind::Legacy(row) => &row.entity, DataRecordKind::Fallible(row) | DataRecordKind::FallibleOverride(row, _, _) => &row.entity }
+    }
+    pub(crate) fn id(&self) -> &str {
+        match self.inner { DataRecordKind::Legacy(row) => &row.id, DataRecordKind::Fallible(row) | DataRecordKind::FallibleOverride(row, _, _) => &row.id }
+    }
+    pub(crate) fn archived(&self) -> bool {
+        match self.inner { DataRecordKind::Legacy(row) => row.archived, DataRecordKind::Fallible(row) => row.archived, DataRecordKind::FallibleOverride(_, _, archived) => archived }
+    }
+    pub(crate) fn values(&self) -> DataValuesView<'_> {
+        match self.inner { DataRecordKind::Legacy(row) => DataValuesView::Legacy(&row.values), DataRecordKind::Fallible(row) => DataValuesView::Fallible(&row.values), DataRecordKind::FallibleOverride(_, values, _) => DataValuesView::Fallible(values) }
+    }
+    fn same_fallible_record(&self, other: &Self) -> bool {
+        match self.inner {
+            DataRecordKind::Fallible(row) | DataRecordKind::FallibleOverride(row, _, _) => match other.inner {
+                DataRecordKind::Fallible(other) | DataRecordKind::FallibleOverride(other, _, _) => std::ptr::eq(row, other),
+                DataRecordKind::Legacy(_) => false,
+            },
+            DataRecordKind::Legacy(_) => false,
+        }
+    }
+}
+impl<'a> DataValuesView<'a> {
+    pub(crate) fn len(&self) -> usize {
+        match self { Self::Legacy(values) => values.len(), Self::Fallible(values) => values.len() }
+    }
+    pub(crate) fn get(&self, key: &str) -> Option<&'a DataValue> {
+        match self { Self::Legacy(values) => values.get(key), Self::Fallible(values) => values.get(key) }
+    }
+    pub(crate) fn iter(&self) -> DataValueIter<'a> {
+        match self { Self::Legacy(values) => DataValueIter::Legacy(values.iter()), Self::Fallible(values) => DataValueIter::Fallible(values.iter()) }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum SessionStateView<'a> {
+    Legacy(&'a SessionState),
+    Fallible(&'a FallibleDecodedSessionState),
+}
+impl<'a> SessionStateView<'a> {
+    pub(crate) fn legacy(&self) -> Option<&'a SessionState> { match self { Self::Legacy(state) => Some(state), _ => None } }
+    pub(crate) fn values(&self) -> DataValuesView<'a> {
+        match self {
+            Self::Legacy(session) => DataValuesView::Legacy(&session.values),
+            Self::Fallible(session) => DataValuesView::Fallible(&session.0.values),
+        }
+    }
+}
+impl<'a> From<&'a SessionState> for SessionStateView<'a> {
+    fn from(value: &'a SessionState) -> Self { Self::Legacy(value) }
+}
+impl<'a> From<&'a FallibleDecodedSessionState> for SessionStateView<'a> {
+    fn from(value: &'a FallibleDecodedSessionState) -> Self { Self::Fallible(value) }
 }
 trait RecordLookup {
     fn len(&self) -> usize;
@@ -5035,6 +5304,7 @@ fn validate_values_shape(values: &Values) -> Result<()> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AdapterError {
     Invalid(ContractError),
+    Allocation(crate::product_alloc::AllocationFailure),
     Unsupported(String),
     Stale(String),
     Cancelled,

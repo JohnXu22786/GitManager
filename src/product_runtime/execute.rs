@@ -8,13 +8,7 @@ fn evaluate(
     env: &Env,
     meter: &mut Meter,
 ) -> Result<DataValue> {
-    Eval {
-        app,
-        data: &state.data,
-        session: &state.session,
-        day: state.day,
-        meter,
-    }
+    Eval::legacy(app, &state.data, &state.session, state.day, meter)
     .eval(expr, env)
 }
 fn assignments(
@@ -322,36 +316,94 @@ impl Transaction<'_> {
     }
 }
 pub(super) fn constraints(program: &ProgramSource, state: &State, meter: &mut Meter) -> Result<()> {
-    let app = &program.program;
-    meter.collection(state.data.records.len())?;
-    for row in &state.data.records {
+    let app = AppRef::from(&program.program);
+    let data = DataSnapshotView::from(&state.data);
+    let session = SessionStateView::from(&state.session);
+    constraints_view(app, data, session, state.day, meter,
+        |_| state.data.validate().map_err(AdapterError::Invalid),
+        |_, _| program.validate_session(&state.session))
+}
+
+pub(super) fn constraints_decoded(
+    program: &FallibleDecodedCapturedProgram,
+    data: &FallibleDecodedDataSnapshot,
+    session: &FallibleDecodedSessionState,
+    day: i32,
+    meter: &mut Meter,
+) -> Result<()> {
+    let app = AppRef::from(program.app());
+    let data_view = DataSnapshotView::from(data);
+    let session_view = SessionStateView::from(session);
+    constraints_view(app, data_view, session_view, day, meter,
+        |allocations| data.validate_with(allocations).map_err(app_validation_error),
+        |_, allocations| program.validate_session_with(session, allocations).map_err(app_validation_error))
+}
+
+fn app_validation_error(error: AppValidationError) -> AdapterError {
+    match error {
+        AppValidationError::Contract(error) => AdapterError::Invalid(error),
+        AppValidationError::Allocation(failure) => AdapterError::Allocation(failure),
+    }
+}
+
+fn constraints_view<D, S>(
+    app: AppRef<'_>,
+    data: DataSnapshotView<'_>,
+    session: SessionStateView<'_>,
+    day: i32,
+    meter: &mut Meter,
+    validate_data: D,
+    validate_session: S,
+) -> Result<()>
+where
+    D: FnOnce(&mut product_alloc::AllocationContext) -> Result<()>,
+    S: FnOnce(&SessionStateView<'_>, &mut product_alloc::AllocationContext) -> Result<()>,
+{
+    meter.collection(data.record_count())?;
+    for row in data.records() {
         meter.tick(1)?;
-        for value in row.values.values() {
-            meter.value(value)?;
-        }
-        if row.archived {
-            continue;
-        }
-        let Some(entity) = app.entities.iter().find(|e| e.id == row.entity) else {
-            continue;
+        for (_, value) in row.values().iter() { meter.value(value)?; }
+        if row.archived() { continue; }
+        let Some(entity) = app.entities().iter().find(|entity| entity.id == row.entity()) else { continue; };
+        let mut legacy_env = Env::new();
+        let mut managed_env = ManagedEnv::new();
+        let env: &dyn EnvAccess = if app.is_fallible() {
+            let reference = DataValue::Reference {
+                entity: product_alloc::try_copy_str(row.entity(), &mut meter.allocations, product_alloc::AllocationSite::String).map_err(AdapterError::Allocation)?,
+                record: product_alloc::try_copy_str(row.id(), &mut meter.allocations, product_alloc::AllocationSite::String).map_err(AdapterError::Allocation)?,
+            };
+            let typ = Type::Reference { entity: product_alloc::try_copy_str(row.entity(), &mut meter.allocations, product_alloc::AllocationSite::String).map_err(AdapterError::Allocation)? };
+            managed_env.try_bind("record", &typ, &reference, &mut meter.allocations).map_err(AdapterError::Allocation)?;
+            &managed_env
+        } else {
+            legacy_env.insert("record".into(), (Type::reference(row.entity()), DataValue::Reference {
+                entity: row.entity().into(), record: row.id().into(),
+            }));
+            &legacy_env
         };
-        let env = BTreeMap::from([(
-            "record".into(),
-            (Type::reference(&row.entity), value_ref(row)),
-        )]);
         for constraint in &entity.constraints {
-            if !boolean(evaluate(app, state, constraint, &env, meter)?)? {
-                return Err(invalid(&format!("Entity constraint failed: {}", entity.id)));
-            }
+            let result = Eval::view(app, data, session, day, meter).eval(constraint, env)?;
+            if !boolean(result)? { return Err(invalid(&format!("Entity constraint failed: {}", entity.id))); }
         }
     }
-    state.data.validate()?;
-    program.validate_session(&state.session)?;
-    for value in state.session.values.values() {
+    validate_data(&mut meter.allocations)?;
+    validate_session(&session, &mut meter.allocations)?;
+    for (_, value) in session.values().iter() {
         meter.value(value)?;
-        check_references(value, &state.data)?;
+        check_references_view(value, &data)?;
     }
     meter.tick(1)?;
+    Ok(())
+}
+
+fn check_references_view(value: &DataValue, data: &DataSnapshotView<'_>) -> Result<()> {
+    match value {
+        DataValue::Reference { entity, record } => {
+            if data.record(entity, record).is_none() { return Err(invalid("record reference does not exist")); }
+        }
+        DataValue::List { items, .. } => for item in items { check_references_view(item, data)?; },
+        _ => {}
+    }
     Ok(())
 }
 fn action(

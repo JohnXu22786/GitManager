@@ -164,3 +164,20 @@ pub(super) fn record<'s>(data:&'s DataSnapshot,value:&DataValue,work:&mut dyn Co
     }
     pay(work,1)?;Err(invalid("record reference does not exist"))
 }
+pub(super) fn record_view<'s>(data:&crate::product_contract::DataSnapshotView<'s>,value:&DataValue,work:&mut dyn ContractWork)->Result<crate::product_contract::DataRecordView<'s>> {
+    pay(work,2)?;
+    let DataValue::Reference{entity,record}=value else{return Err(failed("expected record reference"))};
+    // Retain the legacy charge schedule for the transient key, while the
+    // decoded owner remains borrowed and is never materialized as a BTreeMap.
+    pay(work,2)?;string(entity,work)?;string(record,work)?;
+    pay(work,1)?;
+    let mut visited=0usize;
+    for row in data.records() {
+        pay(work,3)?; visited+=1;
+        if eq_string(row.entity(),entity,work)? && eq_string(row.id(),record,work)? {
+            pay(work,1)?;return Ok(row)
+        }
+    }
+    let _=visited;
+    pay(work,1)?;Err(invalid("record reference does not exist"))
+}

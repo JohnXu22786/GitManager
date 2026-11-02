@@ -3,7 +3,7 @@
 //! The DTO mirrors the derived Serde wire format while replacing BTree maps and
 //! sets with ordered fallible owners. Semantic AppDefinition validation stays
 //! with the existing caller.
-use crate::product_alloc::{self, AllocationContext, AllocationSite};
+use crate::product_alloc::{self, AllocationContext, AllocationFailure, AllocationSite};
 use crate::product_alloc::ordered::{OrderedMap, OrderedSet};
 use crate::product_json::{Number, Value};
 use serde::ser::{SerializeMap, SerializeSeq};
@@ -65,6 +65,24 @@ pub(crate) struct DecodedAppDefinition {
     pub(super) initial_view: String,
 }
 impl DecodedAppDefinition {
+    pub(crate) fn initial_session_with(
+        &self,
+        cx: &mut AllocationContext,
+    ) -> Result<super::fallible_persisted_decode::DecodedSessionState, AllocationFailure> {
+        let view = crate::product_alloc::try_copy_str(&self.initial_view, cx, AllocationSite::String)?;
+        let mut values = FallibleValues::new();
+        for state in &self.state {
+            let id = crate::product_alloc::try_copy_str(&state.id, cx, AllocationSite::String)?;
+            let value = super::values_map::try_clone_data_value(&state.initial, cx)?;
+            values.try_insert(id, value, cx)?;
+        }
+        Ok(super::fallible_persisted_decode::DecodedSessionState {
+            view,
+            values,
+            focused_record: None,
+        })
+    }
+
     pub(crate) fn validate_session_with(
         &self,
         session: &super::fallible_persisted_decode::DecodedSessionState,

@@ -136,6 +136,10 @@ impl Serialize for ScopePopulationDto {
 }
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct LifecycleBindingDto { entity: String, completed: Expr, source: Digest }
+impl LifecycleBindingDto {
+    pub(crate) fn entity(&self) -> &str { &self.entity }
+    pub(crate) fn completed(&self) -> &Expr { &self.completed }
+}
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct EffectPatchRequestDto {
     pub(crate) destination: EffectDestinationDto,

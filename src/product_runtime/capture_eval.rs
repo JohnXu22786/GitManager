@@ -8,7 +8,7 @@ impl Eval<'_> {
     fn references_paid(&mut self,value:&DataValue)->Result<()> {
         self.meter.tick(1)?;cost::pay(self.meter,2)?;
         match value {
-            DataValue::Reference{..}=>{self.meter.tick(self.data.records.len() as u64)?;cost::record(self.data,value,self.meter)?;}
+            DataValue::Reference{..}=>{let data=self.data.legacy().expect("paid capture uses legacy snapshot");self.meter.tick(data.records.len() as u64)?;cost::record(data,value,self.meter)?;}
             DataValue::List{items,..}=>{
                 cost::pay(self.meter,1)?;
                 for value in items{cost::pay(self.meter,3)?;self.references_paid(value)?;}
@@ -28,7 +28,7 @@ impl Eval<'_> {
             }
             Expr::State{state}=>{
                 cost::pay(self.meter,1)?;let mut found=None;
-                for s in &self.app.state {cost::pay(self.meter,3)?;if cost::eq_string(&s.id,state,self.meter)?{found=Some(&s.value_type);break;}}
+                for s in &self.app.legacy().expect("paid capture uses legacy app").state {cost::pay(self.meter,3)?;if cost::eq_string(&s.id,state,self.meter)?{found=Some(&s.value_type);break;}}
                 if found.is_none(){cost::pay(self.meter,1)?;}
                 let t=found.ok_or_else(||failed("missing state type"))?;
                 cost::typ(t,self.meter)?;t.clone()
@@ -36,7 +36,7 @@ impl Eval<'_> {
             Expr::Field{record,field}=>{
                 let Type::Reference{entity}=self.typ(record,env)? else{return Err(failed("invalid field type"))};
                 cost::pay(self.meter,1)?;let mut found=None;
-                for e in &self.app.entities {
+                for e in &self.app.legacy().expect("paid capture uses legacy app").entities {
                     cost::pay(self.meter,3)?;
                     if cost::eq_string(&e.id,&entity,self.meter)? {
                         cost::pay(self.meter,1)?;
@@ -81,8 +81,8 @@ impl Eval<'_> {
                 self.meter.value(value)?;cost::value(value,self.meter)?;(*value).clone()
             }
             Expr::Field{record:expr,field}=>{
-                let key=self.eval(expr,env)?;self.meter.tick(self.data.records.len() as u64)?;
-                let record=cost::record(self.data,&key,self.meter)?;
+                let key=self.eval(expr,env)?;let data=self.data.legacy().expect("paid capture uses legacy snapshot");self.meter.tick(data.records.len() as u64)?;
+                let record=cost::record(data,&key,self.meter)?;
                 cost::search(record.values.len(),field.len(),self.meter)?;
                 let found=record.values.get(field);
                 // Full selected owner is paid BEFORE the native .cloned().
@@ -91,14 +91,16 @@ impl Eval<'_> {
                 self.meter.value(&value)?;value
             }
             Expr::State{state}=>{
-                cost::search(self.session.values.len(),state.len(),self.meter)?;
-                let value=self.session.values.get(state).ok_or_else(||failed("missing session value"))?;
+                let session=self.session.legacy().expect("paid capture uses legacy session");
+                cost::search(session.values.len(),state.len(),self.meter)?;
+                let value=session.values.get(state).ok_or_else(||failed("missing session value"))?;
                 self.meter.value(value)?;cost::value(value,self.meter)?;value.clone()
             }
             Expr::Today=>{cost::pay(self.meter,1)?;DataValue::Date{days:self.day}}
             Expr::Query{entity,binding,predicate,sort,limit,include_archived}=>{
                 cost::pay(self.meter,3)?;let mut candidates=Vec::new();
-                for record in &self.data.records {
+                let data=self.data.legacy().expect("paid capture uses legacy snapshot");
+                for record in &data.records {
                     self.meter.tick(1)?;cost::pay(self.meter,3)?;
                     if cost::eq_string(&record.entity,entity,self.meter)? {
                         cost::pay(self.meter,3)?;

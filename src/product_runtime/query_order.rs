@@ -6,7 +6,7 @@
 //! This module does not validate product inputs, meter work, or close caller
 //! construction/destruction, routing, paid execution, or default-budget fit.
 use super::product_alloc::{try_reserve, AllocationContext, AllocationFailure, AllocationSite};
-use crate::product_contract::{DataValue, Id, Record, SortKey};
+use crate::product_contract::{DataRecordView, DataValue, Id, Record, SortKey};
 use std::cmp::Ordering;
 
 pub(crate) type QueryRow = (Id, Vec<DataValue>, DataValue);
@@ -26,8 +26,13 @@ macro_rules! count {
 }
 
 /// n<2 deliberately does not inspect the context or reserve any workspace.
-pub(crate) fn try_sort_candidate_ids(
-    candidates: &mut [&Record], cx: &mut AllocationContext,
+pub(crate) trait CandidateId { fn candidate_id(&self) -> &str; }
+impl CandidateId for Record { fn candidate_id(&self) -> &str { &self.id } }
+impl CandidateId for DataRecordView<'_> { fn candidate_id(&self) -> &str { self.id() } }
+impl<T: CandidateId + ?Sized> CandidateId for &T { fn candidate_id(&self) -> &str { (**self).candidate_id() } }
+
+pub(crate) fn try_sort_candidate_ids<T: CandidateId>(
+    candidates: &mut [T], cx: &mut AllocationContext,
 ) -> Result<(), AllocationFailure> {
     if candidates.len() < 2 { return Ok(()); }
     let (order, mut inverse) = sorted_indices(Input::Candidates(candidates), cx)?;
@@ -49,7 +54,7 @@ pub(crate) fn try_sort_rows(
             });
         }
     }
-    let (order, mut inverse) = sorted_indices(Input::Rows(rows, sort), cx)
+    let (order, mut inverse) = sorted_indices(Input::<Record>::Rows(rows, sort), cx)
         .map_err(QueryOrderError::Allocation)?;
     permute(rows, &order, &mut inverse);
     Ok(())
@@ -57,11 +62,11 @@ pub(crate) fn try_sort_rows(
 
 // Closed borrowed inputs: no comparator/key/destructor callback can escape the
 // finite comparator below. Query Expr, Record.values and List owners are unread.
-enum Input<'a> {
-    Candidates(&'a [&'a Record]),
+enum Input<'a, T> {
+    Candidates(&'a [T]),
     Rows(&'a [QueryRow], &'a [SortKey]),
 }
-impl Input<'_> {
+impl<T: CandidateId> Input<'_, T> {
     fn len(&self) -> usize {
         match self { Self::Candidates(v) => v.len(), Self::Rows(v, _) => v.len() }
     }
@@ -69,7 +74,7 @@ impl Input<'_> {
         match self {
             Self::Candidates(v) => {
                 count!(comparisons, 1);
-                bytes(&v[a].id, &v[b].id)
+                bytes(v[a].candidate_id(), v[b].candidate_id())
             }
             Self::Rows(v, sort) => compare_rows(&v[a], &v[b], sort),
         }
@@ -127,7 +132,7 @@ fn prepare(n: usize, cx: &mut AllocationContext)
     Ok((order, scratch))
 }
 
-fn sorted_indices(input: Input<'_>, cx: &mut AllocationContext)
+fn sorted_indices<T: CandidateId>(input: Input<'_, T>, cx: &mut AllocationContext)
     -> Result<(Vec<usize>, Vec<usize>), AllocationFailure>
 {
     let n = input.len();

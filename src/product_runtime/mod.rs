@@ -8,6 +8,7 @@ mod capture_key;
 mod fallible_lower;
 mod query_order;
 mod owned_env;
+use owned_env::ManagedEnv;
 pub(crate) use capture::{ProjectionHost, ProjectionReservation};
 mod eval;
 mod execute;
@@ -73,6 +74,10 @@ pub fn has_protected_fields(program: &CapturedProgram) -> bool {
             .any(|f| f.id.starts_with(PROTECTED_FIELD_PREFIX))
     })
 }
+
+#[cfg(test)]
+#[path = "fallible_projection_tests.rs"]
+mod fallible_projection_tests;
 pub const RUNTIME_VERSION: &str = "local-interpreter/4";
 pub const DRIVER_VERSION: &str = "semantic-input/3";
 type Result<T> = std::result::Result<T, AdapterError>;
@@ -420,6 +425,140 @@ impl LocalRuntime {
             program, data, row, binding, expression, expected, day, limits, checks, source,
         )
     }
+    /// Evaluate a scalar proof expression directly against bounded persisted
+    /// owners. The legacy and decoded paths share `Eval`; no map conversion or
+    /// cloned compatibility model is introduced.
+    pub(crate) fn evaluate_decoded_record_projection_with(
+        &self,
+        program: &FallibleDecodedCapturedProgram,
+        data: &FallibleDecodedDataSnapshot,
+        row: &RecordRef,
+        binding: &str,
+        expression: &Expr,
+        expected: &Type,
+        day: i32,
+        limits: RuntimeLimits,
+        mut allocations: product_alloc::AllocationContext,
+    ) -> Result<DataValue> {
+        fn app_error(error: AppValidationError) -> AdapterError {
+            match error {
+                AppValidationError::Contract(error) => AdapterError::Invalid(error),
+                AppValidationError::Allocation(failure) => AdapterError::Allocation(failure),
+            }
+        }
+        validate_day(day)?;
+        limits.validate()?;
+        program.validate_with(&mut allocations).map_err(app_error)?;
+        data.validate_with(&mut allocations).map_err(app_error)?;
+        if program.project_id() != data.project_id() || !valid_id(binding) {
+            return Err(invalid("projection project or binding mismatch"));
+        }
+        let view = DataSnapshotView::from(data);
+        if view.record(&row.entity, &row.record).is_none() {
+            return Err(invalid("record reference does not exist"));
+        }
+        let actual = crate::product_contract::decoded_expression_type_with(
+            program.app(), expression, binding, &row.entity, &mut allocations,
+        ).map_err(app_error)?;
+        if actual != *expected { return Err(invalid("projection result type mismatch")); }
+        let session = program.initial_session_with(&mut allocations).map_err(AdapterError::Allocation)?;
+        program.validate_session_with(&session, &mut allocations).map_err(app_error)?;
+        let value = DataValue::Reference {
+            entity: product_alloc::try_copy_str(&row.entity, &mut allocations, product_alloc::AllocationSite::String).map_err(AdapterError::Allocation)?,
+            record: product_alloc::try_copy_str(&row.record, &mut allocations, product_alloc::AllocationSite::String).map_err(AdapterError::Allocation)?,
+        };
+        let mut managed = ManagedEnv::new();
+        let env_entity = product_alloc::try_copy_str(&row.entity, &mut allocations, product_alloc::AllocationSite::String)
+            .map_err(AdapterError::Allocation)?;
+        let typ = Type::Reference { entity: env_entity };
+        let binding = product_alloc::try_copy_str(binding, &mut allocations, product_alloc::AllocationSite::String)
+            .map_err(AdapterError::Allocation)?;
+        managed.try_bind(&binding, &typ, &value, &mut allocations).map_err(AdapterError::Allocation)?;
+        let mut meter = Meter::with_allocations(limits.clone(), limits.fuel, self.cancelled.clone(), allocations);
+        let mut evaluator = Eval::fallible(program.app(), data, &session, day, &mut meter);
+        let result = evaluator.eval(expression, &managed)?;
+        validate_value(&result, expected, 0)?;
+        Ok(result)
+    }
+    pub(crate) fn evaluate_decoded_historical_record_projection_with(
+        &self,
+        program: &FallibleDecodedCapturedProgram,
+        data: &FallibleDecodedDataSnapshot,
+        row: &RecordRef,
+        values: &FallibleValues,
+        archived: bool,
+        binding: &str,
+        expression: &Expr,
+        expected: &Type,
+        day: i32,
+        limits: RuntimeLimits,
+        mut allocations: product_alloc::AllocationContext,
+    ) -> Result<DataValue> {
+        fn app_error(error: AppValidationError) -> AdapterError {
+            match error {
+                AppValidationError::Contract(error) => AdapterError::Invalid(error),
+                AppValidationError::Allocation(failure) => AdapterError::Allocation(failure),
+            }
+        }
+        validate_day(day)?;
+        limits.validate()?;
+        program.validate_with(&mut allocations).map_err(app_error)?;
+        data.validate_with(&mut allocations).map_err(app_error)?;
+        if values.len() > MAX_ITEMS { return Err(invalid("historical projection row exceeds bounds")); }
+        let base = DataSnapshotView::from(data);
+        let storage = base.schema().iter().find(|entity| entity.id == row.entity)
+            .ok_or_else(|| invalid("historical projection storage entity missing"))?;
+        for (id, value) in values.iter() {
+            let field = storage.fields.iter().find(|field| field.id == *id)
+                .ok_or_else(|| invalid("historical projection field missing"))?;
+            validate_value(value, &field.value_type, 0)?;
+        }
+        let producer = AppRef::from(program.app()).entities().iter().find(|entity| entity.id == row.entity)
+            .ok_or_else(|| invalid("historical producer entity missing"))?;
+        for field in &producer.fields {
+            validate_value(values.get(&field.id).unwrap_or(&DataValue::Null), &field.value_type, 0)?;
+        }
+        let mut meter = Meter::with_allocations(limits.clone(), limits.fuel, self.cancelled.clone(), allocations);
+        let mut historical_record = None;
+        for candidate in base.records() {
+            let comparison_bytes = candidate.entity().len()
+                .saturating_add(row.entity.len())
+                .saturating_add(candidate.id().len())
+                .saturating_add(row.record.len());
+            meter.tick(u64::try_from(comparison_bytes).unwrap_or(u64::MAX))?;
+            if candidate.entity() == row.entity && candidate.id() == row.record {
+                historical_record = Some(candidate);
+                break;
+            }
+        }
+        let historical_record = historical_record
+            .ok_or_else(|| invalid("historical projection record missing"))?;
+        if program.project_id() != data.project_id() || !valid_id(binding) {
+            return Err(invalid("projection project or binding mismatch"));
+        }
+        let actual = crate::product_contract::decoded_expression_type_with(
+            program.app(), expression, binding, &row.entity, &mut meter.allocations,
+        ).map_err(app_error)?;
+        if actual != *expected { return Err(invalid("projection result type mismatch")); }
+        let session = program.initial_session_with(&mut meter.allocations).map_err(AdapterError::Allocation)?;
+        program.validate_session_with(&session, &mut meter.allocations).map_err(app_error)?;
+        let value = DataValue::Reference {
+            entity: product_alloc::try_copy_str(&row.entity, &mut meter.allocations, product_alloc::AllocationSite::String).map_err(AdapterError::Allocation)?,
+            record: product_alloc::try_copy_str(&row.record, &mut meter.allocations, product_alloc::AllocationSite::String).map_err(AdapterError::Allocation)?,
+        };
+        let env_entity = product_alloc::try_copy_str(&row.entity, &mut meter.allocations, product_alloc::AllocationSite::String)
+            .map_err(AdapterError::Allocation)?;
+        let typ = Type::Reference { entity: env_entity };
+        let env_binding = product_alloc::try_copy_str(binding, &mut meter.allocations, product_alloc::AllocationSite::String)
+            .map_err(AdapterError::Allocation)?;
+        let mut managed = ManagedEnv::new();
+        managed.try_bind(&env_binding, &typ, &value, &mut meter.allocations).map_err(AdapterError::Allocation)?;
+        let data_view = DataSnapshotView::fallible_historical(data, historical_record, values, archived);
+        let mut evaluator = Eval::fallible_view(program.app(), data_view, &session, day, &mut meter);
+        let result = evaluator.eval(expression, &managed)?;
+        validate_value(&result, expected, 0)?;
+        Ok(result)
+    }
     /// Evaluate an independently proven own-row historical expression. Validate
     /// the coherent current data and every producer-row value first; global
     /// constraints must not be applied to a mixture of historical/current rows.
@@ -573,13 +712,7 @@ impl LocalRuntime {
         let session = SessionState::initial(&program.program)?;
         let mut meter = Meter::new(limits.clone(), limits.fuel, self.cancelled.clone());
         let env = Env::from([(binding.to_owned(), (Type::reference(&row.entity), value))]);
-        let mut evaluator = Eval {
-            app: &program.program,
-            data,
-            session: &session,
-            day,
-            meter: &mut meter,
-        };
+        let mut evaluator = Eval::legacy(&program.program, data, &session, day, &mut meter);
         if evaluator.typ(expression, &env)? != *expected {
             return Err(invalid("projection result type mismatch"));
         }
@@ -605,6 +738,51 @@ impl LocalRuntime {
     ) -> Result<CompatibilityReport> {
         validate_day(day)?;
         compatibility::check(&ProgramSource::ordinary(program), current, Some(day))
+    }
+    pub(crate) fn compatibility_decoded_state_at(
+        &self,
+        program: &FallibleDecodedCapturedProgram,
+        current: &FallibleDecodedDataSnapshot,
+        day: i32,
+        mut allocations: product_alloc::AllocationContext,
+    ) -> Result<CompatibilityState> {
+        fn app_error(error: AppValidationError) -> AdapterError {
+            match error {
+                AppValidationError::Contract(error) => AdapterError::Invalid(error),
+                AppValidationError::Allocation(failure) => AdapterError::Allocation(failure),
+            }
+        }
+        validate_day(day)?;
+        program.validate_with(&mut allocations).map_err(app_error)?;
+        current.validate_with(&mut allocations).map_err(app_error)?;
+        if program.project_id() != current.project_id() { return Err(invalid("compatibility project mismatch")); }
+
+        let app = AppRef::from(program.app());
+        let mut state = CompatibilityState::Compatible;
+        for stored in current.schema() {
+            if let Some(target) = app.entities().iter().find(|entity| entity.id == stored.id) {
+                for field in &stored.fields {
+                    if !target.fields.iter().any(|candidate| candidate.id == field.id)
+                        && !matches!(field.value_type, Type::Optional { .. })
+                    { state = CompatibilityState::Incompatible; }
+                }
+            } else if DataSnapshotView::from(current).records().any(|record| record.entity() == stored.id) {
+                state = CompatibilityState::RetainedButUnavailable;
+            }
+        }
+        let merged = match current.merge_app_with(program.app(), &mut allocations) {
+            Ok(merged) => merged,
+            Err(AppValidationError::Allocation(failure)) => return Err(AdapterError::Allocation(failure)),
+            Err(AppValidationError::Contract(_)) => return Ok(CompatibilityState::Incompatible),
+        };
+        let session = program.initial_session_with(&mut allocations).map_err(AdapterError::Allocation)?;
+        let limits = RuntimeLimits { fuel: 10_000_000, ..RuntimeLimits::default() };
+        let mut meter = Meter::with_allocations(limits.clone(), limits.fuel, Arc::new(AtomicBool::new(false)), allocations);
+        match execute::constraints_decoded(program, &merged, &session, day, &mut meter) {
+            Ok(()) => Ok(state),
+            Err(AdapterError::Allocation(failure)) => Err(AdapterError::Allocation(failure)),
+            Err(_) => Ok(CompatibilityState::Incompatible),
+        }
     }
     /// Resume daily work with its actual committed artifact receipts. Scenario
     /// replay intentionally starts with no new emissions; it uses `start`.

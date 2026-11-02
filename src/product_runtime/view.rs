@@ -11,13 +11,7 @@ fn enabled(
 ) -> Result<BTreeSet<Id>> {
     let mut result = BTreeSet::new();
     for binding in bindings.iter().filter(|b| b.placement == placement) {
-        let mut eval = Eval {
-            app,
-            data: &state.data,
-            session: &state.session,
-            day: state.day,
-            meter,
-        };
+        let mut eval = Eval::legacy(app, &state.data, &state.session, state.day, meter);
         if !boolean(eval.eval(&binding.enabled, env)?)? {
             continue;
         }
@@ -106,13 +100,7 @@ pub(super) fn render(
                 }
             }
             let items = list(
-                Eval {
-                    app,
-                    data: &state.data,
-                    session: &state.session,
-                    day: state.day,
-                    meter,
-                }
+                Eval::legacy(app, &state.data, &state.session, state.day, meter)
                 .eval(rows, &Env::new())?,
             )?
             .1;
@@ -121,13 +109,7 @@ pub(super) fn render(
         ViewKind::Detail {
             record, columns, ..
         } => {
-            let key = Eval {
-                app,
-                data: &state.data,
-                session: &state.session,
-                day: state.day,
-                meter,
-            }
+            let key = Eval::legacy(app, &state.data, &state.session, state.day, meter)
             .eval(record, &Env::new())?;
             (vec![key], columns)
         }
@@ -152,13 +134,7 @@ pub(super) fn render(
         let env = BTreeMap::from([("row".into(), (Type::reference(&key.entity), value))]);
         let mut cells = Values::new();
         for column in columns {
-            let value = Eval {
-                app,
-                data: &state.data,
-                session: &state.session,
-                day: state.day,
-                meter,
-            }
+            let value = Eval::legacy(app, &state.data, &state.session, state.day, meter)
             .eval(&column.value, &env)?;
             meter.value(&value)?;
             cells.insert(column.id.clone(), value);
@@ -186,13 +162,7 @@ pub(super) fn observe(
     meter.tick(1)?;
     let mut values = Values::new();
     for observable in &app.observables {
-        let value = Eval {
-            app,
-            data: &state.data,
-            session: &state.session,
-            day: state.day,
-            meter,
-        }
+        let value = Eval::legacy(app, &state.data, &state.session, state.day, meter)
         .eval(&observable.value, &Env::new())?;
         meter.value(&value)?;
         values.insert(observable.id.clone(), value);

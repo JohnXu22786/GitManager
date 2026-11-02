@@ -77,12 +77,12 @@ fn sort_reserve(n:usize,size:usize,payload:u64,work:&mut dyn ContractWork)->Resu
     };
     pay(work,add(add(add(mul(c,payload)?,mul(moves,size)?)?,control)?,add(storage,12)?)?)
 }
-pub(super) fn sort_candidates_paid(rows:&mut [&Record],work:&mut dyn ContractWork)->Result<()> {
+pub(super) fn sort_candidates_paid<T: super::query_order::CandidateId>(rows:&mut [T],work:&mut dyn ContractWork)->Result<()> {
     pay(work,4)?;let mut width=0usize;
-    for row in rows.iter(){pay(work,6)?;width=width.max(row.id.len());}
+    for row in rows.iter(){pay(work,6)?;width=width.max(row.candidate_id().len());}
     pay(work,128)?;
-    sort_reserve(rows.len(),size_of::<&Record>(),add(3,mul(2,number(width)?)?)?,work)?;
-    rows.sort_by(|a,b|a.id.cmp(&b.id));
+    sort_reserve(rows.len(),size_of::<T>(),add(3,mul(2,number(width)?)?)?,work)?;
+    rows.sort_by(|a,b|a.candidate_id().cmp(b.candidate_id()));
     pay(work,0)
 }
 pub(super) fn sort_rows_paid(rows:&mut [(Id,Vec<DataValue>,DataValue)],sort:&[SortKey],work:&mut dyn ContractWork)->Result<()> {
