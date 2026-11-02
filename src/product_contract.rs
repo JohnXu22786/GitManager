@@ -380,6 +380,26 @@ pub(crate) struct FallibleDecodedSessionState(fallible_persisted_decode::Decoded
 impl FallibleDecodedSessionState {
     pub(crate) fn values(&self) -> &FallibleValues { self.0.values() }
     pub(crate) fn focused_record(&self) -> Option<&RecordRef> { self.0.focused_record() }
+    pub(crate) fn identity_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Digest, crate::product_backup::fallible_codec::CodecError> {
+        crate::product_backup::fallible_codec::canonical_digest(IdentityDomain::Session, self, cx)
+    }
+    pub(crate) fn try_clone_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Self, AppValidationError> {
+        let value = crate::product_backup::fallible_codec::try_serialize_value(self, cx)
+            .map_err(|error| match error {
+                crate::product_backup::fallible_codec::CodecError::Allocation(failure) => AppValidationError::Allocation(failure),
+                _ => AppValidationError::Contract(ContractError("session copy invariant".into())),
+            })?;
+        fallible_persisted_decode::decode_session_state(value, cx).map(Self).map_err(|error| match error {
+            fallible_value_decode::ValueDecodeError::Allocation(failure) => AppValidationError::Allocation(failure),
+            _ => AppValidationError::Contract(ContractError("session copy invariant".into())),
+        })
+    }
 }
 #[derive(Debug, Serialize)]
 pub(crate) struct FallibleDecodedCapturedProgram(fallible_capture_decode::DecodedCapturedProgram);
@@ -405,6 +425,7 @@ impl FallibleDecodedCapturedProgram {
     }
     pub(crate) fn project_id(&self) -> &str { self.0.project_id() }
     pub(crate) fn binding(&self) -> &SourceBinding { self.0.binding() }
+    pub(crate) fn artifact(&self) -> &ArtifactRef { self.0.artifact() }
     pub(crate) fn program_digest(&self) -> &Digest { self.0.program_digest() }
     pub(crate) fn app(&self) -> &fallible_app_decode::DecodedAppDefinition { self.0.app() }
     pub(crate) fn revision_with(
@@ -547,6 +568,107 @@ pub(crate) struct FallibleDecodedRunEvidence(fallible_run_evidence_decode::Decod
 #[derive(Debug, Serialize)]
 pub(crate) struct FallibleDecodedDecisionGraph(fallible_decision_decode::DecodedDecisionGraph);
 impl FallibleDecodedDecisionGraph {
+    pub(crate) fn revision(&self) -> u64 { self.0.revision }
+
+    pub(crate) fn is_empty_checkpoint(&self) -> bool {
+        self.0.revision == 0 && self.0.decisions.is_empty()
+    }
+
+    pub(crate) fn active_ids_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Vec<String>, DecisionValidationError> {
+        let mut ids = Vec::new();
+        crate::product_alloc::try_reserve(&mut ids, self.0.decisions.len(), cx, crate::product_alloc::AllocationSite::Vector)
+            .map_err(DecisionValidationError::Allocation)?;
+        for decision in &self.0.decisions {
+            if decision.status == DecisionStatus::Active {
+                let id = crate::product_alloc::try_copy_str(&decision.id, cx, crate::product_alloc::AllocationSite::String)
+                    .map_err(DecisionValidationError::Allocation)?;
+                crate::product_alloc::try_push(&mut ids, id, cx, crate::product_alloc::AllocationSite::Vector)
+                    .map_err(DecisionValidationError::Allocation)?;
+            }
+        }
+        Ok(ids)
+    }
+
+    pub(crate) fn accepted_for_scope(
+        &self,
+        id: &str,
+        plan: &FallibleDecodedAdoptionPlan,
+        artifact: &Digest,
+    ) -> bool {
+        self.0.accepted_for_scope(id, plan.0.scope(), artifact)
+    }
+
+    pub(crate) fn contains_decision(&self, id: &str) -> bool {
+        self.0.decisions.iter().any(|decision| decision.id == id)
+    }
+
+    pub(crate) fn matches_scope(&self, id: &str, plan: &FallibleDecodedAdoptionPlan) -> bool {
+        self.0.decisions.iter().any(|decision| decision.id == id && decision.scope.same_as(plan.0.scope()))
+    }
+
+    pub(crate) fn pending_nonbinary_witness(&self, id: &str, witness: &Digest) -> bool {
+        self.0.decisions.iter().any(|decision| {
+            decision.id == id && &decision.witness == witness
+                && matches!(decision.status, DecisionStatus::Pending | DecisionStatus::Superseded { .. })
+                && matches!(decision.outcome,
+                    DecisionOutcome::EitherAcceptable | DecisionOutcome::BothNeeded
+                        | DecisionOutcome::NeitherFits | DecisionOutcome::Deferred)
+        })
+    }
+
+    pub(crate) fn ids_matching_with(
+        &self,
+        ids: &[String],
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Vec<String>, DecisionValidationError> {
+        let mut wanted = crate::product_alloc::ordered::OrderedSet::new();
+        for id in ids {
+            wanted.try_insert(id.as_str(), cx).map_err(DecisionValidationError::Allocation)?;
+        }
+        let mut result = Vec::new();
+        crate::product_alloc::try_reserve(&mut result, ids.len(), cx, crate::product_alloc::AllocationSite::Vector)
+            .map_err(DecisionValidationError::Allocation)?;
+        for decision in &self.0.decisions {
+            if wanted.contains(decision.id.as_str()) {
+                let id = crate::product_alloc::try_copy_str(&decision.id, cx, crate::product_alloc::AllocationSite::String)
+                    .map_err(DecisionValidationError::Allocation)?;
+                crate::product_alloc::try_push(&mut result, id, cx, crate::product_alloc::AllocationSite::Vector)
+                    .map_err(DecisionValidationError::Allocation)?;
+            }
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn try_clone_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Self, DecisionValidationError> {
+        let value = crate::product_backup::fallible_codec::try_serialize_value(self, cx)
+            .map_err(|error| match error {
+                crate::product_backup::fallible_codec::CodecError::Allocation(failure) => DecisionValidationError::Allocation(failure),
+                _ => DecisionValidationError::Contract(ContractError("decision canonical encoding failed".into())),
+            })?;
+        let decoded = decode_decision_graph_fallible(value, cx).map_err(|error| match error {
+            fallible_value_decode::ValueDecodeError::Allocation(failure) => DecisionValidationError::Allocation(failure),
+            _ => DecisionValidationError::Contract(ContractError("decision copy invariant".into())),
+        })?;
+        Ok(decoded)
+    }
+
+    pub(crate) fn rewind_adoption_with(
+        &self,
+        expected: &Digest,
+        retired: &[String],
+        adoption: &str,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(Self, Vec<String>, Vec<String>), DecisionValidationError> {
+        let (graph, active, pending) = self.0.rewind_adoption_with(expected, retired, adoption, cx)?;
+        Ok((Self(graph), active, pending))
+    }
+
     pub(crate) fn validate_with(
         &self,
         cx: &mut crate::product_alloc::AllocationContext,
@@ -596,7 +718,31 @@ impl FallibleDecodedLocalArtifact {
 #[derive(Debug, Serialize)]
 pub(crate) struct FallibleDecodedAdoptionPlan(fallible_decision_decode::DecodedAdoptionPlan);
 impl FallibleDecodedAdoptionPlan {
+    pub(crate) fn id(&self) -> &str { self.0.id() }
+    pub(crate) fn project_id(&self) -> &str { self.0.project_id() }
+    pub(crate) fn expected_generation(&self) -> u64 { self.0.expected_generation() }
     pub(crate) fn expected_data(&self) -> &Digest { self.0.expected_data() }
+    pub(crate) fn expected_decisions(&self) -> &Digest { self.0.expected_decisions() }
+    pub(crate) fn expected_session(&self) -> &Digest { self.0.expected_session() }
+    pub(crate) fn current_source(&self) -> &SourceBinding { self.0.current_source() }
+    pub(crate) fn target(&self) -> &ArtifactRef { self.0.target() }
+    pub(crate) fn required_decisions(&self) -> &[String] { self.0.required_decisions() }
+    pub(crate) fn retire_decisions(&self) -> &[String] { self.0.retire_decisions() }
+    pub(crate) fn evidence(&self) -> &[Digest] { self.0.evidence() }
+    pub(crate) fn compatibility(&self) -> &crate::product_store::scope::DecodedCompatibilityReport { self.0.compatibility() }
+    pub(crate) fn scope_matches_layer(
+        &self,
+        request: &crate::product_store::scope::DecodedScopeRequest,
+        basis_generation: u64,
+    ) -> bool {
+        self.0.scope_matches_layer(request, basis_generation)
+    }
+    pub(crate) fn identity_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Digest, DecisionValidationError> {
+        self.0.identity_with(cx)
+    }
 
     pub(crate) fn validate_with(
         &self,
@@ -690,6 +836,8 @@ pub(crate) fn decode_run_binding_fallible(
 #[path = "product_contract/fallible_decision_decode.rs"]
 #[allow(dead_code)]
 mod fallible_decision_decode;
+impl crate::product_backup::fallible_codec::BackupWire for fallible_decision_decode::DecodedDecisionGraph {}
+impl crate::product_backup::fallible_codec::BackupWire for fallible_decision_decode::DecodedAdoptionPlan {}
 #[path = "product_contract/fallible_app_decode.rs"]
 #[allow(dead_code)]
 pub(crate) mod fallible_app_decode;

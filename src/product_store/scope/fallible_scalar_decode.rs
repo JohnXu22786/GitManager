@@ -114,6 +114,9 @@ pub(crate) struct DecodedScopeRequest {
 impl DecodedScopeRequest {
     pub(crate) fn lifecycles(&self) -> &[LifecycleBindingDto] { &self.lifecycles }
     pub(crate) fn patches(&self) -> &[EffectPatchRequestDto] { &self.patches }
+    pub(crate) fn operations(&self) -> impl Iterator<Item = &String> { self.operations.iter() }
+    pub(crate) fn excluded_records(&self) -> &[RecordRef] { &self.excluded_records }
+    pub(crate) fn population(&self) -> &ScopePopulationDto { &self.population }
 }
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ScopePopulationDto {
@@ -139,6 +142,7 @@ pub(crate) struct LifecycleBindingDto { entity: String, completed: Expr, source:
 impl LifecycleBindingDto {
     pub(crate) fn entity(&self) -> &str { &self.entity }
     pub(crate) fn completed(&self) -> &Expr { &self.completed }
+    pub(crate) fn source(&self) -> &Digest { &self.source }
 }
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct EffectPatchRequestDto {
@@ -180,7 +184,9 @@ impl DecodedFrozenBasis {
     pub(crate) fn revision(&self) -> u64 { self.revision }
     pub(crate) fn active(&self) -> &Digest { &self.active }
     pub(crate) fn data(&self) -> &FallibleDecodedDataSnapshot { &self.data }
+    pub(crate) fn session(&self) -> &FallibleDecodedSessionState { &self.session }
     pub(crate) fn day(&self) -> i32 { self.day }
+    pub(crate) fn decisions(&self) -> &Digest { &self.decisions }
 }
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct DecodedEffectPatch { pub(crate) request: EffectPatchRequestDto, pub(crate) before: Expr, pub(crate) after: Expr }
@@ -195,6 +201,8 @@ pub(crate) struct DecodedScopeLayer {
     request: DecodedScopeRequest, patches: Vec<DecodedEffectPatch>,
 }
 impl DecodedScopeLayer {
+    pub(crate) fn version(&self) -> u32 { self.version }
+    pub(crate) fn candidate(&self) -> &Digest { &self.candidate }
     pub(crate) fn patches(&self) -> &[DecodedEffectPatch] { &self.patches }
     pub(crate) fn request(&self) -> &DecodedScopeRequest { &self.request }
     pub(crate) fn operation(&self) -> &str { &self.operation }
@@ -233,10 +241,21 @@ pub(crate) struct DecodedCompositionManifest {
     runtime: String, driver: String, output: Digest,
 }
 impl DecodedCompositionManifest {
+    pub(crate) fn version(&self) -> u32 { self.version }
+    pub(crate) fn operation(&self) -> &str { &self.operation }
+    pub(crate) fn runtime(&self) -> &str { &self.runtime }
+    pub(crate) fn driver(&self) -> &str { &self.driver }
+    pub(crate) fn active_layers(&self) -> impl Iterator<Item = &Digest> { self.active.iter() }
     pub(crate) fn business(&self) -> &Digest { &self.business }
     pub(crate) fn output(&self) -> &Digest { &self.output }
     pub(crate) fn transition(&self) -> ScopeTransition { self.transition }
     pub(crate) fn previous(&self) -> Option<&Digest> { self.previous.as_ref() }
+    pub(crate) fn identity_with(
+        &self,
+        cx: &mut AllocationContext,
+    ) -> Result<Digest, crate::product_backup::fallible_codec::CodecError> {
+        crate::product_backup::fallible_codec::canonical_digest(IdentityDomain::Adoption, self, cx)
+    }
     pub(crate) fn basis(&self) -> &DecodedFrozenBasis { &self.basis }
     pub(crate) fn copy_with(&self, cx: &mut AllocationContext) -> Result<Self, ValueDecodeError> {
         let value = crate::product_backup::fallible_codec::try_serialize_value(self, cx)
@@ -246,6 +265,10 @@ impl DecodedCompositionManifest {
     pub(crate) fn layers(&self) -> &[Digest] { &self.layers }
     pub(crate) fn rewrites(&self) -> &[DecodedScopeSlotMapping] { &self.rewrites }
     pub(crate) fn active_contains(&self, id: &Digest) -> bool { self.active.contains(id) }
+    pub(crate) fn active_len(&self) -> usize { self.active.iter().count() }
+    pub(crate) fn active_is_subset_of(&self, other: &Self) -> bool {
+        self.active.iter().all(|id| other.active.contains(id))
+    }
     pub(crate) fn same_layer_inventory_as(&self, other: &Self) -> bool {
         self.layers == other.layers && self.active == other.active
     }
@@ -343,7 +366,15 @@ impl DecodedMetadataInitializationReceipt {
         decode_metadata_initialization_receipt(value, cx)
     }
     pub(crate) fn layer(&self) -> &Digest { &self.layer }
+    pub(crate) fn operation(&self) -> &str { &self.operation }
+    pub(crate) fn before_data(&self) -> &Digest { &self.before_data }
     pub(crate) fn after_data(&self) -> &Digest { &self.after_data }
+    pub(crate) fn before_schema(&self) -> &Digest { &self.before_schema }
+    pub(crate) fn after_schema(&self) -> &Digest { &self.after_schema }
+    pub(crate) fn business_projection(&self) -> &Digest { &self.business_projection }
+    pub(crate) fn original_events(&self) -> &Digest { &self.original_events }
+    pub(crate) fn original_records(&self) -> usize { self.original_records }
+    pub(crate) fn capture_day(&self) -> i32 { self.capture_day }
     pub(crate) fn capture_program(&self) -> &Digest { &self.capture_program }
     pub(crate) fn prior_snapshot(&self) -> &Digest { &self.prior_snapshot }
     pub(crate) fn adoption_revision(&self) -> u64 { self.adoption_revision }
@@ -357,6 +388,7 @@ pub(crate) struct DecodedCompatibilityReport {
     retained_records: Vec<RecordRef>, retained_events: Vec<String>,
     retained_fields: Vec<DecodedSemanticKey>, issues: Vec<String>,
 }
+impl crate::product_backup::fallible_codec::BackupWire for DecodedCompatibilityReport {}
 impl DecodedCompatibilityReport {
     pub(crate) fn new(
         state: CompatibilityState,
@@ -496,6 +528,14 @@ pub(crate) struct DecodedScopedAdoptionReceipt {
     initialization: Option<Digest>, initialized_compatibility: DecodedCompatibilityReport,
     revision: u64,
 }
+impl DecodedScopedAdoptionReceipt {
+    pub(crate) fn decisions(&self) -> &[String] { &self.decisions }
+    pub(crate) fn plan(&self) -> &Digest { &self.plan }
+    pub(crate) fn composition(&self) -> &Digest { &self.composition }
+    pub(crate) fn initialization(&self) -> Option<&Digest> { self.initialization.as_ref() }
+    pub(crate) fn initialized_compatibility(&self) -> &DecodedCompatibilityReport { &self.initialized_compatibility }
+    pub(crate) fn revision(&self) -> u64 { self.revision }
+}
 #[derive(Debug, Serialize)]
 pub(crate) struct DecodedManagedRehearsal {
     version: u32, manifest: DecodedCompositionManifest, seed: Digest,
@@ -510,6 +550,10 @@ impl DecodedManagedRehearsal {
     pub(crate) fn initialization(&self) -> Option<&DecodedMetadataInitializationReceipt> { self.initialization.as_ref() }
     pub(crate) fn seed(&self) -> &Digest { &self.seed }
     pub(crate) fn recorded_revision(&self) -> u64 { self.recorded_revision }
+    pub(crate) fn recorded_by(&self) -> &str { &self.recorded_by }
+    pub(crate) fn witnesses(&self) -> impl Iterator<Item = (&String, &Digest)> { self.witnesses.iter() }
+    pub(crate) fn witness_count(&self) -> usize { self.witnesses.len() }
+    pub(crate) fn compatibility(&self) -> &DecodedCompatibilityReport { &self.compatibility }
 }
 #[derive(Debug, Serialize)]
 pub(crate) struct DecodedScopeScenarioCorrespondence {
@@ -569,6 +613,8 @@ pub(crate) struct DecodedScopeCorrespondenceReceipt {
 }
 impl DecodedScopeCorrespondenceReceipt {
     pub(crate) fn proof(&self) -> &DecodedScopeCorrespondence { &self.proof }
+    pub(crate) fn operation(&self) -> &str { &self.operation }
+    pub(crate) fn revision(&self) -> u64 { self.revision }
 }
 #[derive(Debug, Serialize)]
 pub(crate) struct DecodedScopeState {
@@ -581,13 +627,29 @@ pub(crate) struct DecodedScopeState {
     correspondences: FallibleScopeMap<Digest, DecodedScopeCorrespondenceReceipt>,
 }
 impl DecodedScopeState {
+    pub(crate) fn version(&self) -> u32 { self.version }
     pub(crate) fn composition(&self, id: &Digest) -> Option<&DecodedCompositionManifest> { self.compositions.get(id) }
     pub(crate) fn compositions(&self) -> impl Iterator<Item = (&Digest, &DecodedCompositionManifest)> { self.compositions.iter() }
     pub(crate) fn layer(&self, id: &Digest) -> Option<&DecodedScopeLayer> { self.layers.get(id) }
     pub(crate) fn layers(&self) -> impl Iterator<Item = (&Digest, &DecodedScopeLayer)> { self.layers.iter() }
+    pub(crate) fn retain_replay_layers(&mut self, retained: &[Digest], cx: &mut AllocationContext) -> Result<(), crate::product_alloc::AllocationFailure> {
+        let mut remove = Vec::new();
+        for (id, _) in self.layers.iter() {
+            if !retained.contains(id) {
+                let id = crate::product_alloc::try_copy_str(id.as_str(), cx, AllocationSite::String)?;
+                crate::product_alloc::try_push(&mut remove, id, cx, AllocationSite::Vector)?;
+            }
+        }
+        for id in remove {
+            let id = Digest::from_owned_lower_hex(id).expect("copied digest remains valid");
+            self.layers.0.remove_entry(&id);
+        }
+        Ok(())
+    }
     pub(crate) fn rehearsals(&self) -> impl Iterator<Item = (&Digest, &DecodedManagedRehearsal)> { self.rehearsals.iter() }
     pub(crate) fn correspondences(&self) -> impl Iterator<Item = (&Digest, &DecodedScopeCorrespondenceReceipt)> { self.correspondences.iter() }
     pub(crate) fn initializations(&self) -> &[DecodedMetadataInitializationReceipt] { &self.initializations }
+    pub(crate) fn adoptions(&self) -> &[DecodedScopedAdoptionReceipt] { &self.adoptions }
     #[cfg(test)]
     pub(crate) fn clear_initializations_for_test(&mut self) { self.initializations.clear(); }
     pub(crate) fn has_replay_layer(&self, id: &Digest) -> bool { self.layers.get(id).is_some() }

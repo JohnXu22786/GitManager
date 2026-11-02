@@ -3121,6 +3121,495 @@ mod borrowed_view_tests {
         }
     }
 
+    fn valid_scalar_adoption_snapshot() -> ProjectSnapshot {
+        let mut snapshot = initialization_snapshot();
+        let mut layer = snapshot.scalar_scope().unwrap().layers.values().next().unwrap().clone();
+        layer.request.lifecycles[0].source = snapshot.active_revision.clone();
+        let source = snapshot.programs[0].clone();
+        let before = compiler::business_program(&snapshot).unwrap();
+        layer.patches = compiler::derive_patches(&before, &source.program, &layer.request).unwrap();
+        let corrected_layer_id = layer.identity().unwrap();
+        let scope = snapshot.scalar_scope_mut().unwrap();
+        scope.layers.clear();
+        scope.layers.insert(corrected_layer_id, layer.clone());
+        let source_revision = crate::product_contract::canonical_digest(IdentityDomain::Source, &source).unwrap();
+        let layer_id = layer.identity().unwrap();
+        let mut manifest = super::super::CompositionManifest {
+            version: super::super::COMPILER_VERSION,
+            basis: layer.basis.clone(),
+            transition: super::super::ScopeTransition::Adoption,
+            rewrites: vec![],
+            business: source_revision.clone(),
+            layers: vec![layer_id.clone()],
+            active: BTreeSet::from([layer_id.clone()]),
+            previous: None,
+            operation: layer.operation.clone(),
+            runtime: crate::product_runtime::RUNTIME_VERSION.into(),
+            driver: crate::product_runtime::DRIVER_VERSION.into(),
+            output: source_revision.clone(),
+        };
+        let mut target = None;
+        for _ in 0..8 {
+            let compiled = compiler::compile(&snapshot, &manifest).unwrap();
+            let revision = crate::product_contract::canonical_digest(IdentityDomain::Source, &compiled).unwrap();
+            if revision == manifest.output { target = Some(compiled); break; }
+            manifest.output = revision;
+        }
+        let target = target.expect("composition output revision should stabilize");
+        let target_revision = manifest.output.clone();
+        let (data, initialization) = super::super::history::initialize(&snapshot, &layer, &target).unwrap();
+        let input_compatibility = crate::product_runtime::LocalRuntime::default()
+            .compatibility_at(&target, &layer.basis.data, layer.basis.day).unwrap();
+        let output_compatibility = crate::product_runtime::LocalRuntime::default()
+            .compatibility_at(&target, &data, layer.basis.day).unwrap();
+        let plan = crate::product_contract::AdoptionPlan {
+            version: crate::product_contract::CONTRACT_VERSION,
+            id: layer.operation.clone(),
+            project_id: snapshot.data.project_id.clone(),
+            expected_generation: layer.basis.data.generation,
+            expected_data: layer.basis.data.identity().unwrap(),
+            expected_decisions: layer.basis.decisions.clone(),
+            expected_session: layer.basis.session.identity().unwrap(),
+            current_source: source.binding.clone(),
+            target: target.artifact.clone(),
+            scope: layer.scope(),
+            compatibility: input_compatibility,
+            required_decisions: vec![],
+            checks: vec![],
+            evidence: vec![],
+            retire_decisions: vec![],
+        };
+        let plan_id = crate::product_contract::canonical_digest(IdentityDomain::Adoption, &plan).unwrap();
+        let composition_id = crate::product_contract::canonical_digest(IdentityDomain::Adoption, &manifest).unwrap();
+        let initialization_id = crate::product_contract::canonical_digest(IdentityDomain::Adoption, &initialization).unwrap();
+        let revision = snapshot.revision + 1;
+        snapshot.revision = revision;
+        snapshot.programs.push(target.clone());
+        snapshot.active_revision = target_revision.clone();
+        snapshot.data = data;
+        snapshot.session = crate::product_contract::SessionState::initial(&target.program).unwrap();
+        snapshot.adoptions.push(crate::product_store::AdoptionReceipt {
+            plan: plan.clone(), previous: source_revision, active: target_revision.clone(), revision,
+        });
+        snapshot.operations.insert(plan.id.clone(), crate::product_store::OperationReceipt {
+            operation: plan.id.clone(),
+            request: crate::product_contract::canonical_digest(IdentityDomain::Evidence, &"adoption-request").unwrap(),
+            revision,
+        });
+        let scope = snapshot.scalar_scope_mut().unwrap();
+        scope.initializations.push(initialization);
+        scope.compositions.insert(target_revision.clone(), manifest);
+        scope.adoptions.push(super::super::ScopedAdoptionReceipt {
+            decisions: vec![], plan: plan_id, composition: composition_id,
+            initialization: Some(initialization_id), initialized_compatibility: output_compatibility, revision,
+        });
+        snapshot
+    }
+
+    fn valid_scalar_decision_birth_snapshot() -> ProjectSnapshot {
+        let mut snapshot = valid_scalar_adoption_snapshot();
+        let decision_id = "accepted-on-adoption".to_owned();
+        let target = snapshot.programs[1].clone();
+        let witness = crate::product_contract::canonical_digest(IdentityDomain::Evidence, &"accepted-witness").unwrap();
+        let scenario = crate::product_contract::canonical_digest(IdentityDomain::Scenario, &"accepted-scenario").unwrap();
+        let scope = {
+            let plan = &mut snapshot.adoptions[0].plan;
+            plan.required_decisions = vec![decision_id.clone()];
+            plan.scope.clone()
+        };
+        snapshot.decisions.revision = 1;
+        snapshot.decisions.decisions.push(crate::product_contract::ScopedDecision {
+            id: decision_id.clone(),
+            revision: 1,
+            request: "Choose the accepted target".into(),
+            rationale: None,
+            scope,
+            outcome: crate::product_contract::DecisionOutcome::Accept { artifact: target.artifact.program_digest.clone() },
+            status: crate::product_contract::DecisionStatus::Active,
+            obligations: vec![],
+            scenarios: vec![scenario],
+            witness,
+            supersedes: vec![],
+        });
+        snapshot.scalar_scope_mut().unwrap().adoptions[0].decisions = vec![decision_id];
+        let plan_id = crate::product_contract::canonical_digest(IdentityDomain::Adoption, &snapshot.adoptions[0].plan).unwrap();
+        snapshot.scalar_scope_mut().unwrap().adoptions[0].plan = plan_id;
+        snapshot
+    }
+
+    fn valid_scalar_rehearsal_snapshot() -> ProjectSnapshot {
+        let mut snapshot = valid_scalar_adoption_snapshot();
+        let active_revision = snapshot.active_revision.clone();
+        let active = snapshot.program().unwrap().clone();
+        let prior = snapshot.scalar_scope().unwrap().compositions[&active_revision].clone();
+        let layer_id = prior.layers[0].clone();
+        let mut candidate_app = snapshot.programs[0].program.clone();
+        candidate_app.entities[0].fields.push(FieldDefinition {
+            id: "evolution_note".into(),
+            label: "Evolution note".into(),
+            value_type: Type::Optional { item: Box::new(Type::Text) },
+        });
+        candidate_app.entities.push(EntityDefinition {
+            id: "audit".into(), label: "Audit".into(),
+            fields: vec![FieldDefinition { id: "note".into(), label: "Note".into(), value_type: Type::Text }],
+            unique: vec![], constraints: vec![],
+        });
+        let candidate = crate::product_contract::CapturedProgram::capture(
+            &crate::product_contract::canonical_bytes(&candidate_app).unwrap(),
+            "project", crate::product_contract::Producer::Fixture { name: "scalar-rehearsal-candidate".into() }, None,
+        ).unwrap();
+        let candidate_revision = crate::product_contract::canonical_digest(IdentityDomain::Source, &candidate).unwrap();
+        let decisions_before = snapshot.decisions.identity().unwrap();
+        let basis = super::super::FrozenBasis {
+            snapshot: crate::product_contract::canonical_digest(IdentityDomain::Data, &snapshot).unwrap(),
+            revision: snapshot.revision,
+            active: active_revision.clone(),
+            data: snapshot.data.clone(),
+            session: snapshot.session.clone(),
+            day: snapshot.clock_day,
+            decisions: decisions_before.clone(),
+        };
+        let mut manifest = prior;
+        manifest.basis = basis.clone();
+        manifest.transition = super::super::ScopeTransition::Evolution;
+        manifest.business = candidate_revision.clone();
+        manifest.previous = Some(active_revision.clone());
+        manifest.operation = "record-evolution".into();
+        let layer = snapshot.scalar_scope().unwrap().layers[&layer_id].clone();
+        let destination = layer.patches[0].request.destination.clone();
+        manifest.rewrites = vec![super::super::ScopeSlotMapping {
+            layer: layer_id,
+            patch: 0,
+            from_source: active_revision.clone(),
+            from: destination.clone(),
+            to_source: candidate_revision,
+            to: destination,
+            subject: "row".into(),
+        }];
+        snapshot.programs.push(candidate.clone());
+        let target = compiler::compile(&snapshot, &manifest).unwrap();
+        manifest.output = crate::product_contract::canonical_digest(IdentityDomain::Source, &target).unwrap();
+        assert_eq!(
+            crate::product_contract::canonical_bytes(&target).unwrap(),
+            crate::product_contract::canonical_bytes(&compiler::compile(&snapshot, &manifest).unwrap()).unwrap(),
+        );
+        let seed = crate::product_runtime::merged_data(&target, &basis.data).unwrap();
+        let compatibility = crate::product_runtime::LocalRuntime::default()
+            .compatibility_at(&target, &seed, basis.day).unwrap();
+        let recorded_by = manifest.operation.clone();
+        let recorded_revision = snapshot.revision + 1;
+        let witness = crate::product_contract::canonical_digest(IdentityDomain::Evidence, &"rehearsal-choice").unwrap();
+        let rehearsal = super::super::ManagedRehearsal {
+            version: super::super::COMPILER_VERSION,
+            manifest,
+            seed: seed.identity().unwrap(),
+            layer: None,
+            initialization: None,
+            compatibility,
+            recorded_by: recorded_by.clone(),
+            recorded_revision,
+            witnesses: BTreeMap::from([("retained-choice".into(), witness.clone())]),
+        };
+        snapshot.programs.push(target.clone());
+        let scope = layer.scope();
+        snapshot.decisions.revision += 1;
+        snapshot.decisions.decisions.push(crate::product_contract::ScopedDecision {
+            id: "retained-choice".into(),
+            revision: 1,
+            request: "Keep the alternative available".into(),
+            rationale: None,
+            scope,
+            outcome: crate::product_contract::DecisionOutcome::EitherAcceptable,
+            status: crate::product_contract::DecisionStatus::Pending,
+            obligations: vec![],
+            scenarios: vec![crate::product_contract::canonical_digest(IdentityDomain::Scenario, &"rehearsal-scenario").unwrap()],
+            witness,
+            supersedes: vec![],
+        });
+        let plan = crate::product_contract::AdoptionPlan {
+            version: crate::product_contract::CONTRACT_VERSION,
+            id: recorded_by.clone(),
+            project_id: snapshot.data.project_id.clone(),
+            expected_generation: snapshot.data.generation,
+            expected_data: snapshot.data.identity().unwrap(),
+            expected_decisions: decisions_before,
+            expected_session: snapshot.session.identity().unwrap(),
+            current_source: active.binding.clone(),
+            target: active.artifact.clone(),
+            scope: layer.scope(),
+            compatibility: crate::product_runtime::LocalRuntime::default()
+                .compatibility_at(&active, &snapshot.data, snapshot.clock_day).unwrap(),
+            required_decisions: vec![],
+            checks: vec![], evidence: vec![], retire_decisions: vec![],
+        };
+        snapshot.adoptions.push(crate::product_store::AdoptionReceipt {
+            plan,
+            previous: active_revision.clone(),
+            active: active_revision,
+            revision: recorded_revision,
+        });
+        snapshot.operations.insert(recorded_by.clone(), crate::product_store::OperationReceipt {
+            operation: recorded_by.clone(),
+            request: crate::product_contract::canonical_digest(IdentityDomain::Evidence, &"record-rehearsal").unwrap(),
+            revision: recorded_revision,
+        });
+        snapshot.revision = recorded_revision;
+        snapshot.scalar_scope_mut().unwrap().rehearsals.insert(rehearsal.manifest.output.clone(), rehearsal);
+        add_paired_evolution_rehearsal(&mut snapshot);
+        snapshot
+    }
+
+    fn add_paired_evolution_rehearsal(snapshot: &mut ProjectSnapshot) {
+        let active_revision = snapshot.active_revision.clone();
+        let active = snapshot.program().unwrap().clone();
+        let prior = snapshot.scalar_scope().unwrap().compositions[&active_revision].clone();
+        let layer_id = prior.layers[0].clone();
+        let original_basis = snapshot.scalar_scope().unwrap().rehearsals.values().next().unwrap().manifest.basis.clone();
+        let original_proof = snapshot.scalar_scope().unwrap().rehearsals.values().next().unwrap().clone();
+        let mut candidate_app = snapshot.programs[0].program.clone();
+        candidate_app.entities[0].fields.push(FieldDefinition {
+            id: "other_evolution_note".into(),
+            label: "Other evolution note".into(),
+            value_type: Type::Optional { item: Box::new(Type::Text) },
+        });
+        candidate_app.entities.push(EntityDefinition {
+            id: "audit_alt".into(), label: "Alternate audit".into(),
+            fields: vec![FieldDefinition { id: "note".into(), label: "Note".into(), value_type: Type::Text }],
+            unique: vec![], constraints: vec![],
+        });
+        let candidate = crate::product_contract::CapturedProgram::capture(
+            &crate::product_contract::canonical_bytes(&candidate_app).unwrap(),
+            "project", crate::product_contract::Producer::Fixture { name: "scalar-rehearsal-alternative".into() }, None,
+        ).unwrap();
+        let candidate_revision = crate::product_contract::canonical_digest(IdentityDomain::Source, &candidate).unwrap();
+        let layer = snapshot.scalar_scope().unwrap().layers[&layer_id].clone();
+        let destination = layer.patches[0].request.destination.clone();
+        let mut manifest = prior;
+        manifest.basis = original_basis;
+        manifest.transition = super::super::ScopeTransition::Evolution;
+        manifest.business = candidate_revision.clone();
+        manifest.previous = Some(active_revision.clone());
+        manifest.operation = "record-evolution-alternative".into();
+        manifest.rewrites = vec![super::super::ScopeSlotMapping {
+            layer: layer_id,
+            patch: 0,
+            from_source: active_revision.clone(),
+            from: destination.clone(),
+            to_source: candidate_revision,
+            to: destination,
+            subject: "row".into(),
+        }];
+        snapshot.programs.push(candidate.clone());
+        let target = compiler::compile(snapshot, &manifest).unwrap();
+        manifest.output = crate::product_contract::canonical_digest(IdentityDomain::Source, &target).unwrap();
+        assert_eq!(
+            crate::product_contract::canonical_bytes(&target).unwrap(),
+            crate::product_contract::canonical_bytes(&compiler::compile(snapshot, &manifest).unwrap()).unwrap(),
+        );
+        let seed = crate::product_runtime::merged_data(&target, &manifest.basis.data).unwrap();
+        let compatibility = crate::product_runtime::LocalRuntime::default()
+            .compatibility_at(&target, &seed, manifest.basis.day).unwrap();
+        let rehearsal = super::super::ManagedRehearsal {
+            version: super::super::COMPILER_VERSION,
+            seed: seed.identity().unwrap(),
+            manifest,
+            layer: None,
+            initialization: None,
+            compatibility,
+            recorded_by: original_proof.recorded_by,
+            recorded_revision: original_proof.recorded_revision,
+            witnesses: original_proof.witnesses,
+        };
+        snapshot.programs.push(target.clone());
+        snapshot.scalar_scope_mut().unwrap().rehearsals.insert(rehearsal.manifest.output.clone(), rehearsal);
+
+        let pair_tag = crate::product_contract::canonical_digest(IdentityDomain::Evidence, &"managed-evolution-pair/1").unwrap();
+        let mut requests = Vec::new();
+        let decisions = vec!["retained-choice".to_owned()];
+        for (_, proof) in &snapshot.scalar_scope().unwrap().rehearsals {
+            let business = snapshot.programs.iter().find(|program| {
+                crate::product_contract::canonical_digest(IdentityDomain::Source, program).unwrap() == proof.manifest.business
+            }).unwrap();
+            let output = snapshot.programs.iter().find(|program| {
+                crate::product_contract::canonical_digest(IdentityDomain::Source, program).unwrap() == proof.manifest.output
+            }).unwrap();
+            requests.push(crate::product_contract::canonical_digest(
+                IdentityDomain::Adoption,
+                &("managed-rehearsal/1", &proof.manifest.basis.snapshot, &proof.manifest, business, output, &proof.seed, &proof.compatibility, &decisions),
+            ).unwrap());
+        }
+        requests.sort();
+        let pair_request = crate::product_contract::canonical_digest(
+            IdentityDomain::Adoption, &("managed-evolution-pair/1", requests),
+        ).unwrap();
+        let plan = &mut snapshot.adoptions.last_mut().unwrap().plan;
+        plan.evidence.push(crate::product_contract::canonical_digest(IdentityDomain::Evidence, &"raw-evidence").unwrap());
+        plan.evidence.push(pair_tag);
+        plan.evidence.push(pair_request.clone());
+        let recording_request = crate::product_contract::canonical_digest(
+            IdentityDomain::Adoption,
+            &("record-managed-rehearsal/1", &*plan, &active, &snapshot.decisions, &pair_request),
+        ).unwrap();
+        snapshot.operations.get_mut(&plan.id).unwrap().request = recording_request;
+    }
+
+    #[test]
+    fn decoded_scalar_history_empty_checkpoint_matches_legacy_and_refuses_atomically() {
+        use std::num::NonZeroUsize;
+        let snapshot = minimal_snapshot();
+        super::super::verify::validate(&snapshot).unwrap();
+        let decoded = decoded_snapshot(&snapshot);
+        let before = crate::product_backup::fallible_codec::canonical_bytes(&decoded, &mut AllocationContext::new()).unwrap();
+        let mut baseline = AllocationContext::new();
+        decoded.validate_scalar_scope_with(&mut baseline).unwrap();
+        let growths = baseline.growth_requests();
+        assert!(growths > 0);
+        for nth in 1..=growths {
+            let mut refused = AllocationContext::fail_nth_growth(NonZeroUsize::new(nth).unwrap(), false);
+            assert!(matches!(decoded.validate_scalar_scope_with(&mut refused), Err(crate::product_store::scope::ScalarValidationFailure::Allocation(_))), "refusal {nth}/{growths}");
+            assert_eq!(before, crate::product_backup::fallible_codec::canonical_bytes(&decoded, &mut AllocationContext::new()).unwrap());
+            let mut retry = AllocationContext::new();
+            decoded.validate_scalar_scope_with(&mut retry).unwrap();
+        }
+    }
+
+    #[test]
+    fn decoded_scalar_full_adoption_matches_legacy_and_refuses_atomically() {
+        use std::num::NonZeroUsize;
+        let snapshot = valid_scalar_adoption_snapshot();
+        super::super::verify::validate(&snapshot).unwrap();
+        let decoded = decoded_snapshot(&snapshot);
+        let before = crate::product_backup::fallible_codec::canonical_bytes(&decoded, &mut AllocationContext::new()).unwrap();
+        let mut baseline = AllocationContext::new();
+        decoded.validate_scalar_scope_with(&mut baseline).unwrap();
+        let growths = baseline.growth_requests();
+        assert!(growths > 0);
+        // Exercise early, middle and final refusal points across the distinct
+        // copy/collection families without repeating the whole full validator
+        // for every unrelated digest scratch growth.
+        for nth in [1, (growths / 2).max(1), growths] {
+            let mut refused = AllocationContext::fail_nth_growth(NonZeroUsize::new(nth).unwrap(), false);
+            assert!(matches!(decoded.validate_scalar_scope_with(&mut refused), Err(crate::product_store::scope::ScalarValidationFailure::Allocation(_))), "refusal {nth}/{growths}");
+            assert_eq!(before, crate::product_backup::fallible_codec::canonical_bytes(&decoded, &mut AllocationContext::new()).unwrap());
+            decoded.validate_scalar_scope_with(&mut AllocationContext::new()).unwrap();
+        }
+    }
+
+    fn assert_scalar_validator_error_parity(snapshot: &ProjectSnapshot) -> String {
+        let legacy = super::super::verify::validate(snapshot).map_err(|error| format!("{error:?}"));
+        let decoded = decoded_snapshot(snapshot)
+            .validate_scalar_scope_with(&mut AllocationContext::new())
+            .map_err(|error| match error {
+                crate::product_store::scope::ScalarValidationFailure::Store(error) => format!("{error:?}"),
+                crate::product_store::scope::ScalarValidationFailure::Allocation(error) => format!("allocation: {error:?}"),
+            });
+        assert_eq!(decoded, legacy, "legacy and decoded scalar verifier outcomes differ");
+        legacy.expect_err("the fixture must be rejected")
+    }
+
+    #[test]
+    fn decoded_scalar_history_rejects_damaged_initialization_and_pair_receipts_like_legacy() {
+        let mut initialization = valid_scalar_adoption_snapshot();
+        initialization.scalar_scope_mut().unwrap().initializations[0].after_data =
+            crate::product_contract::canonical_digest(IdentityDomain::Adoption, &"tampered-after-data").unwrap();
+        assert!(assert_scalar_validator_error_parity(&initialization).contains(
+            "metadata initialization does not independently regenerate"
+        ));
+
+        // A duplicated pair marker must be rejected before reverse graph
+        // reconstruction can accept an otherwise valid adoption receipt.
+        let mut paired_marker = valid_scalar_adoption_snapshot();
+        let marker = crate::product_contract::canonical_digest(
+            IdentityDomain::Evidence,
+            &"managed-evolution-pair/1",
+        ).unwrap();
+        paired_marker.adoptions[0].plan.evidence.extend([marker.clone(), marker]);
+        assert!(assert_scalar_validator_error_parity(&paired_marker).contains(
+            "paired recording tag is duplicated, misplaced or incomplete"
+        ));
+    }
+
+    #[test]
+    fn decoded_scalar_reverse_birth_checkpoint_and_receipt_match_legacy() {
+        let snapshot = valid_scalar_decision_birth_snapshot();
+        super::super::verify::validate(&snapshot).unwrap();
+        decoded_snapshot(&snapshot)
+            .validate_scalar_scope_with(&mut AllocationContext::new())
+            .unwrap();
+
+        let mut missing_scoped_decision = snapshot;
+        missing_scoped_decision.scalar_scope_mut().unwrap().adoptions[0].decisions.clear();
+        assert!(assert_scalar_validator_error_parity(&missing_scoped_decision).contains(
+            "scoped receipt differs from the exact newly activated intention set"
+        ));
+    }
+
+    #[test]
+    fn decoded_scalar_rehearsal_recording_chronology_matches_legacy() {
+        let snapshot = valid_scalar_rehearsal_snapshot();
+        super::super::verify::validate(&snapshot).unwrap();
+        decoded_snapshot(&snapshot)
+            .validate_scalar_scope_with(&mut AllocationContext::new())
+            .unwrap();
+
+        let mut corrupted = snapshot;
+        let rehearsal = corrupted.scalar_scope_mut().unwrap().rehearsals.values_mut().next().unwrap();
+        rehearsal.seed = crate::product_contract::canonical_digest(IdentityDomain::Adoption, &"forged-seed").unwrap();
+        let error = assert_scalar_validator_error_parity(&corrupted);
+        assert!(error.contains("rehearsal seed lacks exact provenance")
+            || error.contains("paired recording proof inventory differs from its tagged evidence"), "{error}");
+    }
+
+    #[test]
+    fn decoded_scalar_live_history_preserves_specific_legacy_failure() {
+        let mut damaged = valid_scalar_adoption_snapshot();
+        damaged.data.records[0].values.insert(
+            "name".into(),
+            crate::product_contract::DataValue::Text { value: "outside-history".into() },
+        );
+        let error = assert_scalar_validator_error_parity(&damaged);
+        assert!(error.contains("current business record differs from recorded facts"), "{error}");
+    }
+
+    fn adoption_with_direct_correspondence() -> ProjectSnapshot {
+        let mut snapshot = valid_scalar_adoption_snapshot();
+        let layer = snapshot.scalar_scope().unwrap().layers.values().next().unwrap();
+        let source = snapshot.programs[0].clone();
+        let target = snapshot.programs[1].clone();
+        let original = layer.basis.data.clone();
+        let day = layer.basis.day;
+        let registry = super::super::replay::ScopedExecutionContext::registry(&snapshot).unwrap();
+        let mapped = crate::product_runtime::merged_data(&target, &original).unwrap();
+        let (registry, _) = registry.project_seed(&source, &original, &target, &mapped, day).unwrap();
+        let proofs = registry.correspondence_proofs();
+        assert_eq!(proofs.len(), 1);
+        let (id, proof) = proofs.into_iter().next().unwrap();
+        let adoption = snapshot.adoptions.last().unwrap();
+        let operation = adoption.plan.id.clone();
+        let revision = adoption.revision;
+        snapshot.scalar_scope_mut().unwrap().correspondences.insert(id, super::super::ScopeCorrespondenceReceipt {
+            proof,
+            operation,
+            revision,
+        });
+        snapshot
+    }
+
+    #[test]
+    fn decoded_scalar_correspondence_receipt_and_target_chronology_match_legacy() {
+        let snapshot = adoption_with_direct_correspondence();
+        super::super::verify::validate(&snapshot).unwrap();
+        decoded_snapshot(&snapshot)
+            .validate_scalar_scope_with(&mut AllocationContext::new())
+            .unwrap();
+
+        let mut damaged = snapshot;
+        damaged.scalar_scope_mut().unwrap().correspondences.values_mut().next().unwrap().revision += 1;
+        assert!(assert_scalar_validator_error_parity(&damaged).contains(
+            "invalid historical correspondence identity"
+        ));
+    }
+
     fn decoded_snapshot(snapshot: &ProjectSnapshot) -> crate::product_store::fallible_project_snapshot_decode::DecodedProjectSnapshot {
         let bytes = serde_json::to_vec(snapshot).unwrap();
         crate::product_store::fallible_project_snapshot_decode::decode_project_snapshot(

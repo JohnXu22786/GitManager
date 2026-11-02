@@ -49,6 +49,13 @@ pub(crate) enum ProjectSnapshotCloneError {
 }
 
 impl DecodedProjectSnapshot {
+    pub(crate) fn validate_scalar_scope_with(
+        &self,
+        cx: &mut AllocationContext,
+    ) -> Result<(), crate::product_store::scope::ScalarValidationFailure> {
+        crate::product_store::scope::validate_scalar_scope_fallible(self, cx)
+    }
+
     pub(crate) fn validate_container_with(
         &self,
         cx: &mut AllocationContext,
@@ -226,6 +233,32 @@ impl DecodedProjectSnapshot {
         })
     }
 
+    pub(crate) fn with_scalar_basis(
+        &self,
+        active: &Digest,
+        data: &FallibleDecodedDataSnapshot,
+        session: &FallibleDecodedSessionState,
+        day: i32,
+        revision: u64,
+        cx: &mut AllocationContext,
+    ) -> Result<Self, ProjectSnapshotCloneError> {
+        let mut copy = self.try_clone_with(cx)?;
+        copy.active_revision = crate::product_alloc::try_copy_str(active.as_str(), cx, AllocationSite::String)
+            .map(Digest::from_owned_lower_hex).map_err(ProjectSnapshotCloneError::Allocation)?
+            .ok_or(ProjectSnapshotCloneError::Invariant)?;
+        copy.data = data.try_clone_with(cx).map_err(|error| match error {
+            crate::product_contract::FallibleDataSnapshotCloneError::Allocation(failure) => ProjectSnapshotCloneError::Allocation(failure),
+            crate::product_contract::FallibleDataSnapshotCloneError::Invariant => ProjectSnapshotCloneError::Invariant,
+        })?;
+        copy.session = session.try_clone_with(cx).map_err(|error| match error {
+            crate::product_contract::AppValidationError::Allocation(failure) => ProjectSnapshotCloneError::Allocation(failure),
+            crate::product_contract::AppValidationError::Contract(_) => ProjectSnapshotCloneError::Invariant,
+        })?;
+        copy.clock_day = day;
+        copy.revision = revision;
+        Ok(copy)
+    }
+
     pub(crate) fn retain_program_with(
         &mut self,
         program: &FallibleDecodedCapturedProgram,
@@ -258,6 +291,13 @@ impl DecodedProjectSnapshot {
     }
 
     pub(crate) fn programs(&self) -> &[FallibleDecodedCapturedProgram] { &self.programs }
+    pub(crate) fn adoptions(&self) -> &[DecodedAdoptionReceipt] { &self.adoptions }
+    pub(crate) fn operation_revision(&self, id: &str) -> Option<u64> {
+        self.operations.0.get(id).map(|receipt| receipt.revision)
+    }
+    pub(crate) fn operation_request(&self, id: &str) -> Option<&Digest> {
+        self.operations.0.get(id).map(|receipt| &receipt.request)
+    }
 
     pub(crate) fn scalar_scope(&self) -> Option<&crate::product_store::scope::FallibleDecodedScopeState> {
         use crate::product_store::scope::FallibleDecodedScopeEnvelope;
@@ -310,6 +350,11 @@ impl DecodedProjectSnapshot {
         self.revision
     }
 
+    pub(crate) fn clock_day(&self) -> i32 { self.clock_day }
+    pub(crate) fn session(&self) -> &FallibleDecodedSessionState { &self.session }
+    pub(crate) fn decisions(&self) -> &FallibleDecodedDecisionGraph { &self.decisions }
+    pub(crate) fn artifacts(&self) -> &[FallibleDecodedLocalArtifact] { &self.artifacts }
+
     pub(crate) fn has_adoption_expected_data_for(
         &self,
         digest: &crate::product_contract::Digest,
@@ -333,11 +378,17 @@ struct DecodedOperationReceipt {
 }
 
 #[derive(Debug, Serialize)]
-struct DecodedAdoptionReceipt {
+pub(crate) struct DecodedAdoptionReceipt {
     plan: FallibleDecodedAdoptionPlan,
     previous: Digest,
     active: Digest,
     revision: u64,
+}
+impl DecodedAdoptionReceipt {
+    pub(crate) fn plan(&self) -> &FallibleDecodedAdoptionPlan { &self.plan }
+    pub(crate) fn previous(&self) -> &Digest { &self.previous }
+    pub(crate) fn active(&self) -> &Digest { &self.active }
+    pub(crate) fn revision(&self) -> u64 { self.revision }
 }
 
 struct DecodedOperationMap(OrderedMap<String, DecodedOperationReceipt>);

@@ -14,6 +14,11 @@ pub(crate) enum ScalarReplayFailure {
     Store(StoreError),
     Allocation(AllocationFailure),
 }
+
+/// A semantic history refusal carries the legacy verifier's exact error text.
+/// Seed candidate probing may treat that refusal as a rejected candidate,
+/// while the top-level scalar validator preserves it for error parity.
+type LayerHistoryResult = Option<&'static str>;
 impl From<StoreError> for ScalarReplayFailure {
     fn from(error: StoreError) -> Self { Self::Store(error) }
 }
@@ -36,6 +41,16 @@ fn app_error(error: AppValidationError) -> ScalarReplayFailure {
     match error {
         AppValidationError::Allocation(failure) => ScalarReplayFailure::Allocation(failure),
         AppValidationError::Contract(error) => ScalarReplayFailure::Store(StoreError::Invalid(error.0)),
+    }
+}
+fn protected_bool(
+    values: &crate::product_contract::FallibleValues,
+    key: &str,
+) -> Result<bool, ScalarReplayFailure> {
+    match values.get(key) {
+        None | Some(crate::product_contract::DataValue::Null) => Ok(false),
+        Some(crate::product_contract::DataValue::Boolean { value }) => Ok(*value),
+        _ => Err(compiler::error("damaged protected Boolean").into()),
     }
 }
 fn copy_error(error: ProjectSnapshotCloneError) -> ScalarReplayFailure {
@@ -522,6 +537,27 @@ impl FallibleScalarReplayContext {
         Ok(())
     }
 
+    /// Verify the live snapshot against every retained scalar layer, including
+    /// layers no longer active in the current composition. This matches the
+    /// root history walk, which starts from the whole protected layer inventory
+    /// rather than only the active manifest.
+    pub(crate) fn verify_all_live_layers(
+        &self,
+        data: &FallibleDecodedDataSnapshot,
+        day: i32,
+        cx: &mut AllocationContext,
+    ) -> Result<(), ScalarReplayFailure> {
+        let scope = self.snapshot.scalar_scope().ok_or_else(|| compiler::error("scalar replay context requires scalar scope"))?;
+        let target = self.snapshot.captured_program_by_revision_with(self.snapshot.active_revision(), cx)
+            .map_err(app_error)?.ok_or_else(|| compiler::error("active source missing"))?;
+        for (layer_id, _) in scope.layers() {
+            if let Some(reason) = self.verify_layer_history(data, scope, layer_id, None, target, day, cx)? {
+                return Err(compiler::error(reason).into());
+            }
+        }
+        Ok(())
+    }
+
     /// Check seed identity only against the requested managed target's own
     /// composition lineage and proofs. The broader `known_seed` predicate is
     /// used to decide whether raw protected metadata has any authority at all;
@@ -551,7 +587,7 @@ impl FallibleScalarReplayContext {
             .map_err(app_error)?.ok_or_else(|| compiler::error("retained program revision missing"))?;
         let mut live_frame = true;
         for layer_id in manifest.layers() {
-            if !self.verify_layer_history(data, scope, layer_id, None, target_program, day, cx)? {
+            if self.verify_layer_history(data, scope, layer_id, None, target_program, day, cx)?.is_some() {
                 live_frame = false;
                 break;
             }
@@ -634,7 +670,7 @@ impl FallibleScalarReplayContext {
                         complete_frames = false;
                         break;
                     };
-                    if !self.verify_layer_history(data, scope, layer, Some(frame), target_program, day, cx)? {
+                    if self.verify_layer_history(data, scope, layer, Some(frame), target_program, day, cx)?.is_some() {
                         complete_frames = false;
                         break;
                     }
@@ -654,10 +690,10 @@ impl FallibleScalarReplayContext {
         target_program: &FallibleDecodedCapturedProgram,
         day: i32,
         cx: &mut AllocationContext,
-    ) -> Result<bool, ScalarReplayFailure> {
+    ) -> Result<LayerHistoryResult, ScalarReplayFailure> {
         let layer = scope.layer(layer_id).ok_or_else(|| compiler::error("history layer proof missing"))?;
         let Some(receipt) = scope.initializations().iter().find(|receipt| receipt.layer() == layer_id) else {
-            return Ok(false);
+            return Ok(Some("initialization receipt missing"));
         };
         let regenerated_live_additions;
         let (basis, additions) = if let Some(frame) = frame {
@@ -665,7 +701,7 @@ impl FallibleScalarReplayContext {
                 || !frame.before().events_start_with(layer.basis().data())
                 || frame.before().generation() < layer.basis().data().generation()
             {
-                return Ok(false);
+                return Ok(Some("pre-adoption business event history changed"));
             }
             (frame.before(), frame.additions())
         } else {
@@ -682,11 +718,11 @@ impl FallibleScalarReplayContext {
                     && manifest.basis().revision().checked_add(1) == Some(receipt.adoption_revision()))
                     .then_some(manifest.output())
             });
-            let Some(initialization_target) = initialization_target else { return Ok(false) };
+            let Some(initialization_target) = initialization_target else { return Ok(Some("initialization projection differs from retained receipt")) };
             let Some(initialization_source) = self.snapshot.captured_program_by_revision_with(layer.basis().active(), cx)
-                .map_err(app_error)? else { return Ok(false) };
+                .map_err(app_error)? else { return Ok(Some("initialization projection differs from retained receipt")) };
             if initialization_source.program_digest() != receipt.capture_program() {
-                return Ok(false);
+                return Ok(Some("initialization projection differs from retained receipt"));
             }
             let initialization_program = self.snapshot.captured_program_by_revision_with(initialization_target, cx)
                 .map_err(app_error)?.ok_or_else(|| compiler::error("initialization target program missing"))?;
@@ -698,19 +734,22 @@ impl FallibleScalarReplayContext {
             if crate::product_backup::fallible_codec::canonical_bytes(&regenerated, cx).map_err(codec_error)?
                 != crate::product_backup::fallible_codec::canonical_bytes(receipt, cx).map_err(codec_error)?
             {
-                return Ok(false);
+                return Ok(Some("initialization projection differs from retained receipt"));
             }
             // The receipt output itself must be an exact prefix of the live
             // state; later records/events are checked below from its frozen
             // basis and regenerated additions.
             if !data.events_start_with(&initialized) || data.generation() < initialized.generation() {
-                return Ok(false);
+                return Ok(Some("pre-adoption business event history changed"));
             }
             regenerated_live_additions = regenerated_additions;
             (layer.basis().data(), regenerated_live_additions.as_slice())
         };
-        if !data.events_start_with(basis) || data.generation() < basis.generation() || day < layer.basis().day() {
-            return Ok(false);
+        if frame.is_none() && (data.generation() < basis.generation() || day < layer.basis().day()) {
+            return Ok(Some("input predates the live capture and needs an authenticated historical frame"));
+        }
+        if !data.events_start_with(basis) || data.generation() < basis.generation() {
+            return Ok(Some("pre-adoption business event history changed"));
         }
         // Metadata keys contain an entity component, so construct them for
         // each lifecycle row below.
@@ -728,11 +767,11 @@ impl FallibleScalarReplayContext {
                         || row.revision() < original.revision()
                         || (original.archived() && (!row.archived() || row.revision() != original.revision()))
                 }) {
-                    return Ok(false);
+                    return Ok(Some("existing record producer, revision or archive identity changed"));
                 }
                 let mut expected: Option<&crate::product_contract::FallibleValues> = if before_row.is_some() {
                     let Some(addition) = additions.iter().find(|addition| addition.record().entity == row_ref.0 && addition.record().record == row_ref.1) else {
-                        return Ok(false);
+                        return Ok(Some("existing row has no metadata receipt"));
                     };
                     Some(addition.values())
                 } else { None };
@@ -742,37 +781,52 @@ impl FallibleScalarReplayContext {
                 for event in data.events().iter().filter(|event| event.sequence() > basis.generation()) {
                     for change in event.changes().iter().filter(|change| change.entity() == row.entity() && change.record() == row.id()) {
                         if archived || !same_business(change.before(), business) {
-                            return Ok(false);
+                            return Ok(Some("business before-values or archived facts changed outside recorded history"));
                         }
-                        let Some(source) = self.producer_composition(event.program(), cx)? else { return Ok(false) };
-                        let source_program = self.snapshot.captured_program_by_revision_with(source.output(), cx)
-                            .map_err(app_error)?.ok_or_else(|| compiler::error("retained program revision missing"))?;
                         let before_meta = change.before();
                         let after_meta = change.after();
                         if before_meta.is_none() {
                             births += 1;
-                            if before_row.is_some() || births != 1 || row.created_program() != event.program() {
-                                return Ok(false);
+                            if row.created_program() != event.program() {
+                                return Ok(Some("record producer differs from its real birth event"));
                             }
+                            if before_row.is_some() || births != 1 {
+                                return Ok(Some("duplicate or postdated creation provenance"));
+                            }
+                        }
+                        let Some(source) = self.producer_composition(event.program(), cx)? else {
+                            return Ok(Some(if before_meta.is_none() {
+                                "creation has no verified composition"
+                            } else {
+                                "business event source is not verified"
+                            }));
+                        };
+                        let source_program = self.snapshot.captured_program_by_revision_with(source.output(), cx)
+                            .map_err(app_error)?.ok_or_else(|| compiler::error("retained program revision missing"))?;
+                        if before_meta.is_none() {
                             let stamped = source.active_contains(layer_id)
                                 && matches!(layer.request().population, super::ScopePopulationDto::FutureWork | super::ScopePopulationDto::All);
-                            if after_meta.get(&member) != Some(&crate::product_contract::DataValue::Boolean { value: stamped })
-                                || after_meta.get(&sealed) != Some(&crate::product_contract::DataValue::Boolean { value: false })
+                            if protected_bool(after_meta, &member)? != stamped
+                                || protected_bool(after_meta, &sealed)?
                                 || row_keys.iter().any(|key| key != &member && key != &sealed && after_meta.get(key).is_some())
-                            { return Ok(false); }
+                            { return Ok(Some("birth cohort does not match its producing source")); }
                             expected = Some(after_meta);
                         } else {
-                            let Some(prior) = expected else { return Ok(false) };
+                            let Some(prior) = expected else { return Ok(Some("event before-value breaks protected history")) };
                             if !same_metadata(before_meta.expect("checked Some"), prior, &row_keys) {
-                                return Ok(false);
+                                return Ok(Some("event before-value breaks protected history"));
                             }
-                            if before_meta.expect("checked Some").get(&member) != after_meta.get(&member) {
-                                return Ok(false);
+                            if protected_bool(before_meta.expect("checked Some"), &member)? != protected_bool(after_meta, &member)? {
+                                return Ok(Some("cohort membership changed after creation"));
                             }
-                            let was_sealed = prior.get(&sealed) == Some(&crate::product_contract::DataValue::Boolean { value: true });
-                            let is_sealed = after_meta.get(&sealed) == Some(&crate::product_contract::DataValue::Boolean { value: true });
-                            if was_sealed && !same_metadata(after_meta, prior, &row_keys) { return Ok(false); }
-                            if !is_sealed && !same_metadata(after_meta, prior, &row_keys) { return Ok(false); }
+                            let was_sealed = protected_bool(prior, &sealed)?;
+                            let is_sealed = protected_bool(after_meta, &sealed)?;
+                            if was_sealed && !same_metadata(after_meta, prior, &row_keys) {
+                                return Ok(Some("completed result seal was modified"));
+                            }
+                            if !is_sealed && !same_metadata(after_meta, prior, &row_keys) {
+                                return Ok(Some("unsealed history metadata changed"));
+                            }
                             if was_sealed {
                                 for patch in layer.patches() {
                                     if patch.request().entity != row.entity() { continue; }
@@ -781,7 +835,7 @@ impl FallibleScalarReplayContext {
                                     {
                                         if before_meta.expect("checked Some").get(field).unwrap_or(&crate::product_contract::DataValue::Null)
                                             != after_meta.get(field).unwrap_or(&crate::product_contract::DataValue::Null)
-                                        { return Ok(false); }
+                                        { return Ok(Some("completed durable result changed after its seal")); }
                                     }
                                 }
                             }
@@ -792,12 +846,19 @@ impl FallibleScalarReplayContext {
                                     self.completed_projection(source_program, data, row.entity(), row.id(), after_meta, false, lifecycle, event.day(), cx)?
                                 };
                                 let archive_origin = matches!(after_meta.get(&origin_key), Some(crate::product_contract::DataValue::Text { value }) if value == "ObservedAtArchive");
-                                if after_meta.get(&day_key) != Some(&crate::product_contract::DataValue::Date { days: event.day() })
-                                    || (archive_origin && !change.archived())
-                                    || (!archive_origin && (change.archived() || !completed
-                                        || !matches!(after_meta.get(&origin_key), Some(crate::product_contract::DataValue::Text { value }) if value == "ObservedAtCompletion")))
-                                { return Ok(false); }
-                                if !source.layers().contains(layer_id) { return Ok(false); }
+                                if !source.layers().contains(layer_id) { return Ok(Some("seal source omitted its history envelope")); }
+                                if after_meta.get(&day_key) != Some(&crate::product_contract::DataValue::Date { days: event.day() }) {
+                                    return Ok(Some("seal day differs from business event"));
+                                }
+                                if archive_origin && !change.archived() {
+                                    return Ok(Some("archive provenance requires a real archive event"));
+                                }
+                                if !archive_origin && !matches!(after_meta.get(&origin_key), Some(crate::product_contract::DataValue::Text { value }) if value == "ObservedAtCompletion") {
+                                    return Ok(Some("invalid completion provenance"));
+                                }
+                                if !(archive_origin && change.archived()) && !completed {
+                                    return Ok(Some("result sealed without a real terminal transition"));
+                                }
                                 let mut projection_values = after_meta.try_clone_with(cx).map_err(ScalarReplayFailure::Allocation)?;
                                 for other_id in source.layers() {
                                     let Some(other_layer) = scope.layer(other_id) else { continue };
@@ -825,7 +886,7 @@ impl FallibleScalarReplayContext {
                                     let effective = compiler::effective_patch_fallible(&self.snapshot, source, layer_id, index, cx)
                                         .map_err(compiler_failure)?;
                                     let saved = compiler::saved_key_fallible(layer_id, original_patch, cx).map_err(compiler_failure)?;
-                                    let Some(value) = after_meta.get(&saved) else { return Ok(false) };
+                                    let Some(value) = after_meta.get(&saved) else { return Ok(Some("sealed result is missing")) };
                                     crate::product_contract::validate_value(value, &original_patch.request().value_type, 0)
                                         .map_err(|error| ScalarReplayFailure::Store(StoreError::Invalid(error.0)))?;
                                     let expression = compiler::slot_fallible_ref(&producer_app, &effective.request.destination)
@@ -835,41 +896,70 @@ impl FallibleScalarReplayContext {
                                         change.archived(), &effective.request.subject, expression,
                                         &effective.request.value_type, event.day(), cx,
                                     )?;
-                                    if value != &observed { return Ok(false); }
+                                    if value != &observed { return Ok(Some("saved result differs from its actual producing expression")); }
                                 }
                             }
                             expected = Some(after_meta);
                         }
-                        let sealed_now = expected.is_some_and(|values| values.get(&sealed) == Some(&crate::product_contract::DataValue::Boolean { value: true }));
+                        let sealed_now = expected.map(|values| protected_bool(values, &sealed)).transpose()?.unwrap_or(false);
                         let completed = if change.archived() { false } else {
                             self.completed_projection(source_program, data, row.entity(), row.id(), change.after(), false, lifecycle, event.day(), cx)?
                         };
-                        if (change.archived() || completed) && !sealed_now { return Ok(false); }
+                        if (change.archived() || completed) && !sealed_now {
+                            return Ok(Some("terminal business event omitted its required result seal"));
+                        }
                         business = Some(after_meta);
                         archived = change.archived();
                     }
                 }
-                let Some(expected) = expected else { return Ok(false) };
-                if !same_metadata(row.values(), expected, &row_keys)
-                    || !same_business(Some(row.values()), business)
-                    || archived != row.archived()
-                    || (before_row.is_none() && births != 1)
-                { return Ok(false); }
-                let is_sealed = expected.get(&sealed) == Some(&crate::product_contract::DataValue::Boolean { value: true });
+                if before_row.is_none() && births != 1 {
+                    return Ok(Some("future record lacks exactly one birth event"));
+                }
+                if !same_business(Some(row.values()), business) || archived != row.archived() {
+                    return Ok(Some("current business record differs from recorded facts"));
+                }
+                let Some(expected) = expected else { return Ok(Some("current metadata is not accounted for by real history")) };
+                if !same_metadata(row.values(), expected, &row_keys) {
+                    return Ok(Some("current metadata is not accounted for by real history"));
+                }
+                let is_sealed = protected_bool(expected, &sealed)?;
                 let completed = if row.archived() { false } else {
                     self.completed_projection(target_program, data, row.entity(), row.id(), row.values(), row.archived(), lifecycle, day, cx)?
                 };
                 if (is_sealed && !row.archived() && !completed)
                     || (!is_sealed && (row.archived() || completed))
-                { return Ok(false); }
+                {
+                    return Ok(Some(if is_sealed {
+                        "terminal completed work cannot be silently reopened"
+                    } else {
+                        "terminal result was not preserved"
+                    }));
+                }
+                if is_sealed {
+                    for patch in layer.patches() {
+                        if patch.request().entity == row.entity()
+                            && matches!(patch.request().destination,
+                                super::EffectDestinationDto::ViewColumn { .. }
+                                | super::EffectDestinationDto::EmitColumn { .. })
+                        {
+                            let saved = compiler::saved_key_fallible(layer_id, patch, cx)
+                                .map_err(compiler_failure)?;
+                            let Some(value) = expected.get(&saved) else {
+                                return Ok(Some("sealed projection is missing"));
+                            };
+                            crate::product_contract::validate_value(value, &patch.request().value_type, 0)
+                                .map_err(|error| ScalarReplayFailure::Store(StoreError::Invalid(error.0)))?;
+                        }
+                    }
+                }
             }
             for original in basis.records().iter().filter(|record| record.entity() == lifecycle.entity()) {
                 if !data.records().iter().any(|record| record.entity() == original.entity() && record.id() == original.id()) {
-                    return Ok(false);
+                    return Ok(Some("original record identity disappeared"));
                 }
             }
         }
-        Ok(true)
+        Ok(None)
     }
 
     fn completed_projection(

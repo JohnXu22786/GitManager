@@ -61,6 +61,123 @@ pub(super) struct DecodedDecisionGraph {
     pub(super) revision: u64,
     pub(super) decisions: Vec<DecodedScopedDecision>,
 }
+impl DecodedDecisionGraph {
+    pub(super) fn accepted_for_scope(&self, id: &str, scope: &DecodedDecisionScope, artifact: &Digest) -> bool {
+        self.decisions.iter().any(|decision| {
+            decision.id == id && decision.scope.same_as(scope)
+                && matches!(&decision.outcome, DecisionOutcome::Accept { artifact: actual } if actual == artifact)
+        })
+    }
+
+    /// Undo one retained adoption transition until the exact prior canonical
+    /// decision checkpoint is reached. This mirrors the legacy scalar history
+    /// walk without materializing the BTreeMap-backed DecisionGraph.
+    pub(super) fn rewind_adoption_with(
+        &self,
+        expected: &Digest,
+        retired: &[String],
+        adoption: &str,
+        cx: &mut AllocationContext,
+    ) -> Result<(Self, Vec<String>, Vec<String>), super::DecisionValidationError> {
+        let value = crate::product_backup::fallible_codec::try_serialize_value(self, cx)
+            .map_err(|error| match error {
+                crate::product_backup::fallible_codec::CodecError::Allocation(failure) => super::DecisionValidationError::Allocation(failure),
+                _ => super::DecisionValidationError::Contract(super::ContractError("decision copy invariant".into())),
+            })?;
+        let mut working = decode_decision_graph(value, cx).map_err(|error| match error {
+            ValueDecodeError::Allocation(failure) => super::DecisionValidationError::Allocation(failure),
+            _ => super::DecisionValidationError::Contract(super::ContractError("decision copy invariant".into())),
+        })?;
+        let (active, pending) = working.rewind_adoption_in_place(expected, retired, adoption, cx)?;
+        Ok((working, active, pending))
+    }
+
+    fn rewind_adoption_in_place(
+        &mut self,
+        expected: &Digest,
+        retired: &[String],
+        adoption: &str,
+        cx: &mut AllocationContext,
+    ) -> Result<(Vec<String>, Vec<String>), super::DecisionValidationError> {
+        let mut active = Vec::new();
+        let mut pending = Vec::new();
+        let mut retired_ids = crate::product_alloc::ordered::OrderedSet::new();
+        for id in retired {
+            let owned = product_alloc::try_copy_str(id, cx, AllocationSite::String)
+                .map_err(super::DecisionValidationError::Allocation)?;
+            retired_ids.try_insert(owned, cx)
+                .map_err(super::DecisionValidationError::Allocation)?;
+        }
+        self.validate_with(cx)?;
+        if self.identity_with(cx)? != *expected {
+            self.revision = self.revision.checked_sub(1).ok_or_else(|| {
+                super::DecisionValidationError::Contract(super::ContractError(
+                    "decision graph revision has no predecessor".into(),
+                ))
+            })?;
+            for id in retired {
+                let decision = self.decisions.iter_mut().find(|decision| &decision.id == id)
+                    .ok_or_else(|| super::DecisionValidationError::Contract(super::ContractError(
+                        "retired decision missing from retained graph".into(),
+                    )))?;
+                match &decision.status {
+                    DecisionStatus::Withdrawn { adoption: operation } if operation == adoption => {}
+                    DecisionStatus::Superseded { .. } => {}
+                    _ => return Err(super::DecisionValidationError::Contract(super::ContractError(
+                        "retirement differs from its graph transition".into(),
+                    ))),
+                }
+                decision.status = if matches!(decision.outcome, DecisionOutcome::Accept { .. } | DecisionOutcome::KeepCurrent) {
+                    DecisionStatus::Active
+                } else { DecisionStatus::Pending };
+                decision.revision = decision.revision.checked_sub(1).ok_or_else(|| {
+                    super::DecisionValidationError::Contract(super::ContractError(
+                        "retired decision has no prior revision".into(),
+                    ))
+                })?;
+            }
+            while self.canonical_identity_with(cx)? != *expected {
+                let decision = self.decisions.pop().ok_or_else(|| super::DecisionValidationError::Contract(
+                    super::ContractError("retained prior decision graph does not regenerate".into()),
+                ))?;
+                if decision.revision != 1 || retired_ids.contains(decision.id.as_str())
+                    || !matches!(decision.status, DecisionStatus::Active | DecisionStatus::Pending)
+                {
+                    return Err(super::DecisionValidationError::Contract(super::ContractError(
+                        "decision birth rewrites earlier terminal history".into(),
+                    )));
+                }
+                let output = if decision.status == DecisionStatus::Active { &mut active } else { &mut pending };
+                product_alloc::try_push(output, decision.id, cx, AllocationSite::Vector)
+                    .map_err(super::DecisionValidationError::Allocation)?;
+            }
+            self.validate_with(cx)?;
+        } else if !retired.is_empty() {
+            return Err(super::DecisionValidationError::Contract(super::ContractError(
+                "unchanged graph cannot claim a retirement".into(),
+            )));
+        }
+        Ok((active, pending))
+    }
+
+    fn identity_with(&self, cx: &mut AllocationContext) -> Result<Digest, super::DecisionValidationError> {
+        self.validate_with(cx)?;
+        self.canonical_identity_with(cx)
+    }
+
+    fn canonical_identity_with(&self, cx: &mut AllocationContext) -> Result<Digest, super::DecisionValidationError> {
+        crate::product_backup::fallible_codec::canonical_digest(
+            super::IdentityDomain::Decision, self, cx,
+        ).map_err(|error| match error {
+            crate::product_backup::fallible_codec::CodecError::Allocation(failure) => super::DecisionValidationError::Allocation(failure),
+            _ => super::DecisionValidationError::Contract(super::ContractError("decision canonical encoding failed".into())),
+        })
+    }
+
+    fn validate_with(&self, cx: &mut AllocationContext) -> Result<(), super::DecisionValidationError> {
+        super::validate_decision_graph_with(self.version, &self.decisions, cx)
+    }
+}
 
 #[derive(Debug, Serialize)]
 pub(super) struct DecodedScopedDecision {
@@ -85,6 +202,19 @@ pub(super) struct DecodedDecisionScope {
     pub(super) excluded_records: Vec<RecordRef>,
     pub(super) unknowns: Vec<DecodedUnknownBoundary>,
 }
+impl DecodedDecisionScope {
+    pub(super) fn same_as(&self, other: &Self) -> bool {
+        self.operations.iter().eq(other.operations.iter())
+            && self.population == other.population
+            && self.conditions == other.conditions
+            && self.excluded_records == other.excluded_records
+            && self.unknowns.len() == other.unknowns.len()
+            && self.unknowns.iter().zip(&other.unknowns).all(|(left, right)| {
+                left.id == right.id && left.description == right.description
+                    && left.operations.iter().eq(right.operations.iter())
+            })
+    }
+}
 
 #[derive(Debug, Serialize)]
 pub(super) struct DecodedAdoptionPlan {
@@ -105,7 +235,52 @@ pub(super) struct DecodedAdoptionPlan {
     retire_decisions: Vec<String>,
 }
 impl DecodedAdoptionPlan {
+    pub(crate) fn id(&self) -> &str { &self.id }
+    pub(crate) fn project_id(&self) -> &str { &self.project_id }
+    pub(crate) fn expected_generation(&self) -> u64 { self.expected_generation }
     pub(crate) fn expected_data(&self) -> &Digest { &self.expected_data }
+    pub(crate) fn expected_decisions(&self) -> &Digest { &self.expected_decisions }
+    pub(crate) fn expected_session(&self) -> &Digest { &self.expected_session }
+    pub(crate) fn current_source(&self) -> &super::SourceBinding { &self.current_source }
+    pub(crate) fn target(&self) -> &super::ArtifactRef { &self.target }
+    pub(crate) fn required_decisions(&self) -> &[String] { &self.required_decisions }
+    pub(crate) fn retire_decisions(&self) -> &[String] { &self.retire_decisions }
+    pub(crate) fn evidence(&self) -> &[Digest] { &self.evidence }
+    pub(crate) fn compatibility(&self) -> &crate::product_store::scope::DecodedCompatibilityReport { &self.compatibility }
+    pub(crate) fn scope(&self) -> &DecodedDecisionScope { &self.scope }
+    pub(crate) fn scope_matches_layer(
+        &self,
+        request: &crate::product_store::scope::DecodedScopeRequest,
+        basis_generation: u64,
+    ) -> bool {
+        use crate::product_store::scope::ScopePopulationDto;
+        let population_matches = match (request.population(), &self.scope.population) {
+            (ScopePopulationDto::All, super::Population::All) => true,
+            (ScopePopulationDto::FutureWork, super::Population::CreatedAfter { generation }) => *generation == basis_generation,
+            (ScopePopulationDto::SelectedUnfinished { records }, super::Population::Records { records: expected }) => *records == *expected,
+            _ => false,
+        };
+        population_matches
+            && request.operations().eq(self.scope.operations.iter())
+            && request.excluded_records() == self.scope.excluded_records
+            && self.scope.conditions.is_empty()
+            && self.scope.unknowns.is_empty()
+    }
+
+    pub(crate) fn scope_matches_decision(&self, other: &DecodedDecisionScope) -> bool {
+        self.scope.same_as(other)
+    }
+
+    pub(crate) fn identity_with(
+        &self,
+        cx: &mut AllocationContext,
+    ) -> Result<super::Digest, super::DecisionValidationError> {
+        crate::product_backup::fallible_codec::canonical_digest(super::IdentityDomain::Adoption, self, cx)
+            .map_err(|error| match error {
+                crate::product_backup::fallible_codec::CodecError::Allocation(failure) => super::DecisionValidationError::Allocation(failure),
+                _ => super::DecisionValidationError::Contract(super::ContractError("adoption plan canonical encoding failed".into())),
+            })
+    }
 
     pub(crate) fn validate_with(
         &self,
@@ -1103,6 +1278,32 @@ mod tests {
         let mut cx = AllocationContext::new();
         let decoded = decode_decision_graph(syntax(&source), &mut cx).unwrap();
         assert_eq!(super::super::canonical_bytes(&expected).unwrap(), super::super::canonical_bytes(&decoded).unwrap());
+    }
+
+    #[test]
+    fn reverse_checkpoint_reconstructs_births_with_fallible_storage() {
+        let source = format!(r#"{{"version":1,"revision":1,"decisions":[{{"id":"born","revision":1,"request":"Keep behavior","scope":{{"operations":["edit"],"population":{{"kind":"all"}},"conditions":{{}},"excluded_records":[],"unknowns":[]}},"outcome":{{"kind":"keep_current"}},"status":{{"kind":"pending"}},"obligations":[],"scenarios":["{D}"],"witness":"{D}","supersedes":[]}}]}}"#);
+        let empty: super::super::DecisionGraph = typed(&format!(r#"{{"version":1,"revision":0,"decisions":[]}}"#));
+        let expected = empty.identity().unwrap();
+        let decoded = decode_decision_graph(syntax(&source), &mut AllocationContext::new()).unwrap();
+        let mut success = AllocationContext::new();
+        let (rewound, active, pending) = decoded.rewind_adoption_with(&expected, &[], "adopt", &mut success).unwrap();
+        assert!(active.is_empty());
+        assert_eq!(pending, ["born"]);
+        assert_eq!(rewound.revision, 0);
+        assert!(rewound.decisions.is_empty());
+        let growths = success.growth_requests();
+        assert!(growths > 0);
+        for nth in 1..=growths {
+            let decoded = decode_decision_graph(syntax(&source), &mut AllocationContext::new()).unwrap();
+            let before = crate::product_backup::fallible_codec::canonical_bytes(&decoded, &mut AllocationContext::new()).unwrap();
+            let mut refused = AllocationContext::fail_nth_growth(NonZeroUsize::new(nth).unwrap(), false);
+            assert!(matches!(decoded.rewind_adoption_with(&expected, &[], "adopt", &mut refused), Err(super::super::DecisionValidationError::Allocation(_))), "refused growth {nth}/{growths}");
+            assert_eq!(before, crate::product_backup::fallible_codec::canonical_bytes(&decoded, &mut AllocationContext::new()).unwrap());
+            let mut retry = AllocationContext::new();
+            let (_, _, pending) = decoded.rewind_adoption_with(&expected, &[], "adopt", &mut retry).unwrap();
+            assert_eq!(pending, ["born"]);
+        }
     }
 
     fn supersession_source() -> String {
