@@ -89,6 +89,7 @@ impl FallibleDigestSet {
         Ok(())
     }
     pub(crate) fn iter(&self) -> impl Iterator<Item = &Digest> { self.0.iter() }
+    pub(crate) fn contains(&self, value: &Digest) -> bool { self.0.contains(value) }
 }
 impl PartialEq for FallibleDigestSet {
     fn eq(&self, other: &Self) -> bool { self.0.iter().eq(other.0.iter()) }
@@ -109,6 +110,10 @@ pub(crate) struct DecodedScopeRequest {
     pub(crate) excluded_records: Vec<RecordRef>,
     pub(crate) lifecycles: Vec<LifecycleBindingDto>,
     pub(crate) patches: Vec<EffectPatchRequestDto>,
+}
+impl DecodedScopeRequest {
+    pub(crate) fn lifecycles(&self) -> &[LifecycleBindingDto] { &self.lifecycles }
+    pub(crate) fn patches(&self) -> &[EffectPatchRequestDto] { &self.patches }
 }
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ScopePopulationDto {
@@ -132,7 +137,12 @@ impl Serialize for ScopePopulationDto {
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct LifecycleBindingDto { entity: String, completed: Expr, source: Digest }
 #[derive(Debug, PartialEq, Eq, Serialize)]
-pub(crate) struct EffectPatchRequestDto { destination: EffectDestinationDto, entity: String, subject: String, value_type: Type }
+pub(crate) struct EffectPatchRequestDto {
+    pub(crate) destination: EffectDestinationDto,
+    pub(crate) entity: String,
+    pub(crate) subject: String,
+    pub(crate) value_type: Type,
+}
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum EffectDestinationDto {
     Update { action: String, path: Vec<usize>, field: String },
@@ -162,16 +172,34 @@ pub(crate) struct DecodedFrozenBasis {
     session: FallibleDecodedSessionState, day: i32, decisions: Digest,
 }
 #[derive(Debug, PartialEq, Eq, Serialize)]
-pub(crate) struct DecodedEffectPatch { request: EffectPatchRequestDto, before: Expr, after: Expr }
+pub(crate) struct DecodedEffectPatch { pub(crate) request: EffectPatchRequestDto, pub(crate) before: Expr, pub(crate) after: Expr }
+impl DecodedEffectPatch {
+    pub(crate) fn request(&self) -> &EffectPatchRequestDto { &self.request }
+    pub(crate) fn before(&self) -> &Expr { &self.before }
+    pub(crate) fn after(&self) -> &Expr { &self.after }
+}
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct DecodedScopeLayer {
     version: u32, operation: String, basis: DecodedFrozenBasis, candidate: Digest,
     request: DecodedScopeRequest, patches: Vec<DecodedEffectPatch>,
 }
+impl DecodedScopeLayer {
+    pub(crate) fn patches(&self) -> &[DecodedEffectPatch] { &self.patches }
+    pub(crate) fn request(&self) -> &DecodedScopeRequest { &self.request }
+}
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct DecodedScopeSlotMapping {
     layer: Digest, patch: usize, from_source: Digest, from: EffectDestinationDto,
     to_source: Digest, to: EffectDestinationDto, subject: String,
+}
+impl DecodedScopeSlotMapping {
+    pub(crate) fn layer(&self) -> &Digest { &self.layer }
+    pub(crate) fn patch(&self) -> usize { self.patch }
+    pub(crate) fn from_source(&self) -> &Digest { &self.from_source }
+    pub(crate) fn from(&self) -> &EffectDestinationDto { &self.from }
+    pub(crate) fn to_source(&self) -> &Digest { &self.to_source }
+    pub(crate) fn to(&self) -> &EffectDestinationDto { &self.to }
+    pub(crate) fn subject(&self) -> &str { &self.subject }
 }
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct DecodedCompositionManifest {
@@ -179,6 +207,15 @@ pub(crate) struct DecodedCompositionManifest {
     rewrites: Vec<DecodedScopeSlotMapping>, business: Digest, layers: Vec<Digest>,
     active: FallibleDigestSet, previous: Option<Digest>, operation: String,
     runtime: String, driver: String, output: Digest,
+}
+impl DecodedCompositionManifest {
+    pub(crate) fn business(&self) -> &Digest { &self.business }
+    pub(crate) fn output(&self) -> &Digest { &self.output }
+    pub(crate) fn layers(&self) -> &[Digest] { &self.layers }
+    pub(crate) fn active_contains(&self, id: &Digest) -> bool { self.active.contains(id) }
+    pub(crate) fn rewrite_for(&self, id: &Digest, patch: usize) -> Option<&DecodedScopeSlotMapping> {
+        self.rewrites.iter().find(|mapping| &mapping.layer == id && mapping.patch == patch)
+    }
 }
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct DecodedMetadataAddition { record: RecordRef, values: FallibleValues }
@@ -285,6 +322,7 @@ impl<K, V> FallibleScopeMap<K, V> {
     pub(crate) fn keys(&self) -> impl Iterator<Item = &K> { self.0.iter().map(|(key, _)| key) }
 }
 impl<K: Ord, V> FallibleScopeMap<K, V> {
+    pub(crate) fn get(&self, key: &K) -> Option<&V> { self.0.get(key) }
     pub(crate) fn insert(&mut self, key: K, value: V, cx: &mut AllocationContext) -> Result<Option<V>, ValueDecodeError> {
         self.0.try_insert(key, value, cx).map_err(ValueDecodeError::Allocation)
     }
@@ -338,6 +376,10 @@ pub(crate) struct DecodedScopeState {
     adoptions: Vec<DecodedScopedAdoptionReceipt>,
     rehearsals: FallibleScopeMap<Digest, DecodedManagedRehearsal>,
     correspondences: FallibleScopeMap<Digest, DecodedScopeCorrespondenceReceipt>,
+}
+impl DecodedScopeState {
+    pub(crate) fn composition(&self, id: &Digest) -> Option<&DecodedCompositionManifest> { self.compositions.get(id) }
+    pub(crate) fn layer(&self, id: &Digest) -> Option<&DecodedScopeLayer> { self.layers.get(id) }
 }
 
 pub(crate) fn decode_scope_population(value: Value, cx: &mut AllocationContext) -> Result<ScopePopulationDto, ValueDecodeError> {

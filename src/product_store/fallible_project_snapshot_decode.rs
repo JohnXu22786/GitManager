@@ -230,6 +230,29 @@ impl DecodedProjectSnapshot {
         &self.data
     }
 
+    pub(crate) fn scalar_scope(&self) -> Option<&crate::product_store::scope::FallibleDecodedScopeState> {
+        use crate::product_store::scope::FallibleDecodedScopeEnvelope;
+        match &self.scope {
+            FallibleDecodedScopeEnvelope::ScalarV1(state) => Some(state),
+            FallibleDecodedScopeEnvelope::OwnedV2(_) => None,
+        }
+    }
+
+    pub(crate) fn captured_program_by_revision_with(
+        &self,
+        revision: &Digest,
+        cx: &mut AllocationContext,
+    ) -> Result<Option<&FallibleDecodedCapturedProgram>, crate::product_contract::AppValidationError> {
+        for program in &self.programs {
+            if program.revision_with(cx)? == *revision {
+                return Ok(Some(program));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn active_revision(&self) -> &Digest { &self.active_revision }
+
     pub(crate) fn revision(&self) -> u64 {
         self.revision
     }

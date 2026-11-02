@@ -1,5 +1,6 @@
 //! Deterministic lowering into the existing typed language. No second runtime.
 use super::*;
+use crate::product_contract::StringValueMap;
 
 pub(super) fn error(message: &str) -> StoreError {
     StoreError::Invalid(format!("Scoped change unsupported: {message}. Keep current work and prepare a compatible forward repair"))
@@ -161,123 +162,736 @@ pub(super) fn slot<'a>(
         }
     }
 }
-fn list_entity(expr: &Expr, app: &AppDefinition, env: &BTreeMap<Id, Type>) -> Option<Id> {
+
+pub(super) fn slot_fallible<'a>(
+    app: &'a mut crate::product_contract::fallible_app_decode::DecodedAppDefinition,
+    destination: &super::fallible_scalar_decode::EffectDestinationDto,
+) -> Result<&'a mut Expr> {
+    use super::fallible_scalar_decode::EffectDestinationDto as D;
+    use crate::product_contract::fallible_app_decode::{DecodedStatement as S, DecodedViewKind as V};
+    match destination {
+        D::ViewColumn { view, column } => {
+            let view = app.views.iter_mut().find(|v| v.id == *view)
+                .ok_or_else(|| error("view is absent"))?;
+            let columns = match &mut view.kind {
+                V::List { columns, .. } | V::Detail { columns, .. } => columns,
+                V::Form { .. } => return Err(error("form is not a row projection")),
+            };
+            Ok(&mut columns.iter_mut().find(|v| v.id == *column)
+                .ok_or_else(|| error("view column is absent"))?.value)
+        }
+        D::Observable { observable } => Ok(&mut app.observables.iter_mut()
+            .find(|o| o.id == *observable)
+            .ok_or_else(|| error("observable is absent"))?.value),
+        _ => {
+            let (id, path) = match destination {
+                D::Update { action, path, .. } | D::CreateValue { action, path, .. }
+                | D::EmitColumn { action, path, .. } | D::EmitItems { action, path } => (action, path),
+                _ => unreachable!(),
+            };
+            if path.is_empty() || path.len() > MAX_EXPR_DEPTH {
+                return Err(error("invalid statement path"));
+            }
+            let action = app.actions.iter_mut().find(|a| a.id == *id)
+                .ok_or_else(|| error("action is absent"))?;
+            let statement = decoded_step_mut(&mut action.steps, path)?;
+            match (statement, destination) {
+                (S::Update { values, .. }, D::Update { field, .. })
+                | (S::Create { values, .. }, D::CreateValue { field, .. }) => values.get_mut(field)
+                    .ok_or_else(|| error("assignment is absent")),
+                (S::Emit { columns, .. }, D::EmitColumn { column, .. }) => columns.get_mut(column)
+                    .ok_or_else(|| error("output column is absent")),
+                (S::Emit { items, .. }, D::EmitItems { .. }) => Ok(items),
+                _ => Err(error("effect destination has the wrong statement kind")),
+            }
+        }
+    }
+}
+
+fn slot_fallible_ref<'a>(
+    app: &'a crate::product_contract::fallible_app_decode::DecodedAppDefinition,
+    destination: &super::fallible_scalar_decode::EffectDestinationDto,
+) -> Result<&'a Expr> {
+    use super::fallible_scalar_decode::EffectDestinationDto as D;
+    use crate::product_contract::fallible_app_decode::{DecodedStatement as S, DecodedViewKind as V};
+    match destination {
+        D::ViewColumn { view, column } => {
+            let view = app.views.iter().find(|v| v.id == *view)
+                .ok_or_else(|| error("view is absent"))?;
+            let columns = match &view.kind {
+                V::List { columns, .. } | V::Detail { columns, .. } => columns,
+                V::Form { .. } => return Err(error("form is not a row projection")),
+            };
+            Ok(&columns.iter().find(|v| v.id == *column)
+                .ok_or_else(|| error("view column is absent"))?.value)
+        }
+        D::Observable { observable } => Ok(&app.observables.iter()
+            .find(|o| o.id == *observable)
+            .ok_or_else(|| error("observable is absent"))?.value),
+        _ => {
+            let (id, path) = match destination {
+                D::Update { action, path, .. } | D::CreateValue { action, path, .. }
+                | D::EmitColumn { action, path, .. } | D::EmitItems { action, path } => (action, path),
+                _ => unreachable!(),
+            };
+            if path.is_empty() || path.len() > MAX_EXPR_DEPTH {
+                return Err(error("invalid statement path"));
+            }
+            let action = app.actions.iter().find(|a| a.id == *id)
+                .ok_or_else(|| error("action is absent"))?;
+            let statement = decoded_step_ref(&action.steps, path)?;
+            match (statement, destination) {
+                (S::Update { values, .. }, D::Update { field, .. })
+                | (S::Create { values, .. }, D::CreateValue { field, .. }) => values.get(field)
+                    .ok_or_else(|| error("assignment is absent")),
+                (S::Emit { columns, .. }, D::EmitColumn { column, .. }) => columns.get(column)
+                    .ok_or_else(|| error("output column is absent")),
+                (S::Emit { items, .. }, D::EmitItems { .. }) => Ok(items),
+                _ => Err(error("effect destination has the wrong statement kind")),
+            }
+        }
+    }
+}
+
+fn decoded_step_ref<'a>(
+    steps: &'a [crate::product_contract::fallible_app_decode::DecodedStatement],
+    path: &[usize],
+) -> Result<&'a crate::product_contract::fallible_app_decode::DecodedStatement> {
+    use crate::product_contract::fallible_app_decode::DecodedStatement::ForEach;
+    let (&index, rest) = path.split_first().ok_or_else(|| error("invalid statement path"))?;
+    let step = steps.get(index).ok_or_else(|| error("statement path is absent"))?;
+    if rest.is_empty() { return Ok(step); }
+    match step {
+        ForEach { steps, .. } => decoded_step_ref(steps, rest),
+        _ => Err(error("statement path does not traverse a loop")),
+    }
+}
+
+fn decoded_step_mut<'a>(
+    steps: &'a mut [crate::product_contract::fallible_app_decode::DecodedStatement],
+    path: &[usize],
+) -> Result<&'a mut crate::product_contract::fallible_app_decode::DecodedStatement> {
+    use crate::product_contract::fallible_app_decode::DecodedStatement::ForEach;
+    let (&index, rest) = path.split_first().ok_or_else(|| error("invalid statement path"))?;
+    let step = steps.get_mut(index).ok_or_else(|| error("statement path is absent"))?;
+    if rest.is_empty() { return Ok(step); }
+    match step {
+        ForEach { steps, .. } => decoded_step_mut(steps, rest),
+        _ => Err(error("statement path does not traverse a loop")),
+    }
+}
+pub(super) fn list_entity<'a, A, M>(
+    expr: &'a Expr,
+    app: A,
+    env: &'a M,
+) -> Option<&'a str>
+where
+    A: Into<crate::product_contract::AppRef<'a>> + Copy,
+    M: StringValueMap<Type>,
+{
+    let app: crate::product_contract::AppRef<'a> = app.into();
     match expr {
-        Expr::Query { entity, .. } => Some(entity.clone()),
+        Expr::Query { entity, .. } => Some(entity),
         Expr::Filter { items, .. } => list_entity(items, app, env),
-        Expr::State { state } => app
-            .state
-            .iter()
-            .find(|s| &s.id == state)
-            .and_then(|s| type_entity(&s.value_type)),
+        Expr::State { state } => app.state_type(state).and_then(type_entity),
         Expr::Variable { name } => env.get(name).and_then(type_entity),
         Expr::Literal { value_type, .. } => type_entity(value_type),
         _ => None,
     }
 }
-fn type_entity(typ: &Type) -> Option<Id> {
+fn type_entity(typ: &Type) -> Option<&str> {
     if let Type::List { item } = typ {
         if let Type::Reference { entity } = item.as_ref() {
-            return Some(entity.clone());
+            return Some(entity);
         }
     }
     None
 }
-fn locate_context(app: &AppDefinition, request: &EffectPatchRequest) -> Result<BTreeMap<Id, Type>> {
-    if let EffectDestination::ViewColumn { view, .. } = &request.destination {
-        let v = app
-            .views
-            .iter()
-            .find(|v| &v.id == view)
-            .ok_or_else(|| error("view missing"))?;
-        let entity = match &v.kind {
-            ViewKind::List { entity, .. } | ViewKind::Detail { entity, .. } => entity,
-            _ => return Err(error("form projection")),
+#[derive(Debug)]
+pub(super) enum CompilerFailure {
+    Store(StoreError),
+    Allocation(crate::product_alloc::AllocationFailure),
+}
+impl From<StoreError> for CompilerFailure {
+    fn from(value: StoreError) -> Self { Self::Store(value) }
+}
+pub(super) enum CompilerEnvironment {
+    Legacy(BTreeMap<Id, Type>),
+    Fallible(crate::product_alloc::ordered::OrderedMap<Id, Type>),
+}
+pub(super) enum CompilerEnvironmentIter<'a> {
+    Legacy(std::collections::btree_map::Iter<'a, Id, Type>),
+    Fallible(std::slice::Iter<'a, (Id, Type)>),
+}
+impl<'a> Iterator for CompilerEnvironmentIter<'a> {
+    type Item = (&'a Id, &'a Type);
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Legacy(iter) => iter.next(),
+            Self::Fallible(iter) => iter.next().map(|(key, value)| (key, value)),
+        }
+    }
+}
+impl ExactSizeIterator for CompilerEnvironmentIter<'_> {}
+impl StringValueMap<Type> for CompilerEnvironment {
+    type Iter<'a> = CompilerEnvironmentIter<'a> where Self: 'a, Type: 'a;
+    fn len(&self) -> usize { match self { Self::Legacy(map) => map.len(), Self::Fallible(map) => map.len() } }
+    fn get(&self, key: &str) -> Option<&Type> { match self { Self::Legacy(map) => map.get(key), Self::Fallible(map) => map.get(key) } }
+    fn contains_key(&self, key: &str) -> bool { match self { Self::Legacy(map) => map.contains_key(key), Self::Fallible(map) => map.contains_key(key) } }
+    fn iter(&self) -> Self::Iter<'_> {
+        match self { Self::Legacy(map) => CompilerEnvironmentIter::Legacy(map.iter()), Self::Fallible(map) => CompilerEnvironmentIter::Fallible(map.iter_entries()) }
+    }
+}
+impl CompilerEnvironment {
+    fn new(fallible: bool) -> Self {
+        if fallible { Self::Fallible(crate::product_alloc::ordered::OrderedMap::new()) }
+        else { Self::Legacy(BTreeMap::new()) }
+    }
+    fn from_parameters(
+        parameters: crate::product_contract::StringMapRef<'_, Type>,
+        fallible: bool,
+        mut cx: Option<&mut crate::product_alloc::AllocationContext>,
+    ) -> std::result::Result<Self, CompilerFailure> {
+        let mut result = Self::new(fallible);
+        for (key, value) in parameters.iter() {
+            if fallible {
+                let cx = cx.as_deref_mut().expect("fallible environment has allocation context");
+                let key = crate::product_alloc::try_copy_str(key, cx, crate::product_alloc::AllocationSite::String)
+                    .map_err(CompilerFailure::Allocation)?;
+                let value = crate::product_contract::try_clone_type_with(value, cx)
+                    .map_err(CompilerFailure::Allocation)?;
+                if let Self::Fallible(map) = &mut result {
+                    map.try_insert(key, value, cx).map_err(CompilerFailure::Allocation)?;
+                }
+            } else if let Self::Legacy(map) = &mut result {
+                map.insert(key.clone(), value.clone());
+            }
+        }
+        Ok(result)
+    }
+    fn insert_reference(
+        &mut self,
+        key: &str,
+        entity: &str,
+        cx: Option<&mut crate::product_alloc::AllocationContext>,
+    ) -> std::result::Result<(), CompilerFailure> {
+        match self {
+            Self::Legacy(map) => { map.insert(key.to_owned(), Type::reference(entity)); }
+            Self::Fallible(map) => {
+                let cx = cx.expect("fallible environment has allocation context");
+                let key = crate::product_alloc::try_copy_str(key, cx, crate::product_alloc::AllocationSite::String)
+                    .map_err(CompilerFailure::Allocation)?;
+                let entity = crate::product_alloc::try_copy_str(entity, cx, crate::product_alloc::AllocationSite::String)
+                    .map_err(CompilerFailure::Allocation)?;
+                map.try_insert(key, Type::Reference { entity }, cx).map_err(CompilerFailure::Allocation)?;
+            }
+        }
+        Ok(())
+    }
+    fn insert_reference_owned(
+        &mut self,
+        key: &str,
+        entity: String,
+        cx: Option<&mut crate::product_alloc::AllocationContext>,
+    ) -> std::result::Result<(), CompilerFailure> {
+        match self {
+            Self::Legacy(map) => { map.insert(key.to_owned(), Type::Reference { entity }); }
+            Self::Fallible(map) => {
+                let cx = cx.expect("fallible environment has allocation context");
+                let key = crate::product_alloc::try_copy_str(key, cx, crate::product_alloc::AllocationSite::String)
+                    .map_err(CompilerFailure::Allocation)?;
+                map.try_insert(key, Type::Reference { entity }, cx).map_err(CompilerFailure::Allocation)?;
+            }
+        }
+        Ok(())
+    }
+    fn try_clone_with(
+        &self,
+        cx: Option<&mut crate::product_alloc::AllocationContext>,
+    ) -> std::result::Result<Self, CompilerFailure> {
+        match self {
+            Self::Legacy(map) => Ok(Self::Legacy(map.clone())),
+            Self::Fallible(map) => {
+                let cx = cx.expect("fallible environment has allocation context");
+                let copied = map.try_clone_with(
+                    cx,
+                    |key, cx| crate::product_alloc::try_copy_str(key, cx, crate::product_alloc::AllocationSite::String),
+                    |value, cx| crate::product_contract::try_clone_type_with(value, cx),
+                ).map_err(CompilerFailure::Allocation)?;
+                Ok(Self::Fallible(copied))
+            }
+        }
+    }
+    fn remove(&mut self, key: &str) {
+        match self { Self::Legacy(map) => { map.remove(key); }, Self::Fallible(map) => { map.remove(key); } }
+    }
+    fn into_legacy(self) -> BTreeMap<Id, Type> {
+        match self { Self::Legacy(map) => map, Self::Fallible(_) => unreachable!("legacy compiler returned fallible environment") }
+    }
+    fn keys(&self) -> impl Iterator<Item = &String> { self.iter().map(|(key, _)| key) }
+}
+trait DestinationAccess {
+    fn action_path(&self) -> Option<(&str, &[usize])>;
+    fn view_id(&self) -> Option<&str>;
+    fn is_emit_items(&self) -> bool;
+    fn update_field(&self) -> Option<&str>;
+    fn is_update(&self) -> bool;
+    fn emit_column(&self) -> Option<(&str, &[usize], &str)>;
+    fn is_projection(&self) -> bool;
+}
+impl DestinationAccess for EffectDestination {
+    fn action_path(&self) -> Option<(&str, &[usize])> {
+        match self {
+            Self::Update { action, path, .. } | Self::CreateValue { action, path, .. }
+            | Self::EmitColumn { action, path, .. } | Self::EmitItems { action, path } => Some((action, path)),
+            _ => None,
+        }
+    }
+    fn view_id(&self) -> Option<&str> { if let Self::ViewColumn { view, .. } = self { Some(view) } else { None } }
+    fn is_emit_items(&self) -> bool { matches!(self, Self::EmitItems { .. }) }
+    fn update_field(&self) -> Option<&str> {
+        match self { Self::Update { field, .. } | Self::CreateValue { field, .. } => Some(field), _ => None }
+    }
+    fn is_update(&self) -> bool { matches!(self, Self::Update { .. }) }
+    fn emit_column(&self) -> Option<(&str, &[usize], &str)> {
+        if let Self::EmitColumn { action, path, column } = self { Some((action, path, column)) } else { None }
+    }
+    fn is_projection(&self) -> bool { matches!(self, Self::ViewColumn { .. } | Self::EmitColumn { .. }) }
+}
+impl DestinationAccess for super::fallible_scalar_decode::EffectDestinationDto {
+    fn action_path(&self) -> Option<(&str, &[usize])> {
+        use super::fallible_scalar_decode::EffectDestinationDto as D;
+        match self {
+            D::Update { action, path, .. } | D::CreateValue { action, path, .. }
+            | D::EmitColumn { action, path, .. } | D::EmitItems { action, path } => Some((action, path)),
+            _ => None,
+        }
+    }
+    fn view_id(&self) -> Option<&str> {
+        if let Self::ViewColumn { view, .. } = self { Some(view) } else { None }
+    }
+    fn is_emit_items(&self) -> bool { matches!(self, Self::EmitItems { .. }) }
+    fn update_field(&self) -> Option<&str> {
+        match self { Self::Update { field, .. } | Self::CreateValue { field, .. } => Some(field), _ => None }
+    }
+    fn is_update(&self) -> bool { matches!(self, Self::Update { .. }) }
+    fn emit_column(&self) -> Option<(&str, &[usize], &str)> {
+        if let Self::EmitColumn { action, path, column } = self { Some((action, path, column)) } else { None }
+    }
+    fn is_projection(&self) -> bool { matches!(self, Self::ViewColumn { .. } | Self::EmitColumn { .. }) }
+}
+trait PatchView {
+    type Destination: DestinationAccess;
+    fn entity(&self) -> &str;
+    fn destination(&self) -> &Self::Destination;
+}
+impl PatchView for EffectPatchRequest {
+    type Destination = EffectDestination;
+    fn entity(&self) -> &str { &self.entity }
+    fn destination(&self) -> &Self::Destination { &self.destination }
+}
+impl PatchView for super::EffectPatchRequestDto {
+    type Destination = super::EffectDestinationDto;
+    fn entity(&self) -> &str { &self.entity }
+    fn destination(&self) -> &Self::Destination { &self.destination }
+}
+fn locate_context(
+    app: &AppDefinition,
+    request: &EffectPatchRequest,
+) -> Result<BTreeMap<Id, Type>> {
+    let app = crate::product_contract::AppRef::from(app);
+    locate_context_core(
+        app,
+        request.destination.action_path(),
+        request.destination.is_emit_items(),
+        request.entity.as_str(),
+        request.subject.as_str(),
+        request.destination.view_id(),
+        None,
+    ).map(CompilerEnvironment::into_legacy)
+        .map_err(|failure| match failure { CompilerFailure::Store(error) => error, CompilerFailure::Allocation(_) => unreachable!("legacy environment cannot allocate fallibly") })
+}
+
+pub(super) fn locate_context_fallible(
+    app: &crate::product_contract::fallible_app_decode::DecodedAppDefinition,
+    request: &super::fallible_scalar_decode::EffectPatchRequestDto,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<CompilerEnvironment, CompilerFailure> {
+    let app = crate::product_contract::AppRef::from(app);
+    locate_context_core(
+        app,
+        request.destination.action_path(),
+        request.destination.is_emit_items(),
+        request.entity.as_str(),
+        request.subject.as_str(),
+        request.destination.view_id(),
+        Some(cx),
+    )
+}
+
+pub(super) fn rebind_fallible(
+    expr: &Expr,
+    from: &str,
+    to: &str,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<Expr, CompilerFailure> {
+    clone_expr_with_rebind(expr, Some((from, to)), cx)
+}
+
+fn clone_expr_fallible(
+    value: &Expr,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<Expr, CompilerFailure> {
+    clone_expr_with_rebind(value, None, cx)
+}
+
+fn clone_expr_with_rebind(
+    expr: &Expr,
+    rename: Option<(&str, &str)>,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<Expr, CompilerFailure> {
+    fn copy(
+        expr: &Expr,
+        rename: Option<(&str, &str)>,
+        depth: usize,
+        nodes: &mut usize,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Expr, CompilerFailure> {
+        use crate::product_alloc::{try_box, try_copy_str, try_push, try_reserve, AllocationSite};
+        *nodes = nodes.checked_add(1).ok_or_else(|| error("expression copy invariant"))?;
+        if depth > crate::product_contract::MAX_EXPR_DEPTH || *nodes > crate::product_contract::MAX_AST_NODES {
+            return Err(error("expression copy invariant").into());
+        }
+        let string = |value: &str, cx: &mut crate::product_alloc::AllocationContext| {
+            try_copy_str(value, cx, AllocationSite::String).map_err(CompilerFailure::Allocation)
         };
-        if entity != &request.entity || request.subject != "row" {
-            return Err(error("view subject is not its own row"));
-        }
-        return Ok(BTreeMap::from([("row".into(), Type::reference(entity))]));
+        let child = |value: &Expr, nodes: &mut usize, cx: &mut crate::product_alloc::AllocationContext| {
+            let value = copy(value, rename, depth + 1, nodes, cx)?;
+            try_box(value, cx).map_err(CompilerFailure::Allocation)
+        };
+        use Expr::*;
+        Ok(match expr {
+            Literal { value_type, value } => Literal {
+                value_type: crate::product_contract::try_clone_type_with(value_type, cx)
+                    .map_err(CompilerFailure::Allocation)?,
+                value: crate::product_contract::try_clone_data_value_with(value, cx)
+                    .map_err(CompilerFailure::Allocation)?,
+            },
+            Variable { name } => {
+                let name = match rename {
+                    Some((from, to)) if name == from => string(to, cx)?,
+                    _ => string(name, cx)?,
+                };
+                Variable { name }
+            }
+            Field { record, field } => Field {
+                record: child(record, nodes, cx)?,
+                field: string(field, cx)?,
+            },
+            State { state } => State { state: string(state, cx)? },
+            Today => Today,
+            Query { entity, binding, predicate, sort, limit, include_archived } => {
+                let predicate = child(predicate, nodes, cx)?;
+                let mut copied = Vec::new();
+                try_reserve(&mut copied, sort.len(), cx, AllocationSite::Vector).map_err(CompilerFailure::Allocation)?;
+                for key in sort {
+                    let value = copy(&key.value, rename, depth + 1, nodes, cx)?;
+                    let key = crate::product_contract::SortKey { value, descending: key.descending };
+                    try_push(&mut copied, key, cx, AllocationSite::Vector).map_err(CompilerFailure::Allocation)?;
+                }
+                Query { entity: string(entity, cx)?, binding: string(binding, cx)?, predicate, sort: copied, limit: *limit, include_archived: *include_archived }
+            }
+            Filter { items, binding, predicate } => Filter {
+                items: child(items, nodes, cx)?, binding: string(binding, cx)?, predicate: child(predicate, nodes, cx)?,
+            },
+            Map { items, binding, value } => Map {
+                items: child(items, nodes, cx)?, binding: string(binding, cx)?, value: child(value, nodes, cx)?,
+            },
+            Count { items } => Count { items: child(items, nodes, cx)? },
+            Any { items, binding, predicate } => Any {
+                items: child(items, nodes, cx)?, binding: string(binding, cx)?, predicate: child(predicate, nodes, cx)?,
+            },
+            All { items, binding, predicate } => All {
+                items: child(items, nodes, cx)?, binding: string(binding, cx)?, predicate: child(predicate, nodes, cx)?,
+            },
+            Sum { items } => Sum { items: child(items, nodes, cx)? },
+            Contains { items, value } => Contains { items: child(items, nodes, cx)?, value: child(value, nodes, cx)? },
+            Equal { left, right } => Equal { left: child(left, nodes, cx)?, right: child(right, nodes, cx)? },
+            Less { left, right } => Less { left: child(left, nodes, cx)?, right: child(right, nodes, cx)? },
+            Add { left, right } => Add { left: child(left, nodes, cx)?, right: child(right, nodes, cx)? },
+            Subtract { left, right } => Subtract { left: child(left, nodes, cx)?, right: child(right, nodes, cx)? },
+            Concat { left, right } => Concat { left: child(left, nodes, cx)?, right: child(right, nodes, cx)? },
+            TextContains { text, search } => TextContains { text: child(text, nodes, cx)?, search: child(search, nodes, cx)? },
+            Lower { value } => Lower { value: child(value, nodes, cx)? },
+            And { values } | Or { values } => {
+                let mut copied = Vec::new();
+                try_reserve(&mut copied, values.len(), cx, AllocationSite::Vector).map_err(CompilerFailure::Allocation)?;
+                for value in values {
+                    try_push(&mut copied, copy(value, rename, depth + 1, nodes, cx)?, cx, AllocationSite::Vector)
+                        .map_err(CompilerFailure::Allocation)?;
+                }
+                if matches!(expr, And { .. }) { And { values: copied } } else { Or { values: copied } }
+            }
+            Not { value } => Not { value: child(value, nodes, cx)? },
+            If { condition, then_value, else_value } => If {
+                condition: child(condition, nodes, cx)?, then_value: child(then_value, nodes, cx)?, else_value: child(else_value, nodes, cx)?,
+            },
+            Coalesce { value, fallback } => Coalesce { value: child(value, nodes, cx)?, fallback: child(fallback, nodes, cx)? },
+            DateAdd { date, days } => DateAdd { date: child(date, nodes, cx)?, days: child(days, nodes, cx)? },
+            DateDifference { later, earlier } => DateDifference { later: child(later, nodes, cx)?, earlier: child(earlier, nodes, cx)? },
+        })
     }
-    if matches!(request.destination, EffectDestination::Observable { .. }) {
-        return Ok(BTreeMap::new());
-    }
-    let (id, path) = match &request.destination {
-        EffectDestination::Update { action, path, .. }
-        | EffectDestination::CreateValue { action, path, .. }
-        | EffectDestination::EmitColumn { action, path, .. }
-        | EffectDestination::EmitItems { action, path } => (action, path),
-        _ => unreachable!(),
+    let mut nodes = 0;
+    copy(expr, rename, 0, &mut nodes, cx)
+}
+
+fn clone_request_fallible(
+    value: &super::EffectPatchRequestDto,
+    cx: &mut crate::product_alloc::AllocationContext,
+ ) -> std::result::Result<super::EffectPatchRequestDto, CompilerFailure> {
+    Ok(super::EffectPatchRequestDto {
+        destination: clone_destination_fallible(&value.destination, cx)?,
+        entity: crate::product_alloc::try_copy_str(&value.entity, cx, crate::product_alloc::AllocationSite::String)
+            .map_err(CompilerFailure::Allocation)?,
+        subject: crate::product_alloc::try_copy_str(&value.subject, cx, crate::product_alloc::AllocationSite::String)
+            .map_err(CompilerFailure::Allocation)?,
+        value_type: crate::product_contract::try_clone_type_with(&value.value_type, cx)
+            .map_err(CompilerFailure::Allocation)?,
+    })
+}
+
+fn clone_destination_fallible(
+    value: &super::EffectDestinationDto,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<super::EffectDestinationDto, CompilerFailure> {
+    use super::EffectDestinationDto as D;
+    use crate::product_alloc::{try_copy_str, try_push, try_reserve, AllocationSite};
+    let string = |value: &str, cx: &mut crate::product_alloc::AllocationContext| {
+        try_copy_str(value, cx, AllocationSite::String).map_err(CompilerFailure::Allocation)
     };
-    let a = app
-        .actions
-        .iter()
-        .find(|a| &a.id == id)
-        .ok_or_else(|| error("action missing"))?;
-    let mut env = a.parameters.clone();
-    let mut steps = &a.steps;
-    for (depth, index) in path.iter().enumerate() {
-        // Earlier Create bindings are genuine local references, never guessed.
-        for previous in steps.iter().take(*index) {
-            if let Statement::Create { entity, bind, .. } = previous {
-                env.insert(bind.clone(), Type::reference(entity));
-            }
+    let path = |value: &[usize], cx: &mut crate::product_alloc::AllocationContext|
+        -> std::result::Result<Vec<usize>, CompilerFailure> {
+        let mut copied = Vec::new();
+        try_reserve(&mut copied, value.len(), cx, AllocationSite::Vector).map_err(CompilerFailure::Allocation)?;
+        for index in value {
+            try_push(&mut copied, *index, cx, AllocationSite::Vector).map_err(CompilerFailure::Allocation)?;
         }
-        let s = steps
-            .get(*index)
-            .ok_or_else(|| error("statement missing"))?;
-        if depth + 1 < path.len() {
-            if let Statement::ForEach {
-                items,
-                binding,
-                steps: inner,
-            } = s
-            {
-                let entity = list_entity(items, app, &env)
-                    .ok_or_else(|| error("loop subject cannot be proven"))?;
-                env.insert(binding.clone(), Type::reference(entity));
-                steps = inner;
-                continue;
-            } else {
-                return Err(error("invalid nested effect path"));
-            }
+        Ok(copied)
+    };
+    Ok(match value {
+        D::Update { action, path: indices, field } => D::Update { action: string(action, cx)?, path: path(indices, cx)?, field: string(field, cx)? },
+        D::CreateValue { action, path: indices, field } => D::CreateValue { action: string(action, cx)?, path: path(indices, cx)?, field: string(field, cx)? },
+        D::EmitColumn { action, path: indices, column } => D::EmitColumn { action: string(action, cx)?, path: path(indices, cx)?, column: string(column, cx)? },
+        D::ViewColumn { view, column } => D::ViewColumn { view: string(view, cx)?, column: string(column, cx)? },
+        D::EmitItems { action, path: indices } => D::EmitItems { action: string(action, cx)?, path: path(indices, cx)? },
+        D::Observable { observable } => D::Observable { observable: string(observable, cx)? },
+    })
+}
+
+fn clone_effect_patch_fallible(
+    value: &super::DecodedEffectPatch,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<super::DecodedEffectPatch, CompilerFailure> {
+    Ok(super::DecodedEffectPatch {
+        request: clone_request_fallible(&value.request, cx)?,
+        before: clone_expr_fallible(&value.before, cx)?,
+        after: clone_expr_fallible(&value.after, cx)?,
+    })
+}
+
+pub(super) fn effective_patch_fallible(
+    snapshot: &crate::product_store::fallible_project_snapshot_decode::DecodedProjectSnapshot,
+    manifest: &super::DecodedCompositionManifest,
+    id: &crate::product_contract::Digest,
+    index: usize,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<super::DecodedEffectPatch, CompilerFailure> {
+    use super::DecodedEffectPatch;
+    let scope = snapshot.scalar_scope().ok_or_else(|| error("owned family cannot enter scalar scope authority"))?;
+    let original = scope.layer(id).and_then(|layer| layer.patches().get(index))
+        .ok_or_else(|| error("mapped layer patch absent"))?;
+    let mut patch = clone_effect_patch_fallible(original, cx)?;
+    if let Some(mapping) = manifest.rewrite_for(id, index) {
+        let source = snapshot.captured_program_by_revision_with(mapping.to_source(), cx)
+            .map_err(|validation_error| match validation_error {
+                crate::product_contract::AppValidationError::Allocation(failure) => CompilerFailure::Allocation(failure),
+                _ => CompilerFailure::Store(error("mapped source program is invalid")),
+            })?
+            .ok_or_else(|| error("mapped source program absent"))?;
+        if std::mem::discriminant(mapping.to()) != std::mem::discriminant(&original.request().destination) {
+            return Err(error("mapping changes the kind of a protected result").into());
         }
-        match s {
-            Statement::Update { record, .. } => {
-                if record != &variable(&request.subject)
-                    || env.get(&request.subject) != Some(&Type::reference(&request.entity))
-                {
-                    return Err(error("update writes a different subject"));
-                }
-            }
-            Statement::Create { entity, .. } => {
-                if entity != &request.entity {
-                    return Err(error("create entity mismatch"));
-                }
-            }
-            Statement::Emit { items, binding, .. } => {
-                if !matches!(request.destination, EffectDestination::EmitItems { .. })
-                    && (binding != &request.subject
-                        || list_entity(items, app, &env).as_ref() != Some(&request.entity))
-                {
-                    return Err(error("output subject cannot be proven"));
-                }
-                env.insert(binding.clone(), Type::reference(&request.entity));
-            }
-            _ => return Err(error("unsupported effect statement")),
+        let from = patch.request.subject.as_str();
+        let before = rebind_fallible(patch.before(), &from, mapping.subject(), cx)?;
+        let destination = clone_destination_fallible(mapping.to(), cx)?;
+        let subject = crate::product_alloc::try_copy_str(mapping.subject(), cx, crate::product_alloc::AllocationSite::String)
+            .map_err(CompilerFailure::Allocation)?;
+        patch.request.destination = destination;
+        patch.request.subject = subject;
+        let after = clone_expr_fallible(slot_fallible_ref(source.app(), &patch.request.destination)?, cx)?;
+        patch.before = before;
+        patch.after = after;
+        let env = locate_context_fallible(source.app(), &patch.request, cx)?;
+        if !matches!(patch.request.destination, super::EffectDestinationDto::EmitItems { .. } | super::EffectDestinationDto::Observable { .. }) {
+            own_row(&patch.after, &patch.request.subject, &patch.request.entity, crate::product_contract::AppRef::from(source.app()), &env, true)?;
         }
     }
+    Ok(patch)
+}
+
+pub(super) fn business_program_fallible(
+    snapshot: &crate::product_store::fallible_project_snapshot_decode::DecodedProjectSnapshot,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<crate::product_contract::fallible_app_decode::DecodedAppDefinition, CompilerFailure> {
+    let scope = snapshot.scalar_scope().ok_or_else(|| error("owned family cannot enter scalar scope authority"))?;
+    if let Some(manifest) = scope.composition(snapshot.active_revision()) {
+        let business = snapshot.captured_program_by_revision_with(manifest.business(), cx)
+            .map_err(|validation_error| match validation_error {
+                crate::product_contract::AppValidationError::Allocation(failure) => CompilerFailure::Allocation(failure),
+                _ => CompilerFailure::Store(error("business source program is invalid")),
+            })?
+            .ok_or_else(|| error("business source program absent"))?;
+        let mut app = business.app().try_clone_with(cx).map_err(|validation_error| match validation_error {
+            crate::product_contract::AppValidationError::Allocation(failure) => CompilerFailure::Allocation(failure),
+            _ => CompilerFailure::Store(error("business app copy invariant")),
+        })?;
+        let mut seen = crate::product_alloc::ordered::OrderedSet::new();
+        for id in manifest.layers() {
+            let layer = scope.layer(id).ok_or_else(|| error("missing layer"))?;
+            for index in 0..layer.patches().len() {
+                let patch = effective_patch_fallible(snapshot, manifest, id, index, cx)?;
+                let destination_key = crate::product_backup::fallible_codec::canonical_bytes(&patch.request.destination, cx)
+                    .map_err(|codec_error| match codec_error {
+                        crate::product_backup::fallible_codec::CodecError::Allocation(failure) => CompilerFailure::Allocation(failure),
+                        _ => CompilerFailure::Store(error("destination identity invariant")),
+                    })?;
+                let first = seen.try_insert(destination_key, cx).map_err(CompilerFailure::Allocation)?;
+                if first {
+                    let before = clone_expr_fallible(&patch.before, cx)?;
+                    *slot_fallible(&mut app, &patch.request.destination)? = before;
+                }
+                if manifest.active_contains(id) {
+                    let after = clone_expr_fallible(&patch.after, cx)?;
+                    *slot_fallible(&mut app, &patch.request.destination)? = after;
+                }
+            }
+        }
+        Ok(app)
+    } else {
+        let active = snapshot.captured_program_by_revision_with(snapshot.active_revision(), cx)
+            .map_err(|validation_error| match validation_error {
+                crate::product_contract::AppValidationError::Allocation(failure) => CompilerFailure::Allocation(failure),
+                _ => CompilerFailure::Store(error("active source program is invalid")),
+            })?
+            .ok_or_else(|| error("active program revision missing"))?;
+        active.app().try_clone_with(cx).map_err(|validation_error| match validation_error {
+            crate::product_contract::AppValidationError::Allocation(failure) => CompilerFailure::Allocation(failure),
+            _ => CompilerFailure::Store(error("active app copy invariant")),
+        })
+    }
+}
+
+fn locate_context_core(
+    app: crate::product_contract::AppRef<'_>,
+    action_path: Option<(&str, &[usize])>,
+    is_emit_items: bool,
+    requested_entity: &str,
+    subject: &str,
+    view_id: Option<&str>,
+    mut cx: Option<&mut crate::product_alloc::AllocationContext>,
+) -> std::result::Result<CompilerEnvironment, CompilerFailure> {
+    if let Some(view) = view_id {
+        let view_entity = app.view_entity(view).ok_or_else(|| error("view missing"))?
+            .ok_or_else(|| error("form projection"))?;
+        if view_entity != requested_entity || subject != "row" {
+            return Err(error("view subject is not its own row").into());
+        }
+        let mut env = CompilerEnvironment::new(app.is_fallible());
+        env.insert_reference("row", view_entity, cx.as_deref_mut())?;
+        return Ok(env);
+    }
+    let Some((id, path)) = action_path else {
+        return Ok(CompilerEnvironment::new(app.is_fallible()));
+    };
+    let a = app.action(id).ok_or_else(|| error("action missing"))?;
+    let mut env = CompilerEnvironment::from_parameters(a.parameters(), app.is_fallible(), cx.as_deref_mut())?;
+    locate_context_path(app, &mut env, a.steps(), path, is_emit_items, requested_entity, subject, cx.as_deref_mut())?;
     Ok(env)
 }
+
+fn locate_context_path(
+    app: crate::product_contract::AppRef<'_>,
+    env: &mut CompilerEnvironment,
+    steps: crate::product_contract::StatementSlice<'_>,
+    path: &[usize],
+    is_emit_items: bool,
+    requested_entity: &str,
+    subject: &str,
+    mut cx: Option<&mut crate::product_alloc::AllocationContext>,
+) -> std::result::Result<(), CompilerFailure> {
+    let Some((&index, rest)) = path.split_first() else {
+        return Err(error("invalid statement path").into());
+    };
+    // Earlier Create bindings are genuine local references, never guessed.
+    for previous_index in 0..index.min(steps.len()) {
+        if let Some(crate::product_contract::StatementView::Create { entity, bind, .. }) = steps.get(previous_index) {
+            env.insert_reference(bind, entity, cx.as_deref_mut())?;
+        }
+    }
+    let statement = steps.get(index).ok_or_else(|| error("statement missing"))?;
+    if !rest.is_empty() {
+        if let crate::product_contract::StatementView::ForEach { items, binding, steps: inner } = statement {
+            let loop_entity = list_entity(items, app, env).ok_or_else(|| error("loop subject cannot be proven"))?;
+            let loop_entity = if let Some(cx) = cx.as_deref_mut() {
+                crate::product_alloc::try_copy_str(loop_entity, cx, crate::product_alloc::AllocationSite::String)
+                    .map_err(CompilerFailure::Allocation)?
+            } else { loop_entity.to_owned() };
+            env.insert_reference_owned(binding, loop_entity, cx.as_deref_mut())?;
+            return locate_context_path(app, env, inner, rest, is_emit_items, requested_entity, subject, cx.as_deref_mut());
+        }
+        return Err(error("invalid nested effect path").into());
+    }
+    match statement {
+        crate::product_contract::StatementView::Update { record, .. } => {
+            if record != &variable(subject)
+                || !env.get(subject).is_some_and(|typ| {
+                    matches!(typ, Type::Reference { entity } if entity == requested_entity)
+                })
+            {
+                return Err(error("update writes a different subject").into());
+            }
+        }
+        crate::product_contract::StatementView::Create { entity, .. } => {
+            if entity != requested_entity {
+                return Err(error("create entity mismatch").into());
+            }
+        }
+        crate::product_contract::StatementView::Emit { items, binding, .. } => {
+            if !is_emit_items
+                && (binding != subject || list_entity(items, app, env) != Some(requested_entity))
+            {
+                return Err(error("output subject cannot be proven").into());
+            }
+            env.insert_reference(binding, requested_entity, cx.as_deref_mut())?;
+        }
+        _ => return Err(error("unsupported effect statement").into()),
+    }
+    Ok(())
+}
 /// Check reads structurally, before any host instrumentation exists.
-pub(super) fn own_row(
+pub(super) fn own_row<'a, A, M>(
     expr: &Expr,
     subject: &str,
     entity: &str,
-    app: &AppDefinition,
-    env: &BTreeMap<Id, Type>,
+    app: A,
+    env: &M,
     allow_day: bool,
-) -> Result<()> {
+) -> Result<()>
+where
+    A: Into<crate::product_contract::AppRef<'a>> + Copy,
+    M: StringValueMap<Type>,
+{
+    let app: crate::product_contract::AppRef<'a> = app.into();
     match expr {
         Expr::Literal { value_type, .. } => {
             if !matches!(
@@ -300,13 +914,9 @@ pub(super) fn own_row(
             if record.as_ref() != &variable(subject) || field.starts_with(RESERVED_PREFIX) {
                 return Err(error("foreign or protected field read"));
             }
-            let typ = &app
-                .entities
-                .iter()
-                .find(|e| e.id == entity)
-                .and_then(|e| e.fields.iter().find(|f| &f.id == field))
-                .ok_or_else(|| error("unknown subject field"))?
-                .value_type;
+            let typ = app
+                .entity_field_type(entity, field)
+                .ok_or_else(|| error("unknown subject field"))?;
             if matches!(typ, Type::Reference { .. } | Type::List { .. }) {
                 return Err(error("cross-record or collection field read"));
             }
@@ -437,319 +1047,351 @@ fn normalize_labels(app: &mut AppDefinition) {
     }
 }
 
-fn mentions(expr: &serde_json::Value, field: &str) -> bool {
-    match expr {
-        serde_json::Value::Object(m) => {
-            m.get("kind").and_then(|v| v.as_str()) == Some("field")
-                && m.get("field").and_then(|v| v.as_str()) == Some(field)
-                || m.values().any(|v| mentions(v, field))
-        }
-        serde_json::Value::Array(a) => a.iter().any(|v| mentions(v, field)),
-        _ => false,
-    }
+fn check_dependencies(app: &AppDefinition, entity_id: &str, changed: &str) -> Result<()> {
+    check_dependencies_core(crate::product_contract::AppRef::from(app), entity_id, changed)
+        .map_err(|failure| match failure {
+            CompilerFailure::Store(error) => error,
+            CompilerFailure::Allocation(_) => unreachable!("borrowed dependency inspection does not allocate"),
+        })
 }
-fn dangerous_dependency(value: &serde_json::Value, field: &str) -> bool {
-    match value {
-        serde_json::Value::Object(m) => {
-            if m.get("kind").and_then(|v| v.as_str()) == Some("field")
-                && m.get("field").and_then(|v| v.as_str()) == Some(field)
-                && m.get("record")
-                    .and_then(|v| v.get("kind"))
-                    .and_then(|v| v.as_str())
-                    != Some("variable")
-            {
-                return true;
-            }
-            let kind = m.get("kind").and_then(|v| v.as_str());
-            if matches!(
-                kind,
-                Some(
-                    "query"
-                        | "filter"
-                        | "map"
-                        | "any"
-                        | "all"
-                        | "contains"
-                        | "set_state"
-                        | "collection"
-                )
-            ) && mentions(value, field)
-            {
-                return true;
-            }
-            m.values().any(|v| dangerous_dependency(v, field))
+fn expr_mentions_field(expr: &Expr, field: &str) -> bool {
+    use Expr::*;
+    match expr {
+        Field { record, field: current } => current == field || expr_mentions_field(record, field),
+        Query { predicate, sort, .. } => expr_mentions_field(predicate, field)
+            || sort.iter().any(|key| expr_mentions_field(&key.value, field)),
+        Filter { items, predicate, .. } | Any { items, predicate, .. } | All { items, predicate, .. } => {
+            expr_mentions_field(items, field) || expr_mentions_field(predicate, field)
         }
-        serde_json::Value::Array(a) => a.iter().any(|v| dangerous_dependency(v, field)),
-        _ => false,
+        Map { items, value, .. } => expr_mentions_field(items, field) || expr_mentions_field(value, field),
+        Count { items } | Sum { items } | Lower { value: items } | Not { value: items } => expr_mentions_field(items, field),
+        Contains { items, value } | Equal { left: items, right: value } | Less { left: items, right: value }
+        | Add { left: items, right: value } | Subtract { left: items, right: value } | Concat { left: items, right: value }
+        | TextContains { text: items, search: value } | Coalesce { value: items, fallback: value } => {
+            expr_mentions_field(items, field) || expr_mentions_field(value, field)
+        }
+        And { values } | Or { values } => values.iter().any(|value| expr_mentions_field(value, field)),
+        If { condition, then_value, else_value } => expr_mentions_field(condition, field)
+            || expr_mentions_field(then_value, field) || expr_mentions_field(else_value, field),
+        DateAdd { date, days } => expr_mentions_field(date, field) || expr_mentions_field(days, field),
+        DateDifference { later, earlier } => expr_mentions_field(later, field) || expr_mentions_field(earlier, field),
+        Literal { .. } | Variable { .. } | State { .. } | Today => false,
     }
 }
 
-fn foreign_read(value: &Expr, changed: &str, subject: Option<&str>) -> bool {
-    fn visit(v: &serde_json::Value, changed: &str, subject: Option<&str>) -> bool {
-        match v {
-            serde_json::Value::Object(m) => {
-                if m.get("kind").and_then(|v| v.as_str()) == Some("field")
-                    && m.get("field").and_then(|v| v.as_str()) == Some(changed)
-                {
-                    let record = m.get("record");
-                    if record.and_then(|v| v.get("kind")).and_then(|v| v.as_str())
-                        != Some("variable")
-                        || record.and_then(|v| v.get("name")).and_then(|v| v.as_str()) != subject
-                    {
-                        return true;
-                    }
-                }
-                m.values().any(|v| visit(v, changed, subject))
-            }
-            serde_json::Value::Array(a) => a.iter().any(|v| visit(v, changed, subject)),
-            _ => false,
+fn expr_foreign_read(expr: &Expr, changed: &str, subject: Option<&str>) -> bool {
+    use Expr::*;
+    match expr {
+        Field { record, field } => {
+            (field == changed && !matches!(&**record, Variable { name } if Some(name.as_str()) == subject))
+                || expr_foreign_read(record, changed, subject)
         }
+        Query { predicate, sort, .. } => expr_foreign_read(predicate, changed, subject)
+            || sort.iter().any(|key| expr_foreign_read(&key.value, changed, subject)),
+        Filter { items, predicate, .. } | Any { items, predicate, .. } | All { items, predicate, .. } => {
+            expr_foreign_read(items, changed, subject) || expr_foreign_read(predicate, changed, subject)
+        }
+        Map { items, value, .. } => expr_foreign_read(items, changed, subject) || expr_foreign_read(value, changed, subject),
+        Count { items } | Sum { items } | Lower { value: items } | Not { value: items } => expr_foreign_read(items, changed, subject),
+        Contains { items, value } | Equal { left: items, right: value } | Less { left: items, right: value }
+        | Add { left: items, right: value } | Subtract { left: items, right: value } | Concat { left: items, right: value }
+        | TextContains { text: items, search: value } | Coalesce { value: items, fallback: value } => {
+            expr_foreign_read(items, changed, subject) || expr_foreign_read(value, changed, subject)
+        }
+        And { values } | Or { values } => values.iter().any(|value| expr_foreign_read(value, changed, subject)),
+        If { condition, then_value, else_value } => expr_foreign_read(condition, changed, subject)
+            || expr_foreign_read(then_value, changed, subject) || expr_foreign_read(else_value, changed, subject),
+        DateAdd { date, days } => expr_foreign_read(date, changed, subject) || expr_foreign_read(days, changed, subject),
+        DateDifference { later, earlier } => expr_foreign_read(later, changed, subject) || expr_foreign_read(earlier, changed, subject),
+        Literal { .. } | Variable { .. } | State { .. } | Today => false,
     }
-    visit(
-        &serde_json::to_value(value).expect("typed expression"),
-        changed,
-        subject,
-    )
 }
-fn sink_dependencies(steps: &[Statement], changed: &str) -> bool {
-    for step in steps {
-        match step {
-            Statement::Update { record, values } => {
-                if foreign_read(record, changed, None) {
-                    return true;
-                }
-                let subject = match record {
-                    Expr::Variable { name } => Some(name.as_str()),
-                    _ => None,
+
+fn expr_dangerous_dependency(expr: &Expr, field: &str) -> bool {
+    use Expr::*;
+    match expr {
+        Field { record, field: current } => {
+            (current == field && !matches!(&**record, Variable { .. })) || expr_dangerous_dependency(record, field)
+        }
+        Query { .. } | Filter { .. } | Map { .. } | Any { .. } | All { .. } | Contains { .. }
+            if expr_mentions_field(expr, field) => true,
+        Query { predicate, sort, .. } => expr_dangerous_dependency(predicate, field)
+            || sort.iter().any(|key| expr_dangerous_dependency(&key.value, field)),
+        Filter { items, predicate, .. } | Any { items, predicate, .. } | All { items, predicate, .. } => {
+            expr_dangerous_dependency(items, field) || expr_dangerous_dependency(predicate, field)
+        }
+        Map { items, value, .. } => expr_dangerous_dependency(items, field) || expr_dangerous_dependency(value, field),
+        Count { items } | Sum { items } | Lower { value: items } | Not { value: items } => expr_dangerous_dependency(items, field),
+        Contains { items, value } | Equal { left: items, right: value } | Less { left: items, right: value }
+        | Add { left: items, right: value } | Subtract { left: items, right: value } | Concat { left: items, right: value }
+        | TextContains { text: items, search: value } | Coalesce { value: items, fallback: value } => {
+            expr_dangerous_dependency(items, field) || expr_dangerous_dependency(value, field)
+        }
+        And { values } | Or { values } => values.iter().any(|value| expr_dangerous_dependency(value, field)),
+        If { condition, then_value, else_value } => expr_dangerous_dependency(condition, field)
+            || expr_dangerous_dependency(then_value, field) || expr_dangerous_dependency(else_value, field),
+        DateAdd { date, days } => expr_dangerous_dependency(date, field) || expr_dangerous_dependency(days, field),
+        DateDifference { later, earlier } => expr_dangerous_dependency(later, field) || expr_dangerous_dependency(earlier, field),
+        Literal { .. } | Variable { .. } | State { .. } | Today => false,
+    }
+}
+
+fn statement_dangerous_dependency(steps: crate::product_contract::StatementSlice<'_>, field: &str) -> bool {
+    use crate::product_contract::StatementView as S;
+    for index in 0..steps.len() {
+        match steps.get(index).expect("bounded statement index") {
+            S::SetState { value, .. } if expr_mentions_field(value, field) => return true,
+            S::Collection { target, items } => {
+                let target_dep = match target {
+                    CollectionTarget::Field { record, field: target_field } => target_field == field || expr_mentions_field(record, field),
+                    CollectionTarget::State { .. } => false,
                 };
-                // A durable alias can later cross a row boundary through a
-                // different field name. Keep this bounded compiler sound by
-                // rejecting propagation into any other stored field.
-                if values.iter().any(|(field, value)| {
-                    foreign_read(value, changed, subject)
-                        || (field != changed
-                            && mentions(
-                                &serde_json::to_value(value).expect("typed expression"),
-                                changed,
-                            ))
-                }) {
-                    return true;
-                }
+                if target_dep || expr_mentions_field(items, field) { return true; }
             }
-            Statement::Create { values, .. } => {
-                if values.values().any(|v| foreign_read(v, changed, None)) {
-                    return true;
-                }
-            }
-            Statement::SetState { value, .. } => {
-                if foreign_read(value, changed, None) {
-                    return true;
-                }
-            }
-            Statement::Assert { condition, .. } => {
-                if foreign_read(condition, changed, None) {
-                    return true;
-                }
-            }
-            Statement::Archive { record } => {
-                if foreign_read(record, changed, None) {
-                    return true;
-                }
-            }
-            Statement::ForEach { items, steps, .. } => {
-                if foreign_read(items, changed, None) || sink_dependencies(steps, changed) {
-                    return true;
-                }
-            }
-            Statement::Emit {
-                items,
-                binding,
-                columns,
-                ..
-            } => {
-                if foreign_read(items, changed, None) {
-                    return true;
-                }
-                if columns
-                    .values()
-                    .any(|v| foreign_read(v, changed, Some(binding)))
-                {
-                    return true;
-                }
-            }
+            S::ForEach { steps, .. } if statement_dangerous_dependency(steps, field) => return true,
             _ => {}
         }
     }
     false
 }
-fn check_dependencies(app: &AppDefinition, entity_id: &str, changed: &str) -> Result<()> {
-    let entity = app
-        .entities
-        .iter()
-        .find(|e| e.id == entity_id)
+
+fn sink_dependencies(steps: crate::product_contract::StatementSlice<'_>, changed: &str) -> bool {
+    use crate::product_contract::StatementView as S;
+    for index in 0..steps.len() {
+        match steps.get(index).expect("bounded statement index") {
+            S::Update { record, values } => {
+                if expr_foreign_read(record, changed, None) { return true; }
+                let subject = match record { Expr::Variable { name } => Some(name.as_str()), _ => None };
+                if values.iter().any(|(field, value)| expr_foreign_read(value, changed, subject)
+                    || (field != changed && expr_mentions_field(value, changed))) { return true; }
+            }
+            S::Create { values, .. } if values.iter().any(|(_, value)| expr_foreign_read(value, changed, None)) => return true,
+            S::SetState { value, .. } | S::Assert { condition: value, .. } | S::Archive { record: value }
+                if expr_foreign_read(value, changed, None) => return true,
+            S::ForEach { items, steps, .. } if expr_foreign_read(items, changed, None) || sink_dependencies(steps, changed) => return true,
+            S::Emit { items, binding, columns, .. } if expr_foreign_read(items, changed, None)
+                || columns.iter().any(|(_, value)| expr_foreign_read(value, changed, Some(binding))) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn check_dependencies_fallible(
+    app: &crate::product_contract::fallible_app_decode::DecodedAppDefinition,
+    entity_id: &str,
+    changed: &str,
+) -> std::result::Result<(), CompilerFailure> {
+    check_dependencies_core(crate::product_contract::AppRef::from(app), entity_id, changed)
+}
+fn check_dependencies_core(
+    app: crate::product_contract::AppRef<'_>,
+    entity_id: &str,
+    changed: &str,
+) -> std::result::Result<(), CompilerFailure> {
+    let entity = app.entities().iter().find(|entity| entity.id == entity_id)
         .ok_or_else(|| error("effect entity absent"))?;
-    if entity.unique.iter().flatten().any(|f| f == changed)
-        || entity
-            .constraints
-            .iter()
-            .any(|e| mentions(&serde_json::to_value(e).expect("typed expression"), changed))
-        || dangerous_dependency(&serde_json::to_value(app)?, changed)
-        || app.views.iter().any(|view| {
-            view.actions.iter().any(|binding| {
-                foreign_read(&binding.enabled, changed, None)
-                    || binding
-                        .arguments
-                        .values()
-                        .any(|value| foreign_read(value, changed, None))
-            })
-        })
-        || app.actions.iter().any(|a| {
-            sink_dependencies(&a.steps, changed)
-                || a.guards
-                    .iter()
-                    .chain(&a.ensures)
-                    .any(|e| foreign_read(e, changed, None))
-        })
-    {
-        return Err(error("changed durable value influences another stored field, a foreign-row write, shared selection, state, constraint or uniqueness rule"));
+    let unique_dep = entity.unique.iter().flatten().any(|field| field == changed);
+    let constraint_dep = entity.constraints.iter().any(|expr| expr_mentions_field(expr, changed));
+    let mut dangerous_dep = false;
+    app.visit_expressions(&mut |expr| dangerous_dep |= expr_dangerous_dependency(expr, changed));
+    for action in app.actions().iter() {
+        dangerous_dep |= statement_dangerous_dependency(action.steps(), changed);
+    }
+    let mut view_dep = false;
+    app.visit_view_action_expressions(&mut |expr| view_dep |= expr_foreign_read(expr, changed, None));
+    let action_dep = app.actions().iter().any(|action| {
+        sink_dependencies(action.steps(), changed)
+            || action.guards().iter().chain(action.ensures()).any(|expr| expr_foreign_read(expr, changed, None))
+    });
+    if unique_dep || constraint_dep || dangerous_dep || view_dep || action_dep {
+        return Err(error("changed durable value influences another stored field, a foreign-row write, shared selection, state, constraint or uniqueness rule").into());
     }
     Ok(())
 }
 fn check_durable_writers(app: &AppDefinition, patches: &[EffectPatchRequest]) -> Result<()> {
-    fn visit(
-        app: &AppDefinition,
+    check_durable_writers_core(crate::product_contract::AppRef::from(app), patches, None)
+        .map_err(|failure| match failure {
+            CompilerFailure::Store(error) => error,
+            CompilerFailure::Allocation(_) => unreachable!("legacy projection does not allocate fallibly"),
+        })
+}
+fn check_durable_writers_fallible(
+    app: &crate::product_contract::fallible_app_decode::DecodedAppDefinition,
+    patches: &[super::EffectPatchRequestDto],
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<(), CompilerFailure> {
+    check_durable_writers_core(crate::product_contract::AppRef::from(app), patches, Some(cx))
+}
+fn check_durable_writers_core<P: PatchView>(
+    app: crate::product_contract::AppRef<'_>,
+    patches: &[P],
+    mut cx: Option<&mut crate::product_alloc::AllocationContext>,
+) -> std::result::Result<(), CompilerFailure> {
+    use crate::product_contract::StatementView as S;
+    fn visit<P: PatchView>(
+        app: crate::product_contract::AppRef<'_>,
         action: &str,
-        steps: &[Statement],
-        prefix: &[usize],
-        mut env: BTreeMap<Id, Type>,
-        patches: &[EffectPatchRequest],
-    ) -> Result<()> {
-        for (index, statement) in steps.iter().enumerate() {
-            let mut path = prefix.to_vec();
-            path.push(index);
+        steps: crate::product_contract::StatementSlice<'_>,
+        path: &mut Vec<usize>,
+        mut env: CompilerEnvironment,
+        patches: &[P],
+        mut cx: Option<&mut crate::product_alloc::AllocationContext>,
+    ) -> std::result::Result<(), CompilerFailure> {
+        for index in 0..steps.len() {
+            if let Some(cx) = cx.as_deref_mut() {
+                crate::product_alloc::try_push(path, index, cx, crate::product_alloc::AllocationSite::Vector)
+                    .map_err(CompilerFailure::Allocation)?;
+            } else { path.push(index); }
+            let statement = steps.get(index).expect("bounded statement index");
             match statement {
-                Statement::Update { record, values } => {
+                S::Update { record, values } => {
                     let entity = match record {
-                        Expr::Variable { name } => match env.get(name) {
-                            Some(Type::Reference { entity }) => Some(entity),
-                            _ => None,
-                        },
+                        Expr::Variable { name } => match env.get(name) { Some(Type::Reference { entity }) => Some(entity.as_str()), _ => None },
                         _ => None,
                     };
                     for protected in patches {
-                        let field = match &protected.destination {
-                            EffectDestination::Update { field, .. }
-                            | EffectDestination::CreateValue { field, .. } => field,
-                            _ => continue,
-                        };
+                        let Some(field) = protected.destination().update_field() else { continue; };
                         if values.contains_key(field)
-                            && entity.is_none_or(|entity| entity == &protected.entity)
-                            && !patches.iter().any(|patch| {
-                                patch.entity == protected.entity
-                                    && patch.destination
-                                        == (EffectDestination::Update {
-                                            action: action.into(),
-                                            path: path.clone(),
-                                            field: field.clone(),
-                                        })
+                            && entity.is_none_or(|entity| entity == protected.entity())
+                            && !patches.iter().any(|candidate| {
+                                candidate.entity() == protected.entity()
+                                    && candidate.destination().action_path().is_some_and(|(candidate_action, candidate_path)| candidate_action == action && candidate_path == path)
+                                    && candidate.destination().is_update()
+                                    && candidate.destination().update_field() == Some(field)
                             })
                         {
-                            return Err(error("a durable result has an uncovered writer; explicitly reconcile every operation that can overwrite completed work"));
+                            return Err(error("a durable result has an uncovered writer; explicitly reconcile every operation that can overwrite completed work").into());
                         }
                     }
                 }
-                Statement::ForEach {
-                    items,
-                    binding,
-                    steps,
-                } => {
-                    let mut inner = env.clone();
+                S::ForEach { items, binding, steps } => {
+                    let mut inner = env.try_clone_with(cx.as_deref_mut())?;
                     if let Some(entity) = list_entity(items, app, &env) {
-                        inner.insert(binding.clone(), Type::reference(&entity));
+                        inner.insert_reference(binding, entity, cx.as_deref_mut())?;
                     } else {
                         inner.remove(binding);
                     }
-                    visit(app, action, steps, &path, inner, patches)?;
+                    visit(app, action, steps, path, inner, patches, cx.as_deref_mut())?;
                 }
-                Statement::Create { entity, bind, .. } => {
-                    env.insert(bind.clone(), Type::reference(entity));
-                }
+                S::Create { entity, bind, .. } => env.insert_reference(bind, entity, cx.as_deref_mut())?,
                 _ => {}
             }
+            path.pop();
         }
         Ok(())
     }
-    for action in &app.actions {
-        visit(
-            app,
-            &action.id,
-            &action.steps,
-            &[],
-            action.parameters.clone(),
-            patches,
-        )?;
+    let app_ref = crate::product_contract::AppRef::from(app);
+    let actions = app_ref.actions();
+    for action in actions.iter() {
+        let env = CompilerEnvironment::from_parameters(action.parameters(), app_ref.is_fallible(), cx.as_deref_mut())?;
+        let mut path = Vec::new();
+        visit(app_ref, action.id(), action.steps(), &mut path, env, patches, cx.as_deref_mut())?;
     }
     Ok(())
 }
 fn check_completion_order(app: &AppDefinition) -> Result<()> {
-    fn visit(steps: &[Statement], mut emitted: bool) -> Result<bool> {
-        for step in steps {
-            match step {
-        Statement::Emit{..}=>emitted=true,
-        Statement::ForEach{steps,..}=>{
-            let nested=visit(steps,emitted)?;
-            // An emitted body can run again. Its back edge carries the output
-            // barrier even when the first iteration started before any output.
-            if nested && !emitted { visit(steps,true)?; }
-            emitted|=nested;
-        },
-        Statement::Create{..}|Statement::Update{..}|Statement::Archive{..}|Statement::Collection{target:CollectionTarget::Field{..},..} if emitted=>return Err(error("a business write follows output; completion capture requires a compatible final-output action")),
-        _=>{}
-    }
-        }
-        Ok(emitted)
-    }
-    for action in &app.actions {
-        visit(&action.steps, false)?;
-    }
-    Ok(())
+    check_completion_order_ref(crate::product_contract::AppRef::from(app))
 }
-fn check_output_coverage(app: &AppDefinition, patches: &[EffectPatchRequest]) -> Result<()> {
-    fn sites(
-        action: &str,
-        steps: &[Statement],
-        prefix: &[usize],
-        out: &mut Vec<(Id, Vec<usize>, Id)>,
-    ) {
-        for (index, step) in steps.iter().enumerate() {
-            let mut path = prefix.to_vec();
-            path.push(index);
-            match step {
-                Statement::Emit { output, .. } => out.push((action.into(), path, output.clone())),
-                Statement::ForEach { steps, .. } => sites(action, steps, &path, out),
+fn check_completion_order_ref(app: crate::product_contract::AppRef<'_>) -> Result<()> {
+    use crate::product_contract::StatementView as S;
+    fn visit(steps: crate::product_contract::StatementSlice<'_>, mut emitted: bool) -> Result<bool> {
+        for index in 0..steps.len() {
+            match steps.get(index).expect("bounded statement index") {
+                S::Emit { .. } => emitted = true,
+                S::ForEach { steps, .. } => {
+                    let nested = visit(steps, emitted)?;
+                    if nested && !emitted { visit(steps, true)?; }
+                    emitted |= nested;
+                }
+                S::Create { .. } | S::Update { .. } | S::Archive { .. } if emitted => {
+                    return Err(error("a business write follows output; completion capture requires a compatible final-output action"));
+                }
+                S::Collection { target, .. } if emitted && matches!(target, CollectionTarget::Field { .. }) => {
+                    return Err(error("a business write follows output; completion capture requires a compatible final-output action"));
+                }
                 _ => {}
             }
         }
+        Ok(emitted)
     }
-    let mut emitted = vec![];
-    for action in &app.actions {
-        sites(&action.id, &action.steps, &[], &mut emitted);
+    for action in app.actions().iter() { visit(action.steps(), false)?; }
+    Ok(())
+}
+fn check_output_coverage(app: &AppDefinition, patches: &[EffectPatchRequest]) -> Result<()> {
+    check_output_coverage_core(crate::product_contract::AppRef::from(app), patches, None)
+        .map_err(|failure| match failure {
+            CompilerFailure::Store(error) => error,
+            CompilerFailure::Allocation(_) => unreachable!("legacy projection does not allocate fallibly"),
+        })
+}
+
+struct EmitSite<'a> { action: &'a str, path: Vec<usize>, output: &'a str }
+fn check_output_coverage_fallible(
+    app: &crate::product_contract::fallible_app_decode::DecodedAppDefinition,
+    patches: &[super::EffectPatchRequestDto],
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<(), CompilerFailure> {
+    check_output_coverage_core(crate::product_contract::AppRef::from(app), patches, Some(cx))
+}
+fn check_output_coverage_core<P: PatchView>(
+    app: crate::product_contract::AppRef<'_>,
+    patches: &[P],
+    mut cx: Option<&mut crate::product_alloc::AllocationContext>,
+) -> std::result::Result<(), CompilerFailure> {
+    use crate::product_contract::StatementView as S;
+    fn sites<'a>(
+        action: &'a str,
+        steps: crate::product_contract::StatementSlice<'a>,
+        path: &mut Vec<usize>,
+        out: &mut Vec<EmitSite<'a>>,
+        cx: &mut Option<&mut crate::product_alloc::AllocationContext>,
+    ) -> std::result::Result<(), CompilerFailure> {
+        for index in 0..steps.len() {
+            let statement = steps.get(index).expect("bounded statement index");
+            if let Some(cx) = cx.as_deref_mut() {
+                crate::product_alloc::try_push(path, index, cx, crate::product_alloc::AllocationSite::Vector)
+                    .map_err(CompilerFailure::Allocation)?;
+            } else { path.push(index); }
+            match statement {
+                S::Emit { output, .. } => {
+                    let mut saved_path = Vec::new();
+                    if let Some(cx) = cx.as_deref_mut() {
+                        crate::product_alloc::try_reserve(&mut saved_path, path.len(), cx, crate::product_alloc::AllocationSite::Vector)
+                            .map_err(CompilerFailure::Allocation)?;
+                        saved_path.extend_from_slice(path);
+                        crate::product_alloc::try_reserve(out, 1, cx, crate::product_alloc::AllocationSite::Vector)
+                            .map_err(CompilerFailure::Allocation)?;
+                    } else {
+                        saved_path.extend_from_slice(path);
+                        out.try_reserve(1).map_err(|_| CompilerFailure::Store(error("compiler output-site allocation failed")))?;
+                    }
+                    out.push(EmitSite { action, path: saved_path, output });
+                }
+                S::ForEach { steps, .. } => sites(action, steps, path, out, cx)?,
+                _ => {}
+            }
+            path.pop();
+        }
+        Ok(())
+    }
+    let mut emitted = Vec::new();
+    let mut path = Vec::new();
+    let actions = app.actions();
+    for action in actions.iter() {
+        sites(action.id(), action.steps(), &mut path, &mut emitted, &mut cx)?;
     }
     for patch in patches {
-        if let EffectDestination::EmitColumn {
-            action,
-            path,
-            column,
-        } = &patch.destination
-        {
-            let (_, _, output) = emitted
-                .iter()
-                .find(|(a, p, _)| a == action && p == path)
-                .ok_or_else(|| error("protected output site absent"))?;
-            for (other_action, other_path, other_output) in &emitted {
-                if other_output==output&&!patches.iter().any(|p|p.entity==patch.entity&&matches!(&p.destination,EffectDestination::EmitColumn{action,path,column:other_column} if action==other_action&&path==other_path&&other_column==column)) {
-            return Err(error("a shared output has an unprotected emission; separate its output definition or explicitly cover every affected result"));
-        }
+        let Some((action, wanted_path, column)) = patch.destination().emit_column() else { continue; };
+        let (_, output) = emitted.iter().find(|site| site.action == action && site.path == wanted_path)
+            .map(|site| (site, site.output))
+            .ok_or_else(|| error("protected output site absent"))?;
+        for other in &emitted {
+            if other.output == output && !patches.iter().any(|candidate| {
+                candidate.entity() == patch.entity()
+                    && candidate.destination().emit_column().is_some_and(|(a, p, c)| a == other.action && p == other.path && c == column)
+            }) {
+                return Err(error("a shared output has an unprotected emission; separate its output definition or explicitly cover every affected result").into());
             }
         }
     }
@@ -846,18 +1488,29 @@ pub(super) fn derive_patches(
     Ok(patches)
 }
 fn expression_variable(expr: &Expr, id: &str) -> bool {
-    fn visit(v: &serde_json::Value, id: &str) -> bool {
-        match v {
-            serde_json::Value::Object(m) => {
-                m.get("kind").and_then(|v| v.as_str()) == Some("variable")
-                    && m.get("name").and_then(|v| v.as_str()) == Some(id)
-                    || m.values().any(|v| visit(v, id))
-            }
-            serde_json::Value::Array(a) => a.iter().any(|v| visit(v, id)),
-            _ => false,
+    use Expr::*;
+    match expr {
+        Variable { name } => name == id,
+        Field { record, .. } | Count { items: record } | Sum { items: record }
+        | Lower { value: record } | Not { value: record } => expression_variable(record, id),
+        Query { predicate, sort, .. } => expression_variable(predicate, id) || sort.iter().any(|key| expression_variable(&key.value, id)),
+        Filter { items, predicate, .. } | Any { items, predicate, .. } | All { items, predicate, .. } => {
+            expression_variable(items, id) || expression_variable(predicate, id)
         }
+        Map { items, value, .. } => expression_variable(items, id) || expression_variable(value, id),
+        Contains { items, value } | Equal { left: items, right: value }
+        | Less { left: items, right: value } | Add { left: items, right: value }
+        | Subtract { left: items, right: value } | Concat { left: items, right: value }
+        | TextContains { text: items, search: value } | Coalesce { value: items, fallback: value } => {
+            expression_variable(items, id) || expression_variable(value, id)
+        }
+        And { values } | Or { values } => values.iter().any(|value| expression_variable(value, id)),
+        If { condition, then_value, else_value } => expression_variable(condition, id)
+            || expression_variable(then_value, id) || expression_variable(else_value, id),
+        DateAdd { date, days } => expression_variable(date, id) || expression_variable(days, id),
+        DateDifference { later, earlier } => expression_variable(later, id) || expression_variable(earlier, id),
+        Literal { .. } | State { .. } | Today => false,
     }
-    visit(&serde_json::to_value(expr).expect("typed expression"), id)
 }
 pub(super) fn rebind(expr: &Expr, from: &str, to: &str) -> Result<Expr> {
     // Accepted record-local expressions contain no binders; there is no capture.
@@ -1038,6 +1691,99 @@ pub(super) fn validate_mappings(
         return Err(error(
             "every protected history and derived-write slot needs a source-qualified mapping",
         ));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_mappings_fallible(
+    snapshot: &crate::product_store::fallible_project_snapshot_decode::DecodedProjectSnapshot,
+    previous: &super::DecodedCompositionManifest,
+    candidate: &crate::product_contract::FallibleDecodedCapturedProgram,
+    mappings: &[super::fallible_scalar_decode::DecodedScopeSlotMapping],
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<(), CompilerFailure> {
+    let state = snapshot.scalar_scope().ok_or_else(|| error("owned family cannot enter scalar scope authority"))?;
+    let mut seen = crate::product_alloc::ordered::OrderedSet::new();
+    let mut destinations = crate::product_alloc::ordered::OrderedSet::new();
+    let mut candidate_revision = None;
+    for mapping in mappings {
+        if mapping.from_source() != previous.output() {
+            return Err(error("ambiguous, stale or foreign protected-slot mapping").into());
+        }
+        if candidate_revision.is_none() {
+            candidate_revision = Some(candidate.revision_with(cx).map_err(|validation_error| match validation_error {
+                crate::product_contract::AppValidationError::Allocation(failure) => CompilerFailure::Allocation(failure),
+                _ => CompilerFailure::Store(error("mapped candidate program is invalid")),
+            })?);
+        }
+        let revision = candidate_revision.as_ref().expect("revision initialized after source binding check");
+        if mapping.to_source() != revision
+            || !previous.layers().contains(mapping.layer())
+            || !seen.try_insert((mapping.layer(), mapping.patch()), cx).map_err(CompilerFailure::Allocation)?
+        {
+            return Err(error("ambiguous, stale or foreign protected-slot mapping").into());
+        }
+        let current = effective_patch_fallible(snapshot, previous, mapping.layer(), mapping.patch(), cx)?;
+        if mapping.from() != &current.request.destination {
+            return Err(error("protected-slot mapping does not name the current source slot").into());
+        }
+        match (&current.request.destination, mapping.to()) {
+            (super::EffectDestinationDto::Update { field: from, .. }, super::EffectDestinationDto::Update { field: to, .. })
+            | (super::EffectDestinationDto::CreateValue { field: from, .. }, super::EffectDestinationDto::CreateValue { field: to, .. }) if from != to => {
+                return Err(error("durable field retargeting needs an explicit preservation migration").into());
+            }
+            _ => {}
+        }
+        let key = crate::product_backup::fallible_codec::canonical_bytes(mapping.to(), cx)
+            .map_err(|codec_error| match codec_error {
+                crate::product_backup::fallible_codec::CodecError::Allocation(failure) => CompilerFailure::Allocation(failure),
+                _ => CompilerFailure::Store(error("protected destination identity invariant")),
+            })?;
+        if !destinations.try_insert(key, cx).map_err(CompilerFailure::Allocation)? {
+            return Err(error("overlapping protected slots need an explicit compatible reconciliation").into());
+        }
+        let mut request = clone_request_fallible(current.request(), cx)?;
+        request.destination = clone_destination_fallible(mapping.to(), cx)?;
+        request.subject = crate::product_alloc::try_copy_str(mapping.subject(), cx, crate::product_alloc::AllocationSite::String)
+            .map_err(CompilerFailure::Allocation)?;
+        let environment = locate_context_fallible(candidate.app(), &request, cx)?;
+        let expression = clone_expr_fallible(slot_fallible_ref(candidate.app(), &request.destination)?, cx)?;
+        if !matches!(request.destination, super::EffectDestinationDto::EmitItems { .. } | super::EffectDestinationDto::Observable { .. }) {
+            own_row(&expression, &request.subject, &request.entity, crate::product_contract::AppRef::from(candidate.app()), &environment, true)?;
+            if request.destination.is_projection() && environment.iter().any(|(id, _)| id != &request.subject && expression_variable(&expression, id)) {
+                return Err(error("mapped saved projection depends on an action parameter").into());
+            }
+        }
+    }
+    if previous.layers().iter().any(|id| state.layer(id).is_some_and(|layer| !layer.request().lifecycles().is_empty())) {
+        check_completion_order_ref(crate::product_contract::AppRef::from(candidate.app()))?;
+    }
+    for id in previous.layers() {
+        let layer = state.layer(id).ok_or_else(|| error("missing layer"))?;
+        let mut mapped = Vec::new();
+        for mapping in mappings.iter().filter(|mapping| mapping.layer() == id) {
+            let mut request = clone_request_fallible(&layer.patches()[mapping.patch()].request, cx)?;
+            request.destination = clone_destination_fallible(mapping.to(), cx)?;
+            request.subject = crate::product_alloc::try_copy_str(mapping.subject(), cx, crate::product_alloc::AllocationSite::String)
+                .map_err(CompilerFailure::Allocation)?;
+            crate::product_alloc::try_push(&mut mapped, request, cx, crate::product_alloc::AllocationSite::Vector)
+                .map_err(CompilerFailure::Allocation)?;
+        }
+        check_output_coverage_fallible(candidate.app(), &mapped, cx)?;
+        check_durable_writers_fallible(candidate.app(), &mapped, cx)?;
+        for request in &mapped {
+            if let Some(field) = request.destination.update_field() {
+                check_dependencies_fallible(candidate.app(), &request.entity, field)?;
+            }
+        }
+    }
+    let mut expected = 0usize;
+    for id in previous.layers() {
+        expected = expected.checked_add(state.layer(id).ok_or_else(|| error("missing layer"))?.patches().len())
+            .ok_or_else(|| error("protected mapping count overflow"))?;
+    }
+    if mappings.len() != expected {
+        return Err(error("every protected history and derived-write slot needs a source-qualified mapping").into());
     }
     Ok(())
 }
@@ -1526,4 +2272,546 @@ fn add_provenance(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod borrowed_view_tests {
+    use super::*;
+    use crate::product_alloc::AllocationContext;
+    use crate::product_contract::fallible_app_decode::{decode_app_definition, DecodedAppDefinition};
+    use crate::product_contract::{AppRef, FieldDefinition, StateDefinition, Statement, EntityDefinition, MAX_ITEMS};
+    use crate::product_store::scope::EffectPatchRequest;
+    use crate::product_json;
+    use std::num::NonZeroUsize;
+
+    fn syntax(bytes: &[u8]) -> crate::product_json::Value {
+        product_json::parse_json_bytes(bytes, &mut AllocationContext::new()).unwrap()
+    }
+
+    fn fixture() -> (AppDefinition, EffectPatchRequest) {
+        let app = AppDefinition {
+            version: 1,
+            id: "workflow".into(),
+            label: "Workflow".into(),
+            entities: vec![EntityDefinition {
+                id: "item".into(),
+                label: "Item".into(),
+                fields: vec![FieldDefinition {
+                    id: "name".into(),
+                    label: "Name".into(),
+                    value_type: Type::Text,
+                }],
+                unique: vec![],
+                constraints: vec![],
+            }],
+            state: vec![StateDefinition {
+                id: "items".into(),
+                label: "Items".into(),
+                value_type: Type::list(Type::reference("item")),
+                initial: DataValue::List {
+                    item_type: Type::reference("item"),
+                    items: vec![],
+                },
+            }],
+            actions: vec![ActionDefinition {
+                id: "edit".into(),
+                label: "Edit".into(),
+                parameters: BTreeMap::from([(
+                    "items".into(),
+                    Type::list(Type::reference("item")),
+                )]),
+                guards: vec![],
+                steps: vec![Statement::ForEach {
+                    items: Expr::Variable { name: "items".into() },
+                    binding: "record".into(),
+                    steps: vec![Statement::Update {
+                        record: Expr::Variable { name: "record".into() },
+                        values: BTreeMap::from([(
+                            "name".into(),
+                            Expr::Literal {
+                                value: DataValue::Text { value: "old".into() },
+                                value_type: Type::Text,
+                            },
+                        )]),
+                    }],
+                }],
+                ensures: vec![],
+            }],
+            outputs: vec![],
+            observables: vec![],
+            views: vec![],
+            initial_view: "main".into(),
+        };
+        let request = EffectPatchRequest {
+            destination: EffectDestination::Update {
+                action: "edit".into(),
+                path: vec![0, 0],
+                field: "name".into(),
+            },
+            entity: "item".into(),
+            subject: "record".into(),
+            value_type: Type::Text,
+        };
+        (app, request)
+    }
+
+    fn decoded_app(app: &AppDefinition) -> DecodedAppDefinition {
+        let bytes = serde_json::to_vec(app).unwrap();
+        decode_app_definition(syntax(&bytes), &mut AllocationContext::new()).unwrap()
+    }
+
+    fn decoded_request(request: &EffectPatchRequest) -> super::super::fallible_scalar_decode::EffectPatchRequestDto {
+        let bytes = serde_json::to_vec(request).unwrap();
+        super::super::fallible_scalar_decode::decode_effect_patch_request(
+            syntax(&bytes),
+            &mut AllocationContext::new(),
+        ).unwrap()
+    }
+
+    fn minimal_snapshot() -> ProjectSnapshot {
+        let source = r#"{"version":1,"id":"app","label":"App","entities":[{"id":"item","label":"Item","fields":[{"id":"name","label":"Name","value_type":{"kind":"text"}}],"unique":[],"constraints":[]}],"state":[],"actions":[{"id":"noop","label":"No-op","parameters":{},"guards":[],"steps":[{"kind":"create","entity":"item","values":{"name":{"kind":"literal","value_type":{"kind":"text"},"value":{"kind":"text","value":"x"}}},"bind":"created"}],"ensures":[]}],"outputs":[],"observables":[{"id":"status","label":"Status","value":{"kind":"literal","value_type":{"kind":"text"},"value":{"kind":"text","value":"before"}}}],"views":[{"id":"main","label":"Main","kind":{"kind":"form","action":"noop","fields":[],"defaults":{}},"actions":[],"keys":[] }],"initial_view":"main"}"#;
+        let captured = crate::product_contract::CapturedProgram::capture(
+            source.as_bytes(),
+            "project",
+            crate::product_contract::Producer::Fixture { name: "compiler-test".into() },
+            None,
+        ).unwrap();
+        let data = crate::product_contract::DataSnapshot::empty("project", &captured.program).unwrap();
+        let session = crate::product_contract::SessionState::initial(&captured.program).unwrap();
+        let active_revision = crate::product_contract::canonical_digest(crate::product_contract::IdentityDomain::Source, &captured).unwrap();
+        ProjectSnapshot {
+            magic: crate::product_store::MAGIC.into(),
+            version: crate::product_store::GENERATED_PROJECT_FORMAT,
+            revision: 1,
+            programs: vec![captured],
+            active_revision,
+            data,
+            session,
+            clock_day: 0,
+            decisions: crate::product_contract::DecisionGraph { version: crate::product_contract::CONTRACT_VERSION, revision: 0, decisions: vec![] },
+            adoptions: vec![],
+            operations: BTreeMap::new(),
+            artifacts: vec![],
+            scope: super::super::ScopeEnvelope::ScalarV1(super::super::ScopeState::default()),
+        }
+    }
+
+    fn decoded_snapshot(snapshot: &ProjectSnapshot) -> crate::product_store::fallible_project_snapshot_decode::DecodedProjectSnapshot {
+        let bytes = serde_json::to_vec(snapshot).unwrap();
+        crate::product_store::fallible_project_snapshot_decode::decode_project_snapshot(
+            syntax(&bytes),
+            &mut AllocationContext::new(),
+        ).unwrap()
+    }
+
+    fn composed_snapshot_with_observable_patch() -> ProjectSnapshot {
+        let mut snapshot = minimal_snapshot();
+        let program_revision = crate::product_contract::canonical_digest(crate::product_contract::IdentityDomain::Source, &snapshot.programs[0]).unwrap();
+        let decisions_digest = crate::product_contract::canonical_digest(crate::product_contract::IdentityDomain::Decision, &snapshot.decisions).unwrap();
+        let basis = super::super::FrozenBasis {
+            snapshot: crate::product_contract::canonical_digest(crate::product_contract::IdentityDomain::Data, &snapshot).unwrap(),
+            revision: snapshot.revision,
+            active: snapshot.active_revision.clone(),
+            data: snapshot.data.clone(),
+            session: snapshot.session.clone(),
+            day: snapshot.clock_day,
+            decisions: decisions_digest,
+        };
+        let request = EffectPatchRequest {
+            destination: EffectDestination::Observable { observable: "status".into() },
+            entity: "item".into(),
+            subject: "record".into(),
+            value_type: Type::Text,
+        };
+        let literal = |value: &str| Expr::Literal {
+            value: DataValue::Text { value: value.into() },
+            value_type: Type::Text,
+        };
+        let layer = super::super::ScopeLayer {
+            version: super::super::COMPILER_VERSION,
+            operation: "edit".into(),
+            basis: basis.clone(),
+            candidate: program_revision.clone(),
+            request: ScopeRequest {
+                population: ScopePopulation::All,
+                operations: BTreeSet::from(["noop".into()]),
+                excluded_records: vec![],
+                lifecycles: vec![],
+                patches: vec![request.clone()],
+            },
+            patches: vec![EffectPatch { request, before: literal("before"), after: literal("after") }],
+        };
+        let layer_id = layer.identity().unwrap();
+        let mut state = super::super::ScopeState::default();
+        state.layers.insert(layer_id.clone(), layer);
+        state.compositions.insert(snapshot.active_revision.clone(), super::super::CompositionManifest {
+            version: super::super::COMPILER_VERSION,
+            basis,
+            transition: super::super::ScopeTransition::Adoption,
+            rewrites: vec![],
+            business: program_revision,
+            layers: vec![layer_id.clone()],
+            active: BTreeSet::from([layer_id]),
+            previous: None,
+            operation: "compose".into(),
+            runtime: crate::product_runtime::RUNTIME_VERSION.into(),
+            driver: crate::product_runtime::DRIVER_VERSION.into(),
+            output: snapshot.active_revision.clone(),
+        });
+        snapshot.scope = super::super::ScopeEnvelope::ScalarV1(state);
+        snapshot
+    }
+
+    fn captured_program_with_observable(value: &str) -> crate::product_contract::CapturedProgram {
+        let source = format!(r#"{{"version":1,"id":"app","label":"App","entities":[{{"id":"item","label":"Item","fields":[{{"id":"name","label":"Name","value_type":{{"kind":"text"}}}}],"unique":[],"constraints":[]}}],"state":[],"actions":[{{"id":"noop","label":"No-op","parameters":{{}},"guards":[],"steps":[{{"kind":"create","entity":"item","values":{{"name":{{"kind":"literal","value_type":{{"kind":"text"}},"value":{{"kind":"text","value":"x"}}}}}},"bind":"created"}}],"ensures":[]}}],"outputs":[],"observables":[{{"id":"status","label":"Status","value":{{"kind":"literal","value_type":{{"kind":"text"}},"value":{{"kind":"text","value":"{value}"}}}}}}],"views":[{{"id":"main","label":"Main","kind":{{"kind":"form","action":"noop","fields":[],"defaults":{{}}}},"actions":[],"keys":[]}}],"initial_view":"main"}}"#);
+        crate::product_contract::CapturedProgram::capture(
+            source.as_bytes(),
+            "project",
+            crate::product_contract::Producer::Fixture { name: "compiler-test-candidate".into() },
+            None,
+        ).unwrap()
+    }
+
+    fn environment_entries<M: StringValueMap<Type>>(map: &M) -> Vec<(String, Type)> {
+        map.iter().map(|(key, value)| (key.clone(), value.clone())).collect()
+    }
+
+    #[test]
+    fn decoded_and_legacy_context_share_nested_statement_and_type_lookup() {
+        let (app, request) = fixture();
+        let decoded = decoded_app(&app);
+        let request_dto = decoded_request(&request);
+        let legacy = locate_context(&app, &request).unwrap();
+        let mut cx = AllocationContext::new();
+        let fallible = locate_context_fallible(&decoded, &request_dto, &mut cx).unwrap();
+        assert_eq!(environment_entries(&legacy), environment_entries(&fallible));
+        assert_eq!(legacy.get("record"), Some(&Type::reference("item")));
+
+        let own_row_expr = Expr::Field {
+            record: Box::new(Expr::Variable { name: "record".into() }),
+            field: "name".into(),
+        };
+        own_row(&own_row_expr, "record", "item", &app, &legacy, true).unwrap();
+        own_row(&own_row_expr, "record", "item", AppRef::from(&decoded), &fallible, true).unwrap();
+
+        let collection = Expr::Variable { name: "items".into() };
+        assert_eq!(
+            list_entity(&collection, &app, &legacy),
+            list_entity(&collection, AppRef::from(&decoded), &fallible),
+        );
+    }
+
+    #[test]
+    fn decoded_context_refusal_is_typed_and_fresh_retry_succeeds() {
+        let (app, request) = fixture();
+        let decoded = decoded_app(&app);
+        let request = decoded_request(&request);
+        let mut baseline = AllocationContext::new();
+        locate_context_fallible(&decoded, &request, &mut baseline).unwrap();
+        let growths = baseline.growth_requests();
+        assert!(growths > 0 && growths < MAX_ITEMS, "growth count: {growths}");
+
+        for nth in 1..=growths {
+            let mut refused = AllocationContext::fail_nth_growth(NonZeroUsize::new(nth).unwrap(), true);
+            assert!(matches!(
+                locate_context_fallible(&decoded, &request, &mut refused),
+                Err(CompilerFailure::Allocation(_))
+            ));
+            let mut retry = AllocationContext::new();
+            locate_context_fallible(&decoded, &request, &mut retry).unwrap();
+        }
+    }
+
+    #[test]
+    fn decoded_and_legacy_slot_mutation_preserve_same_wire_graph() {
+        let (mut app, request) = fixture();
+        let mut decoded = decoded_app(&app);
+        let request_dto = decoded_request(&request);
+        let replacement = Expr::Variable { name: "new_value".into() };
+        *slot(&mut app, &request.destination).unwrap() = replacement.clone();
+        *slot_fallible(&mut decoded, &request_dto.destination).unwrap() = replacement;
+        assert_eq!(
+            crate::product_contract::canonical_bytes(&app).unwrap(),
+            crate::product_contract::canonical_bytes(&decoded).unwrap(),
+        );
+    }
+
+    #[test]
+    fn fallible_rebind_matches_legacy_and_refuses_with_retry() {
+        let expr = Expr::Query {
+            entity: "item".into(),
+            binding: "row".into(),
+            predicate: Box::new(Expr::And { values: vec![
+                Expr::Variable { name: "record".into() },
+                Expr::Field {
+                    record: Box::new(Expr::Variable { name: "record".into() }),
+                    field: "name".into(),
+                },
+            ] }),
+            sort: vec![crate::product_contract::SortKey {
+                value: Expr::Variable { name: "record".into() },
+                descending: false,
+            }],
+            limit: 3,
+            include_archived: false,
+        };
+        let expected = rebind(&expr, "record", "row").unwrap();
+        let mut baseline = AllocationContext::new();
+        let actual = rebind_fallible(&expr, "record", "row", &mut baseline).unwrap();
+        assert_eq!(
+            crate::product_contract::canonical_bytes(&expected).unwrap(),
+            crate::product_contract::canonical_bytes(&actual).unwrap(),
+        );
+        let growths = baseline.growth_requests();
+        assert!(growths > 0 && growths < MAX_ITEMS);
+        for nth in 1..=growths {
+            let mut refused = AllocationContext::fail_nth_growth(NonZeroUsize::new(nth).unwrap(), true);
+            assert!(matches!(rebind_fallible(&expr, "record", "row", &mut refused), Err(CompilerFailure::Allocation(_))));
+            let mut retry = AllocationContext::new();
+            assert_eq!(
+                crate::product_contract::canonical_bytes(&expected).unwrap(),
+                crate::product_contract::canonical_bytes(&rebind_fallible(&expr, "record", "row", &mut retry).unwrap()).unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn borrowed_dependency_walk_matches_legacy_rules_without_allocation() {
+        let base = captured_program_with_observable("status").program;
+        let mut cases = vec![base.clone()];
+
+        let mut unique = base.clone();
+        unique.entities[0].unique.push(vec!["name".into()]);
+        cases.push(unique);
+
+        let mut constraint = base.clone();
+        constraint.entities[0].constraints.push(Expr::Field {
+            record: Box::new(Expr::Variable { name: "record".into() }),
+            field: "name".into(),
+        });
+        cases.push(constraint);
+
+        let mut operator = base.clone();
+        operator.observables[0].value = Expr::Map {
+            items: Box::new(Expr::Variable { name: "items".into() }),
+            binding: "row".into(),
+            value: Box::new(Expr::Field {
+                record: Box::new(Expr::Variable { name: "row".into() }),
+                field: "name".into(),
+            }),
+        };
+        cases.push(operator);
+
+        let mut view_binding = base.clone();
+        view_binding.views[0].actions.push(crate::product_contract::ActionBinding {
+            id: "inspect".into(),
+            label: "Inspect".into(),
+            placement: crate::product_contract::ActionPlacement::Toolbar,
+            action: "noop".into(),
+            arguments: BTreeMap::new(),
+            enabled: Expr::Field {
+                record: Box::new(Expr::Variable { name: "row".into() }),
+                field: "name".into(),
+            },
+        });
+        cases.push(view_binding);
+
+        let mut own_row = base.clone();
+        own_row.observables[0].value = Expr::Field {
+            record: Box::new(Expr::Variable { name: "row".into() }),
+            field: "name".into(),
+        };
+        cases.push(own_row);
+
+        let mut collection = base.clone();
+        collection.actions[0].steps.push(Statement::Collection {
+            target: CollectionTarget::Field {
+                record: Expr::Variable { name: "record".into() },
+                field: "name".into(),
+            },
+            operation: crate::product_contract::CollectionOperation::Insert,
+            items: Expr::Literal {
+                value_type: Type::Text,
+                value: DataValue::Text { value: "x".into() },
+            },
+        });
+        cases.push(collection);
+
+        for app in cases {
+            let expected = check_dependencies(&app, "item", "name").map_err(|error| error.to_string());
+            let decoded = decoded_app(&app);
+            let actual = check_dependencies_core(AppRef::from(&decoded), "item", "name")
+                .map_err(|failure| match failure {
+                    CompilerFailure::Store(error) => error.to_string(),
+                    CompilerFailure::Allocation(failure) => format!("allocation refusal: {failure:?}"),
+                });
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn decoded_business_projection_matches_legacy_and_refusal_retries() {
+        let snapshot = minimal_snapshot();
+        let decoded = decoded_snapshot(&snapshot);
+        let expected = business_program(&snapshot).unwrap();
+        let mut baseline = AllocationContext::new();
+        let actual = business_program_fallible(&decoded, &mut baseline).unwrap();
+        assert_eq!(
+            crate::product_contract::canonical_bytes(&expected).unwrap(),
+            crate::product_contract::canonical_bytes(&actual).unwrap(),
+        );
+        let growths = baseline.growth_requests();
+        assert!(growths > 0 && growths < crate::product_contract::MAX_COLLECTION, "business projection growth count: {growths}");
+        for nth in 1..=growths {
+            let mut refused = AllocationContext::fail_nth_growth(NonZeroUsize::new(nth).unwrap(), true);
+            assert!(matches!(business_program_fallible(&decoded, &mut refused), Err(CompilerFailure::Allocation(_))));
+            let mut retry = AllocationContext::new();
+            let retried = business_program_fallible(&decoded, &mut retry).unwrap();
+            assert_eq!(crate::product_contract::canonical_bytes(&expected).unwrap(), crate::product_contract::canonical_bytes(&retried).unwrap());
+        }
+    }
+
+    #[test]
+    fn decoded_business_projection_replays_composed_patch_and_refusal() {
+        let snapshot = composed_snapshot_with_observable_patch();
+        let decoded = decoded_snapshot(&snapshot);
+        let expected = business_program(&snapshot).unwrap();
+        let mut baseline = AllocationContext::new();
+        let actual = business_program_fallible(&decoded, &mut baseline).unwrap();
+        assert_eq!(
+            crate::product_contract::canonical_bytes(&expected).unwrap(),
+            crate::product_contract::canonical_bytes(&actual).unwrap(),
+        );
+        assert!(matches!(actual.observables[0].value, Expr::Literal { value: DataValue::Text { ref value }, .. } if value == "after"));
+        let growths = baseline.growth_requests();
+        assert!(growths > 0 && growths < crate::product_contract::MAX_COLLECTION);
+        for nth in 1..=growths {
+            let mut refused = AllocationContext::fail_nth_growth(NonZeroUsize::new(nth).unwrap(), true);
+            assert!(matches!(business_program_fallible(&decoded, &mut refused), Err(CompilerFailure::Allocation(_))));
+            let mut retry = AllocationContext::new();
+            assert_eq!(
+                crate::product_contract::canonical_bytes(&expected).unwrap(),
+                crate::product_contract::canonical_bytes(&business_program_fallible(&decoded, &mut retry).unwrap()).unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn decoded_mapping_validation_matches_legacy_and_refusal_retries() {
+        let snapshot = composed_snapshot_with_observable_patch();
+        let decoded = decoded_snapshot(&snapshot);
+        let scalar = match &snapshot.scope { super::super::ScopeEnvelope::ScalarV1(state) => state, _ => unreachable!() };
+        let previous = scalar.compositions.get(&snapshot.active_revision).unwrap();
+        let candidate = captured_program_with_observable("candidate");
+        let candidate_revision = crate::product_contract::canonical_digest(crate::product_contract::IdentityDomain::Source, &candidate).unwrap();
+        let layer = previous.layers.first().unwrap();
+        let destination = EffectDestination::Observable { observable: "status".into() };
+        let mapping = super::super::ScopeSlotMapping {
+            layer: layer.clone(),
+            patch: 0,
+            from_source: previous.output.clone(),
+            from: destination.clone(),
+            to_source: candidate_revision,
+            to: destination,
+            subject: "record".into(),
+        };
+        validate_mappings(&snapshot, previous, &candidate, std::slice::from_ref(&mapping)).unwrap();
+        let previous_dto = decoded.scalar_scope().unwrap().composition(&snapshot.active_revision).unwrap();
+        let candidate_bytes = serde_json::to_vec(&candidate).unwrap();
+        let candidate_dto = crate::product_contract::decode_captured_program_fallible(
+            syntax(&candidate_bytes), &mut AllocationContext::new(),
+        ).unwrap();
+        let mapping_bytes = serde_json::to_vec(&mapping).unwrap();
+        let mapping_dto = super::super::decode_scope_slot_mapping_fallible(
+            syntax(&mapping_bytes), &mut AllocationContext::new(),
+        ).unwrap();
+        let mut baseline = AllocationContext::new();
+        validate_mappings_fallible(&decoded, previous_dto, &candidate_dto, std::slice::from_ref(&mapping_dto), &mut baseline).unwrap();
+        let growths = baseline.growth_requests();
+        assert!(growths > 0 && growths < crate::product_contract::MAX_COLLECTION);
+        for nth in 1..=growths {
+            let mut refused = AllocationContext::fail_nth_growth(NonZeroUsize::new(nth).unwrap(), true);
+            assert!(matches!(validate_mappings_fallible(&decoded, previous_dto, &candidate_dto, std::slice::from_ref(&mapping_dto), &mut refused), Err(CompilerFailure::Allocation(_))));
+            let mut retry = AllocationContext::new();
+            validate_mappings_fallible(&decoded, previous_dto, &candidate_dto, std::slice::from_ref(&mapping_dto), &mut retry).unwrap();
+        }
+        let duplicate = [mapping.clone(), mapping.clone()];
+        let legacy_error = validate_mappings(&snapshot, previous, &candidate, &duplicate).unwrap_err();
+        let duplicate_dtos = duplicate.iter().map(|mapping| {
+            let bytes = serde_json::to_vec(mapping).unwrap();
+            super::super::decode_scope_slot_mapping_fallible(syntax(&bytes), &mut AllocationContext::new()).unwrap()
+        }).collect::<Vec<_>>();
+        let decoded_error = validate_mappings_fallible(&decoded, previous_dto, &candidate_dto, &duplicate_dtos, &mut AllocationContext::new()).unwrap_err();
+        assert!(matches!(decoded_error, CompilerFailure::Store(error) if error.to_string() == legacy_error.to_string()));
+
+        let mut stale_source = mapping.clone();
+        stale_source.from_source = crate::product_contract::Digest::try_from("a5".repeat(32)).unwrap();
+        let stale_error = validate_mappings(&snapshot, previous, &candidate, std::slice::from_ref(&stale_source)).unwrap_err();
+        let stale_bytes = serde_json::to_vec(&stale_source).unwrap();
+        let stale_dto = super::super::decode_scope_slot_mapping_fallible(
+            syntax(&stale_bytes), &mut AllocationContext::new(),
+        ).unwrap();
+        let mut stale_refusal = AllocationContext::fail_nth_growth(NonZeroUsize::new(1).unwrap(), true);
+        let stale_decoded_error = validate_mappings_fallible(
+            &decoded, previous_dto, &candidate_dto, std::slice::from_ref(&stale_dto), &mut stale_refusal,
+        ).unwrap_err();
+        assert!(matches!(stale_decoded_error, CompilerFailure::Store(error) if error.to_string() == stale_error.to_string()));
+        assert_eq!(stale_refusal.growth_requests(), 0, "stale source is rejected before candidate revision work");
+
+        let mut mapped_snapshot = snapshot.clone();
+        mapped_snapshot.programs.push(candidate.clone());
+        if let super::super::ScopeEnvelope::ScalarV1(state) = &mut mapped_snapshot.scope {
+            state.compositions.get_mut(&mapped_snapshot.active_revision).unwrap().rewrites.push(mapping.clone());
+        }
+        let mapped_decoded = decoded_snapshot(&mapped_snapshot);
+        let mapped_manifest = match &mapped_snapshot.scope {
+            super::super::ScopeEnvelope::ScalarV1(state) => state.compositions.get(&mapped_snapshot.active_revision).unwrap(),
+            _ => unreachable!(),
+        };
+        let mapped_manifest_dto = mapped_decoded.scalar_scope().unwrap().composition(&mapped_snapshot.active_revision).unwrap();
+        let expected_patch = effective_patch(&mapped_snapshot, mapped_manifest, &layer, 0).unwrap();
+        let mut patch_baseline = AllocationContext::new();
+        let actual_patch = effective_patch_fallible(&mapped_decoded, mapped_manifest_dto, &layer, 0, &mut patch_baseline).unwrap();
+        assert_eq!(
+            crate::product_contract::canonical_bytes(&expected_patch).unwrap(),
+            crate::product_contract::canonical_bytes(&actual_patch).unwrap(),
+        );
+        let patch_growths = patch_baseline.growth_requests();
+        assert!(patch_growths > 0 && patch_growths < crate::product_contract::MAX_COLLECTION);
+        for nth in 1..=patch_growths {
+            let mut refused = AllocationContext::fail_nth_growth(NonZeroUsize::new(nth).unwrap(), true);
+            assert!(matches!(
+                effective_patch_fallible(&mapped_decoded, mapped_manifest_dto, &layer, 0, &mut refused),
+                Err(CompilerFailure::Allocation(_))
+            ));
+            let mut retry = AllocationContext::new();
+            assert_eq!(
+                crate::product_contract::canonical_bytes(&expected_patch).unwrap(),
+                crate::product_contract::canonical_bytes(
+                    &effective_patch_fallible(&mapped_decoded, mapped_manifest_dto, &layer, 0, &mut retry).unwrap()
+                ).unwrap(),
+            );
+        }
+        let expected_business = business_program(&mapped_snapshot).unwrap();
+        let mut business_cx = AllocationContext::new();
+        let actual_business = business_program_fallible(&mapped_decoded, &mut business_cx).unwrap();
+        assert_eq!(
+            crate::product_contract::canonical_bytes(&expected_business).unwrap(),
+            crate::product_contract::canonical_bytes(&actual_business).unwrap(),
+        );
+        let business_growths = business_cx.growth_requests();
+        assert!(business_growths > 0 && business_growths < crate::product_contract::MAX_COLLECTION);
+        for nth in 1..=business_growths {
+            let mut refused = AllocationContext::fail_nth_growth(NonZeroUsize::new(nth).unwrap(), true);
+            assert!(matches!(
+                business_program_fallible(&mapped_decoded, &mut refused),
+                Err(CompilerFailure::Allocation(_))
+            ));
+            let mut retry = AllocationContext::new();
+            assert_eq!(
+                crate::product_contract::canonical_bytes(&expected_business).unwrap(),
+                crate::product_contract::canonical_bytes(&business_program_fallible(&mapped_decoded, &mut retry).unwrap()).unwrap(),
+            );
+        }
+    }
 }

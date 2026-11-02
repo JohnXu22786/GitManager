@@ -30,6 +30,7 @@ pub(crate) struct DecodedCapturedProgram {
     program: DecodedAppDefinition,
 }
 impl DecodedCapturedProgram {
+    pub(crate) fn app(&self) -> &DecodedAppDefinition { &self.program }
     pub(crate) fn validate_app_with(&self, cx: &mut AllocationContext) -> Result<(), AppValidationError> {
         self.program.validate_with(cx)
     }

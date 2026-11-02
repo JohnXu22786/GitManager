@@ -58,10 +58,10 @@ pub(crate) struct DecodedAppDefinition {
     pub(super) label: String,
     pub(super) entities: Vec<EntityDefinition>,
     pub(super) state: Vec<StateDefinition>,
-    pub(super) actions: Vec<DecodedActionDefinition>,
+    pub(crate) actions: Vec<DecodedActionDefinition>,
     pub(super) outputs: Vec<OutputDefinition>,
-    pub(super) observables: Vec<ObservableDefinition>,
-    pub(super) views: Vec<DecodedViewDefinition>,
+    pub(crate) observables: Vec<ObservableDefinition>,
+    pub(crate) views: Vec<DecodedViewDefinition>,
     pub(super) initial_view: String,
 }
 impl DecodedAppDefinition {
@@ -134,17 +134,17 @@ impl DecodedAppDefinition {
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct DecodedActionDefinition {
-    pub(super) id: String,
-    pub(super) label: String,
-    pub(super) parameters: FallibleMap<Type>,
-    pub(super) guards: Vec<Expr>,
-    pub(super) steps: Vec<DecodedStatement>,
-    pub(super) ensures: Vec<Expr>,
+pub(crate) struct DecodedActionDefinition {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) parameters: FallibleMap<Type>,
+    pub(crate) guards: Vec<Expr>,
+    pub(crate) steps: Vec<DecodedStatement>,
+    pub(crate) ensures: Vec<Expr>,
 }
 
-pub(super) struct FallibleMap<V>(OrderedMap<String, V>);
-pub(super) struct FallibleMapIter<'a, V>(std::slice::Iter<'a, (String, V)>);
+pub(crate) struct FallibleMap<V>(OrderedMap<String, V>);
+pub(crate) struct FallibleMapIter<'a, V>(std::slice::Iter<'a, (String, V)>);
 impl<'a, V> Iterator for FallibleMapIter<'a, V> {
     type Item = (&'a String, &'a V);
     fn next(&mut self) -> Option<Self::Item> {
@@ -158,6 +158,7 @@ impl<V> FallibleMap<V> {
     pub(super) fn len(&self) -> usize { self.0.len() }
     pub(super) fn is_empty(&self) -> bool { self.0.is_empty() }
     pub(super) fn get(&self, key: &str) -> Option<&V> { self.0.get(key) }
+    pub(crate) fn get_mut(&mut self, key: &str) -> Option<&mut V> { self.0.get_mut(key) }
     pub(super) fn contains_key(&self, key: &str) -> bool { self.0.contains_key(key) }
     pub(super) fn iter(&self) -> FallibleMapIter<'_, V> { FallibleMapIter(self.0.iter_entries()) }
     pub(super) fn try_insert(
@@ -226,7 +227,7 @@ impl Serialize for FallibleKeyModifiers {
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub(super) enum DecodedStatement {
+pub(crate) enum DecodedStatement {
     Create { entity: String, values: FallibleMap<Expr>, bind: String },
     Update { record: Expr, values: FallibleMap<Expr> },
     Archive { record: Expr },
@@ -238,17 +239,17 @@ pub(super) enum DecodedStatement {
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct DecodedViewDefinition {
-    pub(super) id: String,
-    pub(super) label: String,
-    pub(super) kind: DecodedViewKind,
-    pub(super) actions: Vec<DecodedActionBinding>,
-    pub(super) keys: Vec<DecodedKeyBinding>,
+pub(crate) struct DecodedViewDefinition {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) kind: DecodedViewKind,
+    pub(crate) actions: Vec<DecodedActionBinding>,
+    pub(crate) keys: Vec<DecodedKeyBinding>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub(super) enum DecodedViewKind {
+pub(crate) enum DecodedViewKind {
     List {
         entity: String,
         rows: Expr,
@@ -261,7 +262,7 @@ pub(super) enum DecodedViewKind {
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct DecodedColumn { pub(super) id: String, pub(super) label: String, pub(super) value: Expr }
+pub(crate) struct DecodedColumn { pub(crate) id: String, pub(crate) label: String, pub(crate) value: Expr }
 #[derive(Debug, Serialize)]
 pub(super) struct DecodedStateControl { pub(super) id: String, pub(super) label: String, pub(super) state: String, pub(super) on_change: Option<String> }
 #[derive(Debug, Serialize)]

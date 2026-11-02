@@ -82,6 +82,8 @@ impl BackupWire for crate::product_contract::FallibleOutputRow<'_> {}
 impl BackupWire for crate::product_contract::FallibleJsonScalar<'_> {}
 impl BackupWire for crate::product_contract::FallibleArtifactReceipt<'_> {}
 impl BackupWire for crate::product_contract::FallibleDataValueTuple<'_> {}
+impl BackupWire for crate::product_contract::Expr {}
+impl BackupWire for crate::product_store::scope::EffectDestinationDto {}
 impl BackupWire for crate::product_store::scope::DecodedSemanticKey {}
 
 pub(crate) fn canonical_bytes<T: BackupWire + ?Sized>(
