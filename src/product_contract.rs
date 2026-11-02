@@ -335,6 +335,9 @@ impl FallibleDecodedDataSnapshot {
     }
     pub(crate) fn project_id(&self) -> &str { &self.0.project_id }
     pub(crate) fn generation(&self) -> u64 { self.0.generation }
+    pub(crate) fn events_start_with(&self, prefix: &Self) -> bool {
+        self.0.events.starts_with(&prefix.0.events)
+    }
     pub(crate) fn record_count(&self) -> usize { self.0.records.len() }
     pub(crate) fn records(&self) -> &[fallible_persisted_decode::DecodedRecord] { &self.0.records }
     pub(crate) fn events(&self) -> &[fallible_persisted_decode::DecodedBusinessEvent] { &self.0.events }
@@ -410,6 +413,22 @@ impl FallibleDecodedCapturedProgram {
         cx: &mut crate::product_alloc::AllocationContext,
     ) -> std::result::Result<FallibleDecodedSessionState, crate::product_alloc::AllocationFailure> {
         self.0.app().initial_session_with(cx).map(FallibleDecodedSessionState)
+    }
+    pub(crate) fn try_clone_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Self, AppValidationError> {
+        let value = crate::product_backup::fallible_codec::try_serialize_value(self, cx)
+            .map_err(|error| match error {
+                crate::product_backup::fallible_codec::CodecError::Allocation(failure) => AppValidationError::Allocation(failure),
+                _ => AppValidationError::Contract(ContractError("captured program copy invariant".into())),
+            })?;
+        fallible_capture_decode::decode_captured_program(value, cx)
+            .map(Self)
+            .map_err(|error| match error {
+                fallible_value_decode::ValueDecodeError::Allocation(failure) => AppValidationError::Allocation(failure),
+                _ => AppValidationError::Contract(ContractError("captured program copy invariant".into())),
+            })
     }
 }
 #[derive(Debug, Serialize)]
@@ -3010,6 +3029,12 @@ impl<'a> DataRecordView<'a> {
     }
     pub(crate) fn archived(&self) -> bool {
         match self.inner { DataRecordKind::Legacy(row) => row.archived, DataRecordKind::Fallible(row) => row.archived, DataRecordKind::FallibleOverride(_, _, archived) => archived }
+    }
+    pub(crate) fn revision(&self) -> u64 {
+        match self.inner { DataRecordKind::Legacy(row) => row.revision, DataRecordKind::Fallible(row) | DataRecordKind::FallibleOverride(row, _, _) => row.revision }
+    }
+    pub(crate) fn created_program(&self) -> &'a Digest {
+        match self.inner { DataRecordKind::Legacy(row) => &row.created_program, DataRecordKind::Fallible(row) | DataRecordKind::FallibleOverride(row, _, _) => &row.created_program }
     }
     pub(crate) fn values(&self) -> DataValuesView<'_> {
         match self.inner { DataRecordKind::Legacy(row) => DataValuesView::Legacy(&row.values), DataRecordKind::Fallible(row) => DataValuesView::Fallible(&row.values), DataRecordKind::FallibleOverride(_, values, _) => DataValuesView::Fallible(values) }

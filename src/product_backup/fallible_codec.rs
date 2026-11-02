@@ -96,6 +96,7 @@ impl BackupWire for crate::product_store::scope::DecodedScopeLayer {}
 impl BackupWire for crate::product_store::scope::DecodedCompositionManifest {}
 impl BackupWire for crate::product_store::scope::DecodedMetadataAddition {}
 impl BackupWire for crate::product_store::scope::DecodedMetadataInitializationReceipt {}
+impl BackupWire for crate::product_store::scope::DecodedScopeCorrespondence {}
 
 pub(crate) fn canonical_bytes<T: BackupWire + ?Sized>(
     value: &T,

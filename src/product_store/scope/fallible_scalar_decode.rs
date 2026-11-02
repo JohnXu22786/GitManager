@@ -304,6 +304,12 @@ impl DecodedMetadataAddition {
     pub(crate) fn new(record: RecordRef, values: FallibleValues) -> Self { Self { record, values } }
     pub(crate) fn record(&self) -> &RecordRef { &self.record }
     pub(crate) fn values(&self) -> &FallibleValues { &self.values }
+    pub(crate) fn copy_with(&self, cx: &mut AllocationContext) -> Result<Self, ValueDecodeError> {
+        let entity = product_alloc::try_copy_str(&self.record.entity, cx, AllocationSite::String)?;
+        let record = product_alloc::try_copy_str(&self.record.record, cx, AllocationSite::String)?;
+        let values = self.values.try_clone_with(cx).map_err(ValueDecodeError::Allocation)?;
+        Ok(Self { record: RecordRef { entity, record }, values })
+    }
 }
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct DecodedMetadataInitializationReceipt {
@@ -472,6 +478,21 @@ pub(crate) struct DecodedScopeCorrespondence {
     target: Digest, day: i32, projected: Digest, operation_seed: Digest,
     scenario: Option<DecodedScopeScenarioCorrespondence>,
 }
+impl DecodedScopeCorrespondence {
+    pub(crate) fn new(
+        source: FallibleDecodedCapturedProgram,
+        original: FallibleDecodedDataSnapshot,
+        target: Digest,
+        day: i32,
+        projected: Digest,
+        operation_seed: Digest,
+    ) -> Self {
+        Self { source, original, target, day, projected, operation_seed, scenario: None }
+    }
+    pub(crate) fn identity_with(&self, cx: &mut AllocationContext) -> Result<Digest, crate::product_backup::fallible_codec::CodecError> {
+        crate::product_backup::fallible_codec::canonical_digest(IdentityDomain::Scenario, self, cx)
+    }
+}
 #[derive(Debug, Serialize)]
 pub(crate) struct DecodedScopeCorrespondenceReceipt {
     proof: DecodedScopeCorrespondence, operation: String, revision: u64,
@@ -489,6 +510,7 @@ pub(crate) struct DecodedScopeState {
 impl DecodedScopeState {
     pub(crate) fn composition(&self, id: &Digest) -> Option<&DecodedCompositionManifest> { self.compositions.get(id) }
     pub(crate) fn layer(&self, id: &Digest) -> Option<&DecodedScopeLayer> { self.layers.get(id) }
+    pub(crate) fn layers(&self) -> impl Iterator<Item = (&Digest, &DecodedScopeLayer)> { self.layers.iter() }
     pub(crate) fn rehearsals(&self) -> impl Iterator<Item = (&Digest, &DecodedManagedRehearsal)> { self.rehearsals.iter() }
     pub(crate) fn has_replay_layer(&self, id: &Digest) -> bool { self.layers.get(id).is_some() }
     pub(crate) fn replay_layer_count(&self) -> usize { self.layers.len() }

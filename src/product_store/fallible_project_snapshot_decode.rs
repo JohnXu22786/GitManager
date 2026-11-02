@@ -226,6 +226,33 @@ impl DecodedProjectSnapshot {
         })
     }
 
+    pub(crate) fn retain_program_with(
+        &mut self,
+        program: &FallibleDecodedCapturedProgram,
+        cx: &mut AllocationContext,
+    ) -> Result<Digest, crate::product_contract::AppValidationError> {
+        let revision = program.revision_with(cx)?;
+        let mut retained = false;
+        for existing in &self.programs {
+            match existing.revision_with(cx) {
+                Ok(existing_revision) if existing_revision == revision => { retained = true; break; }
+                Ok(_) | Err(crate::product_contract::AppValidationError::Contract(_)) => {}
+                Err(error @ crate::product_contract::AppValidationError::Allocation(_)) => return Err(error),
+            }
+        }
+        if !retained {
+            if self.programs.len() >= MAX_ITEMS {
+                return Err(crate::product_contract::AppValidationError::Contract(
+                    crate::product_contract::ContractError("project history size limit reached".into()),
+                ));
+            }
+            let program = program.try_clone_with(cx)?;
+            crate::product_alloc::try_push(&mut self.programs, program, cx, AllocationSite::Vector)
+                .map_err(crate::product_contract::AppValidationError::Allocation)?;
+        }
+        Ok(revision)
+    }
+
     pub(crate) fn data(&self) -> &FallibleDecodedDataSnapshot {
         &self.data
     }

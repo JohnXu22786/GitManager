@@ -3365,6 +3365,112 @@ mod borrowed_view_tests {
         ).unwrap()
     }
 
+    fn correspondence_fixture(
+        historical: bool,
+    ) -> (
+        ProjectSnapshot,
+        crate::product_contract::CapturedProgram,
+        crate::product_contract::DataSnapshot,
+        i32,
+    ) {
+        use crate::product_contract::{BusinessEvent, RecordChange};
+
+        let mut snapshot = initialization_snapshot();
+        let original = snapshot.data.clone();
+        if historical {
+            let mut later = original.clone();
+            let values = later.records[0].values.clone();
+            later.generation = 1;
+            later.records[0].revision = 2;
+            later.events.push(BusinessEvent {
+                id: "event-1".into(),
+                sequence: 1,
+                operation_id: "operation-1".into(),
+                action: "noop".into(),
+                day: 1,
+                program: later.records[0].created_program.clone(),
+                changes: vec![RecordChange {
+                    entity: "item".into(),
+                    record: "row-1".into(),
+                    before: Some(values.clone()),
+                    after: values,
+                    archived: false,
+                }],
+                outputs: vec![],
+            });
+            snapshot.data = later;
+            snapshot.revision += 1;
+        }
+
+        let source = snapshot.programs[0].clone();
+        let source_revision = crate::product_contract::canonical_digest(
+            IdentityDomain::Source,
+            &source,
+        ).unwrap();
+        let decisions = crate::product_contract::canonical_digest(
+            IdentityDomain::Decision,
+            &snapshot.decisions,
+        ).unwrap();
+        let mut basis_root = snapshot.clone();
+        basis_root.scope = super::super::ScopeEnvelope::ScalarV1(
+            super::super::ScopeState::default(),
+        );
+        let basis = super::super::FrozenBasis {
+            snapshot: crate::product_contract::canonical_digest(IdentityDomain::Data, &basis_root).unwrap(),
+            revision: snapshot.revision,
+            active: source_revision.clone(),
+            data: snapshot.data.clone(),
+            session: snapshot.session.clone(),
+            day: 3,
+            decisions,
+        };
+
+        let original_layer = snapshot.scalar_scope().unwrap().layers.values().next().unwrap();
+        let mut state = super::super::ScopeState::default();
+        let layer = super::super::ScopeLayer {
+            version: super::super::COMPILER_VERSION,
+            operation: "historical-adoption".into(),
+            basis: basis.clone(),
+            candidate: source_revision.clone(),
+            request: original_layer.request.clone(),
+            patches: original_layer.patches.clone(),
+        };
+        let layer_id = layer.identity().unwrap();
+        state.layers.insert(layer_id.clone(), layer);
+        snapshot.scope = super::super::ScopeEnvelope::ScalarV1(state);
+        let target = initialization_target(&snapshot);
+        let target_revision = crate::product_contract::canonical_digest(
+            IdentityDomain::Source,
+            &target,
+        ).unwrap();
+        let manifest = super::super::CompositionManifest {
+            version: super::super::COMPILER_VERSION,
+            basis,
+            transition: super::super::ScopeTransition::Adoption,
+            rewrites: vec![],
+            business: source_revision,
+            layers: vec![layer_id.clone()],
+            active: BTreeSet::from([layer_id]),
+            previous: None,
+            operation: "historical-composition".into(),
+            runtime: crate::product_runtime::RUNTIME_VERSION.into(),
+            driver: crate::product_runtime::DRIVER_VERSION.into(),
+            output: target_revision.clone(),
+        };
+        snapshot.scalar_scope_mut().unwrap().compositions.insert(target_revision, manifest);
+        snapshot.programs.push(target.clone());
+        (snapshot, target, original, if historical { 2 } else { 3 })
+    }
+
+    fn decoded_captured(
+        capture: &crate::product_contract::CapturedProgram,
+    ) -> crate::product_contract::FallibleDecodedCapturedProgram {
+        crate::product_contract::decode_captured_program_fallible(
+            syntax(&serde_json::to_vec(capture).unwrap()),
+            &mut AllocationContext::new(),
+        ).unwrap()
+    }
+
     fn captured_program_with_observable(value: &str) -> crate::product_contract::CapturedProgram {
         let source = format!(r#"{{"version":1,"id":"app","label":"App","entities":[{{"id":"item","label":"Item","fields":[{{"id":"name","label":"Name","value_type":{{"kind":"text"}}}}],"unique":[],"constraints":[]}}],"state":[],"actions":[{{"id":"noop","label":"No-op","parameters":{{}},"guards":[],"steps":[{{"kind":"create","entity":"item","values":{{"name":{{"kind":"literal","value_type":{{"kind":"text"}},"value":{{"kind":"text","value":"x"}}}}}},"bind":"created"}}],"ensures":[]}}],"outputs":[],"observables":[{{"id":"status","label":"Status","value":{{"kind":"literal","value_type":{{"kind":"text"}},"value":{{"kind":"text","value":"{value}"}}}}}}],"views":[{{"id":"main","label":"Main","kind":{{"kind":"form","action":"noop","fields":[],"defaults":{{}}}},"actions":[],"keys":[]}}],"initial_view":"main"}}"#);
         crate::product_contract::CapturedProgram::capture(
@@ -3796,6 +3902,164 @@ mod borrowed_view_tests {
             &decoded, decoded_layer, &target, &mut AllocationContext::new(),
         ), Err(crate::product_store::scope::InitializationFailure::Store(StoreError::Runtime(_)))));
         assert_eq!(crate::product_contract::canonical_bytes(&snapshot).unwrap(), before);
+    }
+
+    fn assert_correspondence_parity(historical: bool) {
+        let (snapshot, target_capture, original, day) = correspondence_fixture(historical);
+        let source_capture = &snapshot.programs[0];
+        let initialized = snapshot.data.clone();
+        let context = super::super::replay::ScopedExecutionContext::registry(&snapshot).unwrap();
+        let expected = super::super::correspondence::derive(
+            &context, source_capture, &original, &target_capture, day, &initialized,
+        ).unwrap();
+
+        let decoded = decoded_snapshot(&snapshot);
+        let source = decoded_captured(source_capture);
+        let target = decoded_captured(&target_capture);
+        let original_decoded = crate::product_contract::decode_data_snapshot_fallible(
+            syntax(&serde_json::to_vec(&original).unwrap()), &mut AllocationContext::new(),
+        ).unwrap();
+        let initialized_decoded = crate::product_contract::decode_data_snapshot_fallible(
+            syntax(&serde_json::to_vec(&initialized).unwrap()), &mut AllocationContext::new(),
+        ).unwrap();
+        let mut cx = AllocationContext::new();
+        let actual = super::super::derive_correspondence_fallible(
+            &decoded, &[], &source, &original_decoded, &target, day, &initialized_decoded, &mut cx,
+        ).unwrap();
+
+        assert_eq!(
+            crate::product_contract::canonical_bytes(&expected.proof).unwrap(),
+            crate::product_backup::fallible_codec::canonical_bytes(actual.proof(), &mut AllocationContext::new()).unwrap(),
+        );
+        assert_eq!(
+            crate::product_contract::canonical_bytes(&expected.seed).unwrap(),
+            crate::product_backup::fallible_codec::canonical_bytes(actual.seed(), &mut AllocationContext::new()).unwrap(),
+        );
+        assert_eq!(
+            crate::product_contract::canonical_bytes(&expected.operation_seed).unwrap(),
+            crate::product_backup::fallible_codec::canonical_bytes(actual.operation_seed(), &mut AllocationContext::new()).unwrap(),
+        );
+        assert_eq!(expected.frames.len(), actual.frames().len());
+        for (expected_frame, actual_frame) in expected.frames.iter().zip(actual.frames()) {
+            assert_eq!(expected_frame.layer, *actual_frame.layer());
+            assert_eq!(
+                crate::product_contract::canonical_bytes(&expected_frame.before).unwrap(),
+                crate::product_backup::fallible_codec::canonical_bytes(
+                    actual_frame.before(), &mut AllocationContext::new(),
+                ).unwrap(),
+            );
+            assert_eq!(expected_frame.additions.len(), actual_frame.additions().len());
+            for (expected_addition, actual_addition) in expected_frame.additions.iter().zip(actual_frame.additions()) {
+                assert_eq!(
+                    crate::product_contract::canonical_bytes(expected_addition).unwrap(),
+                    crate::product_backup::fallible_codec::canonical_bytes(
+                        actual_addition, &mut AllocationContext::new(),
+                    ).unwrap(),
+                );
+            }
+        }
+        assert!(cx.growth_requests() > 0);
+    }
+
+    #[test]
+    fn fallible_scalar_correspondence_matches_direct_and_historical_legacy_derivation() {
+        assert_correspondence_parity(false);
+        assert_correspondence_parity(true);
+    }
+
+    #[test]
+    fn fallible_scalar_correspondence_refusal_is_atomic_retryable_and_releases_partial_owners() {
+        use std::num::NonZeroUsize;
+
+        let (snapshot, target_capture, original, day) = correspondence_fixture(true);
+        let source_capture = &snapshot.programs[0];
+        let initialized = snapshot.data.clone();
+        let decoded = decoded_snapshot(&snapshot);
+        let source = decoded_captured(source_capture);
+        let target = decoded_captured(&target_capture);
+        let original_decoded = crate::product_contract::decode_data_snapshot_fallible(
+            syntax(&serde_json::to_vec(&original).unwrap()), &mut AllocationContext::new(),
+        ).unwrap();
+        let initialized_decoded = crate::product_contract::decode_data_snapshot_fallible(
+            syntax(&serde_json::to_vec(&initialized).unwrap()), &mut AllocationContext::new(),
+        ).unwrap();
+        let root_bytes = crate::product_contract::canonical_bytes(&snapshot).unwrap();
+        let decoded_root_bytes = crate::product_backup::fallible_codec::canonical_bytes(
+            &decoded, &mut AllocationContext::new(),
+        ).unwrap();
+        let mut baseline = AllocationContext::new();
+        let expected = super::super::derive_correspondence_fallible(
+            &decoded, &[], &source, &original_decoded, &target, day, &initialized_decoded, &mut baseline,
+        ).unwrap();
+        let expected_proof = crate::product_backup::fallible_codec::canonical_bytes(
+            expected.proof(), &mut AllocationContext::new(),
+        ).unwrap();
+        let expected_seed = crate::product_backup::fallible_codec::canonical_bytes(
+            expected.seed(), &mut AllocationContext::new(),
+        ).unwrap();
+        let growths = baseline.growth_requests();
+        assert!(growths > 0);
+
+        for nth in 1..=growths {
+            let mut refused = AllocationContext::fail_nth_growth(NonZeroUsize::new(nth).unwrap(), false);
+            let error = super::super::derive_correspondence_fallible(
+                &decoded, &[], &source, &original_decoded, &target, day, &initialized_decoded, &mut refused,
+            ).unwrap_err();
+            assert!(matches!(error, super::super::CorrespondenceFailure::Allocation(_)), "growth {nth}/{growths}: {error:?}");
+            assert!(refused.first_failure().is_some());
+            assert_eq!(crate::product_contract::canonical_bytes(&snapshot).unwrap(), root_bytes);
+            assert_eq!(crate::product_backup::fallible_codec::canonical_bytes(
+                &decoded, &mut AllocationContext::new(),
+            ).unwrap(), decoded_root_bytes);
+        }
+        let mut retry = AllocationContext::new();
+        let retried = super::super::derive_correspondence_fallible(
+            &decoded, &[], &source, &original_decoded, &target, day, &initialized_decoded, &mut retry,
+        ).unwrap();
+        assert_eq!(crate::product_backup::fallible_codec::canonical_bytes(
+            retried.proof(), &mut AllocationContext::new(),
+        ).unwrap(), expected_proof);
+        assert_eq!(crate::product_backup::fallible_codec::canonical_bytes(
+            retried.seed(), &mut AllocationContext::new(),
+        ).unwrap(), expected_seed);
+    }
+
+    #[test]
+    fn fallible_scalar_correspondence_rejects_unsupported_day_and_forged_cohort() {
+        let (snapshot, target_capture, original, _) = correspondence_fixture(false);
+        let source = decoded_captured(&snapshot.programs[0]);
+        let target = decoded_captured(&target_capture);
+        let decoded = decoded_snapshot(&snapshot);
+        let original_decoded = crate::product_contract::decode_data_snapshot_fallible(
+            syntax(&serde_json::to_vec(&original).unwrap()), &mut AllocationContext::new(),
+        ).unwrap();
+        let initialized_decoded = crate::product_contract::decode_data_snapshot_fallible(
+            syntax(&serde_json::to_vec(&snapshot.data).unwrap()), &mut AllocationContext::new(),
+        ).unwrap();
+        let unsupported = super::super::derive_correspondence_fallible(
+            &decoded, &[], &source, &original_decoded, &target, 4, &initialized_decoded, &mut AllocationContext::new(),
+        ).unwrap_err();
+        assert!(matches!(unsupported, super::super::CorrespondenceFailure::Store(error)
+            if error.to_string().contains("historical input has no actual frozen-history correspondence")));
+
+        let mut forged = snapshot.clone();
+        let target_revision = crate::product_contract::canonical_digest(IdentityDomain::Source, &target_capture).unwrap();
+        let scope = forged.scalar_scope_mut().unwrap();
+        let manifest = scope.compositions.get_mut(&target_revision).unwrap();
+        let old_layer_id = manifest.layers[0].clone();
+        let mut layer = scope.layers.remove(&old_layer_id).unwrap();
+        layer.basis.data.records.clear();
+        let new_layer_id = layer.identity().unwrap();
+        scope.layers.insert(new_layer_id.clone(), layer);
+        manifest.layers[0] = new_layer_id.clone();
+        manifest.active = BTreeSet::from([new_layer_id]);
+        let forged_decoded = decoded_snapshot(&forged);
+        let forged_error = super::super::derive_correspondence_fallible(
+            &forged_decoded, &[], &source, &original_decoded, &target, 3, &initialized_decoded,
+            &mut AllocationContext::new(),
+        ).unwrap_err();
+        assert!(matches!(forged_error, super::super::CorrespondenceFailure::Store(error)
+            if error.to_string().contains("historical record is absent from the actual frozen cohort")));
     }
 
     #[test]
