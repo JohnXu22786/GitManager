@@ -4,6 +4,9 @@ use super::archive::{decode, validate_rehearsal_scenes, Content, Object};
 use super::*;
 use crate::product_store::scope::{LockedArchivePolicy, PolicyFrameRecorder, RetainedPolicyDispatch};
 use std::mem::size_of;
+#[path = "fallible_bundle_decode.rs"]
+#[allow(dead_code)]
+mod fallible_bundle_decode;
 // Same checked compile-time packet arithmetic as the scope layer, deliberately
 // private here rather than widening the scope helper's visibility.
 pub(super) const fn archive_payment<const N: usize>(base: u64, terms: [(usize, u64); N]) -> u64 {
