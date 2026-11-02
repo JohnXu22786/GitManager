@@ -16,6 +16,13 @@ use super::{DataValue, Id, Type};
 /// Sorted, fallibly grown storage for Product Contract record/session values.
 /// Iteration and serialization use the same lexical key order as `BTreeMap`.
 pub(crate) struct FallibleValues(OrderedMap<Id, DataValue>);
+pub(crate) struct FallibleValuesIter<'a>(std::slice::Iter<'a, (Id, DataValue)>);
+impl<'a> Iterator for FallibleValuesIter<'a> {
+    type Item = (&'a Id, &'a DataValue);
+    fn next(&mut self) -> Option<Self::Item> { self.0.next().map(|(key, value)| (key, value)) }
+    fn size_hint(&self) -> (usize, Option<usize>) { self.0.size_hint() }
+}
+impl ExactSizeIterator for FallibleValuesIter<'_> {}
 
 impl FallibleValues {
     pub(crate) const fn new() -> Self {
@@ -42,8 +49,8 @@ impl FallibleValues {
         self.0.contains_key(id)
     }
 
-    pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = (&Id, &DataValue)> + ExactSizeIterator {
-        self.0.iter()
+    pub(crate) fn iter(&self) -> FallibleValuesIter<'_> {
+        FallibleValuesIter(self.0.iter_entries())
     }
 
     /// Occupied keys retain the original key and replace the value, matching
@@ -134,7 +141,7 @@ pub(crate) fn try_clone_data_value(
     })
 }
 
-fn try_clone_type(value: &Type, cx: &mut AllocationContext) -> Result<Type, AllocationFailure> {
+pub(super) fn try_clone_type(value: &Type, cx: &mut AllocationContext) -> Result<Type, AllocationFailure> {
     Ok(match value {
         Type::Boolean => Type::Boolean,
         Type::Integer => Type::Integer,

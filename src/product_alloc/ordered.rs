@@ -29,6 +29,11 @@ impl<K, V> OrderedMap<K, V> {
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = (&K, &V)> + ExactSizeIterator {
         self.entries.iter().map(|(k, v)| (k, v))
     }
+    /// Borrow sorted key/value entries using a named iterator type for generic
+    /// read-only validation interfaces.
+    pub fn iter_entries(&self) -> std::slice::Iter<'_, (K, V)> {
+        self.entries.iter()
+    }
     /// Additional elements, not a target capacity; overflow and ZST semantics
     /// come directly from the allocation foundation. Failure changes nothing.
     pub fn try_reserve(&mut self, additional: usize, cx: &mut AllocationContext)

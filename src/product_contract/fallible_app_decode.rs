@@ -53,29 +53,118 @@ const KEY_MODIFIERS: &[&str] = &["control", "alt", "shift", "command"];
 
 #[derive(Debug, Serialize)]
 pub(crate) struct DecodedAppDefinition {
-    version: u32,
-    id: String,
-    label: String,
-    entities: Vec<EntityDefinition>,
-    state: Vec<StateDefinition>,
-    actions: Vec<DecodedActionDefinition>,
-    outputs: Vec<OutputDefinition>,
-    observables: Vec<ObservableDefinition>,
-    views: Vec<DecodedViewDefinition>,
-    initial_view: String,
+    pub(super) version: u32,
+    pub(super) id: String,
+    pub(super) label: String,
+    pub(super) entities: Vec<EntityDefinition>,
+    pub(super) state: Vec<StateDefinition>,
+    pub(super) actions: Vec<DecodedActionDefinition>,
+    pub(super) outputs: Vec<OutputDefinition>,
+    pub(super) observables: Vec<ObservableDefinition>,
+    pub(super) views: Vec<DecodedViewDefinition>,
+    pub(super) initial_view: String,
+}
+impl DecodedAppDefinition {
+    pub(crate) fn validate_with(
+        &self,
+        cx: &mut AllocationContext,
+    ) -> Result<(), super::AppValidationError> {
+        super::validate_decoded_app(self, cx)
+    }
+    pub(crate) fn try_clone_with(
+        &self,
+        cx: &mut AllocationContext,
+    ) -> Result<Self, super::AppValidationError> {
+        let value = crate::product_backup::fallible_codec::try_serialize_value(self, cx)
+            .map_err(|error| match error {
+                crate::product_backup::fallible_codec::CodecError::Allocation(failure) => super::AppValidationError::Allocation(failure),
+                _ => super::AppValidationError::Contract(super::ContractError("program copy invariant".into())),
+            })?;
+        decode_app_definition(value, cx).map_err(|error| match error {
+            ValueDecodeError::Allocation(failure) => super::AppValidationError::Allocation(failure),
+            _ => super::AppValidationError::Contract(super::ContractError("program copy invariant".into())),
+        })
+    }
+    pub(crate) fn clear_display_labels(&mut self) {
+        self.label.clear();
+        for entity in &mut self.entities {
+            entity.label.clear();
+            for field in &mut entity.fields { field.label.clear(); }
+        }
+        for state in &mut self.state { state.label.clear(); }
+        for action in &mut self.actions { action.label.clear(); }
+        for output in &mut self.outputs {
+            output.label.clear();
+            for column in &mut output.columns { column.label.clear(); }
+        }
+        for observable in &mut self.observables { observable.label.clear(); }
+        for view in &mut self.views {
+            view.label.clear();
+            for action in &mut view.actions { action.label.clear(); }
+            match &mut view.kind {
+                DecodedViewKind::List { columns, controls, .. } => {
+                    for column in columns { column.label.clear(); }
+                    for control in controls { control.label.clear(); }
+                }
+                DecodedViewKind::Detail { columns, .. } => for column in columns { column.label.clear(); },
+                DecodedViewKind::Form { fields, .. } => for field in fields { field.label.clear(); },
+            }
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
-struct DecodedActionDefinition {
-    id: String,
-    label: String,
-    parameters: FallibleMap<Type>,
-    guards: Vec<Expr>,
-    steps: Vec<DecodedStatement>,
-    ensures: Vec<Expr>,
+pub(super) struct DecodedActionDefinition {
+    pub(super) id: String,
+    pub(super) label: String,
+    pub(super) parameters: FallibleMap<Type>,
+    pub(super) guards: Vec<Expr>,
+    pub(super) steps: Vec<DecodedStatement>,
+    pub(super) ensures: Vec<Expr>,
 }
 
-struct FallibleMap<V>(OrderedMap<String, V>);
+pub(super) struct FallibleMap<V>(OrderedMap<String, V>);
+pub(super) struct FallibleMapIter<'a, V>(std::slice::Iter<'a, (String, V)>);
+impl<'a, V> Iterator for FallibleMapIter<'a, V> {
+    type Item = (&'a String, &'a V);
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next().map(|(key, value)| (key, value))
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) { self.0.size_hint() }
+}
+impl<V> ExactSizeIterator for FallibleMapIter<'_, V> {}
+impl<V> FallibleMap<V> {
+    pub(super) const fn new() -> Self { Self(OrderedMap::new()) }
+    pub(super) fn len(&self) -> usize { self.0.len() }
+    pub(super) fn is_empty(&self) -> bool { self.0.is_empty() }
+    pub(super) fn get(&self, key: &str) -> Option<&V> { self.0.get(key) }
+    pub(super) fn contains_key(&self, key: &str) -> bool { self.0.contains_key(key) }
+    pub(super) fn iter(&self) -> FallibleMapIter<'_, V> { FallibleMapIter(self.0.iter_entries()) }
+    pub(super) fn try_insert(
+        &mut self,
+        key: String,
+        value: V,
+        cx: &mut AllocationContext,
+    ) -> Result<Option<V>, crate::product_alloc::AllocationFailure> {
+        self.0.try_insert(key, value, cx)
+    }
+    pub(super) fn try_clone_with<F>(
+        &self,
+        cx: &mut AllocationContext,
+        copy_value: F,
+    ) -> Result<Self, crate::product_alloc::AllocationFailure>
+    where
+        F: FnMut(&V, &mut AllocationContext) -> Result<V, crate::product_alloc::AllocationFailure>,
+    {
+        self.0
+            .try_clone_with(
+                cx,
+                |key, cx| product_alloc::try_copy_str(key, cx, AllocationSite::String),
+                copy_value,
+            )
+            .map(Self)
+    }
+}
 impl<V: std::fmt::Debug> std::fmt::Debug for FallibleMap<V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_map().entries(self.0.iter()).finish()
@@ -91,7 +180,15 @@ impl<V: Serialize> Serialize for FallibleMap<V> {
     }
 }
 
-struct FallibleKeyModifiers(OrderedSet<KeyModifier>);
+pub(super) struct FallibleKeyModifiers(pub(super) OrderedSet<KeyModifier>);
+impl FallibleKeyModifiers {
+    pub(super) fn len(&self) -> usize { self.0.len() }
+    pub(super) fn mask(&self) -> u8 {
+        self.0.iter().fold(0, |mask, value| mask | match value {
+            KeyModifier::Control => 1, KeyModifier::Alt => 2, KeyModifier::Shift => 4, KeyModifier::Command => 8,
+        })
+    }
+}
 impl std::fmt::Debug for FallibleKeyModifiers {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_set().entries(self.0.iter()).finish()
@@ -109,7 +206,7 @@ impl Serialize for FallibleKeyModifiers {
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-enum DecodedStatement {
+pub(super) enum DecodedStatement {
     Create { entity: String, values: FallibleMap<Expr>, bind: String },
     Update { record: Expr, values: FallibleMap<Expr> },
     Archive { record: Expr },
@@ -121,17 +218,17 @@ enum DecodedStatement {
 }
 
 #[derive(Debug, Serialize)]
-struct DecodedViewDefinition {
-    id: String,
-    label: String,
-    kind: DecodedViewKind,
-    actions: Vec<DecodedActionBinding>,
-    keys: Vec<DecodedKeyBinding>,
+pub(super) struct DecodedViewDefinition {
+    pub(super) id: String,
+    pub(super) label: String,
+    pub(super) kind: DecodedViewKind,
+    pub(super) actions: Vec<DecodedActionBinding>,
+    pub(super) keys: Vec<DecodedKeyBinding>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-enum DecodedViewKind {
+pub(super) enum DecodedViewKind {
     List {
         entity: String,
         rows: Expr,
@@ -144,24 +241,24 @@ enum DecodedViewKind {
 }
 
 #[derive(Debug, Serialize)]
-struct DecodedColumn { id: String, label: String, value: Expr }
+pub(super) struct DecodedColumn { pub(super) id: String, pub(super) label: String, pub(super) value: Expr }
 #[derive(Debug, Serialize)]
-struct DecodedStateControl { id: String, label: String, state: String, on_change: Option<String> }
+pub(super) struct DecodedStateControl { pub(super) id: String, pub(super) label: String, pub(super) state: String, pub(super) on_change: Option<String> }
 #[derive(Debug, Serialize)]
-struct DecodedSelectionBinding { id: String, state: String, on_change: Option<String> }
+pub(super) struct DecodedSelectionBinding { pub(super) id: String, pub(super) state: String, pub(super) on_change: Option<String> }
 #[derive(Debug, Serialize)]
-struct DecodedFormInput { parameter: String, label: String }
+pub(super) struct DecodedFormInput { pub(super) parameter: String, pub(super) label: String }
 #[derive(Debug, Serialize)]
-struct DecodedActionBinding {
-    id: String,
-    label: String,
-    placement: ActionPlacement,
-    action: String,
-    arguments: FallibleMap<Expr>,
-    enabled: Expr,
+pub(super) struct DecodedActionBinding {
+    pub(super) id: String,
+    pub(super) label: String,
+    pub(super) placement: ActionPlacement,
+    pub(super) action: String,
+    pub(super) arguments: FallibleMap<Expr>,
+    pub(super) enabled: Expr,
 }
 #[derive(Debug, Serialize)]
-struct DecodedKeyBinding { key: String, modifiers: FallibleKeyModifiers, binding: String }
+pub(super) struct DecodedKeyBinding { pub(super) key: String, pub(super) modifiers: FallibleKeyModifiers, pub(super) binding: String }
 
 pub(crate) fn decode_app_definition(
     value: Value,
@@ -724,6 +821,29 @@ mod tests {
         }"#.to_owned()
     }
 
+    fn valid_app_for_validation() -> String {
+        full_app()
+            .replace(
+                r#"{"id":"json","label":"JSON","format":"json","columns":[]}"#,
+                r#"{"id":"json","label":"JSON","format":"json","columns":[{"id":"name","label":"Name","value_type":{"kind":"text"}}]}"#,
+            )
+            .replace(r#"{"kind":"today"}"#, r#"{"kind":"literal","value_type":{"kind":"boolean"},"value":{"kind":"boolean","value":true}}"#)
+            .replace(r#""record":{"kind":"literal","value_type":{"kind":"boolean"},"value":{"kind":"boolean","value":true}}"#,
+                     r#""record":{"kind":"literal","value_type":{"kind":"reference","entity":"person"},"value":{"kind":"reference","entity":"person","record":"ada"}}"#)
+            .replace(r#"{"kind":"variable","name":"members"}"#,
+                     r#"{"kind":"literal","value_type":{"kind":"list","item":{"kind":"reference","entity":"person"}},"value":{"kind":"list","item_type":{"kind":"reference","entity":"person"},"items":[]}}"#)
+            .replace(r#""columns":{"name":{"kind":"variable","name":"name"}}"#,
+                     r#""columns":{"name":{"kind":"literal","value_type":{"kind":"text"},"value":{"kind":"text","value":"Ada"}}}"#)
+            .replace(r#""target":{"kind":"field","record":{"kind":"variable","name":"record"},"field":"name"}"#,
+                     r#""target":{"kind":"state","state":"members"}"#)
+            .replace(r#""on_change":"save""#, r#""on_change":null"#)
+            .replace(r#""controls":[{"id":"filter","label":"Filter","state":"members","on_change":null}]"#, r#""controls":[]"#)
+            .replace(r#""key":"K""#, r#""key":"k""#)
+            .replace(r#""key":"J""#, r#""key":"j""#)
+            .replace(r#""defaults":{"enabled":{"kind":"boolean","value":true}}"#,
+                     r#""defaults":{"name":{"kind":"text","value":"Ada"}}"#)
+    }
+
     fn canonical(source: &str) {
         let expected = typed(source);
         let mut cx = AllocationContext::new();
@@ -743,6 +863,64 @@ mod tests {
         assert!(matches!(expected.views[1].kind, super::super::ViewKind::Detail { .. }));
         assert!(matches!(expected.views[2].kind, super::super::ViewKind::Form { .. }));
         assert_eq!(expected.views[0].keys[0].modifiers.len(), 2);
+    }
+
+    #[test]
+    fn fallible_app_validation_matches_legacy_semantics_and_error_order() {
+        let source = valid_app_for_validation();
+        let legacy = typed(&source);
+        let mut cx = AllocationContext::new();
+        let decoded = decode_app_definition(syntax(&source), &mut cx).unwrap();
+        assert_eq!(
+            legacy.validate(),
+            super::super::validate_decoded_app(&decoded, &mut cx).map_err(|error| match error {
+                super::super::AppValidationError::Contract(error) => error,
+                super::super::AppValidationError::Allocation(failure) => panic!("unexpected allocation refusal: {failure:?}"),
+            }),
+        );
+
+        for (source, expected_error) in [
+            (source.replace("\"initial_view\":\"list\"", "\"initial_view\":\"missing\""), "unknown initial view"),
+            (source.replace("\"bind\":\"record\"", "\"bind\":\"name\""), "binding shadows existing variable: name"),
+            (source.replace(r#"{"kind":"variable","name":"name"}"#, r#"{"kind":"literal","value_type":{"kind":"boolean"},"value":{"kind":"boolean","value":true}}"#), "expected Text"),
+        ] {
+            let legacy = match typed(&source).validate() {
+                Ok(()) => panic!("expected invalid source for {expected_error}"),
+                Err(error) => error,
+            };
+            let mut cx = AllocationContext::new();
+            let decoded = decode_app_definition(syntax(&source), &mut cx).unwrap();
+            let actual = match super::super::validate_decoded_app(&decoded, &mut cx).unwrap_err() {
+                super::super::AppValidationError::Contract(error) => error,
+                super::super::AppValidationError::Allocation(failure) => panic!("unexpected allocation refusal: {failure:?}"),
+            };
+            assert_eq!(actual, legacy);
+            assert!(actual.0.contains(expected_error), "{}", actual.0);
+        }
+    }
+
+    #[test]
+    fn fallible_validation_environment_refusal_is_typed_and_retryable() {
+        let source = valid_app_for_validation();
+        let mut decode_cx = AllocationContext::new();
+        let decoded = decode_app_definition(syntax(&source), &mut decode_cx).unwrap();
+        let before = super::super::canonical_bytes(&decoded).unwrap();
+        let mut baseline = AllocationContext::new();
+        super::super::validate_decoded_app(&decoded, &mut baseline).unwrap();
+        let growths = baseline.growth_requests();
+        assert!(growths > 0, "validation must reserve fallible lexical environments");
+        for nth in 1..=growths {
+            let mut refused = AllocationContext::fail_nth_growth(NonZeroUsize::new(nth).unwrap(), true);
+            let error = super::super::validate_decoded_app(&decoded, &mut refused).unwrap_err();
+            let super::super::AppValidationError::Allocation(failure) = error else {
+                panic!("expected original allocation failure at growth {nth}: {error:?}");
+            };
+            assert_eq!(Some(failure), refused.first_failure());
+            assert_eq!(failure.kind, AllocationFailureKind::Injected);
+            assert_eq!(before, super::super::canonical_bytes(&decoded).unwrap());
+            let mut retry = AllocationContext::new();
+            super::super::validate_decoded_app(&decoded, &mut retry).unwrap();
+        }
     }
 
     #[test]

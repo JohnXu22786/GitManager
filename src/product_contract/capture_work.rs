@@ -313,15 +313,22 @@ impl<'a> Audit<'a> {
     }
 }
 impl<'a> Audit<'a> {
-    pub(super) fn get<'s, T>(
+    pub(super) fn get<'s, M, T>(
         self,
-        map: &'s BTreeMap<String, T>,
+        map: &'s M,
         key: &str,
-    ) -> Result<Option<&'s T>> {
+    ) -> Result<Option<&'s T>>
+    where
+        M: super::StringValueMap<T> + 's,
+        T: 's,
+    {
         self.map_search(map.len(), key.len())?;
         Ok(map.get(key))
     }
-    pub(super) fn has<T>(self, map: &BTreeMap<String, T>, key: &str) -> Result<bool> {
+    pub(super) fn has<M, T>(self, map: &M, key: &str) -> Result<bool>
+    where
+        M: super::StringValueMap<T>,
+    {
         self.map_search(map.len(), key.len())?;
         Ok(map.contains_key(key))
     }
@@ -390,14 +397,17 @@ impl<'a> Audit<'a> {
             .ok_or_else(|| self.overflow())
     }
     pub(super) fn key_comparator(self, key: &KeyBinding) -> Result<u64> {
+        self.key_comparator_parts(key.key.len(), key.modifiers.len())
+    }
+    pub(super) fn key_comparator_parts(self, key_len: usize, modifier_count: usize) -> Result<u64> {
         if !self.enabled() {
             return Ok(0);
         }
         self.pay(24)?;
-        self.comparator(key.key.len())?
-            .checked_add(native::btree_iter(key.modifiers.len()).ok_or_else(|| self.overflow())?)
+        self.comparator(key_len)?
+            .checked_add(native::btree_iter(modifier_count).ok_or_else(|| self.overflow())?)
             .and_then(|n| n.checked_add(native::btree_iter(4)?))
-            .and_then(|n| n.checked_add((key.modifiers.len() as u64).checked_mul(4)?))
+            .and_then(|n| n.checked_add((modifier_count as u64).checked_mul(4)?))
             .and_then(|n| n.checked_add(1))
             .ok_or_else(|| self.overflow())
     }

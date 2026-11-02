@@ -3320,7 +3320,8 @@ pub(in super::super) fn validate_closed_value_capture(
         a.pay(BOUND_ROOT as u64)?;
         let pending = {
             let app = &capture.program;
-            validate_app_semantics!(app, a, validator, action_prefix_nodes);
+            let mut app_validation_cx = crate::product_alloc::AllocationContext::new();
+        validate_app_semantics!(app, a, validator, action_prefix_nodes, &mut app_validation_cx);
             // Complete same-Value equality excludes floats/coercion and schema
             // expansion. Native compact length is <= this actual immutable raw
             // source length. This establishes only the V1 budget predicate.

@@ -7,7 +7,7 @@
 // One lexical V1 semantic prefix, with no callable semantic-only authority.
 // The ordinary/count tail remains in its original scope with the Validator.
 macro_rules! validate_app_semantics {
-    ($this:ident, $a:ident, $validator:ident, $action_prefix_nodes:ident) => {
+    ($this:ident, $a:ident, $validator:ident, $action_prefix_nodes:ident, $cx:expr) => {
         $a.pay(12)?;
         #[cfg(test)]
         count_validation(|counts| counts.apps += 1);
@@ -29,7 +29,7 @@ macro_rules! validate_app_semantics {
             "unknown initial view",
         )?;
         $a.pay(8)?;
-        let mut $validator = Validator::new($this, $a);
+        let mut $validator = Validator::new_app(AppRef::from($this), $a, $cx);
         validate_entities(&$this.entities, &mut $validator)?;
         $a.slice($this.state.len())?;
         for state in &$this.state {
@@ -57,30 +57,7 @@ macro_rules! validate_app_semantics {
         }
         $a.slice($this.actions.len())?;
         for action in &$this.actions {
-            $a.pay(12)?;
-            $a.nonempty(&action.label)?;
-            $a.require(!action.steps.is_empty(), "action needs steps")?;
-            $a.map_iter(action.parameters.len())?;
-            $a.unique(action.parameters.keys().map(String::as_str))?;
-            $a.map_iter(action.parameters.len())?;
-        for typ in action.parameters.values() {
-            $a.pay(12)?;
-                $validator.typ(typ, 0)?;
-            }
-            let mut env = $a.clone_owned(&action.parameters)?;
-            $a.bounded(action.guards.len())?;
-            $a.bounded(action.ensures.len())?;
-            $a.slice(action.guards.len())?;
-        for guard in &action.guards {
-            $a.pay(12)?;
-                $validator.expect(guard, &env, &Type::Boolean, 0, true)?;
-            }
-            $validator.statements(&action.steps, &mut env, 0)?;
-            $a.slice(action.ensures.len())?;
-        for condition in &action.ensures {
-            $a.pay(12)?;
-                $validator.expect(condition, &env, &Type::Boolean, 0, true)?;
-            }
+            $validator.action_definition(action)?;
         }
         $a.pay(1)?;
         let $action_prefix_nodes = $validator.nodes;
@@ -89,7 +66,8 @@ macro_rules! validate_app_semantics {
             $a.pay(12)?;
             $a.nonempty(&observable.label)?;
             $a.pay(8)?;
-            $validator.expr(&observable.value, &Environment::new(), 0, true)?;
+            let env = $validator.empty_environment();
+            $validator.expr(&observable.value, &env, 0, true)?;
         }
         $a.slice($this.views.len())?;
         for view in &$this.views {
@@ -147,6 +125,39 @@ mod fallible_persisted_decode;
 mod fallible_snapshot_decode;
 #[path = "product_contract/fallible_snapshot_validate.rs"]
 mod fallible_snapshot_validate;
+/// Read-only lexical map view shared by legacy BTreeMap owners and fallible
+/// sorted owners. Validation uses it without materializing either model.
+pub(super) trait StringValueMap<V> {
+    type Iter<'a>: Iterator<Item = (&'a String, &'a V)>
+    where
+        Self: 'a,
+        V: 'a;
+    fn len(&self) -> usize;
+    fn get(&self, key: &str) -> Option<&V>;
+    fn contains_key(&self, key: &str) -> bool;
+    fn iter(&self) -> Self::Iter<'_>;
+}
+impl<V> StringValueMap<V> for BTreeMap<String, V> {
+    type Iter<'a> = std::collections::btree_map::Iter<'a, String, V> where V: 'a;
+    fn len(&self) -> usize { BTreeMap::len(self) }
+    fn get(&self, key: &str) -> Option<&V> { BTreeMap::get(self, key) }
+    fn contains_key(&self, key: &str) -> bool { BTreeMap::contains_key(self, key) }
+    fn iter(&self) -> Self::Iter<'_> { BTreeMap::iter(self) }
+}
+impl<V> StringValueMap<V> for fallible_app_decode::FallibleMap<V> {
+    type Iter<'a> = fallible_app_decode::FallibleMapIter<'a, V> where V: 'a;
+    fn len(&self) -> usize { fallible_app_decode::FallibleMap::len(self) }
+    fn get(&self, key: &str) -> Option<&V> { fallible_app_decode::FallibleMap::get(self, key) }
+    fn contains_key(&self, key: &str) -> bool { fallible_app_decode::FallibleMap::contains_key(self, key) }
+    fn iter(&self) -> Self::Iter<'_> { fallible_app_decode::FallibleMap::iter(self) }
+}
+impl StringValueMap<DataValue> for FallibleValues {
+    type Iter<'a> = values_map::FallibleValuesIter<'a>;
+    fn len(&self) -> usize { self.len() }
+    fn get(&self, key: &str) -> Option<&DataValue> { self.get(key) }
+    fn contains_key(&self, key: &str) -> bool { self.contains_key(key) }
+    fn iter(&self) -> Self::Iter<'_> { self.iter() }
+}
 /// Opaque bridge into fallible persisted data/session DTOs for sibling decoders.
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct FallibleDecodedDataSnapshot(fallible_snapshot_decode::DecodedDataSnapshot);
@@ -201,6 +212,14 @@ impl FallibleDecodedDataSnapshot {
 pub(crate) struct FallibleDecodedSessionState(fallible_persisted_decode::DecodedSessionState);
 #[derive(Debug, Serialize)]
 pub(crate) struct FallibleDecodedCapturedProgram(fallible_capture_decode::DecodedCapturedProgram);
+impl FallibleDecodedCapturedProgram {
+    pub(crate) fn validate_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), AppValidationError> {
+        self.0.validate_with(cx)
+    }
+}
 #[derive(Debug, Serialize)]
 pub(crate) struct FallibleDecodedScenarioSpec(fallible_scenario_decode::DecodedScenarioSpec);
 #[derive(Debug, Serialize)]
@@ -359,6 +378,14 @@ impl fmt::Display for ContractError {
     }
 }
 impl std::error::Error for ContractError {}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AppValidationError {
+    Contract(ContractError),
+    Allocation(crate::product_alloc::AllocationFailure),
+}
+impl From<ContractError> for AppValidationError {
+    fn from(value: ContractError) -> Self { Self::Contract(value) }
+}
 type Result<T> = std::result::Result<T, ContractError>;
 fn require(condition: bool, message: impl Into<String>) -> Result<()> {
     if condition {
@@ -880,19 +907,313 @@ pub struct AppDefinition {
     pub initial_view: Id,
 }
 
-struct Validator<'a, 'w> {
+#[derive(Clone, Copy)]
+enum AppRef<'a> {
+    Legacy(&'a AppDefinition),
+    Decoded(&'a fallible_app_decode::DecodedAppDefinition),
+    Snapshot,
+}
+enum StringMapRef<'a, V> {
+    Legacy(&'a BTreeMap<String, V>),
+    Fallible(&'a fallible_app_decode::FallibleMap<V>),
+}
+impl<V> StringMapRef<'_, V> { fn is_empty(&self) -> bool { self.len()==0 } }
+enum StringMapIter<'a, V> {
+    Legacy(std::collections::btree_map::Iter<'a, String, V>),
+    Fallible(fallible_app_decode::FallibleMapIter<'a, V>),
+}
+impl<'a, V> Iterator for StringMapIter<'a, V> {
+    type Item = (&'a String, &'a V);
+    fn next(&mut self) -> Option<Self::Item> { match self { Self::Legacy(i) => i.next(), Self::Fallible(i) => i.next() } }
+}
+impl<V> ExactSizeIterator for StringMapIter<'_, V> {}
+impl<V> StringValueMap<V> for StringMapRef<'_, V> {
+    type Iter<'a> = StringMapIter<'a, V> where Self: 'a, V: 'a;
+    fn len(&self) -> usize { match self { Self::Legacy(m) => m.len(), Self::Fallible(m) => m.len() } }
+    fn get(&self, key: &str) -> Option<&V> { match self { Self::Legacy(m) => m.get(key), Self::Fallible(m) => m.get(key) } }
+    fn contains_key(&self, key: &str) -> bool { match self { Self::Legacy(m) => m.contains_key(key), Self::Fallible(m) => m.contains_key(key) } }
+    fn iter(&self) -> Self::Iter<'_> { match self { Self::Legacy(m) => StringMapIter::Legacy(m.iter()), Self::Fallible(m) => StringMapIter::Fallible(m.iter()) } }
+}
+enum ActionRef<'a> {
+    Legacy(&'a ActionDefinition),
+    Decoded(&'a fallible_app_decode::DecodedActionDefinition),
+}
+impl<'a> ActionRef<'a> {
+    fn id(&self) -> &str { match self { Self::Legacy(v) => &v.id, Self::Decoded(v) => &v.id } }
+    fn label(&self) -> &str { match self { Self::Legacy(v) => &v.label, Self::Decoded(v) => &v.label } }
+    fn parameters(&self) -> StringMapRef<'_, Type> { match self { Self::Legacy(v) => StringMapRef::Legacy(&v.parameters), Self::Decoded(v) => StringMapRef::Fallible(&v.parameters) } }
+    fn guards(&self) -> &[Expr] { match self { Self::Legacy(v) => &v.guards, Self::Decoded(v) => &v.guards } }
+    fn ensures(&self) -> &[Expr] { match self { Self::Legacy(v) => &v.ensures, Self::Decoded(v) => &v.ensures } }
+    fn steps(&self) -> StatementSlice<'a> { match self { Self::Legacy(v) => StatementSlice::Legacy(&v.steps), Self::Decoded(v) => StatementSlice::Decoded(&v.steps) } }
+}
+trait ActionNode {
+    fn action_id(&self) -> &str;
+    fn action_label(&self) -> &str;
+    fn action_parameters(&self) -> StringMapRef<'_, Type>;
+    fn action_guards(&self) -> &[Expr];
+    fn action_ensures(&self) -> &[Expr];
+    fn action_steps(&self) -> StatementSlice<'_>;
+}
+impl ActionNode for ActionDefinition {
+    fn action_id(&self) -> &str { &self.id }
+    fn action_label(&self) -> &str { &self.label }
+    fn action_parameters(&self) -> StringMapRef<'_, Type> { StringMapRef::Legacy(&self.parameters) }
+    fn action_guards(&self) -> &[Expr] { &self.guards }
+    fn action_ensures(&self) -> &[Expr] { &self.ensures }
+    fn action_steps(&self) -> StatementSlice<'_> { StatementSlice::Legacy(&self.steps) }
+}
+impl ActionNode for fallible_app_decode::DecodedActionDefinition {
+    fn action_id(&self) -> &str { &self.id }
+    fn action_label(&self) -> &str { &self.label }
+    fn action_parameters(&self) -> StringMapRef<'_, Type> { StringMapRef::Fallible(&self.parameters) }
+    fn action_guards(&self) -> &[Expr] { &self.guards }
+    fn action_ensures(&self) -> &[Expr] { &self.ensures }
+    fn action_steps(&self) -> StatementSlice<'_> { StatementSlice::Decoded(&self.steps) }
+}
+impl ActionNode for ActionRef<'_> {
+    fn action_id(&self) -> &str { self.id() }
+    fn action_label(&self) -> &str { self.label() }
+    fn action_parameters(&self) -> StringMapRef<'_, Type> { self.parameters() }
+    fn action_guards(&self) -> &[Expr] { self.guards() }
+    fn action_ensures(&self) -> &[Expr] { self.ensures() }
+    fn action_steps(&self) -> StatementSlice<'_> { self.steps() }
+}
+trait ColumnNode { fn id(&self)->&str; fn label(&self)->&str; fn value(&self)->&Expr; }
+impl ColumnNode for Column { fn id(&self)->&str{&self.id} fn label(&self)->&str{&self.label} fn value(&self)->&Expr{&self.value} }
+impl ColumnNode for fallible_app_decode::DecodedColumn { fn id(&self)->&str{&self.id} fn label(&self)->&str{&self.label} fn value(&self)->&Expr{&self.value} }
+trait ControlNode { fn id(&self)->&str; fn label(&self)->&str; fn state(&self)->&str; fn on_change(&self)->Option<&str>; }
+impl ControlNode for StateControl { fn id(&self)->&str{&self.id} fn label(&self)->&str{&self.label} fn state(&self)->&str{&self.state} fn on_change(&self)->Option<&str>{self.on_change.as_deref()} }
+impl ControlNode for fallible_app_decode::DecodedStateControl { fn id(&self)->&str{&self.id} fn label(&self)->&str{&self.label} fn state(&self)->&str{&self.state} fn on_change(&self)->Option<&str>{self.on_change.as_deref()} }
+trait SelectionNode { fn id(&self)->&str; fn state(&self)->&str; fn on_change(&self)->Option<&str>; }
+impl SelectionNode for SelectionBinding { fn id(&self)->&str{&self.id} fn state(&self)->&str{&self.state} fn on_change(&self)->Option<&str>{self.on_change.as_deref()} }
+impl SelectionNode for fallible_app_decode::DecodedSelectionBinding { fn id(&self)->&str{&self.id} fn state(&self)->&str{&self.state} fn on_change(&self)->Option<&str>{self.on_change.as_deref()} }
+trait FormInputNode { fn parameter(&self)->&str; fn label(&self)->&str; }
+impl FormInputNode for FormInput { fn parameter(&self)->&str{&self.parameter} fn label(&self)->&str{&self.label} }
+impl FormInputNode for fallible_app_decode::DecodedFormInput { fn parameter(&self)->&str{&self.parameter} fn label(&self)->&str{&self.label} }
+trait BindingNode { fn id(&self)->&str; fn label(&self)->&str; fn placement(&self)->ActionPlacement; fn action(&self)->&str; fn arguments(&self)->StringMapRef<'_,Expr>; fn enabled(&self)->&Expr; }
+impl BindingNode for ActionBinding { fn id(&self)->&str{&self.id} fn label(&self)->&str{&self.label} fn placement(&self)->ActionPlacement{self.placement} fn action(&self)->&str{&self.action} fn arguments(&self)->StringMapRef<'_,Expr>{StringMapRef::Legacy(&self.arguments)} fn enabled(&self)->&Expr{&self.enabled} }
+impl BindingNode for fallible_app_decode::DecodedActionBinding { fn id(&self)->&str{&self.id} fn label(&self)->&str{&self.label} fn placement(&self)->ActionPlacement{self.placement} fn action(&self)->&str{&self.action} fn arguments(&self)->StringMapRef<'_,Expr>{StringMapRef::Fallible(&self.arguments)} fn enabled(&self)->&Expr{&self.enabled} }
+trait KeyNode { fn key(&self)->&str; fn mask(&self)->u8; fn modifier_count(&self)->usize; fn binding(&self)->&str; }
+impl KeyNode for KeyBinding { fn key(&self)->&str{&self.key} fn mask(&self)->u8{self.modifiers.iter().fold(0,|m,v|m|match v{KeyModifier::Control=>1,KeyModifier::Alt=>2,KeyModifier::Shift=>4,KeyModifier::Command=>8})} fn modifier_count(&self)->usize{self.modifiers.len()} fn binding(&self)->&str{&self.binding} }
+impl KeyNode for fallible_app_decode::DecodedKeyBinding { fn key(&self)->&str{&self.key} fn mask(&self)->u8{self.modifiers.mask()} fn modifier_count(&self)->usize{self.modifiers.len()} fn binding(&self)->&str{&self.binding} }
+enum ViewKindView<'a, V: ViewNode> {
+    List { entity:&'a str, rows:&'a Expr, columns:&'a [V::Column], controls:&'a [V::Control], selection:Option<&'a V::Selection> },
+    Detail { entity:&'a str, record:&'a Expr, columns:&'a [V::Column] },
+    Form { action:&'a str, fields:&'a [V::FormInput], defaults:&'a V::Defaults },
+}
+trait ViewNode {
+    type Column: ColumnNode; type Control: ControlNode; type Selection: SelectionNode; type FormInput: FormInputNode;
+    type Binding: BindingNode; type Key: KeyNode; type Defaults: StringValueMap<DataValue>;
+    fn id(&self)->&str; fn label(&self)->&str; fn kind(&self)->ViewKindView<'_,Self> where Self:Sized;
+    fn actions(&self)->&[Self::Binding]; fn keys(&self)->&[Self::Key];
+}
+impl ViewNode for ViewDefinition {
+    type Column=Column; type Control=StateControl; type Selection=SelectionBinding; type FormInput=FormInput; type Binding=ActionBinding; type Key=KeyBinding; type Defaults=Values;
+    fn id(&self)->&str{&self.id} fn label(&self)->&str{&self.label} fn actions(&self)->&[Self::Binding]{&self.actions} fn keys(&self)->&[Self::Key]{&self.keys}
+    fn kind(&self)->ViewKindView<'_,Self>{match &self.kind{ViewKind::List{entity,rows,columns,controls,selection}=>ViewKindView::List{entity,rows,columns,controls,selection:selection.as_ref()},ViewKind::Detail{entity,record,columns}=>ViewKindView::Detail{entity,record,columns},ViewKind::Form{action,fields,defaults}=>ViewKindView::Form{action,fields,defaults}}}
+}
+impl ViewNode for fallible_app_decode::DecodedViewDefinition {
+    type Column=fallible_app_decode::DecodedColumn; type Control=fallible_app_decode::DecodedStateControl; type Selection=fallible_app_decode::DecodedSelectionBinding; type FormInput=fallible_app_decode::DecodedFormInput; type Binding=fallible_app_decode::DecodedActionBinding; type Key=fallible_app_decode::DecodedKeyBinding; type Defaults=FallibleValues;
+    fn id(&self)->&str{&self.id} fn label(&self)->&str{&self.label} fn actions(&self)->&[Self::Binding]{&self.actions} fn keys(&self)->&[Self::Key]{&self.keys}
+    fn kind(&self)->ViewKindView<'_,Self>{use fallible_app_decode::DecodedViewKind as K;match &self.kind{K::List{entity,rows,columns,controls,selection}=>ViewKindView::List{entity,rows,columns,controls,selection:selection.as_ref()},K::Detail{entity,record,columns}=>ViewKindView::Detail{entity,record,columns},K::Form{action,fields,defaults}=>ViewKindView::Form{action,fields,defaults}}}
+}
+enum StatementSlice<'a> {
+    Legacy(&'a [Statement]),
+    Decoded(&'a [fallible_app_decode::DecodedStatement]),
+}
+enum StatementView<'a> {
+    Create { entity: &'a str, values: StringMapRef<'a, Expr>, bind: &'a str },
+    Update { record: &'a Expr, values: StringMapRef<'a, Expr> },
+    Archive { record: &'a Expr },
+    SetState { state: &'a str, value: &'a Expr },
+    Collection { target: &'a CollectionTarget, items: &'a Expr },
+    ForEach { items: &'a Expr, binding: &'a str, steps: StatementSlice<'a> },
+    Assert { condition: &'a Expr, message: &'a str },
+    Emit { output: &'a str, items: &'a Expr, binding: &'a str, columns: StringMapRef<'a, Expr> },
+}
+trait StatementNode { fn statement_view(&self) -> StatementView<'_>; }
+impl StatementNode for Statement {
+    fn statement_view(&self) -> StatementView<'_> { match self {
+        Self::Create { entity, values, bind } => StatementView::Create { entity, values: StringMapRef::Legacy(values), bind },
+        Self::Update { record, values } => StatementView::Update { record, values: StringMapRef::Legacy(values) },
+        Self::Archive { record } => StatementView::Archive { record },
+        Self::SetState { state, value } => StatementView::SetState { state, value },
+        Self::Collection { target, items, .. } => StatementView::Collection { target, items },
+        Self::ForEach { items, binding, steps } => StatementView::ForEach { items, binding, steps: StatementSlice::Legacy(steps) },
+        Self::Assert { condition, message } => StatementView::Assert { condition, message },
+        Self::Emit { output, items, binding, columns } => StatementView::Emit { output, items, binding, columns: StringMapRef::Legacy(columns) },
+    }}
+}
+impl StatementNode for fallible_app_decode::DecodedStatement {
+    fn statement_view(&self) -> StatementView<'_> { use fallible_app_decode::DecodedStatement as S; match self {
+        S::Create { entity, values, bind } => StatementView::Create { entity, values: StringMapRef::Fallible(values), bind },
+        S::Update { record, values } => StatementView::Update { record, values: StringMapRef::Fallible(values) },
+        S::Archive { record } => StatementView::Archive { record },
+        S::SetState { state, value } => StatementView::SetState { state, value },
+        S::Collection { target, items, .. } => StatementView::Collection { target, items },
+        S::ForEach { items, binding, steps } => StatementView::ForEach { items, binding, steps: StatementSlice::Decoded(steps) },
+        S::Assert { condition, message } => StatementView::Assert { condition, message },
+        S::Emit { output, items, binding, columns } => StatementView::Emit { output, items, binding, columns: StringMapRef::Fallible(columns) },
+    }}
+}
+impl StatementSlice<'_> {
+    fn visit(&self, f: &mut dyn FnMut(&dyn StatementNode) -> Result<()>) -> Result<()> {
+        match self {
+            Self::Legacy(items) => for item in *items { f(item)?; },
+            Self::Decoded(items) => for item in *items { f(item)?; },
+        }
+        Ok(())
+    }
+}
+impl StatementSlice<'_> {
+    fn len(&self) -> usize { match self { Self::Legacy(v) => v.len(), Self::Decoded(v) => v.len() } }
+    fn is_empty(&self) -> bool { self.len() == 0 }
+}
+impl<'a> From<&'a AppDefinition> for AppRef<'a> {
+    fn from(value: &'a AppDefinition) -> Self { Self::Legacy(value) }
+}
+impl<'a> From<&'a fallible_app_decode::DecodedAppDefinition> for AppRef<'a> {
+    fn from(value: &'a fallible_app_decode::DecodedAppDefinition) -> Self { Self::Decoded(value) }
+}
+enum AppEnvironment {
+    Legacy(BTreeMap<Id, Type>),
+    Decoded(fallible_app_decode::FallibleMap<Type>),
+}
+type Environment = BTreeMap<Id, Type>;
+enum EnvironmentIter<'a> {
+    Legacy(std::collections::btree_map::Iter<'a, Id, Type>),
+    Decoded(fallible_app_decode::FallibleMapIter<'a, Type>),
+}
+impl<'a> Iterator for EnvironmentIter<'a> {
+    type Item = (&'a String, &'a Type);
+    fn next(&mut self) -> Option<Self::Item> {
+        match self { Self::Legacy(iter) => iter.next(), Self::Decoded(iter) => iter.next() }
+    }
+}
+impl ExactSizeIterator for EnvironmentIter<'_> {}
+impl StringValueMap<Type> for AppEnvironment {
+    type Iter<'a> = EnvironmentIter<'a> where Self: 'a, Type: 'a;
+    fn len(&self) -> usize {
+        match self { Self::Legacy(map) => map.len(), Self::Decoded(map) => map.len() }
+    }
+    fn get(&self, key: &str) -> Option<&Type> {
+        match self { Self::Legacy(map) => map.get(key), Self::Decoded(map) => map.get(key) }
+    }
+    fn contains_key(&self, key: &str) -> bool {
+        match self { Self::Legacy(map) => map.contains_key(key), Self::Decoded(map) => map.contains_key(key) }
+    }
+    fn iter(&self) -> Self::Iter<'_> {
+        match self { Self::Legacy(map) => EnvironmentIter::Legacy(map.iter()), Self::Decoded(map) => EnvironmentIter::Decoded(map.iter()) }
+    }
+}
+fn charge_type_map_clone<M: StringValueMap<Type>>(audit: Audit<'_>, map: &M) -> Result<()> {
+    if !audit.enabled() { return Ok(()); }
+    audit.pay(1)?;
+    audit.map_iter(map.len())?;
+    for (key, value) in map.iter() {
+        audit.pay(4)?;
+        key.pay_owned(audit)?;
+        value.pay_owned(audit)?;
+    }
+    audit.pay(crate::product_contract::bounded_input::capture_payment_core::CLONE_DESCRIPTOR)?;
+    audit.amount(crate::product_contract::bounded_input::capture_payment_core::btree_clone::<String, Type>(map.len(), 0))
+}
+impl AppEnvironment {
+    fn empty(app: AppRef<'_>) -> Self {
+        match app { AppRef::Decoded(_) => Self::Decoded(fallible_app_decode::FallibleMap::new()), _ => Self::Legacy(BTreeMap::new()) }
+    }
+}
+struct Validator<'a, 'w, 'c> {
     entities: &'a [EntityDefinition],
     state: &'a [StateDefinition],
     actions: &'a [ActionDefinition],
     outputs: &'a [OutputDefinition],
+    app: AppRef<'a>,
+    allocation: Option<&'c mut crate::product_alloc::AllocationContext>,
+    allocation_failure: Option<crate::product_alloc::AllocationFailure>,
     nodes: usize,
     audit: Audit<'w>,
 }
-type Environment = BTreeMap<Id, Type>;
-impl<'a, 'w> Validator<'a, 'w> {
+impl<'a, 'w, 'c> Validator<'a, 'w, 'c> {
     fn new(app: &'a AppDefinition, audit: Audit<'w>) -> Self {
-        Self { entities: &app.entities, state: &app.state, actions: &app.actions,
-            outputs: &app.outputs, nodes: 0, audit }
+        Self { entities:&app.entities, state:&app.state, actions:&app.actions, outputs:&app.outputs,
+            app:AppRef::Legacy(app), allocation:None, allocation_failure:None, nodes:0, audit }
+    }
+    fn new_app(app: AppRef<'a>, audit: Audit<'w>, allocation: &'c mut crate::product_alloc::AllocationContext) -> Self {
+        let (entities,state,actions,outputs)=match app {
+            AppRef::Legacy(app)=>(app.entities.as_slice(),app.state.as_slice(),app.actions.as_slice(),app.outputs.as_slice()),
+            AppRef::Decoded(app)=>(app.entities.as_slice(),app.state.as_slice(),&[][..],app.outputs.as_slice()),
+            AppRef::Snapshot => (&[][..],&[][..],&[][..],&[][..]),
+        };
+        Self { entities, state, actions, outputs, app, allocation:Some(allocation), allocation_failure:None, nodes:0, audit }
+    }
+    fn is_decoded(&self) -> bool { matches!(self.app, AppRef::Decoded(_)) }
+    fn empty_environment(&self) -> AppEnvironment { AppEnvironment::empty(self.app) }
+    fn clone_environment(&mut self, env: &AppEnvironment) -> Result<AppEnvironment> {
+        let a = self.audit;
+        match env {
+            AppEnvironment::Legacy(map) => Ok(AppEnvironment::Legacy(a.clone_owned(map)?)),
+            AppEnvironment::Decoded(map) => {
+                charge_type_map_clone(a, map)?;
+                let result = map.try_clone_with(self.allocation.as_deref_mut().expect("decoded app has allocation context"), |value, cx| values_map::try_clone_type(value, cx));
+                match result {
+                    Ok(copy) => Ok(AppEnvironment::Decoded(copy)),
+                    Err(failure) => { self.allocation_failure = Some(failure); Err(ContractError(String::new())) }
+                }
+            }
+        }
+    }
+    fn insert_environment(&mut self, env: &mut AppEnvironment, key: &str, value: Type) -> Result<()> {
+        let a = self.audit;
+        match env {
+            AppEnvironment::Legacy(map) => a.insert_string(map, key, value),
+            AppEnvironment::Decoded(map) => {
+                a.string(key.len())?;
+                a.insert::<String, Type>(map.len(), a.comparator(key.len())?)?;
+                let cx = self.allocation.as_deref_mut().expect("decoded app has allocation context");
+                let owned_key = crate::product_alloc::try_copy_str(key, cx, crate::product_alloc::AllocationSite::String)
+                    .and_then(|key| map.try_insert(key, value, cx).map(|_| ()))
+                    .map_err(|failure| { self.allocation_failure = Some(failure); ContractError(String::new()) });
+                owned_key
+            }
+        }
+    }
+    fn parameter_environment(&mut self, parameters: StringMapRef<'_, Type>) -> Result<AppEnvironment> {
+        let a = self.audit;
+        match parameters {
+            StringMapRef::Legacy(map) => Ok(AppEnvironment::Legacy(a.clone_owned(map)?)),
+            StringMapRef::Fallible(map) => {
+                charge_type_map_clone(a, map)?;
+                let cx = self.allocation.as_deref_mut().expect("decoded app has allocation context");
+                match map.try_clone_with(cx, |value, cx| values_map::try_clone_type(value, cx)) {
+                    Ok(copy) => Ok(AppEnvironment::Decoded(copy)),
+                    Err(failure) => { self.allocation_failure = Some(failure); Err(ContractError(String::new())) }
+                }
+            }
+        }
+    }
+    fn action_definition<A: ActionNode>(&mut self, action: &A) -> Result<()> {
+        let a = self.audit;
+        a.pay(12)?;
+        a.nonempty(action.action_label())?;
+        let steps = action.action_steps();
+        a.require(!steps.is_empty(), "action needs steps")?;
+        let parameters = action.action_parameters();
+        a.map_iter(parameters.len())?;
+        a.unique(parameters.iter().map(|(key, _)| key.as_str()))?;
+        a.map_iter(parameters.len())?;
+        for (_, typ) in parameters.iter() { a.pay(12)?; self.typ(typ, 0)?; }
+        let mut env = self.parameter_environment(parameters)?;
+        let guards = action.action_guards();
+        let ensures = action.action_ensures();
+        a.bounded(guards.len())?;
+        a.bounded(ensures.len())?;
+        a.slice(guards.len())?;
+        for guard in guards { a.pay(12)?; self.expect(guard, &env, &Type::Boolean, 0, true)?; }
+        self.statements(steps, &mut env, 0)?;
+        a.slice(ensures.len())?;
+        for condition in ensures { a.pay(12)?; self.expect(condition, &env, &Type::Boolean, 0, true)?; }
+        Ok(())
     }
     fn node(&mut self, depth: usize) -> Result<()> {
         let a = self.audit;
@@ -918,6 +1239,17 @@ impl<'a, 'w> Validator<'a, 'w> {
     fn action(&self, id: &str) -> Result<&'a ActionDefinition> {
         let a=self.audit;
         if let Some(value)=a.find(self.actions,id,|v|&v.id)? { return Ok(value); }
+        a.pay(2)?;a.format(id.len().checked_add(16).ok_or_else(||a.overflow())?)?;
+        Err(ContractError(format!("unknown action: {id}")))
+    }
+    fn action_any(&self, id: &str) -> Result<ActionRef<'a>> {
+        let a=self.audit;
+        let found = match self.app {
+            AppRef::Legacy(app) => a.find(&app.actions,id,|v|&v.id)?.map(ActionRef::Legacy),
+            AppRef::Decoded(app) => a.find(&app.actions,id,|v|&v.id)?.map(ActionRef::Decoded),
+            AppRef::Snapshot => a.find(self.actions,id,|v|&v.id)?.map(ActionRef::Legacy),
+        };
+        if let Some(value)=found { return Ok(value); }
         a.pay(2)?;a.format(id.len().checked_add(16).ok_or_else(||a.overflow())?)?;
         Err(ContractError(format!("unknown action: {id}")))
     }
@@ -947,7 +1279,7 @@ impl<'a, 'w> Validator<'a, 'w> {
         }
         Ok(())
     }
-    fn bound(&self, env: &Environment, name: &str, typ: Type) -> Result<Environment> {
+    fn bound_for<M: StringValueMap<Type>>(&mut self, env: &M, name: &str, typ: Type) -> Result<AppEnvironment> {
         let a = self.audit;
         a.pay(8)?;
         a.check_id(name)?;
@@ -959,14 +1291,47 @@ impl<'a, 'w> Validator<'a, 'w> {
         a.pay(2)?;a.format(name.len().checked_add(35).ok_or_else(|| a.overflow())?)?;
         a.require_owned(available, format!("binding shadows existing variable: {name}"))?;
         }
-        let mut env = a.clone_owned(env)?;
-        a.insert_string(&mut env, name, typ)?;
+        let mut env = if self.is_decoded() {
+            let mut copied = fallible_app_decode::FallibleMap::new();
+            charge_type_map_clone(a, env)?;
+            for (key, value) in env.iter() {
+                let key = crate::product_alloc::try_copy_str(key, self.allocation.as_deref_mut().expect("decoded app has allocation context"), crate::product_alloc::AllocationSite::String)
+                    .map_err(|failure| { self.allocation_failure = Some(failure); ContractError(String::new()) })?;
+                let value = values_map::try_clone_type(value, self.allocation.as_deref_mut().expect("decoded app has allocation context"))
+                    .map_err(|failure| { self.allocation_failure = Some(failure); ContractError(String::new()) })?;
+                copied.try_insert(key,value,self.allocation.as_deref_mut().expect("decoded app has allocation context"))
+                    .map_err(|failure| { self.allocation_failure = Some(failure); ContractError(String::new()) })?;
+            }
+            AppEnvironment::Decoded(copied)
+        } else {
+            a.pay(1)?;
+            a.map_iter(env.len())?;
+            for (key,value) in env.iter() { a.pay(4)?; key.pay_owned(a)?; value.pay_owned(a)?; }
+            a.pay(crate::product_contract::bounded_input::capture_payment_core::CLONE_DESCRIPTOR)?;
+            a.amount(crate::product_contract::bounded_input::capture_payment_core::btree_clone::<String,Type>(env.len(),0))?;
+            AppEnvironment::Legacy(env.iter().map(|(k,v)|(k.clone(),v.clone())).collect())
+        };
+        self.insert_environment(&mut env, name, typ)?;
         Ok(env)
     }
-    fn expect(
+    fn bound(&self, env: &Environment, name: &str, typ: Type) -> Result<Environment> {
+        let a=self.audit;
+        a.pay(8)?;
+        a.check_id(name)?;
+        let available=!a.has(env,name)?;
+        a.pay(8)?;
+        if a.enabled() && available { a.pay(1)?; } else {
+            a.pay(2)?;a.format(name.len().checked_add(35).ok_or_else(||a.overflow())?)?;
+            a.require_owned(available,format!("binding shadows existing variable: {name}"))?;
+        }
+        let mut env=a.clone_owned(env)?;
+        a.insert_string(&mut env,name,typ)?;
+        Ok(env)
+    }
+    fn expect<M: StringValueMap<Type>>(
         &mut self,
         expr: &Expr,
-        env: &Environment,
+        env: &M,
         expected: &Type,
         depth: usize,
         state: bool,
@@ -984,10 +1349,10 @@ impl<'a, 'w> Validator<'a, 'w> {
         a.require_owned(equal, format!("expression type mismatch: expected {expected:?}, found {actual:?}"))
         }
     }
-    fn list_item(
+    fn list_item<M: StringValueMap<Type>>(
         &mut self,
         expr: &Expr,
-        env: &Environment,
+        env: &M,
         depth: usize,
         state: bool,
     ) -> Result<Type> {
@@ -998,10 +1363,10 @@ impl<'a, 'w> Validator<'a, 'w> {
             _ => Err(a.error("expected collection")?),
         }
     }
-    fn record_entity(
+    fn record_entity<M: StringValueMap<Type>>(
         &mut self,
         expr: &Expr,
-        env: &Environment,
+        env: &M,
         depth: usize,
         state: bool,
     ) -> Result<Id> {
@@ -1012,7 +1377,7 @@ impl<'a, 'w> Validator<'a, 'w> {
             _ => Err(a.error("expected nonoptional record reference")?),
         }
     }
-    fn expr(&mut self, expr: &Expr, env: &Environment, depth: usize, state: bool) -> Result<Type> {
+    fn expr<M: StringValueMap<Type>>(&mut self, expr: &Expr, env: &M, depth: usize, state: bool) -> Result<Type> {
         let a = self.audit;
         a.pay(8)?;
         self.node(depth)?;
@@ -1057,7 +1422,7 @@ impl<'a, 'w> Validator<'a, 'w> {
                     "query limit out of bounds",
                 )?;
                 a.bounded(sort.len())?;
-                let env = self.bound(env, binding, a.reference_type(entity)?)?;
+                let env = self.bound_for(env, binding, a.reference_type(entity)?)?;
                 self.expect(predicate, &env, &Type::Boolean, next, state)?;
                 a.slice(sort.len())?;
         for key in sort {
@@ -1085,7 +1450,7 @@ impl<'a, 'w> Validator<'a, 'w> {
                 predicate,
             } => {
                 let item = self.list_item(items, env, next, state)?;
-                let env = self.bound(env, binding, a.clone_owned(&item)?)?;
+                let env = self.bound_for(env, binding, a.clone_owned(&item)?)?;
                 self.expect(predicate, &env, &Type::Boolean, next, state)?;
                 if matches!(expr, Expr::Filter { .. }) {
                     a.list_type(item)?
@@ -1099,7 +1464,7 @@ impl<'a, 'w> Validator<'a, 'w> {
                 value,
             } => {
                 let item = self.list_item(items, env, next, state)?;
-                let env = self.bound(env, binding, item)?;
+                let env = self.bound_for(env, binding, item)?;
                 let result = a.list_type(self.expr(value, &env, next, state)?)?;
                 self.typ(&result, 0)?;
                 result
@@ -1182,7 +1547,7 @@ impl<'a, 'w> Validator<'a, 'w> {
             }
         })
     }
-    fn comparison_operands(&mut self, left: &Expr, right: &Expr, env: &Environment,
+    fn comparison_operands<M: StringValueMap<Type>>(&mut self, left: &Expr, right: &Expr, env: &M,
         depth: usize, state: bool, ordered: bool) -> Result<Type> {
         let a=self.audit;
         a.pay(6)?;
@@ -1191,10 +1556,10 @@ impl<'a, 'w> Validator<'a, 'w> {
         self.expect(right, env, &typ, depth, state)?;
         Ok(Type::Boolean)
     }
-    fn assignment(
+    fn assignment<M: StringValueMap<Type>>(
         &mut self,
         value: &Expr,
-        env: &Environment,
+        env: &M,
         expected: &Type,
         depth: usize,
     ) -> Result<()> {
@@ -1233,8 +1598,8 @@ impl<'a, 'w> Validator<'a, 'w> {
     fn assignments(
         &mut self,
         entity: &str,
-        values: &BTreeMap<Id, Expr>,
-        env: &Environment,
+        values: &impl StringValueMap<Expr>,
+        env: &impl StringValueMap<Type>,
         depth: usize,
         create: bool,
     ) -> Result<()> {
@@ -1242,7 +1607,7 @@ impl<'a, 'w> Validator<'a, 'w> {
         a.pay(8)?;
         a.bounded(values.len())?;
         a.map_iter(values.len())?;
-        for (field, value) in values {
+        for (field, value) in values.iter() {
             a.pay(8)?;
             let typ = &self.field(entity, field)?.value_type;
             // Optional storage accepts a computed non-null inner value as well
@@ -1267,42 +1632,32 @@ impl<'a, 'w> Validator<'a, 'w> {
         }
         Ok(())
     }
-    fn statements(
-        &mut self,
-        steps: &[Statement],
-        env: &mut Environment,
-        depth: usize,
-    ) -> Result<()> {
+    fn statements(&mut self, steps: StatementSlice<'_>, env: &mut AppEnvironment, depth: usize) -> Result<()> {
         let a = self.audit;
         a.pay(8)?;
         a.bounded(steps.len())?;
         a.slice(steps.len())?;
-        for step in steps {
+        steps.visit(&mut |step| {
             a.pay(8)?;
             a.pay(12)?;
             self.node(depth)?;
-            match step {
-                Statement::Create {
-                    entity,
-                    values,
-                    bind,
-                } => {
+            match step.statement_view() {
+                StatementView::Create { entity, values, bind } => {
                     self.entity(entity)?;
-                    self.assignments(entity, values, env, depth + 1, true)?;
-                    *env = self.bound(env, bind, a.reference_type(entity)?)?;
+                    self.assignments(entity, &values, env, depth + 1, true)?;
+                    let typ = a.reference_type(entity)?;
+                    *env = self.bound_for(env, bind, typ)?;
                 }
-                Statement::Update { record, values } => {
+                StatementView::Update { record, values } => {
                     let entity = self.record_entity(record, env, depth + 1, true)?;
                     a.require(!values.is_empty(), "empty update")?;
-                    self.assignments(&entity, values, env, depth + 1, false)?;
+                    self.assignments(&entity, &values, env, depth + 1, false)?;
                 }
-                Statement::Archive { record } => {
-                    self.record_entity(record, env, depth + 1, true)?;
-                }
-                Statement::SetState { state, value } => {
+                StatementView::Archive { record } => { self.record_entity(record, env, depth + 1, true)?; }
+                StatementView::SetState { state, value } => {
                     self.expect(value, env, &self.state(state)?.value_type, depth + 1, true)?;
                 }
-                Statement::Collection { target, items, .. } => {
+                StatementView::Collection { target, items } => {
                     let typ = match target {
                         CollectionTarget::State { state } => a.clone_owned(&self.state(state)?.value_type)?,
                         CollectionTarget::Field { record, field } => {
@@ -1310,219 +1665,171 @@ impl<'a, 'w> Validator<'a, 'w> {
                             a.clone_owned(&self.field(&entity, field)?.value_type)?
                         }
                     };
-                    a.require(
-                        matches!(typ, Type::List { .. }),
-                        "collection mutation requires list target",
-                    )?;
+                    a.require(matches!(typ, Type::List { .. }), "collection mutation requires list target")?;
                     self.expect(items, env, &typ, depth + 1, true)?;
                 }
-                Statement::ForEach {
-                    items,
-                    binding,
-                    steps,
-                } => {
+                StatementView::ForEach { items, binding, steps } => {
                     let item = self.list_item(items, env, depth + 1, true)?;
-                    let mut local = self.bound(env, binding, item)?;
+                    let mut local = self.bound_for(env, binding, item)?;
                     self.statements(steps, &mut local, depth + 1)?;
                 }
-                Statement::Assert { condition, message } => {
+                StatementView::Assert { condition, message } => {
                     a.nonempty(message)?;
                     self.expect(condition, env, &Type::Boolean, depth + 1, true)?;
                 }
-                Statement::Emit {
-                    output,
-                    items,
-                    binding,
-                    columns,
-                } => {
+                StatementView::Emit { output, items, binding, columns } => {
                     let output = match a.find(self.outputs, output, |o| &o.id)? {
                         Some(value) => value, None => return Err(a.error("unknown output")?),
                     };
                     let item = self.list_item(items, env, depth + 1, true)?;
-                    let env = self.bound(env, binding, item)?;
-                    a.require(
-                        columns.len() == output.columns.len(),
-                        "output columns differ from definition",
-                    )?;
+                    let local = self.bound_for(env, binding, item)?;
+                    a.require(columns.len() == output.columns.len(), "output columns differ from definition")?;
                     a.slice(output.columns.len())?;
-        for column in &output.columns {
-            a.pay(8)?;
-                        let value = match a.get(columns, &column.id)? {
+                    for column in &output.columns {
+                        a.pay(8)?;
+                        let value = match a.get(&columns, &column.id)? {
                             Some(value) => value, None => return Err(a.error("missing output column")?),
                         };
-                        self.expect(value, &env, &column.value_type, depth + 1, true)?;
+                        self.expect(value, &local, &column.value_type, depth + 1, true)?;
                     }
                 }
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
-    fn columns(&mut self, columns: &[Column], env: &Environment) -> Result<()> {
+    fn columns<C: ColumnNode>(&mut self, columns: &[C], env: &AppEnvironment) -> Result<()> {
         let a = self.audit;
         a.pay(8)?;
-        a.unique(columns.iter().map(|c| c.id.as_str()))?;
+        a.unique(columns.iter().map(|c| c.id()))?;
         a.slice(columns.len())?;
         for column in columns {
             a.pay(8)?;
-            a.nonempty(&column.label)?;
-            self.expr(&column.value, env, 0, true)?;
+            a.nonempty(column.label())?;
+            self.expr(column.value(), env, 0, true)?;
         }
         Ok(())
     }
     fn on_change(&self, action: Option<&str>, typ: &Type) -> Result<()> {
         let a = self.audit;
         a.pay(8)?;
-        if let Some(action) = action {
-            let parameters = &self.action(action)?.parameters;
-            a.string(5)?;
-            if a.enabled() {typ.pay_owned(a)?;}
-            capture_canonical::reserve_from_iter::<String,Type>(1, a.comparator(5)?, a)?;
-            let expected = BTreeMap::from([("value".into(), typ.clone())]);
-            a.require(
-                a.equal_owned(parameters, &expected)?,
-                "on-change action must take exactly one value parameter of the control type",
-            )?;
+        if let Some(action_id) = action {
+            let action = self.action_any(action_id)?;
+            let parameters = action.parameters();
+            if let ActionRef::Legacy(legacy) = action {
+                a.string(5)?;
+                if a.enabled() { typ.pay_owned(a)?; }
+                capture_canonical::reserve_from_iter::<String,Type>(1, a.comparator(5)?, a)?;
+                let expected = BTreeMap::from([("value".into(), typ.clone())]);
+                a.require(a.equal_owned(&legacy.parameters, &expected)?,
+                    "on-change action must take exactly one value parameter of the control type")?;
+            } else {
+                a.map_iter(parameters.len())?;
+                let matches = parameters.len() == 1 && match a.get(&parameters, "value")? {
+                    Some(value) => a.type_equal(value, typ)?, None => false,
+                };
+                a.require(matches, "on-change action must take exactly one value parameter of the control type")?;
+            }
         }
         Ok(())
     }
-    fn view(&mut self, view: &ViewDefinition) -> Result<()> {
+    fn view<V: ViewNode>(&mut self, view: &V) -> Result<()> {
         let a = self.audit;
         a.pay(8)?;
-        a.nonempty(&view.label)?;
+        a.nonempty(view.label())?;
         a.pay(8)?;
-        let mut env = Environment::new();
-        match &view.kind {
-            ViewKind::List {
-                entity,
-                rows,
-                columns,
-                controls,
-                selection,
-            } => {
+        let mut env = self.empty_environment();
+        match view.kind() {
+            ViewKindView::List { entity, rows, columns, controls, selection } => {
                 self.entity(entity)?;
                 self.expect(rows, &env, &a.list_type(a.reference_type(entity)?)?, 0, true)?;
-                a.insert_string(&mut env, "row", a.reference_type(entity)?)?;
+                let row_type = a.reference_type(entity)?;
+                self.insert_environment(&mut env, "row", row_type)?;
                 self.columns(columns, &env)?;
-                a.unique(
-                    controls
-                        .iter()
-                        .map(|c| c.id.as_str())
-                        .chain(selection.iter().map(|s| s.id.as_str())),
-                )?;
+                a.unique(controls.iter().map(|c|c.id()).chain(selection.iter().map(|s|s.id())))?;
                 a.slice(controls.len())?;
-        for control in controls {
-            a.pay(8)?;
-                    a.nonempty(&control.label)?;
-                    let typ = &self.state(&control.state)?.value_type;
-                    a.require(
-                        typ.is_scalar()
-                            || matches!(typ, Type::Optional { item } if item.is_scalar()),
-                        "control must edit a scalar",
-                    )?;
-                    self.on_change(control.on_change.as_deref(), typ)?;
+                for control in controls {
+                    a.pay(8)?;
+                    a.nonempty(control.label())?;
+                    let typ = &self.state(control.state())?.value_type;
+                    a.require(typ.is_scalar() || matches!(typ,Type::Optional{item} if item.is_scalar()),
+                        "control must edit a scalar")?;
+                    self.on_change(control.on_change(), typ)?;
                 }
                 if let Some(selection) = selection {
-                    let typ = &self.state(&selection.state)?.value_type;
-                    a.require(
-                        a.type_equal(typ, &a.list_type(a.reference_type(entity)?)?)?,
-                        "selection state has wrong entity/type",
-                    )?;
-                    self.on_change(selection.on_change.as_deref(), typ)?;
+                    let typ = &self.state(selection.state())?.value_type;
+                    a.require(a.type_equal(typ,&a.list_type(a.reference_type(entity)?)?)?,
+                        "selection state has wrong entity/type")?;
+                    self.on_change(selection.on_change(), typ)?;
                 }
             }
-            ViewKind::Detail {
-                entity,
-                record,
-                columns,
-            } => {
+            ViewKindView::Detail { entity, record, columns } => {
                 self.entity(entity)?;
-                self.expect(record, &env, &a.reference_type(entity)?, 0, true)?;
-                a.insert_string(&mut env, "row", a.reference_type(entity)?)?;
-                self.columns(columns, &env)?;
+                self.expect(record,&env,&a.reference_type(entity)?,0,true)?;
+                let row_type = a.reference_type(entity)?;
+                self.insert_environment(&mut env,"row",row_type)?;
+                self.columns(columns,&env)?;
             }
-            ViewKind::Form {
-                action,
-                fields,
-                defaults,
-            } => {
-                let action = self.action(action)?;
-                a.unique(fields.iter().map(|f| f.parameter.as_str()))?;
+            ViewKindView::Form { action: action_id, fields, defaults } => {
+                let action = self.action_any(action_id)?;
+                let parameters = action.parameters();
+                a.unique(fields.iter().map(|f|f.parameter()))?;
                 a.slice(fields.len())?;
-        for field in fields {
-            a.pay(8)?;
-                    a.nonempty(&field.label)?;
-                    a.require(
-                        a.has(&action.parameters, &field.parameter)?,
-                        "unknown form parameter",
-                    )?;
+                for field in fields {
+                    a.pay(8)?;
+                    a.nonempty(field.label())?;
+                    a.require(a.has(&parameters,field.parameter())?,"unknown form parameter")?;
                 }
                 a.map_iter(defaults.len())?;
-        for (id, value) in defaults {
-            a.pay(8)?;
-                    let typ = match a.get(&action.parameters, id)? {
-                        Some(value) => value, None => return Err(a.error("unknown default parameter")?),
-                    };
-                    validate_value_audited(value, typ, 0, a)?;
+                for (id,value) in defaults.iter() {
+                    a.pay(8)?;
+                    let typ = match a.get(&parameters,id)? {Some(value)=>value,None=>return Err(a.error("unknown default parameter")?)};
+                    validate_value_audited(value,typ,0,a)?;
                 }
-                a.map_iter(action.parameters.len())?;
-        for id in action.parameters.keys() {
-            a.pay(8)?;
-                    a.require(
-                        a.has(defaults, id)? || a.find(fields, id, |f| &f.parameter)?.is_some(),
-                        "form omits required action parameter",
-                    )?;
+                a.map_iter(parameters.len())?;
+                for (id,_) in parameters.iter() {
+                    a.pay(8)?;
+                    a.require(a.has(defaults,id)? || a.find(fields,id,|f|f.parameter())?.is_some(),
+                        "form omits required action parameter")?;
                 }
             }
         }
-        a.unique(view.actions.iter().map(|a| a.id.as_str()))?;
-        a.slice(view.actions.len())?;
-        for binding in &view.actions {
+        a.unique(view.actions().iter().map(|binding|binding.id()))?;
+        a.slice(view.actions().len())?;
+        for binding in view.actions() {
             a.pay(8)?;
-            let env = if binding.placement == ActionPlacement::Row {
-                a.require(
-                    a.has(&env, "row")?,
-                    "row action requires a list or detail view",
-                )?;
-                a.clone_owned(&env)?
-            } else {
-                { a.pay(8)?; Environment::new() }
-            };
-            a.nonempty(&binding.label)?;
-            let action = self.action(&binding.action)?;
-            a.require(
-                binding.arguments.len() == action.parameters.len(),
-                "action argument count mismatch",
-            )?;
-            a.map_iter(action.parameters.len())?;
-        for (name, typ) in &action.parameters {
-            a.pay(8)?;
-                let value = match a.get(&binding.arguments, name)? {
-                    Some(value) => value, None => return Err(a.error("missing action argument")?),
-                };
-                self.expect(value, &env, typ, 0, true)?;
+            let local_env = if binding.placement()==ActionPlacement::Row {
+                a.require(a.has(&env,"row")?,"row action requires a list or detail view")?;
+                self.clone_environment(&env)?
+            } else { a.pay(8)?; self.empty_environment() };
+            a.nonempty(binding.label())?;
+            let action = self.action_any(binding.action())?;
+            let parameters = action.parameters();
+            let arguments = binding.arguments();
+            a.require(arguments.len()==parameters.len(),"action argument count mismatch")?;
+            a.map_iter(parameters.len())?;
+            for (name,typ) in parameters.iter() {
+                a.pay(8)?;
+                let value = match a.get(&arguments,name)? {Some(value)=>value,None=>return Err(a.error("missing action argument")?)};
+                self.expect(value,&local_env,typ,0,true)?;
             }
-            self.expect(&binding.enabled, &env, &Type::Boolean, 0, true)?;
+            self.expect(binding.enabled(),&local_env,&Type::Boolean,0,true)?;
         }
-        a.bounded(view.keys.len())?;
+        a.bounded(view.keys().len())?;
         a.pay(8)?;
         let mut seen = BTreeSet::new();
-        a.slice(view.keys.len())?;
-        for key in &view.keys {
+        a.slice(view.keys().len())?;
+        for key in view.keys() {
             a.pay(8)?;
-            a.scaled(key.key.len(), 4, 40)?;
-            a.require(valid_key(&key.key), "unsupported keyboard key")?;
-            a.insert::<(&String, &BTreeSet<KeyModifier>), ()>(seen.len(), a.key_comparator(key)?)?;
-            a.require(
-                seen.insert((&key.key, &key.modifiers)),
-                "duplicate keyboard chord",
-            )?;
-            a.require(
-                a.find(&view.actions, &key.binding, |v| &v.id)?.is_some(),
-                "unknown keyboard action binding",
-            )?;
+            a.scaled(key.key().len(),4,40)?;
+            a.require(valid_key(key.key()),"unsupported keyboard key")?;
+            let chord=(key.key(),key.mask());
+            a.insert::<(&str,u8),()>(seen.len(),a.key_comparator_parts(key.key().len(),key.modifier_count())?)?;
+            a.require(seen.insert(chord),"duplicate keyboard chord")?;
+            a.require(a.find(view.actions(),key.binding(),|v|v.id())?.is_some(),"unknown keyboard action binding")?;
         }
         Ok(())
     }
+
 }
 pub fn valid_key(key: &str) -> bool {
     (key.len() == 1
@@ -1596,7 +1903,8 @@ impl AppDefinition {
         self.validate_audited(Audit::none()).map(|_| ())
     }
     fn validate_audited(&self, a: Audit<'_>) -> Result<capture_validation::CaptureFacts> {
-        validate_app_semantics!(self, a, validator, action_prefix_nodes);
+        let mut app_validation_cx = crate::product_alloc::AllocationContext::new();
+        validate_app_semantics!(self, a, validator, action_prefix_nodes, &mut app_validation_cx);
         // Keep the ordinary Vec alive through the original validation tail.
         let bytes;
         let canonical_len = if a.enabled() {
@@ -1621,6 +1929,30 @@ impl AppDefinition {
         app.clear_display_labels_audited(Audit::none())?;
         canonical_digest(IdentityDomain::SemanticProgram, &app)
     }
+}
+pub(crate) fn validate_decoded_app(
+    app: &fallible_app_decode::DecodedAppDefinition,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<(), AppValidationError> {
+    let audit = Audit::none();
+    let semantic = (|| -> std::result::Result<(usize, usize), AppValidationError> {
+        validate_app_semantics!(app, audit, validator, action_prefix_nodes, cx);
+        let nodes = validator.nodes;
+        drop(validator);
+        Ok((nodes, action_prefix_nodes))
+    })();
+    if let Some(failure) = cx.first_failure() {
+        return Err(AppValidationError::Allocation(failure));
+    }
+    semantic?;
+    let bytes = crate::product_backup::fallible_codec::canonical_bytes(app, cx).map_err(|error| match error {
+        crate::product_backup::fallible_codec::CodecError::Allocation(failure) => AppValidationError::Allocation(failure),
+        _ => AppValidationError::Contract(ContractError("program canonical encoding failed".into())),
+    })?;
+    if bytes.len() > MAX_WIRE_BYTES {
+        return Err(AppValidationError::Contract(ContractError("program exceeds byte budget".into())));
+    }
+    Ok(())
 }
 impl AppDefinition {
     fn clear_display_labels_audited(&mut self,a:Audit<'_>)->Result<()> {
@@ -1706,7 +2038,7 @@ impl AppDefinition {
     }
 }
 
-fn validate_entities(entities: &[EntityDefinition], validator: &mut Validator<'_, '_>) -> Result<()> {
+fn validate_entities(entities: &[EntityDefinition], validator: &mut Validator<'_, '_, '_>) -> Result<()> {
     let a = validator.audit;
     a.pay(1)?;
     a.unique(entities.iter().map(|e| e.id.as_str()))?;
@@ -5351,7 +5683,7 @@ impl AppDefinition {
             .map(|observable| {
                 Ok((
                     observable.id.clone(),
-                    validator.expr(&observable.value, &Environment::new(), 0, true)?,
+                    validator.expr(&observable.value, &BTreeMap::new(), 0, true)?,
                 ))
             })
             .collect()

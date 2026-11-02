@@ -145,7 +145,7 @@ pub(super) fn validate<T: Snapshot>(snapshot: &T, a: Audit<'_>) -> Result<()> {
         "data record/event budget exceeded")?;
     a.pay(8)?;
     let mut validator = Validator { entities: schema_slice, state: &[], actions: &[],
-        outputs: &[], nodes: 0, audit: a };
+        outputs: &[], app: super::AppRef::Snapshot, allocation: None, allocation_failure: None, nodes: 0, audit: a };
     validate_entities(schema_slice, &mut validator)?;
     a.pay(8)?;
     let mut records = BTreeSet::new();

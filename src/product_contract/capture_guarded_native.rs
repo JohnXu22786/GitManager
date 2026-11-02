@@ -242,7 +242,8 @@ pub(in super::super::super) fn validate_guarded_native_capture(
         let app = &capture.program;
         #[cfg(test)]
         controls::event("semantic");
-        validate_app_semantics!(app, a, validator, action_prefix_nodes);
+        let mut app_validation_cx = crate::product_alloc::AllocationContext::new();
+        validate_app_semantics!(app, a, validator, action_prefix_nodes, &mut app_validation_cx);
         a.pay(0)?; // Removed count entry opportunity, not a count traversal.
         #[cfg(test)]
         controls::event("raw-shape");

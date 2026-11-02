@@ -75,6 +75,7 @@ impl BackupWire for super::Payload {}
 impl BackupWire for super::Envelope {}
 impl BackupWire for crate::product_contract::FallibleDecodedDataSnapshot {}
 impl BackupWire for crate::product_store::fallible_project_snapshot_decode::DecodedProjectSnapshot {}
+impl BackupWire for crate::product_contract::fallible_app_decode::DecodedAppDefinition {}
 
 pub(crate) fn canonical_bytes<T: BackupWire + ?Sized>(
     value: &T,
@@ -103,6 +104,16 @@ pub(crate) fn canonical_digest<T: BackupWire + ?Sized>(
 ) -> Result<Digest, CodecError> {
     let bytes = canonical_bytes(value, cx)?;
     let digest = digest_impl::try_bytes_digest(domain, &bytes).map_err(CodecError::Digest)?;
+    let text = digest.try_hex_string(cx)?;
+    Digest::from_owned_lower_hex(text).ok_or(CodecError::DigestText)
+}
+
+pub(crate) fn bytes_digest(
+    domain: IdentityDomain,
+    bytes: &[u8],
+    cx: &mut AllocationContext,
+) -> Result<Digest, CodecError> {
+    let digest = digest_impl::try_bytes_digest(domain, bytes).map_err(CodecError::Digest)?;
     let text = digest.try_hex_string(cx)?;
     Digest::from_owned_lower_hex(text).ok_or(CodecError::DigestText)
 }

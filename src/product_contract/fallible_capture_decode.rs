@@ -1,8 +1,8 @@
 //! Fallible decoding for the persisted CapturedProgram ownership graph.
 //!
 //! This private DTO composes the bounded AppDefinition decoder with the small
-//! source/artifact metadata graph. It does not perform semantic validation or
-//! alter the production CapturedProgram parser.
+//! source/artifact metadata graph and validates both graphs without converting
+//! either one into an infallibly allocated legacy owner.
 use crate::product_alloc::{self, AllocationContext, AllocationSite};
 use crate::product_alloc::ordered::OrderedMap;
 use crate::product_json::{Number, Value};
@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use super::fallible_app_decode::{decode_app_definition, DecodedAppDefinition};
 use super::fallible_value_decode::{JsonKind, NumericValue, ValueDecodeError};
-use super::{ArtifactKind, ArtifactRef, Digest, Producer, SourceBinding, TaskSource, MAX_WIRE_BYTES};
+use super::{AppValidationError, ArtifactKind, ArtifactRef, ContractError, Digest, IdentityDomain, Producer, SourceBinding, TaskSource, MAX_WIRE_BYTES};
 
 const CAPTURED_PROGRAM_FIELDS: &[&str] = &["artifact", "binding", "source_bytes", "program"];
 const ARTIFACT_FIELDS: &[&str] = &["kind", "version", "language", "raw_digest", "program_digest", "semantic_digest"];
@@ -29,8 +29,64 @@ pub(crate) struct DecodedCapturedProgram {
     source_bytes: Vec<u8>,
     program: DecodedAppDefinition,
 }
+impl DecodedCapturedProgram {
+    pub(crate) fn validate_with(&self, cx: &mut AllocationContext) -> Result<(), AppValidationError> {
+        self.binding.validate().map_err(AppValidationError::Contract)?;
+        if self.artifact.version != super::CONTRACT_VERSION
+            || self.artifact.kind != ArtifactKind::GeneratedApp
+            || self.artifact.language != super::LANGUAGE_VERSION
+        {
+            return Err(AppValidationError::Contract(ContractError("unsupported executable artifact".into())));
+        }
+        if self.source_bytes.len() > MAX_WIRE_BYTES {
+            return Err(AppValidationError::Contract(ContractError("source exceeds byte limit".into())));
+        }
+        let syntax = crate::product_json::parse_json_bytes(&self.source_bytes, cx).map_err(|error| match error.cause {
+            crate::product_json::Cause::Allocation(failure) => AppValidationError::Allocation(failure),
+            _ => AppValidationError::Contract(ContractError("invalid source bytes".into())),
+        })?;
+        let actual = decode_app_definition(syntax, cx).map_err(|error| match error {
+            ValueDecodeError::Allocation(failure) => AppValidationError::Allocation(failure),
+            _ => AppValidationError::Contract(ContractError("invalid source program".into())),
+        })?;
+        actual.validate_with(cx)?;
+        let expected_bytes = crate::product_backup::fallible_codec::canonical_bytes(&self.program, cx)
+            .map_err(codec_validation_error)?;
+        let actual_bytes = crate::product_backup::fallible_codec::canonical_bytes(&actual, cx)
+            .map_err(codec_validation_error)?;
+        if expected_bytes != actual_bytes {
+            return Err(AppValidationError::Contract(ContractError("source bytes do not represent captured program".into())));
+        }
+        let raw = crate::product_backup::fallible_codec::bytes_digest(IdentityDomain::Source, &self.source_bytes, cx)
+            .map_err(codec_validation_error)?;
+        if raw.as_str() != self.artifact.raw_digest.as_str()
+            || raw.as_str() != self.binding.source_digest.as_str()
+        {
+            return Err(AppValidationError::Contract(ContractError("raw source digest mismatch".into())));
+        }
+        let program_digest = crate::product_backup::fallible_codec::canonical_digest(IdentityDomain::Program, &actual, cx)
+            .map_err(codec_validation_error)?;
+        if program_digest.as_str() != self.artifact.program_digest.as_str() {
+            return Err(AppValidationError::Contract(ContractError("program digest mismatch".into())));
+        }
+        let mut semantic = actual.try_clone_with(cx)?;
+        semantic.clear_display_labels();
+        let semantic_digest = crate::product_backup::fallible_codec::canonical_digest(IdentityDomain::SemanticProgram, &semantic, cx)
+            .map_err(codec_validation_error)?;
+        if semantic_digest.as_str() != self.artifact.semantic_digest.as_str() {
+            return Err(AppValidationError::Contract(ContractError("program digest mismatch".into())));
+        }
+        Ok(())
+    }
+}
+fn codec_validation_error(error: crate::product_backup::fallible_codec::CodecError) -> AppValidationError {
+    match error {
+        crate::product_backup::fallible_codec::CodecError::Allocation(failure) => AppValidationError::Allocation(failure),
+        _ => AppValidationError::Contract(ContractError("program codec invariant".into())),
+    }
+}
 
-pub(crate) fn decode_captured_program(
+pub(super) fn decode_captured_program(
     value: Value,
     cx: &mut AllocationContext,
 ) -> Result<DecodedCapturedProgram, ValueDecodeError> {
@@ -378,6 +434,39 @@ mod tests {
         let decoded = decode_captured_program(syntax(&input), &mut cx).unwrap();
         assert_eq!(capture.source_bytes, decoded.source_bytes);
         assert_eq!(super::super::canonical_bytes(&capture).unwrap(), super::super::canonical_bytes(&decoded).unwrap());
+    }
+
+    #[test]
+    fn decoded_capture_validation_composes_fallible_app_validation() {
+        let capture = fixture_capture();
+        let input = serde_json::to_vec(&capture).unwrap();
+        let mut production_cx = AllocationContext::new();
+        let wrapped = super::super::decode_captured_program_fallible(syntax(&input), &mut production_cx).unwrap();
+        let before = super::super::canonical_bytes(&wrapped).unwrap();
+        let mut baseline = AllocationContext::new();
+        wrapped.validate_with(&mut baseline).unwrap();
+        let growths = baseline.growth_requests();
+        assert!(growths > 0);
+        for nth in 1..=growths {
+            let mut refused = AllocationContext::fail_nth_growth(NonZeroUsize::new(nth).unwrap(), true);
+            let error = wrapped.validate_with(&mut refused).unwrap_err();
+            let AppValidationError::Allocation(failure) = error else {
+                panic!("expected original allocation refusal at wrapper validation growth {nth}: {error:?}");
+            };
+            assert_eq!(Some(failure), refused.first_failure());
+            assert_eq!(failure.kind, AllocationFailureKind::Injected);
+            assert_eq!(before, super::super::canonical_bytes(&wrapped).unwrap());
+            wrapped.validate_with(&mut AllocationContext::new()).unwrap();
+        }
+
+        let mut stale_json: SerdeValue = serde_json::to_value(&capture).unwrap();
+        stale_json["artifact"]["program_digest"] = SerdeValue::String("0".repeat(64));
+        let stale_input = serde_json::to_vec(&stale_json).unwrap();
+        let stale = super::super::decode_captured_program_fallible(syntax(&stale_input), &mut AllocationContext::new()).unwrap();
+        assert_eq!(
+            stale.validate_with(&mut AllocationContext::new()),
+            Err(AppValidationError::Contract(ContractError("program digest mismatch".into()))),
+        );
     }
 
     #[test]

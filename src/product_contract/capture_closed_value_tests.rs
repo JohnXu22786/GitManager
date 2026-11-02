@@ -590,7 +590,7 @@ fn assert_closed_schema(source: &str, schema: &str) {
     let schema = source_guard_text(schema);
     let declaration = source.find("pub enum Type {").unwrap();
     let start = source[..declaration].rfind("#[derive(").unwrap();
-    let end = source[declaration..].find("\n\nstruct Validator<").unwrap() + declaration;
+    let end = source[declaration..].find("\n\n#[derive(Clone, Copy)]\nenum AppRef<").unwrap() + declaration;
     assert_eq!(
         source[start..end].trim_end(),
         schema.trim_end()
@@ -1231,7 +1231,7 @@ fn assert_closed_source_bodies(parent: &str, closed: &str, typed: &str, canonica
     assert!(conversion > hit_end && conversion < validate.end);
     let guarded=source_guard_text(guarded);
     let production=guarded.split("// Tests observe").next().unwrap();
-    assert!(production.contains("validate_app_semantics!(app, a, validator, action_prefix_nodes)"));
+    assert!(production.contains("validate_app_semantics!(app, a, validator, action_prefix_nodes, &mut app_validation_cx)"));
     assert!(production.contains("value_output_types!(PendingLength, BOUND_ROOT)"));
     assert!(production.contains("capture_typed::parse_app(&capture.source_bytes, a)?"));
     assert!(!production.contains("validate_closed_value_capture("));

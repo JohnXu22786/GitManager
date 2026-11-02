@@ -1,7 +1,8 @@
-//! Bounded structural decoders for Product Contract value leaves.
+//! Bounded structural decoders for Product Contract value leaves and their errors.
 //!
 //! Inputs are the closed tree produced by `product_json`; these helpers do not
-//! perform semantic validation or route production parsing in this unit.
+//! perform semantic validation; the captured-program boundary adds the
+//! corresponding typed semantic error when it composes this decoder.
 use crate::product_alloc::{self, AllocationContext, AllocationFailure, AllocationSite};
 use crate::product_json::{Number, Value};
 
