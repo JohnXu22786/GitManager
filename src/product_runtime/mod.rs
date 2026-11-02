@@ -1083,6 +1083,117 @@ impl LocalRuntime {
     }
 }
 impl LocalRuntime {
+    /// Evaluate the ordinary constraint pass used by compatibility checking
+    /// over the bounded decoded model. Allocation refusal is returned as the
+    /// outer error so callers can keep it distinct from a semantic
+    /// incompatibility, matching the legacy compatibility report contract.
+    pub(crate) fn check_decoded_compatibility_constraints(
+        &self,
+        program: &FallibleDecodedCapturedProgram,
+        merged: &FallibleDecodedDataSnapshot,
+        day: i32,
+        allocations: &mut product_alloc::AllocationContext,
+    ) -> std::result::Result<std::result::Result<(), AdapterError>, AdapterError> {
+        let session = program.initial_session_with(allocations).map_err(AdapterError::Allocation)?;
+        let limits = RuntimeLimits { fuel: 10_000_000, ..RuntimeLimits::default() };
+        let owned_allocations = std::mem::replace(allocations, product_alloc::AllocationContext::new());
+        let mut meter = Meter::with_allocations(
+            limits.clone(), limits.fuel, Arc::new(AtomicBool::new(false)), owned_allocations,
+        );
+        let result = execute::constraints_decoded(program, merged, &session, day, &mut meter);
+        *allocations = meter.allocations;
+        match result {
+            Err(error @ AdapterError::Allocation(_)) => Err(error),
+            Ok(()) => Ok(Ok(())),
+            Err(error) => Ok(Err(error)),
+        }
+    }
+
+    /// Decoded counterpart of the validation work performed before an
+    /// ordinary runtime run is published. `compatibility` and `issues` are
+    /// the freshly recomputed report values, not persisted claims.
+    pub(crate) fn validate_decoded_initial_runtime(
+        &self,
+        program: &FallibleDecodedCapturedProgram,
+        data: &FallibleDecodedDataSnapshot,
+        session: &FallibleDecodedSessionState,
+        clock_day: i32,
+        limits: RuntimeLimits,
+        compatibility: CompatibilityState,
+        issues: &[String],
+        allocations: &mut product_alloc::AllocationContext,
+    ) -> Result<()> {
+        program.validate_with(allocations).map_err(|error| match error {
+            AppValidationError::Contract(error) => AdapterError::Invalid(error),
+            AppValidationError::Allocation(failure) => AdapterError::Allocation(failure),
+        })?;
+        data.validate_with(allocations).map_err(|error| match error {
+            AppValidationError::Contract(error) => AdapterError::Invalid(error),
+            AppValidationError::Allocation(failure) => AdapterError::Allocation(failure),
+        })?;
+        program.validate_session_with(session, allocations).map_err(|error| match error {
+            AppValidationError::Contract(error) => AdapterError::Invalid(error),
+            AppValidationError::Allocation(failure) => AdapterError::Allocation(failure),
+        })?;
+        validate_day(clock_day)?;
+        limits.validate()?;
+        if data.project_id() != program.project_id() {
+            return Err(invalid("program and data belong to different projects"));
+        }
+        self.validate_decoded_initial_runtime_after_report(
+            program, data, session, clock_day, limits, compatibility, issues, allocations,
+        )
+    }
+
+    pub(crate) fn validate_decoded_initial_runtime_after_report(
+        &self,
+        _program: &FallibleDecodedCapturedProgram,
+        data: &FallibleDecodedDataSnapshot,
+        session: &FallibleDecodedSessionState,
+        _clock_day: i32,
+        limits: RuntimeLimits,
+        compatibility: CompatibilityState,
+        issues: &[String],
+        allocations: &mut product_alloc::AllocationContext,
+    ) -> Result<()> {
+        if compatibility != CompatibilityState::Compatible {
+            let mut message = String::new();
+            for (index, issue) in issues.iter().enumerate() {
+                if index != 0 {
+                    product_alloc::try_append_str(&mut message, "; ", allocations, product_alloc::AllocationSite::String)
+                        .map_err(AdapterError::Allocation)?;
+                }
+                product_alloc::try_append_str(&mut message, issue, allocations, product_alloc::AllocationSite::String)
+                    .map_err(AdapterError::Allocation)?;
+            }
+            return Err(AdapterError::Unsupported(message));
+        }
+
+        let owned_allocations = std::mem::replace(allocations, product_alloc::AllocationContext::new());
+        let mut meter = Meter::with_allocations(
+            limits.clone(), 10_000_000, Arc::new(AtomicBool::new(false)), owned_allocations,
+        );
+        let data_view = DataSnapshotView::from(data);
+        let result = (|| {
+            meter.collection(data_view.record_count())?;
+            for row in data_view.records() {
+                for (_, value) in row.values().iter() { meter.value(value)?; }
+            }
+            for (_, value) in session.values().iter() {
+                meter.value(value)?;
+                check_references_decoded(value, data_view)?;
+            }
+            if let Some(focus) = session.focused_record() {
+                if data_view.record(&focus.entity, &focus.record).is_none() {
+                    return Err(invalid("record reference does not exist"));
+                }
+            }
+            Ok(())
+        })();
+        *allocations = meter.allocations;
+        result
+    }
+
     fn start_source(
         &self,
         program: &ProgramSource,
@@ -1349,6 +1460,18 @@ fn check_references(value: &DataValue, data: &DataSnapshot) -> Result<()> {
             for item in items {
                 check_references(item, data)?;
             }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+fn check_references_decoded(value: &DataValue, data: DataSnapshotView<'_>) -> Result<()> {
+    match value {
+        DataValue::Reference { entity, record } => {
+            if data.record(entity, record).is_none() { return Err(invalid("record reference does not exist")); }
+        }
+        DataValue::List { items, .. } => {
+            for item in items { check_references_decoded(item, data)?; }
         }
         _ => {}
     }

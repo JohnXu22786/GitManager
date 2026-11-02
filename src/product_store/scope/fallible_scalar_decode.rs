@@ -358,6 +358,21 @@ pub(crate) struct DecodedCompatibilityReport {
     retained_fields: Vec<DecodedSemanticKey>, issues: Vec<String>,
 }
 impl DecodedCompatibilityReport {
+    pub(crate) fn new(
+        state: CompatibilityState,
+        current_data: Digest,
+        target_program: Digest,
+        retained_records: Vec<RecordRef>,
+        retained_events: Vec<String>,
+        retained_fields: Vec<DecodedSemanticKey>,
+        issues: Vec<String>,
+    ) -> Self {
+        Self { state, current_data, target_program, retained_records, retained_events, retained_fields, issues }
+    }
+
+    pub(crate) fn state(&self) -> CompatibilityState { self.state }
+    pub(crate) fn issues(&self) -> &[String] { &self.issues }
+
     pub(crate) fn identity_matches(&self, current_data: &Digest, target_program: &Digest) -> bool {
         &self.current_data == current_data && &self.target_program == target_program
     }
@@ -421,6 +436,18 @@ impl DecodedCompatibilityReport {
     }
 }
 impl DecodedSemanticKey {
+    pub(crate) fn field(
+        entity: &str,
+        id: &str,
+        cx: &mut AllocationContext,
+    ) -> Result<Self, crate::product_alloc::AllocationFailure> {
+        Ok(Self {
+            kind: SemanticKind::Field,
+            entity: Some(product_alloc::try_copy_str(entity, cx, AllocationSite::String)?),
+            id: product_alloc::try_copy_str(id, cx, AllocationSite::String)?,
+        })
+    }
+
     fn validate(&self) -> Result<(), DecisionValidationError> {
         check_fallible_id(&self.id)?;
         if let Some(entity) = &self.entity { check_fallible_id(entity)?; }

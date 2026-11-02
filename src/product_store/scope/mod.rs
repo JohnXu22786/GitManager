@@ -10,6 +10,8 @@ mod fallible_owned_history_decode;
 #[allow(dead_code)]
 mod fallible_scope_envelope_decode;
 mod fallible_history;
+mod fallible_compatibility;
+pub(crate) use fallible_compatibility::{report as compatibility_report_fallible, validate_initial_runtime as validate_initial_runtime_fallible, CompatibilityFailure};
 mod fallible_replay_registry;
 pub(crate) use fallible_replay_registry::{replay_snapshot_fallible, ReplayRegistryError};
 mod fallible_replay_context;

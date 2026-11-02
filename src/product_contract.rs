@@ -377,6 +377,10 @@ impl FallibleDecodedDataSnapshot {
 }
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct FallibleDecodedSessionState(fallible_persisted_decode::DecodedSessionState);
+impl FallibleDecodedSessionState {
+    pub(crate) fn values(&self) -> &FallibleValues { self.0.values() }
+    pub(crate) fn focused_record(&self) -> Option<&RecordRef> { self.0.focused_record() }
+}
 #[derive(Debug, Serialize)]
 pub(crate) struct FallibleDecodedCapturedProgram(fallible_capture_decode::DecodedCapturedProgram);
 impl FallibleDecodedCapturedProgram {
