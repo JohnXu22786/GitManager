@@ -3,12 +3,15 @@
 //! This wrapper deliberately has no `Clone`, `FromIterator`, or `Deserialize`
 //! implementation: each could hide an unmetered allocation. Callers must use
 //! `try_insert`/`try_from_iter` and carry the allocation failure unchanged.
-use crate::product_alloc::{ordered::OrderedMap, AllocationContext, AllocationFailure};
+use crate::product_alloc::{
+    ordered::OrderedMap, try_box, try_copy_str, try_push, try_reserve, AllocationContext,
+    AllocationFailure, AllocationSite,
+};
 use serde::ser::SerializeMap;
 use serde::{Serialize, Serializer};
 use std::fmt;
 
-use super::{DataValue, Id};
+use super::{DataValue, Id, Type};
 
 /// Sorted, fallibly grown storage for Product Contract record/session values.
 /// Iteration and serialization use the same lexical key order as `BTreeMap`.
@@ -64,6 +67,23 @@ impl FallibleValues {
         self.0.remove_entry(id)
     }
 
+    /// Deep-copy this ordered owner without calling `Clone` or changing the
+    /// source. The map storage, every key, and every nested DataValue owner are
+    /// separately reserved through `cx`; any refusal drops the partial copy
+    /// and returns the original failure unchanged.
+    pub(crate) fn try_clone_with(
+        &self,
+        cx: &mut AllocationContext,
+    ) -> Result<Self, AllocationFailure> {
+        self.0
+            .try_clone_with(
+                cx,
+                |id, cx| try_copy_str(id, cx, AllocationSite::String),
+                |value, cx| try_clone_data_value(value, cx),
+            )
+            .map(Self)
+    }
+
     /// Consume fallible producers without introducing an infallible
     /// `FromIterator` path. Duplicate keys retain the first key and last value,
     /// matching `BTreeMap` construction from an ordered iterator. Iterator
@@ -77,6 +97,59 @@ impl FallibleValues {
     {
         OrderedMap::try_from_iter(entries, cx).map(Self)
     }
+}
+
+/// Deep-copy a validated Product Contract value graph. Stored values have
+/// already passed the Contract depth and collection checks; all actual owned
+/// storage in that graph is still reserved independently here.
+pub(crate) fn try_clone_data_value(
+    value: &DataValue,
+    cx: &mut AllocationContext,
+) -> Result<DataValue, AllocationFailure> {
+    Ok(match value {
+        DataValue::Null => DataValue::Null,
+        DataValue::Boolean { value } => DataValue::Boolean { value: *value },
+        DataValue::Integer { value } => DataValue::Integer { value: *value },
+        DataValue::Text { value } => DataValue::Text {
+            value: try_copy_str(value, cx, AllocationSite::String)?,
+        },
+        DataValue::Date { days } => DataValue::Date { days: *days },
+        DataValue::Reference { entity, record } => DataValue::Reference {
+            entity: try_copy_str(entity, cx, AllocationSite::String)?,
+            record: try_copy_str(record, cx, AllocationSite::String)?,
+        },
+        DataValue::List { item_type, items } => {
+            let item_type = try_clone_type(item_type, cx)?;
+            let mut copied = Vec::new();
+            try_reserve(&mut copied, items.len(), cx, AllocationSite::Vector)?;
+            for item in items {
+                let item = try_clone_data_value(item, cx)?;
+                try_push(&mut copied, item, cx, AllocationSite::Vector)?;
+            }
+            DataValue::List {
+                item_type,
+                items: copied,
+            }
+        }
+    })
+}
+
+fn try_clone_type(value: &Type, cx: &mut AllocationContext) -> Result<Type, AllocationFailure> {
+    Ok(match value {
+        Type::Boolean => Type::Boolean,
+        Type::Integer => Type::Integer,
+        Type::Text => Type::Text,
+        Type::Date => Type::Date,
+        Type::Reference { entity } => Type::Reference {
+            entity: try_copy_str(entity, cx, AllocationSite::String)?,
+        },
+        Type::List { item } => Type::List {
+            item: try_box(try_clone_type(item, cx)?, cx)?,
+        },
+        Type::Optional { item } => Type::Optional {
+            item: try_box(try_clone_type(item, cx)?, cx)?,
+        },
+    })
 }
 
 impl Serialize for FallibleValues {
@@ -216,5 +289,142 @@ mod tests {
         let mut retry = AllocationContext::new();
         values.try_insert("new".to_owned(), text("accepted"), &mut retry).unwrap();
         assert_eq!(values.len(), 2);
+    }
+
+    fn deep_fixture() -> BTreeMap<Id, DataValue> {
+        let reference_type = Type::Reference {
+            entity: "person".to_owned(),
+        };
+        let nested_type = Type::Optional {
+            item: Box::new(Type::List {
+                item: Box::new(reference_type.clone()),
+            }),
+        };
+        let nested_value = DataValue::List {
+            item_type: Type::Reference {
+                entity: "person".to_owned(),
+            },
+            items: vec![DataValue::Reference {
+                entity: "person".to_owned(),
+                record: "record-雪".to_owned(),
+            }],
+        };
+        BTreeMap::from([
+            ("null".to_owned(), DataValue::Null),
+            ("boolean".to_owned(), DataValue::Boolean { value: true }),
+            ("integer".to_owned(), DataValue::Integer { value: i64::MIN }),
+            ("text".to_owned(), text("雪\nvalue")),
+            ("date".to_owned(), DataValue::Date { days: -1 }),
+            (
+                "reference".to_owned(),
+                DataValue::Reference {
+                    entity: "person".to_owned(),
+                    record: "record-1".to_owned(),
+                },
+            ),
+            (
+                "nested-list".to_owned(),
+                DataValue::List {
+                    item_type: nested_type,
+                    items: vec![nested_value],
+                },
+            ),
+        ])
+    }
+
+    fn fallible_values(values: &BTreeMap<Id, DataValue>) -> FallibleValues {
+        FallibleValues::try_from_iter(
+            values
+                .iter()
+                .map(|(id, value)| Ok((id.clone(), value.clone()))),
+            &mut AllocationContext::new(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn fallible_deep_copy_matches_every_value_variant_and_is_independent() {
+        let legacy = deep_fixture();
+        let source = fallible_values(&legacy);
+        let mut cx = AllocationContext::new();
+        let mut copied = source.try_clone_with(&mut cx).unwrap();
+
+        assert_eq!(source, copied);
+        assert_eq!(
+            super::super::canonical_bytes(&legacy).unwrap(),
+            super::super::canonical_bytes(&copied).unwrap(),
+        );
+
+        *copied.get_mut("text").unwrap() = text("changed only in the copy");
+        assert_eq!(source.get("text"), Some(&text("雪\nvalue")));
+        assert_eq!(copied.get("text"), Some(&text("changed only in the copy")));
+    }
+
+    #[test]
+    fn empty_and_boundary_nested_values_copy_without_hidden_growth() {
+        let mut empty_cx = AllocationContext::new();
+        let empty = FallibleValues::new();
+        assert!(empty.try_clone_with(&mut empty_cx).unwrap().is_empty());
+        assert_eq!(empty_cx.growth_requests(), 0);
+
+        let mut boundary = DataValue::Text {
+            value: "leaf".to_owned(),
+        };
+        for _ in 0..super::super::MAX_TYPE_DEPTH {
+            boundary = DataValue::List {
+                item_type: Type::Text,
+                items: vec![boundary],
+            };
+        }
+        let mut source = FallibleValues::new();
+        source
+            .try_insert("boundary".to_owned(), boundary, &mut AllocationContext::new())
+            .unwrap();
+        let mut cx = AllocationContext::new();
+        assert_eq!(source, source.try_clone_with(&mut cx).unwrap());
+        assert!(cx.growth_requests() > 0);
+    }
+
+    #[test]
+    fn every_reached_deep_copy_growth_refusal_preserves_source_and_retries() {
+        use crate::product_alloc::{AllocationFailureKind, AllocationSite};
+        use std::num::NonZeroUsize;
+
+        let legacy = deep_fixture();
+        let source = fallible_values(&legacy);
+        let source_bytes = super::super::canonical_bytes(&source).unwrap();
+        let mut count = AllocationContext::new();
+        let expected = source.try_clone_with(&mut count).unwrap();
+        assert_eq!(source, expected);
+        let growths = count.growth_requests();
+        assert!(growths > 0);
+
+        let mut sites = Vec::new();
+        for ordinal in 1..=growths {
+            let mut refused = AllocationContext::fail_nth_growth(
+                NonZeroUsize::new(ordinal).unwrap(),
+                true,
+            );
+            let error = source.try_clone_with(&mut refused).unwrap_err();
+            assert_eq!(Some(error), refused.first_failure());
+            assert_eq!(error.kind, AllocationFailureKind::Injected);
+            sites.push(error.site);
+            assert_eq!(
+                super::super::canonical_bytes(&source).unwrap(),
+                source_bytes,
+                "refusal at growth {ordinal}/{growths} changed source",
+            );
+
+            let mut retry = AllocationContext::new();
+            assert_eq!(source, source.try_clone_with(&mut retry).unwrap());
+        }
+        for site in [
+            AllocationSite::OrderedMap,
+            AllocationSite::String,
+            AllocationSite::Vector,
+            AllocationSite::Box,
+        ] {
+            assert!(sites.contains(&site), "missing refusal at {site:?}");
+        }
     }
 }
