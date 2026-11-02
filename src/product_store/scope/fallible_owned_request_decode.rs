@@ -39,6 +39,9 @@ impl DecodedOwnedPreviewRequest {
     pub(crate) fn source_before(&self) -> &Digest { self.inventory.sources.before() }
     pub(crate) fn source_after(&self) -> &Digest { self.inventory.sources.after() }
     pub(crate) fn root_entity(&self) -> &str { self.inventory.sources.root_entity() }
+    pub(crate) fn auxiliary(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.auxiliary.iter().map(|value| (value.entity.as_str(), value.owner_field.as_str()))
+    }
     pub(crate) fn lifecycle_predicates(&self) -> (&Expr, &Expr) {
         (&self.inventory.lifecycle.before, &self.inventory.lifecycle.after)
     }

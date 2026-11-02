@@ -3,8 +3,8 @@
 use super::common_fact_admission::{refuse, AdmissionResult, ProofMeter};
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
-#[derive(Clone, Debug)]
-enum Kind {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Kind {
     Root,
     Aux {
         owner: Id,
@@ -160,7 +160,7 @@ fn all_statements<'a>(steps: &'a [Statement], out: &mut Vec<&'a Statement>) {
         }
     }
 }
-fn schemas(
+pub(super) fn schemas(
     before: &AppDefinition,
     data: &DataSnapshot,
     after: &AppDefinition,
