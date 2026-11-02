@@ -101,6 +101,79 @@ impl DecodedCapturedProgram {
         Ok(())
     }
 }
+
+/// Construct the exact modern generated-app capture from a decoded owner.
+/// The produced source bytes are the same canonical bytes consumed by the
+/// legacy `CapturedProgram::capture` path, while all temporary ownership and
+/// metadata growth is charged to the caller's allocation context.
+pub(crate) fn capture_generated_app(
+    program: DecodedAppDefinition,
+    project: &str,
+    producer: Producer,
+    cx: &mut AllocationContext,
+) -> std::result::Result<DecodedCapturedProgram, AppValidationError> {
+    use crate::product_alloc::{try_copy_str, AllocationSite};
+
+    program.validate_with(cx)?;
+    let source_bytes = crate::product_backup::fallible_codec::canonical_bytes(&program, cx)
+        .map_err(codec_validation_error)?;
+    if source_bytes.len() > MAX_WIRE_BYTES {
+        return Err(AppValidationError::Contract(ContractError("source exceeds byte limit".into())));
+    }
+    let raw_digest = crate::product_backup::fallible_codec::bytes_digest(
+        IdentityDomain::Source,
+        &source_bytes,
+        cx,
+    )
+    .map_err(codec_validation_error)?;
+    let program_digest = crate::product_backup::fallible_codec::canonical_digest(
+        IdentityDomain::Program,
+        &program,
+        cx,
+    )
+    .map_err(codec_validation_error)?;
+    let mut semantic = program.try_clone_with(cx)?;
+    semantic.clear_display_labels();
+    let semantic_digest = crate::product_backup::fallible_codec::canonical_digest(
+        IdentityDomain::SemanticProgram,
+        &semantic,
+        cx,
+    )
+    .map_err(codec_validation_error)?;
+
+    let language = try_copy_str(super::LANGUAGE_VERSION, cx, AllocationSite::String)
+        .map_err(AppValidationError::Allocation)?;
+    let project_id = try_copy_str(project, cx, AllocationSite::String)
+        .map_err(AppValidationError::Allocation)?;
+    let program_path = try_copy_str("program.json", cx, AllocationSite::String)
+        .map_err(AppValidationError::Allocation)?;
+    let source_digest_text = try_copy_str(raw_digest.as_str(), cx, AllocationSite::String)
+        .map_err(AppValidationError::Allocation)?;
+    let source_digest = Digest::from_owned_lower_hex(source_digest_text)
+        .ok_or_else(|| AppValidationError::Contract(ContractError("capture digest invariant".into())))?;
+    let binding = SourceBinding {
+        project_id,
+        program_path,
+        task: None,
+        producer,
+        source_digest,
+    };
+    binding.validate().map_err(AppValidationError::Contract)?;
+    Ok(DecodedCapturedProgram {
+        artifact: ArtifactRef {
+            kind: ArtifactKind::GeneratedApp,
+            version: super::CONTRACT_VERSION,
+            language,
+            raw_digest,
+            program_digest,
+            semantic_digest,
+        },
+        binding,
+        source_bytes,
+        program,
+    })
+}
+
 fn codec_validation_error(error: crate::product_backup::fallible_codec::CodecError) -> AppValidationError {
     match error {
         crate::product_backup::fallible_codec::CodecError::Allocation(failure) => AppValidationError::Allocation(failure),

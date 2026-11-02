@@ -2119,6 +2119,539 @@ pub(super) fn compile(
         None,
     )?)
 }
+
+/// Fallible scalar composition compiler for the promoted decoded owner graph.
+/// This mirrors `compile` without materializing the legacy BTreeMap model.
+pub(super) fn compile_fallible(
+    snapshot: &crate::product_store::fallible_project_snapshot_decode::DecodedProjectSnapshot,
+    manifest: &super::DecodedCompositionManifest,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<crate::product_contract::FallibleDecodedCapturedProgram, CompilerFailure> {
+    use crate::product_alloc::{try_append_str, try_reserve, try_push, AllocationSite};
+    use crate::product_contract::{AppValidationError, Producer};
+
+    fn app_error(error: AppValidationError) -> CompilerFailure {
+        match error {
+            AppValidationError::Contract(error) => CompilerFailure::Store(StoreError::Invalid(error.0)),
+            AppValidationError::Allocation(failure) => CompilerFailure::Allocation(failure),
+        }
+    }
+    fn codec_error(failure: crate::product_backup::fallible_codec::CodecError) -> CompilerFailure {
+        match failure {
+            crate::product_backup::fallible_codec::CodecError::Allocation(failure) => CompilerFailure::Allocation(failure),
+            _ => CompilerFailure::Store(error("compiler codec invariant")),
+        }
+    }
+    fn string(value: &str, cx: &mut crate::product_alloc::AllocationContext) -> std::result::Result<String, CompilerFailure> {
+        crate::product_alloc::try_copy_str(value, cx, AllocationSite::String).map_err(CompilerFailure::Allocation)
+    }
+    fn boxed(value: Expr, cx: &mut crate::product_alloc::AllocationContext) -> std::result::Result<Box<Expr>, CompilerFailure> {
+        crate::product_alloc::try_box(value, cx).map_err(CompilerFailure::Allocation)
+    }
+    fn copied_type(value: &Type, cx: &mut crate::product_alloc::AllocationContext) -> std::result::Result<Type, CompilerFailure> {
+        crate::product_contract::try_clone_type_with(value, cx).map_err(CompilerFailure::Allocation)
+    }
+    fn optional_type(value: &Type, cx: &mut crate::product_alloc::AllocationContext) -> std::result::Result<Type, CompilerFailure> {
+        if matches!(value, Type::Optional { .. }) { copied_type(value, cx) }
+        else { Ok(Type::Optional { item: crate::product_alloc::try_box(copied_type(value, cx)?, cx).map_err(CompilerFailure::Allocation)? }) }
+    }
+    fn boolean(value: bool) -> Expr {
+        Expr::Literal { value_type: Type::Boolean, value: DataValue::Boolean { value } }
+    }
+    fn text(value: String) -> Expr {
+        Expr::Literal { value_type: Type::Text, value: DataValue::Text { value } }
+    }
+    fn variable(name: &str, cx: &mut crate::product_alloc::AllocationContext) -> std::result::Result<Expr, CompilerFailure> {
+        Ok(Expr::Variable { name: string(name, cx)? })
+    }
+    fn field(subject: &str, id: &str, cx: &mut crate::product_alloc::AllocationContext) -> std::result::Result<Expr, CompilerFailure> {
+        Ok(Expr::Field { record: boxed(variable(subject, cx)?, cx)?, field: string(id, cx)? })
+    }
+    fn flag(subject: &str, id: &str, cx: &mut crate::product_alloc::AllocationContext) -> std::result::Result<Expr, CompilerFailure> {
+        Ok(Expr::Coalesce { value: boxed(field(subject, id, cx)?, cx)?, fallback: boxed(boolean(false), cx)? })
+    }
+    fn conditional(
+        condition: Expr, yes: Expr, no: Expr, cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Expr, CompilerFailure> {
+        Ok(Expr::If { condition: boxed(condition, cx)?, then_value: boxed(yes, cx)?, else_value: boxed(no, cx)? })
+    }
+    fn inert(value: &Type) -> std::result::Result<Expr, CompilerFailure> {
+        Ok(match value {
+            Type::Boolean => boolean(false),
+            Type::Integer => Expr::Literal { value_type: Type::Integer, value: DataValue::Integer { value: 0 } },
+            Type::Text => Expr::Literal { value_type: Type::Text, value: DataValue::Text { value: String::new() } },
+            Type::Date => Expr::Literal { value_type: Type::Date, value: DataValue::Date { days: 0 } },
+            _ => return Err(error("protected result must be a scalar value, optionally nullable").into()),
+        })
+    }
+    fn reserved_strings(value: &crate::product_json::Value) -> bool {
+        use crate::product_json::Value;
+        match value {
+            Value::String(value) => value.starts_with(RESERVED_PREFIX),
+            Value::Array(values) => values.iter().any(reserved_strings),
+            Value::Object(values) => values.iter().any(|(key, value)| key.starts_with(RESERVED_PREFIX) || reserved_strings(value)),
+            _ => false,
+        }
+    }
+
+    let scope = snapshot.scalar_scope().ok_or_else(|| error("owned family cannot enter scalar scope authority"))?;
+    let business = snapshot.captured_program_by_revision_with(manifest.business(), cx).map_err(app_error)?
+        .ok_or_else(|| error("business source program absent"))?;
+    let source_value = crate::product_backup::fallible_codec::try_serialize_value(business.app(), cx).map_err(codec_error)?;
+    if reserved_strings(&source_value) { return Err(error("authored source uses the reserved metadata namespace").into()); }
+    let mut app = business.app().try_clone_with(cx).map_err(app_error)?;
+
+    // Restore every shared destination to the earliest retained meaning before
+    // replaying the layer chain, matching the legacy two-pass lowering.
+    let mut seen = crate::product_alloc::ordered::OrderedSet::new();
+    for id in manifest.layers() {
+        let layer = scope.layer(id).ok_or_else(|| error("missing layer"))?;
+        for index in 0..layer.patches().len() {
+            let patch = effective_patch_fallible(snapshot, manifest, id, index, cx)?;
+            let key = crate::product_backup::fallible_codec::canonical_bytes(&patch.request.destination, cx).map_err(codec_error)?;
+            if seen.try_insert(key, cx).map_err(CompilerFailure::Allocation)? {
+                let before = clone_expr_fallible(&patch.before, cx)?;
+                *slot_fallible(&mut app, &patch.request.destination)? = before;
+            }
+        }
+    }
+    for id in manifest.layers() {
+        let layer = scope.layer(id).ok_or_else(|| error("missing layer"))?;
+        let active = manifest.active_contains(id);
+        for lifecycle in layer.request().lifecycles() {
+            let sealed = key_fallible(id, lifecycle.entity(), "sealed", cx)?;
+            let mut negated = Vec::new();
+            try_push(&mut negated, Expr::Not { value: boxed(flag("record", &sealed, cx)?, cx)? }, cx, AllocationSite::Vector)
+                .map_err(CompilerFailure::Allocation)?;
+            try_push(&mut negated, clone_expr_fallible(lifecycle.completed(), cx)?, cx, AllocationSite::Vector)
+                .map_err(CompilerFailure::Allocation)?;
+            let entity = app.entities.iter_mut().find(|entity| entity.id == lifecycle.entity())
+                .ok_or_else(|| error("protected entity removed"))?;
+            try_push(&mut entity.constraints, Expr::Or { values: negated }, cx, AllocationSite::Vector)
+                .map_err(CompilerFailure::Allocation)?;
+            for (suffix, typ, label) in [
+                ("member", Type::Boolean, "Scope membership"),
+                ("sealed", Type::Boolean, "Preserved result"),
+                ("day", Type::Date, "Result capture day"),
+                ("origin", Type::Text, "Result provenance"),
+            ] {
+                let id = key_fallible(id, lifecycle.entity(), suffix, cx)?;
+                let label = string(label, cx)?;
+                let value_type = optional_type(&typ, cx)?;
+                try_push(&mut entity.fields, crate::product_contract::FieldDefinition { id, label, value_type }, cx, AllocationSite::Vector)
+                    .map_err(CompilerFailure::Allocation)?;
+            }
+        }
+        for index in 0..layer.patches().len() {
+            let original = &layer.patches()[index];
+            let patch = effective_patch_fallible(snapshot, manifest, id, index, cx)?;
+            let request = patch.request();
+            let old = clone_expr_fallible(slot_fallible_ref(&app, &request.destination)?, cx)?;
+            let global = matches!(request.destination, super::EffectDestinationDto::EmitItems { .. } | super::EffectDestinationDto::Observable { .. });
+            let mut live = if !active { old }
+            else if global { clone_expr_fallible(patch.after(), cx)? }
+            else if matches!(request.destination, super::EffectDestinationDto::CreateValue { .. })
+                && matches!(layer.request().population, super::ScopePopulationDto::FutureWork | super::ScopePopulationDto::All) {
+                clone_expr_fallible(patch.after(), cx)?
+            } else if matches!(request.destination, super::EffectDestinationDto::CreateValue { .. }) {
+                old
+            } else {
+                let member = key_fallible(id, &request.entity, "member", cx)?;
+                conditional(flag(&request.subject, &member, cx)?, clone_expr_fallible(patch.after(), cx)?, old, cx)?
+            };
+            if matches!(request.destination, super::EffectDestinationDto::ViewColumn { .. } | super::EffectDestinationDto::EmitColumn { .. }) {
+                let saved = saved_key_fallible(id, original, cx)?;
+                let sealed = key_fallible(id, &request.entity, "sealed", cx)?;
+                let entity = app.entities.iter_mut().find(|entity| entity.id == request.entity)
+                    .ok_or_else(|| error("protected entity absent"))?;
+                let saved_id = string(&saved, cx)?;
+                let saved_label = string("Preserved completed result", cx)?;
+                let saved_type = optional_type(&request.value_type, cx)?;
+                try_push(&mut entity.fields, crate::product_contract::FieldDefinition { id: saved_id, label: saved_label, value_type: saved_type }, cx, AllocationSite::Vector)
+                    .map_err(CompilerFailure::Allocation)?;
+                let read = if matches!(request.value_type, Type::Optional { .. }) {
+                    field(&request.subject, &saved, cx)?
+                } else {
+                    let mut conditions = Vec::new();
+                    try_push(&mut conditions, Expr::Not { value: boxed(flag("record", &sealed, cx)?, cx)? }, cx, AllocationSite::Vector).map_err(CompilerFailure::Allocation)?;
+                    let null = Expr::Literal { value_type: optional_type(&request.value_type, cx)?, value: DataValue::Null };
+                    let equal = Expr::Equal { left: boxed(field("record", &saved, cx)?, cx)?, right: boxed(null, cx)? };
+                    try_push(&mut conditions, Expr::Not { value: boxed(equal, cx)? }, cx, AllocationSite::Vector).map_err(CompilerFailure::Allocation)?;
+                    try_push(&mut entity.constraints, Expr::Or { values: conditions }, cx, AllocationSite::Vector).map_err(CompilerFailure::Allocation)?;
+                    let inert_type = match &request.value_type { Type::Optional { item } => item.as_ref(), typ => typ };
+                    Expr::Coalesce { value: boxed(field(&request.subject, &saved, cx)?, cx)?, fallback: boxed(inert(inert_type)?, cx)? }
+                };
+                live = conditional(flag(&request.subject, &sealed, cx)?, read, live, cx)?;
+            } else if let super::EffectDestinationDto::Update { field: target, .. } = &request.destination {
+                let sealed = key_fallible(id, &request.entity, "sealed", cx)?;
+                live = conditional(flag(&request.subject, &sealed, cx)?, field(&request.subject, target, cx)?, live, cx)?;
+            }
+            *slot_fallible(&mut app, &request.destination)? = live;
+        }
+    }
+
+    // Instrument original action steps from the projected graph, then append
+    // seal passes and provenance in the same order as the legacy compiler.
+    let projected = app.try_clone_with(cx).map_err(app_error)?;
+    for action_index in 0..app.actions.len() {
+        let steps = instrument_fallible(&app.actions[action_index].steps, &projected, snapshot, manifest, &app.actions[action_index].parameters, cx)?;
+        let seals = sealing_passes_fallible(&projected, snapshot, manifest, None, cx)?;
+        let action = &mut app.actions[action_index];
+        action.steps = steps;
+        try_reserve(&mut action.steps, seals.len(), cx, AllocationSite::Vector).map_err(CompilerFailure::Allocation)?;
+        action.steps.extend(seals);
+    }
+    add_provenance_fallible(&mut app, snapshot, manifest, cx)?;
+    app.validate_with(cx).map_err(app_error)?;
+
+    let mut description = String::new();
+    let input = manifest.compiler_input_identity_with(cx).map_err(codec_error)?;
+    let suffix = input.as_str();
+    let mut version = [0u8; 10];
+    let mut version_len = 0;
+    let mut remaining = COMPILER_VERSION;
+    loop {
+        version[version_len] = b'0' + (remaining % 10) as u8;
+        version_len += 1;
+        remaining /= 10;
+        if remaining == 0 { break; }
+    }
+    version[..version_len].reverse();
+    let version = std::str::from_utf8(&version[..version_len]).expect("decimal digits are UTF-8");
+    let description_len = "Verified host scope composition v".len() + version.len() + ": ".len() + suffix.len();
+    crate::product_alloc::try_reserve_string(&mut description, description_len, cx, AllocationSite::String).map_err(CompilerFailure::Allocation)?;
+    try_append_str(&mut description, "Verified host scope composition v", cx, AllocationSite::String).map_err(CompilerFailure::Allocation)?;
+    description.push_str(version);
+    try_append_str(&mut description, ": ", cx, AllocationSite::String).map_err(CompilerFailure::Allocation)?;
+    try_append_str(&mut description, suffix, cx, AllocationSite::String).map_err(CompilerFailure::Allocation)?;
+    let producer = Producer::ExternalAuthor { description };
+    crate::product_contract::capture_generated_app_fallible(app, snapshot.data().project_id(), producer, cx)
+        .map_err(app_error)
+}
+
+fn clone_statement_fallible(
+    statement: &crate::product_contract::fallible_app_decode::DecodedStatement,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<crate::product_contract::fallible_app_decode::DecodedStatement, CompilerFailure> {
+    let value = crate::product_backup::fallible_codec::try_serialize_value(statement, cx).map_err(|failure| match failure {
+        crate::product_backup::fallible_codec::CodecError::Allocation(failure) => CompilerFailure::Allocation(failure),
+        _ => CompilerFailure::Store(error("statement copy invariant")),
+    })?;
+    crate::product_contract::fallible_app_decode::decode_statement_value(value, cx).map_err(|failure| match failure {
+        crate::product_contract::fallible_value_decode::ValueDecodeError::Allocation(failure) => CompilerFailure::Allocation(failure),
+        _ => CompilerFailure::Store(error("statement copy invariant")),
+    })
+}
+
+fn key_fallible(
+    layer: &Digest,
+    entity: &str,
+    suffix: &str,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<String, CompilerFailure> {
+    use crate::product_alloc::{try_append_str, try_reserve_string, AllocationSite};
+    let digest = crate::product_backup::fallible_codec::canonical_digest(
+        IdentityDomain::Adoption,
+        &super::DecodedCompilerKeyIdentity { layer, entity, suffix },
+        cx,
+    ).map_err(|failure| match failure {
+        crate::product_backup::fallible_codec::CodecError::Allocation(failure) => CompilerFailure::Allocation(failure),
+        _ => CompilerFailure::Store(error("compiler key invariant")),
+    })?;
+    let mut result = String::new();
+    let length = RESERVED_PREFIX.len() + 24 + 1 + suffix.len();
+    try_reserve_string(&mut result, length, cx, AllocationSite::String).map_err(CompilerFailure::Allocation)?;
+    try_append_str(&mut result, RESERVED_PREFIX, cx, AllocationSite::String).map_err(CompilerFailure::Allocation)?;
+    result.push_str(&digest.as_str()[..24]);
+    result.push('_');
+    result.push_str(suffix);
+    Ok(result)
+}
+
+fn saved_key_fallible(
+    layer: &Digest,
+    patch: &super::DecodedEffectPatch,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<String, CompilerFailure> {
+    use crate::product_alloc::{try_append_str, try_reserve_string, AllocationSite};
+    let digest = crate::product_backup::fallible_codec::canonical_digest(
+        IdentityDomain::Adoption, &patch.request.destination, cx,
+    ).map_err(|failure| match failure {
+        crate::product_backup::fallible_codec::CodecError::Allocation(failure) => CompilerFailure::Allocation(failure),
+        _ => CompilerFailure::Store(error("compiler key invariant")),
+    })?;
+    let mut suffix = String::new();
+    try_reserve_string(&mut suffix, 22, cx, AllocationSite::String).map_err(CompilerFailure::Allocation)?;
+    try_append_str(&mut suffix, "value_", cx, AllocationSite::String).map_err(CompilerFailure::Allocation)?;
+    suffix.push_str(&digest.as_str()[..16]);
+    key_fallible(layer, &patch.request.entity, &suffix, cx)
+}
+
+fn decoded_boolean(value: bool) -> Expr {
+    Expr::Literal { value_type: Type::Boolean, value: DataValue::Boolean { value } }
+}
+fn decoded_text(value: String) -> Expr {
+    Expr::Literal { value_type: Type::Text, value: DataValue::Text { value } }
+}
+fn decoded_variable(name: &str, cx: &mut crate::product_alloc::AllocationContext) -> std::result::Result<Expr, CompilerFailure> {
+    Ok(Expr::Variable { name: crate::product_alloc::try_copy_str(name, cx, crate::product_alloc::AllocationSite::String).map_err(CompilerFailure::Allocation)? })
+}
+fn decoded_field(subject: &str, id: &str, cx: &mut crate::product_alloc::AllocationContext) -> std::result::Result<Expr, CompilerFailure> {
+    Ok(Expr::Field {
+        record: crate::product_alloc::try_box(decoded_variable(subject, cx)?, cx).map_err(CompilerFailure::Allocation)?,
+        field: crate::product_alloc::try_copy_str(id, cx, crate::product_alloc::AllocationSite::String).map_err(CompilerFailure::Allocation)?,
+    })
+}
+fn decoded_flag(subject: &str, id: &str, cx: &mut crate::product_alloc::AllocationContext) -> std::result::Result<Expr, CompilerFailure> {
+    Ok(Expr::Coalesce {
+        value: crate::product_alloc::try_box(decoded_field(subject, id, cx)?, cx).map_err(CompilerFailure::Allocation)?,
+        fallback: crate::product_alloc::try_box(decoded_boolean(false), cx).map_err(CompilerFailure::Allocation)?,
+    })
+}
+
+fn instrument_fallible(
+    steps: &[crate::product_contract::fallible_app_decode::DecodedStatement],
+    app: &crate::product_contract::fallible_app_decode::DecodedAppDefinition,
+    snapshot: &crate::product_store::fallible_project_snapshot_decode::DecodedProjectSnapshot,
+    manifest: &super::DecodedCompositionManifest,
+    parameters: &crate::product_contract::fallible_app_decode::FallibleMap<Type>,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<Vec<crate::product_contract::fallible_app_decode::DecodedStatement>, CompilerFailure> {
+    let env = CompilerEnvironment::from_parameters(
+        crate::product_contract::StringMapRef::Fallible(parameters), true, Some(cx),
+    )?;
+    instrument_scope_steps(steps, app, snapshot, manifest, env, cx)
+}
+
+fn instrument_scope_steps(
+    steps: &[crate::product_contract::fallible_app_decode::DecodedStatement],
+    app: &crate::product_contract::fallible_app_decode::DecodedAppDefinition,
+    snapshot: &crate::product_store::fallible_project_snapshot_decode::DecodedProjectSnapshot,
+    manifest: &super::DecodedCompositionManifest,
+    mut environment: CompilerEnvironment,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<Vec<crate::product_contract::fallible_app_decode::DecodedStatement>, CompilerFailure> {
+    use crate::product_alloc::{try_push, try_reserve, AllocationSite};
+    use crate::product_contract::fallible_app_decode::DecodedStatement as S;
+    let mut result = Vec::new();
+    try_reserve(&mut result, steps.len(), cx, AllocationSite::Vector).map_err(CompilerFailure::Allocation)?;
+    for original in steps {
+        let mut statement = clone_statement_fallible(original, cx)?;
+        match &mut statement {
+            S::Create { entity, values, .. } => {
+                if let Some(scope) = snapshot.scalar_scope() {
+                    for id in manifest.layers() {
+                        let layer = scope.layer(id).ok_or_else(|| error("missing layer"))?;
+                        if layer.request().lifecycles().iter().any(|life| life.entity() == entity) {
+                            let member = key_fallible(id, entity, "member", cx)?;
+                            let sealed = key_fallible(id, entity, "sealed", cx)?;
+                            let is_member = manifest.active_contains(id)
+                                && matches!(layer.request().population, super::ScopePopulationDto::FutureWork | super::ScopePopulationDto::All);
+                            values.try_insert(member, decoded_boolean(is_member), cx).map_err(CompilerFailure::Allocation)?;
+                            values.try_insert(sealed, decoded_boolean(false), cx).map_err(CompilerFailure::Allocation)?;
+                        }
+                    }
+                }
+            }
+            S::Archive { record } => {
+                let entity = match record {
+                    Expr::Variable { name } => match environment.get(name) {
+                        Some(Type::Reference { entity }) => entity.as_str(),
+                        _ => return Err(error("archive subject cannot be proven").into()),
+                    },
+                    _ => return Err(error("archive subject cannot be proven").into()),
+                };
+                let mut seals = sealing_passes_fallible(app, snapshot, manifest, Some((record, entity)), cx)?;
+                try_reserve(&mut result, seals.len(), cx, AllocationSite::Vector).map_err(CompilerFailure::Allocation)?;
+                result.append(&mut seals);
+            }
+            S::Emit { .. } => {
+                let mut seals = sealing_passes_fallible(app, snapshot, manifest, None, cx)?;
+                try_reserve(&mut result, seals.len(), cx, AllocationSite::Vector).map_err(CompilerFailure::Allocation)?;
+                result.append(&mut seals);
+            }
+            S::ForEach { steps: nested_steps, items, binding } => {
+                let entity = list_entity(items, crate::product_contract::AppRef::from(app), &environment)
+                    .ok_or_else(|| error("loop subject cannot be proven for completion capture"))?;
+                let mut nested = environment.try_clone_with(Some(cx))?;
+                nested.insert_reference(binding, entity, Some(cx))?;
+                *nested_steps = instrument_scope_steps(nested_steps, app, snapshot, manifest, nested, cx)?;
+            }
+            _ => {}
+        }
+        if let S::Create { entity, bind, .. } = &statement {
+            environment.insert_reference(bind, entity, Some(cx))?;
+        }
+        try_push(&mut result, statement, cx, AllocationSite::Vector).map_err(CompilerFailure::Allocation)?;
+    }
+    Ok(result)
+}
+
+fn sealing_passes_fallible(
+    app: &crate::product_contract::fallible_app_decode::DecodedAppDefinition,
+    snapshot: &crate::product_store::fallible_project_snapshot_decode::DecodedProjectSnapshot,
+    manifest: &super::DecodedCompositionManifest,
+    archive: Option<(&Expr, &str)>,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<Vec<crate::product_contract::fallible_app_decode::DecodedStatement>, CompilerFailure> {
+    use crate::product_alloc::{try_box, try_push, try_reserve, AllocationSite};
+    use crate::product_contract::fallible_app_decode::{DecodedStatement as S, FallibleMap};
+    let mut result = Vec::new();
+    let Some(scope) = snapshot.scalar_scope() else { return Err(error("owned family cannot enter scalar scope authority").into()); };
+    for id in manifest.layers() {
+        let layer = scope.layer(id).ok_or_else(|| error("missing layer"))?;
+        for lifecycle in layer.request().lifecycles() {
+            let binding = key_fallible(id, lifecycle.entity(), "seal_row", cx)?;
+            let condition = if let Some((record, entity)) = archive {
+                if entity != lifecycle.entity() { continue; }
+                Expr::Equal { left: try_box(decoded_variable(&binding, cx)?, cx).map_err(CompilerFailure::Allocation)?, right: try_box(clone_expr_fallible(record, cx)?, cx).map_err(CompilerFailure::Allocation)? }
+            } else {
+                rebind_fallible(lifecycle.completed(), "record", &binding, cx)?
+            };
+            let sealed = key_fallible(id, lifecycle.entity(), "sealed", cx)?;
+            let not_sealed = Expr::Not { value: try_box(decoded_flag(&binding, &sealed, cx)?, cx).map_err(CompilerFailure::Allocation)? };
+            let mut predicates = Vec::new();
+            try_reserve(&mut predicates, 2, cx, AllocationSite::Vector).map_err(CompilerFailure::Allocation)?;
+            try_push(&mut predicates, not_sealed, cx, AllocationSite::Vector).map_err(CompilerFailure::Allocation)?;
+            try_push(&mut predicates, condition, cx, AllocationSite::Vector).map_err(CompilerFailure::Allocation)?;
+            let predicate = Expr::And { values: predicates };
+            let query = Expr::Query {
+                entity: crate::product_alloc::try_copy_str(lifecycle.entity(), cx, AllocationSite::String).map_err(CompilerFailure::Allocation)?,
+                binding: crate::product_alloc::try_copy_str(&binding, cx, AllocationSite::String).map_err(CompilerFailure::Allocation)?,
+                predicate: try_box(predicate, cx).map_err(CompilerFailure::Allocation)?,
+                sort: Vec::new(), limit: crate::product_contract::MAX_COLLECTION, include_archived: false,
+            };
+            let mut assignments = FallibleMap::new();
+            for (index, original) in layer.patches().iter().enumerate() {
+                let patch = effective_patch_fallible(snapshot, manifest, id, index, cx)?;
+                if patch.request.entity == lifecycle.entity() && matches!(patch.request.destination, super::EffectDestinationDto::ViewColumn { .. } | super::EffectDestinationDto::EmitColumn { .. }) {
+                    let expression = clone_expr_fallible(slot_fallible_ref(app, &patch.request.destination)?, cx)?;
+                    let expression = rebind_fallible(&expression, &patch.request.subject, &binding, cx)?;
+                    let saved = saved_key_fallible(id, original, cx)?;
+                    assignments.try_insert(saved, expression, cx).map_err(CompilerFailure::Allocation)?;
+                }
+            }
+            assignments.try_insert(key_fallible(id, lifecycle.entity(), "sealed", cx)?, decoded_boolean(true), cx).map_err(CompilerFailure::Allocation)?;
+            assignments.try_insert(key_fallible(id, lifecycle.entity(), "day", cx)?, Expr::Today, cx).map_err(CompilerFailure::Allocation)?;
+            let origin = if archive.is_some() { "ObservedAtArchive" } else { "ObservedAtCompletion" };
+            let origin = crate::product_alloc::try_copy_str(origin, cx, AllocationSite::String).map_err(CompilerFailure::Allocation)?;
+            assignments.try_insert(key_fallible(id, lifecycle.entity(), "origin", cx)?, decoded_text(origin), cx).map_err(CompilerFailure::Allocation)?;
+            let record = decoded_variable(&binding, cx)?;
+            let mut body = Vec::new();
+            try_reserve(&mut body, 1, cx, AllocationSite::Vector).map_err(CompilerFailure::Allocation)?;
+            try_push(&mut body, S::Update { record, values: assignments }, cx, AllocationSite::Vector).map_err(CompilerFailure::Allocation)?;
+            try_push(&mut result, S::ForEach { items: query, binding, steps: body }, cx, AllocationSite::Vector).map_err(CompilerFailure::Allocation)?;
+        }
+    }
+    Ok(result)
+}
+
+fn add_provenance_fallible(
+    app: &mut crate::product_contract::fallible_app_decode::DecodedAppDefinition,
+    snapshot: &crate::product_store::fallible_project_snapshot_decode::DecodedProjectSnapshot,
+    manifest: &super::DecodedCompositionManifest,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<(), CompilerFailure> {
+    use crate::product_alloc::{try_push, AllocationSite};
+    use crate::product_contract::fallible_app_decode::{DecodedStatement as S, DecodedViewKind as V};
+    for layer_id in manifest.layers() {
+        let scope = snapshot.scalar_scope().ok_or_else(|| error("owned family cannot enter scalar scope authority"))?;
+        let layer = scope.layer(layer_id).ok_or_else(|| error("missing layer"))?;
+        for index in 0..layer.patches().len() {
+            let patch = effective_patch_fallible(snapshot, manifest, layer_id, index, cx)?;
+            let request = patch.request();
+            if !matches!(request.destination, super::EffectDestinationDto::ViewColumn { .. } | super::EffectDestinationDto::EmitColumn { .. }) {
+                continue;
+            }
+            let origin = key_fallible(layer_id, &request.entity, "origin", cx)?;
+            let day = key_fallible(layer_id, &request.entity, "day", cx)?;
+            let record = key_fallible(layer_id, &request.entity, "record", cx)?;
+            let origin_expr = Expr::Coalesce {
+                value: crate::product_alloc::try_box(decoded_field(&request.subject, &origin, cx)?, cx).map_err(CompilerFailure::Allocation)?,
+                fallback: crate::product_alloc::try_box(decoded_text(crate::product_alloc::try_copy_str("CurrentCalculation", cx, AllocationSite::String).map_err(CompilerFailure::Allocation)?), cx).map_err(CompilerFailure::Allocation)?,
+            };
+            let day_expr = Expr::Coalesce {
+                value: crate::product_alloc::try_box(decoded_field(&request.subject, &day, cx)?, cx).map_err(CompilerFailure::Allocation)?,
+                fallback: crate::product_alloc::try_box(Expr::Today, cx).map_err(CompilerFailure::Allocation)?,
+            };
+            let record_expr = decoded_variable(&request.subject, cx)?;
+            let record_type = Type::Reference {
+                entity: crate::product_alloc::try_copy_str(&request.entity, cx, AllocationSite::String).map_err(CompilerFailure::Allocation)?,
+            };
+            let origin_column = crate::product_alloc::try_copy_str(&origin, cx, AllocationSite::String).map_err(CompilerFailure::Allocation)?;
+            let day_column = crate::product_alloc::try_copy_str(&day, cx, AllocationSite::String).map_err(CompilerFailure::Allocation)?;
+            let values: [(String, &'static str, Type, Expr); 3] = [
+                (origin_column, "Result provenance", Type::Text, origin_expr),
+                (day_column, "Result day", Type::Date, day_expr),
+                (record, "Source record", record_type, record_expr),
+            ];
+            match &request.destination {
+                super::EffectDestinationDto::ViewColumn { view, .. } => {
+                    let view = app.views.iter_mut().find(|view_def| &view_def.id == view)
+                        .ok_or_else(|| error("view removed"))?;
+                    let columns = match &mut view.kind {
+                        V::List { columns, .. } | V::Detail { columns, .. } => columns,
+                        V::Form { .. } => return Err(error("form is not a row projection").into()),
+                    };
+                    for (id, label, _, value) in values {
+                        if !columns.iter().any(|column| column.id == id) {
+                            let label = crate::product_alloc::try_copy_str(label, cx, AllocationSite::String).map_err(CompilerFailure::Allocation)?;
+                            try_push(columns, crate::product_contract::fallible_app_decode::DecodedColumn { id, label, value }, cx, AllocationSite::Vector)
+                                .map_err(CompilerFailure::Allocation)?;
+                        }
+                    }
+                }
+                super::EffectDestinationDto::EmitColumn { action, path, .. } => {
+                    let source = snapshot.captured_program_by_revision_with(manifest.business(), cx)
+                        .map_err(|failure| match failure {
+                            crate::product_contract::AppValidationError::Allocation(failure) => CompilerFailure::Allocation(failure),
+                            _ => CompilerFailure::Store(error("business source program is invalid")),
+                        })?.ok_or_else(|| error("business source program absent"))?;
+                    let source_action = source.app().actions.iter().find(|action_def| &action_def.id == action)
+                        .ok_or_else(|| error("output action absent"))?;
+                    let source_statement = decoded_step_ref(&source_action.steps, path)?;
+                    let output = match source_statement { S::Emit { output, .. } => output.as_str(), _ => return Err(error("output slot absent").into()) };
+                    let definition = app.outputs.iter_mut().find(|definition| definition.id == output)
+                        .ok_or_else(|| error("output definition absent"))?;
+                    for (id, label, typ, _) in &values {
+                        if !definition.columns.iter().any(|column| &column.id == id) {
+                            let id = crate::product_alloc::try_copy_str(id, cx, AllocationSite::String).map_err(CompilerFailure::Allocation)?;
+                            let label = crate::product_alloc::try_copy_str(label, cx, AllocationSite::String).map_err(CompilerFailure::Allocation)?;
+                            let value_type = crate::product_contract::try_clone_type_with(typ, cx).map_err(CompilerFailure::Allocation)?;
+                            try_push(&mut definition.columns, crate::product_contract::FieldDefinition { id, label, value_type }, cx, AllocationSite::Vector)
+                                .map_err(CompilerFailure::Allocation)?;
+                        }
+                    }
+                    fn append(
+                        steps: &mut [S], output: &str, subject: &str, values: &[(String, &'static str, Type, Expr); 3],
+                        cx: &mut crate::product_alloc::AllocationContext,
+                    ) -> std::result::Result<(), CompilerFailure> {
+                        for step in steps {
+                            match step {
+                                S::Emit { output: id, binding, columns, .. } if id == output => {
+                                    for (id, _, _, expr) in values {
+                                        let key = crate::product_alloc::try_copy_str(id, cx, AllocationSite::String).map_err(CompilerFailure::Allocation)?;
+                                        let expr = rebind_fallible(expr, subject, binding, cx)?;
+                                        columns.try_insert(key, expr, cx).map_err(CompilerFailure::Allocation)?;
+                                    }
+                                }
+                                S::ForEach { steps, .. } => append(steps, output, subject, values, cx)?,
+                                _ => {}
+                            }
+                        }
+                        Ok(())
+                    }
+                    for action_def in &mut app.actions {
+                        append(&mut action_def.steps, output, &request.subject, &values, cx)?;
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+    Ok(())
+}
+
 fn instrument(
     steps: &[Statement],
     app: &AppDefinition,
@@ -2619,6 +3152,96 @@ mod borrowed_view_tests {
         snapshot
     }
 
+    fn composed_snapshot_with_view_projection_patch() -> ProjectSnapshot {
+        let mut snapshot = minimal_snapshot();
+        let mut app = snapshot.programs[0].program.clone();
+        app.views[0].kind = crate::product_contract::ViewKind::List {
+            entity: "item".into(),
+            rows: Expr::Query {
+                entity: "item".into(),
+                binding: "row".into(),
+                predicate: Box::new(Expr::Literal { value_type: Type::Boolean, value: DataValue::Boolean { value: true } }),
+                sort: vec![],
+                limit: MAX_COLLECTION,
+                include_archived: false,
+            },
+            columns: vec![crate::product_contract::Column {
+                id: "name".into(),
+                label: "Name".into(),
+                value: Expr::Field {
+                    record: Box::new(Expr::Variable { name: "row".into() }),
+                    field: "name".into(),
+                },
+            }],
+            controls: vec![],
+            selection: None,
+        };
+        let source_bytes = crate::product_contract::canonical_bytes(&app).unwrap();
+        let captured = crate::product_contract::CapturedProgram::capture(
+            &source_bytes, "project", crate::product_contract::Producer::Fixture { name: "compiler-view-test".into() }, None,
+        ).unwrap();
+        snapshot.programs = vec![captured.clone()];
+        snapshot.active_revision = crate::product_contract::canonical_digest(IdentityDomain::Source, &captured).unwrap();
+        snapshot.data = crate::product_contract::DataSnapshot::empty("project", &captured.program).unwrap();
+        snapshot.session = crate::product_contract::SessionState::initial(&captured.program).unwrap();
+        let program_revision = snapshot.active_revision.clone();
+        let decisions = crate::product_contract::canonical_digest(IdentityDomain::Decision, &snapshot.decisions).unwrap();
+        let basis = super::super::FrozenBasis {
+            snapshot: crate::product_contract::canonical_digest(IdentityDomain::Data, &snapshot).unwrap(),
+            revision: snapshot.revision,
+            active: snapshot.active_revision.clone(),
+            data: snapshot.data.clone(),
+            session: snapshot.session.clone(),
+            day: snapshot.clock_day,
+            decisions,
+        };
+        let destination = EffectDestination::ViewColumn { view: "main".into(), column: "name".into() };
+        let request = EffectPatchRequest { destination: destination.clone(), entity: "item".into(), subject: "row".into(), value_type: Type::Text };
+        let before = Expr::Field { record: Box::new(Expr::Variable { name: "row".into() }), field: "name".into() };
+        let after = Expr::If {
+            condition: Box::new(Expr::Literal { value_type: Type::Boolean, value: DataValue::Boolean { value: true } }),
+            then_value: Box::new(Expr::Literal { value_type: Type::Text, value: DataValue::Text { value: "unknown".into() } }),
+            else_value: Box::new(Expr::Field { record: Box::new(Expr::Variable { name: "row".into() }), field: "name".into() }),
+        };
+        let layer = super::super::ScopeLayer {
+            version: super::super::COMPILER_VERSION,
+            operation: "view-edit".into(),
+            basis: basis.clone(),
+            candidate: program_revision.clone(),
+            request: ScopeRequest {
+                population: ScopePopulation::All,
+                operations: BTreeSet::from(["noop".into()]),
+                excluded_records: vec![],
+                lifecycles: vec![super::super::LifecycleBinding {
+                    entity: "item".into(),
+                    completed: Expr::Literal { value_type: Type::Boolean, value: DataValue::Boolean { value: true } },
+                    source: crate::product_contract::canonical_digest(IdentityDomain::Adoption, &"view-lifecycle").unwrap(),
+                }],
+                patches: vec![request.clone()],
+            },
+            patches: vec![EffectPatch { request, before, after }],
+        };
+        let layer_id = layer.identity().unwrap();
+        let mut state = super::super::ScopeState::default();
+        state.layers.insert(layer_id.clone(), layer);
+        state.compositions.insert(snapshot.active_revision.clone(), super::super::CompositionManifest {
+            version: super::super::COMPILER_VERSION,
+            basis,
+            transition: super::super::ScopeTransition::Adoption,
+            rewrites: vec![],
+            business: program_revision,
+            layers: vec![layer_id.clone()],
+            active: BTreeSet::from([layer_id]),
+            previous: None,
+            operation: "view-compose".into(),
+            runtime: crate::product_runtime::RUNTIME_VERSION.into(),
+            driver: crate::product_runtime::DRIVER_VERSION.into(),
+            output: snapshot.active_revision.clone(),
+        });
+        snapshot.scope = super::super::ScopeEnvelope::ScalarV1(state);
+        snapshot
+    }
+
     fn captured_program_with_observable(value: &str) -> crate::product_contract::CapturedProgram {
         let source = format!(r#"{{"version":1,"id":"app","label":"App","entities":[{{"id":"item","label":"Item","fields":[{{"id":"name","label":"Name","value_type":{{"kind":"text"}}}}],"unique":[],"constraints":[]}}],"state":[],"actions":[{{"id":"noop","label":"No-op","parameters":{{}},"guards":[],"steps":[{{"kind":"create","entity":"item","values":{{"name":{{"kind":"literal","value_type":{{"kind":"text"}},"value":{{"kind":"text","value":"x"}}}}}},"bind":"created"}}],"ensures":[]}}],"outputs":[],"observables":[{{"id":"status","label":"Status","value":{{"kind":"literal","value_type":{{"kind":"text"}},"value":{{"kind":"text","value":"{value}"}}}}}}],"views":[{{"id":"main","label":"Main","kind":{{"kind":"form","action":"noop","fields":[],"defaults":{{}}}},"actions":[],"keys":[]}}],"initial_view":"main"}}"#);
         crate::product_contract::CapturedProgram::capture(
@@ -2924,6 +3547,104 @@ mod borrowed_view_tests {
                 crate::product_contract::canonical_bytes(&business_program_fallible(&decoded, &mut retry).unwrap()).unwrap(),
             );
         }
+    }
+
+    #[test]
+    fn decoded_composition_compiler_and_capture_match_legacy_with_refusal_retry() {
+        let snapshot = composed_snapshot_with_observable_patch();
+        let decoded = decoded_snapshot(&snapshot);
+        let manifest = match &snapshot.scope {
+            super::super::ScopeEnvelope::ScalarV1(state) => state.compositions.get(&snapshot.active_revision).unwrap(),
+            _ => unreachable!(),
+        };
+        let expected = compile(&snapshot, manifest).unwrap();
+        let decoded_manifest = decoded.scalar_scope().unwrap().composition(&snapshot.active_revision).unwrap();
+        let mut baseline = AllocationContext::new();
+        let actual = compile_fallible(&decoded, decoded_manifest, &mut baseline).unwrap();
+        let expected_bytes = crate::product_contract::canonical_bytes(&expected).unwrap();
+        let actual_bytes = crate::product_backup::fallible_codec::canonical_bytes(&actual, &mut AllocationContext::new()).unwrap();
+        assert_eq!(actual_bytes, expected_bytes);
+        assert_eq!(
+            actual.revision_with(&mut AllocationContext::new()).unwrap(),
+            crate::product_contract::canonical_digest(crate::product_contract::IdentityDomain::Source, &expected).unwrap(),
+        );
+        let growths = baseline.growth_requests();
+        assert!(growths > 0 && growths < crate::product_contract::MAX_COLLECTION, "compiler growth count: {growths}");
+        let before = crate::product_backup::fallible_codec::canonical_bytes(&decoded, &mut AllocationContext::new()).unwrap();
+        for nth in 1..=growths {
+            let mut refused = AllocationContext::fail_nth_growth(NonZeroUsize::new(nth).unwrap(), true);
+            assert!(matches!(compile_fallible(&decoded, decoded_manifest, &mut refused), Err(CompilerFailure::Allocation(_))), "expected allocation refusal at growth {nth}");
+            let mut retry = AllocationContext::new();
+            let retried = compile_fallible(&decoded, decoded_manifest, &mut retry).unwrap();
+            assert_eq!(
+                crate::product_backup::fallible_codec::canonical_bytes(&retried, &mut AllocationContext::new()).unwrap(),
+                expected_bytes,
+            );
+            assert_eq!(
+                crate::product_backup::fallible_codec::canonical_bytes(&decoded, &mut AllocationContext::new()).unwrap(),
+                before,
+            );
+        }
+    }
+
+    #[test]
+    fn decoded_composition_compiler_matches_lifecycle_sealing_passes() {
+        let mut snapshot = composed_snapshot_with_observable_patch();
+        let layer_id = match &snapshot.scope {
+            super::super::ScopeEnvelope::ScalarV1(state) => state.compositions.get(&snapshot.active_revision).unwrap().layers[0].clone(),
+            _ => unreachable!(),
+        };
+        let active_revision = snapshot.active_revision.clone();
+        {
+            let super::super::ScopeEnvelope::ScalarV1(state) = &mut snapshot.scope else { unreachable!() };
+            state.layers.get_mut(&layer_id).unwrap().request.lifecycles.push(super::super::LifecycleBinding {
+                entity: "item".into(),
+                completed: Expr::Literal { value_type: Type::Boolean, value: DataValue::Boolean { value: true } },
+                source: canonical_digest(IdentityDomain::Adoption, &"lifecycle-test").unwrap(),
+            });
+        }
+        let super::super::ScopeEnvelope::ScalarV1(state) = &snapshot.scope else { unreachable!() };
+        let manifest = state.compositions.get(&active_revision).unwrap();
+        let expected = compile(&snapshot, manifest).unwrap();
+        let decoded = decoded_snapshot(&snapshot);
+        let decoded_manifest = decoded.scalar_scope().unwrap().composition(&snapshot.active_revision).unwrap();
+        let mut baseline = AllocationContext::new();
+        let actual = compile_fallible(&decoded, decoded_manifest, &mut baseline).unwrap();
+        let growths = baseline.growth_requests();
+        let before = crate::product_backup::fallible_codec::canonical_bytes(&decoded, &mut AllocationContext::new()).unwrap();
+        assert_eq!(
+            crate::product_backup::fallible_codec::canonical_bytes(&actual, &mut AllocationContext::new()).unwrap(),
+            crate::product_contract::canonical_bytes(&expected).unwrap(),
+        );
+        assert!(growths > 0 && growths < crate::product_contract::MAX_COLLECTION);
+        for nth in 1..=growths {
+            let mut refused = AllocationContext::fail_nth_growth(NonZeroUsize::new(nth).unwrap(), true);
+            assert!(matches!(compile_fallible(&decoded, decoded_manifest, &mut refused), Err(CompilerFailure::Allocation(_))), "lifecycle allocation refusal {nth}/{growths}");
+            let mut retry = AllocationContext::new();
+            let retried = compile_fallible(&decoded, decoded_manifest, &mut retry).unwrap();
+            assert_eq!(
+                crate::product_backup::fallible_codec::canonical_bytes(&retried, &mut AllocationContext::new()).unwrap(),
+                crate::product_contract::canonical_bytes(&expected).unwrap(),
+            );
+            assert_eq!(crate::product_backup::fallible_codec::canonical_bytes(&decoded, &mut AllocationContext::new()).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn decoded_composition_compiler_matches_projection_provenance() {
+        let snapshot = composed_snapshot_with_view_projection_patch();
+        let manifest = match &snapshot.scope {
+            super::super::ScopeEnvelope::ScalarV1(state) => state.compositions.get(&snapshot.active_revision).unwrap(),
+            _ => unreachable!(),
+        };
+        let expected = compile(&snapshot, manifest).unwrap();
+        let decoded = decoded_snapshot(&snapshot);
+        let manifest = decoded.scalar_scope().unwrap().composition(&snapshot.active_revision).unwrap();
+        let actual = compile_fallible(&decoded, manifest, &mut AllocationContext::new()).unwrap();
+        assert_eq!(
+            crate::product_backup::fallible_codec::canonical_bytes(&actual, &mut AllocationContext::new()).unwrap(),
+            crate::product_contract::canonical_bytes(&expected).unwrap(),
+        );
     }
 
     #[test]

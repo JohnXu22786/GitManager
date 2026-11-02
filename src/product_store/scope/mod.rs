@@ -16,7 +16,8 @@ pub(crate) use fallible_scalar_decode::{
     decode_effect_patch as decode_effect_patch_fallible,
     decode_effect_patch_request as decode_effect_patch_request_fallible,
     decode_scope_slot_mapping as decode_scope_slot_mapping_fallible,
-    DecodedCompositionManifest, DecodedEffectPatch, DecodedScopeState as FallibleDecodedScopeState,
+    DecodedCompositionCompilerIdentity, DecodedCompilerKeyIdentity, DecodedCompositionManifest, DecodedEffectPatch, DecodedScopeState as FallibleDecodedScopeState,
+    ScopePopulationDto,
     EffectDestinationDto, EffectPatchRequestDto,
 };
 mod owned_wire;

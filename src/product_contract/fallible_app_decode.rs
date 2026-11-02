@@ -56,10 +56,10 @@ pub(crate) struct DecodedAppDefinition {
     pub(super) version: u32,
     pub(super) id: String,
     pub(super) label: String,
-    pub(super) entities: Vec<EntityDefinition>,
+    pub(crate) entities: Vec<EntityDefinition>,
     pub(super) state: Vec<StateDefinition>,
     pub(crate) actions: Vec<DecodedActionDefinition>,
-    pub(super) outputs: Vec<OutputDefinition>,
+    pub(crate) outputs: Vec<OutputDefinition>,
     pub(crate) observables: Vec<ObservableDefinition>,
     pub(crate) views: Vec<DecodedViewDefinition>,
     pub(super) initial_view: String,
@@ -172,14 +172,14 @@ impl<'a, V> Iterator for FallibleMapIter<'a, V> {
 }
 impl<V> ExactSizeIterator for FallibleMapIter<'_, V> {}
 impl<V> FallibleMap<V> {
-    pub(super) const fn new() -> Self { Self(OrderedMap::new()) }
+    pub(crate) const fn new() -> Self { Self(OrderedMap::new()) }
     pub(super) fn len(&self) -> usize { self.0.len() }
     pub(super) fn is_empty(&self) -> bool { self.0.is_empty() }
     pub(super) fn get(&self, key: &str) -> Option<&V> { self.0.get(key) }
     pub(crate) fn get_mut(&mut self, key: &str) -> Option<&mut V> { self.0.get_mut(key) }
     pub(super) fn contains_key(&self, key: &str) -> bool { self.0.contains_key(key) }
     pub(super) fn iter(&self) -> FallibleMapIter<'_, V> { FallibleMapIter(self.0.iter_entries()) }
-    pub(super) fn try_insert(
+    pub(crate) fn try_insert(
         &mut self,
         key: String,
         value: V,
@@ -677,6 +677,17 @@ fn statement(value: Value, depth: usize, nodes: &mut usize, cx: &mut AllocationC
         }
         _ => unreachable!("statement variant list is complete"),
     }
+}
+
+/// Decode one already-owned statement through the same bounded structural
+/// decoder used by the full AppDefinition graph. This is used for metered
+/// ownership copies by the scalar composition compiler.
+pub(crate) fn decode_statement_value(
+    value: Value,
+    cx: &mut AllocationContext,
+) -> Result<DecodedStatement, ValueDecodeError> {
+    let mut nodes = 0;
+    statement(value, 0, &mut nodes, cx)
 }
 
 fn collection_target(value: Value, depth: usize, nodes: &mut usize, cx: &mut AllocationContext) -> Result<CollectionTarget, ValueDecodeError> {

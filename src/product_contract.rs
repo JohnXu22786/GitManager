@@ -432,6 +432,15 @@ pub(crate) fn decode_captured_program_fallible(
 ) -> std::result::Result<FallibleDecodedCapturedProgram, fallible_value_decode::ValueDecodeError> {
     fallible_capture_decode::decode_captured_program(value, cx).map(FallibleDecodedCapturedProgram)
 }
+pub(crate) fn capture_generated_app_fallible(
+    app: fallible_app_decode::DecodedAppDefinition,
+    project: &str,
+    producer: Producer,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<FallibleDecodedCapturedProgram, AppValidationError> {
+    fallible_capture_decode::capture_generated_app(app, project, producer, cx)
+        .map(FallibleDecodedCapturedProgram)
+}
 pub(crate) fn decode_scenario_spec_fallible(
     value: crate::product_json::Value,
     cx: &mut crate::product_alloc::AllocationContext,

@@ -6,7 +6,7 @@
 use crate::product_alloc::{self, ordered::{OrderedMap, OrderedSet}, AllocationContext, AllocationSite};
 use crate::product_contract::fallible_expr_decode::decode_expr;
 use crate::product_contract::fallible_value_decode::{decode_type, decode_values, JsonKind, NumericValue, ValueDecodeError};
-use crate::product_contract::{decode_captured_program_fallible, decode_data_snapshot_fallible, decode_record_ref_fallible, decode_scenario_spec_fallible, decode_session_state_fallible, AppValidationError, CompatibilityState, ContractError, DecisionValidationError, Digest, Expr, FallibleDecodedCapturedProgram, FallibleDecodedDataSnapshot, FallibleDecodedScenarioSpec, FallibleDecodedSessionState, FallibleValues, RecordRef, SemanticKind, Type, MAX_COLLECTION, MAX_EVENTS, MAX_EXPR_DEPTH, MAX_ITEMS, MAX_TEXT_BYTES};
+use crate::product_contract::{decode_captured_program_fallible, decode_data_snapshot_fallible, decode_record_ref_fallible, decode_scenario_spec_fallible, decode_session_state_fallible, AppValidationError, CompatibilityState, ContractError, DecisionValidationError, Digest, Expr, FallibleDecodedCapturedProgram, FallibleDecodedDataSnapshot, FallibleDecodedScenarioSpec, FallibleDecodedSessionState, FallibleValues, IdentityDomain, RecordRef, SemanticKind, Type, MAX_COLLECTION, MAX_EVENTS, MAX_EXPR_DEPTH, MAX_ITEMS, MAX_TEXT_BYTES};
 use super::contract::ScopeTransition;
 use crate::product_json::{Number, Value};
 use serde::ser::{SerializeMap, SerializeSeq};
@@ -219,6 +219,58 @@ impl DecodedCompositionManifest {
     pub(crate) fn active_contains(&self, id: &Digest) -> bool { self.active.contains(id) }
     pub(crate) fn rewrite_for(&self, id: &Digest, patch: usize) -> Option<&DecodedScopeSlotMapping> {
         self.rewrites.iter().find(|mapping| &mapping.layer == id && mapping.patch == patch)
+    }
+    pub(crate) fn compiler_input_identity_with(
+        &self,
+        cx: &mut AllocationContext,
+    ) -> Result<Digest, crate::product_backup::fallible_codec::CodecError> {
+        crate::product_backup::fallible_codec::canonical_digest(
+            IdentityDomain::Adoption,
+            &DecodedCompositionCompilerIdentity {
+                business: &self.business, layers: &self.layers, active: &self.active,
+                rewrites: &self.rewrites, previous: &self.previous, operation: &self.operation,
+                version: super::contract::COMPILER_VERSION,
+            },
+            cx,
+        )
+    }
+}
+pub(crate) struct DecodedCompositionCompilerIdentity<'a> {
+    business: &'a Digest,
+    layers: &'a [Digest],
+    active: &'a FallibleDigestSet,
+    rewrites: &'a [DecodedScopeSlotMapping],
+    previous: &'a Option<Digest>,
+    operation: &'a str,
+    version: u32,
+}
+impl Serialize for DecodedCompositionCompilerIdentity<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        let mut tuple = serializer.serialize_tuple(7)?;
+        tuple.serialize_element(self.business)?;
+        tuple.serialize_element(self.layers)?;
+        tuple.serialize_element(self.active)?;
+        tuple.serialize_element(self.rewrites)?;
+        tuple.serialize_element(self.previous)?;
+        tuple.serialize_element(self.operation)?;
+        tuple.serialize_element(&self.version)?;
+        tuple.end()
+    }
+}
+pub(crate) struct DecodedCompilerKeyIdentity<'a> {
+    pub(crate) layer: &'a Digest,
+    pub(crate) entity: &'a str,
+    pub(crate) suffix: &'a str,
+}
+impl Serialize for DecodedCompilerKeyIdentity<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        let mut tuple = serializer.serialize_tuple(3)?;
+        tuple.serialize_element(self.layer)?;
+        tuple.serialize_element(self.entity)?;
+        tuple.serialize_element(self.suffix)?;
+        tuple.end()
     }
 }
 #[derive(Debug, PartialEq, Eq, Serialize)]
