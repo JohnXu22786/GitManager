@@ -1141,7 +1141,7 @@ fn statement_dangerous_dependency(steps: crate::product_contract::StatementSlice
     for index in 0..steps.len() {
         match steps.get(index).expect("bounded statement index") {
             S::SetState { value, .. } if expr_mentions_field(value, field) => return true,
-            S::Collection { target, items } => {
+            S::Collection { target, items, .. } => {
                 let target_dep = match target {
                     CollectionTarget::Field { record, field: target_field } => target_field == field || expr_mentions_field(record, field),
                     CollectionTarget::State { .. } => false,

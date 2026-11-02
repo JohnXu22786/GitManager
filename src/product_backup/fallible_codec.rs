@@ -83,6 +83,7 @@ impl BackupWire for crate::product_store::fallible_project_snapshot_decode::Deco
 impl BackupWire for crate::product_contract::fallible_app_decode::DecodedAppDefinition {}
 impl BackupWire for crate::product_contract::DecodedCapturedProgramWire {}
 impl BackupWire for crate::product_contract::FallibleDecodedCapturedProgram {}
+impl BackupWire for crate::product_contract::AppDefinition {}
 impl BackupWire for crate::product_contract::FallibleDecodedScenarioSpec {}
 impl BackupWire for crate::product_contract::FallibleOutputRow<'_> {}
 impl BackupWire for crate::product_contract::FallibleJsonScalar<'_> {}
@@ -91,6 +92,9 @@ impl BackupWire for crate::product_contract::FallibleDataValueTuple<'_> {}
 impl BackupWire for crate::product_contract::Expr {}
 impl BackupWire for crate::product_store::scope::EffectDestinationDto {}
 impl BackupWire for crate::product_contract::fallible_app_decode::DecodedStatement {}
+impl BackupWire for crate::product_contract::Statement {}
+impl BackupWire for (&str, &[crate::product_contract::Statement]) {}
+impl BackupWire for (&str, &[crate::product_contract::fallible_app_decode::DecodedStatement]) {}
 impl BackupWire for crate::product_store::scope::DecodedSemanticKey {}
 impl BackupWire for crate::product_store::scope::DecodedCompositionCompilerIdentity<'_> {}
 impl BackupWire for crate::product_store::scope::DecodedCompilerKeyIdentity<'_> {}
@@ -99,6 +103,7 @@ impl BackupWire for crate::product_store::scope::DecodedCompositionManifest {}
 impl BackupWire for crate::product_store::scope::DecodedMetadataAddition {}
 impl BackupWire for crate::product_store::scope::DecodedMetadataInitializationReceipt {}
 impl BackupWire for crate::product_store::scope::DecodedScopeCorrespondence {}
+impl BackupWire for crate::product_store::scope::DecodedOwnedStructuralReport {}
 
 pub(crate) fn canonical_bytes<T: BackupWire + ?Sized>(
     value: &T,

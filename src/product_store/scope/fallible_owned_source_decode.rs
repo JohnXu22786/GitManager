@@ -35,10 +35,10 @@ const CHANGE_KINDS: &[&str] = &[
 
 #[derive(Debug, Serialize)]
 pub(crate) struct DecodedOwnedSourceRequest {
-    before: Digest,
-    after: Digest,
-    root_entity: String,
-    edits: Vec<DecodedOwnedSpanEdit>,
+    pub(super) before: Digest,
+    pub(super) after: Digest,
+    pub(super) root_entity: String,
+    pub(super) edits: Vec<DecodedOwnedSpanEdit>,
 }
 impl DecodedOwnedSourceRequest {
     pub(crate) fn before(&self) -> &Digest { &self.before }
@@ -46,66 +46,66 @@ impl DecodedOwnedSourceRequest {
     pub(crate) fn root_entity(&self) -> &str { &self.root_entity }
 }
 #[derive(Debug, Serialize)]
-struct DecodedOwnedSpanEdit {
-    id: String,
-    before: DecodedOwnedSpanEndpoint,
-    after: DecodedOwnedSpanEndpoint,
+pub(super) struct DecodedOwnedSpanEdit {
+    pub(super) id: String,
+    pub(super) before: DecodedOwnedSpanEndpoint,
+    pub(super) after: DecodedOwnedSpanEndpoint,
 }
 #[derive(Debug, Serialize)]
-struct DecodedOwnedRootBinding {
-    name: String,
-    value_type: Type,
+pub(super) struct DecodedOwnedRootBinding {
+    pub(super) name: String,
+    pub(super) value_type: Type,
 }
 #[derive(Debug, Serialize)]
-struct DecodedOwnedSpanEndpoint {
-    source: Digest,
-    action: String,
-    list_path: Vec<usize>,
-    start: usize,
-    len: usize,
-    kinds: Vec<OwnedStatementKind>,
-    digest: Digest,
-    previous: Option<Digest>,
-    next: Option<Digest>,
-    root: Option<DecodedOwnedRootBinding>,
+pub(super) struct DecodedOwnedSpanEndpoint {
+    pub(super) source: Digest,
+    pub(super) action: String,
+    pub(super) list_path: Vec<usize>,
+    pub(super) start: usize,
+    pub(super) len: usize,
+    pub(super) kinds: Vec<OwnedStatementKind>,
+    pub(super) digest: Digest,
+    pub(super) previous: Option<Digest>,
+    pub(super) next: Option<Digest>,
+    pub(super) root: Option<DecodedOwnedRootBinding>,
 }
 #[derive(Debug, Serialize)]
-struct DecodedOwnedStructuralChange {
-    kind: OwnedStructuralChangeKind,
-    container: Option<String>,
-    id: String,
-    before: Option<Digest>,
-    after: Digest,
-    before_type: Option<Type>,
-    after_type: Option<Type>,
+pub(super) struct DecodedOwnedStructuralChange {
+    pub(super) kind: OwnedStructuralChangeKind,
+    pub(super) container: Option<String>,
+    pub(super) id: String,
+    pub(super) before: Option<Digest>,
+    pub(super) after: Digest,
+    pub(super) before_type: Option<Type>,
+    pub(super) after_type: Option<Type>,
 }
 #[derive(Debug, Serialize)]
-struct DecodedOwnedCommonStatement {
-    action: String,
-    before: Vec<usize>,
-    after: Vec<usize>,
-    kind: OwnedStatementKind,
+pub(super) struct DecodedOwnedCommonStatement {
+    pub(super) action: String,
+    pub(super) before: Vec<usize>,
+    pub(super) after: Vec<usize>,
+    pub(super) kind: OwnedStatementKind,
 }
 #[derive(Debug, Serialize)]
-struct DecodedOwnedWriter {
-    side: OwnedSourceSide,
-    source: Digest,
-    action: String,
-    path: Vec<usize>,
-    kind: OwnedStatementKind,
-    entity: String,
-    field: Option<String>,
-    value_type: Option<Type>,
+pub(super) struct DecodedOwnedWriter {
+    pub(super) side: OwnedSourceSide,
+    pub(super) source: Digest,
+    pub(super) action: String,
+    pub(super) path: Vec<usize>,
+    pub(super) kind: OwnedStatementKind,
+    pub(super) entity: String,
+    pub(super) field: Option<String>,
+    pub(super) value_type: Option<Type>,
 }
 #[derive(Debug, Serialize)]
 pub(crate) struct DecodedOwnedStructuralReport {
-    before: Digest,
-    after: Digest,
-    root_entity: String,
-    edits: Vec<DecodedOwnedSpanEdit>,
-    common_statements: Vec<DecodedOwnedCommonStatement>,
-    writers: Vec<DecodedOwnedWriter>,
-    changes: Vec<DecodedOwnedStructuralChange>,
+    pub(super) before: Digest,
+    pub(super) after: Digest,
+    pub(super) root_entity: String,
+    pub(super) edits: Vec<DecodedOwnedSpanEdit>,
+    pub(super) common_statements: Vec<DecodedOwnedCommonStatement>,
+    pub(super) writers: Vec<DecodedOwnedWriter>,
+    pub(super) changes: Vec<DecodedOwnedStructuralChange>,
 }
 
 pub(crate) fn decode_owned_source_request(

@@ -1561,6 +1561,8 @@ pub(crate) enum StringMapRef<'a, V> {
     Legacy(&'a BTreeMap<String, V>),
     Fallible(&'a fallible_app_decode::FallibleMap<V>),
 }
+impl<V> Copy for StringMapRef<'_, V> {}
+impl<V> Clone for StringMapRef<'_, V> { fn clone(&self) -> Self { *self } }
 impl<V> StringMapRef<'_, V> { pub(crate) fn is_empty(&self) -> bool { self.len()==0 } }
 pub(crate) enum StringMapIter<'a, V> {
     Legacy(std::collections::btree_map::Iter<'a, String, V>),
@@ -1714,12 +1716,13 @@ pub(crate) enum StatementSlice<'a> {
     Legacy(&'a [Statement]),
     Decoded(&'a [fallible_app_decode::DecodedStatement]),
 }
+#[derive(Clone, Copy)]
 pub(crate) enum StatementView<'a> {
     Create { entity: &'a str, values: StringMapRef<'a, Expr>, bind: &'a str },
     Update { record: &'a Expr, values: StringMapRef<'a, Expr> },
     Archive { record: &'a Expr },
     SetState { state: &'a str, value: &'a Expr },
-    Collection { target: &'a CollectionTarget, items: &'a Expr },
+    Collection { target: &'a CollectionTarget, operation: CollectionOperation, items: &'a Expr },
     ForEach { items: &'a Expr, binding: &'a str, steps: StatementSlice<'a> },
     Assert { condition: &'a Expr, message: &'a str },
     Emit { output: &'a str, items: &'a Expr, binding: &'a str, columns: StringMapRef<'a, Expr> },
@@ -1731,7 +1734,7 @@ impl StatementNode for Statement {
         Self::Update { record, values } => StatementView::Update { record, values: StringMapRef::Legacy(values) },
         Self::Archive { record } => StatementView::Archive { record },
         Self::SetState { state, value } => StatementView::SetState { state, value },
-        Self::Collection { target, items, .. } => StatementView::Collection { target, items },
+        Self::Collection { target, operation, items } => StatementView::Collection { target, operation: *operation, items },
         Self::ForEach { items, binding, steps } => StatementView::ForEach { items, binding, steps: StatementSlice::Legacy(steps) },
         Self::Assert { condition, message } => StatementView::Assert { condition, message },
         Self::Emit { output, items, binding, columns } => StatementView::Emit { output, items, binding, columns: StringMapRef::Legacy(columns) },
@@ -1743,7 +1746,7 @@ impl StatementNode for fallible_app_decode::DecodedStatement {
         S::Update { record, values } => StatementView::Update { record, values: StringMapRef::Fallible(values) },
         S::Archive { record } => StatementView::Archive { record },
         S::SetState { state, value } => StatementView::SetState { state, value },
-        S::Collection { target, items, .. } => StatementView::Collection { target, items },
+        S::Collection { target, operation, items } => StatementView::Collection { target, operation: *operation, items },
         S::ForEach { items, binding, steps } => StatementView::ForEach { items, binding, steps: StatementSlice::Decoded(steps) },
         S::Assert { condition, message } => StatementView::Assert { condition, message },
         S::Emit { output, items, binding, columns } => StatementView::Emit { output, items, binding, columns: StringMapRef::Fallible(columns) },
@@ -1761,10 +1764,33 @@ impl StatementSlice<'_> {
 impl<'a> StatementSlice<'a> {
     pub(crate) fn len(&self) -> usize { match self { Self::Legacy(v) => v.len(), Self::Decoded(v) => v.len() } }
     pub(crate) fn is_empty(&self) -> bool { self.len() == 0 }
+    pub(crate) fn slice_prefix(self, end: usize) -> Self { match self { Self::Legacy(v) => Self::Legacy(&v[..end]), Self::Decoded(v) => Self::Decoded(&v[..end]) } }
+    pub(crate) fn slice_range(self, start: usize, len: usize) -> Self { let end=start+len; match self { Self::Legacy(v) => Self::Legacy(&v[start..end]), Self::Decoded(v) => Self::Decoded(&v[start..end]) } }
     pub(crate) fn get(&self, index: usize) -> Option<StatementView<'a>> {
         match self {
             Self::Legacy(items) => items.get(index).map(StatementNode::statement_view),
             Self::Decoded(items) => items.get(index).map(StatementNode::statement_view),
+        }
+    }
+    pub(crate) fn statement_digest_with(
+        &self, index: usize, cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Digest, crate::product_backup::fallible_codec::CodecError> {
+        match self {
+            Self::Legacy(items) => crate::product_backup::fallible_codec::canonical_digest(
+                IdentityDomain::Evidence, items.get(index).ok_or(crate::product_backup::fallible_codec::CodecError::SerializationInvariant)?, cx,
+            ),
+            Self::Decoded(items) => crate::product_backup::fallible_codec::canonical_digest(
+                IdentityDomain::Evidence, items.get(index).ok_or(crate::product_backup::fallible_codec::CodecError::SerializationInvariant)?, cx,
+            ),
+        }
+    }
+    pub(crate) fn span_digest_with(
+        &self, start: usize, len: usize, cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Digest, crate::product_backup::fallible_codec::CodecError> {
+        let end = start.checked_add(len).ok_or(crate::product_backup::fallible_codec::CodecError::SerializationInvariant)?;
+        match self {
+            Self::Legacy(items) => crate::product_backup::fallible_codec::canonical_digest(IdentityDomain::Evidence, &("owned-span/1", items.get(start..end).ok_or(crate::product_backup::fallible_codec::CodecError::SerializationInvariant)?), cx),
+            Self::Decoded(items) => crate::product_backup::fallible_codec::canonical_digest(IdentityDomain::Evidence, &("owned-span/1", items.get(start..end).ok_or(crate::product_backup::fallible_codec::CodecError::SerializationInvariant)?), cx),
         }
     }
 }
@@ -1785,6 +1811,41 @@ impl<'a> AppRef<'a> {
             Self::Snapshot => &[],
         }
     }
+    pub(crate) fn id(&self) -> Option<&'a str> {
+        match self { Self::Legacy(app) => Some(&app.id), Self::Decoded(app) => Some(&app.id), Self::Snapshot => None }
+    }
+    pub(crate) fn label(&self) -> Option<&'a str> {
+        match self { Self::Legacy(app) => Some(&app.label), Self::Decoded(app) => Some(&app.label), Self::Snapshot => None }
+    }
+    pub(crate) fn version(&self) -> Option<u32> {
+        match self { Self::Legacy(app) => Some(app.version), Self::Decoded(app) => Some(app.version), Self::Snapshot => None }
+    }
+    pub(crate) fn initial_view(&self) -> Option<&'a str> {
+        match self { Self::Legacy(app) => Some(&app.initial_view), Self::Decoded(app) => Some(&app.initial_view), Self::Snapshot => None }
+    }
+    pub(crate) fn observable_count(&self) -> usize {
+        match self { Self::Legacy(app) => app.observables.len(), Self::Decoded(app) => app.observables.len(), Self::Snapshot => 0 }
+    }
+    pub(crate) fn observable(&self, index: usize) -> Option<(&'a str, &'a Expr)> {
+        match self {
+            Self::Legacy(app) => app.observables.get(index).map(|v| (v.id.as_str(), &v.value)),
+            Self::Decoded(app) => app.observables.get(index).map(|v| (v.id.as_str(), &v.value)),
+            Self::Snapshot => None,
+        }
+    }
+    pub(crate) fn column_expression(&self, view: &str, column: &str) -> Option<(&'a str, &'a Expr)> {
+        match self {
+            Self::Legacy(app) => app.views.iter().find(|v| v.id == view).and_then(|view| match &view.kind {
+                ViewKind::List { entity, columns, .. } | ViewKind::Detail { entity, columns, .. } => columns.iter().find(|c| c.id == column).map(|c| (entity.as_str(), &c.value)),
+                ViewKind::Form { .. } => None,
+            }),
+            Self::Decoded(app) => app.views.iter().find(|v| v.id == view).and_then(|view| match &view.kind {
+                fallible_app_decode::DecodedViewKind::List { entity, columns, .. } | fallible_app_decode::DecodedViewKind::Detail { entity, columns, .. } => columns.iter().find(|c| c.id == column).map(|c| (entity.as_str(), &c.value)),
+                fallible_app_decode::DecodedViewKind::Form { .. } => None,
+            }),
+            Self::Snapshot => None,
+        }
+    }
     pub(crate) fn visit_view_action_expressions(&self, visit: &mut dyn FnMut(&Expr)) {
         match self {
             Self::Legacy(app) => for view in &app.views { view.visit_action_expressions(visit); },
@@ -1803,7 +1864,7 @@ impl<'a> AppRef<'a> {
                     }
                     StatementView::Archive { record } => visit(record),
                     StatementView::SetState { value, .. } => visit(value),
-                    StatementView::Collection { target, items } => {
+                    StatementView::Collection { target, items, .. } => {
                         if let CollectionTarget::Field { record, .. } = target { visit(record); }
                         visit(items);
                     }
@@ -2473,7 +2534,7 @@ impl<'a, 'w, 'c> Validator<'a, 'w, 'c> {
                 StatementView::SetState { state, value } => {
                     self.expect(value, env, &self.state(state)?.value_type, depth + 1, true)?;
                 }
-                StatementView::Collection { target, items } => {
+                StatementView::Collection { target, items, .. } => {
                     let typ = match target {
                         CollectionTarget::State { state } => a.clone_owned(&self.state(state)?.value_type)?,
                         CollectionTarget::Field { record, field } => {
@@ -2780,6 +2841,23 @@ pub(crate) fn decoded_expression_type_empty_with(
     let env = fallible_app_decode::FallibleMap::new();
     let mut validator = Validator::new_app(AppRef::Decoded(app), Audit::none(), cx);
     let result = validator.expr(expression, &env, 0, true);
+    if let Some(failure) = validator.allocation_failure.take() {
+        return Err(AppValidationError::Allocation(failure));
+    }
+    result.map_err(AppValidationError::Contract)
+}
+
+/// Type-check a decoded expression against an already-owned lexical map.
+/// Callers which build nested statement scopes can share one charged ordered
+/// environment instead of cloning/reconstructing a one-binding map per read.
+pub(crate) fn decoded_expression_type_in_with(
+    app: &fallible_app_decode::DecodedAppDefinition,
+    expression: &Expr,
+    bindings: &impl StringValueMap<Type>,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<Type, AppValidationError> {
+    let mut validator = Validator::new_app(AppRef::Decoded(app), Audit::none(), cx);
+    let result = validator.expr(expression, bindings, 0, true);
     if let Some(failure) = validator.allocation_failure.take() {
         return Err(AppValidationError::Allocation(failure));
     }

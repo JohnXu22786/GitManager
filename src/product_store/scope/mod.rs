@@ -16,6 +16,11 @@ pub(crate) use fallible_compatibility::{report as compatibility_report_fallible,
 mod fallible_replay_registry;
 pub(crate) use fallible_replay_registry::{replay_snapshot_fallible, ReplayRegistryError};
 mod fallible_replay_context;
+mod owned_source_shared;
+mod fallible_owned_source_analysis;
+pub(crate) use fallible_owned_source_analysis::{analyze_owned_sources_fallible, SourceAnalysisFailure};
+pub(crate) use fallible_owned_source_decode::decode_owned_source_request as decode_owned_source_request_fallible;
+pub(crate) use fallible_owned_source_decode::DecodedOwnedStructuralReport;
 pub(crate) use fallible_replay_context::{FallibleScalarReplayContext, ScalarReplayFailure};
 mod fallible_scalar_verify;
 pub(crate) use fallible_scalar_verify::{validate as validate_scalar_scope_fallible, ScalarValidationFailure};
