@@ -129,6 +129,9 @@ impl<'a> DecodedCommonFactRules<'a> {
     }
     pub(crate) fn certificates(&self) -> &[DecodedCommonFactCertificate] { &self.certificates }
     pub(crate) fn discovered(&self) -> &OrderedSet<(String, String)> { &self.discovered }
+    pub(crate) fn take_outputs(self) -> (Vec<DecodedCommonFactCertificate>, OrderedSet<(String, String)>) {
+        (self.certificates, self.discovered)
+    }
     pub(crate) fn environment(&self, parameters: &impl StringValueMap<Type>, prefix: &str, cx: &mut AllocationContext) -> Result<DecodedRuleEnvironment, CommonFactInventoryFailure> {
         let mut environment = DecodedRuleEnvironment::new();
         let mut previous: Option<&str> = None;

@@ -631,4 +631,218 @@ mod tests {
         assert_reference_refusal(reference("registry_ref", "scratch", true, vec![]), decoded_reference("registry_ref", "scratch", true, vec![]), "Common factual admission: edge: references to terminal history/private auxiliary relations are unsupported");
         assert_reference_refusal(reference("job_ref", "registry", true, vec![]), decoded_reference("job_ref", "registry", true, vec![]), "Common factual admission: edge: owner reference is not the exact root");
     }
+
+    #[test]
+    fn decoded_pair_verifier_matches_legacy_and_retries_allocation_refusals() {
+        use super::super::common_fact_admission::{ProofBudget, ProofMeter};
+        use super::super::fallible_common_fact_verify::verify_pair_fallible;
+        use std::sync::{atomic::AtomicBool, Arc};
+
+        let (_app_before, _app_after, legacy_before, legacy_after, legacy_data, mut legacy_request, legacy_inventory,
+            before, after, snapshot, _request, inventory) = fixture();
+        let lifecycle = Expr::Equal {
+            left: Box::new(Expr::Field { record: Box::new(Expr::Variable { name: "record".into() }), field: "done".into() }),
+            right: Box::new(Expr::Literal { value_type: Type::Boolean, value: DataValue::Boolean { value: true } }),
+        };
+        legacy_request.inventory.lifecycle.before = lifecycle.clone();
+        legacy_request.inventory.lifecycle.after = lifecycle;
+        let request_value = serde_json::to_value(&legacy_request).unwrap();
+        let mut request_cx = AllocationContext::new();
+        let request = super::super::fallible_owned_request_decode::decode_owned_preview_request(
+            crate::product_json::parse_json_bytes(&serde_json::to_vec(&request_value).unwrap(), &mut request_cx).unwrap(), &mut request_cx,
+        ).unwrap();
+        let make_meter = || ProofMeter::new(ProofBudget::default(), Arc::new(AtomicBool::new(false))).unwrap();
+
+        let mut legacy_meter = make_meter();
+        let expected = super::super::common_fact_rules::verify_pair_frame(
+            &legacy_before, &legacy_after, &legacy_request, &legacy_inventory, &legacy_data, None, &mut legacy_meter,
+        ).unwrap();
+        let mut cx = AllocationContext::new();
+        let mut decoded_meter = make_meter();
+        let actual = verify_pair_fallible(&before, &after, snapshot.data(), &request, &inventory, &mut decoded_meter, &mut cx).unwrap();
+        assert_eq!(actual.certificates.len(), expected.0.len());
+        for (decoded, legacy) in actual.certificates.iter().zip(&expected.0) {
+            assert_eq!(decoded.side, legacy.side);
+            assert_eq!(decoded.site, legacy.site);
+            assert_eq!(decoded.rule, legacy.rule);
+            assert_eq!(decoded.identity, legacy.identity);
+        }
+        assert_eq!(actual.projections, expected.1);
+        assert_eq!(actual.comparison, expected.2);
+        assert_eq!(legacy_meter.remaining_units_for_test(), decoded_meter.remaining_units_for_test(), "pair proof charge must match the legacy accounting");
+
+        let growths = cx.growth_requests();
+        assert!(growths > 0);
+        for nth in 1..=growths {
+            let mut refusal = AllocationContext::fail_nth_growth(std::num::NonZeroUsize::new(nth).unwrap(), true);
+            let mut meter = make_meter();
+            assert!(matches!(verify_pair_fallible(&before, &after, snapshot.data(), &request, &inventory, &mut meter, &mut refusal),
+                Err(super::super::fallible_common_fact_inventory::CommonFactInventoryFailure::Allocation(_))),
+                "growth refusal {nth} must preserve its allocation classification");
+            let mut retry = AllocationContext::new();
+            let mut meter = make_meter();
+            let retried = verify_pair_fallible(&before, &after, snapshot.data(), &request, &inventory, &mut meter, &mut retry).unwrap();
+            assert_eq!(retried.comparison, expected.2);
+            assert_eq!(retried.certificates.len(), expected.0.len());
+        }
+    }
+
+    #[test]
+    fn decoded_pair_verifier_preserves_lifecycle_order_and_nonempty_state_marker_gate() {
+        use super::super::common_fact_admission::{ProofBudget, ProofMeter};
+        use super::super::fallible_common_fact_verify::verify_pair_fallible;
+        use std::sync::{atomic::AtomicBool, Arc};
+
+        fn lifecycle() -> Expr {
+            Expr::Equal {
+                left: Box::new(Expr::Field { record: Box::new(Expr::Variable { name: "record".into() }), field: "done".into() }),
+                right: Box::new(Expr::Literal { value_type: Type::Boolean, value: DataValue::Boolean { value: true } }),
+            }
+        }
+        let build = || fixture_with(|before, after| {
+            for app in [before, after] {
+                app.state.push(StateDefinition { id: "input".into(), label: "Input".into(), value_type: Type::Text, initial: DataValue::Text { value: String::new() } });
+                app.actions[0].steps.push(Statement::SetState { state: "input".into(), value: Expr::Literal { value_type: Type::Text, value: DataValue::Text { value: "retained-marker".into() } } });
+            }
+        });
+        let (_app_before, _app_after, legacy_before, legacy_after, legacy_data, mut legacy_request, legacy_inventory,
+            before, after, snapshot, request, inventory) = build();
+        legacy_request.inventory.lifecycle.before = lifecycle();
+        legacy_request.inventory.lifecycle.after = lifecycle();
+        let mut legacy_meter = ProofMeter::new(ProofBudget::default(), Arc::new(AtomicBool::new(false))).unwrap();
+        let legacy_error = super::super::common_fact_rules::verify_pair_frame(
+            &legacy_before, &legacy_after, &legacy_request, &legacy_inventory, &legacy_data, None, &mut legacy_meter,
+        ).unwrap_err();
+        let legacy_error = match legacy_error { crate::product_store::StoreError::Invalid(message) => message, other => panic!("unexpected legacy refusal: {other:?}") };
+        let request_value = serde_json::to_value(&legacy_request).unwrap();
+        let mut request_cx = AllocationContext::new();
+        let decoded_request = super::super::fallible_owned_request_decode::decode_owned_preview_request(
+            crate::product_json::parse_json_bytes(&serde_json::to_vec(&request_value).unwrap(), &mut request_cx).unwrap(), &mut request_cx,
+        ).unwrap();
+        let mut meter = ProofMeter::new(ProofBudget::default(), Arc::new(AtomicBool::new(false))).unwrap();
+        let decoded_error = verify_pair_fallible(&before, &after, snapshot.data(), &decoded_request, &inventory, &mut meter, &mut AllocationContext::new()).unwrap_err();
+        assert!(matches!(&decoded_error, super::super::fallible_common_fact_inventory::CommonFactInventoryFailure::Store(crate::product_store::StoreError::Invalid(message)) if message == &legacy_error), "legacy={legacy_error}; decoded={decoded_error:?}");
+        assert!(legacy_error.contains("input reset must be literal empty, common, top-level and final"));
+
+        // A mismatch in the pair's lifecycle meaning is checked before schema
+        // and state-marker validation, matching the legacy refusal order.
+        let mismatch = Expr::Equal {
+            left: Box::new(Expr::Field { record: Box::new(Expr::Variable { name: "record".into() }), field: "done".into() }),
+            right: Box::new(Expr::Literal { value_type: Type::Boolean, value: DataValue::Boolean { value: false } }),
+        };
+        legacy_request.inventory.lifecycle.after = mismatch.clone();
+        let decoded_value = serde_json::to_value(&request).unwrap();
+        let mut decoded_json: serde_json::Value = decoded_value;
+        decoded_json["inventory"]["lifecycle"]["before"] = serde_json::to_value(lifecycle()).unwrap();
+        decoded_json["inventory"]["lifecycle"]["after"] = serde_json::to_value(mismatch).unwrap();
+        let mut cx = AllocationContext::new();
+        let decoded_request = super::super::fallible_owned_request_decode::decode_owned_preview_request(
+            crate::product_json::parse_json_bytes(&serde_json::to_vec(&decoded_json).unwrap(), &mut cx).unwrap(), &mut cx,
+        ).unwrap();
+        let mut legacy_meter = ProofMeter::new(ProofBudget::default(), Arc::new(AtomicBool::new(false))).unwrap();
+        let legacy_error = super::super::common_fact_rules::verify_pair_frame(
+            &legacy_before, &legacy_after, &legacy_request, &legacy_inventory, &legacy_data, None, &mut legacy_meter,
+        ).unwrap_err();
+        let legacy_error = match legacy_error { crate::product_store::StoreError::Invalid(message) => message, other => panic!("unexpected legacy refusal: {other:?}") };
+        let mut meter = ProofMeter::new(ProofBudget::default(), Arc::new(AtomicBool::new(false))).unwrap();
+        let decoded_error = verify_pair_fallible(&before, &after, snapshot.data(), &decoded_request, &inventory, &mut meter, &mut AllocationContext::new()).unwrap_err();
+        assert!(matches!(decoded_error, super::super::fallible_common_fact_inventory::CommonFactInventoryFailure::Store(crate::product_store::StoreError::Invalid(message)) if message == legacy_error));
+        assert!(legacy_error.contains("before/after completion meaning differs"));
+    }
+
+    #[test]
+    fn decoded_pair_verifier_checks_revision_margin_only_for_active_rows() {
+        use super::super::common_fact_admission::{ProofBudget, ProofMeter};
+        use super::super::fallible_common_fact_verify::verify_pair_fallible;
+        use std::sync::{atomic::AtomicBool, Arc};
+
+        let (_app_before, _app_after, legacy_before, legacy_after, mut legacy_data, mut legacy_request, legacy_inventory,
+            before, after, snapshot, _request, inventory) = fixture();
+        let lifecycle = Expr::Equal {
+            left: Box::new(Expr::Field { record: Box::new(Expr::Variable { name: "record".into() }), field: "done".into() }),
+            right: Box::new(Expr::Literal { value_type: Type::Boolean, value: DataValue::Boolean { value: true } }),
+        };
+        legacy_request.inventory.lifecycle.before = lifecycle.clone();
+        legacy_request.inventory.lifecycle.after = lifecycle;
+        let request_value = serde_json::to_value(&legacy_request).unwrap();
+        let mut cx = AllocationContext::new();
+        let decoded_request = super::super::fallible_owned_request_decode::decode_owned_preview_request(
+            crate::product_json::parse_json_bytes(&serde_json::to_vec(&request_value).unwrap(), &mut cx).unwrap(), &mut cx,
+        ).unwrap();
+        let mut data_record = Record {
+            entity: "job".into(), id: "near-overflow".into(), revision: u64::MAX - 9_999_999,
+            created_program: Digest::from_owned_lower_hex("0".repeat(64)).unwrap(), archived: false,
+            values: BTreeMap::from([("done".into(), DataValue::Boolean { value: false })]),
+        };
+
+        for archived in [false, true] {
+            data_record.archived = archived;
+            legacy_data.records.clear();
+            legacy_data.records.push(data_record.clone());
+            let mut cx = AllocationContext::new();
+            let decoded_data = decode_data_snapshot_fallible(
+                crate::product_json::parse_json_bytes(&serde_json::to_vec(&legacy_data).unwrap(), &mut cx).unwrap(), &mut cx,
+            ).unwrap();
+            let mut legacy_meter = ProofMeter::new(ProofBudget::default(), Arc::new(AtomicBool::new(false))).unwrap();
+            let legacy = super::super::common_fact_rules::verify_pair_frame(
+                &legacy_before, &legacy_after, &legacy_request, &legacy_inventory, &legacy_data, None, &mut legacy_meter,
+            );
+            let mut meter = ProofMeter::new(ProofBudget::default(), Arc::new(AtomicBool::new(false))).unwrap();
+            let decoded = verify_pair_fallible(&before, &after, &decoded_data, &decoded_request, &inventory, &mut meter, &mut AllocationContext::new());
+            if archived {
+                assert!(legacy.is_ok());
+                assert!(decoded.is_ok());
+            } else {
+                let legacy_error = match legacy.unwrap_err() { crate::product_store::StoreError::Invalid(message) => message, other => panic!("unexpected legacy refusal: {other:?}") };
+                assert_eq!(legacy_error, "Common factual admission: retained revisions: insufficient revision range for the bounded runtime run");
+                assert!(matches!(decoded, Err(super::super::fallible_common_fact_inventory::CommonFactInventoryFailure::Store(crate::product_store::StoreError::Invalid(message))) if message == legacy_error));
+            }
+        }
+        let _ = snapshot;
+    }
+
+    #[test]
+    fn decoded_pair_verifier_refuses_unrooted_paired_nonempty_spans_before_schema_rules() {
+        use super::super::common_fact_admission::{ProofBudget, ProofMeter};
+        use super::super::fallible_common_fact_verify::verify_pair_fallible;
+        use super::super::owned_contract::{OwnedSpanEdit, OwnedSpanEndpoint};
+        use std::sync::{atomic::AtomicBool, Arc};
+
+        let (_app_before, _app_after, legacy_before, legacy_after, legacy_data, mut legacy_request, mut legacy_inventory,
+            before, after, snapshot, request, mut inventory) = fixture();
+        let lifecycle = Expr::Equal {
+            left: Box::new(Expr::Field { record: Box::new(Expr::Variable { name: "record".into() }), field: "done".into() }),
+            right: Box::new(Expr::Literal { value_type: Type::Boolean, value: DataValue::Boolean { value: true } }),
+        };
+        legacy_request.inventory.lifecycle.before = lifecycle.clone();
+        legacy_request.inventory.lifecycle.after = lifecycle;
+        let request_value = serde_json::to_value(&legacy_request).unwrap();
+        let mut cx = AllocationContext::new();
+        let decoded_request = super::super::fallible_owned_request_decode::decode_owned_preview_request(
+            crate::product_json::parse_json_bytes(&serde_json::to_vec(&request_value).unwrap(), &mut cx).unwrap(), &mut cx,
+        ).unwrap();
+        let digest = Digest::from_owned_lower_hex("0".repeat(64)).unwrap();
+        let endpoint = |source: Digest| OwnedSpanEndpoint {
+            source, action: "record".into(), list_path: vec![], start: 0, len: 1,
+            kinds: vec![OwnedStatementKind::Create], digest: Digest::from_owned_lower_hex("0".repeat(64)).unwrap(), previous: None, next: None, root: None,
+        };
+        legacy_inventory.structure.edits.push(OwnedSpanEdit { id: "paired".into(), before: endpoint(digest.clone()), after: endpoint(digest.clone()) });
+        let decoded_endpoint = |source: Digest| super::super::fallible_owned_source_decode::DecodedOwnedSpanEndpoint {
+            source, action: "record".into(), list_path: vec![], start: 0, len: 1, kinds: vec![OwnedStatementKind::Create],
+            digest: Digest::from_owned_lower_hex("0".repeat(64)).unwrap(), previous: None, next: None, root: None,
+        };
+        inventory.structure.edits.push(super::super::fallible_owned_source_decode::DecodedOwnedSpanEdit {
+            id: "paired".into(), before: decoded_endpoint(digest.clone()), after: decoded_endpoint(digest),
+        });
+
+        let mut legacy_meter = ProofMeter::new(ProofBudget::default(), Arc::new(AtomicBool::new(false))).unwrap();
+        let legacy_error = super::super::common_fact_rules::verify_pair_frame(
+            &legacy_before, &legacy_after, &legacy_request, &legacy_inventory, &legacy_data, None, &mut legacy_meter,
+        ).unwrap_err();
+        let legacy_error = match legacy_error { crate::product_store::StoreError::Invalid(message) => message, other => panic!("unexpected legacy refusal: {other:?}") };
+        let mut meter = ProofMeter::new(ProofBudget::default(), Arc::new(AtomicBool::new(false))).unwrap();
+        let decoded_error = verify_pair_fallible(&before, &after, snapshot.data(), &decoded_request, &inventory, &mut meter, &mut AllocationContext::new()).unwrap_err();
+        assert!(matches!(decoded_error, super::super::fallible_common_fact_inventory::CommonFactInventoryFailure::Store(crate::product_store::StoreError::Invalid(message)) if message == legacy_error));
+        assert!(legacy_error.contains("paired variant lacks an exact single-root correspondence"));
+    }
 }
