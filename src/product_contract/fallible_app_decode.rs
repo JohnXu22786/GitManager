@@ -264,6 +264,7 @@ pub(crate) struct DecodedViewDefinition {
     pub(crate) actions: Vec<DecodedActionBinding>,
     pub(crate) keys: Vec<DecodedKeyBinding>,
 }
+impl DecodedViewDefinition { pub(crate) fn has_keys(&self) -> bool { !self.keys.is_empty() } }
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

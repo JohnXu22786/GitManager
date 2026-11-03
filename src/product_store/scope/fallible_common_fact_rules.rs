@@ -23,6 +23,7 @@ pub(crate) struct DecodedCommonFactCertificate {
 }
 impl crate::product_backup::fallible_codec::BackupWire for (&DecodedOwnedRootBinding, &String) {}
 impl crate::product_backup::fallible_codec::BackupWire for (&String, &Expr, &Option<String>) {}
+impl crate::product_backup::fallible_codec::BackupWire for crate::product_contract::fallible_app_decode::DecodedViewDefinition {}
 
 pub(crate) struct DecodedRuleValue {
     pub(crate) ty: Type,
@@ -549,6 +550,148 @@ impl<'a> DecodedCommonFactRules<'a> {
         }
         Ok(())
     }
+
+    fn stable_own_row(expr: &Expr, binding: &str) -> bool {
+        match expr {
+            Expr::Literal { .. } => true,
+            Expr::Field { record, .. } => variable(record, binding),
+            Expr::Not { value } => Self::stable_own_row(value, binding),
+            Expr::Equal { left, right } | Expr::Less { left, right } => Self::stable_own_row(left, binding) && Self::stable_own_row(right, binding),
+            Expr::And { values } | Expr::Or { values } => values.iter().all(|value| Self::stable_own_row(value, binding)),
+            Expr::If { condition, then_value, else_value } => [condition, then_value, else_value].iter().all(|value| Self::stable_own_row(value, binding)),
+            Expr::Coalesce { value, fallback } => Self::stable_own_row(value, binding) && Self::stable_own_row(fallback, binding),
+            _ => false,
+        }
+    }
+    fn historical_rows(&mut self, view: &crate::product_contract::fallible_app_decode::DecodedViewDefinition, rows: &Expr, cx: &mut AllocationContext) -> Result<(), CommonFactInventoryFailure> {
+        let Expr::Query { entity, binding, predicate, sort, limit, include_archived } = rows else {
+            return Err(refuse(cx, &view.id, "historical root rows require an exact root query"));
+        };
+        let mut row = DecodedRuleValue::plain(reference_type(entity, cx)?);
+        row.root = Some(copy_string("historical-view-root", cx)?);
+        let mut env = DecodedRuleEnvironment::new();
+        env.insert(binding, row, cx)?;
+        let first = match predicate.as_ref() { Expr::And { values } => values.first(), other => Some(other) };
+        let excludes_history = if !include_archived {
+            if let Some(Expr::Not { value }) = first { self.facet(value, &env, cx)?.as_deref() == Some("historical-view-root") } else { false }
+        } else { false };
+        if entity != self.root_entity || *limit != MAX_COLLECTION || (!Self::stable_own_row(predicate, binding) && !excludes_history)
+            || !sort.iter().all(|key| Self::stable_own_row(&key.value, binding)) {
+            return Err(refuse(cx, &view.id, "historical root membership/order lacks stable own-row or completed-exclusion rule"));
+        }
+        let site = format_owned(cx, format_args!("view {} rows", view.id))?;
+        self.certify(&site, "untruncated stable historical root membership/order or leading completed exclusion", rows, cx)
+    }
+    fn history_view(&mut self, view: &crate::product_contract::fallible_app_decode::DecodedViewDefinition, entity: &str, rows: &Expr, columns: &[crate::product_contract::fallible_app_decode::DecodedColumn], cx: &mut AllocationContext) -> Result<(), CommonFactInventoryFailure> {
+        let Some(DecodedOwnedSchemaKind::History { sequence, .. }) = self.kinds.get(entity) else { return Err(refuse(cx, &view.id, "history must be an inert direct query")); };
+        let Expr::Query { entity: queried, binding, predicate, sort, limit, .. } = rows else {
+            return Err(refuse(cx, &view.id, "history must be an inert direct query"));
+        };
+        if queried != entity || literal(predicate) != Some(&DataValue::Boolean { value: true }) || *limit != MAX_COLLECTION
+            || sort.len() != 1 || !matches!(&sort[0].value, Expr::Field { record, field } if variable(record, binding) && field == sequence)
+            || !view.actions.is_empty() || view.has_keys() {
+            return Err(refuse(cx, &view.id, "fresh-identity history consumer has unsupported order, selection or action"));
+        }
+        if let crate::product_contract::fallible_app_decode::DecodedViewKind::List { controls, selection, .. } = &view.kind {
+            if !controls.is_empty() || selection.is_some() { return Err(refuse(cx, &view.id, "history controls/selection would expose shifted row identities")); }
+        }
+        let mut env = DecodedRuleEnvironment::new();
+        env.insert("row", DecodedRuleValue::plain(reference_type(entity, cx)?), cx)?;
+        for column in columns {
+            if !matches!(&column.value, Expr::Field { record, .. } if variable(record, "row")) {
+                return Err(refuse(cx, &view.id, "history columns must be direct stored scalar fields"));
+            }
+            let value = self.expression(&column.value, &env, false, true, &view.id, cx)?;
+            if !value.ty.is_scalar() && !matches!(value.ty, Type::Optional { .. }) {
+                return Err(refuse(cx, &view.id, "history cannot expose references or list identity consumers"));
+            }
+        }
+        let site = format_owned(cx, format_args!("view {}", view.id))?;
+        self.certify(&site, "inert stored-field history, distinct retained/inductive sequence order; actual row IDs retained", view, cx)
+    }
+    pub(crate) fn observations(&mut self, cx: &mut AllocationContext) -> Result<(), CommonFactInventoryFailure> {
+        let structure = self.structure.ok_or_else(|| refuse(cx, "observations", "decoded structural inventory required"))?;
+        let AppRef::Decoded(app) = self.app else { return Err(refuse(cx, "observations", "decoded app owner required")); };
+        for view in &app.views {
+            let mut row_env = DecodedRuleEnvironment::new();
+            match &view.kind {
+                crate::product_contract::fallible_app_decode::DecodedViewKind::List { entity, rows, columns, controls, selection } => {
+                    if matches!(self.kinds.get(entity), Some(DecodedOwnedSchemaKind::History { .. })) {
+                        self.history_view(view, entity, rows, columns, cx)?;
+                        continue;
+                    }
+                    if entity == &structure.root_entity { self.historical_rows(view, rows, cx)?; }
+                    let rows_at = format_owned(cx, format_args!("view {} rows", view.id))?;
+                    let rows_value = self.expression(rows, &DecodedRuleEnvironment::new(), true, true, &rows_at, cx)?;
+                    if !rows_value.policy.is_empty() { return Err(refuse(cx, &view.id, "row identity/selection depends on private policy")); }
+                    let mut row = rows_value.item(cx)?;
+                    if entity == &structure.root_entity || matches!(self.kinds.get(entity), Some(DecodedOwnedSchemaKind::Link { .. } | DecodedOwnedSchemaKind::Aux { .. })) {
+                        row.root = Some(format_owned(cx, format_args!("view/{}/row", view.id))?);
+                    }
+                    row_env.insert("row", row.try_clone_with(cx)?, cx)?;
+                    for column in columns {
+                        let at = format_owned(cx, format_args!("view {} column {}", view.id, column.id))?;
+                        let value = self.expression(&column.value, &row_env, true, true, &at, cx)?;
+                        if entity == &structure.root_entity && value.frame_dependent { return Err(refuse(cx, &at, "historical time/session-dependent column is unsupported")); }
+                        if !value.policy.iter().all(|root| Some(root.as_str()) == row.root.as_deref()) { return Err(refuse(cx, &view.id, "display reads another root's private policy")); }
+                    }
+                    if controls.iter().any(|control| control.on_change.is_some()) || selection.is_some() {
+                        return Err(refuse(cx, &view.id, "callback/selection state ingress lacks a closed input rule"));
+                    }
+                }
+                crate::product_contract::fallible_app_decode::DecodedViewKind::Detail { .. } => return Err(refuse(cx, &view.id, "detail identity/history selection is unsupported")),
+                crate::product_contract::fallible_app_decode::DecodedViewKind::Form { defaults, .. } => {
+                    if defaults.iter().any(|(_, value)| matches!(value, DataValue::Reference { .. } | DataValue::List { .. })) {
+                        return Err(refuse(cx, &view.id, "form reference defaults lack independent provenance"));
+                    }
+                }
+            }
+            for action in &view.actions {
+                let empty = DecodedRuleEnvironment::new();
+                let env = if action.placement == crate::product_contract::ActionPlacement::Row { &row_env } else { &empty };
+                let enabled_at = format_owned(cx, format_args!("view {} binding {} enabled", view.id, action.id))?;
+                let enabled = self.expression(&action.enabled, env, true, true, &enabled_at, cx)?;
+                let target = app.actions.iter().find(|candidate| candidate.id == action.action).ok_or_else(|| refuse(cx, &view.id, "binding target action missing"))?;
+                if (self.mixed(&target.id) && !enabled.policy.is_empty()) || (self.shared_update(&action.action) && !enabled.facets.is_empty()) {
+                    let at = format_owned(cx, format_args!("view {} binding {}", view.id, action.id))?;
+                    return Err(refuse(cx, &at, "common factual UI admission depends on private policy or unrelated lifecycle"));
+                }
+                if !enabled.policy.iter().all(|root| Some(root.as_str()) == env.get("row").and_then(|row| row.root.as_deref())) {
+                    return Err(refuse(cx, &view.id, "nonlocal policy enablement"));
+                }
+                let mut previous = None;
+                while let Some((name, arg)) = next_map_value(&action.arguments, previous) {
+                    let at = format_owned(cx, format_args!("view {} binding {} argument {name}", view.id, action.id))?;
+                    let value = self.expression(arg, env, false, false, &at, cx)?;
+                    if !value.policy.is_empty() || value.private_identity { return Err(refuse(cx, &view.id, "policy-derived scalar/reference binding laundering")); }
+                    previous = Some(name);
+                }
+            }
+        }
+        for observable in &app.observables {
+            let at = format_owned(cx, format_args!("observable {}", observable.id))?;
+            let value = self.expression(&observable.value, &DecodedRuleEnvironment::new(), true, true, &at, cx)?;
+            if value.session_dependent { return Err(refuse(cx, &observable.id, "historical session-dependent observable is unsupported")); }
+            if value.frame_dependent {
+                let guarded = if let Expr::Count { items } = &observable.value {
+                    if let Expr::Query { entity, binding, predicate, .. } = items.as_ref() {
+                        let first = match predicate.as_ref() { Expr::And { values } => values.first(), other => Some(other) };
+                        let mut row = DecodedRuleValue::plain(reference_type(entity, cx)?);
+                        row.root = Some(copy_string("historical-count-root", cx)?);
+                        let mut env = DecodedRuleEnvironment::new(); env.insert(binding, row, cx)?;
+                        entity == &structure.root_entity && matches!(first, Some(Expr::Not { value }) if self.facet(value, &env, cx)?.as_deref() == Some("historical-count-root"))
+                    } else { false }
+                } else { false };
+                if !guarded { return Err(refuse(cx, &observable.id, "time/session historical count lacks leading completed-false short-circuit")); }
+            }
+            if !value.policy.is_empty() {
+                let Expr::Count { items } = &observable.value else { return Err(refuse(cx, &observable.id, "private aggregate is not Count(Query(root))")); };
+                let Expr::Query { entity, limit, sort, .. } = items.as_ref() else { return Err(refuse(cx, &observable.id, "private count has no exact root query")); };
+                if entity != &structure.root_entity || *limit != MAX_COLLECTION || !sort.is_empty() { return Err(refuse(cx, &observable.id, "private count is cross-root, sorted or truncated")); }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn app_error(value: product_contract::AppValidationError) -> CommonFactInventoryFailure { match value { product_contract::AppValidationError::Allocation(v) => CommonFactInventoryFailure::Allocation(v), product_contract::AppValidationError::Contract(v) => CommonFactInventoryFailure::Store(v.into()) } }
@@ -637,6 +780,60 @@ mod tests {
     fn empty_structure(root: &str) -> DecodedOwnedStructuralReport {
         let digest = || Digest::from_owned_lower_hex("0000000000000000000000000000000000000000000000000000000000000000".into()).unwrap();
         DecodedOwnedStructuralReport { before: digest(), after: digest(), root_entity: root.into(), edits: vec![], common_statements: vec![], writers: vec![], changes: vec![] }
+    }
+
+    fn app_with_view(kind: crate::product_contract::ViewKind) -> crate::product_contract::FallibleDecodedCapturedProgram {
+        let mut source = crate::fixture::program(false).program;
+        source.initial_view = "view".into();
+        source.views = vec![crate::product_contract::ViewDefinition { id: "view".into(), label: "View".into(), kind, actions: vec![], keys: vec![] }];
+        let captured = crate::fixture::capture(serde_json::to_value(source).unwrap());
+        let mut cx = AllocationContext::new();
+        let value = crate::product_json::parse_json_bytes(&serde_json::to_vec(&captured).unwrap(), &mut cx).unwrap();
+        crate::product_contract::decode_captured_program_fallible(value, &mut cx).unwrap()
+    }
+    fn stable_root_list() -> crate::product_contract::ViewKind {
+        crate::product_contract::ViewKind::List {
+            entity: "job".into(),
+            rows: Expr::Query { entity: "job".into(), binding: "r".into(), predicate: Box::new(boolean(true)), sort: vec![], limit: MAX_COLLECTION, include_archived: true },
+            columns: vec![crate::product_contract::Column { id: "done".into(), label: "Done".into(), value: Expr::Field { record: Box::new(Expr::Variable { name: "row".into() }), field: "done".into() } }],
+            controls: vec![], selection: None,
+        }
+    }
+
+    #[test]
+    fn decoded_rule_observations_accepts_stable_root_list_and_retries_allocation_refusal() {
+        let app = app_with_view(stable_root_list());
+        let kinds = DecodedOwnedSchemaKinds::test_from([("job".into(), DecodedOwnedSchemaKind::Root)]);
+        let policy = OrderedSet::new();
+        let structure = empty_structure("job");
+        let mut meter = proof_meter();
+        let mut rules = DecodedCommonFactRules::new(AppRef::Decoded(app.app()), &kinds, "job", "done", DataValue::Boolean { value: true }, OwnedSourceSide::Before, &policy, &[], true, &mut meter).with_structure(&structure);
+        let mut successful = AllocationContext::new();
+        rules.observations(&mut successful).unwrap();
+        let expected_certificates = rules.certificates().len();
+        let growths = successful.growth_requests();
+        assert_eq!(expected_certificates, 1);
+        for nth in 1..=growths {
+            let mut meter = proof_meter();
+            let mut rules = DecodedCommonFactRules::new(AppRef::Decoded(app.app()), &kinds, "job", "done", DataValue::Boolean { value: true }, OwnedSourceSide::Before, &policy, &[], true, &mut meter).with_structure(&structure);
+            let mut cx = AllocationContext::fail_nth_growth(std::num::NonZeroUsize::new(nth).unwrap(), true);
+            assert!(matches!(rules.observations(&mut cx), Err(CommonFactInventoryFailure::Allocation(_))), "growth {nth} must preserve its allocation refusal");
+        }
+        let mut meter = proof_meter();
+        let mut retry = DecodedCommonFactRules::new(AppRef::Decoded(app.app()), &kinds, "job", "done", DataValue::Boolean { value: true }, OwnedSourceSide::Before, &policy, &[], true, &mut meter).with_structure(&structure);
+        retry.observations(&mut AllocationContext::new()).unwrap();
+        assert_eq!(retry.certificates().len(), expected_certificates);
+    }
+
+    #[test]
+    fn decoded_rule_observations_preserves_detail_refusal_evidence() {
+        let app = app_with_view(crate::product_contract::ViewKind::Detail { entity: "job".into(), record: Expr::Literal { value_type: Type::reference("job"), value: DataValue::Reference { entity: "job".into(), record: "record".into() } }, columns: vec![] });
+        let kinds = DecodedOwnedSchemaKinds::test_from([("job".into(), DecodedOwnedSchemaKind::Root)]);
+        let policy = OrderedSet::new();
+        let structure = empty_structure("job");
+        let mut meter = proof_meter();
+        let mut rules = DecodedCommonFactRules::new(AppRef::Decoded(app.app()), &kinds, "job", "done", DataValue::Boolean { value: true }, OwnedSourceSide::Before, &policy, &[], true, &mut meter).with_structure(&structure);
+        assert!(matches!(rules.observations(&mut AllocationContext::new()), Err(CommonFactInventoryFailure::Store(StoreError::Invalid(text))) if text == "Common factual admission: view: detail identity/history selection is unsupported"));
     }
 
     #[test]
