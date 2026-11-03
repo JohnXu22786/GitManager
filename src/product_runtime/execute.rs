@@ -1,5 +1,5 @@
 use super::*;
-use eval::{boolean, list, record, value_ref};
+use eval::{boolean, list, record, record_view, value_ref};
 
 fn evaluate(
     app: AppRef<'_>,
@@ -184,6 +184,46 @@ fn set_state_value(
     }
 }
 
+fn collection_value(
+    operation: CollectionOperation,
+    items: Vec<DataValue>,
+    item_type: Type,
+    mut previous: Vec<DataValue>,
+    fallible: bool,
+    meter: &mut Meter,
+) -> Result<DataValue> {
+    match operation {
+        CollectionOperation::Insert => for item in items {
+            meter.tick(previous.len() as u64 + 1)?;
+            if !previous.contains(&item) {
+                meter.collection(previous.len() + 1)?;
+                if fallible {
+                    product_alloc::try_push(&mut previous, item, &mut meter.allocations,
+                        product_alloc::AllocationSite::Vector).map_err(AdapterError::Allocation)?;
+                } else {
+                    previous.push(item);
+                }
+            }
+        },
+        CollectionOperation::Remove => {
+            let mut retained = Vec::new();
+            for item in previous {
+                meter.tick(items.len() as u64 + 1)?;
+                if !items.contains(&item) {
+                    if fallible {
+                        product_alloc::try_push(&mut retained, item, &mut meter.allocations,
+                            product_alloc::AllocationSite::Vector).map_err(AdapterError::Allocation)?;
+                    } else {
+                        retained.push(item);
+                    }
+                }
+            }
+            previous = retained;
+        }
+    }
+    Ok(DataValue::List { item_type, items: previous })
+}
+
 fn advance_generation(data: &mut DataSnapshot) -> Result<u64> {
     let next = data.generation.checked_add(1)
         .ok_or_else(|| failed("data generation overflow"))?;
@@ -309,6 +349,81 @@ pub(crate) fn decoded_shared_transaction_kernel_parity_and_atomicity(
             record: Expr::Variable { name: "created".into() },
         },
     ];
+    let collection_insert_items = Expr::Literal {
+        value_type: Type::list(Type::Text),
+        value: DataValue::List {
+            item_type: Type::Text,
+            items: vec![
+                DataValue::Text { value: "b".into() },
+                DataValue::Text { value: "b".into() },
+                DataValue::Text { value: "a".into() },
+            ],
+        },
+    };
+    let collection_remove_items = Expr::Literal {
+        value_type: Type::list(Type::Text),
+        value: DataValue::List {
+            item_type: Type::Text,
+            items: vec![DataValue::Text { value: "a".into() }],
+        },
+    };
+    let collection_existing_items = Expr::Literal {
+        value_type: Type::list(Type::Text),
+        value: DataValue::List {
+            item_type: Type::Text,
+            items: vec![DataValue::Text { value: "b".into() }],
+        },
+    };
+    let collection_steps = vec![
+        Statement::Collection {
+            target: CollectionTarget::State { state: "tags".into() },
+            operation: CollectionOperation::Insert,
+            items: collection_insert_items.clone(),
+        },
+        Statement::Collection {
+            target: CollectionTarget::State { state: "tags".into() },
+            operation: CollectionOperation::Remove,
+            items: collection_remove_items.clone(),
+        },
+        Statement::Collection {
+            target: CollectionTarget::Field {
+                record: Expr::Literal {
+                    value_type: Type::reference("job"),
+                    value: reference.clone(),
+                },
+                field: "tags".into(),
+            },
+            operation: CollectionOperation::Insert,
+            items: collection_insert_items.clone(),
+        },
+        Statement::Collection {
+            target: CollectionTarget::Field {
+                record: Expr::Literal {
+                    value_type: Type::reference("job"),
+                    value: reference.clone(),
+                },
+                field: "tags".into(),
+            },
+            operation: CollectionOperation::Remove,
+            items: collection_remove_items.clone(),
+        },
+        Statement::Collection {
+            target: CollectionTarget::State { state: "tags".into() },
+            operation: CollectionOperation::Insert,
+            items: collection_existing_items.clone(),
+        },
+        Statement::Collection {
+            target: CollectionTarget::Field {
+                record: Expr::Literal {
+                    value_type: Type::reference("job"),
+                    value: reference.clone(),
+                },
+                field: "tags".into(),
+            },
+            operation: CollectionOperation::Insert,
+            items: collection_existing_items.clone(),
+        },
+    ];
     let app = AppDefinition {
         version: CONTRACT_VERSION,
         id: "kernel-test".into(),
@@ -337,6 +452,37 @@ pub(crate) fn decoded_shared_transaction_kernel_parity_and_atomicity(
                     values: [("extra".into(), Expr::Literal { value_type: Type::Text, value: DataValue::Text { value: "same-transaction".into() } })].into(),
                 },
             ], ensures: vec![] },
+            ActionDefinition { id: "collection_kernel".into(), label: "Collection kernel".into(), parameters: BTreeMap::new(), guards: vec![], steps: collection_steps.clone(), ensures: vec![] },
+            ActionDefinition { id: "collection_state_insert".into(), label: "Collection state insert".into(), parameters: BTreeMap::new(), guards: vec![], steps: vec![collection_steps[0].clone()], ensures: vec![] },
+            ActionDefinition { id: "collection_state_remove".into(), label: "Collection state remove".into(), parameters: BTreeMap::new(), guards: vec![], steps: vec![collection_steps[1].clone()], ensures: vec![] },
+            ActionDefinition { id: "collection_field_insert".into(), label: "Collection field insert".into(), parameters: BTreeMap::new(), guards: vec![], steps: vec![collection_steps[2].clone()], ensures: vec![] },
+            ActionDefinition { id: "collection_field_remove".into(), label: "Collection field remove".into(), parameters: BTreeMap::new(), guards: vec![], steps: vec![collection_steps[3].clone()], ensures: vec![] },
+            ActionDefinition { id: "collection_state_noop".into(), label: "Collection state no-op".into(), parameters: BTreeMap::new(), guards: vec![], steps: vec![collection_steps[4].clone()], ensures: vec![] },
+            ActionDefinition { id: "collection_field_noop".into(), label: "Collection field no-op".into(), parameters: BTreeMap::new(), guards: vec![], steps: vec![collection_steps[5].clone()], ensures: vec![] },
+            ActionDefinition { id: "collection_missing_state".into(), label: "Collection missing state".into(), parameters: BTreeMap::new(), guards: vec![], steps: vec![Statement::Collection {
+                target: CollectionTarget::State { state: "absent".into() }, operation: CollectionOperation::Insert,
+                items: collection_insert_items.clone(),
+            }], ensures: vec![] },
+            ActionDefinition { id: "collection_missing_field".into(), label: "Collection missing field".into(), parameters: BTreeMap::new(), guards: vec![], steps: vec![Statement::Collection {
+                target: CollectionTarget::Field { record: Expr::Literal { value_type: Type::reference("job"), value: reference.clone() }, field: "absent".into() },
+                operation: CollectionOperation::Insert, items: collection_insert_items.clone(),
+            }], ensures: vec![] },
+            ActionDefinition { id: "collection_missing_record".into(), label: "Collection missing record".into(), parameters: BTreeMap::new(), guards: vec![], steps: vec![Statement::Collection {
+                target: CollectionTarget::Field { record: Expr::Literal { value_type: Type::reference("job"), value: DataValue::Reference { entity: "job".into(), record: "missing".into() } }, field: "tags".into() },
+                operation: CollectionOperation::Insert, items: collection_insert_items.clone(),
+            }], ensures: vec![] },
+            ActionDefinition { id: "collection_wrong_state_shape".into(), label: "Collection wrong state shape".into(), parameters: BTreeMap::new(), guards: vec![], steps: vec![Statement::Collection {
+                target: CollectionTarget::State { state: "scalar".into() }, operation: CollectionOperation::Insert,
+                items: collection_insert_items.clone(),
+            }], ensures: vec![] },
+            ActionDefinition { id: "collection_wrong_field_shape".into(), label: "Collection wrong field shape".into(), parameters: BTreeMap::new(), guards: vec![], steps: vec![Statement::Collection {
+                target: CollectionTarget::Field { record: Expr::Literal { value_type: Type::reference("job"), value: reference.clone() }, field: "name".into() },
+                operation: CollectionOperation::Insert, items: collection_insert_items.clone(),
+            }], ensures: vec![] },
+            ActionDefinition { id: "collection_items_first".into(), label: "Collection items first".into(), parameters: BTreeMap::new(), guards: vec![], steps: vec![Statement::Collection {
+                target: CollectionTarget::Field { record: Expr::Variable { name: "missing".into() }, field: "tags".into() },
+                operation: CollectionOperation::Insert, items: Expr::Literal { value_type: Type::Integer, value: DataValue::Integer { value: 1 } },
+            }], ensures: vec![] },
         ],
         outputs: vec![],
         observables: vec![],
@@ -362,6 +508,183 @@ pub(crate) fn decoded_shared_transaction_kernel_parity_and_atomicity(
     let decoded_create = AppRef::from(&decoded_app).action("create_only").ok_or("decoded create action absent")?.steps();
     let legacy_create_update = AppRef::from(&app).action("create_update").ok_or("legacy create-update action absent")?.steps();
     let decoded_create_update = AppRef::from(&decoded_app).action("create_update").ok_or("decoded create-update action absent")?.steps();
+    let legacy_collection = AppRef::from(&app).action("collection_kernel").ok_or("legacy collection action absent")?.steps();
+    let decoded_collection = AppRef::from(&decoded_app).action("collection_kernel").ok_or("decoded collection action absent")?.steps();
+
+    // The shared transaction interpreter must keep legacy and decoded
+    // Collection semantics aligned for state values and record fields.
+    let mut collection_data = legacy.clone();
+    collection_data.records[0].values.insert("tags".into(), DataValue::List {
+        item_type: Type::Text,
+        items: vec![DataValue::Text { value: "a".into() }, DataValue::Text { value: "a".into() }],
+    });
+    let collection_session = SessionState {
+        view: "work".into(),
+        values: Values::from([("tags".into(), DataValue::List {
+            item_type: Type::Text,
+            items: vec![DataValue::Text { value: "a".into() }, DataValue::Text { value: "a".into() }],
+        })]),
+        focused_record: None,
+    };
+    let mut legacy_collection_state = State {
+        data: collection_data.clone(), session: collection_session.clone(), day: 0,
+        outputs: vec![], output_participants: vec![], output_participant_count: 0,
+    };
+    let mut legacy_collection_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+    let mut legacy_collection_owner = KernelState::Legacy(&mut legacy_collection_state);
+    Transaction { program: None, app: AppRef::from(&app), program_digest: &program, operation: "collection-op", seed: 7, created: 0, cancel_after_statement: None }
+        .statements(&mut legacy_collection_owner, legacy_collection, &mut Env::new(), &mut legacy_collection_meter)
+        .map_err(|error| format!("legacy Collection: {error:?}"))?;
+
+    let mut collection_decode_allocations = product_alloc::AllocationContext::new();
+    let mut decoded_collection_data = decode_data_snapshot_fallible(
+        crate::product_json::parse_json_bytes(&serde_json::to_vec(&collection_data).map_err(|error| error.to_string())?, &mut collection_decode_allocations)
+            .map_err(|error| format!("decoded Collection data parse: {error:?}"))?,
+        &mut collection_decode_allocations,
+    ).map_err(|error| format!("decoded Collection data: {error:?}"))?;
+    let mut decoded_collection_session = decode_session_state_fallible(
+        crate::product_json::parse_json_bytes(&serde_json::to_vec(&collection_session).map_err(|error| error.to_string())?, &mut collection_decode_allocations)
+            .map_err(|error| format!("decoded Collection session parse: {error:?}"))?,
+        &mut collection_decode_allocations,
+    ).map_err(|error| format!("decoded Collection session: {error:?}"))?;
+    let collection_data_base = decoded_collection_data.try_clone_with(&mut product_alloc::AllocationContext::new())
+        .map_err(|error| format!("decoded Collection base copy: {error:?}"))?;
+    let collection_session_base = decoded_collection_session.try_clone_with(&mut product_alloc::AllocationContext::new())
+        .map_err(|error| format!("decoded Collection session base copy: {error:?}"))?;
+    let mut decoded_collection_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+    let mut decoded_collection_owner = KernelState::Decoded {
+        data: &mut decoded_collection_data, session: &mut decoded_collection_session, day: 0,
+    };
+    Transaction { program: None, app: AppRef::from(&decoded_app), program_digest: &program, operation: "collection-op", seed: 7, created: 0, cancel_after_statement: None }
+        .statements(&mut decoded_collection_owner, decoded_collection, &mut Env::new(), &mut decoded_collection_meter)
+        .map_err(|error| format!("decoded Collection: {error:?}"))?;
+    if serde_json::to_value(&legacy_collection_state.data.records[0]).map_err(|error| error.to_string())?
+        != serde_json::to_value(&decoded_collection_data.records()[0]).map_err(|error| error.to_string())?
+        || serde_json::to_value(&legacy_collection_state.session).map_err(|error| error.to_string())?
+            != serde_json::to_value(&decoded_collection_session).map_err(|error| error.to_string())?
+        || legacy_collection_state.data.records[0].revision != 4
+        || decoded_collection_data.records()[0].revision() != 4
+        || legacy_collection_meter.fuel != decoded_collection_meter.fuel
+        || legacy_collection_meter.steps != decoded_collection_meter.steps
+        || legacy_collection_meter.writes != decoded_collection_meter.writes
+    {
+        return Err("legacy and decoded Collection values or revisions diverged".into());
+    }
+
+    // Probe each target/operation independently, then refuse every growth
+    // request and retry from the same source owners.
+    for action_id in ["collection_state_insert", "collection_state_remove", "collection_field_insert", "collection_field_remove", "collection_state_noop", "collection_field_noop"] {
+        let steps = AppRef::from(&decoded_app).action(action_id).ok_or("decoded Collection case absent")?.steps();
+        let mut probe_data = collection_data_base.try_clone_with(&mut product_alloc::AllocationContext::new())
+            .map_err(|error| format!("{action_id} probe data copy: {error:?}"))?;
+        let mut probe_session = collection_session_base.try_clone_with(&mut product_alloc::AllocationContext::new())
+            .map_err(|error| format!("{action_id} probe session copy: {error:?}"))?;
+        let mut probe_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+        let mut probe_owner = KernelState::Decoded { data: &mut probe_data, session: &mut probe_session, day: 0 };
+        Transaction { program: None, app: AppRef::from(&decoded_app), program_digest: &program, operation: "collection-op", seed: 7, created: 0, cancel_after_statement: None }
+            .statements(&mut probe_owner, steps, &mut Env::new(), &mut probe_meter)
+            .map_err(|error| format!("{action_id} decoded probe: {error:?}"))?;
+        let growths = probe_meter.allocations.growth_requests();
+        if growths == 0 { return Err(format!("{action_id} decoded operation had no observed growth points")); }
+        for nth in 1..=growths {
+            let mut refused_data = collection_data_base.try_clone_with(&mut product_alloc::AllocationContext::new())
+                .map_err(|error| format!("{action_id} refusal data copy: {error:?}"))?;
+            let mut refused_session = collection_session_base.try_clone_with(&mut product_alloc::AllocationContext::new())
+                .map_err(|error| format!("{action_id} refusal session copy: {error:?}"))?;
+            let before_data = refused_data.try_clone_with(&mut product_alloc::AllocationContext::new())
+                .map_err(|error| format!("{action_id} refusal data snapshot: {error:?}"))?;
+            let before_session = refused_session.try_clone_with(&mut product_alloc::AllocationContext::new())
+                .map_err(|error| format!("{action_id} refusal session snapshot: {error:?}"))?;
+            let mut refuse_meter = Meter::with_allocations(RuntimeLimits::default(), 1_000_000,
+                Arc::new(AtomicBool::new(false)), product_alloc::AllocationContext::fail_nth_growth(NonZeroUsize::new(nth).unwrap(), false));
+            let mut refused_owner = KernelState::Decoded { data: &mut refused_data, session: &mut refused_session, day: 0 };
+            let refused = Transaction { program: None, app: AppRef::from(&decoded_app), program_digest: &program, operation: "collection-op", seed: 7, created: 0, cancel_after_statement: None }
+                .statements(&mut refused_owner, steps, &mut Env::new(), &mut refuse_meter);
+            if !matches!(refused, Err(AdapterError::Allocation(_)))
+                || refused_data != before_data || refused_session != before_session {
+                return Err(format!("{action_id} refusal {nth} changed an owner or lost allocation error: {refused:?}"));
+            }
+            let mut retry_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+            let mut retry_owner = KernelState::Decoded { data: &mut refused_data, session: &mut refused_session, day: 0 };
+            Transaction { program: None, app: AppRef::from(&decoded_app), program_digest: &program, operation: "collection-op", seed: 7, created: 0, cancel_after_statement: None }
+                .statements(&mut retry_owner, steps, &mut Env::new(), &mut retry_meter)
+                .map_err(|error| format!("{action_id} retry after refusal {nth}: {error:?}"))?;
+            if refused_data != probe_data || refused_session != probe_session {
+                return Err(format!("{action_id} retry after refusal {nth} differed from successful probe"));
+            }
+        }
+    }
+
+    // A cancellation arriving after a tentative Collection write discards the
+    // transaction's private owners and leaves the committed source owners intact.
+    let mut cancelled_collection_data = collection_data_base.try_clone_with(&mut product_alloc::AllocationContext::new())
+        .map_err(|error| format!("cancelled Collection data copy: {error:?}"))?;
+    let mut cancelled_collection_session = collection_session_base.try_clone_with(&mut product_alloc::AllocationContext::new())
+        .map_err(|error| format!("cancelled Collection session copy: {error:?}"))?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut cancel_meter = Meter::new(RuntimeLimits::default(), 1_000_000, cancel.clone());
+    let mut cancelled_collection_owner = KernelState::Decoded {
+        data: &mut cancelled_collection_data, session: &mut cancelled_collection_session, day: 0,
+    };
+    let cancelled_collection = Transaction { program: None, app: AppRef::from(&decoded_app), program_digest: &program, operation: "collection-op", seed: 7, created: 0, cancel_after_statement: Some(cancel.clone()) }
+        .statements(&mut cancelled_collection_owner, AppRef::from(&decoded_app).action("collection_kernel").unwrap().steps().slice_prefix(2), &mut Env::new(), &mut cancel_meter);
+    if !matches!(cancelled_collection, Err(AdapterError::Cancelled))
+        || cancelled_collection_data != collection_data_base
+        || cancelled_collection_session == collection_session_base {
+        return Err(format!("decoded Collection cancellation did not preserve committed owners after a tentative write: {cancelled_collection:?}"));
+    }
+
+    // Missing targets, invalid target references, and non-list values retain
+    // the existing interpreter's refusal class and error order on both owners.
+    for (action_id, expected) in [
+        ("collection_missing_state", "state absent"),
+        ("collection_missing_field", "collection field absent"),
+        ("collection_missing_record", "record reference does not exist"),
+        ("collection_wrong_state_shape", "expected list"),
+        ("collection_wrong_field_shape", "expected list"),
+        ("collection_items_first", "expected list"),
+    ] {
+        let legacy_steps = AppRef::from(&app).action(action_id).ok_or("legacy Collection error case absent")?.steps();
+        let decoded_steps = AppRef::from(&decoded_app).action(action_id).ok_or("decoded Collection error case absent")?.steps();
+        let mut bad_session = collection_session.clone();
+        if action_id == "collection_wrong_state_shape" {
+            bad_session.values.insert("scalar".into(), DataValue::Text { value: "not a list".into() });
+        }
+        let mut bad_legacy = State { data: collection_data.clone(), session: bad_session.clone(), day: 0,
+            outputs: vec![], output_participants: vec![], output_participant_count: 0 };
+        let before_bad_legacy = bad_legacy.clone();
+        let mut bad_legacy_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+        let mut bad_legacy_owner = KernelState::Legacy(&mut bad_legacy);
+        let legacy_result = Transaction { program: None, app: AppRef::from(&app), program_digest: &program, operation: "collection-op", seed: 7, created: 0, cancel_after_statement: None }
+            .statements(&mut bad_legacy_owner, legacy_steps, &mut Env::new(), &mut bad_legacy_meter);
+
+        let mut bad_data = collection_data_base.try_clone_with(&mut product_alloc::AllocationContext::new())
+            .map_err(|error| format!("{action_id} data copy: {error:?}"))?;
+        let mut bad_decoded_session = collection_session_base.try_clone_with(&mut product_alloc::AllocationContext::new())
+            .map_err(|error| format!("{action_id} session copy: {error:?}"))?;
+        if action_id == "collection_wrong_state_shape" {
+            bad_decoded_session.values_mut().try_set("scalar", DataValue::Text { value: "not a list".into() },
+                &mut product_alloc::AllocationContext::new()).map_err(|error| format!("{action_id} fixture allocation: {error:?}"))?;
+        }
+        let before_bad_data = bad_data.try_clone_with(&mut product_alloc::AllocationContext::new())
+            .map_err(|error| format!("{action_id} data snapshot: {error:?}"))?;
+        let before_bad_session = bad_decoded_session.try_clone_with(&mut product_alloc::AllocationContext::new())
+            .map_err(|error| format!("{action_id} session snapshot: {error:?}"))?;
+        let mut bad_decoded_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+        let mut bad_decoded_owner = KernelState::Decoded { data: &mut bad_data, session: &mut bad_decoded_session, day: 0 };
+        let decoded_result = Transaction { program: None, app: AppRef::from(&decoded_app), program_digest: &program, operation: "collection-op", seed: 7, created: 0, cancel_after_statement: None }
+            .statements(&mut bad_decoded_owner, decoded_steps, &mut Env::new(), &mut bad_decoded_meter);
+        let same_error = match expected {
+            "state absent" | "expected list" => matches!(&legacy_result, Err(AdapterError::Failed(message)) if message == expected)
+                && matches!(&decoded_result, Err(AdapterError::Failed(message)) if message == expected),
+            _ => matches!(&legacy_result, Err(AdapterError::Invalid(message)) if message.0 == expected)
+                && matches!(&decoded_result, Err(AdapterError::Invalid(message)) if message.0 == expected),
+        };
+        if !same_error || bad_legacy.data != before_bad_legacy.data || bad_legacy.session != before_bad_legacy.session
+            || bad_data != before_bad_data || bad_decoded_session != before_bad_session {
+            return Err(format!("legacy and decoded {action_id} behavior diverged or mutated owners: {legacy_result:?} / {decoded_result:?}"));
+        }
+    }
     let mut legacy_kernel_state = State {
         data: legacy.clone(),
         session: SessionState { view: "work".into(), values: Values::new(), focused_record: None },
@@ -863,62 +1186,72 @@ impl Transaction<'_> {
                     operation,
                     items,
                 } => {
-                    let state = state.legacy()?;
-                    let (_, items) = list(evaluate(app, state, items, env, meter)?)?;
-                    let (key, field, old) = match target {
-                        CollectionTarget::State { state: id } => (
-                            None,
-                            id.to_owned(),
-                            state
-                                .session
-                                .values
-                                .get(id)
-                                .cloned()
-                                .ok_or_else(|| failed("state absent"))?,
-                        ),
-                        CollectionTarget::Field {
-                            record: expr,
-                            field,
-                        } => {
-                            let key = evaluate(app, state, expr, env, meter)?;
-                            let value = record(&state.data, &key)?
-                                .values
-                                .get(field)
-                                .cloned()
-                                .ok_or_else(|| invalid("collection field absent"))?;
-                            (Some(key), field.to_owned(), value)
-                        }
-                    };
-                    let (item_type, mut previous) = list(old)?;
-                    match operation {
-                        CollectionOperation::Insert => {
-                            for item in items {
-                                meter.tick(previous.len() as u64 + 1)?;
-                                if !previous.contains(&item) {
-                                    meter.collection(previous.len() + 1)?;
-                                    previous.push(item);
+                    // Preserve the legacy order: evaluate the incoming items
+                    // before resolving or reading either target.
+                    let evaluated_items = evaluate_owner(app, state, items, env, meter)?;
+                    let (_, items) = list(evaluated_items)?;
+                    match state {
+                        KernelState::Legacy(legacy) => {
+                            let (key, field, old) = match target {
+                                CollectionTarget::State { state: id } => (
+                                    None,
+                                    id.to_owned(),
+                                    legacy.session.values.get(id).cloned()
+                                        .ok_or_else(|| failed("state absent"))?,
+                                ),
+                                CollectionTarget::Field { record: expr, field } => {
+                                    let key = evaluate(app, legacy, expr, env, meter)?;
+                                    let value = record(&legacy.data, &key)?.values.get(field).cloned()
+                                        .ok_or_else(|| invalid("collection field absent"))?;
+                                    (Some(key), field.to_owned(), value)
                                 }
+                            };
+                            let (item_type, previous) = list(old)?;
+                            let value = collection_value(operation, items, item_type, previous, false, meter)?;
+                            if let Some(key) = key {
+                                update(legacy, &key, BTreeMap::from([(field, value)]), false, meter)?;
+                            } else {
+                                set_state_value(SessionOwner::Legacy(&mut legacy.session), &field, value, meter)?;
                             }
                         }
-                        CollectionOperation::Remove => {
-                            let mut retained = Vec::new();
-                            for item in previous {
-                                meter.tick(items.len() as u64 + 1)?;
-                                if !items.contains(&item) {
-                                    retained.push(item);
+                        KernelState::Decoded { .. } => {
+                            let mut target_key = match target {
+                                CollectionTarget::State { .. } => None,
+                                CollectionTarget::Field { record: expr, .. } => {
+                                    Some(evaluate_owner(app, state, expr, env, meter)?)
                                 }
+                            };
+                            let KernelState::Decoded { data, session, .. } = state else { unreachable!() };
+                            let (key, field, old) = match target {
+                                CollectionTarget::State { state: id } => {
+                                    let old = session.values().get(id).ok_or_else(|| failed("state absent"))?;
+                                    if !matches!(old, DataValue::List { .. }) { return Err(failed("expected list")); }
+                                    (None, id.as_str(), try_clone_data_value_with(old, &mut meter.allocations)
+                                        .map_err(AdapterError::Allocation)?)
+                                }
+                                CollectionTarget::Field { field, .. } => {
+                                    let key = target_key.take().expect("field target was evaluated");
+                                    let data_view = DataSnapshotView::from(&**data);
+                                    let row = record_view(&data_view, &key)?;
+                                    let old = row.values().get(field)
+                                        .ok_or_else(|| invalid("collection field absent"))?;
+                                    if !matches!(old, DataValue::List { .. }) { return Err(failed("expected list")); }
+                                    (Some(key), field.as_str(), try_clone_data_value_with(old, &mut meter.allocations)
+                                        .map_err(AdapterError::Allocation)?)
+                                }
+                            };
+                            let (item_type, previous) = list(old)?;
+                            let value = collection_value(operation, items, item_type, previous, true, meter)?;
+                            if let Some(key) = key {
+                                let mut values = FallibleValues::new();
+                                let field = product_alloc::try_copy_str(field, &mut meter.allocations,
+                                    product_alloc::AllocationSite::String).map_err(AdapterError::Allocation)?;
+                                values.try_insert(field, value, &mut meter.allocations).map_err(AdapterError::Allocation)?;
+                                update_owner(DataOwner::Fallible(data), &key, UpdateValues::Fallible(values), false, meter)?;
+                            } else {
+                                set_state_value(SessionOwner::Fallible(session), field, value, meter)?;
                             }
-                            previous = retained;
                         }
-                    }
-                    let value = DataValue::List {
-                        item_type,
-                        items: previous,
-                    };
-                    if let Some(key) = key {
-                        update(state, &key, BTreeMap::from([(field, value)]), false, meter)?;
-                    } else {
-                        set_state_value(SessionOwner::Legacy(&mut state.session), &field, value, meter)?;
                     }
                 }
                 StatementView::ForEach {
