@@ -145,6 +145,18 @@ impl KernelState<'_> {
             }
         }
     }
+    fn archive(&mut self, key: &DataValue, meter: &mut Meter) -> Result<()> {
+        match self {
+            Self::Legacy(state) => update(state, key, Values::new(), true, meter),
+            Self::Decoded { data, .. } => update_owner(
+                DataOwner::Fallible(data),
+                key,
+                UpdateValues::Fallible(FallibleValues::new()),
+                true,
+                meter,
+            ),
+        }
+    }
     fn set_state(&mut self, id: &str, value: DataValue, meter: &mut Meter) -> Result<()> {
         match self {
             Self::Legacy(state) => set_state_value(SessionOwner::Legacy(&mut state.session), id, value, meter),
@@ -279,8 +291,25 @@ pub(crate) fn decoded_shared_transaction_kernel_parity_and_atomicity(
                 value: DataValue::Text { value: "through-kernel".into() },
             },
         },
+        Statement::Archive {
+            record: Expr::Literal {
+                value_type: Type::reference("job"),
+                value: reference.clone(),
+            },
+        },
     ];
     let only_state = vec![steps[1].clone()];
+    let archive_only = vec![steps[2].clone()];
+    let archive_created = vec![
+        Statement::Create {
+            entity: "job".into(),
+            values: BTreeMap::new(),
+            bind: "created".into(),
+        },
+        Statement::Archive {
+            record: Expr::Variable { name: "created".into() },
+        },
+    ];
     let app = AppDefinition {
         version: CONTRACT_VERSION,
         id: "kernel-test".into(),
@@ -291,6 +320,8 @@ pub(crate) fn decoded_shared_transaction_kernel_parity_and_atomicity(
             ActionDefinition { id: "kernel".into(), label: "Kernel".into(), parameters: BTreeMap::new(), guards: vec![], steps: steps.clone(), ensures: vec![] },
             ActionDefinition { id: "update_only".into(), label: "Update only".into(), parameters: BTreeMap::new(), guards: vec![], steps: steps[..1].to_vec(), ensures: vec![] },
             ActionDefinition { id: "state_only".into(), label: "State only".into(), parameters: BTreeMap::new(), guards: vec![], steps: only_state.clone(), ensures: vec![] },
+            ActionDefinition { id: "archive_only".into(), label: "Archive only".into(), parameters: BTreeMap::new(), guards: vec![], steps: archive_only.clone(), ensures: vec![] },
+            ActionDefinition { id: "archive_created".into(), label: "Archive created".into(), parameters: BTreeMap::new(), guards: vec![], steps: archive_created.clone(), ensures: vec![] },
             ActionDefinition { id: "create_only".into(), label: "Create only".into(), parameters: BTreeMap::new(), guards: vec![], steps: vec![Statement::Create {
                 entity: "job".into(),
                 values: [("name".into(), Expr::Literal { value_type: Type::Text, value: DataValue::Text { value: "created".into() } })].into(),
@@ -324,6 +355,10 @@ pub(crate) fn decoded_shared_transaction_kernel_parity_and_atomicity(
     let decoded_steps = AppRef::from(&decoded_app).action("kernel").ok_or("decoded test action absent")?.steps();
     let decoded_update_only = AppRef::from(&decoded_app).action("update_only").ok_or("decoded update action absent")?.steps();
     let decoded_state_only = AppRef::from(&decoded_app).action("state_only").ok_or("decoded state action absent")?.steps();
+    let legacy_archive = AppRef::from(&app).action("archive_only").ok_or("legacy archive action absent")?.steps();
+    let decoded_archive = AppRef::from(&decoded_app).action("archive_only").ok_or("decoded archive action absent")?.steps();
+    let legacy_archive_created = AppRef::from(&app).action("archive_created").ok_or("legacy create-archive action absent")?.steps();
+    let decoded_archive_created = AppRef::from(&decoded_app).action("archive_created").ok_or("decoded create-archive action absent")?.steps();
     let legacy_create = AppRef::from(&app).action("create_only").ok_or("legacy create action absent")?.steps();
     let decoded_create = AppRef::from(&decoded_app).action("create_only").ok_or("decoded create action absent")?.steps();
     let legacy_create_update = AppRef::from(&app).action("create_update").ok_or("legacy create-update action absent")?.steps();
@@ -360,6 +395,8 @@ pub(crate) fn decoded_shared_transaction_kernel_parity_and_atomicity(
         ).map_err(|error| format!("decoded kernel session parse: {error:?}"))?,
         &mut session_allocations,
     ).map_err(|error| format!("decoded kernel session: {error:?}"))?;
+    let decoded_initial_session = decoded_kernel_session.try_clone_with(&mut product_alloc::AllocationContext::new())
+        .map_err(|error| format!("decoded initial kernel session copy: {error:?}"))?;
     let before_kernel_refusal = decoded_kernel_data.try_clone_with(&mut product_alloc::AllocationContext::new())
         .map_err(|error| format!("decoded kernel refusal copy: {error:?}"))?;
     let mut refuse_update = Meter::with_allocations(
@@ -414,6 +451,124 @@ pub(crate) fn decoded_shared_transaction_kernel_parity_and_atomicity(
     {
         return Err("legacy and decoded statement kernel results diverged".into());
     }
+    if !legacy_kernel_state.data.records[0].archived
+        || legacy_kernel_state.data.records[0].revision != 3
+        || !decoded_kernel_data.records()[0].archived()
+        || decoded_kernel_data.records()[0].revision() != 3
+    {
+        return Err("legacy and decoded Archive did not set the archived flag and increment revision".into());
+    }
+
+    // Archive has the same refusal class and no mutation on missing, historical,
+    // and revision-overflow records for decoded and legacy owners.
+    for (label, mut fixture, expected) in [
+        ("missing", legacy.clone(), "record reference does not exist"),
+        ("already archived", legacy.clone(), "archived historical records cannot be modified"),
+        ("revision overflow", legacy.clone(), "record revision overflow"),
+    ] {
+        match label {
+            "missing" => fixture.records.clear(),
+            "already archived" => fixture.records[0].archived = true,
+            "revision overflow" => fixture.records[0].revision = u64::MAX,
+            _ => unreachable!(),
+        }
+        let mut legacy_state = State { data: fixture.clone(), session: initial_session.clone(), day: 0,
+            outputs: vec![], output_participants: vec![], output_participant_count: 0 };
+        let legacy_before = legacy_state.data.clone();
+        let mut legacy_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+        let mut legacy_owner = KernelState::Legacy(&mut legacy_state);
+        let legacy_result = Transaction { program: None, app: AppRef::from(&app), program_digest: &program,
+            operation: "kernel-op", seed: 7, created: 0, cancel_after_statement: None }
+            .statements(&mut legacy_owner, legacy_archive, &mut Env::new(), &mut legacy_meter);
+
+        let bytes = serde_json::to_vec(&fixture).map_err(|error| error.to_string())?;
+        let mut allocations = product_alloc::AllocationContext::new();
+        let value = crate::product_json::parse_json_bytes(&bytes, &mut allocations)
+            .map_err(|error| format!("{label} archive parse: {error:?}"))?;
+        let mut decoded = decode_data_snapshot_fallible(value, &mut allocations)
+            .map_err(|error| format!("{label} archive decode: {error:?}"))?;
+        let decoded_before = decoded.try_clone_with(&mut product_alloc::AllocationContext::new())
+            .map_err(|error| format!("{label} archive copy: {error:?}"))?;
+        let mut session = decode_session_state_fallible(
+            crate::product_json::parse_json_bytes(&serde_json::to_vec(&initial_session).map_err(|error| error.to_string())?,
+                &mut product_alloc::AllocationContext::new()).map_err(|error| format!("{label} session parse: {error:?}"))?,
+            &mut product_alloc::AllocationContext::new(),
+        ).map_err(|error| format!("{label} session decode: {error:?}"))?;
+        let mut decoded_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+        let mut decoded_owner = KernelState::Decoded { data: &mut decoded, session: &mut session, day: 0 };
+        let decoded_result = Transaction { program: None, app: AppRef::from(&decoded_app), program_digest: &program,
+            operation: "kernel-op", seed: 7, created: 0, cancel_after_statement: None }
+            .statements(&mut decoded_owner, decoded_archive, &mut Env::new(), &mut decoded_meter);
+        let matching = match expected {
+            "record revision overflow" => matches!(&legacy_result, Err(AdapterError::Failed(message)) if message == expected)
+                && matches!(&decoded_result, Err(AdapterError::Failed(message)) if message == expected),
+            _ => matches!(&legacy_result, Err(AdapterError::Invalid(message)) if message.0 == expected)
+                && matches!(&decoded_result, Err(AdapterError::Invalid(message)) if message.0 == expected),
+        };
+        if !matching || legacy_state.data != legacy_before || decoded != decoded_before {
+            return Err(format!("legacy and decoded {label} Archive refusal diverged or mutated state: {legacy_result:?} vs {decoded_result:?}"));
+        }
+    }
+
+    // Archive must resolve a record reference produced by an earlier Create in
+    // the same shared statement interpreter, and commit exactly once.
+    let mut archive_created_legacy = legacy_kernel_state.clone();
+    let mut archive_created_legacy_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+    let mut archive_created_legacy_owner = KernelState::Legacy(&mut archive_created_legacy);
+    Transaction { program: None, app: AppRef::from(&app), program_digest: &program, operation: "kernel-op", seed: 7, created: 0, cancel_after_statement: None }
+        .statements(&mut archive_created_legacy_owner, legacy_archive_created, &mut Env::new(), &mut archive_created_legacy_meter)
+        .map_err(|error| format!("legacy Create then Archive: {error:?}"))?;
+    let mut archive_created_data = decoded_kernel_data.try_clone_with(&mut product_alloc::AllocationContext::new())
+        .map_err(|error| format!("decoded create-archive base copy: {error:?}"))?;
+    let mut archive_created_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+    let mut archive_created_owner = KernelState::Decoded { data: &mut archive_created_data, session: &mut decoded_kernel_session, day: 0 };
+    Transaction { program: None, app: AppRef::from(&decoded_app), program_digest: &program, operation: "kernel-op", seed: 7, created: 0, cancel_after_statement: None }
+        .statements(&mut archive_created_owner, decoded_archive_created, &mut Env::new(), &mut archive_created_meter)
+        .map_err(|error| format!("decoded Create then Archive: {error:?}"))?;
+    let legacy_created = archive_created_legacy.data.records.last().ok_or("legacy Create then Archive record missing")?;
+    let decoded_created = archive_created_data.records().last().ok_or("decoded Create then Archive record missing")?;
+    if serde_json::to_value(legacy_created).map_err(|error| error.to_string())?
+        != serde_json::to_value(decoded_created).map_err(|error| error.to_string())?
+        || !decoded_created.archived() || decoded_created.revision() != 2
+    {
+        return Err("legacy and decoded Create then Archive results diverged".into());
+    }
+    let archive_base = decoded.try_clone_with(&mut product_alloc::AllocationContext::new())
+        .map_err(|error| format!("decoded archive base copy: {error:?}"))?;
+    let mut archive_probe = archive_base.try_clone_with(&mut product_alloc::AllocationContext::new())
+        .map_err(|error| format!("decoded archive probe copy: {error:?}"))?;
+    let mut archive_probe_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+    let mut archive_probe_owner = KernelState::Decoded { data: &mut archive_probe, session: &mut decoded_kernel_session, day: 0 };
+    Transaction { program: None, app: AppRef::from(&decoded_app), program_digest: &program,
+        operation: "kernel-op", seed: 7, created: 0, cancel_after_statement: None }
+        .statements(&mut archive_probe_owner, decoded_archive, &mut Env::new(), &mut archive_probe_meter)
+        .map_err(|error| format!("decoded Archive probe: {error:?}"))?;
+    let archive_growths = archive_probe_meter.allocations.growth_requests();
+    if archive_growths == 0 { return Err("decoded Archive did not exercise fallible reference allocation".into()); }
+    for nth in 1..=archive_growths {
+        let mut refused_data = archive_base.try_clone_with(&mut product_alloc::AllocationContext::new())
+            .map_err(|error| format!("decoded Archive refusal copy: {error:?}"))?;
+        let before_refusal = refused_data.try_clone_with(&mut product_alloc::AllocationContext::new())
+            .map_err(|error| format!("decoded Archive refusal snapshot: {error:?}"))?;
+        let mut refuse_meter = Meter::with_allocations(RuntimeLimits::default(), 1_000_000,
+            Arc::new(AtomicBool::new(false)), product_alloc::AllocationContext::fail_nth_growth(NonZeroUsize::new(nth).unwrap(), false));
+        let mut refused_owner = KernelState::Decoded { data: &mut refused_data, session: &mut decoded_kernel_session, day: 0 };
+        let refused = Transaction { program: None, app: AppRef::from(&decoded_app), program_digest: &program,
+            operation: "kernel-op", seed: 7, created: 0, cancel_after_statement: None }
+            .statements(&mut refused_owner, decoded_archive, &mut Env::new(), &mut refuse_meter);
+        if !matches!(refused, Err(AdapterError::Allocation(_))) || refused_data != before_refusal {
+            return Err(format!("decoded Archive allocation refusal {nth} changed the owner or lost allocation error: {refused:?}"));
+        }
+    }
+    let mut archive_retry = archive_base.try_clone_with(&mut product_alloc::AllocationContext::new())
+        .map_err(|error| format!("decoded Archive retry copy: {error:?}"))?;
+    let mut archive_retry_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+    let mut archive_retry_owner = KernelState::Decoded { data: &mut archive_retry, session: &mut decoded_kernel_session, day: 0 };
+    Transaction { program: None, app: AppRef::from(&decoded_app), program_digest: &program,
+        operation: "kernel-op", seed: 7, created: 0, cancel_after_statement: None }
+        .statements(&mut archive_retry_owner, decoded_archive, &mut Env::new(), &mut archive_retry_meter)
+        .map_err(|error| format!("decoded Archive retry: {error:?}"))?;
+    if archive_retry != archive_probe { return Err("decoded Archive retry differs from successful Archive".into()); }
 
     // Create runs through the same statement interpreter for both owner types.
     let mut create_legacy = legacy_kernel_state.clone();
@@ -556,9 +711,9 @@ pub(crate) fn decoded_shared_transaction_kernel_parity_and_atomicity(
         return Err(format!("legacy and decoded revision overflow diverged: {overflow_legacy_result:?} vs {overflow_decoded_result:?}"));
     }
 
-    let before_cancel = decoded_kernel_data.try_clone_with(&mut product_alloc::AllocationContext::new())
+    let before_cancel = decoded.try_clone_with(&mut product_alloc::AllocationContext::new())
         .map_err(|error| format!("decoded cancel copy: {error:?}"))?;
-    let before_cancel_session = decoded_kernel_session.try_clone_with(&mut product_alloc::AllocationContext::new())
+    let before_cancel_session = decoded_initial_session.try_clone_with(&mut product_alloc::AllocationContext::new())
         .map_err(|error| format!("decoded cancel session copy: {error:?}"))?;
     let mut cancelled_private_data = before_cancel.try_clone_with(&mut product_alloc::AllocationContext::new())
         .map_err(|error| format!("cancel private data copy: {error:?}"))?;
@@ -573,8 +728,8 @@ pub(crate) fn decoded_shared_transaction_kernel_parity_and_atomicity(
     }.statements(&mut decoded_owners, decoded_steps, &mut Env::new(), &mut cancel_meter);
     if !matches!(cancelled, Err(AdapterError::Cancelled))
         || cancelled_private_data == before_cancel
-        || decoded_kernel_data != before_cancel
-        || decoded_kernel_session != before_cancel_session
+        || decoded != before_cancel
+        || decoded_initial_session != before_cancel_session
     {
         return Err(format!("decoded statement cancellation did not roll back after an update: {cancelled:?}"));
     }
@@ -666,9 +821,8 @@ impl Transaction<'_> {
                     state.update(&key, values, meter)?;
                 }
                 StatementView::Archive { record } => {
-                    let state = state.legacy()?;
-                    let key = evaluate(app, state, record, env, meter)?;
-                    update(state, &key, Values::new(), true, meter)?;
+                    let key = evaluate_owner(app, state, record, env, meter)?;
+                    state.archive(&key, meter)?;
                 }
                 StatementView::SetState { state: id, value } => {
                     let value = evaluate_owner(app, state, value, env, meter)?;
