@@ -217,7 +217,7 @@ pub(super) fn guard_cases(pair: &CompletedHistoricalIntervals<'_, '_>, registry:
     // Actual different execution identity refuses before any new packet/query,
     // even when no proof fuel remains. It is not a fabricated positive loan.
     let mut meter=ProofMeter::new(ProofBudget {units:1,elapsed_millis:60_000},Arc::new(AtomicBool::new(false))).unwrap();
-    let error=pair.loan.surface(p,pair.loan.execution.current().program().unwrap(),&mut meter).err().expect("wrong actual execution must refuse");
+    let error=pair.loan.surface(p,pair.loan.execution.current().program().unwrap(),false,&mut meter).err().expect("wrong actual execution must refuse");
     assert!(error.to_string().contains("historical Initial loan execution differs"));
     assert_eq!(meter.remaining_units_for_test(),0);
 }

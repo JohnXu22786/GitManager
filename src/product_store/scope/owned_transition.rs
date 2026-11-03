@@ -428,11 +428,16 @@ impl<'gate> OwnedPolicyCheck<'gate> {
 pub(super) fn invoke_historical_initial_policy<'gate, C>(
     execution: &'gate VerifiedOwnedTransitionExecution,
     loan: &owned_persist::HistoricalInitialLoan<'_>, meter: &'gate mut ProofMeter,
+    registry: Option<&owned_persist::ReconstructedOwned>,
     check: &mut C,
 ) -> Result<()>
 where C: for<'g, 'l> FnMut(&mut OwnedPolicyCheck<'g>, &owned_persist::HistoricalInitialLoan<'l>) -> Result<()>,
 {
-    let mut context = OwnedPolicyCheck { execution, registry: None, meter };
+    let mut context = OwnedPolicyCheck {
+        execution,
+        registry,
+        meter,
+    };
     check(&mut context, loan)
 }
 impl OwnedPolicyCheck<'_> {
@@ -440,7 +445,12 @@ impl OwnedPolicyCheck<'_> {
         &mut self, loan: &owned_persist::HistoricalInitialLoan<'_>, source: &CapturedProgram,
     ) -> Result<owned_continuation::VerifiedOwnedPolicySurface> {
         self.meter.charge(5)?;
-        loan.surface(self.execution, source, self.meter)
+        let reuse_registry = match self.registry {
+            Some(registry) if loan.is_registry(registry) => true,
+            Some(_) => return Err(refuse("owned policy", "historical Initial loan registry differs")),
+            None => false,
+        };
+        loan.surface(self.execution, source, reuse_registry, self.meter)
     }
 }
 

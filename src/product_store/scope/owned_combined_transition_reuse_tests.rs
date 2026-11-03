@@ -185,16 +185,16 @@ pub(crate) fn selected(loan: &HistoricalInitialLoan<'_>, inner: &ReconstructedOw
     assert!(loan.transition_donor(&later, manifest, completed, &mut meter(60_000)).unwrap().is_none());
     let mut missing_donor = copy_registry(loan.registry);
     missing_donor.recipes.remove(&manifest.output);
-    let missing_loan = HistoricalInitialLoan { registry: &missing_donor, execution: loan.execution, reuse_registry: false };
+    let missing_loan = HistoricalInitialLoan { registry: &missing_donor, execution: loan.execution };
     assert!(missing_loan.transition_donor(inner, manifest, completed, &mut meter(60_000)).unwrap().is_none());
     let mut wrong_donor = copy_registry(loan.registry);
     wrong_donor.recipes.insert(manifest.output.clone(), OwnedExecutionRecipe::Initial(donor.original.clone()));
-    let wrong_loan = HistoricalInitialLoan { registry: &wrong_donor, execution: loan.execution, reuse_registry: false };
+    let wrong_loan = HistoricalInitialLoan { registry: &wrong_donor, execution: loan.execution };
     assert!(wrong_loan.transition_donor(inner, manifest, completed, &mut meter(60_000)).unwrap().is_none());
     for index in [0, 1] {
         let mut changed = copy_registry(loan.registry);
         changed.epochs[index].output = Digest::try_from("0".repeat(64)).unwrap();
-        let changed_loan = HistoricalInitialLoan { registry: &changed, execution: loan.execution, reuse_registry: false };
+        let changed_loan = HistoricalInitialLoan { registry: &changed, execution: loan.execution };
         assert!(changed_loan.transition_donor(inner, manifest, completed, &mut meter(60_000)).unwrap().is_none());
     }
     let mut wrong_previous = manifest.clone();

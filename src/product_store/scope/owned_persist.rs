@@ -253,7 +253,11 @@ const HISTORICAL_INITIAL_ARC_PAYMENT: u64 = comparison_payment(448, [
 pub(crate) struct HistoricalInitialLoan<'gate> {
     registry: &'gate ReconstructedOwned,
     execution: &'gate VerifiedOwnedTransitionExecution,
-    reuse_registry: bool,
+}
+impl HistoricalInitialLoan<'_> {
+    pub(super) fn is_registry(&self, registry: &ReconstructedOwned) -> bool {
+        std::ptr::eq(self.registry, registry)
+    }
 }
 // V12 complete fixed transport packets. All old floors remain unchanged;
 // the whole duplicate native interval is removed only by its one-use proof.
@@ -469,10 +473,11 @@ where
         meter.charge(1)?;
         meter.charge(6)?;
         meter.charge(const { historical_initial_callback_payment::<C>() })?;
-        let loan = HistoricalInitialLoan { registry, execution, reuse_registry };
+        let loan = HistoricalInitialLoan { registry, execution };
         #[cfg(test)]
         combined_transition_reuse_tests::accounting("before-policy", meter);
-        owned_transition::invoke_historical_initial_policy(execution, &loan, meter, &mut check)?;
+        let policy_registry = reuse_registry.then_some(registry);
+        owned_transition::invoke_historical_initial_policy(execution, &loan, meter, policy_registry, &mut check)?;
         #[cfg(test)]
         combined_transition_reuse_tests::accounting("after-policy", meter);
     }
@@ -694,7 +699,7 @@ macro_rules! completed_interval_replay_body {
 impl HistoricalInitialLoan<'_> {
     pub(super) fn surface(
         &self, execution: &VerifiedOwnedTransitionExecution, source: &CapturedProgram,
-        meter: &mut ProofMeter,
+        reuse_registry: bool, meter: &mut ProofMeter,
     ) -> Result<owned_continuation::VerifiedOwnedPolicySurface> {
         // The caller retained the original five-unit entry charge. Preserve the
         // original layer error before the new paid exact-callback binding.
@@ -707,7 +712,7 @@ impl HistoricalInitialLoan<'_> {
         #[cfg(test)]
         adoption_diagnostic::phase(adoption_diagnostic::Phase::SurfaceReconstruct);
         meter.charge(HISTORICAL_INITIAL_WORKER_PAYMENT)?;
-        if !self.reuse_registry {
+        if !reuse_registry {
             meter.charge(HISTORICAL_INITIAL_INTERVAL_ENTRY_PAYMENT)?;
         }
         // New owner/lookup/enclosing transports are paid before any mint attempt.
@@ -744,7 +749,7 @@ impl HistoricalInitialLoan<'_> {
         completed_failure!(failure);
         completed_charge!(meter, COMPLETED_INTERVAL_SURFACE_PAYMENT);
         match completed.as_ref() {
-            Some(pair) if self.reuse_registry => {
+            Some(pair) if reuse_registry => {
                 // The completed interval was already reconstructed from this
                 // exact snapshot to mint `self`. Keep that registry and its
                 // verified recipes; rebuilding the same registry here repeats
@@ -760,7 +765,7 @@ impl HistoricalInitialLoan<'_> {
                 completed_surface_body!(pair,registry,source,layer,meter)
             },
             None => {
-                if self.reuse_registry {
+                if reuse_registry {
                     meter.charge(HISTORICAL_INITIAL_INTERVAL_ENTRY_PAYMENT)?;
                 }
                 let registry = self.reconstruct(None, meter)?;
@@ -3946,7 +3951,7 @@ mod ordinary_prefix_controls {
 const _: [(); 12160] = [(); HISTORICAL_INITIAL_ARC_PAYMENT as usize];
 
 #[cfg(all(test, target_pointer_width = "64"))]
-const _: [(); 10336] = [(); historical_initial_callback_payment::<()>() as usize];
+const _: [(); 10304] = [(); historical_initial_callback_payment::<()>() as usize];
 
 #[cfg(all(test, target_pointer_width = "64"))]
 const _: [(); 7492] = [(); HISTORICAL_INITIAL_COMPARE_PAYMENT as usize];
