@@ -845,4 +845,290 @@ mod tests {
         assert!(matches!(decoded_error, super::super::fallible_common_fact_inventory::CommonFactInventoryFailure::Store(crate::product_store::StoreError::Invalid(message)) if message == legacy_error));
         assert!(legacy_error.contains("paired variant lacks an exact single-root correspondence"));
     }
+
+    #[test]
+    fn decoded_projection_capture_matches_legacy_and_retries_growth_refusals() {
+        use super::super::common_fact_admission::{ProofBudget, ProofMeter};
+        use super::super::fallible_owned_projection_capture::{capture_decoded_frame, capture_maps_equal, DecodedCaptureFailure};
+        use super::super::fallible_owned_inventory_decode::decode_projection;
+        use std::num::NonZeroUsize;
+        use std::sync::{atomic::AtomicBool, Arc};
+
+        fn decode_request(request: &OwnedPreviewRequest, cx: &mut AllocationContext) -> DecodedOwnedPreviewRequest {
+            let value = serde_json::to_value(request).unwrap();
+            super::super::fallible_owned_request_decode::decode_owned_preview_request(
+                crate::product_json::parse_json_bytes(&serde_json::to_vec(&value).unwrap(), cx).unwrap(), cx,
+            ).unwrap()
+        }
+        fn decode_recipe(recipe: &super::super::common_fact_admission::OwnedProjectionRecipe, cx: &mut AllocationContext)
+            -> super::super::fallible_owned_inventory_decode::DecodedOwnedProjectionRecipe
+        {
+            let value = serde_json::to_value(recipe).unwrap();
+            decode_projection(crate::product_json::parse_json_bytes(&serde_json::to_vec(&value).unwrap(), cx).unwrap(), cx).unwrap()
+        }
+        fn row(id: &str, done: bool, archived: bool, program: &CapturedProgram) -> Record {
+            Record {
+                entity: "job".into(), id: id.into(), revision: 1,
+                created_program: crate::product_store::revision(program).unwrap(), archived,
+                values: BTreeMap::from([("done".into(), DataValue::Boolean { value: done })]),
+            }
+        }
+
+        let (_app_before, _app_after, legacy_before, _legacy_after, mut legacy_data, mut legacy_request,
+            _legacy_inventory, decoded_before, _decoded_after, _snapshot, _decoded_request, _inventory) = fixture();
+        let done = Expr::Field { record: Box::new(Expr::Variable { name: "record".into() }), field: "done".into() };
+        legacy_request.inventory.lifecycle.before = done.clone();
+        legacy_request.inventory.lifecycle.after = done.clone();
+        let recipe = super::super::common_fact_admission::OwnedProjectionRecipe {
+            location: "test/done".into(),
+            destination: super::super::common_fact_admission::OwnedProjectionDestination::RootCount {
+                observable: "total".into(), include_archived: false,
+            },
+            binding: "record".into(), value_type: Type::Boolean, host_value_type: Type::Boolean,
+            absent_value: None, baseline: Some(done.clone()), candidate: done, capture_required: true,
+        };
+        let make_meter = || ProofMeter::new(ProofBudget::default(), Arc::new(AtomicBool::new(false))).unwrap();
+
+        for (id, done, archived, should_capture) in [
+            ("unfinished", false, false, false),
+            ("archived-unfinished", false, true, true),
+            ("completed", true, false, true),
+        ] {
+            legacy_data.records = vec![row(id, done, archived, &legacy_before)];
+            let before = serde_json::to_vec(&legacy_data).unwrap();
+            let mut legacy_meter = make_meter();
+            let expected = super::super::common_fact_admission::capture_frame(
+                &legacy_before, &legacy_data, 0, &legacy_request, std::slice::from_ref(&recipe), &mut legacy_meter,
+            ).unwrap();
+            let mut decode_cx = AllocationContext::new();
+            let decoded_data = decode_data_snapshot_fallible(
+                crate::product_json::parse_json_bytes(&serde_json::to_vec(&legacy_data).unwrap(), &mut decode_cx).unwrap(), &mut decode_cx,
+            ).unwrap();
+            let decoded_data_before = serde_json::to_vec(&decoded_data).unwrap();
+            let decoded_request = decode_request(&legacy_request, &mut decode_cx);
+            let decoded_recipe = decode_recipe(&recipe, &mut decode_cx);
+            if id == "unfinished" {
+                let mut no_match = legacy_request.clone();
+                no_match.inventory.sources.root_entity = "unrelated".into();
+                let mut legacy_meter = make_meter();
+                let expected_empty = super::super::common_fact_admission::capture_frame(
+                    &legacy_before, &legacy_data, 0, &no_match, std::slice::from_ref(&recipe), &mut legacy_meter,
+                ).unwrap();
+                let no_match_request = decode_request(&no_match, &mut decode_cx);
+                let mut no_match_cx = AllocationContext::fail_nth_growth(NonZeroUsize::new(1).unwrap(), true);
+                let mut no_match_meter = make_meter();
+                let actual_empty = capture_decoded_frame(&decoded_before, &decoded_data, 0, &no_match_request,
+                    std::slice::from_ref(&decoded_recipe), &mut no_match_meter, None, &mut no_match_cx).unwrap();
+                assert!(actual_empty.is_empty());
+                assert_eq!(serde_json::to_vec(&expected_empty).unwrap(), serde_json::to_vec(&actual_empty).unwrap());
+                assert_eq!(no_match_cx.growth_requests(), 0,
+                    "nonmatching roots must not trigger decoded owner validation/allocation");
+            }
+            let mut meter = make_meter();
+            let actual = capture_decoded_frame(&decoded_before, &decoded_data, 0, &decoded_request,
+                std::slice::from_ref(&decoded_recipe), &mut meter, None, &mut decode_cx).unwrap();
+            assert_eq!(serde_json::to_vec(&expected).unwrap(), serde_json::to_vec(&actual).unwrap());
+            let mut compare_meter = ProofMeter::new(
+                ProofBudget { units: 2, elapsed_millis: 60_000 }, Arc::new(AtomicBool::new(false)),
+            ).unwrap();
+            assert!(capture_maps_equal(&actual, &actual, &mut compare_meter).is_err(),
+                "evidence comparison must consume the proof budget");
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let mut compare_meter = ProofMeter::new(ProofBudget::default(), cancelled.clone()).unwrap();
+            cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+            assert!(capture_maps_equal(&actual, &actual, &mut compare_meter).is_err(),
+                "evidence comparison must observe cancellation");
+            assert_eq!(actual.is_empty(), !should_capture);
+            assert_eq!(before, serde_json::to_vec(&legacy_data).unwrap(), "capture must not mutate the source owner");
+            assert_eq!(decoded_data_before, serde_json::to_vec(&decoded_data).unwrap(), "capture must not mutate decoded source owners");
+
+            let baseline_cx = AllocationContext::new();
+            let mut count_cx = baseline_cx;
+            let mut count_meter = make_meter();
+            capture_decoded_frame(&decoded_before, &decoded_data, 0, &decoded_request,
+                std::slice::from_ref(&decoded_recipe), &mut count_meter, None, &mut count_cx).unwrap();
+            let growths = count_cx.growth_requests();
+            assert!(growths > 0);
+            for nth in 1..=growths {
+                let mut refused_cx = AllocationContext::fail_nth_growth(NonZeroUsize::new(nth).unwrap(), true);
+                let mut refused_meter = make_meter();
+                assert!(matches!(capture_decoded_frame(&decoded_before, &decoded_data, 0, &decoded_request,
+                    std::slice::from_ref(&decoded_recipe), &mut refused_meter, None, &mut refused_cx),
+                    Err(DecodedCaptureFailure::Allocation(_))), "growth refusal {nth} must retain allocation classification");
+                let mut retry_cx = AllocationContext::new();
+                let mut retry_meter = make_meter();
+                let retry = capture_decoded_frame(&decoded_before, &decoded_data, 0, &decoded_request,
+                    std::slice::from_ref(&decoded_recipe), &mut retry_meter, None, &mut retry_cx).unwrap();
+                assert_eq!(serde_json::to_vec(&expected).unwrap(), serde_json::to_vec(&retry).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn decoded_projection_capture_preserves_profile_refusal_and_absent_baseline_rules() {
+        use super::super::common_fact_admission::{InitialLimitsProfile, ProofBudget, ProofMeter};
+        use super::super::fallible_owned_projection_capture::{capture_decoded_frame, DecodedCaptureFailure};
+        use super::super::fallible_owned_inventory_decode::decode_projection;
+        use std::sync::{atomic::AtomicBool, Arc};
+        use std::time::Duration;
+
+        fn decoded_request(request: &OwnedPreviewRequest, cx: &mut AllocationContext) -> DecodedOwnedPreviewRequest {
+            let value = serde_json::to_value(request).unwrap();
+            super::super::fallible_owned_request_decode::decode_owned_preview_request(
+                crate::product_json::parse_json_bytes(&serde_json::to_vec(&value).unwrap(), cx).unwrap(), cx,
+            ).unwrap()
+        }
+        fn decoded_recipe(recipe: &super::super::common_fact_admission::OwnedProjectionRecipe, cx: &mut AllocationContext)
+            -> super::super::fallible_owned_inventory_decode::DecodedOwnedProjectionRecipe
+        {
+            let value = serde_json::to_value(recipe).unwrap();
+            decode_projection(crate::product_json::parse_json_bytes(&serde_json::to_vec(&value).unwrap(), cx).unwrap(), cx).unwrap()
+        }
+        fn recipe(expr: Option<Expr>, absent: Option<DataValue>, value_type: Type) -> super::super::common_fact_admission::OwnedProjectionRecipe {
+            super::super::common_fact_admission::OwnedProjectionRecipe {
+                location: "test/value".into(),
+                destination: super::super::common_fact_admission::OwnedProjectionDestination::RootCount {
+                    observable: "total".into(), include_archived: true,
+                },
+                binding: "record".into(), value_type: value_type.clone(), host_value_type: value_type,
+                absent_value: absent, baseline: expr.clone(), candidate: expr.unwrap_or(Expr::Literal {
+                    value_type: Type::Boolean, value: DataValue::Boolean { value: false },
+                }), capture_required: true,
+            }
+        }
+        fn row(program: &CapturedProgram, done: bool, archived: bool) -> Record {
+            Record { entity: "job".into(), id: "selected".into(), revision: 1,
+                created_program: crate::product_store::revision(program).unwrap(), archived,
+                values: BTreeMap::from([("done".into(), DataValue::Boolean { value: done })]), }
+        }
+        fn meter(budget: ProofBudget) -> ProofMeter {
+            ProofMeter::new(budget, Arc::new(AtomicBool::new(false))).unwrap()
+        }
+        fn error_text(error: DecodedCaptureFailure) -> String {
+            match error {
+                DecodedCaptureFailure::Store(crate::product_store::StoreError::Invalid(message)) => message,
+                DecodedCaptureFailure::Store(crate::product_store::StoreError::Runtime(error)) => format!("{error:?}"),
+                DecodedCaptureFailure::Allocation(error) => panic!("unexpected allocation refusal: {error:?}"),
+                other => panic!("unexpected refusal: {other:?}"),
+            }
+        }
+
+        let (_app_before, _app_after, legacy_before, _legacy_after, mut data, legacy_request,
+            _inventory, decoded_program, _decoded_after, _snapshot, _request, _decoded_inventory) = fixture();
+        data.records = vec![row(&legacy_before, true, true)];
+        let mut cx = AllocationContext::new();
+        let decoded_data = decode_data_snapshot_fallible(
+            crate::product_json::parse_json_bytes(&serde_json::to_vec(&data).unwrap(), &mut cx).unwrap(), &mut cx,
+        ).unwrap();
+        let done = Expr::Field { record: Box::new(Expr::Variable { name: "record".into() }), field: "done".into() };
+
+        let missing = recipe(None, None, Type::Boolean);
+        let missing_decoded = decoded_recipe(&missing, &mut cx);
+        let mut legacy_meter = meter(ProofBudget::default());
+        let legacy_error = super::super::common_fact_admission::capture_frame(
+            &legacy_before, &data, 0, &legacy_request, std::slice::from_ref(&missing), &mut legacy_meter,
+        ).unwrap_err();
+        let mut decoded_meter = meter(ProofBudget::default());
+        let decoded_error = capture_decoded_frame(&decoded_program, &decoded_data, 0, &decoded_request(&legacy_request, &mut cx),
+            std::slice::from_ref(&missing_decoded), &mut decoded_meter, None, &mut cx).unwrap_err();
+        let legacy_text = match legacy_error { crate::product_store::StoreError::Invalid(message) => message, other => panic!("unexpected legacy refusal: {other:?}") };
+        assert_eq!(legacy_text, error_text(decoded_error));
+        assert!(legacy_text.contains("absent baseline has no explicit availability rule"));
+
+        let absent = recipe(None, Some(DataValue::Boolean { value: false }), Type::Boolean);
+        let absent_decoded = decoded_recipe(&absent, &mut cx);
+        let mut legacy_meter = meter(ProofBudget::default());
+        let expected = super::super::common_fact_admission::capture_frame(
+            &legacy_before, &data, 0, &legacy_request, std::slice::from_ref(&absent), &mut legacy_meter,
+        ).unwrap();
+        let mut absent_meter = meter(ProofBudget::default());
+        let mut absent_cx = AllocationContext::new();
+        let actual = capture_decoded_frame(&decoded_program, &decoded_data, 0, &decoded_request(&legacy_request, &mut absent_cx),
+            std::slice::from_ref(&absent_decoded), &mut absent_meter, None, &mut absent_cx).unwrap();
+        assert_eq!(serde_json::to_vec(&expected).unwrap(), serde_json::to_vec(&actual).unwrap());
+
+        let output_limit = RuntimeLimits::default().output_bytes;
+        let boolean = DataValue::Boolean { value: true };
+        let mut validation_meter = meter(ProofBudget { units: 10, elapsed_millis: 60_000 });
+        let validation_error = crate::product_runtime::decoded_capture_validate_value(
+            &boolean, &Type::Boolean, &mut validation_meter,
+        ).unwrap_err();
+        assert!(format!("{validation_error:?}").contains("cumulative proof/initialization budget exhausted"));
+        let mut output_meter = meter(ProofBudget::default());
+        assert_eq!(crate::product_runtime::decoded_capture_account_output(
+            &boolean, output_limit - 31, &RuntimeLimits::default(), &mut output_meter,
+        ).unwrap(), output_limit);
+        let mut output_meter = meter(ProofBudget::default());
+        let output_error = crate::product_runtime::decoded_capture_account_output(
+            &boolean, output_limit, &RuntimeLimits::default(), &mut output_meter,
+        ).unwrap_err();
+        assert!(format!("{output_error:?}").contains("cumulative output limit"));
+        let mut low_meter = meter(ProofBudget { units: 9, elapsed_millis: 60_000 });
+        let budget_error = crate::product_runtime::decoded_capture_account_output(
+            &boolean, output_limit, &RuntimeLimits::default(), &mut low_meter,
+        ).unwrap_err();
+        assert!(format!("{budget_error:?}").contains("cumulative proof/initialization budget exhausted"));
+
+        let mut absent_request = legacy_request.clone();
+        absent_request.population = super::super::contract::ScopePopulation::SelectedUnfinished { records: vec![RecordRef { entity: "job".into(), record: "selected".into() }] };
+        let mut legacy_meter = meter(ProofBudget::default());
+        let legacy_error = super::super::common_fact_admission::capture_frame(
+            &legacy_before, &data, 0, &absent_request, std::slice::from_ref(&absent), &mut legacy_meter,
+        ).unwrap_err();
+        let mut decoded_meter = meter(ProofBudget::default());
+        let mut decoded_cx = AllocationContext::new();
+        let actual = capture_decoded_frame(&decoded_program, &decoded_data, 0, &decoded_request(&absent_request, &mut decoded_cx),
+            std::slice::from_ref(&absent_decoded), &mut decoded_meter, None, &mut decoded_cx).unwrap_err();
+        let expected = match legacy_error { crate::product_store::StoreError::Invalid(message) => message, other => panic!("unexpected legacy refusal: {other:?}") };
+        assert_eq!(expected, error_text(actual));
+        assert!(expected.contains("selected root is already completed"));
+
+        let malformed = recipe(Some(done.clone()), None, Type::Integer);
+        let malformed_decoded = decoded_recipe(&malformed, &mut cx);
+        let mut legacy_meter = meter(ProofBudget::default());
+        let legacy_error = super::super::common_fact_admission::capture_frame(
+            &legacy_before, &data, 0, &legacy_request, std::slice::from_ref(&malformed), &mut legacy_meter,
+        ).unwrap_err();
+        let mut malformed_meter = meter(ProofBudget::default());
+        let mut malformed_cx = AllocationContext::new();
+        let actual = capture_decoded_frame(&decoded_program, &decoded_data, 0, &decoded_request(&legacy_request, &mut malformed_cx),
+            std::slice::from_ref(&malformed_decoded), &mut malformed_meter, None, &mut malformed_cx).unwrap_err();
+        let expected = match legacy_error {
+            crate::product_store::StoreError::Runtime(error) => format!("{error:?}"),
+            other => panic!("unexpected malformed projection result: {other:?}"),
+        };
+        assert_eq!(expected, error_text(actual));
+        assert!(expected.contains("projection result type mismatch"));
+
+        let valid = recipe(Some(done), None, Type::Boolean);
+        let valid_decoded = decoded_recipe(&valid, &mut cx);
+        let mut profile_meter = meter(ProofBudget::default());
+        let mut profile = InitialLimitsProfile::new(&mut profile_meter).unwrap();
+        let mut profile_cx = AllocationContext::new();
+        let _ = capture_decoded_frame(&decoded_program, &decoded_data, 0, &decoded_request(&legacy_request, &mut profile_cx),
+            std::slice::from_ref(&valid_decoded), &mut profile_meter, Some(&mut profile), &mut profile_cx).unwrap();
+        assert_eq!(profile.counts_for_test(), (0, 1, true));
+
+        let low_budget = ProofBudget { units: 10_000, elapsed_millis: 60_000 };
+        let mut fuel_meter = meter(low_budget);
+        let fuel_error = capture_decoded_frame(&decoded_program, &decoded_data, 0, &decoded_request(&legacy_request, &mut cx),
+            std::slice::from_ref(&valid_decoded), &mut fuel_meter, None, &mut cx).unwrap_err();
+        assert!(error_text(fuel_error).contains("cumulative proof/initialization budget exhausted"));
+        let remaining = fuel_meter.remaining_units_for_test();
+        assert!(remaining > 0 && remaining < RuntimeLimits::default().fuel,
+            "the row must refuse while reserving a complete runtime fuel packet");
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut cancelled_meter = ProofMeter::new(ProofBudget::default(), cancelled.clone()).unwrap();
+        cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+        let cancelled_error = capture_decoded_frame(&decoded_program, &decoded_data, 0, &decoded_request(&legacy_request, &mut cx),
+            std::slice::from_ref(&valid_decoded), &mut cancelled_meter, None, &mut cx).unwrap_err();
+        assert!(error_text(cancelled_error).contains("cancelled or cumulative elapsed budget exhausted"));
+
+        let mut elapsed_meter = meter(ProofBudget { units: 10_000_000, elapsed_millis: 1 });
+        std::thread::sleep(Duration::from_millis(2));
+        let elapsed_error = capture_decoded_frame(&decoded_program, &decoded_data, 0, &decoded_request(&legacy_request, &mut cx),
+            std::slice::from_ref(&valid_decoded), &mut elapsed_meter, None, &mut cx).unwrap_err();
+        assert!(error_text(elapsed_error).contains("cancelled or cumulative elapsed budget exhausted"));
+    }
 }

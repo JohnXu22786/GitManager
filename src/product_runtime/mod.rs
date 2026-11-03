@@ -3,6 +3,19 @@
 mod compatibility;
 mod capture_cost;
 mod capture_native;
+pub(crate) fn decoded_capture_account_output(value: &DataValue, current: usize, limits: &RuntimeLimits,
+    work: &mut dyn ContractWork) -> Result<usize>
+{
+    capture::decoded_capture_account_output(value, current, limits, work)
+}
+pub(crate) fn decoded_capture_validate_value(value: &DataValue, expected: &Type,
+    work: &mut dyn ContractWork) -> Result<()>
+{
+    capture::decoded_capture_validate_value(value, expected, work)
+}
+pub(crate) fn decoded_capture_value_copy_cost(value: &DataValue, work: &mut dyn ContractWork) -> Result<()> {
+    capture::decoded_capture_value_copy_cost(value, work)
+}
 mod capture_eval;
 mod capture_key;
 mod fallible_lower;
@@ -2147,6 +2160,9 @@ pub(crate) fn merged_definition_data(
 
 // Capture-row API/payment controls are staged before the APIs exist.
 mod capture;
+pub(crate) fn projection_capture_entry_units<H: ProjectionHost>() -> u64 {
+    capture::projection_capture_entry_units::<H>()
+}
 #[cfg(test)]
 mod capture_row_controls;
 #[cfg(test)]

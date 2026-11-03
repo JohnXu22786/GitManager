@@ -750,19 +750,19 @@ pub(super) fn capture_frame(
     capture_frame_batched(baseline, data, day, request, projections, meter)
 }
 
-fn capture_resource_error(cause: WorkFailure) -> AdapterError {
+pub(super) fn capture_resource_error(cause: WorkFailure) -> AdapterError {
     match cause {
         WorkFailure::Cancelled => AdapterError::Cancelled,
         WorkFailure::BudgetExhausted(reason) => AdapterError::BudgetExhausted(reason.into()),
     }
 }
-fn capture_formula_error(error: ContractWorkError) -> AdapterError {
+pub(super) fn capture_formula_error(error: ContractWorkError) -> AdapterError {
     match error {
         ContractWorkError::Contract(error) => AdapterError::Invalid(error),
         ContractWorkError::Resource(cause) => capture_resource_error(cause),
     }
 }
-fn capture_arithmetic_error() -> AdapterError {
+pub(super) fn capture_arithmetic_error() -> AdapterError {
     capture_resource_error(WorkFailure::BudgetExhausted("capture work arithmetic overflow"))
 }
 
@@ -822,7 +822,7 @@ fn capture_insert<V>(
     map.insert(key, value);
     Ok(())
 }
-fn capture_paid_refusal(
+pub(super) fn capture_paid_refusal(
     at: &str, rule: &str,
     charge: &mut impl FnMut(u64) -> std::result::Result<(), AdapterError>,
 ) -> AdmissionResult<StoreError> {
@@ -841,7 +841,7 @@ fn capture_paid_refusal(
 // simultaneous optional-profile roles (parameter, outer and inner closures).
 // Two return-place/status words and two alignment/cleanup words are explicit.
 // Prepay before the helper/closures, including None and first-row refusal.
-const INITIAL_CAPTURE_PROFILE_TRANSPORT: u64 = 4 * (
+pub(super) const INITIAL_CAPTURE_PROFILE_TRANSPORT: u64 = 4 * (
     std::mem::size_of::<&CapturedProgram>() + std::mem::size_of::<&DataSnapshot>()
     + std::mem::size_of::<i32>() + std::mem::size_of::<&OwnedPreviewRequest>()
     + std::mem::size_of::<&[OwnedProjectionRecipe]>() + std::mem::size_of::<&mut ProofMeter>()

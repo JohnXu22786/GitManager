@@ -200,6 +200,7 @@ mod fallible_owned_source_decode;
 pub(crate) mod fallible_owned_request_decode;
 #[allow(dead_code)]
 mod fallible_owned_inventory_decode;
+mod fallible_owned_projection_capture;
 mod correspondence;
 mod family;
 pub use family::ScopeEnvelope;

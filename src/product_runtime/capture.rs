@@ -167,6 +167,40 @@ impl LocalRuntime{
     }
 
 }
+
+/// Apply the same paid output accounting used by capture rows to a decoded
+/// projection value, carrying the row's cumulative output-byte total.
+pub(crate) fn decoded_capture_account_output(
+    value: &DataValue,
+    current: usize,
+    limits: &RuntimeLimits,
+    work: &mut dyn ContractWork,
+) -> Result<usize> {
+    let bytes = capture_native::count_output_paid(value, work)?;
+    cost::pay(work, 3)?;
+    let total = current.checked_add(bytes).ok_or_else(|| cost::overflow())?;
+    if total > limits.output_bytes { return Err(exhausted("cumulative output limit")); }
+    cost::pay(work, cost::number(bytes)?)?;
+    cost::pay(work, 1)?;
+    Ok(total)
+}
+
+/// Charge the same fallible validation and clone traversal used by absent
+/// baseline values before the caller forms its owned decoded copy.
+pub(crate) fn decoded_capture_validate_value(
+    value: &DataValue,
+    expected: &Type,
+    work: &mut dyn ContractWork,
+) -> Result<()> {
+    validate_value_with_work(value, expected, 0, work).map_err(cost::contract)
+}
+
+pub(crate) fn decoded_capture_value_copy_cost(
+    value: &DataValue,
+    work: &mut dyn ContractWork,
+) -> Result<()> {
+    cost::value(value, work)
+}
 impl<'c,'v,'a,'s,H:ProjectionHost+?Sized> ProjectionCapture<'c,'v,'a,'s,H>{
     const ENTRY:u64=153+size_of::<CaptureHost<'a,H>>() as u64+size_of::<Self>() as u64;
     pub(crate) fn charge_host(&mut self,units:u64)->Result<()>{
@@ -239,6 +273,10 @@ impl<'c,'v,'a,'s,H:ProjectionHost+?Sized> ProjectionCapture<'c,'v,'a,'s,H>{
         self.validation.with_host(|host|host.active_row_deadline=None);
         result
     }
+}
+
+pub(crate) fn projection_capture_entry_units<H: ProjectionHost>() -> u64 {
+    ProjectionCapture::<H>::ENTRY
 }
 enum RowFailure{Local(AdapterError),Source}
 pub(crate) struct ProjectionRow<'r,'c,'v,'a,'s,H:ProjectionHost+?Sized>{

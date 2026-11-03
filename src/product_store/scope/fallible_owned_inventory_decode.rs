@@ -50,6 +50,11 @@ pub(crate) struct DecodedOwnedInventoryV2 {
     outcome_comparison: Vec<String>,
 }
 
+impl DecodedOwnedInventoryV2 {
+    pub(crate) fn projections(&self) -> &[DecodedOwnedProjectionRecipe] { &self.projections }
+    pub(crate) fn captured(&self) -> &FallibleScopeMap<String, FallibleValues> { &self.captured }
+}
+
 #[derive(Debug, Serialize)]
 struct DecodedCommonFactCertificate {
     side: OwnedSourceSide,
@@ -59,7 +64,7 @@ struct DecodedCommonFactCertificate {
 }
 
 #[derive(Debug, Serialize)]
-struct DecodedOwnedProjectionRecipe {
+pub(crate) struct DecodedOwnedProjectionRecipe {
     location: String,
     destination: DecodedOwnedProjectionDestination,
     binding: String,
@@ -69,6 +74,14 @@ struct DecodedOwnedProjectionRecipe {
     baseline: Option<Expr>,
     candidate: Expr,
     capture_required: bool,
+}
+impl DecodedOwnedProjectionRecipe {
+    pub(crate) fn location(&self) -> &str { &self.location }
+    pub(crate) fn binding(&self) -> &str { &self.binding }
+    pub(crate) fn value_type(&self) -> &Type { &self.value_type }
+    pub(crate) fn host_value_type(&self) -> &Type { &self.host_value_type }
+    pub(crate) fn absent_value(&self) -> Option<&DataValue> { self.absent_value.as_ref() }
+    pub(crate) fn baseline(&self) -> Option<&Expr> { self.baseline.as_ref() }
 }
 
 #[derive(Debug, Serialize)]
@@ -170,7 +183,7 @@ fn decode_certificate(value: Value, cx: &mut AllocationContext) -> Result<Decode
     })
 }
 
-fn decode_projection(value: Value, cx: &mut AllocationContext) -> Result<DecodedOwnedProjectionRecipe, ValueDecodeError> {
+pub(crate) fn decode_projection(value: Value, cx: &mut AllocationContext) -> Result<DecodedOwnedProjectionRecipe, ValueDecodeError> {
     let fields = struct_fields(value, "a struct OwnedProjectionRecipe", PROJECTION_FIELDS, cx)?;
     let (mut location, mut projection_destination, mut binding, mut value_type, mut host_value_type,
         mut absent_value, mut baseline, mut candidate, mut capture_required) =
