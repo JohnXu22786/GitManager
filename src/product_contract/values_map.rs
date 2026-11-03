@@ -74,6 +74,34 @@ impl FallibleValues {
         self.0.remove_entry(id)
     }
 
+    /// Move entries into this owner with the same replacement rule as
+    /// `BTreeMap::extend`. Each vacant insertion is reserved through `cx`;
+    /// callers performing a transaction must apply this to a private working
+    /// copy so a later refusal can discard earlier entries atomically.
+    pub(crate) fn try_extend_owned(
+        &mut self,
+        values: Self,
+        cx: &mut AllocationContext,
+    ) -> Result<(), AllocationFailure> {
+        for (id, value) in values.0.into_entries() {
+            self.0.try_insert(id, value, cx)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn try_set(
+        &mut self,
+        id: &str,
+        value: DataValue,
+        cx: &mut AllocationContext,
+    ) -> Result<Option<DataValue>, AllocationFailure> {
+        if let Some(current) = self.0.get_mut(id) {
+            return Ok(Some(std::mem::replace(current, value)));
+        }
+        let id = try_copy_str(id, cx, AllocationSite::String)?;
+        self.0.try_insert(id, value, cx)
+    }
+
     /// Deep-copy this ordered owner without calling `Clone` or changing the
     /// source. The map storage, every key, and every nested DataValue owner are
     /// separately reserved through `cx`; any refusal drops the partial copy

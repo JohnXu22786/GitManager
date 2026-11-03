@@ -739,3 +739,8 @@ fn inventory_does_not_confuse_action_prefix_with_lifecycle_predicate() {
         .any(|w| w.field.as_deref() == Some("production")));
     assert!(!has(&r, "mixed_lifecycle_transition", "calculate [1, 0]"));
 }
+
+#[test]
+fn decoded_shared_transaction_kernel() {
+    product_runtime::decoded_shared_transaction_kernel_parity_and_atomicity().unwrap();
+}

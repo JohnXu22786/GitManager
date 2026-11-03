@@ -1,27 +1,66 @@
 use super::*;
-use eval::{boolean, list, record, reference, value_ref};
+use eval::{boolean, list, record, value_ref};
 
 fn evaluate(
-    app: &AppDefinition,
+    app: AppRef<'_>,
     state: &State,
     expr: &Expr,
     env: &Env,
     meter: &mut Meter,
 ) -> Result<DataValue> {
-    Eval::legacy(app, &state.data, &state.session, state.day, meter)
+    Eval::view(app, DataSnapshotView::from(&state.data), SessionStateView::from(&state.session), state.day, meter)
     .eval(expr, env)
 }
+fn evaluate_owner(
+    app: AppRef<'_>,
+    state: &KernelState<'_>,
+    expr: &Expr,
+    env: &Env,
+    meter: &mut Meter,
+) -> Result<DataValue> {
+    let (data, session, day) = state.views();
+    Eval::view(app, data, session, day, meter).eval(expr, env)
+}
 fn assignments(
-    app: &AppDefinition,
+    app: AppRef<'_>,
     state: &State,
-    values: &BTreeMap<Id, Expr>,
+    values: StringMapRef<'_, Expr>,
     env: &Env,
     meter: &mut Meter,
 ) -> Result<Values> {
     values
         .iter()
-        .map(|(id, expr)| Ok((id.clone(), evaluate(app, state, expr, env, meter)?)))
+        .map(|(id, expr)| Ok((id.to_owned(), evaluate(app, state, expr, env, meter)?)))
         .collect()
+}
+fn update_assignments(
+    app: AppRef<'_>,
+    state: &KernelState<'_>,
+    values: StringMapRef<'_, Expr>,
+    env: &Env,
+    meter: &mut Meter,
+) -> Result<UpdateValues> {
+    match state {
+        KernelState::Legacy(_) => values.iter().map(|(id, expr)| {
+            Ok((id.to_owned(), evaluate_owner(app, state, expr, env, meter)?))
+        }).collect::<Result<Values>>().map(UpdateValues::Legacy),
+        KernelState::Decoded { .. } => {
+            let mut output = FallibleValues::new();
+            for (id, expr) in values.iter() {
+                let value = evaluate_owner(app, state, expr, env, meter)?;
+                let id = product_alloc::try_copy_str(
+                    id,
+                    &mut meter.allocations,
+                    product_alloc::AllocationSite::String,
+                ).map_err(AdapterError::Allocation)?;
+                let value = try_clone_data_value_with(&value, &mut meter.allocations)
+                    .map_err(AdapterError::Allocation)?;
+                output.try_insert(id, value, &mut meter.allocations)
+                    .map_err(AdapterError::Allocation)?;
+            }
+            Ok(UpdateValues::Fallible(output))
+        }
+    }
 }
 fn update(
     state: &mut State,
@@ -30,49 +69,430 @@ fn update(
     archive: bool,
     meter: &mut Meter,
 ) -> Result<()> {
-    meter.write()?;
-    meter.tick(state.data.records.len() as u64)?;
-    let target = reference(key)?;
-    let row = state
-        .data
-        .records
-        .iter_mut()
-        .find(|r| r.entity == target.entity && r.id == target.record)
-        .ok_or_else(|| invalid("record does not exist"))?;
-    if row.archived {
-        return Err(invalid("archived historical records cannot be modified"));
+    update_owner(
+        DataOwner::Legacy(&mut state.data),
+        key,
+        UpdateValues::Legacy(values),
+        archive,
+        meter,
+    )
+}
+
+enum DataOwner<'a> {
+    Legacy(&'a mut DataSnapshot),
+    Fallible(&'a mut FallibleDecodedDataSnapshot),
+}
+enum UpdateValues {
+    Legacy(Values),
+    Fallible(FallibleValues),
+}
+enum SessionOwner<'a> {
+    Legacy(&'a mut SessionState),
+    Fallible(&'a mut FallibleDecodedSessionState),
+}
+
+/// Persistent owners used by the one statement interpreter. Legacy execution
+/// borrows its existing runtime state; decoded execution supplies the same data
+/// and session owners without materializing either through legacy maps.
+enum KernelState<'a> {
+    Legacy(&'a mut State),
+    Decoded {
+        data: &'a mut FallibleDecodedDataSnapshot,
+        session: &'a mut FallibleDecodedSessionState,
+        day: i32,
+    },
+}
+impl KernelState<'_> {
+    fn views(&self) -> (DataSnapshotView<'_>, SessionStateView<'_>, i32) {
+        match self {
+            Self::Legacy(state) => (
+                DataSnapshotView::from(&state.data),
+                SessionStateView::from(&state.session),
+                state.day,
+            ),
+            Self::Decoded { data, session, day } => (
+                DataSnapshotView::from(&**data),
+                SessionStateView::from(&**session),
+                *day,
+            ),
+        }
     }
-    row.values.extend(values);
-    row.archived = archive;
-    row.revision = row
-        .revision
-        .checked_add(1)
-        .ok_or_else(|| failed("record revision overflow"))?;
+    fn legacy(&mut self) -> Result<&mut State> {
+        match self {
+            Self::Legacy(state) => Ok(state),
+            Self::Decoded { .. } => Err(failed("statement is outside decoded update/state slice")),
+        }
+    }
+    fn update(&mut self, key: &DataValue, values: UpdateValues, meter: &mut Meter) -> Result<()> {
+        match self {
+            Self::Legacy(state) => {
+                let UpdateValues::Legacy(values) = values else {
+                    return Err(failed("transaction values owner mismatch"));
+                };
+                update(state, key, values, false, meter)
+            }
+            Self::Decoded { data, .. } => {
+                let UpdateValues::Fallible(values) = values else {
+                    return Err(failed("transaction values owner mismatch"));
+                };
+                update_owner(
+                    DataOwner::Fallible(data),
+                    key,
+                    UpdateValues::Fallible(values),
+                    false,
+                    meter,
+                )
+            }
+        }
+    }
+    fn set_state(&mut self, id: &str, value: DataValue, meter: &mut Meter) -> Result<()> {
+        match self {
+            Self::Legacy(state) => set_state_value(SessionOwner::Legacy(&mut state.session), id, value, meter),
+            Self::Decoded { session, .. } => set_state_value(SessionOwner::Fallible(session), id, value, meter),
+        }
+    }
+}
+
+fn set_state_value(
+    owner: SessionOwner<'_>,
+    id: &str,
+    value: DataValue,
+    meter: &mut Meter,
+) -> Result<()> {
+    meter.write()?;
+    match owner {
+        SessionOwner::Legacy(session) => {
+            session.values.insert(id.to_owned(), value);
+            Ok(())
+        }
+        SessionOwner::Fallible(session) => session.values_mut()
+            .try_set(id, value, &mut meter.allocations)
+            .map(|_| ())
+            .map_err(AdapterError::Allocation),
+    }
+}
+
+fn advance_generation(data: &mut DataSnapshot) -> Result<u64> {
+    let next = data.generation.checked_add(1)
+        .ok_or_else(|| failed("data generation overflow"))?;
+    data.generation = next;
+    Ok(next)
+}
+
+/// Shared record update/archive primitive for both persisted owner families.
+/// The caller owns a transaction-local snapshot, so partial fallible map growth
+/// is discarded with that snapshot if any later reservation fails.
+fn update_owner(
+    owner: DataOwner<'_>,
+    key: &DataValue,
+    values: UpdateValues,
+    archive: bool,
+    meter: &mut Meter,
+) -> Result<()> {
+    meter.write()?;
+    let record_count = match &owner {
+        DataOwner::Legacy(data) => data.records.len(),
+        DataOwner::Fallible(data) => data.record_count(),
+    };
+    meter.tick(record_count as u64)?;
+    let (entity, record) = match key {
+        DataValue::Reference { entity, record } => (entity.as_str(), record.as_str()),
+        _ => return Err(failed("expected record reference")),
+    };
+    match owner {
+        DataOwner::Legacy(data) => {
+            let row = data.records.iter_mut()
+                .find(|row| row.entity == entity && row.id == record)
+                .ok_or_else(|| invalid("record does not exist"))?;
+            if row.archived {
+                return Err(invalid("archived historical records cannot be modified"));
+            }
+            let revision = row.revision.checked_add(1)
+                .ok_or_else(|| failed("record revision overflow"))?;
+            let UpdateValues::Legacy(values) = values else {
+                return Err(failed("transaction values owner mismatch"));
+            };
+            row.values.extend(values);
+            row.archived = archive;
+            row.revision = revision;
+            Ok(())
+        }
+        DataOwner::Fallible(data) => {
+            let UpdateValues::Fallible(values) = values else {
+                return Err(failed("transaction values owner mismatch"));
+            };
+            data.try_update_record_by(entity, record, values, archive, &mut meter.allocations)
+                .map_err(|error| match error {
+                    AppValidationError::Contract(error) if error.0 == "record revision overflow" => {
+                        failed("record revision overflow")
+                    }
+                    error => app_validation_error(error),
+                })
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn decoded_shared_transaction_kernel_parity_and_atomicity(
+) -> std::result::Result<(), String> {
+    use std::num::NonZeroUsize;
+    let program = Digest::try_from("0".repeat(64)).map_err(|error| error.to_string())?;
+    let legacy = DataSnapshot {
+        version: CONTRACT_VERSION,
+        project_id: "project".into(),
+        generation: 0,
+        schema: vec![],
+        records: vec![Record {
+            entity: "job".into(),
+            id: "row-1".into(),
+            revision: 1,
+            created_program: program.clone(),
+            archived: false,
+            values: Values::from([("name".into(), DataValue::Text { value: "old".into() })]),
+        }],
+        events: vec![],
+    };
+    let encoded = serde_json::to_vec(&legacy).map_err(|error| error.to_string())?;
+    let mut decode_allocations = product_alloc::AllocationContext::new();
+    let decoded = decode_data_snapshot_fallible(
+        crate::product_json::parse_json_bytes(&encoded, &mut decode_allocations)
+            .map_err(|error| format!("{error:?}"))?,
+        &mut decode_allocations,
+    ).map_err(|error| format!("{error:?}"))?;
+
+    // Exercise the exact statement interpreter used by LocalRuntime::apply,
+    // with a decoded data/session owner. The update and state write are kept in
+    // one StatementSlice so evaluation order and meter behavior are shared.
+    let reference = DataValue::Reference { entity: "job".into(), record: "row-1".into() };
+    let steps = vec![
+        Statement::Update {
+            record: Expr::Literal { value_type: Type::reference("job"), value: reference.clone() },
+            values: [("extra".into(), Expr::Literal {
+                value_type: Type::Text,
+                value: DataValue::Text { value: "through-kernel".into() },
+            })].into(),
+        },
+        Statement::SetState {
+            state: "selected".into(),
+            value: Expr::Literal {
+                value_type: Type::Text,
+                value: DataValue::Text { value: "through-kernel".into() },
+            },
+        },
+    ];
+    let only_state = vec![steps[1].clone()];
+    let app = AppDefinition {
+        version: CONTRACT_VERSION,
+        id: "kernel-test".into(),
+        label: "Kernel test".into(),
+        entities: vec![],
+        state: vec![],
+        actions: vec![
+            ActionDefinition { id: "kernel".into(), label: "Kernel".into(), parameters: BTreeMap::new(), guards: vec![], steps: steps.clone(), ensures: vec![] },
+            ActionDefinition { id: "update_only".into(), label: "Update only".into(), parameters: BTreeMap::new(), guards: vec![], steps: steps[..1].to_vec(), ensures: vec![] },
+            ActionDefinition { id: "state_only".into(), label: "State only".into(), parameters: BTreeMap::new(), guards: vec![], steps: only_state.clone(), ensures: vec![] },
+        ],
+        outputs: vec![],
+        observables: vec![],
+        views: vec![],
+        initial_view: "work".into(),
+    };
+    let mut app_allocations = product_alloc::AllocationContext::new();
+    let app_value = crate::product_json::parse_json_bytes(
+        &serde_json::to_vec(&app).map_err(|error| error.to_string())?,
+        &mut app_allocations,
+    ).map_err(|error| format!("decoded app parse: {error:?}"))?;
+    let decoded_app = fallible_app_decode::decode_app_definition(app_value, &mut app_allocations)
+        .map_err(|error| format!("decoded app: {error:?}"))?;
+    let legacy_steps = AppRef::from(&app).action("kernel").ok_or("legacy test action absent")?.steps();
+    let decoded_steps = AppRef::from(&decoded_app).action("kernel").ok_or("decoded test action absent")?.steps();
+    let decoded_update_only = AppRef::from(&decoded_app).action("update_only").ok_or("decoded update action absent")?.steps();
+    let decoded_state_only = AppRef::from(&decoded_app).action("state_only").ok_or("decoded state action absent")?.steps();
+    let mut legacy_kernel_state = State {
+        data: legacy.clone(),
+        session: SessionState { view: "work".into(), values: Values::new(), focused_record: None },
+        day: 0,
+        outputs: vec![],
+        output_participants: vec![],
+        output_participant_count: 0,
+    };
+    let mut legacy_kernel_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+    let mut legacy_owners = KernelState::Legacy(&mut legacy_kernel_state);
+    Transaction {
+        program: None,
+        app: AppRef::from(&app),
+        program_digest: &program,
+        operation: "kernel-op",
+        seed: 7,
+        created: 0,
+        cancel_after_statement: None,
+    }.statements(&mut legacy_owners, legacy_steps, &mut Env::new(), &mut legacy_kernel_meter)
+        .map_err(|error| format!("legacy statement kernel: {error:?}"))?;
+
+    let mut decoded_kernel_data = decoded.try_clone_with(&mut product_alloc::AllocationContext::new())
+        .map_err(|error| format!("decoded kernel data copy: {error:?}"))?;
+    let initial_session = SessionState { view: "work".into(), values: Values::new(), focused_record: None };
+    let mut session_allocations = product_alloc::AllocationContext::new();
+    let mut decoded_kernel_session = decode_session_state_fallible(
+        crate::product_json::parse_json_bytes(
+            &serde_json::to_vec(&initial_session).map_err(|error| error.to_string())?,
+            &mut session_allocations,
+        ).map_err(|error| format!("decoded kernel session parse: {error:?}"))?,
+        &mut session_allocations,
+    ).map_err(|error| format!("decoded kernel session: {error:?}"))?;
+    let before_kernel_refusal = decoded_kernel_data.try_clone_with(&mut product_alloc::AllocationContext::new())
+        .map_err(|error| format!("decoded kernel refusal copy: {error:?}"))?;
+    let mut refuse_update = Meter::with_allocations(
+        RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)),
+        product_alloc::AllocationContext::fail_nth_growth(NonZeroUsize::new(7).unwrap(), false),
+    );
+    let mut decoded_owners = KernelState::Decoded { data: &mut decoded_kernel_data, session: &mut decoded_kernel_session, day: 0 };
+    let refused_update = Transaction {
+        program: None, app: AppRef::from(&decoded_app), program_digest: &program,
+        operation: "kernel-op", seed: 7, created: 0, cancel_after_statement: None,
+    }.statements(&mut decoded_owners, decoded_update_only, &mut Env::new(), &mut refuse_update);
+    if !matches!(
+        refused_update,
+        Err(AdapterError::Allocation(failure)) if failure.site == product_alloc::AllocationSite::OrderedMap
+    ) || refuse_update.allocations.growth_requests() != 7
+        || decoded_kernel_data != before_kernel_refusal
+    {
+        return Err(format!("decoded statement update refusal was not atomic: {refused_update:?}; growth requests {}", refuse_update.allocations.growth_requests()));
+    }
+
+    let before_state_refusal = decoded_kernel_session.try_clone_with(&mut product_alloc::AllocationContext::new())
+        .map_err(|error| format!("decoded state refusal copy: {error:?}"))?;
+    let mut refuse_state = Meter::with_allocations(
+        RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)),
+        product_alloc::AllocationContext::fail_nth_growth(NonZeroUsize::new(3).unwrap(), false),
+    );
+    let mut decoded_owners = KernelState::Decoded { data: &mut decoded_kernel_data, session: &mut decoded_kernel_session, day: 0 };
+    let refused_state = Transaction {
+        program: None, app: AppRef::from(&decoded_app), program_digest: &program,
+        operation: "kernel-op", seed: 7, created: 0, cancel_after_statement: None,
+    }.statements(&mut decoded_owners, decoded_state_only, &mut Env::new(), &mut refuse_state);
+    if !matches!(
+        refused_state,
+        Err(AdapterError::Allocation(failure)) if failure.site == product_alloc::AllocationSite::OrderedMap
+    ) || refuse_state.allocations.growth_requests() != 3
+        || decoded_kernel_session != before_state_refusal
+    {
+        return Err(format!("decoded statement state refusal was not atomic: {refused_state:?}"));
+    }
+
+    let mut retry_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+    let mut decoded_owners = KernelState::Decoded { data: &mut decoded_kernel_data, session: &mut decoded_kernel_session, day: 0 };
+    Transaction {
+        program: None, app: AppRef::from(&decoded_app), program_digest: &program,
+        operation: "kernel-op", seed: 7, created: 0, cancel_after_statement: None,
+    }.statements(&mut decoded_owners, decoded_steps, &mut Env::new(), &mut retry_meter)
+        .map_err(|error| format!("decoded statement kernel retry: {error:?}"))?;
+    if serde_json::to_value(&legacy_kernel_state.data.records[0]).map_err(|error| error.to_string())?
+        != serde_json::to_value(&decoded_kernel_data.records()[0]).map_err(|error| error.to_string())?
+        || serde_json::to_value(&legacy_kernel_state.session).map_err(|error| error.to_string())?
+        != serde_json::to_value(&decoded_kernel_session).map_err(|error| error.to_string())?
+    {
+        return Err("legacy and decoded statement kernel results diverged".into());
+    }
+
+    // Decoded overflow keeps the same refusal class as the legacy update.
+    let mut overflow_legacy = legacy.clone();
+    overflow_legacy.records[0].revision = u64::MAX;
+    let mut overflow_allocations = product_alloc::AllocationContext::new();
+    let overflow_bytes = serde_json::to_vec(&overflow_legacy).map_err(|error| error.to_string())?;
+    let overflow_value = crate::product_json::parse_json_bytes(&overflow_bytes, &mut overflow_allocations)
+        .map_err(|error| format!("overflow snapshot parse: {error:?}"))?;
+    let mut overflow_decoded = decode_data_snapshot_fallible(overflow_value, &mut overflow_allocations)
+        .map_err(|error| format!("overflow snapshot decode: {error:?}"))?;
+    let before_overflow_decoded = overflow_decoded.try_clone_with(&mut product_alloc::AllocationContext::new())
+        .map_err(|error| format!("overflow snapshot copy: {error:?}"))?;
+    let mut overflow_legacy_state = State {
+        data: overflow_legacy.clone(),
+        session: initial_session.clone(),
+        day: 0,
+        outputs: vec![],
+        output_participants: vec![],
+        output_participant_count: 0,
+    };
+    let mut overflow_legacy_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+    let mut overflow_legacy_owner = KernelState::Legacy(&mut overflow_legacy_state);
+    let overflow_legacy_result = Transaction {
+        program: None, app: AppRef::from(&app), program_digest: &program,
+        operation: "kernel-op", seed: 7, created: 0, cancel_after_statement: None,
+    }.statements(&mut overflow_legacy_owner, legacy_steps, &mut Env::new(), &mut overflow_legacy_meter);
+    let mut overflow_session = decode_session_state_fallible(
+        crate::product_json::parse_json_bytes(
+            &serde_json::to_vec(&initial_session).map_err(|error| error.to_string())?,
+            &mut product_alloc::AllocationContext::new(),
+        ).map_err(|error| format!("overflow session parse: {error:?}"))?,
+        &mut product_alloc::AllocationContext::new(),
+    ).map_err(|error| format!("overflow session decode: {error:?}"))?;
+    let mut overflow_decoded_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+    let mut overflow_decoded_owner = KernelState::Decoded { data: &mut overflow_decoded, session: &mut overflow_session, day: 0 };
+    let overflow_decoded_result = Transaction {
+        program: None, app: AppRef::from(&decoded_app), program_digest: &program,
+        operation: "kernel-op", seed: 7, created: 0, cancel_after_statement: None,
+    }.statements(&mut overflow_decoded_owner, decoded_update_only, &mut Env::new(), &mut overflow_decoded_meter);
+    if !matches!(&overflow_legacy_result, Err(AdapterError::Failed(message)) if message == "record revision overflow")
+        || !matches!(&overflow_decoded_result, Err(AdapterError::Failed(message)) if message == "record revision overflow")
+        || overflow_decoded != before_overflow_decoded
+        || overflow_legacy_state.data != overflow_legacy
+    {
+        return Err(format!("legacy and decoded revision overflow diverged: {overflow_legacy_result:?} vs {overflow_decoded_result:?}"));
+    }
+
+    let before_cancel = decoded_kernel_data.try_clone_with(&mut product_alloc::AllocationContext::new())
+        .map_err(|error| format!("decoded cancel copy: {error:?}"))?;
+    let before_cancel_session = decoded_kernel_session.try_clone_with(&mut product_alloc::AllocationContext::new())
+        .map_err(|error| format!("decoded cancel session copy: {error:?}"))?;
+    let mut cancelled_private_data = before_cancel.try_clone_with(&mut product_alloc::AllocationContext::new())
+        .map_err(|error| format!("cancel private data copy: {error:?}"))?;
+    let mut cancelled_private_session = before_cancel_session.try_clone_with(&mut product_alloc::AllocationContext::new())
+        .map_err(|error| format!("cancel private session copy: {error:?}"))?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut cancel_meter = Meter::new(RuntimeLimits::default(), 1_000_000, cancel.clone());
+    let mut decoded_owners = KernelState::Decoded { data: &mut cancelled_private_data, session: &mut cancelled_private_session, day: 0 };
+    let cancelled = Transaction {
+        program: None, app: AppRef::from(&decoded_app), program_digest: &program,
+        operation: "kernel-op", seed: 7, created: 0, cancel_after_statement: Some(cancel.clone()),
+    }.statements(&mut decoded_owners, decoded_steps, &mut Env::new(), &mut cancel_meter);
+    if !matches!(cancelled, Err(AdapterError::Cancelled))
+        || cancelled_private_data == before_cancel
+        || decoded_kernel_data != before_cancel
+        || decoded_kernel_session != before_cancel_session
+    {
+        return Err(format!("decoded statement cancellation did not roll back after an update: {cancelled:?}"));
+    }
     Ok(())
 }
 struct Transaction<'a> {
-    program: &'a CapturedProgram,
+    program: Option<&'a CapturedProgram>,
+    app: AppRef<'a>,
+    program_digest: &'a Digest,
     operation: &'a str,
     seed: u64,
     created: usize,
+    #[cfg(test)]
+    cancel_after_statement: Option<Arc<AtomicBool>>,
 }
 impl Transaction<'_> {
     fn statements(
         &mut self,
-        state: &mut State,
-        steps: &[Statement],
+        state: &mut KernelState<'_>,
+        steps: StatementSlice<'_>,
         env: &mut Env,
         meter: &mut Meter,
     ) -> Result<()> {
-        let app = &self.program.program;
-        for step in steps {
+        let app = self.app;
+        for index in 0..steps.len() {
             meter.step()?;
-            match step {
-                Statement::Create {
+            match steps.get(index).expect("bounded statement index") {
+                StatementView::Create {
                     entity,
                     values,
                     bind,
                 } => {
+                    let state = state.legacy()?;
                     let values = assignments(app, state, values, env, meter)?;
                     meter.write()?;
                     meter.collection(state.data.records.len() + 1)?;
@@ -91,40 +511,41 @@ impl Transaction<'_> {
                         return Err(invalid("generated record identity collision"));
                     }
                     let row = Record {
-                        entity: entity.clone(),
+                        entity: entity.to_owned(),
                         id,
                         revision: 1,
-                        created_program: self.program.artifact.program_digest.clone(),
+                        created_program: self.program_digest.clone(),
                         archived: false,
                         values,
                     };
-                    env.insert(bind.clone(), (Type::reference(entity), value_ref(&row)));
+                    env.insert(bind.to_owned(), (Type::reference(entity), value_ref(&row)));
                     state.data.records.push(row);
                 }
-                Statement::Update { record, values } => {
-                    let key = evaluate(app, state, record, env, meter)?;
-                    let values = assignments(app, state, values, env, meter)?;
-                    update(state, &key, values, false, meter)?;
+                StatementView::Update { record, values } => {
+                    let key = evaluate_owner(app, state, record, env, meter)?;
+                    let values = update_assignments(app, state, values, env, meter)?;
+                    state.update(&key, values, meter)?;
                 }
-                Statement::Archive { record } => {
+                StatementView::Archive { record } => {
+                    let state = state.legacy()?;
                     let key = evaluate(app, state, record, env, meter)?;
                     update(state, &key, Values::new(), true, meter)?;
                 }
-                Statement::SetState { state: id, value } => {
-                    let value = evaluate(app, state, value, env, meter)?;
-                    meter.write()?;
-                    state.session.values.insert(id.clone(), value);
+                StatementView::SetState { state: id, value } => {
+                    let value = evaluate_owner(app, state, value, env, meter)?;
+                    state.set_state(id, value, meter)?;
                 }
-                Statement::Collection {
+                StatementView::Collection {
                     target,
                     operation,
                     items,
                 } => {
+                    let state = state.legacy()?;
                     let (_, items) = list(evaluate(app, state, items, env, meter)?)?;
                     let (key, field, old) = match target {
                         CollectionTarget::State { state: id } => (
                             None,
-                            id.clone(),
+                            id.to_owned(),
                             state
                                 .session
                                 .values
@@ -142,7 +563,7 @@ impl Transaction<'_> {
                                 .get(field)
                                 .cloned()
                                 .ok_or_else(|| invalid("collection field absent"))?;
-                            (Some(key), field.clone(), value)
+                            (Some(key), field.to_owned(), value)
                         }
                     };
                     let (item_type, mut previous) = list(old)?;
@@ -174,38 +595,39 @@ impl Transaction<'_> {
                     if let Some(key) = key {
                         update(state, &key, BTreeMap::from([(field, value)]), false, meter)?;
                     } else {
-                        meter.write()?;
-                        state.session.values.insert(field, value);
+                        set_state_value(SessionOwner::Legacy(&mut state.session), &field, value, meter)?;
                     }
                 }
-                Statement::ForEach {
+                StatementView::ForEach {
                     items,
                     binding,
                     steps,
                 } => {
-                    let (typ, items) = list(evaluate(app, state, items, env, meter)?)?;
+                    let (typ, items) = list(evaluate_owner(app, state, items, env, meter)?)?;
                     for item in items {
                         meter.tick(1)?;
                         let mut local = env.clone();
-                        local.insert(binding.clone(), (typ.clone(), item));
+                        local.insert(binding.to_owned(), (typ.clone(), item));
                         self.statements(state, steps, &mut local, meter)?;
                     }
                 }
-                Statement::Assert { condition, message } => {
-                    if !boolean(evaluate(app, state, condition, env, meter)?)? {
+                StatementView::Assert { condition, message } => {
+                    if !boolean(evaluate_owner(app, state, condition, env, meter)?)? {
                         return Err(invalid(message));
                     }
                 }
-                Statement::Emit {
+                StatementView::Emit {
                     output,
                     items,
                     binding,
                     columns,
                 } => {
+                    let state = state.legacy()?;
+                    let program = self.program.ok_or_else(|| failed("output requires captured legacy program"))?;
                     let definition = app
-                        .outputs
+                        .outputs()
                         .iter()
-                        .find(|o| &o.id == output)
+                        .find(|o| o.id == output)
                         .ok_or_else(|| failed("output absent"))?;
                     let (typ, items) = list(evaluate(app, state, items, env, meter)?)?;
                     // Auxiliary identity evidence must never change Emit's
@@ -250,13 +672,13 @@ impl Transaction<'_> {
                                 participants
                                     .as_mut()
                                     .unwrap()
-                                    .push(EmissionRecord::from_record(row));
+                            .push(EmissionRecord::from_record(row));
                             } else {
                                 participants = None;
                             }
                         }
                         let mut local = env.clone();
-                        local.insert(binding.clone(), (typ.clone(), item));
+                        local.insert(binding.to_owned(), (typ.clone(), item));
                         let row = assignments(app, state, columns, &local, meter)?;
                         for value in row.values() {
                             meter.value(value)?;
@@ -302,7 +724,7 @@ impl Transaction<'_> {
                     state
                         .output_participants
                         .push(EmittedRecordParticipants::from_execution(
-                            self.program,
+                            program,
                             self.operation,
                             state.outputs.len(),
                             &artifact,
@@ -310,6 +732,10 @@ impl Transaction<'_> {
                         ));
                     state.outputs.push(artifact);
                 }
+            }
+            #[cfg(test)]
+            if let Some(cancel) = &self.cancel_after_statement {
+                cancel.store(true, Ordering::SeqCst);
             }
         }
         Ok(())
@@ -415,18 +841,16 @@ fn action(
     seed: u64,
     meter: &mut Meter,
 ) -> Result<()> {
-    let app = &program.program;
+    let app = AppRef::from(&program.program);
     let definition = app
-        .actions
-        .iter()
-        .find(|a| a.id == id)
+        .action(id)
         .ok_or_else(|| invalid("unknown action"))?;
     validate_input(
         &SemanticInput::Invoke {
             action: id.into(),
             arguments: arguments.clone(),
         },
-        app,
+        &program.program,
     )?;
     let mut env = Env::new();
     for (id, value) in arguments {
@@ -434,10 +858,10 @@ fn action(
         check_references(value, &state.data)?;
         env.insert(
             id.clone(),
-            (definition.parameters[id].clone(), value.clone()),
+            (definition.parameters().get(id).expect("validated action parameter").clone(), value.clone()),
         );
     }
-    for guard in &definition.guards {
+    for guard in definition.guards() {
         if !boolean(evaluate(app, state, guard, &env, meter)?)? {
             return Err(invalid(&format!("Action guard rejected: {id}")));
         }
@@ -445,23 +869,25 @@ fn action(
     let previous = state.data.clone();
     let output_start = state.outputs.len();
     state.data = merged_data(program, &state.data)?;
+    let mut owners = KernelState::Legacy(state);
     Transaction {
-        program,
+        program: Some(program),
+        app,
+        program_digest: &program.artifact.program_digest,
         operation,
         seed,
         created: 0,
+        #[cfg(test)]
+        cancel_after_statement: None,
     }
-    .statements(state, &definition.steps, &mut env, meter)?;
-    for ensure in &definition.ensures {
+    .statements(&mut owners, definition.steps(), &mut env, meter)?;
+    let KernelState::Legacy(state) = owners else { unreachable!() };
+    for ensure in definition.ensures() {
         if !boolean(evaluate(app, state, ensure, &env, meter)?)? {
             return Err(invalid(&format!("Action postcondition rejected: {id}")));
         }
     }
-    state.data.generation = state
-        .data
-        .generation
-        .checked_add(1)
-        .ok_or_else(|| failed("data generation overflow"))?;
+    advance_generation(&mut state.data)?;
     let mut changes = Vec::new();
     for row in &state.data.records {
         meter.tick(previous.records.len() as u64 + 1)?;
@@ -635,7 +1061,13 @@ pub(super) fn input(
             } else if !presented.enabled_actions.contains(&binding.id) {
                 return Err(invalid("action is disabled"));
             }
-            let arguments = assignments(app, state, &binding.arguments, &env, meter)?;
+            let arguments = assignments(
+                AppRef::from(app),
+                state,
+                StringMapRef::Legacy(&binding.arguments),
+                &env,
+                meter,
+            )?;
             action(
                 program,
                 state,

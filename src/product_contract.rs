@@ -382,6 +382,35 @@ impl FallibleDecodedDataSnapshot {
     pub(crate) fn record_values_mut(&mut self, entity: &str, id: &str) -> Option<&mut FallibleValues> {
         self.0.records.iter_mut().find(|record| record.entity == entity && record.id == id).map(|record| &mut record.values)
     }
+    /// Mutable transaction access remains on the decoded owner. It never
+    /// exposes a legacy `DataSnapshot` or an infallibly copied map.
+    pub(crate) fn record_mut(
+        &mut self,
+        entity: &str,
+        id: &str,
+    ) -> Option<&mut fallible_persisted_decode::DecodedRecord> {
+        self.0.records.iter_mut().find(|record| record.entity == entity && record.id == id)
+    }
+    pub(crate) fn try_update_record_by(
+        &mut self,
+        entity: &str,
+        id: &str,
+        values: FallibleValues,
+        archive: bool,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), AppValidationError> {
+        let row = self.record_mut(entity, id)
+            .ok_or_else(|| AppValidationError::Contract(ContractError("record does not exist".into())))?;
+        if row.archived {
+            return Err(AppValidationError::Contract(ContractError("archived historical records cannot be modified".into())));
+        }
+        let revision = row.revision.checked_add(1)
+            .ok_or_else(|| AppValidationError::Contract(ContractError("record revision overflow".into())))?;
+        row.values.try_extend_owned(values, cx).map_err(AppValidationError::Allocation)?;
+        row.archived = archive;
+        row.revision = revision;
+        Ok(())
+    }
     pub(crate) fn business_projection_matches_after_removing<'a, I>(
         &self,
         before: &Self,
@@ -409,6 +438,7 @@ impl FallibleDecodedSessionState {
     pub(crate) fn view(&self) -> &str { self.0.view() }
     pub(crate) fn values(&self) -> &FallibleValues { self.0.values() }
     pub(crate) fn focused_record(&self) -> Option<&RecordRef> { self.0.focused_record() }
+    pub(crate) fn values_mut(&mut self) -> &mut FallibleValues { &mut self.0.values }
     pub(crate) fn identity_with(
         &self,
         cx: &mut crate::product_alloc::AllocationContext,

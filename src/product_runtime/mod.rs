@@ -12,6 +12,8 @@ use owned_env::ManagedEnv;
 pub(crate) use capture::{ProjectionHost, ProjectionReservation};
 mod eval;
 mod execute;
+#[cfg(test)]
+pub(crate) use execute::decoded_shared_transaction_kernel_parity_and_atomicity;
 mod view;
 use crate::product_alloc;
 
