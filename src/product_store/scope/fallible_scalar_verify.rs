@@ -939,4 +939,3 @@ pub(crate) fn validate(
     validate_history(snapshot, replay, cx)?;
     Ok(())
 }
-

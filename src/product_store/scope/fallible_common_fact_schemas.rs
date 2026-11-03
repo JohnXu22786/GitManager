@@ -39,6 +39,12 @@ pub(super) struct DecodedOwnedSchemaKinds(OrderedMap<String, DecodedOwnedSchemaK
 impl DecodedOwnedSchemaKinds {
     pub(super) fn get(&self, entity: &str) -> Option<&DecodedOwnedSchemaKind> { self.0.get(entity) }
     pub(super) fn iter(&self) -> impl Iterator<Item = (&String, &DecodedOwnedSchemaKind)> { self.0.iter() }
+    #[cfg(test)]
+    pub(super) fn test_from(entries: impl IntoIterator<Item = (String, DecodedOwnedSchemaKind)>) -> Self {
+        let mut values = OrderedMap::new();
+        for (key, value) in entries { values.try_insert(key, value, &mut AllocationContext::new()).expect("test schema allocation"); }
+        Self(values)
+    }
 }
 
 fn refusal(cx: &mut AllocationContext, at: &str, rule: &str) -> DecodedSchemaFailure {

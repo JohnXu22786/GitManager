@@ -19,6 +19,7 @@ mod fallible_replay_context;
 mod owned_source_shared;
 mod fallible_owned_source_analysis;
 pub(crate) mod fallible_common_fact_inventory;
+mod fallible_common_fact_rules;
 mod fallible_common_fact_schemas;
 pub(crate) use fallible_owned_source_analysis::{analyze_owned_sources_fallible, SourceAnalysisFailure};
 pub(crate) use fallible_owned_source_decode::decode_owned_source_request as decode_owned_source_request_fallible;
