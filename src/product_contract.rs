@@ -559,6 +559,13 @@ impl FallibleDecodedSessionState {
     pub(crate) fn values(&self) -> &FallibleValues { self.0.values() }
     pub(crate) fn focused_record(&self) -> Option<&RecordRef> { self.0.focused_record() }
     pub(crate) fn values_mut(&mut self) -> &mut FallibleValues { &mut self.0.values }
+    pub(crate) fn try_set_view_and_clear_focus(
+        &mut self,
+        view: &str,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), crate::product_alloc::AllocationFailure> {
+        self.0.try_set_view_and_clear_focus(view, cx)
+    }
     pub(crate) fn identity_with(
         &self,
         cx: &mut crate::product_alloc::AllocationContext,
@@ -1802,11 +1809,11 @@ pub(crate) enum ControlIter<'a> { Legacy(std::slice::Iter<'a, StateControl>), De
 pub(crate) enum ControlRef<'a> { Legacy(&'a StateControl), Decoded(&'a fallible_app_decode::DecodedStateControl) }
 impl<'a> Iterator for ControlIter<'a> { type Item = ControlRef<'a>; fn next(&mut self) -> Option<Self::Item> { match self { Self::Legacy(v) => v.next().map(ControlRef::Legacy), Self::Decoded(v) => v.next().map(ControlRef::Decoded) } } }
 impl ExactSizeIterator for ControlIter<'_> {}
-impl ControlSlice<'_> { pub(crate) fn iter(&self) -> ControlIter<'_> { match self { Self::Legacy(v) => ControlIter::Legacy(v.iter()), Self::Decoded(v) => ControlIter::Decoded(v.iter()) } } }
-impl ControlRef<'_> { pub(crate) fn id(&self) -> &str { match self { Self::Legacy(v) => &v.id, Self::Decoded(v) => &v.id } } pub(crate) fn label(&self) -> &str { match self { Self::Legacy(v) => &v.label, Self::Decoded(v) => &v.label } } pub(crate) fn state(&self) -> &str { match self { Self::Legacy(v) => &v.state, Self::Decoded(v) => &v.state } } pub(crate) fn on_change(&self) -> Option<&str> { match self { Self::Legacy(v) => v.on_change.as_deref(), Self::Decoded(v) => v.on_change.as_deref() } } }
+impl<'a> ControlSlice<'a> { pub(crate) fn iter(&self) -> ControlIter<'a> { match self { Self::Legacy(v) => ControlIter::Legacy(v.iter()), Self::Decoded(v) => ControlIter::Decoded(v.iter()) } } }
+impl<'a> ControlRef<'a> { pub(crate) fn id(&self) -> &'a str { match self { Self::Legacy(v) => &v.id, Self::Decoded(v) => &v.id } } pub(crate) fn label(&self) -> &'a str { match self { Self::Legacy(v) => &v.label, Self::Decoded(v) => &v.label } } pub(crate) fn state(&self) -> &'a str { match self { Self::Legacy(v) => &v.state, Self::Decoded(v) => &v.state } } pub(crate) fn on_change(&self) -> Option<&'a str> { match self { Self::Legacy(v) => v.on_change.as_deref(), Self::Decoded(v) => v.on_change.as_deref() } } }
 #[derive(Clone, Copy)]
 pub(crate) enum SelectionRef<'a> { Legacy(&'a SelectionBinding), Decoded(&'a fallible_app_decode::DecodedSelectionBinding) }
-impl SelectionRef<'_> { pub(crate) fn id(&self) -> &str { match self { Self::Legacy(v) => &v.id, Self::Decoded(v) => &v.id } } pub(crate) fn state(&self) -> &str { match self { Self::Legacy(v) => &v.state, Self::Decoded(v) => &v.state } } pub(crate) fn on_change(&self) -> Option<&str> { match self { Self::Legacy(v) => v.on_change.as_deref(), Self::Decoded(v) => v.on_change.as_deref() } } }
+impl<'a> SelectionRef<'a> { pub(crate) fn id(&self) -> &'a str { match self { Self::Legacy(v) => &v.id, Self::Decoded(v) => &v.id } } pub(crate) fn state(&self) -> &'a str { match self { Self::Legacy(v) => &v.state, Self::Decoded(v) => &v.state } } pub(crate) fn on_change(&self) -> Option<&'a str> { match self { Self::Legacy(v) => v.on_change.as_deref(), Self::Decoded(v) => v.on_change.as_deref() } } }
 #[derive(Clone, Copy)]
 pub(crate) enum FormInputSlice<'a> { Legacy(&'a [FormInput]), Decoded(&'a [fallible_app_decode::DecodedFormInput]) }
 pub(crate) enum FormInputIter<'a> { Legacy(std::slice::Iter<'a, FormInput>), Decoded(std::slice::Iter<'a, fallible_app_decode::DecodedFormInput>) }
@@ -1823,8 +1830,8 @@ pub(crate) enum BindingIter<'a> { Legacy(std::slice::Iter<'a, ActionBinding>), D
 pub(crate) enum BindingRef<'a> { Legacy(&'a ActionBinding), Decoded(&'a fallible_app_decode::DecodedActionBinding) }
 impl<'a> Iterator for BindingIter<'a> { type Item = BindingRef<'a>; fn next(&mut self) -> Option<Self::Item> { match self { Self::Legacy(v) => v.next().map(BindingRef::Legacy), Self::Decoded(v) => v.next().map(BindingRef::Decoded) } } }
 impl ExactSizeIterator for BindingIter<'_> {}
-impl BindingSlice<'_> { pub(crate) fn iter(&self) -> BindingIter<'_> { match self { Self::Legacy(v) => BindingIter::Legacy(v.iter()), Self::Decoded(v) => BindingIter::Decoded(v.iter()) } } }
-impl BindingRef<'_> { pub(crate) fn id(&self) -> &str { match self { Self::Legacy(v) => &v.id, Self::Decoded(v) => &v.id } } pub(crate) fn label(&self) -> &str { match self { Self::Legacy(v) => &v.label, Self::Decoded(v) => &v.label } } pub(crate) fn placement(&self) -> ActionPlacement { match self { Self::Legacy(v) => v.placement, Self::Decoded(v) => v.placement } } pub(crate) fn action(&self) -> &str { match self { Self::Legacy(v) => &v.action, Self::Decoded(v) => &v.action } } pub(crate) fn arguments(&self) -> StringMapRef<'_, Expr> { match self { Self::Legacy(v) => StringMapRef::Legacy(&v.arguments), Self::Decoded(v) => StringMapRef::Fallible(&v.arguments) } } pub(crate) fn enabled(&self) -> &Expr { match self { Self::Legacy(v) => &v.enabled, Self::Decoded(v) => &v.enabled } } }
+impl<'a> BindingSlice<'a> { pub(crate) fn iter(&self) -> BindingIter<'a> { match self { Self::Legacy(v) => BindingIter::Legacy(v.iter()), Self::Decoded(v) => BindingIter::Decoded(v.iter()) } } }
+impl<'a> BindingRef<'a> { pub(crate) fn id(&self) -> &'a str { match self { Self::Legacy(v) => &v.id, Self::Decoded(v) => &v.id } } pub(crate) fn label(&self) -> &'a str { match self { Self::Legacy(v) => &v.label, Self::Decoded(v) => &v.label } } pub(crate) fn placement(&self) -> ActionPlacement { match self { Self::Legacy(v) => v.placement, Self::Decoded(v) => v.placement } } pub(crate) fn action(&self) -> &'a str { match self { Self::Legacy(v) => &v.action, Self::Decoded(v) => &v.action } } pub(crate) fn arguments(&self) -> StringMapRef<'a, Expr> { match self { Self::Legacy(v) => StringMapRef::Legacy(&v.arguments), Self::Decoded(v) => StringMapRef::Fallible(&v.arguments) } } pub(crate) fn enabled(&self) -> &'a Expr { match self { Self::Legacy(v) => &v.enabled, Self::Decoded(v) => &v.enabled } } }
 #[derive(Clone, Copy)]
 pub(crate) enum KeySlice<'a> { Legacy(&'a [KeyBinding]), Decoded(&'a [fallible_app_decode::DecodedKeyBinding]) }
 pub(crate) enum KeyIter<'a> { Legacy(std::slice::Iter<'a, KeyBinding>), Decoded(std::slice::Iter<'a, fallible_app_decode::DecodedKeyBinding>) }
@@ -1834,9 +1841,9 @@ impl<'a> Iterator for KeyIter<'a> { type Item = KeyRef<'a>; fn next(&mut self) -
 impl ExactSizeIterator for KeyIter<'_> {}
 impl KeySlice<'_> { pub(crate) fn iter(&self) -> KeyIter<'_> { match self { Self::Legacy(v) => KeyIter::Legacy(v.iter()), Self::Decoded(v) => KeyIter::Decoded(v.iter()) } } }
 impl KeyRef<'_> { pub(crate) fn key(&self) -> &str { match self { Self::Legacy(v) => &v.key, Self::Decoded(v) => &v.key } } pub(crate) fn modifier_count(&self) -> usize { match self { Self::Legacy(v) => v.modifiers.len(), Self::Decoded(v) => v.modifiers.len() } } pub(crate) fn modifier(&self, index: usize) -> Option<KeyModifier> { match self { Self::Legacy(v) => v.modifiers.iter().nth(index).copied(), Self::Decoded(v) => v.modifiers.0.iter().nth(index).copied() } } pub(crate) fn binding(&self) -> &str { match self { Self::Legacy(v) => &v.binding, Self::Decoded(v) => &v.binding } } }
-impl ViewRef<'_> {
+impl<'a> ViewRef<'a> {
     pub(crate) fn id(&self) -> &str { match self { Self::Legacy(v) => &v.id, Self::Decoded(v) => &v.id } }
-    pub(crate) fn kind(&self) -> ViewKindRef<'_> { match self { Self::Legacy(v) => match &v.kind {
+    pub(crate) fn kind(&self) -> ViewKindRef<'a> { match self { Self::Legacy(v) => match &v.kind {
         ViewKind::List { entity, rows, columns, controls, selection } => ViewKindRef::List { entity, rows, columns: ColumnSlice::Legacy(columns), controls: ControlSlice::Legacy(controls), selection: selection.as_ref().map(SelectionRef::Legacy) },
         ViewKind::Detail { entity, record, columns } => ViewKindRef::Detail { entity, record, columns: ColumnSlice::Legacy(columns) },
         ViewKind::Form { action, fields, defaults } => ViewKindRef::Form { action, fields: FormInputSlice::Legacy(fields), defaults: DataValueMapRef::Legacy(defaults) },
@@ -1845,8 +1852,8 @@ impl ViewRef<'_> {
         fallible_app_decode::DecodedViewKind::Detail { entity, record, columns } => ViewKindRef::Detail { entity, record, columns: ColumnSlice::Decoded(columns) },
         fallible_app_decode::DecodedViewKind::Form { action, fields, defaults } => ViewKindRef::Form { action, fields: FormInputSlice::Decoded(fields), defaults: DataValueMapRef::Fallible(defaults) },
     } } }
-    pub(crate) fn actions(&self) -> BindingSlice<'_> { match self { Self::Legacy(v) => BindingSlice::Legacy(&v.actions), Self::Decoded(v) => BindingSlice::Decoded(&v.actions) } }
-    pub(crate) fn keys(&self) -> KeySlice<'_> { match self { Self::Legacy(v) => KeySlice::Legacy(&v.keys), Self::Decoded(v) => KeySlice::Decoded(&v.keys) } }
+    pub(crate) fn actions(&self) -> BindingSlice<'a> { match self { Self::Legacy(v) => BindingSlice::Legacy(&v.actions), Self::Decoded(v) => BindingSlice::Decoded(&v.actions) } }
+    pub(crate) fn keys(&self) -> KeySlice<'a> { match self { Self::Legacy(v) => KeySlice::Legacy(&v.keys), Self::Decoded(v) => KeySlice::Decoded(&v.keys) } }
 }
 pub(crate) enum StringMapRef<'a, V> {
     Legacy(&'a BTreeMap<String, V>),

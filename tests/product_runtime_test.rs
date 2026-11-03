@@ -141,10 +141,14 @@ struct DecodedFixture {
 }
 impl DecodedFixture {
     fn new(source: serde_json::Value, generation: Option<u64>) -> Self {
+        Self::with_focus(source, generation, None)
+    }
+    fn with_focus(source: serde_json::Value, generation: Option<u64>, focused_record: Option<RecordRef>) -> Self {
         let capture = fixture::capture(source);
         let mut data = seed(&capture);
         if let Some(generation) = generation { data.generation = generation; }
-        let session = SessionState::initial(&capture.program).unwrap();
+        let mut session = SessionState::initial(&capture.program).unwrap();
+        session.focused_record = focused_record;
         let mut allocations = product_alloc::AllocationContext::new();
         let program = decode_captured_program_fallible(
             product_json::parse_json_bytes(&serde_json::to_vec(&capture).unwrap(), &mut allocations).unwrap(),
@@ -165,6 +169,30 @@ impl DecodedFixture {
             RuntimeLimits::default(), &mut product_alloc::AllocationContext::new()).unwrap()
     }
 }
+fn assert_decoded_legacy_parity(runtime: &LocalRuntime, legacy: &mut ProductRun, decoded: &mut DecodedProductRun<'_>, input: SemanticInput, id: &str) {
+    let left = runtime.apply(legacy, &input, id);
+    let right = runtime.apply_decoded(decoded, &input, id, &mut product_alloc::AllocationContext::new());
+    match (left, right) {
+        (Ok(left), Ok(right)) => {
+            assert_eq!(left.outcome, right.outcome, "{id}");
+            assert_eq!(left.before_data, right.before_data, "{id}");
+            assert_eq!(left.after_data, right.after_data, "{id}");
+            assert_eq!(left.before_session, right.before_session, "{id}");
+            assert_eq!(left.after_session, right.after_session, "{id}");
+            assert_eq!(left.outputs, right.outputs, "{id}");
+        }
+        (Err(left), Err(right)) => {
+            assert_eq!(format!("{left:?}"), format!("{right:?}"), "{id}");
+            assert_eq!(legacy.trace().last().unwrap().outcome, decoded.trace().last().unwrap().outcome, "{id}");
+        }
+        (left, right) => panic!("legacy/decoded result differs for {id}: {left:?} / {right:?}"),
+    }
+    assert_eq!(serde_json::to_value(runtime.data(legacy)).unwrap(), serde_json::to_value(decoded.data()).unwrap(), "data after {id}");
+    assert_eq!(serde_json::to_value(runtime.session(legacy)).unwrap(), serde_json::to_value(decoded.session()).unwrap(), "session after {id}");
+    assert_eq!(serde_json::to_value(runtime.emitted_artifacts(legacy).unwrap()).unwrap(), serde_json::to_value(decoded.artifacts()).unwrap(), "artifacts after {id}");
+    assert_eq!(legacy.trace().len(), decoded.trace().len(), "trace after {id}");
+}
+
 fn decoded_ready_run<'a>(owners: &'a DecodedFixture, runtime: &LocalRuntime) -> DecodedProductRun<'a> {
     let mut run = owners.start(runtime);
     let mut allocations = product_alloc::AllocationContext::new();
@@ -299,25 +327,167 @@ fn decoded_product_run_observe_and_refusal_do_not_publish_action_history() {
 }
 
 #[test]
-fn decoded_product_run_rejects_unsupported_input_without_publication() {
+fn decoded_product_run_routes_every_semantic_input_with_legacy_parity() {
+    let program = capture(organizer());
     let owners = DecodedFixture::new(organizer(), None);
     let runtime = LocalRuntime::default();
+    let mut decoded = owners.start(&runtime);
+    let mut legacy = runtime.start(&program, &seed(&program), &SessionState::initial(&program.program).unwrap(),
+        20_000, 42, RuntimeLimits::default()).unwrap();
+
+    assert_decoded_legacy_parity(&runtime, &mut legacy, &mut decoded, SemanticInput::Navigate { view: "new_person".into() }, "navigate-form");
+    assert_decoded_legacy_parity(&runtime, &mut legacy, &mut decoded, SemanticInput::Submit { view: "new_person".into(), arguments: args(&[("name", string("Ada")), ("area", string("north"))]) }, "submit-person");
+    assert_decoded_legacy_parity(&runtime, &mut legacy, &mut decoded, SemanticInput::Navigate { view: "people".into() }, "navigate-list");
+    let person = runtime.data(&legacy).records[0].id.clone();
+    assert_decoded_legacy_parity(&runtime, &mut legacy, &mut decoded, SemanticInput::Control { view: "people".into(), control: "search_input".into(), value: string("Ada") }, "control-search");
+    assert_decoded_legacy_parity(&runtime, &mut legacy, &mut decoded, SemanticInput::Control { view: "people".into(), control: "pick".into(), value: DataValue::List {
+        item_type: Type::reference("person"), items: vec![reference("person", &person)],
+    } }, "control-selection");
+    assert_decoded_legacy_parity(&runtime, &mut legacy, &mut decoded, SemanticInput::Activate { view: "people".into(), binding: "export_button".into(), row: None }, "activate-export");
+    assert_decoded_legacy_parity(&runtime, &mut legacy, &mut decoded, SemanticInput::Observe { point: "after-export".into() }, "observe-output");
+    assert_decoded_legacy_parity(&runtime, &mut legacy, &mut decoded, SemanticInput::AdvanceClock { days: 1 }, "advance-clock");
+    assert_decoded_legacy_parity(&runtime, &mut legacy, &mut decoded, add("Grace"), "invoke-add");
+    assert_eq!(decoded.observations().len(), 1);
+    assert_eq!(decoded.observations()[0].outputs().len(), 1);
+}
+
+#[test]
+fn decoded_product_run_action_inputs_reject_invalid_context_and_retry_atomically() {
+    let mut source = organizer();
+    source["actions"].as_array_mut().unwrap().push(json!({
+        "id":"handle_search","label":"Search handler","parameters":{"value":{"kind":"text"}},"guards":[],
+        "steps":[{"kind":"for_each","items":query("person"),"binding":"person","steps":[{"kind":"update","record":var("person"),"values":{"area":var("value")}}]}],
+        "ensures":[{"kind":"not","value":{"kind":"equal","left":var("value"),"right":text("reject")}}]
+    }));
+    source["views"][0]["kind"]["controls"][0]["on_change"] = json!("handle_search");
+    source["views"][0]["actions"].as_array_mut().unwrap().extend([
+        json!({"id":"row_collect","label":"Collect row","placement":"row","action":"collect","arguments":{},"enabled":yes()}),
+        json!({"id":"row_disabled","label":"Disabled row","placement":"row","action":"collect","arguments":{},"enabled":{"kind":"literal","value_type":{"kind":"boolean"},"value":{"kind":"boolean","value":false}}}),
+    ]);
+    let program = capture(source.clone());
+    let owners = DecodedFixture::new(source, None);
+    let runtime = LocalRuntime::default();
+    let mut decoded = owners.start(&runtime);
+    let mut legacy = runtime.start(&program, &seed(&program), &SessionState::initial(&program.program).unwrap(),
+        20_000, 42, RuntimeLimits::default()).unwrap();
+    assert_decoded_legacy_parity(&runtime, &mut legacy, &mut decoded, add("Ada"), "add-ada");
+    let before_data = serde_json::to_value(decoded.data()).unwrap();
+    let before_session = serde_json::to_value(decoded.session()).unwrap();
+    assert_decoded_legacy_parity(&runtime, &mut legacy, &mut decoded, SemanticInput::Control { view: "people".into(), control: "search_input".into(), value: string("reject") }, "retry-control");
+    assert_eq!(decoded.trace().last().unwrap().outcome, StepOutcome::Rejected);
+    assert_eq!(serde_json::to_value(decoded.data()).unwrap(), before_data);
+    assert_eq!(serde_json::to_value(decoded.session()).unwrap(), before_session);
+    assert_decoded_legacy_parity(&runtime, &mut legacy, &mut decoded, SemanticInput::Control { view: "people".into(), control: "search_input".into(), value: string("north") }, "retry-control");
+    assert_eq!(decoded.data().records()[0].values().get("area"), Some(&string("north")));
+    assert_decoded_legacy_parity(&runtime, &mut legacy, &mut decoded, SemanticInput::Submit {
+        view: "new_person".into(), arguments: args(&[("name", string("Grace")), ("area", string("north"))]),
+    }, "inactive-submit");
+    assert_eq!(decoded.trace().last().unwrap().outcome, StepOutcome::Rejected);
+    assert_decoded_legacy_parity(&runtime, &mut legacy, &mut decoded, SemanticInput::Submit {
+        view: "new_person".into(), arguments: args(&[]),
+    }, "inactive-submit-invalid-arguments");
+    assert_decoded_legacy_parity(&runtime, &mut legacy, &mut decoded, SemanticInput::Navigate { view: "new_person".into() }, "form-view");
+    assert_decoded_legacy_parity(&runtime, &mut legacy, &mut decoded, SemanticInput::Control { view: "people".into(), control: "search_input".into(), value: string("stale") }, "inactive-control");
+    assert_eq!(decoded.trace().last().unwrap().outcome, StepOutcome::Rejected);
+    assert_decoded_legacy_parity(&runtime, &mut legacy, &mut decoded, SemanticInput::Control {
+        view: "people".into(), control: "search_input".into(), value: DataValue::Integer { value: 42 },
+    }, "inactive-control-invalid-value");
+    let row = RecordRef { entity: "person".into(), record: decoded.data().records()[0].id().into() };
+    assert_decoded_legacy_parity(&runtime, &mut legacy, &mut decoded, SemanticInput::Activate {
+        view: "people".into(), binding: "row_collect".into(), row: Some(row.clone()),
+    }, "inactive-activate");
+    assert_eq!(decoded.trace().last().unwrap().outcome, StepOutcome::Rejected);
+    assert_decoded_legacy_parity(&runtime, &mut legacy, &mut decoded, SemanticInput::Activate {
+        view: "people".into(), binding: "row_collect".into(),
+        row: Some(RecordRef { entity: "other_entity".into(), record: row.record.clone() }),
+    }, "inactive-activate-invalid-row");
+    assert_decoded_legacy_parity(&runtime, &mut legacy, &mut decoded, SemanticInput::Navigate { view: "people".into() }, "list-view");
+    assert_decoded_legacy_parity(&runtime, &mut legacy, &mut decoded, SemanticInput::Control { view: "people".into(), control: "pick".into(), value: DataValue::List {
+        item_type: Type::reference("person"), items: vec![reference("person", "missing")],
+    } }, "missing-selection");
+    assert_eq!(decoded.trace().last().unwrap().outcome, StepOutcome::Rejected);
+    assert_decoded_legacy_parity(&runtime, &mut legacy, &mut decoded, SemanticInput::Control { view: "people".into(), control: "pick".into(), value: DataValue::List {
+        item_type: Type::reference("person"), items: vec![reference("person", &row.record), reference("person", &row.record)],
+    } }, "duplicate-selection");
+    assert_eq!(decoded.trace().last().unwrap().outcome, StepOutcome::Rejected);
+    assert_decoded_legacy_parity(&runtime, &mut legacy, &mut decoded, SemanticInput::Activate { view: "people".into(), binding: "row_collect".into(), row: Some(row.clone()) }, "visible-row");
+    assert_eq!(decoded.trace().last().unwrap().outcome, StepOutcome::Applied);
+    assert_decoded_legacy_parity(&runtime, &mut legacy, &mut decoded, SemanticInput::Activate { view: "people".into(), binding: "row_disabled".into(), row: Some(row.clone()) }, "disabled-row");
+    assert_eq!(decoded.trace().last().unwrap().outcome, StepOutcome::Rejected);
+    assert_decoded_legacy_parity(&runtime, &mut legacy, &mut decoded, SemanticInput::Activate { view: "people".into(), binding: "row_collect".into(), row: Some(RecordRef { entity: "person".into(), record: "missing".into() }) }, "invisible-row");
+    assert_eq!(decoded.trace().last().unwrap().outcome, StepOutcome::Rejected);
+}
+
+#[test]
+fn decoded_navigate_clears_focus_and_clock_rejection_rolls_back() {
+    let owners = DecodedFixture::with_focus(organizer(), None, Some(RecordRef { entity: "person".into(), record: "p1".into() }));
+    let runtime = LocalRuntime::default();
     let mut run = owners.start(&runtime);
-    let before_data = run.data().identity_with(&mut product_alloc::AllocationContext::new()).unwrap();
-    let before_session = run.session().identity_with(&mut product_alloc::AllocationContext::new()).unwrap();
+    runtime.apply_decoded(&mut run, &SemanticInput::Navigate { view: "new_person".into() }, "navigate-focus",
+        &mut product_alloc::AllocationContext::new()).unwrap();
+    assert!(run.session().focused_record().is_none());
+
+    let mut source = organizer();
+    source["entities"][0]["constraints"] = json!([{
+        "kind":"less","left":{"kind":"today"},"right":{"kind":"literal","value_type":{"kind":"date"},"value":{"kind":"date","days":20002}}
+    }]);
+    let constrained = DecodedFixture::new(source, None);
+    let mut run = constrained.start(&runtime);
+    runtime.apply_decoded(&mut run, &add("Ada"), "clock-seed", &mut product_alloc::AllocationContext::new()).unwrap();
+    runtime.apply_decoded(&mut run, &SemanticInput::AdvanceClock { days: 1 }, "clock-edge",
+        &mut product_alloc::AllocationContext::new()).unwrap();
+    let before_day = run.clock_day();
     let before_trace = run.trace().len();
-    let error = runtime.apply_decoded(
-        &mut run,
-        &SemanticInput::Navigate { view: "people".into() },
-        "decoded-unsupported-navigate",
-        &mut product_alloc::AllocationContext::new(),
-    ).unwrap_err();
-    assert!(matches!(error, AdapterError::Unsupported(_)));
-    assert_eq!(run.data().identity_with(&mut product_alloc::AllocationContext::new()).unwrap(), before_data);
-    assert_eq!(run.session().identity_with(&mut product_alloc::AllocationContext::new()).unwrap(), before_session);
-    assert_eq!(run.trace().len(), before_trace);
-    assert!(run.data().events().is_empty());
-    assert!(run.observations().is_empty());
+    let rejected = runtime.apply_decoded(&mut run, &SemanticInput::AdvanceClock { days: 1 }, "clock-rejected",
+        &mut product_alloc::AllocationContext::new()).unwrap_err();
+    assert!(matches!(rejected, AdapterError::Invalid(_)));
+    assert_eq!(run.clock_day(), before_day);
+    assert_eq!(run.trace().len(), before_trace + 1);
+    assert_eq!(run.trace().last().unwrap().outcome, StepOutcome::Rejected);
+
+    let mut maximum_day = runtime.start_decoded(&constrained.program, &constrained.data, &constrained.session,
+        2_932_896, 42, RuntimeLimits::default(), &mut product_alloc::AllocationContext::new()).unwrap();
+    let range_error = runtime.apply_decoded(&mut maximum_day, &SemanticInput::AdvanceClock { days: 1 }, "clock-range",
+        &mut product_alloc::AllocationContext::new()).unwrap_err();
+    assert!(matches!(range_error, AdapterError::Invalid(_)));
+    assert_eq!(maximum_day.clock_day(), 2_932_896);
+}
+
+#[test]
+fn decoded_publication_allocation_refusal_and_cancellation_allow_retry() {
+    let runtime = LocalRuntime::default();
+    let owners = DecodedFixture::new(organizer(), None);
+    let input = SemanticInput::Control { view: "people".into(), control: "search_input".into(), value: string("Ada") };
+    let mut probe = owners.start(&runtime);
+    let mut probe_allocations = product_alloc::AllocationContext::new();
+    runtime.apply_decoded(&mut probe, &input, "control-allocate", &mut probe_allocations).unwrap();
+    let growths = probe_allocations.growth_requests();
+    assert!(growths > 0);
+    for ordinal in 1..=growths {
+        let mut run = owners.start(&runtime);
+        let before_data = run.data().identity_with(&mut product_alloc::AllocationContext::new()).unwrap();
+        let before_session = run.session().identity_with(&mut product_alloc::AllocationContext::new()).unwrap();
+        let failure = runtime.apply_decoded(&mut run, &input, "control-allocate",
+            &mut product_alloc::AllocationContext::fail_nth_growth(NonZeroUsize::new(ordinal).unwrap(), false));
+        assert!(matches!(failure, Err(AdapterError::Allocation(_))), "allocation growth {ordinal}");
+        assert_eq!(run.data().identity_with(&mut product_alloc::AllocationContext::new()).unwrap(), before_data);
+        assert_eq!(run.session().identity_with(&mut product_alloc::AllocationContext::new()).unwrap(), before_session);
+        assert!(run.trace().is_empty());
+        runtime.apply_decoded(&mut run, &input, "control-allocate", &mut product_alloc::AllocationContext::new()).unwrap();
+        assert_eq!(run.session().values().get("search"), Some(&string("Ada")));
+    }
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancellable_runtime = LocalRuntime::with_cancellation(cancelled.clone());
+    let mut run = owners.start(&cancellable_runtime);
+    cancelled.store(true, Ordering::SeqCst);
+    let before = run.session().identity_with(&mut product_alloc::AllocationContext::new()).unwrap();
+    let failure = cancellable_runtime.apply_decoded(&mut run, &input, "control-cancel", &mut product_alloc::AllocationContext::new());
+    assert_eq!(failure.unwrap_err(), AdapterError::Cancelled);
+    assert_eq!(run.session().identity_with(&mut product_alloc::AllocationContext::new()).unwrap(), before);
+    assert_eq!(run.trace().last().unwrap().outcome, StepOutcome::Failed);
+    cancelled.store(false, Ordering::SeqCst);
+    cancellable_runtime.apply_decoded(&mut run, &input, "control-cancel", &mut product_alloc::AllocationContext::new()).unwrap();
 }
 
 #[test]

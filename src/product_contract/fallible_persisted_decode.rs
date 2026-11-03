@@ -83,6 +83,15 @@ impl DecodedSessionState {
     pub(super) fn view(&self) -> &str { &self.view }
     pub(super) fn values(&self) -> &FallibleValues { &self.values }
     pub(super) fn focused_record(&self) -> Option<&RecordRef> { self.focused_record.as_ref() }
+    pub(super) fn try_set_view_and_clear_focus(
+        &mut self,
+        view: &str,
+        cx: &mut AllocationContext,
+    ) -> std::result::Result<(), product_alloc::AllocationFailure> {
+        self.view = product_alloc::try_copy_str(view, cx, AllocationSite::String)?;
+        self.focused_record = None;
+        Ok(())
+    }
 }
 
 pub(super) fn decode_record(value: Value, cx: &mut AllocationContext) -> Result<DecodedRecord, ValueDecodeError> {

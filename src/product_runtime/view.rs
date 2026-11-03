@@ -221,6 +221,24 @@ struct DecodedViewObservation {
     form_values: FallibleValues,
 }
 
+pub(super) fn decoded_binding_enabled(
+    program: &FallibleDecodedCapturedProgram,
+    data: &FallibleDecodedDataSnapshot,
+    session: &FallibleDecodedSessionState,
+    day: i32,
+    binding: &str,
+    row: Option<&RecordRef>,
+    meter: &mut Meter,
+) -> Result<bool> {
+    let view = render_decoded(program, data, session, day, meter)?;
+    match row {
+        Some(row) => view.rows.iter().find(|presented| &presented.record == row)
+            .map(|presented| presented.enabled_actions.0.contains(binding))
+            .ok_or_else(|| invalid("row is not visible")),
+        None => Ok(view.enabled_actions.0.contains(binding)),
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct DecodedPresentedRow {
     record: RecordRef,

@@ -75,6 +75,7 @@ impl BackupWire for super::Payload {}
 impl BackupWire for super::Envelope {}
 impl BackupWire for crate::product_contract::FallibleDecodedDataSnapshot {}
 impl BackupWire for crate::product_contract::FallibleDecodedSessionState {}
+impl BackupWire for crate::product_contract::DataValue {}
 impl BackupWire for crate::product_contract::FallibleEntitySchemaIdentity<'_> {}
 impl BackupWire for crate::product_contract::FallibleBusinessRecordsIdentity<'_> {}
 impl BackupWire for crate::product_contract::FallibleBusinessEventsIdentity<'_> {}

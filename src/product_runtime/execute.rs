@@ -1579,7 +1579,17 @@ impl Transaction<'_> {
                             IdentityDomain::Input,
                             &(self.seed, self.operation, entity, self.created),
                         )?;
-                        let id = format!("record-{}", &digest.as_str()[..32]);
+                        let mut id = product_alloc::try_copy_str(
+                            "record-",
+                            &mut meter.allocations,
+                            product_alloc::AllocationSite::String,
+                        ).map_err(AdapterError::Allocation)?;
+                        product_alloc::try_append_str(
+                            &mut id,
+                            &digest.as_str()[..32],
+                            &mut meter.allocations,
+                            product_alloc::AllocationSite::String,
+                        ).map_err(AdapterError::Allocation)?;
                         if data.records().iter().any(|row| row.entity() == entity && row.id() == id) {
                             return Err(invalid("generated record identity collision"));
                         }
@@ -1985,7 +1995,7 @@ pub(super) fn action_decoded(
     session: &mut FallibleDecodedSessionState,
     day: i32,
     id: &str,
-    arguments: &Values,
+    arguments: &impl StringValueMap<DataValue>,
     operation: &str,
     seed: u64,
     meter: &mut Meter,
@@ -2002,7 +2012,7 @@ pub(super) fn action_decoded(
     }
     let mut env = ManagedEnv::new();
     let data_view = DataSnapshotView::from(&*data);
-    for (argument, value) in arguments {
+    for (argument, value) in arguments.iter() {
         let typ = parameters.get(argument)
             .ok_or_else(|| invalid("unknown action argument"))?;
         meter.value(value)?;
@@ -2042,6 +2052,214 @@ pub(super) fn action_decoded(
     let outputs = decoded_output_digests(&meter.decoded_outputs, &mut meter.allocations)?;
     finalize_decoded_action(data, session, day, previous, id, operation, program.program_digest(), &outputs, meter)?;
     constraints_decoded(program, data, session, day, meter)
+}
+
+fn decoded_view<'a>(app: AppRef<'a>, id: &str) -> Result<ViewRef<'a>> {
+    (0..app.view_count()).filter_map(|index| app.view(index))
+        .find(|view| view.id() == id)
+        .ok_or_else(|| invalid("unknown input view"))
+}
+
+fn validate_decoded_arguments(
+    app: AppRef<'_>,
+    action_id: &str,
+    values: &impl StringValueMap<DataValue>,
+) -> Result<()> {
+    let action = app.action(action_id).ok_or_else(|| invalid("unknown action"))?;
+    let parameters = action.parameters();
+    if values.len() != parameters.len() {
+        return Err(invalid("input argument count mismatch"));
+    }
+    for (id, typ) in parameters.iter() {
+        let value = values.get(id).ok_or_else(|| invalid("missing input argument"))?;
+        validate_value(value, typ, 0).map_err(AdapterError::Invalid)?;
+    }
+    Ok(())
+}
+
+pub(super) fn input_action_decoded<'a>(input: &'a SemanticInput, app: AppRef<'a>) -> Option<&'a str> {
+    match input {
+        SemanticInput::Invoke { action, .. } => Some(action),
+        SemanticInput::Submit { view, .. } => match decoded_view(app, view).ok()?.kind() {
+            ViewKindRef::Form { action, .. } => Some(action),
+            _ => None,
+        },
+        SemanticInput::Control { view, control, .. } => {
+            let view = decoded_view(app, view).ok()?;
+            match view.kind() {
+                ViewKindRef::List { controls, selection, .. } => controls.iter()
+                    .find(|candidate| candidate.id() == control)
+                    .and_then(|candidate| candidate.on_change())
+                    .or_else(|| selection.filter(|candidate| candidate.id() == control).and_then(|candidate| candidate.on_change())),
+                _ => None,
+            }
+        }
+        SemanticInput::Activate { view, binding, .. } => decoded_view(app, view).ok()?
+            .actions().iter().find(|candidate| candidate.id() == binding).map(|candidate| candidate.action()),
+        SemanticInput::Navigate { .. } | SemanticInput::Observe { .. } | SemanticInput::AdvanceClock { .. } => None,
+    }
+}
+
+fn validate_input_decoded(input: &SemanticInput, app: AppRef<'_>) -> Result<()> {
+    match input {
+        SemanticInput::Invoke { action, arguments } => validate_decoded_arguments(app, action, arguments),
+        SemanticInput::Submit { view, arguments } => {
+            let view = decoded_view(app, view)?;
+            let ViewKindRef::Form { action, .. } = view.kind() else {
+                return Err(invalid("submit requires form view"));
+            };
+            validate_decoded_arguments(app, action, arguments)
+        }
+        SemanticInput::Control { view, control, value } => {
+            let view = decoded_view(app, view)?;
+            let ViewKindRef::List { controls, selection, .. } = view.kind() else {
+                return Err(invalid("control requires list view"));
+            };
+            let state = controls.iter().find(|candidate| candidate.id() == control)
+                .map(|candidate| candidate.state())
+                .or_else(|| selection.filter(|candidate| candidate.id() == control).map(|candidate| candidate.state()))
+                .ok_or_else(|| invalid("unknown input control"))?;
+            let value_type = app.state_type(state).ok_or_else(|| failed("control state absent"))?;
+            validate_value(value, value_type, 0).map_err(AdapterError::Invalid)
+        }
+        SemanticInput::Activate { view, binding, row } => {
+            let view = decoded_view(app, view)?;
+            let action = view.actions().iter().find(|candidate| candidate.id() == binding)
+                .ok_or_else(|| invalid("unknown input action binding"))?;
+            if (action.placement() == ActionPlacement::Row) != row.is_some() {
+                return Err(invalid("action row context does not match placement"));
+            }
+            if let Some(row) = row {
+                if !valid_id(&row.record) { return Err(invalid("invalid identifier")); }
+                let entity = match view.kind() {
+                    ViewKindRef::List { entity, .. } | ViewKindRef::Detail { entity, .. } => entity,
+                    ViewKindRef::Form { .. } => return Err(invalid("form action cannot bind row")),
+                };
+                if row.entity != entity { return Err(invalid("input row belongs to another entity")); }
+            }
+            Ok(())
+        }
+        SemanticInput::Navigate { view } => { decoded_view(app, view)?; Ok(()) }
+        SemanticInput::AdvanceClock { days } => {
+            if *days > 3_652_058 { return Err(invalid("clock advance out of bounds")); }
+            Ok(())
+        }
+        SemanticInput::Observe { point } => if valid_id(point) { Ok(()) } else { Err(invalid("invalid identifier")) },
+    }
+}
+
+fn decoded_assignments(
+    app: AppRef<'_>,
+    data: &mut FallibleDecodedDataSnapshot,
+    session: &mut FallibleDecodedSessionState,
+    day: i32,
+    values: StringMapRef<'_, Expr>,
+    env: &dyn EnvAccess,
+    meter: &mut Meter,
+) -> Result<FallibleValues> {
+    let owners = KernelState::Decoded { data, session, day };
+    let mut result = FallibleValues::new();
+    for (id, expression) in values.iter() {
+        let value = evaluate_owner(app, &owners, expression, env, meter)?;
+        let id = product_alloc::try_copy_str(id, &mut meter.allocations, product_alloc::AllocationSite::String)
+            .map_err(AdapterError::Allocation)?;
+        let value = try_clone_data_value_with(&value, &mut meter.allocations).map_err(AdapterError::Allocation)?;
+        result.try_insert(id, value, &mut meter.allocations).map_err(AdapterError::Allocation)?;
+    }
+    Ok(result)
+}
+
+pub(super) fn input_decoded(
+    program: &FallibleDecodedCapturedProgram,
+    data: &mut FallibleDecodedDataSnapshot,
+    session: &mut FallibleDecodedSessionState,
+    day: &mut i32,
+    input: &SemanticInput,
+    operation: &str,
+    seed: u64,
+    meter: &mut Meter,
+) -> Result<()> {
+    let app = AppRef::from(program.app());
+    validate_input_decoded(input, app)?;
+    match input {
+        SemanticInput::Invoke { action, arguments } =>
+            action_decoded(program, data, session, *day, action, arguments, operation, seed, meter),
+        SemanticInput::Submit { view, arguments } => {
+            if session.view() != view { return Err(invalid("form is not the active view")); }
+            let form = decoded_view(app, view)?;
+            let ViewKindRef::Form { action, .. } = form.kind() else { return Err(invalid("not a form")); };
+            action_decoded(program, data, session, *day, action, arguments, operation, seed, meter)
+        }
+        SemanticInput::Control { view, control, value } => {
+            if session.view() != view { return Err(invalid("control is not in the active view")); }
+            meter.value(value)?;
+            let data_view = DataSnapshotView::from(&*data);
+            check_references_decoded(value, data_view)?;
+            let definition = decoded_view(app, view)?;
+            let ViewKindRef::List { controls, selection, .. } = definition.kind() else {
+                return Err(invalid("not a list control"));
+            };
+            let (state, on_change) = if let Some(candidate) = controls.iter().find(|candidate| candidate.id() == control) {
+                (candidate.state(), candidate.on_change())
+            } else {
+                let selection = selection.filter(|candidate| candidate.id() == control)
+                    .ok_or_else(|| invalid("unknown control"))?;
+                let (_, items) = eval::list(try_clone_data_value_with(value, &mut meter.allocations)
+                    .map_err(AdapterError::Allocation)?)?;
+                let mut unique = crate::product_alloc::ordered::OrderedSet::new();
+                for item in &items {
+                    let key = crate::product_backup::fallible_codec::canonical_bytes(item, &mut meter.allocations)
+                        .map_err(codec_adapter_error)?;
+                    if !unique.try_insert(key, &mut meter.allocations).map_err(AdapterError::Allocation)? {
+                        return Err(invalid("duplicate selected record"));
+                    }
+                }
+                (selection.state(), selection.on_change())
+            };
+            meter.write()?;
+            let stored_value = try_clone_data_value_with(value, &mut meter.allocations).map_err(AdapterError::Allocation)?;
+            session.values_mut().try_set(state, stored_value, &mut meter.allocations).map_err(AdapterError::Allocation)?;
+            if let Some(action) = on_change {
+                let mut arguments = FallibleValues::new();
+                let key = product_alloc::try_copy_str("value", &mut meter.allocations, product_alloc::AllocationSite::String)
+                    .map_err(AdapterError::Allocation)?;
+                let value = try_clone_data_value_with(value, &mut meter.allocations).map_err(AdapterError::Allocation)?;
+                arguments.try_insert(key, value, &mut meter.allocations).map_err(AdapterError::Allocation)?;
+                action_decoded(program, data, session, *day, action, &arguments, operation, seed, meter)?;
+            }
+            program.validate_session_with(session, &mut meter.allocations).map_err(app_validation_error)
+        }
+        SemanticInput::Activate { view, binding, row } => {
+            if session.view() != view { return Err(invalid("binding is not in the active view")); }
+            let definition = decoded_view(app, view)?;
+            let binding_ref = definition.actions().iter().find(|candidate| candidate.id() == binding)
+                .ok_or_else(|| invalid("unknown binding"))?;
+            let row_env = if let Some(row) = row {
+                if !view::decoded_binding_enabled(program, data, session, *day, binding, Some(row), meter)? {
+                    return Err(invalid("row action is disabled"));
+                }
+                let mut env = ManagedEnv::new();
+                EnvMut::try_bind_reference(&mut env, "row", &row.entity, &row.entity, &row.record, meter)?;
+                env
+            } else {
+                if !view::decoded_binding_enabled(program, data, session, *day, binding, None, meter)? {
+                    return Err(invalid("action is disabled"));
+                }
+                ManagedEnv::new()
+            };
+            let arguments = decoded_assignments(app, data, session, *day, binding_ref.arguments(), &row_env, meter)?;
+            action_decoded(program, data, session, *day, binding_ref.action(), &arguments, operation, seed, meter)
+        }
+        SemanticInput::Navigate { view } => session.try_set_view_and_clear_focus(view, &mut meter.allocations)
+            .map_err(AdapterError::Allocation),
+        SemanticInput::AdvanceClock { days } => {
+            let next = i64::from(*day) + i64::from(*days);
+            *day = i32::try_from(next).map_err(|_| failed("date overflow"))?;
+            validate_day(*day).map_err(AdapterError::Invalid)?;
+            constraints_decoded(program, data, session, *day, meter)
+        }
+        SemanticInput::Observe { .. } => Ok(()),
+    }
 }
 
 pub(super) fn input(

@@ -515,9 +515,8 @@ impl LocalRuntime {
         })
     }
 
-    /// Apply the bounded decoded ProductRun slice. Invoke shares the statement
-    /// transaction and finalization kernel with the legacy runtime. Observe is
-    /// retained for cold reopen; other semantic inputs are explicitly deferred.
+    /// Apply semantic inputs while keeping persisted data and session in their
+    /// fallible decoded owners for the full transaction.
     pub(crate) fn apply_decoded(
         &self,
         run: &mut DecodedProductRun<'_>,
@@ -550,30 +549,20 @@ impl LocalRuntime {
 
         let before_data = run.data.identity_with(allocations).map_err(app_adapter_error)?;
         let before_session = run.session.identity_with(allocations).map_err(codec_adapter_error)?;
-        let (action, mut next_data, mut next_session, mut next_observation) = match input {
-            SemanticInput::Invoke { action, .. } => (
-                Some(action.as_str()),
-                run.data.try_clone_with(allocations).map_err(|error| match error {
-                    FallibleDataSnapshotCloneError::Allocation(failure) => AdapterError::Allocation(failure),
-                    FallibleDataSnapshotCloneError::Invariant => failed("decoded action snapshot copy invariant"),
-                })?,
-                run.session.try_clone_with(allocations).map_err(app_adapter_error)?,
-                None,
-            ),
-            SemanticInput::Observe { point } => {
-                if run.observations.iter().any(|observation| observation.point() == point) {
-                    return Err(invalid("observation point already used"));
-                }
-                (None,
-                    run.data.try_clone_with(allocations).map_err(|error| match error {
-                        FallibleDataSnapshotCloneError::Allocation(failure) => AdapterError::Allocation(failure),
-                        FallibleDataSnapshotCloneError::Invariant => failed("decoded observation snapshot copy invariant"),
-                    })?,
-                    run.session.try_clone_with(allocations).map_err(app_adapter_error)?,
-                    None)
+        if let SemanticInput::Observe { point } = input {
+            if run.observations.iter().any(|observation| observation.point() == point) {
+                return Err(invalid("observation point already used"));
             }
-            _ => return Err(AdapterError::Unsupported("decoded ProductRun input is not routed yet".into())),
-        };
+        }
+        let app = AppRef::from(run.program.app());
+        let action = execute::input_action_decoded(input, app);
+        let mut next_data = run.data.try_clone_with(allocations).map_err(|error| match error {
+            FallibleDataSnapshotCloneError::Allocation(failure) => AdapterError::Allocation(failure),
+            FallibleDataSnapshotCloneError::Invariant => failed("decoded input snapshot copy invariant"),
+        })?;
+        let mut next_session = run.session.try_clone_with(allocations).map_err(app_adapter_error)?;
+        let mut next_day = run.day;
+        let mut next_observation = None;
         let owned_allocations = std::mem::replace(allocations, product_alloc::AllocationContext::new());
         let mut meter = Meter::with_allocations(run.limits.clone(), run.fuel, self.cancelled.clone(), owned_allocations);
         meter.decoded_output_base_count = run.outputs.len();
@@ -582,17 +571,21 @@ impl LocalRuntime {
         let result = (|| {
             meter.tick(1)?;
             match input {
-                SemanticInput::Invoke { action, arguments } => execute::action_decoded(
-                    run.program, &mut next_data, &mut next_session, run.day,
-                    action, arguments, operation_id, run.seed, &mut meter,
-                )?,
                 SemanticInput::Observe { point } => {
                     if !valid_id(point) { return Err(invalid("invalid observation point")); }
                     next_observation = Some(view::observe_decoded_with_meter(
                         run.program, &next_data, &next_session, run.day, point, &run.outputs, &mut meter,
                     )?);
                 }
-                _ => unreachable!("decoded inputs were bounded above"),
+                SemanticInput::Invoke { .. }
+                | SemanticInput::Control { .. }
+                | SemanticInput::Activate { .. }
+                | SemanticInput::Submit { .. }
+                | SemanticInput::Navigate { .. }
+                | SemanticInput::AdvanceClock { .. } => execute::input_decoded(
+                    run.program, &mut next_data, &mut next_session, &mut next_day,
+                    input, operation_id, run.seed, &mut meter,
+                )?,
             }
             meter.tick(1)?;
             Ok(())
@@ -642,6 +635,7 @@ impl LocalRuntime {
         if result.is_ok() {
             run.data = next_data;
             run.session = next_session;
+            run.day = next_day;
             if let Some(observation) = next_observation {
                 run.observations.push(observation);
             }
