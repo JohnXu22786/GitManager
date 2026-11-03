@@ -78,6 +78,7 @@ impl BackupWire for crate::product_contract::FallibleDecodedSessionState {}
 impl BackupWire for crate::product_contract::FallibleEntitySchemaIdentity<'_> {}
 impl BackupWire for crate::product_contract::FallibleBusinessRecordsIdentity<'_> {}
 impl BackupWire for crate::product_contract::FallibleBusinessEventsIdentity<'_> {}
+impl BackupWire for crate::product_contract::FallibleActionEventIdentity<'_> {}
 impl BackupWire for crate::product_contract::FallibleDecodedDecisionGraph {}
 impl BackupWire for crate::product_store::fallible_project_snapshot_decode::DecodedProjectSnapshot {}
 impl BackupWire for crate::product_contract::fallible_app_decode::DecodedAppDefinition {}

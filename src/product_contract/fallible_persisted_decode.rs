@@ -69,6 +69,7 @@ impl DecodedBusinessEvent {
     pub(crate) fn day(&self) -> i32 { self.day }
     pub(crate) fn program(&self) -> &Digest { &self.program }
     pub(crate) fn changes(&self) -> &[DecodedRecordChange] { &self.changes }
+    pub(crate) fn outputs(&self) -> &[Digest] { &self.outputs }
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]

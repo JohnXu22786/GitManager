@@ -163,6 +163,72 @@ impl KernelState<'_> {
             Self::Decoded { session, .. } => set_state_value(SessionOwner::Fallible(session), id, value, meter),
         }
     }
+    fn finalize_action(
+        &mut self,
+        previous: DataSnapshotView<'_>,
+        action: &str,
+        operation: &str,
+        program: &Digest,
+        outputs: &[Digest],
+        meter: &mut Meter,
+    ) -> Result<()> {
+        match self {
+            Self::Legacy(state) => {
+                let generation = next_generation(state.data.generation)?;
+                let mut changes = Vec::new();
+                for row in &state.data.records {
+                    meter.tick(previous.record_count() as u64 + 1)?;
+                    let before = previous.record(&row.entity, &row.id);
+                    if before.is_some_and(|before| legacy_record_matches(before, row)) {
+                        continue;
+                    }
+                    let before = match before {
+                        None => None,
+                        Some(before) => match before.values() {
+                            DataValuesView::Legacy(values) => Some(values.clone()),
+                            DataValuesView::Fallible(_) => return Err(failed("history owner mismatch")),
+                        },
+                    };
+                    changes.push(RecordChange {
+                        entity: row.entity.clone(),
+                        record: row.id.clone(),
+                        before,
+                        after: row.values.clone(),
+                        archived: row.archived,
+                    });
+                }
+                let event_id = canonical_digest(IdentityDomain::Input, &(operation, program))?;
+                state.data.generation = generation;
+                state.data.events.push(BusinessEvent {
+                    id: format!("event-{}", &event_id.as_str()[..32]),
+                    sequence: generation,
+                    operation_id: operation.into(),
+                    action: action.into(),
+                    day: state.day,
+                    program: program.clone(),
+                    changes,
+                    outputs: outputs.to_vec(),
+                });
+                Ok(())
+            }
+            Self::Decoded { data, day, .. } => {
+                let generation = next_generation(data.generation())?;
+                let mut candidate = data.try_clone_with(&mut meter.allocations).map_err(|error| match error {
+                    FallibleDataSnapshotCloneError::Allocation(failure) => AdapterError::Allocation(failure),
+                    FallibleDataSnapshotCloneError::Invariant => failed("decoded action snapshot copy invariant"),
+                })?;
+                for _ in 0..candidate.record_count() {
+                    meter.tick(previous.record_count() as u64 + 1)?;
+                }
+                candidate.try_append_action_event(
+                    previous, generation, operation, action, *day, program, outputs,
+                    &mut meter.allocations,
+                ).map_err(app_adapter_error)?;
+                **data = candidate;
+                Ok(())
+            }
+        }
+    }
 }
 
 fn set_state_value(
@@ -224,11 +290,43 @@ fn collection_value(
     Ok(DataValue::List { item_type, items: previous })
 }
 
-fn advance_generation(data: &mut DataSnapshot) -> Result<u64> {
-    let next = data.generation.checked_add(1)
-        .ok_or_else(|| failed("data generation overflow"))?;
-    data.generation = next;
-    Ok(next)
+fn next_generation(generation: u64) -> Result<u64> {
+    generation.checked_add(1).ok_or_else(|| failed("data generation overflow"))
+}
+
+/// Shared decoded finalization entry point for the next ProductRun apply
+/// caller. Input records are already post-statement/postcondition owners; the
+/// function commits only generation and event history into the transaction's
+/// decoded data owner.
+pub(super) fn finalize_decoded_action(
+    data: &mut FallibleDecodedDataSnapshot,
+    session: &mut FallibleDecodedSessionState,
+    day: i32,
+    previous: DataSnapshotView<'_>,
+    action: &str,
+    operation: &str,
+    program: &Digest,
+    outputs: &[Digest],
+    meter: &mut Meter,
+) -> std::result::Result<(), AdapterError> {
+    KernelState::Decoded { data, session, day }
+        .finalize_action(previous, action, operation, program, outputs, meter)
+}
+
+fn legacy_record_matches(left: DataRecordView<'_>, right: &Record) -> bool {
+    left.entity() == right.entity
+        && left.id() == right.id
+        && left.revision() == right.revision
+        && left.created_program() == &right.created_program
+        && left.archived() == right.archived
+        && data_values_equal(left.values(), DataValuesView::Legacy(&right.values))
+}
+
+fn data_values_equal(left: DataValuesView<'_>, right: DataValuesView<'_>) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right.iter()).all(|((left_key, left_value), (right_key, right_value))| {
+            left_key == right_key && left_value == right_value
+        })
 }
 
 /// Shared record update/archive primitive for both persisted owner families.
@@ -293,14 +391,26 @@ pub(crate) fn decoded_shared_transaction_kernel_parity_and_atomicity(
         version: CONTRACT_VERSION,
         project_id: "project".into(),
         generation: 0,
-        schema: vec![],
+        schema: vec![EntityDefinition {
+            id: "job".into(), label: "Job".into(),
+            fields: vec![
+                FieldDefinition { id: "name".into(), label: "Name".into(), value_type: Type::Text },
+                FieldDefinition { id: "extra".into(), label: "Extra".into(), value_type: Type::Text },
+                FieldDefinition { id: "tags".into(), label: "Tags".into(), value_type: Type::list(Type::Text) },
+            ],
+            unique: vec![], constraints: vec![],
+        }],
         records: vec![Record {
             entity: "job".into(),
             id: "row-1".into(),
             revision: 1,
             created_program: program.clone(),
             archived: false,
-            values: Values::from([("name".into(), DataValue::Text { value: "old".into() })]),
+            values: Values::from([
+                ("name".into(), DataValue::Text { value: "old".into() }),
+                ("extra".into(), DataValue::Text { value: "".into() }),
+                ("tags".into(), DataValue::List { item_type: Type::Text, items: vec![] }),
+            ]),
         }],
         events: vec![],
     };
@@ -438,7 +548,11 @@ pub(crate) fn decoded_shared_transaction_kernel_parity_and_atomicity(
             ActionDefinition { id: "archive_created".into(), label: "Archive created".into(), parameters: BTreeMap::new(), guards: vec![], steps: archive_created.clone(), ensures: vec![] },
             ActionDefinition { id: "create_only".into(), label: "Create only".into(), parameters: BTreeMap::new(), guards: vec![], steps: vec![Statement::Create {
                 entity: "job".into(),
-                values: [("name".into(), Expr::Literal { value_type: Type::Text, value: DataValue::Text { value: "created".into() } })].into(),
+                values: [
+                    ("name".into(), Expr::Literal { value_type: Type::Text, value: DataValue::Text { value: "created".into() } }),
+                    ("extra".into(), Expr::Literal { value_type: Type::Text, value: DataValue::Text { value: "".into() } }),
+                    ("tags".into(), Expr::Literal { value_type: Type::list(Type::Text), value: DataValue::List { item_type: Type::Text, items: vec![] } }),
+                ].into(),
                 bind: "created".into(),
             }], ensures: vec![] },
             ActionDefinition { id: "create_update".into(), label: "Create then update".into(), parameters: BTreeMap::new(), guards: vec![], steps: vec![
@@ -723,7 +837,7 @@ pub(crate) fn decoded_shared_transaction_kernel_parity_and_atomicity(
         .map_err(|error| format!("decoded kernel refusal copy: {error:?}"))?;
     let mut refuse_update = Meter::with_allocations(
         RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)),
-        product_alloc::AllocationContext::fail_nth_growth(NonZeroUsize::new(7).unwrap(), false),
+        product_alloc::AllocationContext::fail_nth_growth(NonZeroUsize::new(6).unwrap(), false),
     );
     let mut decoded_owners = KernelState::Decoded { data: &mut decoded_kernel_data, session: &mut decoded_kernel_session, day: 0 };
     let refused_update = Transaction {
@@ -733,7 +847,7 @@ pub(crate) fn decoded_shared_transaction_kernel_parity_and_atomicity(
     if !matches!(
         refused_update,
         Err(AdapterError::Allocation(failure)) if failure.site == product_alloc::AllocationSite::OrderedMap
-    ) || refuse_update.allocations.growth_requests() != 7
+    ) || refuse_update.allocations.growth_requests() != 6
         || decoded_kernel_data != before_kernel_refusal
     {
         return Err(format!("decoded statement update refusal was not atomic: {refused_update:?}; growth requests {}", refuse_update.allocations.growth_requests()));
@@ -781,6 +895,146 @@ pub(crate) fn decoded_shared_transaction_kernel_parity_and_atomicity(
         return Err("legacy and decoded update kernel results diverged".into());
     }
 
+    // This must be the same finalization path that the action interpreter
+    // uses, with a decoded owner and no legacy snapshot bridge.
+    let mut finalized_legacy = legacy_kernel_state.clone();
+    finalized_legacy.day = 17;
+    let mut finalized_decoded = decoded_kernel_data.try_clone_with(&mut product_alloc::AllocationContext::new())
+        .map_err(|error| format!("decoded finalization candidate copy: {error:?}"))?;
+    let output_digests = [program.clone(), Digest::try_from("1".repeat(64)).map_err(|error| error.to_string())?];
+    let mut finalize_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+    finalize_decoded_action(
+        &mut finalized_decoded, &mut decoded_kernel_session, 17, DataSnapshotView::from(&decoded),
+        "kernel", "kernel-op", &program, &output_digests, &mut finalize_meter,
+    ).map_err(|error| format!("decoded shared action finalization: {error:?}"))?;
+    if finalized_decoded.generation() != 1 || finalized_decoded.events().len() != 1 {
+        return Err("decoded shared action finalization did not commit generation and history".into());
+    }
+    let mut legacy_finalize_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+    let mut legacy_finalize_owner = KernelState::Legacy(&mut finalized_legacy);
+    legacy_finalize_owner.finalize_action(
+        DataSnapshotView::from(&legacy), "kernel", "kernel-op", &program, &output_digests, &mut legacy_finalize_meter,
+    ).map_err(|error| format!("legacy shared action finalization: {error:?}"))?;
+    let legacy_event = finalized_legacy.data.events.last().ok_or("legacy finalization event missing")?;
+    let decoded_event = finalized_decoded.events().last().ok_or("decoded finalization event missing")?;
+    let expected_event_digest = canonical_digest(IdentityDomain::Input, &("kernel-op", &program))
+        .map_err(|error| format!("expected event identity: {error:?}"))?;
+    if finalized_legacy.data.generation != 1
+        || legacy_event.sequence != 1
+        || legacy_event.id != format!("event-{}", &expected_event_digest.as_str()[..32])
+        || legacy_event.operation_id != "kernel-op"
+        || legacy_event.action != "kernel"
+        || legacy_event.day != 17
+        || legacy_event.program != program
+        || legacy_event.outputs != output_digests
+        || serde_json::to_value(decoded_event).map_err(|error| error.to_string())?
+            != serde_json::to_value(legacy_event).map_err(|error| error.to_string())?
+        || decoded_event.changes().len() != 1
+    {
+        return Err("legacy and decoded finalization event parity failed".into());
+    }
+
+    // History derivation consumes the same per-row fuel for both persisted
+    // owners, and decoded refusal keeps the caller's committed data intact.
+    let mut legacy_low_fuel = legacy_kernel_state.clone();
+    let before_low_fuel = decoded_kernel_data.try_clone_with(&mut product_alloc::AllocationContext::new())
+        .map_err(|error| format!("decoded low-fuel snapshot: {error:?}"))?;
+    let mut decoded_low_fuel = decoded_kernel_data.try_clone_with(&mut product_alloc::AllocationContext::new())
+        .map_err(|error| format!("decoded low-fuel candidate: {error:?}"))?;
+    let mut legacy_low_fuel_meter = Meter::new(RuntimeLimits::default(), 1, Arc::new(AtomicBool::new(false)));
+    let mut legacy_low_fuel_owner = KernelState::Legacy(&mut legacy_low_fuel);
+    let legacy_low_fuel_result = legacy_low_fuel_owner.finalize_action(
+        DataSnapshotView::from(&legacy_kernel_state.data), "kernel", "low-fuel-op", &program, &[], &mut legacy_low_fuel_meter,
+    );
+    let mut decoded_low_fuel_meter = Meter::new(RuntimeLimits::default(), 1, Arc::new(AtomicBool::new(false)));
+    let decoded_low_fuel_result = finalize_decoded_action(
+        &mut decoded_low_fuel, &mut decoded_kernel_session, 0, DataSnapshotView::from(&decoded_kernel_data),
+        "kernel", "low-fuel-op", &program, &[], &mut decoded_low_fuel_meter,
+    );
+    if !matches!(legacy_low_fuel_result, Err(AdapterError::BudgetExhausted(_)))
+        || !matches!(decoded_low_fuel_result, Err(AdapterError::BudgetExhausted(_)))
+        || decoded_low_fuel != before_low_fuel {
+        return Err("legacy/decoded finalization fuel refusal or rollback diverged".into());
+    }
+
+    // An accepted no-op still advances exactly once and appends an empty,
+    // deterministic history record; the next action receives sequence 2.
+    let mut noop_data = decoded_kernel_data.try_clone_with(&mut product_alloc::AllocationContext::new())
+        .map_err(|error| format!("decoded no-op candidate copy: {error:?}"))?;
+    let noop_before = noop_data.try_clone_with(&mut product_alloc::AllocationContext::new())
+        .map_err(|error| format!("decoded no-op history base copy: {error:?}"))?;
+    let mut noop_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+    let mut noop_owner = KernelState::Decoded { data: &mut noop_data, session: &mut decoded_kernel_session, day: 18 };
+    noop_owner.finalize_action(DataSnapshotView::from(&noop_before), "noop", "kernel-op-2", &program, &[], &mut noop_meter)
+        .map_err(|error| format!("decoded no-op finalization: {error:?}"))?;
+    if noop_data.generation() != 1 || noop_data.events().len() != 1
+        || noop_data.events()[0].sequence() != 1 || !noop_data.events()[0].changes().is_empty()
+        || !noop_data.events()[0].outputs().is_empty() {
+        return Err("decoded no-op finalization changed history incorrectly".into());
+    }
+    let mut legacy_noop = legacy_kernel_state.clone();
+    legacy_noop.day = 18;
+    let mut legacy_noop_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+    let mut legacy_noop_owner = KernelState::Legacy(&mut legacy_noop);
+    legacy_noop_owner.finalize_action(
+        DataSnapshotView::from(&legacy_kernel_state.data), "noop", "kernel-op-2", &program, &[], &mut legacy_noop_meter,
+    ).map_err(|error| format!("legacy no-op finalization: {error:?}"))?;
+    if serde_json::to_value(&legacy_noop.data.events[0]).map_err(|error| error.to_string())?
+        != serde_json::to_value(&noop_data.events()[0]).map_err(|error| error.to_string())? {
+        return Err("legacy and decoded no-op history diverged".into());
+    }
+    let second_noop_before = noop_data.try_clone_with(&mut product_alloc::AllocationContext::new())
+        .map_err(|error| format!("decoded second no-op history base copy: {error:?}"))?;
+    let mut second_noop_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+    let mut second_noop_owner = KernelState::Decoded { data: &mut noop_data, session: &mut decoded_kernel_session, day: 18 };
+    second_noop_owner.finalize_action(DataSnapshotView::from(&second_noop_before), "noop", "kernel-op-3", &program, &[], &mut second_noop_meter)
+        .map_err(|error| format!("decoded second no-op finalization: {error:?}"))?;
+    if noop_data.generation() != 2 || noop_data.events().len() != 2 || noop_data.events()[1].sequence() != 2 {
+        return Err("decoded action event sequence did not advance exactly once".into());
+    }
+    let legacy_second_noop_before = legacy_noop.data.clone();
+    let mut legacy_second_noop_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+    let mut legacy_second_noop_owner = KernelState::Legacy(&mut legacy_noop);
+    legacy_second_noop_owner.finalize_action(
+        DataSnapshotView::from(&legacy_second_noop_before), "noop", "kernel-op-3", &program, &[], &mut legacy_second_noop_meter,
+    ).map_err(|error| format!("legacy second no-op finalization: {error:?}"))?;
+    if legacy_noop.data.generation != 2 || legacy_noop.data.events[1].sequence != 2
+        || serde_json::to_value(&legacy_noop.data.events[1]).map_err(|error| error.to_string())?
+            != serde_json::to_value(&noop_data.events()[1]).map_err(|error| error.to_string())? {
+        return Err("legacy and decoded action event sequences diverged".into());
+    }
+
+    // Refusal at every allocation reached during decoded finalization leaves
+    // the candidate owner unchanged; a fresh attempt succeeds deterministically.
+    let mut probe_data = decoded_kernel_data.try_clone_with(&mut product_alloc::AllocationContext::new())
+        .map_err(|error| format!("decoded finalization probe copy: {error:?}"))?;
+    let mut probe_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+    let mut probe_owner = KernelState::Decoded { data: &mut probe_data, session: &mut decoded_kernel_session, day: 19 };
+    probe_owner.finalize_action(DataSnapshotView::from(&decoded), "kernel", "allocation-op", &program, &output_digests, &mut probe_meter)
+        .map_err(|error| format!("decoded finalization probe: {error:?}"))?;
+    let finalization_growths = probe_meter.allocations.growth_requests();
+    if finalization_growths == 0 { return Err("decoded finalization did not use fallible allocations".into()); }
+    for nth in 1..=finalization_growths {
+        let mut refused_data = decoded_kernel_data.try_clone_with(&mut product_alloc::AllocationContext::new())
+            .map_err(|error| format!("decoded finalization refusal copy: {error:?}"))?;
+        let before_refusal = refused_data.try_clone_with(&mut product_alloc::AllocationContext::new())
+            .map_err(|error| format!("decoded finalization refusal snapshot: {error:?}"))?;
+        let mut refuse_meter = Meter::with_allocations(RuntimeLimits::default(), 1_000_000,
+            Arc::new(AtomicBool::new(false)), product_alloc::AllocationContext::fail_nth_growth(NonZeroUsize::new(nth).unwrap(), false));
+        let mut refused_owner = KernelState::Decoded { data: &mut refused_data, session: &mut decoded_kernel_session, day: 19 };
+        let refused = refused_owner.finalize_action(DataSnapshotView::from(&decoded), "kernel", "allocation-op", &program, &output_digests, &mut refuse_meter);
+        if !matches!(refused, Err(AdapterError::Allocation(_))) || refused_data != before_refusal {
+            return Err(format!("decoded finalization refusal {nth} changed the owner or lost allocation error: {refused:?}"));
+        }
+    }
+    let mut retry_data = decoded_kernel_data.try_clone_with(&mut product_alloc::AllocationContext::new())
+        .map_err(|error| format!("decoded finalization retry copy: {error:?}"))?;
+    let mut retry_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+    let mut retry_owner = KernelState::Decoded { data: &mut retry_data, session: &mut decoded_kernel_session, day: 19 };
+    retry_owner.finalize_action(DataSnapshotView::from(&decoded), "kernel", "allocation-op", &program, &output_digests, &mut retry_meter)
+        .map_err(|error| format!("decoded finalization retry: {error:?}"))?;
+    if retry_data != probe_data { return Err("decoded finalization retry differed from successful commit".into()); }
+
     // A literal row reference archives the matching record and increments its revision.
     let mut archive_legacy_state = State {
         data: legacy.clone(), session: initial_session.clone(), day: 0,
@@ -810,6 +1064,22 @@ pub(crate) fn decoded_shared_transaction_kernel_parity_and_atomicity(
         || archive_decoded_data.records()[0].revision() != 2
     {
         return Err("legacy and decoded Archive did not set the archived flag and increment revision".into());
+    }
+    let mut archive_commit_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+    let mut archive_commit_owner = KernelState::Legacy(&mut archive_legacy_state);
+    archive_commit_owner.finalize_action(
+        DataSnapshotView::from(&legacy), "archive_only", "archive-op", &program, &[], &mut archive_commit_meter,
+    ).map_err(|error| format!("legacy Archive commit: {error:?}"))?;
+    let mut decoded_archive_commit_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+    let mut decoded_archive_commit_owner = KernelState::Decoded { data: &mut archive_decoded_data, session: &mut archive_decoded_session, day: 0 };
+    decoded_archive_commit_owner.finalize_action(
+        DataSnapshotView::from(&decoded), "archive_only", "archive-op", &program, &[], &mut decoded_archive_commit_meter,
+    ).map_err(|error| format!("decoded Archive commit: {error:?}"))?;
+    if archive_legacy_state.data.events[0].changes[0].archived != true
+        || archive_decoded_data.events()[0].changes()[0].archived() != true
+        || serde_json::to_value(&archive_legacy_state.data.events[0]).map_err(|error| error.to_string())?
+            != serde_json::to_value(&archive_decoded_data.events()[0]).map_err(|error| error.to_string())? {
+        return Err("legacy and decoded Archive history changes diverged".into());
     }
 
     // Archive has the same refusal class and no mutation on missing, historical,
@@ -944,6 +1214,24 @@ pub(crate) fn decoded_shared_transaction_kernel_parity_and_atomicity(
         != create_probe.records().last().map(|row| serde_json::to_value(row).unwrap()) {
         return Err("legacy and decoded Create results diverged".into());
     }
+    let mut legacy_create_commit_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+    let mut legacy_create_commit_owner = KernelState::Legacy(&mut create_legacy);
+    legacy_create_commit_owner.finalize_action(
+        DataSnapshotView::from(&legacy_kernel_state.data), "create_only", "create-op", &program, &[], &mut legacy_create_commit_meter,
+    ).map_err(|error| format!("legacy Create commit: {error:?}"))?;
+    let mut decoded_create_commit_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+    let mut decoded_create_commit_owner = KernelState::Decoded { data: &mut create_probe, session: &mut decoded_kernel_session, day: 0 };
+    decoded_create_commit_owner.finalize_action(
+        DataSnapshotView::from(&decoded_kernel_data), "create_only", "create-op", &program, &[], &mut decoded_create_commit_meter,
+    ).map_err(|error| format!("decoded Create commit: {error:?}"))?;
+    let legacy_create_change = &create_legacy.data.events[0].changes[0];
+    let decoded_create_change = &create_probe.events()[0].changes()[0];
+    if legacy_create_change.before.is_some() || decoded_create_change.before().is_some()
+        || legacy_create_change.record != decoded_create_change.record()
+        || serde_json::to_value(legacy_create_change).map_err(|error| error.to_string())?
+            != serde_json::to_value(decoded_create_change).map_err(|error| error.to_string())? {
+        return Err("legacy and decoded Create history changes diverged".into());
+    }
     for nth in 1..=create_growths {
         let mut refused_data = create_base.try_clone_with(&mut product_alloc::AllocationContext::new())
             .map_err(|error| format!("decoded create refusal copy: {error:?}"))?;
@@ -967,7 +1255,10 @@ pub(crate) fn decoded_shared_transaction_kernel_parity_and_atomicity(
     Transaction { program: None, app: AppRef::from(&decoded_app), program_digest: &program, operation: "kernel-op", seed: 7, created: 0, cancel_after_statement: None }
         .statements(&mut retry_create_owner, decoded_create, &mut Env::new(), &mut retry_create_meter)
         .map_err(|error| format!("decoded Create retry: {error:?}"))?;
-    if retry_create != create_probe { return Err("decoded Create retry differs from successful Create".into()); }
+    if serde_json::to_value(retry_create.records()).map_err(|error| error.to_string())?
+        != serde_json::to_value(create_probe.records()).map_err(|error| error.to_string())? {
+        return Err("decoded Create retry differs from successful Create".into());
+    }
 
     let colliding_id = format!("record-{}", &canonical_digest(
         IdentityDomain::Input, &(7u64, "kernel-op", "job", 1usize),
@@ -1062,6 +1353,41 @@ pub(crate) fn decoded_shared_transaction_kernel_parity_and_atomicity(
         || overflow_legacy_state.data != overflow_legacy
     {
         return Err(format!("legacy and decoded revision overflow diverged: {overflow_legacy_result:?} vs {overflow_decoded_result:?}"));
+    }
+
+    let mut generation_overflow = legacy.clone();
+    generation_overflow.generation = u64::MAX;
+    let overflow_bytes = serde_json::to_vec(&generation_overflow).map_err(|error| error.to_string())?;
+    let mut generation_allocations = product_alloc::AllocationContext::new();
+    let overflow_value = crate::product_json::parse_json_bytes(&overflow_bytes, &mut generation_allocations)
+        .map_err(|error| format!("generation overflow parse: {error:?}"))?;
+    let mut generation_overflow_decoded = decode_data_snapshot_fallible(overflow_value, &mut generation_allocations)
+        .map_err(|error| format!("generation overflow decode: {error:?}"))?;
+    let before_generation_overflow = generation_overflow_decoded.try_clone_with(&mut product_alloc::AllocationContext::new())
+        .map_err(|error| format!("generation overflow copy: {error:?}"))?;
+    let mut generation_overflow_session = decoded_initial_session.try_clone_with(&mut product_alloc::AllocationContext::new())
+        .map_err(|error| format!("generation overflow session copy: {error:?}"))?;
+    let mut generation_overflow_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+    let mut generation_overflow_owner = KernelState::Decoded {
+        data: &mut generation_overflow_decoded, session: &mut generation_overflow_session, day: 0,
+    };
+    let generation_overflow_result = generation_overflow_owner.finalize_action(
+        DataSnapshotView::from(&generation_overflow), "kernel", "overflow-op", &program, &[], &mut generation_overflow_meter,
+    );
+    let mut generation_overflow_legacy = State {
+        data: generation_overflow.clone(), session: initial_session.clone(), day: 0,
+        outputs: vec![], output_participants: vec![], output_participant_count: 0,
+    };
+    let mut generation_overflow_legacy_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+    let mut generation_overflow_legacy_owner = KernelState::Legacy(&mut generation_overflow_legacy);
+    let generation_overflow_legacy_result = generation_overflow_legacy_owner.finalize_action(
+        DataSnapshotView::from(&generation_overflow), "kernel", "overflow-op", &program, &[], &mut generation_overflow_legacy_meter,
+    );
+    if !matches!(&generation_overflow_result, Err(AdapterError::Failed(message)) if message == "data generation overflow")
+        || !matches!(&generation_overflow_legacy_result, Err(AdapterError::Failed(message)) if message == "data generation overflow")
+        || generation_overflow_decoded != before_generation_overflow
+        || generation_overflow_legacy.data != generation_overflow {
+        return Err(format!("legacy/decoded generation overflow diverged: {generation_overflow_legacy_result:?} / {generation_overflow_result:?}"));
     }
 
     let before_cancel = decoded_kernel_data.try_clone_with(&mut product_alloc::AllocationContext::new())
@@ -1543,41 +1869,12 @@ fn action(
             return Err(invalid(&format!("Action postcondition rejected: {id}")));
         }
     }
-    advance_generation(&mut state.data)?;
-    let mut changes = Vec::new();
-    for row in &state.data.records {
-        meter.tick(previous.records.len() as u64 + 1)?;
-        let before = previous
-            .records
-            .iter()
-            .find(|r| r.entity == row.entity && r.id == row.id);
-        if before != Some(row) {
-            changes.push(RecordChange {
-                entity: row.entity.clone(),
-                record: row.id.clone(),
-                before: before.map(|r| r.values.clone()),
-                after: row.values.clone(),
-                archived: row.archived,
-            });
-        }
-    }
-    let event_id = canonical_digest(
-        IdentityDomain::Input,
-        &(operation, &program.artifact.program_digest),
+    let outputs = state.outputs[output_start..].iter().map(|output| output.digest.clone()).collect::<Vec<_>>();
+    let mut owners = KernelState::Legacy(state);
+    owners.finalize_action(
+        DataSnapshotView::from(&previous), id, operation, &program.artifact.program_digest, &outputs, meter,
     )?;
-    state.data.events.push(BusinessEvent {
-        id: format!("event-{}", &event_id.as_str()[..32]),
-        sequence: state.data.generation,
-        operation_id: operation.into(),
-        action: id.into(),
-        day: state.day,
-        program: program.artifact.program_digest.clone(),
-        changes,
-        outputs: state.outputs[output_start..]
-            .iter()
-            .map(|a| a.digest.clone())
-            .collect(),
-    });
+    let KernelState::Legacy(state) = owners else { unreachable!() };
     constraints(program, state, meter)
 }
 pub(super) fn input(

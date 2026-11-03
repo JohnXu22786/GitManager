@@ -211,6 +211,19 @@ pub(crate) struct FallibleBusinessRecordsIdentity<'a>(&'a [fallible_persisted_de
 #[derive(Serialize)]
 #[serde(transparent)]
 pub(crate) struct FallibleBusinessEventsIdentity<'a>(&'a [fallible_persisted_decode::DecodedBusinessEvent]);
+pub(crate) struct FallibleActionEventIdentity<'a> {
+    pub(crate) operation: &'a str,
+    pub(crate) program: &'a Digest,
+}
+impl Serialize for FallibleActionEventIdentity<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        let mut tuple = serializer.serialize_tuple(2)?;
+        tuple.serialize_element(self.operation)?;
+        tuple.serialize_element(self.program)?;
+        tuple.end()
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FallibleDataSnapshotCloneError {
     Allocation(crate::product_alloc::AllocationFailure),
@@ -396,6 +409,84 @@ impl FallibleDecodedDataSnapshot {
         };
         try_push(&mut self.0.records, record, cx, AllocationSite::Vector)
             .map_err(AppValidationError::Allocation)
+    }
+    /// Append one accepted action's history using the fallible persisted
+    /// owner. The caller passes the pre-action view and a transaction-local
+    /// clone, so any allocation or validation refusal can be discarded without
+    /// exposing a partial generation/event commit.
+    pub(crate) fn try_append_action_event(
+        &mut self,
+        previous: DataSnapshotView<'_>,
+        generation: u64,
+        operation_id: &str,
+        action: &str,
+        day: i32,
+        program: &Digest,
+        outputs: &[Digest],
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), AppValidationError> {
+        use crate::product_alloc::{try_copy_str, try_push, try_reserve, try_reserve_string, AllocationSite};
+
+        let mut changes = Vec::new();
+        try_reserve(&mut changes, self.record_count(), cx, AllocationSite::Vector)
+            .map_err(AppValidationError::Allocation)?;
+        for after in self.records() {
+            let after = DataRecordView { inner: DataRecordKind::Fallible(after) };
+            let before = previous.record(after.entity(), after.id());
+            if before.is_some_and(|before| records_equal(before, after)) {
+                continue;
+            }
+            let entity = try_copy_str(after.entity(), cx, AllocationSite::String)
+                .map_err(AppValidationError::Allocation)?;
+            let record = try_copy_str(after.id(), cx, AllocationSite::String)
+                .map_err(AppValidationError::Allocation)?;
+            let before = before.map(|record| clone_values(record.values(), cx)).transpose()
+                .map_err(AppValidationError::Allocation)?;
+            let after_values = clone_values(after.values(), cx)
+                .map_err(AppValidationError::Allocation)?;
+            try_push(&mut changes, fallible_persisted_decode::DecodedRecordChange {
+                entity, record, before, after: after_values, archived: after.archived(),
+            }, cx, AllocationSite::Vector).map_err(AppValidationError::Allocation)?;
+        }
+        let mut event_outputs = Vec::new();
+        try_reserve(&mut event_outputs, outputs.len(), cx, AllocationSite::Vector)
+            .map_err(AppValidationError::Allocation)?;
+        for digest in outputs {
+            let value = try_copy_str(digest.as_str(), cx, AllocationSite::String)
+                .map_err(AppValidationError::Allocation)?;
+            let value = Digest::from_owned_lower_hex(value)
+                .ok_or_else(|| AppValidationError::Contract(ContractError("output digest invariant".into())))?;
+            try_push(&mut event_outputs, value, cx, AllocationSite::Vector)
+                .map_err(AppValidationError::Allocation)?;
+        }
+        let event_identity = crate::product_backup::fallible_codec::canonical_digest(
+            IdentityDomain::Input,
+            &FallibleActionEventIdentity { operation: operation_id, program },
+            cx,
+        ).map_err(|error| match error {
+            crate::product_backup::fallible_codec::CodecError::Allocation(failure) => AppValidationError::Allocation(failure),
+            _ => AppValidationError::Contract(ContractError("event identity encoding failed".into())),
+        })?;
+        let mut id = String::new();
+        try_reserve_string(&mut id, 38, cx, AllocationSite::String).map_err(AppValidationError::Allocation)?;
+        id.push_str("event-");
+        id.push_str(&event_identity.as_str()[..32]);
+        let operation_id = try_copy_str(operation_id, cx, AllocationSite::String)
+            .map_err(AppValidationError::Allocation)?;
+        let action = try_copy_str(action, cx, AllocationSite::String)
+            .map_err(AppValidationError::Allocation)?;
+        let program = try_copy_str(program.as_str(), cx, AllocationSite::String)
+            .map_err(AppValidationError::Allocation)?;
+        let program = Digest::from_owned_lower_hex(program)
+            .ok_or_else(|| AppValidationError::Contract(ContractError("event program digest invariant".into())))?;
+        let event = fallible_persisted_decode::DecodedBusinessEvent {
+            id, sequence: generation, operation_id, action, day, program,
+            changes, outputs: event_outputs,
+        };
+        try_push(&mut self.0.events, event, cx, AllocationSite::Vector)
+            .map_err(AppValidationError::Allocation)?;
+        self.0.generation = generation;
+        self.validate_with(cx)
     }
     pub(crate) fn events(&self) -> &[fallible_persisted_decode::DecodedBusinessEvent] { &self.0.events }
     pub(crate) fn schema(&self) -> &[EntityDefinition] { &self.0.schema }
@@ -3562,6 +3653,36 @@ impl DataSnapshot {
         self.validate()?;
         canonical_digest(IdentityDomain::Schema, &self.schema)
     }
+}
+
+fn records_equal(left: DataRecordView<'_>, right: DataRecordView<'_>) -> bool {
+    left.entity() == right.entity()
+        && left.id() == right.id()
+        && left.revision() == right.revision()
+        && left.created_program() == right.created_program()
+        && left.archived() == right.archived()
+        && values_equal(left.values(), right.values())
+}
+
+fn values_equal(left: DataValuesView<'_>, right: DataValuesView<'_>) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right.iter()).all(|((left_key, left_value), (right_key, right_value))| {
+            left_key == right_key && left_value == right_value
+        })
+}
+
+fn clone_values(
+    values: DataValuesView<'_>,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<FallibleValues, crate::product_alloc::AllocationFailure> {
+    use crate::product_alloc::{try_copy_str, AllocationSite};
+    let mut cloned = FallibleValues::new();
+    for (id, value) in values.iter() {
+        let id = try_copy_str(id, cx, AllocationSite::String)?;
+        let value = try_clone_data_value_with(value, cx)?;
+        cloned.try_insert(id, value, cx)?;
+    }
+    Ok(cloned)
 }
 
 /// Borrowed read-only view over either persisted snapshot owner. Runtime
