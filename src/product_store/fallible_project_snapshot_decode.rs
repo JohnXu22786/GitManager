@@ -49,6 +49,103 @@ pub(crate) enum ProjectSnapshotCloneError {
 }
 
 impl DecodedProjectSnapshot {
+    /// Commit one successful decoded runtime transaction into this private
+    /// candidate. All validation and fallible growth happens before any
+    /// serialized snapshot field is changed.
+    pub(crate) fn commit_runtime_result_with(
+        &mut self,
+        run: crate::product_runtime::DecodedProductRun<'_>,
+        cx: &mut AllocationContext,
+    ) -> Result<(), ProjectSnapshotCloneError> {
+        let invalid = || ProjectSnapshotCloneError::Invariant;
+        let receipts = run.operation_receipts();
+        let trace = run.trace();
+        if receipts.is_empty() || receipts.len() != trace.len() {
+            return Err(invalid());
+        }
+        if run.initial_day() != self.clock_day
+            || !run.matches_program_revision_with(&self.active_revision, cx).map_err(|error| match error {
+                crate::product_contract::AppValidationError::Allocation(failure) => ProjectSnapshotCloneError::Allocation(failure),
+                crate::product_contract::AppValidationError::Contract(_) => invalid(),
+            })?
+        {
+            return Err(invalid());
+        }
+        let first_step = trace.first().ok_or_else(invalid)?;
+        let data_identity = self.data.identity_with(cx).map_err(|error| match error {
+            crate::product_contract::AppValidationError::Allocation(failure) => ProjectSnapshotCloneError::Allocation(failure),
+            crate::product_contract::AppValidationError::Contract(_) => invalid(),
+        })?;
+        let session_identity = self.session.identity_with(cx).map_err(|error| match error {
+            crate::product_backup::fallible_codec::CodecError::Allocation(failure) => ProjectSnapshotCloneError::Allocation(failure),
+            _ => invalid(),
+        })?;
+        if data_identity != first_step.before_data || session_identity != first_step.before_session {
+            return Err(invalid());
+        }
+        let revision = self.revision.checked_add(1).ok_or_else(invalid)?;
+        if self.operations.0.len().checked_add(receipts.len()).filter(|len| *len <= MAX_COLLECTION).is_none()
+            || self.artifacts.len().checked_add(run.artifacts().len()).filter(|len| *len <= MAX_ITEMS).is_none()
+        {
+            return Err(invalid());
+        }
+        let mut output_bytes = self.artifacts.iter().map(FallibleDecodedLocalArtifact::byte_len)
+            .try_fold(0usize, usize::checked_add).ok_or_else(invalid)?;
+        for artifact in run.artifacts() {
+            output_bytes = output_bytes.checked_add(artifact.byte_len()).ok_or_else(invalid)?;
+            if output_bytes > MAX_OUTPUT_BYTES { return Err(invalid()); }
+        }
+
+        // Receipts are copied from the actual runtime trace, never reconstructed
+        // from operation IDs. Validate the entire sequence before preparing any
+        // candidate mutation.
+        for (index, (receipt, step)) in receipts.iter().zip(trace).enumerate() {
+            if receipt.step != index
+                || step.index != index
+                || !run.trace_step_applied(index)
+                || step.operation_id != receipt.operation_id
+                || !crate::product_contract::valid_id(&receipt.operation_id)
+                || self.operations.0.contains_key(receipt.operation_id.as_str())
+            {
+                return Err(invalid());
+            }
+            for earlier in &receipts[..index] {
+                if earlier.operation_id == receipt.operation_id { return Err(invalid()); }
+            }
+        }
+
+        let mut prepared = Vec::new();
+        crate::product_alloc::try_reserve(&mut prepared, receipts.len(), cx, AllocationSite::Vector)
+            .map_err(ProjectSnapshotCloneError::Allocation)?;
+        for (receipt, step) in receipts.iter().zip(trace) {
+            let key = crate::product_alloc::try_copy_str(&receipt.operation_id, cx, AllocationSite::String)
+                .map_err(ProjectSnapshotCloneError::Allocation)?;
+            let operation = crate::product_alloc::try_copy_str(&receipt.operation_id, cx, AllocationSite::String)
+                .map_err(ProjectSnapshotCloneError::Allocation)?;
+            let request = crate::product_alloc::try_copy_str(step.input_digest.as_str(), cx, AllocationSite::String)
+                .map_err(ProjectSnapshotCloneError::Allocation)?;
+            let request = Digest::from_owned_lower_hex(request).ok_or_else(invalid)?;
+            prepared.push((key, DecodedOperationReceipt { operation, request, revision }));
+        }
+
+        // Reserve both destinations before moving any runtime-owned result.
+        self.operations.0.try_reserve(prepared.len(), cx)
+            .map_err(ProjectSnapshotCloneError::Allocation)?;
+        crate::product_alloc::try_reserve(&mut self.artifacts, run.artifacts().len(), cx, AllocationSite::Vector)
+            .map_err(ProjectSnapshotCloneError::Allocation)?;
+
+        let (data, session, day, artifacts) = run.into_commit_parts();
+        self.data = data;
+        self.session = session;
+        self.clock_day = day;
+        self.revision = revision;
+        self.artifacts.extend(artifacts);
+        for (key, receipt) in prepared {
+            self.operations.0.insert_reserved_unique(key, receipt);
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_scalar_scope_with(
         &self,
         cx: &mut AllocationContext,
@@ -1047,6 +1144,129 @@ mod tests {
     fn refusal_at_each_reached_owner_growth_cleans_up_and_retries() {
         let input = fixture();
         assert_every_growth_refuses_and_retries(&input);
+    }
+
+    fn runtime_commit_snapshot() -> serde_json::Value {
+        let program = crate::fixture::capture(crate::fixture::organizer());
+        let data = crate::fixture::seed(&program);
+        let session = crate::product_contract::SessionState::initial(&program.program).unwrap();
+        let active_revision = crate::product_contract::canonical_digest(
+            IdentityDomain::Source,
+            &program,
+        ).unwrap();
+        let snapshot = ProjectSnapshot {
+            magic: crate::product_store::MAGIC.into(),
+            version: crate::product_store::GENERATED_PROJECT_FORMAT,
+            revision: 1,
+            programs: vec![program],
+            active_revision,
+            data,
+            session,
+            clock_day: 20_000,
+            decisions: crate::fixture::decisions(),
+            adoptions: Vec::new(),
+            operations: std::collections::BTreeMap::new(),
+            artifacts: Vec::new(),
+            scope: ScopeEnvelope::ScalarV1(ScopeState::default()),
+        };
+        serde_json::to_value(snapshot).unwrap()
+    }
+
+    fn runtime_commit_run<'a>(source: &'a DecodedProjectSnapshot) -> crate::product_runtime::DecodedProductRun<'a> {
+        let mut allocations = AllocationContext::new();
+        let mut run = crate::product_runtime::LocalRuntime::default().start_decoded(
+            &source.programs[0], &source.data, &source.session, source.clock_day, 42,
+            crate::product_contract::RuntimeLimits::default(), &mut allocations,
+        ).unwrap();
+        let runtime = crate::product_runtime::LocalRuntime::default();
+        runtime.apply_decoded(&mut run, &crate::fixture::add("Ada"), "runtime-add", &mut allocations).unwrap();
+        runtime.apply_decoded(&mut run, &crate::fixture::invoke("collect", crate::product_contract::Values::new()), "runtime-collect", &mut allocations).unwrap();
+        runtime.apply_decoded(&mut run, &crate::fixture::invoke("export_people", crate::product_contract::Values::new()), "runtime-export", &mut allocations).unwrap();
+        run
+    }
+
+    #[test]
+    fn decoded_runtime_result_commit_installs_fields_and_trace_bound_receipt() {
+        let input = runtime_commit_snapshot();
+        let source = decoded(&input);
+        let mut candidate = decoded(&input);
+        let run = runtime_commit_run(&source);
+        let expected_data = run.data().identity_with(&mut AllocationContext::new()).unwrap();
+        let expected_session = run.session().identity_with(&mut AllocationContext::new()).unwrap();
+        let expected_request = run.trace()[0].input_digest.clone();
+        let expected_artifacts = run.artifacts().len();
+        candidate.commit_runtime_result_with(run, &mut AllocationContext::new()).unwrap();
+
+        assert_eq!(candidate.revision(), 2);
+        assert_eq!(candidate.clock_day(), 20_000);
+        assert_eq!(candidate.data().identity_with(&mut AllocationContext::new()).unwrap(), expected_data);
+        assert_eq!(candidate.session().identity_with(&mut AllocationContext::new()).unwrap(), expected_session);
+        assert_eq!(candidate.operation_revision("runtime-add"), Some(2));
+        assert_eq!(candidate.operation_request("runtime-add"), Some(&expected_request));
+        assert_eq!(candidate.artifacts().len(), expected_artifacts);
+        assert_eq!(expected_artifacts, 1);
+    }
+
+    #[test]
+    fn decoded_runtime_result_commit_allocation_refusals_leave_candidate_unchanged() {
+        let input = runtime_commit_snapshot();
+        let source = decoded(&input);
+        let mut probe = decoded(&input);
+        let run = runtime_commit_run(&source);
+        let mut count = AllocationContext::new();
+        probe.commit_runtime_result_with(run, &mut count).unwrap();
+        let growths = count.growth_requests();
+        assert!(growths > 0);
+
+        for nth in 1..=growths {
+            let mut candidate = decoded(&input);
+            let before = candidate.canonical_bytes_with(&mut AllocationContext::new()).unwrap();
+            let run = runtime_commit_run(&source);
+            let mut allocations = AllocationContext::fail_nth_growth(NonZeroUsize::new(nth).unwrap(), true);
+            let result = candidate.commit_runtime_result_with(run, &mut allocations);
+            assert!(matches!(result, Err(ProjectSnapshotCloneError::Allocation(_))), "growth {nth}: {result:?}");
+            assert_eq!(before, candidate.canonical_bytes_with(&mut AllocationContext::new()).unwrap());
+
+            let run = runtime_commit_run(&source);
+            candidate.commit_runtime_result_with(run, &mut AllocationContext::new()).unwrap();
+            assert_eq!(candidate.operation_revision("runtime-add"), Some(2));
+        }
+    }
+
+    #[test]
+    fn decoded_runtime_result_commit_rejects_refused_duplicate_and_overflow_atomically() {
+        let input = runtime_commit_snapshot();
+        let source = decoded(&input);
+
+        let mut refused = crate::product_runtime::LocalRuntime::default().start_decoded(
+            &source.programs[0], &source.data, &source.session, source.clock_day, 42,
+            crate::product_contract::RuntimeLimits::default(), &mut AllocationContext::new(),
+        ).unwrap();
+        assert!(crate::product_runtime::LocalRuntime::default().apply_decoded(
+            &mut refused,
+            &crate::product_contract::SemanticInput::Navigate { view: "missing".into() },
+            "refused-op",
+            &mut AllocationContext::new(),
+        ).is_err());
+        let mut candidate = decoded(&input);
+        let before = candidate.canonical_bytes_with(&mut AllocationContext::new()).unwrap();
+        assert!(matches!(candidate.commit_runtime_result_with(refused, &mut AllocationContext::new()), Err(ProjectSnapshotCloneError::Invariant)));
+        assert_eq!(before, candidate.canonical_bytes_with(&mut AllocationContext::new()).unwrap());
+
+        let mut duplicate_candidate = decoded(&input);
+        let run = runtime_commit_run(&source);
+        duplicate_candidate.commit_runtime_result_with(run, &mut AllocationContext::new()).unwrap();
+        let before = duplicate_candidate.canonical_bytes_with(&mut AllocationContext::new()).unwrap();
+        let duplicate_run = runtime_commit_run(&source);
+        assert!(matches!(duplicate_candidate.commit_runtime_result_with(duplicate_run, &mut AllocationContext::new()), Err(ProjectSnapshotCloneError::Invariant)));
+        assert_eq!(before, duplicate_candidate.canonical_bytes_with(&mut AllocationContext::new()).unwrap());
+
+        let mut overflow_candidate = decoded(&input);
+        overflow_candidate.revision = u64::MAX;
+        let before = overflow_candidate.canonical_bytes_with(&mut AllocationContext::new()).unwrap();
+        let run = runtime_commit_run(&source);
+        assert!(matches!(overflow_candidate.commit_runtime_result_with(run, &mut AllocationContext::new()), Err(ProjectSnapshotCloneError::Invariant)));
+        assert_eq!(before, overflow_candidate.canonical_bytes_with(&mut AllocationContext::new()).unwrap());
     }
 
     use serde_json::json;

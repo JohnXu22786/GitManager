@@ -319,6 +319,7 @@ pub(crate) struct DecodedProductRun<'a> {
     data: FallibleDecodedDataSnapshot,
     session: FallibleDecodedSessionState,
     day: i32,
+    initial_day: i32,
     seed: u64,
     limits: RuntimeLimits,
     fuel: u64,
@@ -343,9 +344,9 @@ pub(crate) struct DecodedTraceStep {
     pub(crate) diagnostic: Option<String>,
 }
 
-struct DecodedOperationReceipt {
-    operation_id: String,
-    step: usize,
+pub(crate) struct DecodedOperationReceipt {
+    pub(crate) operation_id: String,
+    pub(crate) step: usize,
 }
 
 impl DecodedProductRun<'_> {
@@ -355,6 +356,26 @@ impl DecodedProductRun<'_> {
     pub(crate) fn observations(&self) -> &[view::DecodedRuntimeObservation] { &self.observations }
     pub(crate) fn artifacts(&self) -> &[FallibleDecodedLocalArtifact] { &self.outputs }
     pub(crate) fn clock_day(&self) -> i32 { self.day }
+    pub(crate) fn initial_day(&self) -> i32 { self.initial_day }
+    pub(crate) fn matches_program_revision_with(
+        &self,
+        revision: &Digest,
+        allocations: &mut product_alloc::AllocationContext,
+    ) -> std::result::Result<bool, AppValidationError> {
+        Ok(self.program.revision_with(allocations)? == *revision)
+    }
+    pub(crate) fn operation_receipts(&self) -> &[DecodedOperationReceipt] { &self.receipts }
+    pub(crate) fn trace_step_applied(&self, index: usize) -> bool {
+        self.trace.get(index).is_some_and(|step| step.outcome == StepOutcome::Applied)
+    }
+    pub(crate) fn into_commit_parts(self) -> (
+        FallibleDecodedDataSnapshot,
+        FallibleDecodedSessionState,
+        i32,
+        Vec<FallibleDecodedLocalArtifact>,
+    ) {
+        (self.data, self.session, self.day, self.outputs)
+    }
 }
 impl DecodedTraceStep {
     fn try_clone_with(
@@ -505,6 +526,7 @@ impl LocalRuntime {
             data,
             session,
             day: clock_day,
+            initial_day: clock_day,
             seed: random_seed,
             fuel: limits.fuel,
             limits,

@@ -85,6 +85,14 @@ impl<K, V> OrderedMap<K, V> {
 }
 
 impl<K: Ord, V> OrderedMap<K, V> {
+    /// Insert into capacity reserved by the caller after validating a unique
+    /// key batch. This path performs no allocation and cannot report failure.
+    pub(crate) fn insert_reserved_unique(&mut self, key: K, value: V) {
+        let index = self.search(&key).expect_err("reserved unique insert key was checked");
+        debug_assert!(self.entries.len() < self.entries.capacity());
+        self.entries.insert(index, (key, value));
+    }
+
     /// Occupied: retain the original key, return the old value, no growth.
     /// Vacant: reserve before moving any entry, then insert without callbacks.
     /// On reservation failure contents/capacity are unchanged and the incoming
