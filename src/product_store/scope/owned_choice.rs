@@ -422,6 +422,7 @@ impl ProductStore {
                 operation: adoption.plan.id.clone(),
                 request,
                 revision: next.revision,
+                trace_digest: None,
             },
         );
         verify(&current, target, decisions, &adoption.plan, &next)?;

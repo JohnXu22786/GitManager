@@ -127,6 +127,8 @@ pub struct OperationReceipt {
     pub operation: Id,
     pub request: Digest,
     pub revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_digest: Option<Digest>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1062,6 +1064,7 @@ impl ProductStore {
                 operation: operation.into(),
                 request,
                 revision: snapshot.revision,
+                trace_digest: None,
             },
         );
         let stored_request = &snapshot.operations.get(operation)
@@ -1415,6 +1418,7 @@ impl ProductStore {
                 operation: prepared.plan.id.clone(),
                 request,
                 revision: current.revision,
+                trace_digest: None,
             },
         );
         let revision = current.revision;

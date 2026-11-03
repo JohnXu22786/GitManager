@@ -334,6 +334,8 @@ pub(crate) struct DecodedTraceStep {
     pub(crate) index: usize,
     pub(crate) operation_id: String,
     pub(crate) input_digest: Digest,
+    /// Store-level idempotency digest for the original SemanticInput alone.
+    pub(crate) store_request_digest: Digest,
     pub(crate) action: Option<String>,
     pub(crate) before_data: Digest,
     pub(crate) after_data: Digest,
@@ -396,6 +398,7 @@ impl DecodedTraceStep {
             index: self.index,
             operation_id: copy_string(&self.operation_id, allocations)?,
             input_digest: try_clone_digest(&self.input_digest, allocations)?,
+            store_request_digest: try_clone_digest(&self.store_request_digest, allocations)?,
             action: self.action.as_deref().map(|value| copy_string(value, allocations)).transpose()?,
             before_data: try_clone_digest(&self.before_data, allocations)?,
             after_data: try_clone_digest(&self.after_data, allocations)?,
@@ -553,6 +556,11 @@ impl LocalRuntime {
             &DecodedApplyRequest(input, run.program.artifact()),
             allocations,
         ).map_err(codec_adapter_error)?;
+        let store_request = crate::product_backup::fallible_codec::canonical_digest(
+            IdentityDomain::Input,
+            input,
+            allocations,
+        ).map_err(codec_adapter_error)?;
         if let Some(receipt) = run.receipts.iter().find(|receipt| receipt.operation_id == operation_id) {
             return if run.trace[receipt.step].input_digest == request {
                 run.trace[receipt.step].try_clone_with(allocations)
@@ -632,6 +640,7 @@ impl LocalRuntime {
             index: run.trace.len(),
             operation_id: product_alloc::try_copy_str(operation_id, allocations, product_alloc::AllocationSite::String).map_err(AdapterError::Allocation)?,
             input_digest: request,
+            store_request_digest: store_request,
             action: step_action,
             before_data,
             after_data,

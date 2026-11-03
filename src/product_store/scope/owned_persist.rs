@@ -2939,6 +2939,7 @@ pub(crate) fn owned_snapshot_for_test(
             operation: operation.into(),
             request,
             revision: next,
+            trace_digest: None,
         },
     );
     snapshot.active_revision = revision(&target)?;

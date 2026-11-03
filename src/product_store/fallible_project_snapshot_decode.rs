@@ -22,7 +22,8 @@ const PROJECT_FIELDS: &[&str] = &[
     "magic", "version", "revision", "programs", "active_revision", "data", "session",
     "clock_day", "decisions", "adoptions", "operations", "artifacts", "scope",
 ];
-const OPERATION_RECEIPT_FIELDS: &[&str] = &["operation", "request", "revision"];
+const OPERATION_RECEIPT_FIELDS: &[&str] = &["operation", "request", "revision", "trace_digest"];
+const LEGACY_OPERATION_RECEIPT_FIELDS: &[&str] = &["operation", "request", "revision"];
 const ADOPTION_RECEIPT_FIELDS: &[&str] = &["plan", "previous", "active", "revision"];
 
 #[derive(Debug, Serialize)]
@@ -60,7 +61,7 @@ impl DecodedProjectSnapshot {
         let invalid = || ProjectSnapshotCloneError::Invariant;
         let receipts = run.operation_receipts();
         let trace = run.trace();
-        if receipts.is_empty() || receipts.len() != trace.len() {
+        if receipts.len() != 1 || trace.len() != 1 {
             return Err(invalid());
         }
         if run.initial_day() != self.clock_day
@@ -122,10 +123,13 @@ impl DecodedProjectSnapshot {
                 .map_err(ProjectSnapshotCloneError::Allocation)?;
             let operation = crate::product_alloc::try_copy_str(&receipt.operation_id, cx, AllocationSite::String)
                 .map_err(ProjectSnapshotCloneError::Allocation)?;
-            let request = crate::product_alloc::try_copy_str(step.input_digest.as_str(), cx, AllocationSite::String)
+            let request = crate::product_alloc::try_copy_str(step.store_request_digest.as_str(), cx, AllocationSite::String)
                 .map_err(ProjectSnapshotCloneError::Allocation)?;
             let request = Digest::from_owned_lower_hex(request).ok_or_else(invalid)?;
-            prepared.push((key, DecodedOperationReceipt { operation, request, revision }));
+            let trace_digest = crate::product_alloc::try_copy_str(step.input_digest.as_str(), cx, AllocationSite::String)
+                .map_err(ProjectSnapshotCloneError::Allocation)?;
+            let trace_digest = Digest::from_owned_lower_hex(trace_digest).ok_or_else(invalid)?;
+            prepared.push((key, DecodedOperationReceipt { operation, request, revision, trace_digest: Some(trace_digest) }));
         }
 
         // Reserve both destinations before moving any runtime-owned result.
@@ -395,6 +399,9 @@ impl DecodedProjectSnapshot {
     pub(crate) fn operation_request(&self, id: &str) -> Option<&Digest> {
         self.operations.0.get(id).map(|receipt| &receipt.request)
     }
+    pub(crate) fn operation_trace_digest(&self, id: &str) -> Option<&Digest> {
+        self.operations.0.get(id).and_then(|receipt| receipt.trace_digest.as_ref())
+    }
 
     pub(crate) fn scalar_scope(&self) -> Option<&crate::product_store::scope::FallibleDecodedScopeState> {
         use crate::product_store::scope::FallibleDecodedScopeEnvelope;
@@ -476,6 +483,8 @@ struct DecodedOperationReceipt {
     operation: String,
     request: Digest,
     revision: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trace_digest: Option<Digest>,
 }
 
 #[derive(Debug, Serialize)]
@@ -577,15 +586,25 @@ fn decode_operation_map(value: Value, cx: &mut AllocationContext) -> Result<Deco
 }
 
 fn decode_operation_receipt(value: Value, cx: &mut AllocationContext) -> Result<DecodedOperationReceipt, ValueDecodeError> {
-    let mut fields = struct_fields(value, "a struct OperationReceipt", OPERATION_RECEIPT_FIELDS)?;
+    let mut fields = match value {
+        Value::Array(values) if values.len() == LEGACY_OPERATION_RECEIPT_FIELDS.len() => StructFields::Sequence {
+            names: LEGACY_OPERATION_RECEIPT_FIELDS,
+            actual: values.len(),
+            values: values.into_iter(),
+            index: 0,
+        },
+        value => struct_fields(value, "a struct OperationReceipt", OPERATION_RECEIPT_FIELDS)?,
+    };
     let mut operation = None;
     let mut request = None;
     let mut revision = None;
+    let mut trace_digest = None;
     while let Some((key, value)) = fields.next(cx)? {
         match key.as_str() {
             "operation" => operation = Some(string(value)?),
             "request" => request = Some(digest(value)?),
             "revision" => revision = Some(integer_u64(value)?),
+            "trace_digest" => trace_digest = Some(digest(value)?),
             _ => return Err(ValueDecodeError::UnknownField { key, expected: OPERATION_RECEIPT_FIELDS }),
         }
     }
@@ -593,6 +612,7 @@ fn decode_operation_receipt(value: Value, cx: &mut AllocationContext) -> Result<
         operation: required(operation, "operation")?,
         request: required(request, "request")?,
         revision: required(revision, "revision")?,
+        trace_digest,
     })
 }
 
@@ -1147,7 +1167,11 @@ mod tests {
     }
 
     fn runtime_commit_snapshot() -> serde_json::Value {
-        let program = crate::fixture::capture(crate::fixture::organizer());
+        let mut app = crate::fixture::organizer();
+        let mut emit = app["actions"][2]["steps"][0].clone();
+        emit["items"] = crate::fixture::query("person");
+        app["actions"][0]["steps"].as_array_mut().unwrap().push(emit);
+        let program = crate::fixture::capture(app);
         let data = crate::fixture::seed(&program);
         let session = crate::product_contract::SessionState::initial(&program.program).unwrap();
         let active_revision = crate::product_contract::canonical_digest(
@@ -1178,10 +1202,9 @@ mod tests {
             &source.programs[0], &source.data, &source.session, source.clock_day, 42,
             crate::product_contract::RuntimeLimits::default(), &mut allocations,
         ).unwrap();
-        let runtime = crate::product_runtime::LocalRuntime::default();
-        runtime.apply_decoded(&mut run, &crate::fixture::add("Ada"), "runtime-add", &mut allocations).unwrap();
-        runtime.apply_decoded(&mut run, &crate::fixture::invoke("collect", crate::product_contract::Values::new()), "runtime-collect", &mut allocations).unwrap();
-        runtime.apply_decoded(&mut run, &crate::fixture::invoke("export_people", crate::product_contract::Values::new()), "runtime-export", &mut allocations).unwrap();
+        crate::product_runtime::LocalRuntime::default().apply_decoded(
+            &mut run, &crate::fixture::add("Ada"), "runtime-add", &mut allocations,
+        ).unwrap();
         run
     }
 
@@ -1190,21 +1213,36 @@ mod tests {
         let input = runtime_commit_snapshot();
         let source = decoded(&input);
         let mut candidate = decoded(&input);
-        let run = runtime_commit_run(&source);
+        let mut run = runtime_commit_run(&source);
         let expected_data = run.data().identity_with(&mut AllocationContext::new()).unwrap();
         let expected_session = run.session().identity_with(&mut AllocationContext::new()).unwrap();
-        let expected_request = run.trace()[0].input_digest.clone();
+        let expected_trace_digest = run.trace()[0].input_digest.clone();
+        let input = crate::fixture::add("Ada");
+        let expected_store_request = crate::product_contract::canonical_digest(IdentityDomain::Input, &input).unwrap();
         let expected_artifacts = run.artifacts().len();
+        let replayed = crate::product_runtime::LocalRuntime::default().apply_decoded(
+            &mut run, &input, "runtime-add", &mut AllocationContext::new(),
+        ).unwrap();
+        assert_eq!(replayed.input_digest, expected_trace_digest);
+        assert_eq!(run.trace().len(), 1, "an idempotent retry adds no second operation");
         candidate.commit_runtime_result_with(run, &mut AllocationContext::new()).unwrap();
 
         assert_eq!(candidate.revision(), 2);
         assert_eq!(candidate.clock_day(), 20_000);
         assert_eq!(candidate.data().identity_with(&mut AllocationContext::new()).unwrap(), expected_data);
         assert_eq!(candidate.session().identity_with(&mut AllocationContext::new()).unwrap(), expected_session);
+        assert_eq!(candidate.data().records().len(), 1);
         assert_eq!(candidate.operation_revision("runtime-add"), Some(2));
-        assert_eq!(candidate.operation_request("runtime-add"), Some(&expected_request));
+        assert_eq!(candidate.operation_request("runtime-add"), Some(&expected_store_request));
+        assert_eq!(candidate.operation_trace_digest("runtime-add"), Some(&expected_trace_digest));
+        assert_ne!(expected_store_request, expected_trace_digest);
         assert_eq!(candidate.artifacts().len(), expected_artifacts);
         assert_eq!(expected_artifacts, 1);
+        let persisted = serde_json::to_value(&candidate).unwrap();
+        assert_eq!(persisted["operations"]["runtime-add"]["trace_digest"], expected_trace_digest.as_str());
+        let _: crate::product_store::ProjectSnapshot = serde_json::from_value(persisted.clone()).unwrap();
+        let reloaded = decoded(&persisted);
+        assert_eq!(reloaded.operation_trace_digest("runtime-add"), Some(&expected_trace_digest));
     }
 
     #[test]
@@ -1267,6 +1305,18 @@ mod tests {
         let run = runtime_commit_run(&source);
         assert!(matches!(overflow_candidate.commit_runtime_result_with(run, &mut AllocationContext::new()), Err(ProjectSnapshotCloneError::Invariant)));
         assert_eq!(before, overflow_candidate.canonical_bytes_with(&mut AllocationContext::new()).unwrap());
+
+        let mut multi_step = runtime_commit_run(&source);
+        crate::product_runtime::LocalRuntime::default().apply_decoded(
+            &mut multi_step,
+            &crate::product_contract::SemanticInput::Navigate { view: "people".into() },
+            "second-op",
+            &mut AllocationContext::new(),
+        ).unwrap();
+        let mut multi_candidate = decoded(&input);
+        let before = multi_candidate.canonical_bytes_with(&mut AllocationContext::new()).unwrap();
+        assert!(matches!(multi_candidate.commit_runtime_result_with(multi_step, &mut AllocationContext::new()), Err(ProjectSnapshotCloneError::Invariant)));
+        assert_eq!(before, multi_candidate.canonical_bytes_with(&mut AllocationContext::new()).unwrap());
     }
 
     use serde_json::json;

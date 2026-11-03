@@ -832,6 +832,7 @@ impl ProductStore {
                 operation: adoption.plan.id.clone(),
                 request: request.clone(),
                 revision: next.revision,
+                trace_digest: None,
             },
         );
         meter.charge(8)?;

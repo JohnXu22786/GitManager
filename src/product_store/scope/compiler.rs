@@ -3195,6 +3195,7 @@ mod borrowed_view_tests {
             operation: plan.id.clone(),
             request: crate::product_contract::canonical_digest(IdentityDomain::Evidence, &"adoption-request").unwrap(),
             revision,
+            trace_digest: None,
         });
         let scope = snapshot.scalar_scope_mut().unwrap();
         scope.initializations.push(initialization);
@@ -3352,6 +3353,7 @@ mod borrowed_view_tests {
             operation: recorded_by.clone(),
             request: crate::product_contract::canonical_digest(IdentityDomain::Evidence, &"record-rehearsal").unwrap(),
             revision: recorded_revision,
+            trace_digest: None,
         });
         snapshot.revision = recorded_revision;
         snapshot.scalar_scope_mut().unwrap().rehearsals.insert(rehearsal.manifest.output.clone(), rehearsal);

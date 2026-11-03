@@ -613,6 +613,7 @@ fn rehashed_compositions_require_exact_predecessor_business_and_basis() {
             operation: linked.plan.id.clone(),
             request: linked.plan.identity().unwrap(),
             revision: linked.revision,
+            trace_digest: None,
         },
     );
     unreceipted_switch.revision = linked.revision;

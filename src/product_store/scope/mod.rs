@@ -909,6 +909,7 @@ impl ProductStore {
                 operation: adoption.plan.id.clone(),
                 request,
                 revision: current.revision,
+                trace_digest: None,
             },
         );
         let revision = current.revision;
