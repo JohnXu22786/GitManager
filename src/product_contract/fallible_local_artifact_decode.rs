@@ -26,8 +26,45 @@ pub(crate) struct DecodedLocalArtifact {
 }
 
 impl DecodedLocalArtifact {
+    pub(crate) fn from_rows(
+        output: &str,
+        format: OutputFormat,
+        columns: &[FieldDefinition],
+        rows: Vec<FallibleValues>,
+        max_bytes: usize,
+        cx: &mut AllocationContext,
+    ) -> Result<Self, super::AppValidationError> {
+        use super::{AppValidationError, IdentityDomain};
+        let output = product_alloc::try_copy_str(output, cx, AllocationSite::String)
+            .map_err(AppValidationError::Allocation)?;
+        let mut owned_columns = Vec::new();
+        product_alloc::try_reserve(&mut owned_columns, columns.len(), cx, AllocationSite::Vector)
+            .map_err(AppValidationError::Allocation)?;
+        for column in columns {
+            owned_columns.push(FieldDefinition {
+                id: product_alloc::try_copy_str(&column.id, cx, AllocationSite::String)
+                    .map_err(AppValidationError::Allocation)?,
+                label: product_alloc::try_copy_str(&column.label, cx, AllocationSite::String)
+                    .map_err(AppValidationError::Allocation)?,
+                value_type: super::try_clone_type_with(&column.value_type, cx)
+                    .map_err(AppValidationError::Allocation)?,
+            });
+        }
+        let bytes = encode_output_fallible(format, &owned_columns, &rows, max_bytes, cx)?;
+        let bytes_digest = crate::product_backup::fallible_codec::bytes_digest(
+            IdentityDomain::OutputBytes, &bytes, cx,
+        ).map_err(codec_error)?;
+        let digest = crate::product_backup::fallible_codec::canonical_digest(
+            IdentityDomain::Output,
+            &ArtifactReceipt(&output, format, &owned_columns, &rows, &bytes_digest),
+            cx,
+        ).map_err(codec_error)?;
+        Ok(Self { output, format, columns: owned_columns, rows, bytes, bytes_digest, digest })
+    }
+
     pub(crate) fn digest(&self) -> &Digest { &self.digest }
     pub(crate) fn byte_len(&self) -> usize { self.bytes.len() }
+    pub(crate) fn bytes(&self) -> &[u8] { &self.bytes }
     pub(super) fn row_count(&self) -> usize { self.rows.len() }
 
     pub(crate) fn validate_with(
@@ -57,7 +94,7 @@ impl DecodedLocalArtifact {
         let bytes_digest = crate::product_backup::fallible_codec::bytes_digest(IdentityDomain::OutputBytes, &self.bytes, cx)
             .map_err(codec_error)?;
         if self.bytes_digest != bytes_digest { return Err(contract("artifact byte digest mismatch")); }
-        let encoded = encode_output_fallible(self.format, &self.columns, &self.rows, cx)?;
+        let encoded = encode_output_fallible(self.format, &self.columns, &self.rows, MAX_OUTPUT_BYTES, cx)?;
         if self.bytes != encoded { return Err(contract("artifact bytes do not encode observed rows")); }
         let receipt = crate::product_backup::fallible_codec::canonical_digest(
             IdentityDomain::Output,
@@ -108,20 +145,22 @@ fn encode_output_fallible(
     format: super::OutputFormat,
     columns: &[FieldDefinition],
     rows: &[FallibleValues],
+    max_bytes: usize,
     cx: &mut AllocationContext,
 ) -> Result<Vec<u8>, super::AppValidationError> {
     use super::{AppValidationError, ContractError, OutputFormat};
+    let max_bytes = max_bytes.min(MAX_OUTPUT_BYTES);
     validate_columns(columns, cx)?;
     if rows.len() > MAX_COLLECTION { return Err(AppValidationError::Contract(ContractError("invalid output dimensions".into()))); }
     let mut bytes = Vec::new();
     if format == OutputFormat::Csv {
         for (index, column) in columns.iter().enumerate() {
-            if index > 0 { append(&mut bytes, b",", cx)?; }
-            append_csv_field(&mut bytes, &column.id, cx)?;
+            if index > 0 { append(&mut bytes, b",", max_bytes, cx)?; }
+            append_csv_field(&mut bytes, &column.id, max_bytes, cx)?;
         }
-        append(&mut bytes, b"\r\n", cx)?;
+        append(&mut bytes, b"\r\n", max_bytes, cx)?;
     } else {
-        append(&mut bytes, b"[", cx)?;
+        append(&mut bytes, b"[", max_bytes, cx)?;
     }
     for (index, row) in rows.iter().enumerate() {
         if row.len() != columns.len() || columns.iter().any(|column| !row.contains_key(&column.id)) {
@@ -129,33 +168,43 @@ fn encode_output_fallible(
         }
         if format == OutputFormat::Csv {
             for (column_index, column) in columns.iter().enumerate() {
-                if column_index > 0 { append(&mut bytes, b",", cx)?; }
+                if column_index > 0 { append(&mut bytes, b",", max_bytes, cx)?; }
                 let value = row.get(&column.id).expect("row keys were checked");
-                append_csv_value(&mut bytes, value, cx)?;
+                append_csv_value(&mut bytes, value, max_bytes, cx)?;
             }
-            append(&mut bytes, b"\r\n", cx)?;
+            append(&mut bytes, b"\r\n", max_bytes, cx)?;
         } else {
-            if index > 0 { append(&mut bytes, b",", cx)?; }
+            if index > 0 { append(&mut bytes, b",", max_bytes, cx)?; }
             let mut object = crate::product_alloc::ordered::OrderedMap::new();
             for column in columns {
                 let value = row.get(&column.id).expect("row keys were checked");
                 object.try_insert(column.id.as_str(), value, cx).map_err(AppValidationError::Allocation)?;
             }
-            let remaining = MAX_OUTPUT_BYTES.checked_sub(bytes.len())
+            let remaining = max_bytes.checked_sub(bytes.len())
                 .and_then(|remaining| remaining.checked_sub(1))
                 .ok_or_else(output_limit_error)?;
             let encoded = crate::product_backup::fallible_codec::canonical_bytes_bounded(
                 &OutputRow(&object), remaining, cx,
             ).map_err(codec_error)?;
-            append(&mut bytes, &encoded, cx)?;
+            append(&mut bytes, &encoded, max_bytes, cx)?;
         }
     }
-    if format == OutputFormat::Json { append(&mut bytes, b"]", cx)?; }
+    if format == OutputFormat::Json { append(&mut bytes, b"]", max_bytes, cx)?; }
     Ok(bytes)
 }
 
-fn append(bytes: &mut Vec<u8>, value: &[u8], cx: &mut AllocationContext) -> Result<(), super::AppValidationError> {
-    if !matches!(bytes.len().checked_add(value.len()), Some(length) if length <= MAX_OUTPUT_BYTES) {
+pub(crate) fn encoded_output_byte_len_with(
+    format: super::OutputFormat,
+    columns: &[FieldDefinition],
+    rows: &[FallibleValues],
+    max_bytes: usize,
+    cx: &mut AllocationContext,
+) -> Result<usize, super::AppValidationError> {
+    Ok(encode_output_fallible(format, columns, rows, max_bytes, cx)?.len())
+}
+
+fn append(bytes: &mut Vec<u8>, value: &[u8], max_bytes: usize, cx: &mut AllocationContext) -> Result<(), super::AppValidationError> {
+    if !matches!(bytes.len().checked_add(value.len()), Some(length) if length <= max_bytes.min(MAX_OUTPUT_BYTES)) {
         return Err(output_limit_error());
     }
     crate::product_alloc::try_reserve(bytes, value.len(), cx, AllocationSite::Bytes).map_err(super::AppValidationError::Allocation)?;
@@ -167,68 +216,70 @@ fn output_limit_error() -> super::AppValidationError {
     super::AppValidationError::Contract(super::ContractError("output byte limit exceeded".into()))
 }
 
-fn append_csv_field(bytes: &mut Vec<u8>, value: &str, cx: &mut AllocationContext) -> Result<(), super::AppValidationError> {
+fn append_csv_field(bytes: &mut Vec<u8>, value: &str, max_bytes: usize, cx: &mut AllocationContext) -> Result<(), super::AppValidationError> {
     append_csv_quoted_with_literal_prefix(
         bytes,
         value,
         value.starts_with(['=', '+', '-', '@', '\t', '\r', '\n']),
+        max_bytes,
         cx,
     )
 }
 
-fn append_csv_value(bytes: &mut Vec<u8>, value: &super::DataValue, cx: &mut AllocationContext) -> Result<(), super::AppValidationError> {
+fn append_csv_value(bytes: &mut Vec<u8>, value: &super::DataValue, max_bytes: usize, cx: &mut AllocationContext) -> Result<(), super::AppValidationError> {
     use super::{AppValidationError, ContractError, DataValue};
     let mut rendered = Vec::new();
     match value {
         DataValue::Text { value } => {
-            if value.starts_with(['=', '+', '-', '@', '\t', '\r', '\n']) { append(&mut rendered, b"'", cx)?; }
-            append(&mut rendered, value.as_bytes(), cx)?;
-            append_csv_quoted(bytes, std::str::from_utf8(&rendered).expect("UTF-8 source preserved"), cx)?;
+            if value.starts_with(['=', '+', '-', '@', '\t', '\r', '\n']) { append(&mut rendered, b"'", max_bytes, cx)?; }
+            append(&mut rendered, value.as_bytes(), max_bytes, cx)?;
+            append_csv_quoted(bytes, std::str::from_utf8(&rendered).expect("UTF-8 source preserved"), max_bytes, cx)?;
         }
-        DataValue::Boolean { value } => append_csv_quoted(bytes, if *value { "true" } else { "false" }, cx)?,
+        DataValue::Boolean { value } => append_csv_quoted(bytes, if *value { "true" } else { "false" }, max_bytes, cx)?,
         DataValue::Integer { value } => {
-            append_i64_csv(bytes, *value, cx)?;
+            append_i64_csv(bytes, *value, max_bytes, cx)?;
         }
         DataValue::Date { days } => {
             let date = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
                 .and_then(|epoch| epoch.checked_add_signed(chrono::Duration::days(i64::from(*days))))
                 .ok_or_else(|| AppValidationError::Contract(ContractError("date overflow".into())))?;
-            append_date_csv(bytes, date, cx)?;
+            append_date_csv(bytes, date, max_bytes, cx)?;
         }
         DataValue::Reference { .. } => {
             let encoded = crate::product_backup::fallible_codec::canonical_bytes(&JsonScalar(value), cx).map_err(codec_error)?;
-            append_csv_quoted(bytes, std::str::from_utf8(&encoded).expect("canonical JSON is UTF-8"), cx)?;
+            append_csv_quoted(bytes, std::str::from_utf8(&encoded).expect("canonical JSON is UTF-8"), max_bytes, cx)?;
         }
         DataValue::Null | DataValue::List { .. } => return Err(AppValidationError::Contract(ContractError("output cells must be scalar".into()))),
     }
     Ok(())
 }
 
-fn append_csv_quoted(bytes: &mut Vec<u8>, value: &str, cx: &mut AllocationContext) -> Result<(), super::AppValidationError> {
-    append_csv_quoted_with_literal_prefix(bytes, value, false, cx)
+fn append_csv_quoted(bytes: &mut Vec<u8>, value: &str, max_bytes: usize, cx: &mut AllocationContext) -> Result<(), super::AppValidationError> {
+    append_csv_quoted_with_literal_prefix(bytes, value, false, max_bytes, cx)
 }
 
 fn append_csv_quoted_with_literal_prefix(
     bytes: &mut Vec<u8>,
     value: &str,
     literal_prefix: bool,
+    max_bytes: usize,
     cx: &mut AllocationContext,
 ) -> Result<(), super::AppValidationError> {
     if value.contains([',', '"', '\r', '\n']) {
-        append(bytes, b"\"", cx)?;
-        if literal_prefix { append(bytes, b"'", cx)?; }
+        append(bytes, b"\"", max_bytes, cx)?;
+        if literal_prefix { append(bytes, b"'", max_bytes, cx)?; }
         for chunk in value.split_inclusive('"') {
             if let Some(prefix) = chunk.strip_suffix('"') {
-                append(bytes, prefix.as_bytes(), cx)?;
-                append(bytes, b"\"\"", cx)?;
+                append(bytes, prefix.as_bytes(), max_bytes, cx)?;
+                append(bytes, b"\"\"", max_bytes, cx)?;
             } else {
-                append(bytes, chunk.as_bytes(), cx)?;
+                append(bytes, chunk.as_bytes(), max_bytes, cx)?;
             }
         }
-        append(bytes, b"\"", cx)?;
+        append(bytes, b"\"", max_bytes, cx)?;
     } else {
-        if literal_prefix { append(bytes, b"'", cx)?; }
-        append(bytes, value.as_bytes(), cx)?;
+        if literal_prefix { append(bytes, b"'", max_bytes, cx)?; }
+        append(bytes, value.as_bytes(), max_bytes, cx)?;
     }
     Ok(())
 }
@@ -301,7 +352,7 @@ impl Serialize for ArtifactReceipt<'_> {
     }
 }
 
-fn append_i64_csv(bytes: &mut Vec<u8>, value: i64, cx: &mut AllocationContext) -> Result<(), super::AppValidationError> {
+fn append_i64_csv(bytes: &mut Vec<u8>, value: i64, max_bytes: usize, cx: &mut AllocationContext) -> Result<(), super::AppValidationError> {
     let mut buffer = [0u8; 20];
     let negative = value < 0;
     let mut number = value.unsigned_abs();
@@ -313,14 +364,14 @@ fn append_i64_csv(bytes: &mut Vec<u8>, value: i64, cx: &mut AllocationContext) -
         if number == 0 { break; }
     }
     if negative { index -= 1; buffer[index] = b'-'; }
-    append_csv_quoted(bytes, std::str::from_utf8(&buffer[index..]).expect("ASCII integer"), cx)
+    append_csv_quoted(bytes, std::str::from_utf8(&buffer[index..]).expect("ASCII integer"), max_bytes, cx)
 }
 
-fn append_date_csv(bytes: &mut Vec<u8>, date: chrono::NaiveDate, cx: &mut AllocationContext) -> Result<(), super::AppValidationError> {
+fn append_date_csv(bytes: &mut Vec<u8>, date: chrono::NaiveDate, max_bytes: usize, cx: &mut AllocationContext) -> Result<(), super::AppValidationError> {
     let mut rendered = StackString::<16>::new();
     std::fmt::Write::write_fmt(&mut rendered, format_args!("{date}"))
         .map_err(|_| super::AppValidationError::Contract(super::ContractError("date formatting invariant".into())))?;
-    append_csv_quoted(bytes, rendered.as_str(), cx)
+    append_csv_quoted(bytes, rendered.as_str(), max_bytes, cx)
 }
 
 pub(crate) fn decode_local_artifact(
@@ -652,7 +703,7 @@ mod tests {
         }
         let mut cx = AllocationContext::new();
         assert!(matches!(
-            encode_output_fallible(OutputFormat::Csv, &csv_columns, &csv_rows, &mut cx),
+            encode_output_fallible(OutputFormat::Csv, &csv_columns, &csv_rows, MAX_OUTPUT_BYTES, &mut cx),
             Err(AppValidationError::Contract(ContractError(message))) if message == "output byte limit exceeded"
         ));
         assert_eq!(cx.first_failure(), None);
@@ -678,7 +729,7 @@ mod tests {
         }
         let mut cx = AllocationContext::new();
         assert!(matches!(
-            encode_output_fallible(OutputFormat::Json, &json_columns, &json_rows, &mut cx),
+            encode_output_fallible(OutputFormat::Json, &json_columns, &json_rows, MAX_OUTPUT_BYTES, &mut cx),
             Err(AppValidationError::Contract(ContractError(message))) if message == "output byte limit exceeded"
         ));
         assert_eq!(cx.first_failure(), None);

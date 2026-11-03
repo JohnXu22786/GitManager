@@ -310,6 +310,92 @@ pub struct ProductRun {
     receipts: BTreeMap<Id, (Digest, TraceStep)>,
 }
 
+/// Transaction-local run owner for callers that already hold the fallibly
+/// decoded program, data and session graphs. The legacy `ProductRun` remains
+/// unchanged; ProductStore can migrate its apply path to this owner without
+/// materializing the legacy runtime DTOs.
+pub(crate) struct DecodedProductRun<'a> {
+    program: &'a FallibleDecodedCapturedProgram,
+    data: FallibleDecodedDataSnapshot,
+    session: FallibleDecodedSessionState,
+    day: i32,
+    seed: u64,
+    limits: RuntimeLimits,
+    fuel: u64,
+    trace: Vec<DecodedTraceStep>,
+    observations: Vec<view::DecodedRuntimeObservation>,
+    outputs: Vec<FallibleDecodedLocalArtifact>,
+    receipts: Vec<DecodedOperationReceipt>,
+}
+
+#[derive(Debug)]
+pub(crate) struct DecodedTraceStep {
+    pub(crate) index: usize,
+    pub(crate) operation_id: String,
+    pub(crate) input_digest: Digest,
+    pub(crate) action: Option<String>,
+    pub(crate) before_data: Digest,
+    pub(crate) after_data: Digest,
+    pub(crate) before_session: Digest,
+    pub(crate) after_session: Digest,
+    pub(crate) outputs: Vec<Digest>,
+    pub(crate) outcome: StepOutcome,
+    pub(crate) diagnostic: Option<String>,
+}
+
+struct DecodedOperationReceipt {
+    operation_id: String,
+    step: usize,
+}
+
+impl DecodedProductRun<'_> {
+    pub(crate) fn data(&self) -> &FallibleDecodedDataSnapshot { &self.data }
+    pub(crate) fn session(&self) -> &FallibleDecodedSessionState { &self.session }
+    pub(crate) fn trace(&self) -> &[DecodedTraceStep] { &self.trace }
+    pub(crate) fn observations(&self) -> &[view::DecodedRuntimeObservation] { &self.observations }
+    pub(crate) fn artifacts(&self) -> &[FallibleDecodedLocalArtifact] { &self.outputs }
+    pub(crate) fn clock_day(&self) -> i32 { self.day }
+}
+impl DecodedTraceStep {
+    fn try_clone_with(
+        &self,
+        allocations: &mut product_alloc::AllocationContext,
+    ) -> Result<Self> {
+        let copy_string = |value: &str, allocations: &mut product_alloc::AllocationContext| {
+            product_alloc::try_copy_str(value, allocations, product_alloc::AllocationSite::String)
+                .map_err(AdapterError::Allocation)
+        };
+        let mut outputs = Vec::new();
+        product_alloc::try_reserve(&mut outputs, self.outputs.len(), allocations, product_alloc::AllocationSite::Vector)
+            .map_err(AdapterError::Allocation)?;
+        for digest in &self.outputs {
+            outputs.push(try_clone_digest(digest, allocations)?);
+        }
+        Ok(Self {
+            index: self.index,
+            operation_id: copy_string(&self.operation_id, allocations)?,
+            input_digest: try_clone_digest(&self.input_digest, allocations)?,
+            action: self.action.as_deref().map(|value| copy_string(value, allocations)).transpose()?,
+            before_data: try_clone_digest(&self.before_data, allocations)?,
+            after_data: try_clone_digest(&self.after_data, allocations)?,
+            before_session: try_clone_digest(&self.before_session, allocations)?,
+            after_session: try_clone_digest(&self.after_session, allocations)?,
+            outputs,
+            outcome: self.outcome,
+            diagnostic: self.diagnostic.as_deref().map(|value| copy_string(value, allocations)).transpose()?,
+        })
+    }
+}
+
+fn try_clone_digest(
+    digest: &Digest,
+    allocations: &mut product_alloc::AllocationContext,
+) -> Result<Digest> {
+    let value = product_alloc::try_copy_str(digest.as_str(), allocations, product_alloc::AllocationSite::String)
+        .map_err(AdapterError::Allocation)?;
+    Digest::from_owned_lower_hex(value).ok_or_else(|| failed("decoded digest copy invariant"))
+}
+
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum DecodedObserveInput<'a> {
@@ -361,6 +447,9 @@ impl crate::product_backup::fallible_codec::BackupWire for DecodedRunEvidenceWir
 #[derive(Serialize)]
 struct DecodedObserveRequest<'a>(DecodedObserveInput<'a>, &'a ArtifactRef);
 impl crate::product_backup::fallible_codec::BackupWire for DecodedObserveRequest<'_> {}
+#[derive(Serialize)]
+struct DecodedApplyRequest<'a>(&'a SemanticInput, &'a ArtifactRef);
+impl crate::product_backup::fallible_codec::BackupWire for DecodedApplyRequest<'_> {}
 impl ProductRun {
     pub fn trace(&self) -> &[TraceStep] {
         &self.trace
@@ -375,6 +464,195 @@ impl ProductRun {
         self.state.day
     }
 }
+
+impl LocalRuntime {
+    pub(crate) fn start_decoded<'a>(
+        &self,
+        program: &'a FallibleDecodedCapturedProgram,
+        data: &FallibleDecodedDataSnapshot,
+        session: &FallibleDecodedSessionState,
+        clock_day: i32,
+        random_seed: u64,
+        limits: RuntimeLimits,
+        allocations: &mut product_alloc::AllocationContext,
+    ) -> Result<DecodedProductRun<'a>> {
+        program.validate_with(allocations).map_err(app_adapter_error)?;
+        data.validate_with(allocations).map_err(app_adapter_error)?;
+        program.validate_session_with(session, allocations).map_err(app_adapter_error)?;
+        validate_day(clock_day).map_err(AdapterError::Invalid)?;
+        limits.validate().map_err(AdapterError::Invalid)?;
+        if data.project_id() != program.project_id() {
+            return Err(invalid("program and data belong to different projects"));
+        }
+        let (compatibility, merged) = self.decoded_compatibility_with(program, data, clock_day, allocations)?;
+        if compatibility != CompatibilityState::Compatible {
+            return Err(AdapterError::Unsupported(format!("decoded data is not compatible with the current app: {compatibility:?}")));
+        }
+        let mut initial = Meter::with_allocations(
+            limits.clone(), limits.fuel, self.cancelled.clone(),
+            std::mem::replace(allocations, product_alloc::AllocationContext::new()),
+        );
+        let constraints = execute::constraints_decoded(program, &merged, session, clock_day, &mut initial);
+        *allocations = initial.allocations;
+        constraints?;
+        let data = data.try_clone_with(allocations).map_err(|error| match error {
+            FallibleDataSnapshotCloneError::Allocation(failure) => AdapterError::Allocation(failure),
+            FallibleDataSnapshotCloneError::Invariant => failed("decoded initial data copy invariant"),
+        })?;
+        let session = session.try_clone_with(allocations).map_err(app_adapter_error)?;
+        Ok(DecodedProductRun {
+            program,
+            data,
+            session,
+            day: clock_day,
+            seed: random_seed,
+            fuel: limits.fuel,
+            limits,
+            trace: Vec::new(),
+            observations: Vec::new(),
+            outputs: Vec::new(),
+            receipts: Vec::new(),
+        })
+    }
+
+    /// Apply the bounded decoded ProductRun slice. Invoke shares the statement
+    /// transaction and finalization kernel with the legacy runtime. Observe is
+    /// retained for cold reopen; other semantic inputs are explicitly deferred.
+    pub(crate) fn apply_decoded(
+        &self,
+        run: &mut DecodedProductRun<'_>,
+        input: &SemanticInput,
+        operation_id: &str,
+        allocations: &mut product_alloc::AllocationContext,
+    ) -> Result<DecodedTraceStep> {
+        if !valid_id(operation_id) { return Err(invalid("invalid operation ID")); }
+        validate_input_shape(input)?;
+        let request = crate::product_backup::fallible_codec::canonical_digest(
+            IdentityDomain::Input,
+            &DecodedApplyRequest(input, run.program.artifact()),
+            allocations,
+        ).map_err(codec_adapter_error)?;
+        if let Some(receipt) = run.receipts.iter().find(|receipt| receipt.operation_id == operation_id) {
+            return if run.trace[receipt.step].input_digest == request {
+                run.trace[receipt.step].try_clone_with(allocations)
+            } else {
+                Err(AdapterError::Stale("Operation ID belongs to another input".into()))
+            };
+        }
+        if run.data.events().iter().any(|event| event.operation_id() == operation_id) {
+            return Err(AdapterError::Stale(
+                "Operation already committed; resolve its persisted receipt before retrying".into(),
+            ));
+        }
+        if run.trace.len() >= run.limits.action_steps {
+            return Err(exhausted("input action limit"));
+        }
+
+        let before_data = run.data.identity_with(allocations).map_err(app_adapter_error)?;
+        let before_session = run.session.identity_with(allocations).map_err(codec_adapter_error)?;
+        let (action, mut next_data, mut next_session, mut next_observation) = match input {
+            SemanticInput::Invoke { action, .. } => (
+                Some(action.as_str()),
+                run.data.try_clone_with(allocations).map_err(|error| match error {
+                    FallibleDataSnapshotCloneError::Allocation(failure) => AdapterError::Allocation(failure),
+                    FallibleDataSnapshotCloneError::Invariant => failed("decoded action snapshot copy invariant"),
+                })?,
+                run.session.try_clone_with(allocations).map_err(app_adapter_error)?,
+                None,
+            ),
+            SemanticInput::Observe { point } => {
+                if run.observations.iter().any(|observation| observation.point() == point) {
+                    return Err(invalid("observation point already used"));
+                }
+                (None,
+                    run.data.try_clone_with(allocations).map_err(|error| match error {
+                        FallibleDataSnapshotCloneError::Allocation(failure) => AdapterError::Allocation(failure),
+                        FallibleDataSnapshotCloneError::Invariant => failed("decoded observation snapshot copy invariant"),
+                    })?,
+                    run.session.try_clone_with(allocations).map_err(app_adapter_error)?,
+                    None)
+            }
+            _ => return Err(AdapterError::Unsupported("decoded ProductRun input is not routed yet".into())),
+        };
+        let owned_allocations = std::mem::replace(allocations, product_alloc::AllocationContext::new());
+        let mut meter = Meter::with_allocations(run.limits.clone(), run.fuel, self.cancelled.clone(), owned_allocations);
+        meter.decoded_output_base_count = run.outputs.len();
+        meter.decoded_output_base_bytes = run.outputs.iter()
+            .map(FallibleDecodedLocalArtifact::byte_len).fold(0usize, usize::saturating_add);
+        let result = (|| {
+            meter.tick(1)?;
+            match input {
+                SemanticInput::Invoke { action, arguments } => execute::action_decoded(
+                    run.program, &mut next_data, &mut next_session, run.day,
+                    action, arguments, operation_id, run.seed, &mut meter,
+                )?,
+                SemanticInput::Observe { point } => {
+                    if !valid_id(point) { return Err(invalid("invalid observation point")); }
+                    next_observation = Some(view::observe_decoded_with_meter(
+                        run.program, &next_data, &next_session, run.day, point, &run.outputs, &mut meter,
+                    )?);
+                }
+                _ => unreachable!("decoded inputs were bounded above"),
+            }
+            meter.tick(1)?;
+            Ok(())
+        })();
+        *allocations = meter.allocations;
+        if matches!(&result, Err(AdapterError::Allocation(_))) { return result.map(|_| unreachable!()); }
+        let emitted = std::mem::take(&mut meter.decoded_outputs);
+        let output_digests = if result.is_ok() {
+            execute::decoded_output_digests(&emitted, allocations)?
+        } else { Vec::new() };
+
+        let (outcome, diagnostic) = match &result {
+            Ok(()) => (StepOutcome::Applied, None),
+            Err(AdapterError::Invalid(_)) => (StepOutcome::Rejected, Some(diagnostic_decoded(result.as_ref().unwrap_err(), allocations)?)),
+            Err(AdapterError::BudgetExhausted(_)) => (StepOutcome::BudgetExhausted, Some(diagnostic_decoded(result.as_ref().unwrap_err(), allocations)?)),
+            Err(error) => (StepOutcome::Failed, Some(diagnostic_decoded(error, allocations)?)),
+        };
+        let after_data = if result.is_ok() { next_data.identity_with(allocations).map_err(app_adapter_error)? } else { try_clone_digest(&before_data, allocations)? };
+        let after_session = if result.is_ok() { next_session.identity_with(allocations).map_err(codec_adapter_error)? } else { try_clone_digest(&before_session, allocations)? };
+        let step_action = action.map(|action| product_alloc::try_copy_str(action, allocations, product_alloc::AllocationSite::String).map_err(AdapterError::Allocation)).transpose()?;
+        let step = DecodedTraceStep {
+            index: run.trace.len(),
+            operation_id: product_alloc::try_copy_str(operation_id, allocations, product_alloc::AllocationSite::String).map_err(AdapterError::Allocation)?,
+            input_digest: request,
+            action: step_action,
+            before_data,
+            after_data,
+            before_session,
+            after_session,
+            outputs: output_digests,
+            outcome,
+            diagnostic,
+        };
+        product_alloc::try_reserve(&mut run.trace, 1, allocations, product_alloc::AllocationSite::Vector).map_err(AdapterError::Allocation)?;
+        let receipt_operation = if result.is_ok() {
+            product_alloc::try_reserve(&mut run.receipts, 1, allocations, product_alloc::AllocationSite::Vector).map_err(AdapterError::Allocation)?;
+            product_alloc::try_copy_str(operation_id, allocations, product_alloc::AllocationSite::String).map_err(AdapterError::Allocation)?
+        } else { String::new() };
+        let returned_step = if result.is_ok() { Some(step.try_clone_with(allocations)?) } else { None };
+        if result.is_ok() && next_observation.is_some() {
+            product_alloc::try_reserve(&mut run.observations, 1, allocations, product_alloc::AllocationSite::Vector).map_err(AdapterError::Allocation)?;
+        }
+        if result.is_ok() {
+            product_alloc::try_reserve(&mut run.outputs, emitted.len(), allocations, product_alloc::AllocationSite::Vector).map_err(AdapterError::Allocation)?;
+        }
+        run.fuel = meter.fuel;
+        if result.is_ok() {
+            run.data = next_data;
+            run.session = next_session;
+            if let Some(observation) = next_observation {
+                run.observations.push(observation);
+            }
+            run.outputs.extend(emitted);
+            run.receipts.push(DecodedOperationReceipt { operation_id: receipt_operation, step: step.index });
+        }
+        run.trace.push(step);
+        result?;
+        Ok(returned_step.expect("successful decoded apply prepared its result"))
+    }
+}
 struct Meter {
     limits: RuntimeLimits,
     fuel: u64,
@@ -384,6 +662,9 @@ struct Meter {
     cancelled: Arc<AtomicBool>,
     allocations: product_alloc::AllocationContext,
     row: Option<capture::RowStop>,
+    decoded_outputs: Vec<FallibleDecodedLocalArtifact>,
+    decoded_output_base_count: usize,
+    decoded_output_base_bytes: usize,
 }
 impl Meter {
     fn new(limits: RuntimeLimits, fuel: u64, cancelled: Arc<AtomicBool>) -> Self {
@@ -404,6 +685,9 @@ impl Meter {
             cancelled,
             allocations,
             row: None,
+            decoded_outputs: Vec::new(),
+            decoded_output_base_count: 0,
+            decoded_output_base_bytes: 0,
         }
     }
     fn tick(&mut self, cost: u64) -> Result<()> {
@@ -928,13 +1212,13 @@ impl LocalRuntime {
         validate_day(day)?;
         compatibility::check(&ProgramSource::ordinary(program), current, Some(day))
     }
-    pub(crate) fn compatibility_decoded_state_at(
+    fn decoded_compatibility_with(
         &self,
         program: &FallibleDecodedCapturedProgram,
         current: &FallibleDecodedDataSnapshot,
         day: i32,
-        mut allocations: product_alloc::AllocationContext,
-    ) -> Result<CompatibilityState> {
+        allocations: &mut product_alloc::AllocationContext,
+    ) -> Result<(CompatibilityState, FallibleDecodedDataSnapshot)> {
         fn app_error(error: AppValidationError) -> AdapterError {
             match error {
                 AppValidationError::Contract(error) => AdapterError::Invalid(error),
@@ -942,8 +1226,8 @@ impl LocalRuntime {
             }
         }
         validate_day(day)?;
-        program.validate_with(&mut allocations).map_err(app_error)?;
-        current.validate_with(&mut allocations).map_err(app_error)?;
+        program.validate_with(allocations).map_err(app_error)?;
+        current.validate_with(allocations).map_err(app_error)?;
         if program.project_id() != current.project_id() { return Err(invalid("compatibility project mismatch")); }
 
         let app = AppRef::from(program.app());
@@ -959,19 +1243,33 @@ impl LocalRuntime {
                 state = CompatibilityState::RetainedButUnavailable;
             }
         }
-        let merged = match current.merge_app_with(program.app(), &mut allocations) {
+        let merged = match current.merge_app_with(program.app(), allocations) {
             Ok(merged) => merged,
             Err(AppValidationError::Allocation(failure)) => return Err(AdapterError::Allocation(failure)),
-            Err(AppValidationError::Contract(_)) => return Ok(CompatibilityState::Incompatible),
+            Err(AppValidationError::Contract(_)) => return Ok((CompatibilityState::Incompatible, current.try_clone_with(allocations).map_err(|error| match error {
+                FallibleDataSnapshotCloneError::Allocation(failure) => AdapterError::Allocation(failure),
+                FallibleDataSnapshotCloneError::Invariant => failed("decoded compatibility data copy invariant"),
+            })?)),
         };
-        let session = program.initial_session_with(&mut allocations).map_err(AdapterError::Allocation)?;
+        let session = program.initial_session_with(allocations).map_err(AdapterError::Allocation)?;
         let limits = RuntimeLimits { fuel: 10_000_000, ..RuntimeLimits::default() };
-        let mut meter = Meter::with_allocations(limits.clone(), limits.fuel, Arc::new(AtomicBool::new(false)), allocations);
+        let owned_allocations = std::mem::replace(allocations, product_alloc::AllocationContext::new());
+        let mut meter = Meter::with_allocations(limits.clone(), limits.fuel, Arc::new(AtomicBool::new(false)), owned_allocations);
         match execute::constraints_decoded(program, &merged, &session, day, &mut meter) {
-            Ok(()) => Ok(state),
-            Err(AdapterError::Allocation(failure)) => Err(AdapterError::Allocation(failure)),
-            Err(_) => Ok(CompatibilityState::Incompatible),
+            Ok(()) => { *allocations = meter.allocations; Ok((state, merged)) },
+            Err(AdapterError::Allocation(failure)) => { *allocations = meter.allocations; Err(AdapterError::Allocation(failure)) },
+            Err(_) => { *allocations = meter.allocations; Ok((CompatibilityState::Incompatible, merged)) },
         }
+    }
+    pub(crate) fn compatibility_decoded_state_at(
+        &self,
+        program: &FallibleDecodedCapturedProgram,
+        current: &FallibleDecodedDataSnapshot,
+        day: i32,
+        mut allocations: product_alloc::AllocationContext,
+    ) -> Result<CompatibilityState> {
+        self.decoded_compatibility_with(program, current, day, &mut allocations)
+            .map(|(state, _)| state)
     }
     /// Resume daily work with its actual committed artifact receipts. Scenario
     /// replay intentionally starts with no new emissions; it uses `start`.
@@ -1317,7 +1615,7 @@ impl LocalRuntime {
                     return Err(invalid("invalid observation input"));
                 }
                 let result = view::observe_decoded_with_meter(
-                    program, &start_data, &start_session, scenario.clock_day(), point, &mut meter,
+                    program, &start_data, &start_session, scenario.clock_day(), point, &[], &mut meter,
                 )?;
                 meter.tick(1)?;
                 Ok(result)

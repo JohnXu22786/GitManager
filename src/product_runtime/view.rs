@@ -201,13 +201,14 @@ pub(crate) struct DecodedRuntimeObservation {
     view: DecodedViewObservation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     view_schema: Option<DecodedViewSchema>,
-    outputs: Vec<()>,
+    outputs: Vec<FallibleDecodedLocalArtifact>,
 }
 impl DecodedRuntimeObservation {
     pub(super) fn point(&self) -> &str { &self.point }
     pub(super) fn data_digest(&self) -> &Digest { &self.data_digest }
     pub(super) fn session_digest(&self) -> &Digest { &self.session_digest }
     pub(super) fn outputs_empty(&self) -> bool { self.outputs.is_empty() }
+    pub(crate) fn outputs(&self) -> &[FallibleDecodedLocalArtifact] { &self.outputs }
 }
 
 #[derive(Debug, Serialize)]
@@ -331,7 +332,7 @@ pub(super) fn observe_decoded(
 
     let owned_allocations = std::mem::replace(allocations, AllocationContext::new());
     let mut meter = Meter::with_allocations(limits.clone(), limits.fuel, cancelled, owned_allocations);
-    let result = observe_decoded_with_meter(program, data, session, day, point, &mut meter);
+    let result = observe_decoded_with_meter(program, data, session, day, point, &[], &mut meter);
     *allocations = meter.allocations;
     result
 }
@@ -346,6 +347,7 @@ pub(super) fn observe_decoded_with_meter(
     session: &FallibleDecodedSessionState,
     day: i32,
     point: &str,
+    outputs: &[FallibleDecodedLocalArtifact],
     meter: &mut Meter,
 ) -> Result<DecodedRuntimeObservation> {
     if !valid_id(point) { return Err(invalid("invalid observation point")); }
@@ -375,6 +377,14 @@ pub(super) fn observe_decoded_with_meter(
             .map_err(AdapterError::Allocation)?;
     }
     let view_schema = decoded_view_schema(program, &view.view, meter)?;
+    let mut observed_outputs = Vec::new();
+    product_alloc::try_reserve(&mut observed_outputs, outputs.len(), &mut meter.allocations, product_alloc::AllocationSite::Vector)
+        .map_err(AdapterError::Allocation)?;
+    for output in outputs {
+        let copy = output.try_clone_with(&mut meter.allocations).map_err(decoded_app_error)?;
+        product_alloc::try_push(&mut observed_outputs, copy, &mut meter.allocations, product_alloc::AllocationSite::Vector)
+            .map_err(AdapterError::Allocation)?;
+    }
     let observation = DecodedRuntimeObservation {
         point: decoded_copy_str(point, meter)?,
         data_digest,
@@ -383,7 +393,7 @@ pub(super) fn observe_decoded_with_meter(
         value_types: DecodedTypeMap(value_types),
         view,
         view_schema,
-        outputs: Vec::new(),
+        outputs: observed_outputs,
     };
     meter.tick(1)?;
     Ok(observation)

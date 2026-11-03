@@ -1,11 +1,16 @@
 use super::*;
-use eval::{boolean, list, record, record_view, value_ref};
+use eval::{boolean, list, record, record_view, value_ref, EnvMut};
+use super::owned_env::ManagedEnv;
+
+fn try_clone_decoded_env(env: &dyn EnvAccess, allocations: &mut product_alloc::AllocationContext) -> Result<ManagedEnv> {
+    env.try_managed_copy(allocations).map_err(AdapterError::Allocation)
+}
 
 fn evaluate(
     app: AppRef<'_>,
     state: &State,
     expr: &Expr,
-    env: &Env,
+    env: &dyn EnvAccess,
     meter: &mut Meter,
 ) -> Result<DataValue> {
     Eval::view(app, DataSnapshotView::from(&state.data), SessionStateView::from(&state.session), state.day, meter)
@@ -15,7 +20,7 @@ fn evaluate_owner(
     app: AppRef<'_>,
     state: &KernelState<'_>,
     expr: &Expr,
-    env: &Env,
+    env: &dyn EnvAccess,
     meter: &mut Meter,
 ) -> Result<DataValue> {
     let (data, session, day) = state.views();
@@ -25,7 +30,7 @@ fn assignments(
     app: AppRef<'_>,
     state: &State,
     values: StringMapRef<'_, Expr>,
-    env: &Env,
+    env: &dyn EnvAccess,
     meter: &mut Meter,
 ) -> Result<Values> {
     values
@@ -37,7 +42,7 @@ fn update_assignments(
     app: AppRef<'_>,
     state: &KernelState<'_>,
     values: StringMapRef<'_, Expr>,
-    env: &Env,
+    env: &dyn EnvAccess,
     meter: &mut Meter,
 ) -> Result<UpdateValues> {
     match state {
@@ -292,6 +297,23 @@ fn collection_value(
 
 fn next_generation(generation: u64) -> Result<u64> {
     generation.checked_add(1).ok_or_else(|| failed("data generation overflow"))
+}
+
+pub(super) fn decoded_output_digests(
+    outputs: &[FallibleDecodedLocalArtifact],
+    allocations: &mut product_alloc::AllocationContext,
+) -> Result<Vec<Digest>> {
+    let mut digests = Vec::new();
+    product_alloc::try_reserve(&mut digests, outputs.len(), allocations, product_alloc::AllocationSite::Vector)
+        .map_err(AdapterError::Allocation)?;
+    for output in outputs {
+        let value = product_alloc::try_copy_str(output.digest().as_str(), allocations, product_alloc::AllocationSite::String)
+            .map_err(AdapterError::Allocation)?;
+        let digest = Digest::from_owned_lower_hex(value).ok_or_else(|| failed("decoded output digest invariant"))?;
+        product_alloc::try_push(&mut digests, digest, allocations, product_alloc::AllocationSite::Vector)
+            .map_err(AdapterError::Allocation)?;
+    }
+    Ok(digests)
 }
 
 /// Shared decoded finalization entry point for the next ProductRun apply
@@ -1425,11 +1447,85 @@ struct Transaction<'a> {
     cancel_after_statement: Option<Arc<AtomicBool>>,
 }
 impl Transaction<'_> {
-    fn statements(
+    fn emit_decoded(
+        &mut self,
+        state: &KernelState<'_>,
+        output: &str,
+        items_expr: &Expr,
+        binding: &str,
+        columns: StringMapRef<'_, Expr>,
+        env: &dyn EnvAccess,
+        meter: &mut Meter,
+    ) -> Result<()> {
+        let definition = self.app.outputs().iter().find(|definition| definition.id == output)
+            .ok_or_else(|| failed("output absent"))?;
+        let (item_type, items) = list(evaluate_owner(self.app, state, items_expr, env, meter)?)?;
+        meter.collection(items.len())?;
+        if meter.decoded_output_base_count.saturating_add(meter.decoded_outputs.len()) >= MAX_ITEMS {
+            return Err(exhausted("cumulative output limit"));
+        }
+        let prior_bytes = meter.decoded_outputs.iter()
+            .map(FallibleDecodedLocalArtifact::byte_len)
+            .fold(meter.decoded_output_base_bytes, usize::saturating_add);
+        let remaining_bytes = meter.limits.output_bytes.saturating_sub(prior_bytes);
+        let output_size = |rows: &[FallibleValues], meter: &mut Meter| {
+            crate::product_contract::decoded_output_byte_len_with(
+                definition.format,
+                &definition.columns,
+                rows,
+                remaining_bytes,
+                &mut meter.allocations,
+            ).map_err(|error| match error {
+                AppValidationError::Contract(contract) if contract.0 == "output byte limit exceeded" => exhausted("cumulative output limit"),
+                other => app_validation_error(other),
+            })
+        };
+        let header_bytes = output_size(&[], meter)?;
+        let mut encoded_bytes = header_bytes;
+        let mut rows = Vec::new();
+        product_alloc::try_reserve(&mut rows, items.len(), &mut meter.allocations, product_alloc::AllocationSite::Vector)
+            .map_err(AdapterError::Allocation)?;
+        for item in items {
+            meter.tick(1)?;
+            let mut local = try_clone_decoded_env(env, &mut meter.allocations)?;
+            EnvMut::try_bind(&mut local, binding, &item_type, &item, meter)?;
+            let mut row = FallibleValues::new();
+            for (column, expression) in columns.iter() {
+                let value = evaluate_owner(self.app, state, expression, &local, meter)?;
+                meter.value(&value)?;
+                let key = product_alloc::try_copy_str(column, &mut meter.allocations, product_alloc::AllocationSite::String)
+                    .map_err(AdapterError::Allocation)?;
+                let value = try_clone_data_value_with(&value, &mut meter.allocations)
+                    .map_err(AdapterError::Allocation)?;
+                row.try_insert(key, value, &mut meter.allocations).map_err(AdapterError::Allocation)?;
+            }
+            let single_bytes = output_size(std::slice::from_ref(&row), meter)?;
+            let row_bytes = single_bytes.saturating_sub(header_bytes)
+                .saturating_add(usize::from(definition.format == OutputFormat::Json && !rows.is_empty()));
+            encoded_bytes = encoded_bytes.saturating_add(row_bytes);
+            if encoded_bytes > remaining_bytes {
+                return Err(exhausted("cumulative output limit"));
+            }
+            meter.tick(single_bytes as u64)?;
+            product_alloc::try_push(&mut rows, row, &mut meter.allocations, product_alloc::AllocationSite::Vector)
+                .map_err(AdapterError::Allocation)?;
+        }
+        let artifact = FallibleDecodedLocalArtifact::from_rows_with(
+            output, definition.format, &definition.columns, rows, remaining_bytes, &mut meter.allocations,
+        ).map_err(|error| match error {
+            AppValidationError::Contract(contract) if contract.0 == "output byte limit exceeded" => exhausted("cumulative output limit"),
+            other => app_validation_error(other),
+        })?;
+        meter.tick(artifact.byte_len() as u64)?;
+        product_alloc::try_push(&mut meter.decoded_outputs, artifact, &mut meter.allocations, product_alloc::AllocationSite::Vector)
+            .map_err(AdapterError::Allocation)
+    }
+
+    fn statements<E: EnvMut>(
         &mut self,
         state: &mut KernelState<'_>,
         steps: StatementSlice<'_>,
-        env: &mut Env,
+        env: &mut E,
         meter: &mut Meter,
     ) -> Result<()> {
         let app = self.app;
@@ -1467,7 +1563,7 @@ impl Transaction<'_> {
                             archived: false,
                             values,
                         };
-                        env.insert(bind.to_owned(), (Type::reference(entity), value_ref(&row)));
+                        env.try_bind(bind, &Type::reference(entity), &value_ref(&row), meter)?;
                         state.data.records.push(row);
                     }
                     KernelState::Decoded { .. } => {
@@ -1489,9 +1585,7 @@ impl Transaction<'_> {
                         }
                         data.try_append_record(entity, &id, 1, self.program_digest, values, &mut meter.allocations)
                             .map_err(app_validation_error)?;
-                        env.insert(bind.to_owned(), (Type::reference(entity), DataValue::Reference {
-                            entity: entity.to_owned(), record: id,
-                        }));
+                        env.try_bind_reference(bind, entity, entity, &id, meter)?;
                     }
                 },
                 StatementView::Update { record, values } => {
@@ -1588,8 +1682,8 @@ impl Transaction<'_> {
                     let (typ, items) = list(evaluate_owner(app, state, items, env, meter)?)?;
                     for item in items {
                         meter.tick(1)?;
-                        let mut local = env.clone();
-                        local.insert(binding.to_owned(), (typ.clone(), item));
+                        let mut local = env.try_clone_for_statement(meter)?;
+                        EnvMut::try_bind(&mut local, binding, &typ, &item, meter)?;
                         self.statements(state, steps, &mut local, meter)?;
                     }
                 }
@@ -1604,6 +1698,10 @@ impl Transaction<'_> {
                     binding,
                     columns,
                 } => {
+                    if matches!(state, KernelState::Decoded { .. }) {
+                        self.emit_decoded(state, output, items, binding, columns, env, meter)?;
+                        continue;
+                    }
                     let state = state.legacy()?;
                     let program = self.program.ok_or_else(|| failed("output requires captured legacy program"))?;
                     let definition = app
@@ -1659,8 +1757,8 @@ impl Transaction<'_> {
                                 participants = None;
                             }
                         }
-                        let mut local = env.clone();
-                        local.insert(binding.to_owned(), (typ.clone(), item));
+                        let mut local = env.try_clone_for_statement(meter)?;
+                        local.try_bind(binding, &typ, &item, meter)?;
                         let row = assignments(app, state, columns, &local, meter)?;
                         for value in row.values() {
                             meter.value(value)?;
@@ -1877,6 +1975,75 @@ fn action(
     let KernelState::Legacy(state) = owners else { unreachable!() };
     constraints(program, state, meter)
 }
+
+/// Decoded ProductRun counterpart to `action`. It uses the same transaction
+/// statement interpreter and finalization/constraint passes while keeping the
+/// caller's fallible data and session owners transaction-local.
+pub(super) fn action_decoded(
+    program: &FallibleDecodedCapturedProgram,
+    data: &mut FallibleDecodedDataSnapshot,
+    session: &mut FallibleDecodedSessionState,
+    day: i32,
+    id: &str,
+    arguments: &Values,
+    operation: &str,
+    seed: u64,
+    meter: &mut Meter,
+) -> Result<()> {
+    let app = AppRef::from(program.app());
+    let definition = app.action(id).ok_or_else(|| invalid("unknown action"))?;
+    let parameters = definition.parameters();
+    if arguments.len() != parameters.len() {
+        return Err(invalid("action arguments differ from declared parameters"));
+    }
+    for (argument, typ) in parameters.iter() {
+        let value = arguments.get(argument).ok_or_else(|| invalid("missing input argument"))?;
+        validate_value(value, typ, 0).map_err(AdapterError::Invalid)?;
+    }
+    let mut env = ManagedEnv::new();
+    let data_view = DataSnapshotView::from(&*data);
+    for (argument, value) in arguments {
+        let typ = parameters.get(argument)
+            .ok_or_else(|| invalid("unknown action argument"))?;
+        meter.value(value)?;
+        check_references_decoded(value, data_view)?;
+        EnvMut::try_bind(&mut env, argument, typ, value, meter)?;
+    }
+    let mut owners = KernelState::Decoded { data, session, day };
+    for guard in definition.guards() {
+        if !boolean(evaluate_owner(app, &owners, guard, &env, meter)?)? {
+            return Err(invalid(&format!("Action guard rejected: {id}")));
+        }
+    }
+    let KernelState::Decoded { data, .. } = &owners else { unreachable!() };
+    let previous_data = data.try_clone_with(&mut meter.allocations).map_err(|error| match error {
+        FallibleDataSnapshotCloneError::Allocation(failure) => AdapterError::Allocation(failure),
+        FallibleDataSnapshotCloneError::Invariant => failed("decoded action snapshot copy invariant"),
+    })?;
+    let previous = DataSnapshotView::from(&previous_data);
+    let KernelState::Decoded { data, .. } = &mut owners else { unreachable!() };
+    **data = data.merge_app_with(program.app(), &mut meter.allocations).map_err(app_validation_error)?;
+    Transaction {
+        program: None,
+        app,
+        program_digest: program.program_digest(),
+        operation,
+        seed,
+        created: 0,
+        #[cfg(test)]
+        cancel_after_statement: None,
+    }.statements(&mut owners, definition.steps(), &mut env, meter)?;
+    for ensure in definition.ensures() {
+        if !boolean(evaluate_owner(app, &owners, ensure, &env, meter)?)? {
+            return Err(invalid(&format!("Action postcondition rejected: {id}")));
+        }
+    }
+    let KernelState::Decoded { data, session, .. } = &mut owners else { unreachable!() };
+    let outputs = decoded_output_digests(&meter.decoded_outputs, &mut meter.allocations)?;
+    finalize_decoded_action(data, session, day, previous, id, operation, program.program_digest(), &outputs, meter)?;
+    constraints_decoded(program, data, session, day, meter)
+}
+
 pub(super) fn input(
     program: &ProgramSource,
     state: &mut State,

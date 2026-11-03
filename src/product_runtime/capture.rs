@@ -68,7 +68,10 @@ impl Meter{
         let ProjectionReservation{limits,host_deadline,row_deadline,cancelled,additional_cancelled}=reservation;
         let mut meter=Self{limits,fuel,steps:0,writes:0,started:host_deadline,cancelled,
             allocations:super::product_alloc::AllocationContext::new(),
-            row:Some(RowStop{host_deadline,row_deadline,additional_cancelled})};
+            row:Some(RowStop{host_deadline,row_deadline,additional_cancelled}),
+            decoded_outputs:Vec::new(),
+            decoded_output_base_count:0,
+            decoded_output_base_bytes:0};
         meter.row_charge(272).map_err(cost::resource)?;
         Ok(meter)
     }

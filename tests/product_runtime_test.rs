@@ -134,6 +134,273 @@ fn apply(r: &mut ProductRun, input: SemanticInput, id: &str) {
     LocalRuntime::default().apply(r, &input, id).unwrap();
 }
 
+struct DecodedFixture {
+    program: FallibleDecodedCapturedProgram,
+    data: FallibleDecodedDataSnapshot,
+    session: FallibleDecodedSessionState,
+}
+impl DecodedFixture {
+    fn new(source: serde_json::Value, generation: Option<u64>) -> Self {
+        let capture = fixture::capture(source);
+        let mut data = seed(&capture);
+        if let Some(generation) = generation { data.generation = generation; }
+        let session = SessionState::initial(&capture.program).unwrap();
+        let mut allocations = product_alloc::AllocationContext::new();
+        let program = decode_captured_program_fallible(
+            product_json::parse_json_bytes(&serde_json::to_vec(&capture).unwrap(), &mut allocations).unwrap(),
+            &mut allocations,
+        ).unwrap();
+        let data = decode_data_snapshot_fallible(
+            product_json::parse_json_bytes(&serde_json::to_vec(&data).unwrap(), &mut allocations).unwrap(),
+            &mut allocations,
+        ).unwrap();
+        let session = decode_session_state_fallible(
+            product_json::parse_json_bytes(&serde_json::to_vec(&session).unwrap(), &mut allocations).unwrap(),
+            &mut allocations,
+        ).unwrap();
+        Self { program, data, session }
+    }
+    fn start<'a>(&'a self, runtime: &LocalRuntime) -> DecodedProductRun<'a> {
+        runtime.start_decoded(&self.program, &self.data, &self.session, 20_000, 42,
+            RuntimeLimits::default(), &mut product_alloc::AllocationContext::new()).unwrap()
+    }
+}
+fn decoded_ready_run<'a>(owners: &'a DecodedFixture, runtime: &LocalRuntime) -> DecodedProductRun<'a> {
+    let mut run = owners.start(runtime);
+    let mut allocations = product_alloc::AllocationContext::new();
+    runtime.apply_decoded(&mut run, &add("Ada"), "decoded-add", &mut allocations).unwrap();
+    runtime.apply_decoded(&mut run, &invoke("collect", Values::new()), "decoded-collect", &mut allocations).unwrap();
+    run
+}
+
+#[test]
+fn decoded_product_run_invoke_uses_shared_kernel_and_commits_event_outputs() {
+    let capture = fixture::capture(organizer());
+    let mut allocations = product_alloc::AllocationContext::new();
+    let decoded_program = decode_captured_program_fallible(
+        product_json::parse_json_bytes(&serde_json::to_vec(&capture).unwrap(), &mut allocations).unwrap(),
+        &mut allocations,
+    ).unwrap();
+    let data = seed(&capture);
+    let decoded_data = decode_data_snapshot_fallible(
+        product_json::parse_json_bytes(&serde_json::to_vec(&data).unwrap(), &mut allocations).unwrap(),
+        &mut allocations,
+    ).unwrap();
+    let session = SessionState::initial(&capture.program).unwrap();
+    let decoded_session = decode_session_state_fallible(
+        product_json::parse_json_bytes(&serde_json::to_vec(&session).unwrap(), &mut allocations).unwrap(),
+        &mut allocations,
+    ).unwrap();
+    let runtime = LocalRuntime::default();
+    let initial_identity = decoded_data.identity_with(&mut product_alloc::AllocationContext::new()).unwrap();
+    let mut run = runtime.start_decoded(
+        &decoded_program, &decoded_data, &decoded_session, 20_000, 42,
+        RuntimeLimits::default(), &mut allocations,
+    ).unwrap();
+
+    let step = runtime.apply_decoded(&mut run, &add("Ada"), "decoded-add", &mut allocations).unwrap();
+    assert_eq!(step.outcome, StepOutcome::Applied);
+    assert_eq!(step.before_data, initial_identity, "the first action must retain the caller's original data identity");
+    assert_eq!(run.data().generation(), 1);
+    assert_eq!(run.data().records().len(), 1);
+    assert_eq!(run.data().records()[0].entity(), "person");
+    assert_eq!(run.data().events().len(), 1);
+    assert_eq!(run.data().events()[0].operation_id(), "decoded-add");
+
+    runtime.apply_decoded(&mut run, &invoke("collect", Values::new()), "decoded-collect", &mut allocations).unwrap();
+    let exported = runtime.apply_decoded(&mut run, &invoke("export_people", Values::new()), "decoded-export", &mut allocations).unwrap();
+    assert_eq!(exported.outcome, StepOutcome::Applied);
+    assert_eq!(run.artifacts().len(), 1);
+    assert_eq!(run.artifacts()[0].bytes(), b"name\r\nAda\r\n");
+    assert_eq!(run.data().events().last().unwrap().outputs(), &[run.artifacts()[0].digest().clone()]);
+    runtime.apply_decoded(&mut run, &SemanticInput::Observe { point: "selected_count".into() },
+        "decoded-observe-after-output", &mut allocations).unwrap();
+    assert_eq!(run.observations().last().unwrap().outputs().len(), 1);
+    assert_eq!(run.observations().last().unwrap().outputs()[0].bytes(), b"name\r\nAda\r\n");
+    let prior_generation = run.data().generation();
+    let replay_refusal = runtime.apply_decoded(&mut run, &invoke("export_people", Values::new()), "decoded-export",
+        &mut product_alloc::AllocationContext::fail_nth_growth(NonZeroUsize::new(1).unwrap(), false));
+    assert!(matches!(replay_refusal, Err(AdapterError::Allocation(_))));
+    assert_eq!(run.data().generation(), prior_generation);
+    let replay = runtime.apply_decoded(&mut run, &invoke("export_people", Values::new()), "decoded-export", &mut allocations).unwrap();
+    assert_eq!(replay.index, exported.index);
+    assert_eq!(run.data().generation(), prior_generation, "receipt replay must not append a second event");
+    let stale = runtime.apply_decoded(&mut run, &add("Grace"), "decoded-export", &mut allocations).unwrap_err();
+    assert!(matches!(stale, AdapterError::Stale(_)));
+}
+
+#[test]
+fn decoded_product_run_start_rejects_incompatible_data_and_preserves_original_snapshot() {
+    let capture = fixture::capture(organizer());
+    let mut data = seed(&capture);
+    data.schema[0].fields.push(FieldDefinition {
+        id: "retired_required".into(),
+        label: "Retired required field".into(),
+        value_type: Type::Text,
+    });
+    let mut allocations = product_alloc::AllocationContext::new();
+    let program = decode_captured_program_fallible(
+        product_json::parse_json_bytes(&serde_json::to_vec(&capture).unwrap(), &mut allocations).unwrap(),
+        &mut allocations,
+    ).unwrap();
+    let data = decode_data_snapshot_fallible(
+        product_json::parse_json_bytes(&serde_json::to_vec(&data).unwrap(), &mut allocations).unwrap(),
+        &mut allocations,
+    ).unwrap();
+    let session = SessionState::initial(&capture.program).unwrap();
+    let session = decode_session_state_fallible(
+        product_json::parse_json_bytes(&serde_json::to_vec(&session).unwrap(), &mut allocations).unwrap(),
+        &mut allocations,
+    ).unwrap();
+    let error = LocalRuntime::default().start_decoded(
+        &program, &data, &session, 20_000, 42, RuntimeLimits::default(), &mut allocations,
+    ).err().unwrap();
+    assert!(matches!(error, AdapterError::Unsupported(_)));
+}
+
+#[test]
+fn decoded_product_run_observe_and_refusal_do_not_publish_action_history() {
+    let owners = DecodedFixture::new(organizer(), None);
+    let runtime = LocalRuntime::default();
+    let mut run = owners.start(&runtime);
+    let before_data = run.data().identity_with(&mut product_alloc::AllocationContext::new()).unwrap();
+    let before_session = run.session().identity_with(&mut product_alloc::AllocationContext::new()).unwrap();
+    let observe = runtime.apply_decoded(&mut run, &SemanticInput::Observe { point: "selected_count".into() },
+        "decoded-observe", &mut product_alloc::AllocationContext::new()).unwrap();
+    assert_eq!(observe.outcome, StepOutcome::Applied);
+    assert_eq!(run.observations().len(), 1);
+    assert_eq!(run.data().generation(), 0);
+    assert!(run.data().events().is_empty());
+    assert_eq!(run.data().identity_with(&mut product_alloc::AllocationContext::new()).unwrap(), before_data);
+    assert_eq!(run.session().identity_with(&mut product_alloc::AllocationContext::new()).unwrap(), before_session);
+
+    let mut rejected = organizer();
+    rejected["actions"][0]["guards"] = json!([{"kind":"literal","value_type":{"kind":"boolean"},"value":{"kind":"boolean","value":false}}]);
+    let rejected_owners = DecodedFixture::new(rejected, None);
+    let mut rejected_run = rejected_owners.start(&runtime);
+    let error = runtime.apply_decoded(&mut rejected_run, &add("Ada"), "decoded-guard-reject",
+        &mut product_alloc::AllocationContext::new()).unwrap_err();
+    assert!(matches!(error, AdapterError::Invalid(_)));
+    assert_eq!(rejected_run.trace().last().unwrap().outcome, StepOutcome::Rejected);
+    assert_eq!(rejected_run.data().generation(), 0);
+    assert!(rejected_run.data().events().is_empty());
+
+    let mut ensure_rejected = organizer();
+    ensure_rejected["actions"][0]["ensures"] = json!([{"kind":"literal","value_type":{"kind":"boolean"},"value":{"kind":"boolean","value":false}}]);
+    let ensure_owners = DecodedFixture::new(ensure_rejected, None);
+    let mut ensure_run = ensure_owners.start(&runtime);
+    let error = runtime.apply_decoded(&mut ensure_run, &add("Ada"), "decoded-ensure-reject",
+        &mut product_alloc::AllocationContext::new()).unwrap_err();
+    assert!(matches!(error, AdapterError::Invalid(_)));
+    assert_eq!(ensure_run.trace().last().unwrap().outcome, StepOutcome::Rejected);
+    assert_eq!(ensure_run.data().generation(), 0);
+    assert!(ensure_run.data().records().is_empty());
+    assert!(ensure_run.data().events().is_empty());
+}
+
+#[test]
+fn decoded_product_run_rejects_unsupported_input_without_publication() {
+    let owners = DecodedFixture::new(organizer(), None);
+    let runtime = LocalRuntime::default();
+    let mut run = owners.start(&runtime);
+    let before_data = run.data().identity_with(&mut product_alloc::AllocationContext::new()).unwrap();
+    let before_session = run.session().identity_with(&mut product_alloc::AllocationContext::new()).unwrap();
+    let before_trace = run.trace().len();
+    let error = runtime.apply_decoded(
+        &mut run,
+        &SemanticInput::Navigate { view: "people".into() },
+        "decoded-unsupported-navigate",
+        &mut product_alloc::AllocationContext::new(),
+    ).unwrap_err();
+    assert!(matches!(error, AdapterError::Unsupported(_)));
+    assert_eq!(run.data().identity_with(&mut product_alloc::AllocationContext::new()).unwrap(), before_data);
+    assert_eq!(run.session().identity_with(&mut product_alloc::AllocationContext::new()).unwrap(), before_session);
+    assert_eq!(run.trace().len(), before_trace);
+    assert!(run.data().events().is_empty());
+    assert!(run.observations().is_empty());
+}
+
+#[test]
+fn decoded_product_run_finalization_allocation_refusal_preserves_owners_and_retry_commits() {
+    let runtime = LocalRuntime::default();
+    let owners = DecodedFixture::new(organizer(), None);
+    let mut probe = decoded_ready_run(&owners, &runtime);
+    let mut probe_allocations = product_alloc::AllocationContext::new();
+    runtime.apply_decoded(&mut probe, &invoke("export_people", Values::new()), "decoded-export",
+        &mut probe_allocations).unwrap();
+    let growths = probe_allocations.growth_requests();
+    assert!(growths > 0);
+
+    for ordinal in 1..=growths {
+        let mut run = decoded_ready_run(&owners, &runtime);
+        let before_data = run.data().identity_with(&mut product_alloc::AllocationContext::new()).unwrap();
+        let before_session = run.session().identity_with(&mut product_alloc::AllocationContext::new()).unwrap();
+        let before_trace = run.trace().len();
+        let mut refused_allocations = product_alloc::AllocationContext::fail_nth_growth(
+            NonZeroUsize::new(ordinal).unwrap(), false,
+        );
+        let refusal = runtime.apply_decoded(&mut run, &invoke("export_people", Values::new()), "decoded-export",
+            &mut refused_allocations);
+        assert!(matches!(refusal, Err(AdapterError::Allocation(_))), "growth {ordinal}");
+        assert_eq!(run.data().identity_with(&mut product_alloc::AllocationContext::new()).unwrap(), before_data);
+        assert_eq!(run.session().identity_with(&mut product_alloc::AllocationContext::new()).unwrap(), before_session);
+        assert_eq!(run.trace().len(), before_trace);
+        assert!(run.artifacts().is_empty());
+
+        runtime.apply_decoded(&mut run, &invoke("export_people", Values::new()), "decoded-export",
+            &mut product_alloc::AllocationContext::new()).unwrap();
+        assert_eq!(run.data().generation(), 3);
+        assert_eq!(run.data().events().last().unwrap().operation_id(), "decoded-export");
+        assert_eq!(run.artifacts().len(), 1);
+    }
+}
+
+#[test]
+fn decoded_product_run_output_byte_limit_is_cumulative_across_invokes() {
+    let owners = DecodedFixture::new(organizer(), None);
+    let runtime = LocalRuntime::default();
+    let mut limits = RuntimeLimits::default();
+    limits.output_bytes = b"name\r\nAda\r\n".len();
+    let mut allocations = product_alloc::AllocationContext::new();
+    let mut run = runtime.start_decoded(&owners.program, &owners.data, &owners.session,
+        20_000, 42, limits, &mut allocations).unwrap();
+    runtime.apply_decoded(&mut run, &add("Ada"), "decoded-add", &mut allocations).unwrap();
+    runtime.apply_decoded(&mut run, &invoke("collect", Values::new()), "decoded-collect", &mut allocations).unwrap();
+    runtime.apply_decoded(&mut run, &invoke("export_people", Values::new()), "decoded-export-1", &mut allocations).unwrap();
+    let generation = run.data().generation();
+    let event_count = run.data().events().len();
+    let refusal = runtime.apply_decoded(&mut run, &invoke("export_people", Values::new()), "decoded-export-2", &mut allocations);
+    assert!(matches!(refusal, Err(AdapterError::BudgetExhausted(message)) if message == "cumulative output limit"));
+    assert_eq!(run.artifacts().len(), 1);
+    assert_eq!(run.data().generation(), generation);
+    assert_eq!(run.data().events().len(), event_count);
+}
+
+#[test]
+fn decoded_product_run_generation_overflow_and_cancellation_publish_no_history() {
+    let owners = DecodedFixture::new(organizer(), Some(u64::MAX));
+    let runtime = LocalRuntime::default();
+    let mut run = owners.start(&runtime);
+    let before = run.data().identity_with(&mut product_alloc::AllocationContext::new()).unwrap();
+    let overflow = runtime.apply_decoded(&mut run, &add("Ada"), "decoded-overflow",
+        &mut product_alloc::AllocationContext::new()).unwrap_err();
+    assert!(matches!(overflow, AdapterError::Failed(message) if message == "data generation overflow"));
+    assert_eq!(run.data().identity_with(&mut product_alloc::AllocationContext::new()).unwrap(), before);
+    assert!(run.data().events().is_empty());
+
+    let normal = DecodedFixture::new(organizer(), None);
+    let mut cancelled_run = normal.start(&runtime);
+    let cancelled = LocalRuntime::with_cancellation(Arc::new(AtomicBool::new(true)));
+    let cancelled_error = cancelled.apply_decoded(&mut cancelled_run, &add("Ada"), "decoded-cancel",
+        &mut product_alloc::AllocationContext::new()).unwrap_err();
+    assert_eq!(cancelled_error, AdapterError::Cancelled);
+    assert_eq!(cancelled_run.data().generation(), 0);
+    assert!(cancelled_run.data().events().is_empty());
+    runtime.apply_decoded(&mut cancelled_run, &add("Ada"), "decoded-cancel",
+        &mut product_alloc::AllocationContext::new()).unwrap();
+    assert_eq!(cancelled_run.data().generation(), 1);
+}
+
 fn cancel() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))
 }

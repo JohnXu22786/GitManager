@@ -12,6 +12,11 @@ pub(super) trait EnvAccess {
     fn try_managed_copy(&self, allocations: &mut AllocationContext)
         -> std::result::Result<ManagedEnv, super::product_alloc::AllocationFailure>;
 }
+pub(super) trait EnvMut: EnvAccess + Sized {
+    fn try_bind(&mut self, name: &str, ty: &Type, value: &DataValue, meter: &mut Meter) -> Result<()>;
+    fn try_clone_for_statement(&self, meter: &mut Meter) -> Result<Self>;
+    fn try_bind_reference(&mut self, name: &str, type_entity: &str, value_entity: &str, record: &str, meter: &mut Meter) -> Result<()>;
+}
 impl EnvAccess for Env {
     fn len(&self) -> usize { BTreeMap::len(self) }
     fn get(&self, name: &str) -> Option<(&Type, &DataValue)> {
@@ -29,6 +34,18 @@ impl EnvAccess for Env {
         )
     }
 }
+impl EnvMut for Env {
+    fn try_bind(&mut self, name: &str, ty: &Type, value: &DataValue, _meter: &mut Meter) -> Result<()> {
+        self.insert(name.to_owned(), (ty.clone(), value.clone()));
+        Ok(())
+    }
+    fn try_clone_for_statement(&self, _meter: &mut Meter) -> Result<Self> { Ok(self.clone()) }
+    fn try_bind_reference(&mut self, name: &str, type_entity: &str, value_entity: &str, record: &str, meter: &mut Meter) -> Result<()> {
+        self.try_bind(name, &Type::reference(type_entity), &DataValue::Reference {
+            entity: value_entity.to_owned(), record: record.to_owned(),
+        }, meter)
+    }
+}
 impl EnvAccess for ManagedEnv {
     fn len(&self) -> usize { ManagedEnv::len(self) }
     fn get(&self, name: &str) -> Option<(&Type, &DataValue)> { ManagedEnv::get(self, name) }
@@ -39,6 +56,19 @@ impl EnvAccess for ManagedEnv {
     fn try_managed_copy(&self, allocations: &mut AllocationContext)
         -> std::result::Result<ManagedEnv, super::product_alloc::AllocationFailure> {
         ManagedEnv::try_copy(self, allocations)
+    }
+}
+impl EnvMut for ManagedEnv {
+    fn try_bind(&mut self, name: &str, ty: &Type, value: &DataValue, meter: &mut Meter) -> Result<()> {
+        ManagedEnv::try_bind(self, name, ty, value, &mut meter.allocations)
+            .map_err(AdapterError::Allocation)
+    }
+    fn try_clone_for_statement(&self, meter: &mut Meter) -> Result<Self> {
+        ManagedEnv::try_copy(self, &mut meter.allocations).map_err(AdapterError::Allocation)
+    }
+    fn try_bind_reference(&mut self, name: &str, type_entity: &str, value_entity: &str, record: &str, meter: &mut Meter) -> Result<()> {
+        ManagedEnv::try_bind_reference(self, name, type_entity, value_entity, record, &mut meter.allocations)
+            .map_err(AdapterError::Allocation)
     }
 }
 pub(super) struct Eval<'a> {

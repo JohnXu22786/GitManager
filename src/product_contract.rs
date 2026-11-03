@@ -982,6 +982,31 @@ impl From<ContractError> for DecisionValidationError {
 #[derive(Debug, Serialize)]
 pub(crate) struct FallibleDecodedLocalArtifact(fallible_local_artifact_decode::DecodedLocalArtifact);
 impl FallibleDecodedLocalArtifact {
+    pub(crate) fn from_rows_with(
+        output: &str,
+        format: OutputFormat,
+        columns: &[FieldDefinition],
+        rows: Vec<FallibleValues>,
+        max_bytes: usize,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Self, AppValidationError> {
+        fallible_local_artifact_decode::DecodedLocalArtifact::from_rows(output, format, columns, rows, max_bytes, cx)
+            .map(Self)
+    }
+    pub(crate) fn try_clone_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Self, AppValidationError> {
+        let value = crate::product_backup::fallible_codec::try_serialize_value(self, cx)
+            .map_err(|error| match error {
+                crate::product_backup::fallible_codec::CodecError::Allocation(failure) => AppValidationError::Allocation(failure),
+                _ => AppValidationError::Contract(ContractError("artifact copy invariant".into())),
+            })?;
+        decode_local_artifact_fallible(value, cx).map_err(|error| match error {
+            fallible_value_decode::ValueDecodeError::Allocation(failure) => AppValidationError::Allocation(failure),
+            _ => AppValidationError::Contract(ContractError("artifact copy invariant".into())),
+        })
+    }
     pub(crate) fn validate_with(
         &self,
         cx: &mut crate::product_alloc::AllocationContext,
@@ -990,7 +1015,19 @@ impl FallibleDecodedLocalArtifact {
     }
     pub(crate) fn digest(&self) -> &Digest { self.0.digest() }
     pub(crate) fn byte_len(&self) -> usize { self.0.byte_len() }
+    pub(crate) fn bytes(&self) -> &[u8] { self.0.bytes() }
 }
+
+pub(crate) fn decoded_output_byte_len_with(
+    format: OutputFormat,
+    columns: &[FieldDefinition],
+    rows: &[FallibleValues],
+    max_bytes: usize,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<usize, AppValidationError> {
+    fallible_local_artifact_decode::encoded_output_byte_len_with(format, columns, rows, max_bytes, cx)
+}
+impl crate::product_backup::fallible_codec::BackupWire for FallibleDecodedLocalArtifact {}
 #[derive(Debug, Serialize)]
 pub(crate) struct FallibleDecodedAdoptionPlan(fallible_decision_decode::DecodedAdoptionPlan);
 impl FallibleDecodedAdoptionPlan {
