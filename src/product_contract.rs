@@ -368,6 +368,35 @@ impl FallibleDecodedDataSnapshot {
     }
     pub(crate) fn record_count(&self) -> usize { self.0.records.len() }
     pub(crate) fn records(&self) -> &[fallible_persisted_decode::DecodedRecord] { &self.0.records }
+    pub(crate) fn try_append_record(
+        &mut self,
+        entity: &str,
+        id: &str,
+        revision: u64,
+        created_program: &Digest,
+        values: FallibleValues,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), AppValidationError> {
+        use crate::product_alloc::{try_copy_str, try_push, AllocationSite};
+        let entity = try_copy_str(entity, cx, AllocationSite::String)
+            .map_err(AppValidationError::Allocation)?;
+        let id = try_copy_str(id, cx, AllocationSite::String)
+            .map_err(AppValidationError::Allocation)?;
+        let created_program = try_copy_str(created_program.as_str(), cx, AllocationSite::String)
+            .map_err(AppValidationError::Allocation)?;
+        let created_program = Digest::from_owned_lower_hex(created_program)
+            .ok_or_else(|| AppValidationError::Contract(ContractError("created program digest invariant".into())))?;
+        let record = fallible_persisted_decode::DecodedRecord {
+            entity,
+            id,
+            revision,
+            created_program,
+            archived: false,
+            values,
+        };
+        try_push(&mut self.0.records, record, cx, AllocationSite::Vector)
+            .map_err(AppValidationError::Allocation)
+    }
     pub(crate) fn events(&self) -> &[fallible_persisted_decode::DecodedBusinessEvent] { &self.0.events }
     pub(crate) fn schema(&self) -> &[EntityDefinition] { &self.0.schema }
     pub(crate) fn record_producers(&self) -> impl Iterator<Item = &Digest> {

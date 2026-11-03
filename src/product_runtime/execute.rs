@@ -291,6 +291,22 @@ pub(crate) fn decoded_shared_transaction_kernel_parity_and_atomicity(
             ActionDefinition { id: "kernel".into(), label: "Kernel".into(), parameters: BTreeMap::new(), guards: vec![], steps: steps.clone(), ensures: vec![] },
             ActionDefinition { id: "update_only".into(), label: "Update only".into(), parameters: BTreeMap::new(), guards: vec![], steps: steps[..1].to_vec(), ensures: vec![] },
             ActionDefinition { id: "state_only".into(), label: "State only".into(), parameters: BTreeMap::new(), guards: vec![], steps: only_state.clone(), ensures: vec![] },
+            ActionDefinition { id: "create_only".into(), label: "Create only".into(), parameters: BTreeMap::new(), guards: vec![], steps: vec![Statement::Create {
+                entity: "job".into(),
+                values: [("name".into(), Expr::Literal { value_type: Type::Text, value: DataValue::Text { value: "created".into() } })].into(),
+                bind: "created".into(),
+            }], ensures: vec![] },
+            ActionDefinition { id: "create_update".into(), label: "Create then update".into(), parameters: BTreeMap::new(), guards: vec![], steps: vec![
+                Statement::Create {
+                    entity: "job".into(),
+                    values: [("name".into(), Expr::Literal { value_type: Type::Text, value: DataValue::Text { value: "created".into() } })].into(),
+                    bind: "created".into(),
+                },
+                Statement::Update {
+                    record: Expr::Variable { name: "created".into() },
+                    values: [("extra".into(), Expr::Literal { value_type: Type::Text, value: DataValue::Text { value: "same-transaction".into() } })].into(),
+                },
+            ], ensures: vec![] },
         ],
         outputs: vec![],
         observables: vec![],
@@ -308,6 +324,10 @@ pub(crate) fn decoded_shared_transaction_kernel_parity_and_atomicity(
     let decoded_steps = AppRef::from(&decoded_app).action("kernel").ok_or("decoded test action absent")?.steps();
     let decoded_update_only = AppRef::from(&decoded_app).action("update_only").ok_or("decoded update action absent")?.steps();
     let decoded_state_only = AppRef::from(&decoded_app).action("state_only").ok_or("decoded state action absent")?.steps();
+    let legacy_create = AppRef::from(&app).action("create_only").ok_or("legacy create action absent")?.steps();
+    let decoded_create = AppRef::from(&decoded_app).action("create_only").ok_or("decoded create action absent")?.steps();
+    let legacy_create_update = AppRef::from(&app).action("create_update").ok_or("legacy create-update action absent")?.steps();
+    let decoded_create_update = AppRef::from(&decoded_app).action("create_update").ok_or("decoded create-update action absent")?.steps();
     let mut legacy_kernel_state = State {
         data: legacy.clone(),
         session: SessionState { view: "work".into(), values: Values::new(), focused_record: None },
@@ -393,6 +413,101 @@ pub(crate) fn decoded_shared_transaction_kernel_parity_and_atomicity(
         != serde_json::to_value(&decoded_kernel_session).map_err(|error| error.to_string())?
     {
         return Err("legacy and decoded statement kernel results diverged".into());
+    }
+
+    // Create runs through the same statement interpreter for both owner types.
+    let mut create_legacy = legacy_kernel_state.clone();
+    let mut create_legacy_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+    let mut create_legacy_owner = KernelState::Legacy(&mut create_legacy);
+    Transaction { program: None, app: AppRef::from(&app), program_digest: &program, operation: "kernel-op", seed: 7, created: 0, cancel_after_statement: None }
+        .statements(&mut create_legacy_owner, legacy_create, &mut Env::new(), &mut create_legacy_meter)
+        .map_err(|error| format!("legacy create: {error:?}"))?;
+    let create_base = decoded_kernel_data.try_clone_with(&mut product_alloc::AllocationContext::new())
+        .map_err(|error| format!("decoded create base copy: {error:?}"))?;
+    let mut create_probe = create_base.try_clone_with(&mut product_alloc::AllocationContext::new())
+        .map_err(|error| format!("decoded create probe copy: {error:?}"))?;
+    let mut create_probe_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+    let mut create_probe_owner = KernelState::Decoded { data: &mut create_probe, session: &mut decoded_kernel_session, day: 0 };
+    Transaction { program: None, app: AppRef::from(&decoded_app), program_digest: &program, operation: "kernel-op", seed: 7, created: 0, cancel_after_statement: None }
+        .statements(&mut create_probe_owner, decoded_create, &mut Env::new(), &mut create_probe_meter)
+        .map_err(|error| format!("decoded create probe: {error:?}"))?;
+    let create_growths = create_probe_meter.allocations.growth_requests();
+    if create_growths == 0 || create_legacy.data.records.last().map(|row| serde_json::to_value(row).unwrap())
+        != create_probe.records().last().map(|row| serde_json::to_value(row).unwrap()) {
+        return Err("legacy and decoded Create results diverged".into());
+    }
+    for nth in 1..=create_growths {
+        let mut refused_data = create_base.try_clone_with(&mut product_alloc::AllocationContext::new())
+            .map_err(|error| format!("decoded create refusal copy: {error:?}"))?;
+        let before_refusal = refused_data.try_clone_with(&mut product_alloc::AllocationContext::new())
+            .map_err(|error| format!("decoded create refusal snapshot: {error:?}"))?;
+        let mut refuse_create = Meter::with_allocations(
+            RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)),
+            product_alloc::AllocationContext::fail_nth_growth(NonZeroUsize::new(nth).unwrap(), false),
+        );
+        let mut refused_owner = KernelState::Decoded { data: &mut refused_data, session: &mut decoded_kernel_session, day: 0 };
+        let refused = Transaction { program: None, app: AppRef::from(&decoded_app), program_digest: &program, operation: "kernel-op", seed: 7, created: 0, cancel_after_statement: None }
+            .statements(&mut refused_owner, decoded_create, &mut Env::new(), &mut refuse_create);
+        if !matches!(refused, Err(AdapterError::Allocation(_))) || refused_data != before_refusal {
+            return Err(format!("decoded Create refusal {nth} changed the owner or lost allocation error: {refused:?}"));
+        }
+    }
+    let mut retry_create = create_base.try_clone_with(&mut product_alloc::AllocationContext::new())
+        .map_err(|error| format!("decoded create retry copy: {error:?}"))?;
+    let mut retry_create_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+    let mut retry_create_owner = KernelState::Decoded { data: &mut retry_create, session: &mut decoded_kernel_session, day: 0 };
+    Transaction { program: None, app: AppRef::from(&decoded_app), program_digest: &program, operation: "kernel-op", seed: 7, created: 0, cancel_after_statement: None }
+        .statements(&mut retry_create_owner, decoded_create, &mut Env::new(), &mut retry_create_meter)
+        .map_err(|error| format!("decoded Create retry: {error:?}"))?;
+    if retry_create != create_probe { return Err("decoded Create retry differs from successful Create".into()); }
+
+    let colliding_id = format!("record-{}", &canonical_digest(
+        IdentityDomain::Input, &(7u64, "kernel-op", "job", 1usize),
+    ).map_err(|error| format!("collision identity digest: {error}"))?.as_str()[..32]);
+    let mut collision_legacy = legacy_kernel_state.clone();
+    collision_legacy.data.records.push(Record {
+        entity: "job".into(), id: colliding_id.clone(), revision: 1,
+        created_program: program.clone(), archived: false, values: Values::new(),
+    });
+    let mut collision_decoded = create_base.try_clone_with(&mut product_alloc::AllocationContext::new())
+        .map_err(|error| format!("decoded collision copy: {error:?}"))?;
+    collision_decoded.try_append_record(
+        "job", &colliding_id, 1, &program, FallibleValues::new(),
+        &mut product_alloc::AllocationContext::new(),
+    ).map_err(|error| format!("decoded collision fixture: {error:?}"))?;
+    let collision_before = collision_decoded.try_clone_with(&mut product_alloc::AllocationContext::new())
+        .map_err(|error| format!("decoded collision snapshot: {error:?}"))?;
+    let mut collision_legacy_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+    let mut collision_legacy_owner = KernelState::Legacy(&mut collision_legacy);
+    let collision_legacy_result = Transaction { program: None, app: AppRef::from(&app), program_digest: &program, operation: "kernel-op", seed: 7, created: 0, cancel_after_statement: None }
+        .statements(&mut collision_legacy_owner, legacy_create, &mut Env::new(), &mut collision_legacy_meter);
+    let mut collision_decoded_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+    let mut collision_decoded_owner = KernelState::Decoded { data: &mut collision_decoded, session: &mut decoded_kernel_session, day: 0 };
+    let collision_decoded_result = Transaction { program: None, app: AppRef::from(&decoded_app), program_digest: &program, operation: "kernel-op", seed: 7, created: 0, cancel_after_statement: None }
+        .statements(&mut collision_decoded_owner, decoded_create, &mut Env::new(), &mut collision_decoded_meter);
+    if !matches!(&collision_legacy_result, Err(AdapterError::Invalid(message)) if message.0 == "generated record identity collision")
+        || !matches!(&collision_decoded_result, Err(AdapterError::Invalid(message)) if message.0 == "generated record identity collision")
+        || collision_decoded != collision_before
+        || collision_legacy.data.records.len() != collision_decoded.record_count() {
+        return Err(format!("legacy and decoded generated-identity collision behavior diverged: {collision_legacy_result:?} / {collision_decoded_result:?}"));
+    }
+
+    let mut create_update_legacy = legacy_kernel_state.clone();
+    let mut create_update_legacy_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+    let mut create_update_legacy_owner = KernelState::Legacy(&mut create_update_legacy);
+    Transaction { program: None, app: AppRef::from(&app), program_digest: &program, operation: "kernel-op", seed: 7, created: 0, cancel_after_statement: None }
+        .statements(&mut create_update_legacy_owner, legacy_create_update, &mut Env::new(), &mut create_update_legacy_meter)
+        .map_err(|error| format!("legacy Create then Update: {error:?}"))?;
+    let mut create_update_decoded = create_base.try_clone_with(&mut product_alloc::AllocationContext::new())
+        .map_err(|error| format!("decoded Create then Update copy: {error:?}"))?;
+    let mut create_update_meter = Meter::new(RuntimeLimits::default(), 1_000_000, Arc::new(AtomicBool::new(false)));
+    let mut create_update_owner = KernelState::Decoded { data: &mut create_update_decoded, session: &mut decoded_kernel_session, day: 0 };
+    Transaction { program: None, app: AppRef::from(&decoded_app), program_digest: &program, operation: "kernel-op", seed: 7, created: 0, cancel_after_statement: None }
+        .statements(&mut create_update_owner, decoded_create_update, &mut Env::new(), &mut create_update_meter)
+        .map_err(|error| format!("decoded Create then Update: {error:?}"))?;
+    if create_update_legacy.data.records.last().map(|row| (row.revision, serde_json::to_value(&row.values).unwrap()))
+        != create_update_decoded.records().last().map(|row| (row.revision(), serde_json::to_value(row.values()).unwrap())) {
+        return Err("legacy and decoded Create then Update results diverged".into());
     }
 
     // Decoded overflow keeps the same refusal class as the legacy update.
@@ -491,36 +606,60 @@ impl Transaction<'_> {
                     entity,
                     values,
                     bind,
-                } => {
-                    let state = state.legacy()?;
-                    let values = assignments(app, state, values, env, meter)?;
-                    meter.write()?;
-                    meter.collection(state.data.records.len() + 1)?;
-                    self.created += 1;
-                    let digest = canonical_digest(
-                        IdentityDomain::Input,
-                        &(self.seed, self.operation, entity, self.created),
-                    )?;
-                    let id = format!("record-{}", &digest.as_str()[..32]);
-                    if state
-                        .data
-                        .records
-                        .iter()
-                        .any(|r| r.entity == *entity && r.id == id)
-                    {
-                        return Err(invalid("generated record identity collision"));
+                } => match state {
+                    KernelState::Legacy(state) => {
+                        let values = assignments(app, state, values, env, meter)?;
+                        meter.write()?;
+                        meter.collection(state.data.records.len() + 1)?;
+                        self.created += 1;
+                        let digest = canonical_digest(
+                            IdentityDomain::Input,
+                            &(self.seed, self.operation, entity, self.created),
+                        )?;
+                        let id = format!("record-{}", &digest.as_str()[..32]);
+                        if state
+                            .data
+                            .records
+                            .iter()
+                            .any(|r| r.entity == *entity && r.id == id)
+                        {
+                            return Err(invalid("generated record identity collision"));
+                        }
+                        let row = Record {
+                            entity: entity.to_owned(),
+                            id,
+                            revision: 1,
+                            created_program: self.program_digest.clone(),
+                            archived: false,
+                            values,
+                        };
+                        env.insert(bind.to_owned(), (Type::reference(entity), value_ref(&row)));
+                        state.data.records.push(row);
                     }
-                    let row = Record {
-                        entity: entity.to_owned(),
-                        id,
-                        revision: 1,
-                        created_program: self.program_digest.clone(),
-                        archived: false,
-                        values,
-                    };
-                    env.insert(bind.to_owned(), (Type::reference(entity), value_ref(&row)));
-                    state.data.records.push(row);
-                }
+                    KernelState::Decoded { .. } => {
+                        let values = update_assignments(app, state, values, env, meter)?;
+                        let UpdateValues::Fallible(values) = values else {
+                            return Err(failed("transaction values owner mismatch"));
+                        };
+                        let KernelState::Decoded { data, .. } = state else { unreachable!() };
+                        meter.write()?;
+                        meter.collection(data.record_count() + 1)?;
+                        self.created += 1;
+                        let digest = canonical_digest(
+                            IdentityDomain::Input,
+                            &(self.seed, self.operation, entity, self.created),
+                        )?;
+                        let id = format!("record-{}", &digest.as_str()[..32]);
+                        if data.records().iter().any(|row| row.entity() == entity && row.id() == id) {
+                            return Err(invalid("generated record identity collision"));
+                        }
+                        data.try_append_record(entity, &id, 1, self.program_digest, values, &mut meter.allocations)
+                            .map_err(app_validation_error)?;
+                        env.insert(bind.to_owned(), (Type::reference(entity), DataValue::Reference {
+                            entity: entity.to_owned(), record: id,
+                        }));
+                    }
+                },
                 StatementView::Update { record, values } => {
                     let key = evaluate_owner(app, state, record, env, meter)?;
                     let values = update_assignments(app, state, values, env, meter)?;
