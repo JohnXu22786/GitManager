@@ -3,7 +3,7 @@
 //! This is kept separate from the legacy verifier until the decoded verifier
 //! is assembled. It consumes decoded app/schema owners and never converts
 //! them back to legacy maps.
-use super::common_fact_admission::ProofMeter;
+use super::common_fact_admission::{OwnedProjectionDestination, OwnedProjectionRecipe, ProofMeter};
 use super::fallible_common_fact_inventory::{CommonFactInventoryFailure, DecodedCommonFactInventory};
 use super::fallible_common_fact_schemas::{DecodedOwnedSchemaKind, DecodedOwnedSchemaKinds};
 use super::owned_contract::{OwnedSourceSide, OwnedStatementKind};
@@ -694,6 +694,94 @@ impl<'a> DecodedCommonFactRules<'a> {
     }
 }
 
+/// Derive projection recipes from decoded before/after app owners. This mirrors
+/// the legacy rules while keeping every owned recipe allocation fallible.
+pub(crate) fn decoded_rule_projections(
+    before: AppRef<'_>,
+    after: AppRef<'_>,
+    root: &str,
+    cx: &mut AllocationContext,
+) -> Result<Vec<OwnedProjectionRecipe>, CommonFactInventoryFailure> {
+    let (AppRef::Decoded(before), AppRef::Decoded(after)) = (before, after) else {
+        return Err(refuse(cx, "projections", "decoded app owners required"));
+    };
+    let mut result = Vec::new();
+    let mut row_environment = DecodedRuleEnvironment::new();
+    row_environment.insert("row", DecodedRuleValue::plain(reference_type(root, cx)?), cx)?;
+
+    for view in &after.views {
+        let crate::product_contract::fallible_app_decode::DecodedViewKind::List { entity, rows, columns, .. } = &view.kind else { continue; };
+        if entity != root { continue; }
+        let original = before.views.iter().find(|candidate| candidate.id == view.id)
+            .ok_or_else(|| refuse(cx, &view.id, "new root views unsupported"))?;
+        let crate::product_contract::fallible_app_decode::DecodedViewKind::List { rows: old_rows, columns: old_columns, .. } = &original.kind
+            else { return Err(refuse(cx, &view.id, "view kind changed")); };
+        if rows != old_rows { return Err(refuse(cx, &view.id, "row selection/identity changed")); }
+
+        for column in columns {
+            let prior = old_columns.iter().find(|candidate| candidate.id == column.id);
+            let value_type = product_contract::decoded_expression_type_in_with(after, &column.value, &row_environment, cx).map_err(app_error)?;
+            if prior.is_none() && value_type != Type::Boolean {
+                let at = format_owned(cx, format_args!("{}.{}", view.id, column.id))?;
+                return Err(refuse(cx, &at, "added column has no nullable Boolean availability rule"));
+            }
+            if let Some(prior) = prior {
+                let prior_type = product_contract::decoded_expression_type_in_with(before, &prior.value, &row_environment, cx).map_err(app_error)?;
+                if prior_type != value_type { return Err(refuse(cx, &view.id, "changed projection type is unsupported")); }
+            }
+
+            let host_value_type = if prior.is_none() {
+                Type::Optional { item: product_alloc::try_box(copy_type(&value_type, cx)?, cx)? }
+            } else { copy_type(&value_type, cx)? };
+            let recipe = OwnedProjectionRecipe {
+                location: format_owned(cx, format_args!("view/{}/{}", view.id, column.id))?,
+                destination: OwnedProjectionDestination::ViewColumn { view: copy_string(&view.id, cx)?, column: copy_string(&column.id, cx)? },
+                binding: copy_string("row", cx)?,
+                host_value_type,
+                absent_value: if prior.is_none() { Some(DataValue::Null) } else { None },
+                value_type: copy_type(&value_type, cx)?,
+                baseline: prior.map(|value| copy_expr(&value.value, cx)).transpose()?,
+                candidate: copy_expr(&column.value, cx)?,
+                capture_required: true,
+            };
+            product_alloc::try_push(&mut result, recipe, cx, AllocationSite::Vector)?;
+        }
+    }
+
+    for observable in &after.observables {
+        let Expr::Count { items } = &observable.value else { continue; };
+        let Expr::Query { entity, binding, predicate, sort, limit, include_archived } = items.as_ref() else { continue; };
+        if entity != root { continue; }
+        if *limit != MAX_COLLECTION || !sort.is_empty() {
+            return Err(refuse(cx, &observable.id, "root count must be untruncated and unordered before mixed per-root selection"));
+        }
+        let prior = before.observables.iter().find(|candidate| candidate.id == observable.id);
+        let baseline = if let Some(prior) = prior {
+            let Expr::Count { items } = &prior.value else { return Err(refuse(cx, &observable.id, "count changed shape")); };
+            let Expr::Query { entity: old_entity, binding: old_binding, predicate: old_predicate, sort: old_sort, limit: old_limit, include_archived: old_include_archived } = items.as_ref()
+                else { return Err(refuse(cx, &observable.id, "count changed query")); };
+            if (old_entity, old_binding, old_sort, old_limit, old_include_archived) != (entity, binding, sort, limit, include_archived) {
+                return Err(refuse(cx, &observable.id, "count header changed"));
+            }
+            Some(copy_expr(old_predicate, cx)?)
+        } else { None };
+
+        let recipe = OwnedProjectionRecipe {
+            location: format_owned(cx, format_args!("count/{}", observable.id))?,
+            destination: OwnedProjectionDestination::RootCount { observable: copy_string(&observable.id, cx)?, include_archived: *include_archived },
+            binding: copy_string(binding, cx)?,
+            value_type: Type::Boolean,
+            host_value_type: Type::Boolean,
+            absent_value: if baseline.is_none() { Some(DataValue::Boolean { value: false }) } else { None },
+            baseline,
+            candidate: copy_expr(predicate, cx)?,
+            capture_required: true,
+        };
+        product_alloc::try_push(&mut result, recipe, cx, AllocationSite::Vector)?;
+    }
+    Ok(result)
+}
+
 fn app_error(value: product_contract::AppValidationError) -> CommonFactInventoryFailure { match value { product_contract::AppValidationError::Allocation(v) => CommonFactInventoryFailure::Allocation(v), product_contract::AppValidationError::Contract(v) => CommonFactInventoryFailure::Store(v.into()) } }
 fn codec_error(value: crate::product_backup::fallible_codec::CodecError) -> CommonFactInventoryFailure { match value { crate::product_backup::fallible_codec::CodecError::Allocation(v) => CommonFactInventoryFailure::Allocation(v), _ => CommonFactInventoryFailure::Store(StoreError::Invalid("Common factual admission: identity encoding invariant".into())) } }
 fn copy_string(value: &str, cx: &mut AllocationContext) -> Result<String, CommonFactInventoryFailure> { product_alloc::try_copy_str(value, cx, AllocationSite::String).map_err(Into::into) }
@@ -707,6 +795,7 @@ fn next_map_value<'a>(map: &'a FallibleMap<Expr>, after: Option<&str>) -> Option
     next_string_value(map, after)
 }
 fn copy_type(value: &Type, cx: &mut AllocationContext) -> Result<Type, CommonFactInventoryFailure> { product_contract::try_clone_type_with(value, cx).map_err(Into::into) }
+fn copy_expr(value: &Expr, cx: &mut AllocationContext) -> Result<Expr, CommonFactInventoryFailure> { product_contract::try_clone_expr_with(value, cx).map_err(app_error) }
 fn format_owned(cx: &mut AllocationContext, args: std::fmt::Arguments<'_>) -> Result<String, CommonFactInventoryFailure> { let mut value = String::new(); product_alloc::try_append_fmt(&mut value, args, cx, AllocationSite::Formatting).map_err(|failure| match failure { product_alloc::FormatFailure::Allocation(v) => CommonFactInventoryFailure::Allocation(v), product_alloc::FormatFailure::Formatter => CommonFactInventoryFailure::Store(StoreError::Invalid("Common factual admission: formatting invariant".into())) })?; Ok(value) }
 fn refuse(cx: &mut AllocationContext, at: &str, rule: &str) -> CommonFactInventoryFailure { match format_owned(cx, format_args!("Common factual admission: {at}: {rule}")) { Ok(text) => CommonFactInventoryFailure::Store(StoreError::Invalid(text)), Err(error) => error } }
 fn literal(expr: &Expr) -> Option<&DataValue> { if let Expr::Literal { value, .. } = expr { Some(value) } else { None } }
@@ -790,6 +879,136 @@ mod tests {
         let mut cx = AllocationContext::new();
         let value = crate::product_json::parse_json_bytes(&serde_json::to_vec(&captured).unwrap(), &mut cx).unwrap();
         crate::product_contract::decode_captured_program_fallible(value, &mut cx).unwrap()
+    }
+
+    fn decode_program(source: crate::product_contract::AppDefinition) -> crate::product_contract::FallibleDecodedCapturedProgram {
+        let captured = crate::fixture::capture(serde_json::to_value(source).unwrap());
+        let mut cx = AllocationContext::new();
+        let value = crate::product_json::parse_json_bytes(&serde_json::to_vec(&captured).unwrap(), &mut cx).unwrap();
+        crate::product_contract::decode_captured_program_fallible(value, &mut cx).unwrap()
+    }
+
+    #[test]
+    fn decoded_rule_projections_preserve_recipe_rules_and_allocation_refusal() {
+        let mut before_source = crate::fixture::program(false).program;
+        before_source.initial_view = "root-list".into();
+        before_source.views.clear();
+        before_source.observables.clear();
+        let rows = Expr::Query {
+            entity: "job".into(), binding: "item".into(), predicate: Box::new(boolean(true)),
+            sort: vec![], limit: MAX_COLLECTION, include_archived: true,
+        };
+        let old_column = crate::product_contract::Column {
+            id: "done".into(), label: "Done".into(),
+            value: Expr::Field { record: Box::new(Expr::Variable { name: "row".into() }), field: "done".into() },
+        };
+        before_source.views.push(crate::product_contract::ViewDefinition {
+            id: "root-list".into(), label: "Jobs".into(),
+            kind: crate::product_contract::ViewKind::List { entity: "job".into(), rows: rows.clone(), columns: vec![old_column.clone()], controls: vec![], selection: None },
+            actions: vec![], keys: vec![],
+        });
+        let old_predicate = Expr::Equal {
+            left: Box::new(Expr::Field { record: Box::new(Expr::Variable { name: "item".into() }), field: "done".into() }),
+            right: Box::new(boolean(false)),
+        };
+        let old_count = Expr::Count { items: Box::new(Expr::Query {
+            entity: "job".into(), binding: "item".into(), predicate: Box::new(old_predicate.clone()),
+            sort: vec![], limit: MAX_COLLECTION, include_archived: true,
+        }) };
+        before_source.observables.push(crate::product_contract::ObservableDefinition { id: "open-count".into(), label: "Open".into(), value: old_count });
+
+        let mut after_source = before_source.clone();
+        let added_column = crate::product_contract::Column { id: "available".into(), label: "Available".into(), value: boolean(true) };
+        let crate::product_contract::ViewKind::List { columns, .. } = &mut after_source.views[0].kind else { panic!() };
+        columns.push(added_column.clone());
+        after_source.observables[0].value = Expr::Count { items: Box::new(Expr::Query {
+            entity: "job".into(), binding: "item".into(), predicate: Box::new(boolean(true)),
+            sort: vec![], limit: MAX_COLLECTION, include_archived: true,
+        }) };
+        after_source.observables.push(crate::product_contract::ObservableDefinition {
+            id: "new-count".into(), label: "New count".into(),
+            value: Expr::Count { items: Box::new(Expr::Query {
+                entity: "job".into(), binding: "item".into(), predicate: Box::new(boolean(false)),
+                sort: vec![], limit: MAX_COLLECTION, include_archived: false,
+            }) },
+        });
+        let mut non_boolean_source = before_source.clone();
+        let crate::product_contract::ViewKind::List { columns, .. } = &mut non_boolean_source.views[0].kind else { panic!() };
+        columns.push(crate::product_contract::Column { id: "not-boolean".into(), label: "Not Boolean".into(), value: integer(1) });
+        let mut changed_type_source = after_source.clone();
+        let crate::product_contract::ViewKind::List { columns, .. } = &mut changed_type_source.views[0].kind else { panic!() };
+        columns[0].value = Expr::Field { record: Box::new(Expr::Variable { name: "row".into() }), field: "name".into() };
+        let mut changed_header_source = after_source.clone();
+        let Expr::Count { items } = &mut changed_header_source.observables[0].value else { panic!() };
+        let Expr::Query { include_archived, .. } = items.as_mut() else { panic!() };
+        *include_archived = false;
+        let mut truncated_count_source = after_source.clone();
+        let Expr::Count { items } = &mut truncated_count_source.observables[0].value else { panic!() };
+        let Expr::Query { limit, .. } = items.as_mut() else { panic!() };
+        *limit = 1;
+        let before = decode_program(before_source);
+        let after = decode_program(after_source);
+
+        let mut success = AllocationContext::new();
+        let recipes = decoded_rule_projections(AppRef::Decoded(before.app()), AppRef::Decoded(after.app()), "job", &mut success).unwrap();
+        assert_eq!(recipes.len(), 4, "the complete stable view, new Boolean column, and root counts need recipes");
+        assert_eq!(recipes[0].location, "view/root-list/done");
+        assert_eq!(recipes[0].destination, OwnedProjectionDestination::ViewColumn { view: "root-list".into(), column: "done".into() });
+        assert_eq!(recipes[0].binding, "row");
+        assert_eq!(recipes[0].host_value_type, Type::Boolean);
+        assert_eq!(recipes[0].absent_value, None);
+        assert_eq!(recipes[0].baseline, Some(old_column.value.clone()));
+        assert_eq!(recipes[0].candidate, old_column.value);
+        assert!(recipes[0].capture_required);
+        assert_eq!(recipes[1].location, "view/root-list/available");
+        assert_eq!(recipes[1].host_value_type, Type::Optional { item: Box::new(Type::Boolean) });
+        assert_eq!(recipes[1].absent_value, Some(DataValue::Null));
+        assert_eq!(recipes[1].baseline, None);
+        assert_eq!(recipes[1].candidate, added_column.value);
+        assert_eq!(recipes[2].location, "count/open-count");
+        assert_eq!(recipes[2].destination, OwnedProjectionDestination::RootCount { observable: "open-count".into(), include_archived: true });
+        assert_eq!(recipes[2].binding, "item");
+        assert_eq!(recipes[2].value_type, Type::Boolean);
+        assert_eq!(recipes[2].absent_value, None);
+        assert_eq!(recipes[2].baseline, Some(old_predicate));
+        assert_eq!(recipes[2].candidate, boolean(true));
+        assert!(recipes[2].capture_required);
+        assert_eq!(recipes[3].location, "count/new-count");
+        assert_eq!(recipes[3].baseline, None);
+        assert_eq!(recipes[3].absent_value, Some(DataValue::Boolean { value: false }));
+
+        let growths = success.growth_requests();
+        assert!(growths > 0);
+        for nth in 1..=growths {
+            let mut cx = AllocationContext::fail_nth_growth(std::num::NonZeroUsize::new(nth).unwrap(), true);
+            assert!(matches!(decoded_rule_projections(AppRef::Decoded(before.app()), AppRef::Decoded(after.app()), "job", &mut cx), Err(CommonFactInventoryFailure::Allocation(_))), "growth {nth} must preserve allocation refusal");
+        }
+        let mut retry = AllocationContext::new();
+        assert_eq!(decoded_rule_projections(AppRef::Decoded(before.app()), AppRef::Decoded(after.app()), "job", &mut retry).unwrap(), recipes);
+
+        let mut changed_rows_source = crate::fixture::program(false).program;
+        changed_rows_source.views.clear();
+        changed_rows_source.initial_view = "root-list".into();
+        changed_rows_source.views.push(crate::product_contract::ViewDefinition {
+            id: "root-list".into(), label: "Jobs".into(),
+            kind: crate::product_contract::ViewKind::List { entity: "job".into(), rows: rows.clone(), columns: vec![], controls: vec![], selection: None },
+            actions: vec![], keys: vec![],
+        });
+        let mut changed_rows = changed_rows_source.clone();
+        let crate::product_contract::ViewKind::List { rows, .. } = &mut changed_rows.views[0].kind else { panic!() };
+        *rows = Expr::Query { entity: "job".into(), binding: "item".into(), predicate: Box::new(boolean(false)), sort: vec![], limit: MAX_COLLECTION, include_archived: true };
+        let changed_rows_before = decode_program(changed_rows_source);
+        let changed_rows_after = decode_program(changed_rows);
+        assert!(matches!(decoded_rule_projections(AppRef::Decoded(changed_rows_before.app()), AppRef::Decoded(changed_rows_after.app()), "job", &mut AllocationContext::new()), Err(CommonFactInventoryFailure::Store(StoreError::Invalid(message))) if message.contains("row selection/identity changed")));
+
+        let truncated_count = decode_program(truncated_count_source);
+        assert!(matches!(decoded_rule_projections(AppRef::Decoded(before.app()), AppRef::Decoded(truncated_count.app()), "job", &mut AllocationContext::new()), Err(CommonFactInventoryFailure::Store(StoreError::Invalid(message))) if message.contains("root count must be untruncated and unordered")));
+        let non_boolean = decode_program(non_boolean_source);
+        assert!(matches!(decoded_rule_projections(AppRef::Decoded(before.app()), AppRef::Decoded(non_boolean.app()), "job", &mut AllocationContext::new()), Err(CommonFactInventoryFailure::Store(StoreError::Invalid(message))) if message.contains("added column has no nullable Boolean availability rule")));
+        let changed_type = decode_program(changed_type_source);
+        assert!(matches!(decoded_rule_projections(AppRef::Decoded(before.app()), AppRef::Decoded(changed_type.app()), "job", &mut AllocationContext::new()), Err(CommonFactInventoryFailure::Store(StoreError::Invalid(message))) if message.contains("changed projection type is unsupported")));
+        let changed_header = decode_program(changed_header_source);
+        assert!(matches!(decoded_rule_projections(AppRef::Decoded(before.app()), AppRef::Decoded(changed_header.app()), "job", &mut AllocationContext::new()), Err(CommonFactInventoryFailure::Store(StoreError::Invalid(message))) if message.contains("count header changed")));
     }
     fn stable_root_list() -> crate::product_contract::ViewKind {
         crate::product_contract::ViewKind::List {
