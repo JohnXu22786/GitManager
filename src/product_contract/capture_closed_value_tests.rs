@@ -590,7 +590,11 @@ fn assert_closed_schema(source: &str, schema: &str) {
     let schema = source_guard_text(schema);
     let declaration = source.find("pub enum Type {").unwrap();
     let start = source[..declaration].rfind("#[derive(").unwrap();
-    let end = source[declaration..].find("\n\n#[derive(Clone, Copy)]\nenum AppRef<").unwrap() + declaration;
+    let app_ref = source.find("enum AppRef<").unwrap();
+    let app_ref_derive = "\n\n#[derive(Clone, Copy)]\n";
+    let end = source[..app_ref]
+        .rfind(app_ref_derive)
+        .expect("AppRef must retain its Copy derive");
     assert_eq!(
         source[start..end].trim_end(),
         schema.trim_end()
@@ -1417,6 +1421,14 @@ fn closed_value_source_guards_accept_line_endings_and_reject_mutations() {
         let changed_schema = texts[4].replacen("Boolean,", "BooleanChanged,", 1);
         assert_ne!(changed_schema, texts[4]);
         assert!(std::panic::catch_unwind(|| assert_closed_schema(&texts[0], &changed_schema)).is_err());
+        let private_app_ref = texts[0].replacen("pub(crate) enum AppRef<", "enum AppRef<", 1);
+        assert_ne!(private_app_ref, texts[0]);
+        assert_closed_schema(&private_app_ref, &texts[4]);
+        let app_ref_derive = format!("#[derive(Clone, Copy)]{newline}pub(crate) enum AppRef<");
+        let changed_app_ref_derive = format!("#[derive(Clone)]{newline}pub(crate) enum AppRef<");
+        let changed_app_ref_derive = texts[0].replacen(&app_ref_derive, &changed_app_ref_derive, 1);
+        assert_ne!(changed_app_ref_derive, texts[0]);
+        assert!(std::panic::catch_unwind(|| assert_closed_schema(&changed_app_ref_derive, &texts[4])).is_err());
         let changed_parent = texts[0].replacen("        self.binding.validate_audited(a)?;", "        self.binding.validate_audited(a)?; // changed", 1);
         assert_ne!(changed_parent, texts[0]);
         assert!(std::panic::catch_unwind(|| assert_closed_source_bodies(&changed_parent, &texts[1], &texts[2], &texts[3], &texts[5])).is_err());
