@@ -10,11 +10,20 @@ mod product_alloc;
 mod product_json;
 #[path = "../src/product_app.rs"]
 mod product_app;
+#[path = "../src/product_decisions/mod.rs"]
+mod product_decisions;
+#[path = "../src/product_locations.rs"]
+mod product_locations;
 #[path = "../src/product_runtime/mod.rs"]
 mod product_runtime;
+#[path = "../src/product_backup.rs"]
+mod product_backup;
+#[path = "../src/product_store/mod.rs"]
+mod product_store;
 use fixture::*;
 use product_contract::*;
 use product_runtime::*;
+use product_store::{scope::*, ProductStore};
 use serde_json::json;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -123,6 +132,41 @@ fn map_binding_uses_managed_env_and_propagates_each_growth_refusal() {
 }
 fn apply(r: &mut ProductRun, input: SemanticInput, id: &str) {
     LocalRuntime::default().apply(r, &input, id).unwrap();
+}
+
+fn cancel() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(false))
+}
+
+fn witnesses(store: &ProductStore) -> Vec<LifecycleWitness> {
+    let snapshot = store.load().unwrap();
+    let row = |done: bool| {
+        let record = snapshot.data.records.iter().find(|record| {
+            record.entity == "job"
+                && (record.values.get("done") == Some(&DataValue::Boolean { value: true }))
+                    == done
+        }).unwrap();
+        RecordRef { entity: record.entity.clone(), record: record.id.clone() }
+    };
+    [OwnedSourceSide::Before, OwnedSourceSide::After]
+        .into_iter()
+        .map(|side| LifecycleWitness {
+            side,
+            scenario: ScenarioSpec {
+                version: 1,
+                id: "test".into(),
+                label: "test".into(),
+                seed: snapshot.data.clone(),
+                session: snapshot.session.clone(),
+                clock_day: snapshot.clock_day,
+                random_seed: 1,
+                inputs: vec![SemanticInput::Observe { point: "test".into() }],
+                validity: vec![],
+            },
+            completed: row(true),
+            unfinished: row(false),
+        })
+        .collect()
 }
 
 #[test]

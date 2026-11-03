@@ -1,8 +1,11 @@
 //! Hand-authored language capability fixtures, not live generation evidence.
 #[path = "../../support/product_contract_fixture.rs"]
 mod contract_fixture;
+#[path = "../product_scope/mod.rs"]
+mod scope_fixture;
 use crate::product_contract::*;
 pub use contract_fixture::*;
+pub use scope_fixture::program;
 use serde_json::{json, Value};
 
 pub fn capture(value: Value) -> CapturedProgram {

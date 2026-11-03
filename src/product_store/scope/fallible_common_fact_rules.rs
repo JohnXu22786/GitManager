@@ -999,7 +999,7 @@ mod tests {
         });
         let mut changed_rows = changed_rows_source.clone();
         let crate::product_contract::ViewKind::List { rows, .. } = &mut changed_rows.views[0].kind else { panic!() };
-        *rows = Expr::Query { entity: "job".into(), binding: "item".into(), predicate: Box::new(boolean(false)), sort: vec![], limit: MAX_COLLECTION, include_archived: true };
+        rows.clone_from(&Expr::Query { entity: "job".into(), binding: "item".into(), predicate: Box::new(boolean(false)), sort: vec![], limit: MAX_COLLECTION, include_archived: true });
         let changed_rows_before = decode_program(changed_rows_source);
         let changed_rows_after = decode_program(changed_rows);
         assert!(matches!(decoded_rule_projections(AppRef::Decoded(changed_rows_before.app()), AppRef::Decoded(changed_rows_after.app()), "job", &mut AllocationContext::new()), Err(CommonFactInventoryFailure::Store(StoreError::Invalid(message))) if message.contains("row selection/identity changed")));
