@@ -4,12 +4,13 @@
 //! is assembled. It consumes decoded app/schema owners and never converts
 //! them back to legacy maps.
 use super::common_fact_admission::ProofMeter;
-use super::fallible_common_fact_inventory::CommonFactInventoryFailure;
+use super::fallible_common_fact_inventory::{CommonFactInventoryFailure, DecodedCommonFactInventory};
 use super::fallible_common_fact_schemas::{DecodedOwnedSchemaKind, DecodedOwnedSchemaKinds};
-use super::fallible_owned_source_decode::DecodedOwnedWriter;
 use super::owned_contract::{OwnedSourceSide, OwnedStatementKind};
+use super::fallible_owned_source_decode::{DecodedOwnedRootBinding, DecodedOwnedSpanEndpoint, DecodedOwnedStructuralReport, DecodedOwnedWriter};
 use crate::product_alloc::{self, ordered::{OrderedMap, OrderedSet}, AllocationContext, AllocationSite};
 use crate::product_contract::{self, AppRef, DataValue, Digest, Expr, IdentityDomain, StringValueMap, Type, MAX_COLLECTION, MAX_TEXT_BYTES};
+use crate::product_contract::fallible_app_decode::{DecodedActionDefinition, DecodedStatement, FallibleMap};
 use crate::product_store::StoreError;
 use serde::Serialize;
 
@@ -20,6 +21,8 @@ pub(crate) struct DecodedCommonFactCertificate {
     pub(crate) rule: String,
     pub(crate) identity: Digest,
 }
+impl crate::product_backup::fallible_codec::BackupWire for (&DecodedOwnedRootBinding, &String) {}
+impl crate::product_backup::fallible_codec::BackupWire for (&String, &Expr, &Option<String>) {}
 
 pub(crate) struct DecodedRuleValue {
     pub(crate) ty: Type,
@@ -98,9 +101,11 @@ pub(crate) struct DecodedCommonFactRules<'a> {
     side: OwnedSourceSide,
     policy: &'a OrderedSet<(String, String)>,
     writers: &'a [DecodedOwnedWriter],
+    structure: Option<&'a DecodedOwnedStructuralReport>,
     all_roots_active: bool,
     meter: &'a mut ProofMeter,
     certificates: Vec<DecodedCommonFactCertificate>,
+    discovered: OrderedSet<(String, String)>,
 }
 impl<'a> DecodedCommonFactRules<'a> {
     pub(crate) fn new(
@@ -110,12 +115,23 @@ impl<'a> DecodedCommonFactRules<'a> {
         all_roots_active: bool, meter: &'a mut ProofMeter,
     ) -> Self {
         Self { app, kinds, root_entity, lifecycle_field, lifecycle_value,
-            side, policy, writers, all_roots_active, meter, certificates: Vec::new() }
+            side, policy, writers, structure: None, all_roots_active, meter, certificates: Vec::new(), discovered: OrderedSet::new() }
+    }
+    pub(crate) fn with_structure(mut self, structure: &'a DecodedOwnedStructuralReport) -> Self { self.structure = Some(structure); self }
+    pub(crate) fn from_inventory(
+        app: AppRef<'a>, kinds: &'a DecodedOwnedSchemaKinds, inventory: &'a DecodedCommonFactInventory,
+        lifecycle_field: &'a str, lifecycle_value: DataValue, side: OwnedSourceSide,
+        policy: &'a OrderedSet<(String, String)>, all_roots_active: bool, meter: &'a mut ProofMeter,
+    ) -> Self {
+        Self::new(app, kinds, &inventory.structure.root_entity, lifecycle_field, lifecycle_value, side,
+            policy, &inventory.structure.writers, all_roots_active, meter).with_structure(&inventory.structure)
     }
     pub(crate) fn certificates(&self) -> &[DecodedCommonFactCertificate] { &self.certificates }
+    pub(crate) fn discovered(&self) -> &OrderedSet<(String, String)> { &self.discovered }
     pub(crate) fn environment(&self, parameters: &impl StringValueMap<Type>, prefix: &str, cx: &mut AllocationContext) -> Result<DecodedRuleEnvironment, CommonFactInventoryFailure> {
         let mut environment = DecodedRuleEnvironment::new();
-        for (name, ty) in parameters.iter() {
+        let mut previous: Option<&str> = None;
+        while let Some((name, ty)) = next_string_value(parameters, previous) {
             let mut value = DecodedRuleValue::plain(copy_type(ty, cx)?);
             if let Type::Reference { entity } = ty {
                 match self.kinds.get(entity) {
@@ -127,6 +143,7 @@ impl<'a> DecodedCommonFactRules<'a> {
             }
             if value.root.is_some() { value.active_root = self.all_roots_active; }
             environment.insert(name, value, cx)?;
+            previous = Some(name);
         }
         Ok(environment)
     }
@@ -152,20 +169,6 @@ impl<'a> DecodedCommonFactRules<'a> {
         let Expr::Field { record, field } = left.as_ref() else { return Ok(None); };
         if field != self.lifecycle_field || self.ty(record, env, cx)? != reference_type(self.root_entity, cx)? { return Ok(None); }
         self.receiver(record, env, cx)
-    }
-    fn unfinished(&self, expr: &Expr, env: &DecodedRuleEnvironment, cx: &mut AllocationContext) -> Result<OrderedSet<String>, CommonFactInventoryFailure> {
-        let mut result = OrderedSet::new();
-        match expr {
-            Expr::And { values } => for value in values { for root in self.unfinished(value, env, cx)?.iter() { result.try_insert(copy_string(root, cx)?, cx)?; } },
-            Expr::Not { value } => if let Some(root) = self.facet(value, env, cx)? { result.try_insert(root, cx)?; },
-            Expr::Equal { left, right } => if let (Expr::Field { record, field }, Some(value)) = (left.as_ref(), literal(right)) {
-                if field == self.lifecycle_field && value != &self.lifecycle_value && self.ty(record, env, cx)? == reference_type(self.root_entity, cx)? {
-                    if let Some(root) = self.receiver(record, env, cx)? { result.try_insert(root, cx)?; }
-                }
-            },
-            _ => (),
-        }
-        Ok(result)
     }
     fn correlation(&self, predicate: &Expr, entity: &str, binding: &str, env: &DecodedRuleEnvironment, cx: &mut AllocationContext) -> Result<Option<String>, CommonFactInventoryFailure> {
         match predicate {
@@ -298,11 +301,268 @@ impl<'a> DecodedCommonFactRules<'a> {
         }
         Ok(out)
     }
+
+    fn variant(&self, action: &str, path: &[usize]) -> Option<&DecodedOwnedSpanEndpoint> {
+        let structure = self.structure?;
+        structure.edits.iter().map(|edit| if self.side == OwnedSourceSide::Before { &edit.before } else { &edit.after }).find(|endpoint| {
+            endpoint.action == action && path.len() > endpoint.list_path.len() && path.starts_with(&endpoint.list_path)
+                && endpoint.start.checked_add(endpoint.len).is_some_and(|end| (endpoint.start..end).contains(&path[endpoint.list_path.len()]))
+        })
+    }
+    fn finite_unfinished(&self, expr: &Expr, root: &str, env: &DecodedRuleEnvironment, cx: &mut AllocationContext) -> Result<bool, CommonFactInventoryFailure> {
+        if let Some(value) = literal(expr) { return Ok(value != &self.lifecycle_value); }
+        if let Expr::Field { record, field } = expr {
+            if field != self.lifecycle_field || self.ty(record, env, cx)? != reference_type(self.root_entity, cx)? { return Ok(false); }
+            return Ok(self.receiver(record, env, cx)?.as_deref() == Some(root));
+        }
+        if let Expr::If { condition, then_value, else_value } = expr {
+            if self.facet(condition, env, cx)?.as_deref() == Some(root) { return self.finite_unfinished(else_value, root, env, cx); }
+            return Ok(self.finite_unfinished(then_value, root, env, cx)? && self.finite_unfinished(else_value, root, env, cx)?);
+        }
+        Ok(false)
+    }
+    fn unfinished(&self, expr: &Expr, env: &DecodedRuleEnvironment, cx: &mut AllocationContext) -> Result<OrderedSet<String>, CommonFactInventoryFailure> {
+        let mut result = OrderedSet::new();
+        match expr {
+            Expr::And { values } => for value in values { for root in self.unfinished(value, env, cx)?.iter() { result.try_insert(copy_string(root, cx)?, cx)?; } },
+            Expr::Not { value } => if let Some(root) = self.facet(value, env, cx)? { result.try_insert(root, cx)?; },
+            Expr::Equal { left, right } => if let (Expr::Field { record, field }, Some(value)) = (left.as_ref(), literal(right)) {
+                if field == self.lifecycle_field && value != &self.lifecycle_value && self.ty(record, env, cx)? == reference_type(self.root_entity, cx)? {
+                    if let Some(root) = self.receiver(record, env, cx)? { result.try_insert(root, cx)?; }
+                }
+            },
+            _ => (),
+        }
+        Ok(result)
+    }
+    fn mixed(&self, action: &str) -> bool {
+        self.writers.iter().any(|writer| writer.side == self.side && writer.action == action && match self.kinds.get(&writer.entity) {
+            Some(DecodedOwnedSchemaKind::Root) => writer.kind == OwnedStatementKind::Create,
+            Some(DecodedOwnedSchemaKind::Aux { .. }) => false,
+            Some(_) => true,
+            None => false,
+        })
+    }
+    fn shared_update(&self, action: &str) -> bool {
+        self.writers.iter().any(|writer| writer.side == self.side && writer.action == action && writer.kind == OwnedStatementKind::Update
+            && matches!(self.kinds.get(&writer.entity), Some(DecodedOwnedSchemaKind::Registry { .. })))
+    }
+    fn auxiliary_absence(&self, action: &DecodedActionDefinition, path: &[usize], entity: &str, root: &str, env: &DecodedRuleEnvironment, cx: &mut AllocationContext) -> Result<bool, CommonFactInventoryFailure> {
+        if path.len() < 2 { return Ok(false); }
+        let mut steps = action.steps.as_slice();
+        let mut parent: Option<&Expr> = None;
+        for index in &path[..path.len() - 1] {
+            let Some(DecodedStatement::ForEach { items, steps: inner, .. }) = steps.get(*index) else { return Ok(false); };
+            parent = Some(items);
+            steps = inner;
+        }
+        let Some(Expr::Query { entity: gate_entity, binding, predicate, limit, include_archived: false, .. }) = parent else { return Ok(false); };
+        if gate_entity != self.root_entity || *limit != MAX_COLLECTION || self.correlation(predicate, gate_entity, binding, env, cx)?.as_deref() != Some(root) { return Ok(false); }
+        fn absent(rules: &DecodedCommonFactRules<'_>, expr: &Expr, entity: &str, root: &str, env: &DecodedRuleEnvironment, cx: &mut AllocationContext) -> Result<bool, CommonFactInventoryFailure> {
+            if let Expr::And { values } = expr { for value in values { if absent(rules, value, entity, root, env, cx)? { return Ok(true); } } return Ok(false); }
+            let Expr::Equal { left, right } = expr else { return Ok(false); };
+            if literal(right) != Some(&DataValue::Integer { value: 0 }) { return Ok(false); }
+            let Expr::Count { items } = left.as_ref() else { return Ok(false); };
+            let Expr::Query { entity: candidate, binding, predicate, limit, sort, include_archived: false } = items.as_ref() else { return Ok(false); };
+            Ok(candidate == entity && *limit == MAX_COLLECTION && sort.is_empty() && matches!(predicate.as_ref(), Expr::Equal { .. })
+                && rules.correlation(predicate, candidate, binding, env, cx)?.as_deref() == Some(root))
+        }
+        let sole_create = matches!(steps, [DecodedStatement::Create { entity: created, .. }] if created == entity);
+        Ok(sole_create && absent(self, predicate, entity, root, env, cx)?)
+    }
+    fn statements(&mut self, action: &DecodedActionDefinition, steps: &[DecodedStatement], prefix: &[usize], env: &mut DecodedRuleEnvironment,
+        control: &DecodedRuleValue, unfinished: &OrderedSet<String>, owner: Option<&str>, mixed: bool, cx: &mut AllocationContext) -> Result<(), CommonFactInventoryFailure> {
+        for (index, step) in steps.iter().enumerate() {
+            self.meter.charge(1)?;
+            let mut path = copy_indices(prefix, cx)?;
+            product_alloc::try_push(&mut path, index, cx, AllocationSite::Vector)?;
+            let at = format_owned(cx, format_args!("{} {path:?}", action.id))?;
+            let endpoint = self.variant(&action.id, &path);
+            let variant = endpoint.is_some();
+            let mut derived_owner = owner.map(|value| copy_string(value, cx)).transpose()?;
+            let root_binding = endpoint.and_then(|value| value.root.as_ref()).map(|root| copy_string(&root.name, cx)).transpose()?;
+            if let Some(binding) = root_binding.as_deref() {
+                let root_type = reference_type(self.root_entity, cx)?;
+                let actual = env.get(binding).filter(|value| value.ty == root_type)
+                    .and_then(|value| value.root.as_deref()).ok_or_else(|| refuse(cx, &at, "declared span root has no derived owner identity"))?;
+                if owner.is_some_and(|outer| outer != actual) { return Err(refuse(cx, &at, "declared span root differs from its enclosing frontier")); }
+                let actual = copy_string(actual, cx)?;
+                let root = endpoint.and_then(|value| value.root.as_ref()).ok_or_else(|| refuse(cx, &at, "declared span root disappeared"))?;
+                let root = DecodedOwnedRootBinding { name: copy_string(&root.name, cx)?, value_type: copy_type(&root.value_type, cx)? };
+                self.certify(&at, "endpoint root authenticated against exact derived owner", &(&root, &actual), cx)?;
+                derived_owner = Some(actual);
+            }
+            let owner = derived_owner.as_deref();
+            match step {
+                DecodedStatement::ForEach { items, binding, steps: nested } => {
+                    let selection = self.expression(items, env, true, false, &format_owned(cx, format_args!("{at}.items"))?, cx)?;
+                    if variant && owner.is_none() {
+                        if !matches!(items, Expr::Query { entity, limit, include_archived: false, .. } if entity == self.root_entity && *limit == MAX_COLLECTION) {
+                            return Err(refuse(cx, &at, "unbound insertion lacks an exact active root traversal"));
+                        }
+                        self.certify(&at, "one-sided insertion establishes an exact per-row root frontier", &(binding, items, &selection.root), cx)?;
+                    }
+                    if variant && owner.is_some() && selection.root.as_deref() != owner { return Err(refuse(cx, &at, "nested variant traversal escapes its exact root frontier")); }
+                    let mut local = env.try_clone_with(cx)?;
+                    local.insert(binding, selection.item(cx)?, cx)?;
+                    let mut controls = control.try_clone_with(cx)?;
+                    controls.merge(&selection, cx)?;
+                    let mut remaining = copy_set(unfinished, cx)?;
+                    if let Expr::Query { entity, binding: query_binding, predicate, .. } = items {
+                        let mut query_env = env.try_clone_with(cx)?;
+                        let mut row = DecodedRuleValue::plain(reference_type(entity, cx)?);
+                        row.root = selection.root.as_deref().map(|root| copy_string(root, cx)).transpose()?;
+                        query_env.insert(query_binding, row, cx)?;
+                        for root in self.unfinished(predicate, &query_env, cx)?.iter() { remaining.try_insert(copy_string(root, cx)?, cx)?; }
+                    }
+                    let frontier = selection.root.as_deref().or(owner);
+                    if !controls.policy.is_empty() && !controls.policy.iter().all(|root| Some(root.as_str()) == frontier) { return Err(refuse(cx, &at, "loop policy control crosses root ownership")); }
+                    self.statements(action, nested, &path, &mut local, &controls, &remaining, frontier, mixed, cx)?;
+                }
+                DecodedStatement::Update { record, values } => {
+                    let target = self.expression(record, env, false, false, &format_owned(cx, format_args!("{at}.target"))?, cx)?;
+                    let Type::Reference { entity } = &target.ty else { return Err(refuse(cx, &at, "update target is not a required reference")); };
+                    let kind = self.kinds.get(entity).ok_or_else(|| refuse(cx, &at, "unknown entity"))?;
+                    if matches!(kind, DecodedOwnedSchemaKind::History { .. }) { return Err(refuse(cx, &at, "terminal history update is forbidden")); }
+                    if variant && !matches!(kind, DecodedOwnedSchemaKind::Root | DecodedOwnedSchemaKind::Aux { .. }) { return Err(refuse(cx, &at, "variant writes a common relation")); }
+                    if matches!(kind, DecodedOwnedSchemaKind::Root) && !target.root.as_ref().is_some_and(|root| unfinished.contains(root)) { return Err(refuse(cx, &at, "business update can touch previously completed history")); }
+                    if variant && (owner.is_none() || target.root.as_deref() != owner) { return Err(refuse(cx, &at, "owned write targets a different root")); }
+                    let mut previous = None;
+                    while let Some((field, value)) = next_map_value(values, previous) {
+                        if kind.owner() == Some(field) || matches!(kind, DecodedOwnedSchemaKind::Registry { key } if key == field) { return Err(refuse(cx, &at, "immutable owner/registry key reassignment")); }
+                        let v = self.expression(value, env, true, false, &format_owned(cx, format_args!("{at}.{field}"))?, cx)?;
+                        let mut deps = control.try_clone_with(cx)?; deps.merge(&target, cx)?; deps.merge(&v, cx)?;
+                        if matches!(kind, DecodedOwnedSchemaKind::Root) && (variant || (mixed && !deps.policy.is_empty())) && !target.active_root { return Err(refuse(cx, &at, "policy update lacks unarchived root-target provenance")); }
+                        match kind {
+                            DecodedOwnedSchemaKind::Root | DecodedOwnedSchemaKind::Aux { .. } => {
+                                if variant || !deps.policy.is_empty() { self.discovered.try_insert((copy_string(entity, cx)?, copy_string(field, cx)?), cx)?; }
+                                if !deps.policy.iter().all(|root| Some(root.as_str()) == target.root.as_deref()) { return Err(refuse(cx, &at, "owned value depends on another root's policy")); }
+                if matches!(kind, DecodedOwnedSchemaKind::Root) && field == self.lifecycle_field {
+                                    let root = target.root.as_deref().ok_or_else(|| refuse(cx, &at, "lifecycle target lacks root identity"))?;
+                    let finite = self.finite_unfinished(value, root, env, cx)?;
+                    if !finite && (mixed || variant || steps.len() != 1 || !prefix.is_empty() || index != 0 || literal(value) != Some(&self.lifecycle_value)) { return Err(refuse(cx, &at, "mixed or unproved lifecycle transition")); }
+                                    if !finite { self.certify(&at, "isolated explicit completion transition; capture then seal required", step, cx)?; }
+                                }
+                            }
+                            DecodedOwnedSchemaKind::Link { .. } => if !deps.policy.is_empty() || !matches!(literal(value), Some(DataValue::Boolean { .. })) { return Err(refuse(cx, &at, "link non-owner update must be common literal Boolean")); },
+                            DecodedOwnedSchemaKind::Registry { .. } => {
+                                let explicit = matches!(record, Expr::Variable { name } if matches!(StringValueMap::<Type>::get(&action.parameters, name), Some(Type::Reference { entity: parameter_entity }) if parameter_entity == entity));
+                            if !explicit || !deps.policy.is_empty() || !deps.facets.is_empty() { return Err(refuse(cx, &at, "shared existing fact update requires explicit shared parameter and policy-independent admission")); }
+                                if !matches!(value, Expr::Literal { .. } | Expr::Today) && !matches!(value, Expr::Variable { name } if action.parameters.get(name).is_some_and(Type::is_scalar)) { return Err(refuse(cx, &at, "shared fact value is not explicit input/literal/clock")); }
+                            }
+                            DecodedOwnedSchemaKind::History { .. } => unreachable!(),
+                        }
+                        previous = Some(field.as_str());
+                    }
+                    self.certify(&at, if variant { "exact owner policy write with total expressions" } else { "exact common or isolated owner writer" }, step, cx)?;
+                }
+                DecodedStatement::Create { entity, bind, values } => {
+                    let kind = self.kinds.get(entity).ok_or_else(|| refuse(cx, &at, "unknown entity"))?;
+                    if variant && !matches!(kind, DecodedOwnedSchemaKind::Aux { .. }) { return Err(refuse(cx, &at, "variant may create only a declared owned auxiliary")); }
+                    let mut deps = control.try_clone_with(cx)?;
+                    let mut evaluated = OrderedMap::new();
+                    let mut previous = None;
+                    while let Some((field, value)) = next_map_value(values, previous) {
+                        let v = self.expression(value, env, true, false, &format_owned(cx, format_args!("{at}.{field}"))?, cx)?;
+                        deps.merge(&v, cx)?;
+                        evaluated.try_insert(copy_string(field, cx)?, v, cx)?;
+                        previous = Some(field.as_str());
+                    }
+                    let root = kind.owner().and_then(|field| evaluated.get(field)).and_then(|value| value.root.as_deref());
+                    match kind {
+                        DecodedOwnedSchemaKind::Aux { .. } => {
+                            if !match root { Some(root) => self.auxiliary_absence(action, &path, entity, root, env, cx)?, None => false } { return Err(refuse(cx, &at, "auxiliary uniqueness can reject common transaction: exact current owner-absence gate required")); }
+                            if root.is_none() || owner != root || !deps.policy.iter().all(|value| Some(value.as_str()) == root) { return Err(refuse(cx, &at, "auxiliary create lacks exact local owner")); }
+                        }
+                        DecodedOwnedSchemaKind::Root => {
+                            let initially_unfinished = match values.get(self.lifecycle_field) { Some(value) => self.finite_unfinished(value, "new-root", env, cx)?, None => false };
+                            if !deps.policy.is_empty() || !initially_unfinished { return Err(refuse(cx, &at, "root creation must be policy-independent and initially unfinished")); }
+                        }
+                        DecodedOwnedSchemaKind::Registry { key } => {
+                            if !deps.policy.is_empty() || deps.private_identity { return Err(refuse(cx, &at, "policy-derived shared registry create")); }
+                            let mut previous = None;
+                            while let Some((field, value)) = next_map_value(values, previous) {
+                                if field == key {
+                                    if let Expr::Field { record, field: source_field } = value {
+                                        let Type::Reference { entity: source_entity } = self.ty(record, env, cx)? else { return Err(refuse(cx, &at, "registry key origin")); };
+                                        if self.writers.iter().any(|writer| writer.entity == source_entity && writer.field.as_ref() == Some(source_field) && writer.kind != OwnedStatementKind::Create) { return Err(refuse(cx, &at, "registry name must come from immutable legacy fact or explicit scalar input")); }
+                                    }
+                                } else if !matches!(literal(value), Some(DataValue::Boolean { value: false } | DataValue::Null)) && !matches!(literal(value), Some(DataValue::Text { value }) if value.is_empty()) { return Err(refuse(cx, &at, "registry initial receipt fields must be empty/false/null literals")); }
+                                previous = Some(field.as_str());
+                            }
+                        }
+                        DecodedOwnedSchemaKind::Link { .. } => {
+                            if root.is_none() || !deps.policy.is_empty() || deps.private_identity { return Err(refuse(cx, &at, "common link create has unproved owner or private dependency")); }
+                            let mut previous = None;
+                            while let Some((field, value)) = next_map_value(values, previous) {
+                                if self.app.entities().iter().find(|candidate| candidate.id == *entity).and_then(|candidate| candidate.fields.iter().find(|candidate| candidate.id == *field)).is_some_and(|candidate| candidate.value_type == Type::Boolean) && !matches!(literal(value), Some(DataValue::Boolean { .. })) { return Err(refuse(cx, &at, "new link flags must be literals")); }
+                                previous = Some(field.as_str());
+                            }
+                        }
+                        DecodedOwnedSchemaKind::History { sequence, owner: history_owner, .. } => {
+                            if !deps.policy.is_empty() || deps.private_identity || (!deps.facets.is_empty() && history_owner.is_none()) { return Err(refuse(cx, &at, "terminal append has policy/lifecycle-selected common admission")); }
+                            if !values.get(sequence).and_then(bookkeeping).is_some_and(|(candidate, _, _)| candidate == entity) { return Err(refuse(cx, &at, "terminal producer bookkeeping differs")); }
+                        }
+                    }
+                    let mut created = DecodedRuleValue::plain(reference_type(entity, cx)?);
+                    created.root = if matches!(kind, DecodedOwnedSchemaKind::Root) { Some(format_owned(cx, format_args!("{at}/{bind}"))?) } else { root.map(|value| copy_string(value, cx)).transpose()? };
+                    created.active_root = matches!(kind, DecodedOwnedSchemaKind::Root) || self.all_roots_active || env.0.iter().any(|(_, value)| value.active_root && value.root.is_some() && value.root == created.root);
+                    created.private_identity = variant;
+                    env.insert(bind, created, cx)?;
+                    self.certify(&at, if variant { "exact owned auxiliary create" } else { "exact common creation with complete producer/consumer closure" }, step, cx)?;
+                }
+                DecodedStatement::SetState { state, value } => {
+                    if variant || !control.policy.is_empty() || prefix.len() != 0 || index + 1 != steps.len() { return Err(refuse(cx, &at, "input reset must be literal empty, common, top-level and final")); }
+                    // Non-empty continuation markers require retained-transition evidence, which is outside this decoded rule unit.
+                    if matches!(literal(value), Some(DataValue::Text { value }) if value.is_empty()) {
+                        let rule = format_owned(cx, format_args!("closed input reset {state}"))?;
+                        self.certify(&at, &rule, step, cx)?;
+                    }
+                    else { return Err(refuse(cx, &at, "input reset must be literal empty, common, top-level and final")); }
+                }
+                DecodedStatement::Assert { condition, .. } => {
+                    let value = self.expression(condition, env, false, false, &at, cx)?;
+                    if variant || !value.policy.is_empty() || !control.policy.is_empty() { return Err(refuse(cx, &at, "dependent assertion is unsupported")); }
+                }
+                DecodedStatement::Archive { .. } | DecodedStatement::Collection { .. } | DecodedStatement::Emit { .. } => return Err(refuse(cx, &at, "archive/collection/output effect has no closed preview rule")),
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn actions(&mut self, cx: &mut AllocationContext) -> Result<(), CommonFactInventoryFailure> {
+        if self.structure.is_none() { return Err(refuse(cx, "actions", "decoded structural inventory required")); }
+        let AppRef::Decoded(app) = self.app else { return Err(refuse(cx, "actions", "decoded app owner required")); };
+        for action in &app.actions {
+            let mut env = self.environment(&action.parameters, &action.id, cx)?;
+            let mut controls = DecodedRuleValue::plain(Type::Boolean);
+            let mut unfinished = OrderedSet::new();
+            let mixed = self.mixed(&action.id);
+            for (index, guard) in action.guards.iter().enumerate() {
+                let at = format_owned(cx, format_args!("{} guard[{index}]", action.id))?;
+                let value = self.expression(guard, &env, true, false, &at, cx)?;
+                controls.merge(&value, cx)?;
+                for root in self.unfinished(guard, &env, cx)?.iter() { unfinished.try_insert(copy_string(root, cx)?, cx)?; }
+            }
+            if mixed && !controls.policy.is_empty() { return Err(refuse(cx, &action.id, "common factual admission depends on private policy rather than exact lifecycle facet")); }
+            if !action.ensures.is_empty() { return Err(refuse(cx, &action.id, "action postconditions are outside closed total admission grammar")); }
+            self.statements(action, &action.steps, &[], &mut env, &controls, &unfinished, None, mixed, cx)?;
+        }
+        Ok(())
+    }
 }
 
 fn app_error(value: product_contract::AppValidationError) -> CommonFactInventoryFailure { match value { product_contract::AppValidationError::Allocation(v) => CommonFactInventoryFailure::Allocation(v), product_contract::AppValidationError::Contract(v) => CommonFactInventoryFailure::Store(v.into()) } }
 fn codec_error(value: crate::product_backup::fallible_codec::CodecError) -> CommonFactInventoryFailure { match value { crate::product_backup::fallible_codec::CodecError::Allocation(v) => CommonFactInventoryFailure::Allocation(v), _ => CommonFactInventoryFailure::Store(StoreError::Invalid("Common factual admission: identity encoding invariant".into())) } }
 fn copy_string(value: &str, cx: &mut AllocationContext) -> Result<String, CommonFactInventoryFailure> { product_alloc::try_copy_str(value, cx, AllocationSite::String).map_err(Into::into) }
+fn copy_indices(value: &[usize], cx: &mut AllocationContext) -> Result<Vec<usize>, CommonFactInventoryFailure> { let mut result = Vec::new(); product_alloc::try_reserve(&mut result, value.len(), cx, AllocationSite::Vector)?; result.extend_from_slice(value); Ok(result) }
+fn copy_set(value: &OrderedSet<String>, cx: &mut AllocationContext) -> Result<OrderedSet<String>, CommonFactInventoryFailure> { let mut result = OrderedSet::new(); for item in value.iter() { result.try_insert(copy_string(item, cx)?, cx)?; } Ok(result) }
+fn next_string_value<'a, M, V>(map: &'a M, after: Option<&str>) -> Option<(&'a String, &'a V)>
+where M: StringValueMap<V>, V: 'a {
+    map.iter().filter(|(key, _)| after.is_none_or(|previous| key.as_str() > previous)).min_by(|left, right| left.0.cmp(right.0))
+}
+fn next_map_value<'a>(map: &'a FallibleMap<Expr>, after: Option<&str>) -> Option<(&'a String, &'a Expr)> {
+    next_string_value(map, after)
+}
 fn copy_type(value: &Type, cx: &mut AllocationContext) -> Result<Type, CommonFactInventoryFailure> { product_contract::try_clone_type_with(value, cx).map_err(Into::into) }
 fn format_owned(cx: &mut AllocationContext, args: std::fmt::Arguments<'_>) -> Result<String, CommonFactInventoryFailure> { let mut value = String::new(); product_alloc::try_append_fmt(&mut value, args, cx, AllocationSite::Formatting).map_err(|failure| match failure { product_alloc::FormatFailure::Allocation(v) => CommonFactInventoryFailure::Allocation(v), product_alloc::FormatFailure::Formatter => CommonFactInventoryFailure::Store(StoreError::Invalid("Common factual admission: formatting invariant".into())) })?; Ok(value) }
 fn refuse(cx: &mut AllocationContext, at: &str, rule: &str) -> CommonFactInventoryFailure { match format_owned(cx, format_args!("Common factual admission: {at}: {rule}")) { Ok(text) => CommonFactInventoryFailure::Store(StoreError::Invalid(text)), Err(error) => error } }
@@ -373,6 +633,136 @@ mod tests {
         value.active_root = true;
         env.insert("root", value, &mut AllocationContext::new()).unwrap();
         env
+    }
+    fn empty_structure(root: &str) -> DecodedOwnedStructuralReport {
+        let digest = || Digest::from_owned_lower_hex("0000000000000000000000000000000000000000000000000000000000000000".into()).unwrap();
+        DecodedOwnedStructuralReport { before: digest(), after: digest(), root_entity: root.into(), edits: vec![], common_statements: vec![], writers: vec![], changes: vec![] }
+    }
+
+    #[test]
+    fn decoded_rule_actions_keeps_postcondition_refusal_and_allocation_retry() {
+        let mut source = crate::fixture::program(false).program;
+        source.actions = vec![crate::product_contract::ActionDefinition {
+            id: "postcondition".into(), label: "Postcondition".into(), parameters: std::collections::BTreeMap::new(),
+            guards: vec![], steps: vec![crate::product_contract::Statement::Assert { condition: boolean(true), message: "ok".into() }], ensures: vec![boolean(true)],
+        }];
+        let captured = crate::fixture::capture(serde_json::to_value(source).unwrap());
+        let mut decode_cx = AllocationContext::new();
+        let value = crate::product_json::parse_json_bytes(&serde_json::to_vec(&captured).unwrap(), &mut decode_cx).unwrap();
+        let app = crate::product_contract::decode_captured_program_fallible(value, &mut decode_cx).unwrap();
+        let before = serde_json::to_value(&app.app().actions).unwrap();
+        let structure = empty_structure("job");
+        let kinds = DecodedOwnedSchemaKinds::test_from([("job".into(), DecodedOwnedSchemaKind::Root)]);
+        let policy = OrderedSet::new();
+        let mut meter = proof_meter();
+        let mut rules = empty_rules(&app, &kinds, &policy, &mut meter).with_structure(&structure);
+
+        let error = rules.actions(&mut AllocationContext::fail_nth_growth(std::num::NonZeroUsize::new(1).unwrap(), true)).unwrap_err();
+        assert!(matches!(error, CommonFactInventoryFailure::Allocation(_)));
+        let retry = rules.actions(&mut AllocationContext::new()).unwrap_err();
+        assert!(matches!(retry, CommonFactInventoryFailure::Store(StoreError::Invalid(text)) if text == "Common factual admission: postcondition: action postconditions are outside closed total admission grammar"));
+        assert_eq!(serde_json::to_value(&app.app().actions).unwrap(), before);
+    }
+
+    #[test]
+    fn decoded_rule_actions_matches_variant_spans_by_action_and_statement_path() {
+        let (app, kinds, policy) = setup();
+        let digest = || Digest::from_owned_lower_hex("0000000000000000000000000000000000000000000000000000000000000000".into()).unwrap();
+        let endpoint = || DecodedOwnedSpanEndpoint { source: digest(), action: "a".into(), list_path: vec![0], start: 2, len: 1, kinds: vec![OwnedStatementKind::Update], digest: digest(), previous: None, next: None, root: None };
+        let structure = DecodedOwnedStructuralReport { before: digest(), after: digest(), root_entity: "job".into(), edits: vec![super::super::fallible_owned_source_decode::DecodedOwnedSpanEdit { id: "edit".into(), before: endpoint(), after: endpoint() }], common_statements: vec![], writers: vec![], changes: vec![] };
+        let mut meter = proof_meter();
+        let rules = empty_rules(&app, &kinds, &policy, &mut meter).with_structure(&structure);
+        assert!(rules.variant("a", &[0, 2]).is_some());
+        assert!(rules.variant("a", &[0, 1]).is_none());
+        assert!(rules.variant("a", &[1, 2]).is_none());
+        assert!(rules.variant("b", &[0, 2]).is_none());
+    }
+
+    #[test]
+    fn decoded_rule_actions_classifies_common_writers_and_shared_updates() {
+        let (app, _, policy) = setup();
+        let kinds = DecodedOwnedSchemaKinds::test_from([("job".into(), DecodedOwnedSchemaKind::Root), ("shared".into(), DecodedOwnedSchemaKind::Registry { key: "name".into() })]);
+        let writer = DecodedOwnedWriter { side: OwnedSourceSide::Before, source: Digest::from_owned_lower_hex("0000000000000000000000000000000000000000000000000000000000000000".into()).unwrap(), action: "shared".into(), path: vec![0], kind: OwnedStatementKind::Update, entity: "shared".into(), field: Some("secret".into()), value_type: Some(Type::Boolean) };
+        let mut meter = proof_meter();
+        let writers = [writer];
+        let rules = DecodedCommonFactRules::new(AppRef::Decoded(app.app()), &kinds, "job", "done", DataValue::Boolean { value: true }, OwnedSourceSide::Before, &policy, &writers, false, &mut meter);
+        assert!(rules.mixed("shared"));
+        assert!(rules.shared_update("shared"));
+        assert!(!rules.mixed("other"));
+    }
+
+    #[test]
+    fn decoded_rule_actions_accepts_unchanged_root_update_only_under_unfinished_guard() {
+        let mut source = crate::fixture::program(false).program;
+        let root = Expr::Variable { name: "root".into() };
+        let done = Expr::Field { record: Box::new(root.clone()), field: "done".into() };
+        source.actions = vec![crate::product_contract::ActionDefinition {
+            id: "finish".into(), label: "Finish".into(), parameters: [("root".into(), Type::reference("job"))].into_iter().collect(),
+            guards: vec![Expr::Not { value: Box::new(Expr::Equal { left: Box::new(done.clone()), right: Box::new(boolean(true)) }) }],
+            steps: vec![crate::product_contract::Statement::Update { record: root, values: [("done".into(), boolean(false))].into_iter().collect() }], ensures: vec![],
+        }];
+        let captured = crate::fixture::capture(serde_json::to_value(source).unwrap());
+        let mut decode_cx = AllocationContext::new();
+        let value = crate::product_json::parse_json_bytes(&serde_json::to_vec(&captured).unwrap(), &mut decode_cx).unwrap();
+        let app = crate::product_contract::decode_captured_program_fallible(value, &mut decode_cx).unwrap();
+        let structure = empty_structure("job");
+        let kinds = DecodedOwnedSchemaKinds::test_from([("job".into(), DecodedOwnedSchemaKind::Root)]);
+        let policy = OrderedSet::new();
+        let mut meter = proof_meter();
+        let mut rules = DecodedCommonFactRules::new(AppRef::Decoded(app.app()), &kinds, "job", "done", DataValue::Boolean { value: true }, OwnedSourceSide::Before, &policy, &[], true, &mut meter).with_structure(&structure);
+        rules.actions(&mut AllocationContext::new()).unwrap();
+        assert_eq!(rules.certificates().len(), 2);
+    }
+
+    #[test]
+    fn decoded_rule_actions_refuses_archive_delete_and_preserves_decoded_action() {
+        let mut source = crate::fixture::program(false).program;
+        source.actions = vec![crate::product_contract::ActionDefinition {
+            id: "archive".into(), label: "Archive".into(), parameters: [("root".into(), Type::reference("job"))].into_iter().collect(),
+            guards: vec![], steps: vec![crate::product_contract::Statement::Archive { record: Expr::Variable { name: "root".into() } }], ensures: vec![],
+        }];
+        let captured = crate::fixture::capture(serde_json::to_value(source).unwrap());
+        let mut decode_cx = AllocationContext::new();
+        let value = crate::product_json::parse_json_bytes(&serde_json::to_vec(&captured).unwrap(), &mut decode_cx).unwrap();
+        let app = crate::product_contract::decode_captured_program_fallible(value, &mut decode_cx).unwrap();
+        let before = serde_json::to_value(&app.app().actions).unwrap();
+        let structure = empty_structure("job");
+        let kinds = DecodedOwnedSchemaKinds::test_from([("job".into(), DecodedOwnedSchemaKind::Root)]);
+        let policy = OrderedSet::new();
+        let mut meter = proof_meter();
+        let mut rules = DecodedCommonFactRules::new(AppRef::Decoded(app.app()), &kinds, "job", "done", DataValue::Boolean { value: true }, OwnedSourceSide::Before, &policy, &[], true, &mut meter).with_structure(&structure);
+        let error = rules.actions(&mut AllocationContext::new()).unwrap_err();
+        assert!(matches!(error, CommonFactInventoryFailure::Store(StoreError::Invalid(text)) if text == "Common factual admission: archive [0]: archive/collection/output effect has no closed preview rule"));
+        assert_eq!(serde_json::to_value(&app.app().actions).unwrap(), before);
+    }
+
+    #[test]
+    fn decoded_rule_actions_only_accepts_empty_common_final_state_reset_without_transition_evidence() {
+        let decode = |value: &str| {
+            let mut source = crate::fixture::program(false).program;
+            source.state.push(crate::product_contract::StateDefinition { id: "input".into(), label: "Input".into(), value_type: Type::Text, initial: DataValue::Text { value: String::new() } });
+            source.actions = vec![crate::product_contract::ActionDefinition {
+                id: "reset".into(), label: "Reset".into(), parameters: Default::default(), guards: vec![],
+                steps: vec![crate::product_contract::Statement::SetState { state: "input".into(), value: Expr::Literal { value_type: Type::Text, value: DataValue::Text { value: value.into() } } }], ensures: vec![],
+            }];
+            let captured = crate::fixture::capture(serde_json::to_value(source).unwrap());
+            let mut cx = AllocationContext::new();
+            let value = crate::product_json::parse_json_bytes(&serde_json::to_vec(&captured).unwrap(), &mut cx).unwrap();
+            crate::product_contract::decode_captured_program_fallible(value, &mut cx).unwrap()
+        };
+        let kinds = DecodedOwnedSchemaKinds::test_from([("job".into(), DecodedOwnedSchemaKind::Root)]);
+        let policy = OrderedSet::new();
+        let structure = empty_structure("job");
+        let empty = decode("");
+        let mut empty_meter = proof_meter();
+        let mut empty_rules = DecodedCommonFactRules::new(AppRef::Decoded(empty.app()), &kinds, "job", "done", DataValue::Boolean { value: true }, OwnedSourceSide::Before, &policy, &[], false, &mut empty_meter).with_structure(&structure);
+        empty_rules.actions(&mut AllocationContext::new()).unwrap();
+        assert_eq!(empty_rules.certificates()[0].rule, "closed input reset input");
+
+        let marker = decode("retained-marker");
+        let mut marker_meter = proof_meter();
+        let mut marker_rules = DecodedCommonFactRules::new(AppRef::Decoded(marker.app()), &kinds, "job", "done", DataValue::Boolean { value: true }, OwnedSourceSide::Before, &policy, &[], false, &mut marker_meter).with_structure(&structure);
+        assert!(matches!(marker_rules.actions(&mut AllocationContext::new()), Err(CommonFactInventoryFailure::Store(StoreError::Invalid(text))) if text == "Common factual admission: reset [0]: input reset must be literal empty, common, top-level and final"));
     }
 
     #[test]
