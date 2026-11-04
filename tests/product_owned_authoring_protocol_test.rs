@@ -13,6 +13,8 @@ mod product_discovery;
 mod product_locations;
 #[path = "../src/product_protocol.rs"]
 mod product_protocol;
+#[path = "../src/product_backup.rs"]
+mod product_backup;
 #[path = "../src/product_provider/mod.rs"]
 mod product_provider;
 #[path = "../src/product_alloc.rs"]

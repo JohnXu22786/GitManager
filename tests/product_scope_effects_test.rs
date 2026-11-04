@@ -6,6 +6,10 @@ mod product_contract;
 mod product_decisions;
 #[path = "../src/product_protocol.rs"]
 mod product_protocol;
+#[path = "../src/product_locations.rs"]
+mod product_locations;
+#[path = "../src/product_backup.rs"]
+mod product_backup;
 #[path = "../src/product_alloc.rs"]
 mod product_alloc;
 #[path = "../src/product_json.rs"]

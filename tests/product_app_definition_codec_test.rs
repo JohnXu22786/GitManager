@@ -2,24 +2,6 @@
 // file in that suite; standalone integration-test builds include it once here.
 // Private borrowed walkers and the ONE System observer are reused, not copied.
 #[cfg(not(app_codec_aggregate))]
-#[path = "../src/product_decisions/mod.rs"]
-mod product_decisions;
-#[cfg(not(app_codec_aggregate))]
-#[path = "../src/product_locations.rs"]
-mod product_locations;
-#[cfg(not(app_codec_aggregate))]
-#[path = "../src/product_protocol.rs"]
-mod product_protocol;
-#[cfg(not(app_codec_aggregate))]
-#[path = "../src/product_backup.rs"]
-mod product_backup;
-#[cfg(not(app_codec_aggregate))]
-#[path = "../src/product_runtime/mod.rs"]
-mod product_runtime;
-#[cfg(not(app_codec_aggregate))]
-#[path = "../src/product_store/mod.rs"]
-mod product_store;
-#[cfg(not(app_codec_aggregate))]
 include!("product_app_expr_codec_test.rs");
 
 mod definition {

@@ -9,6 +9,18 @@
 #[path = "../src/product_app.rs"] mod product_app;
 #[cfg(not(app_codec_aggregate))]
 #[path = "../src/product_contract.rs"] mod product_contract;
+#[cfg(not(app_codec_aggregate))]
+#[path = "../src/product_decisions/mod.rs"] mod product_decisions;
+#[cfg(not(app_codec_aggregate))]
+#[path = "../src/product_locations.rs"] mod product_locations;
+#[cfg(not(app_codec_aggregate))]
+#[path = "../src/product_protocol.rs"] mod product_protocol;
+#[cfg(not(app_codec_aggregate))]
+#[path = "../src/product_backup.rs"] mod product_backup;
+#[cfg(not(app_codec_aggregate))]
+#[path = "../src/product_runtime/mod.rs"] mod product_runtime;
+#[cfg(not(app_codec_aggregate))]
+#[path = "../src/product_store/mod.rs"] mod product_store;
 #[path = "support/app_codec_oracle.rs"] mod oracle;
 use crate::product_alloc::{AllocationContext as Cx, AllocationFailure, AllocationFailureKind as FailureKind,
     AllocationSite as Site, FormatFailure, ordered::OrderedMap};

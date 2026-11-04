@@ -12,6 +12,10 @@ mod product_alloc;
 mod product_json;
 #[path = "../src/product_app.rs"]
 mod product_app;
+#[path = "../src/product_locations.rs"]
+mod product_locations;
+#[path = "../src/product_backup.rs"]
+mod product_backup;
 #[path = "../src/product_runtime/mod.rs"]
 mod product_runtime;
 #[path = "../src/product_store/mod.rs"]
