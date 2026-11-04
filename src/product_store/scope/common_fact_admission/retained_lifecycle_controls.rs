@@ -3,6 +3,56 @@
 use super::*;
 use std::time::Duration;
 
+fn witnesses(store: &crate::product_store::ProductStore) -> Vec<LifecycleWitness> {
+    let snapshot = store.load().unwrap();
+    let row = |completed: bool| {
+        let row = snapshot
+            .data
+            .records
+            .iter()
+            .find(|row| {
+                let is_completed = match row.values.get("done") {
+                    Some(DataValue::Boolean { value }) => *value,
+                    _ => matches!(
+                        row.values.get("status"),
+                        Some(DataValue::Text { value }) if value == "done"
+                    ),
+                };
+                row.entity == "job" && is_completed == completed
+            })
+            .unwrap();
+        RecordRef {
+            entity: row.entity.clone(),
+            record: row.id.clone(),
+        }
+    };
+    [OwnedSourceSide::Before, OwnedSourceSide::After]
+        .into_iter()
+        .map(|side| LifecycleWitness {
+            side,
+            scenario: ScenarioSpec {
+                version: 1,
+                id: "retained-controls".into(),
+                label: "Retained lifecycle controls".into(),
+                seed: snapshot.data.clone(),
+                session: snapshot.session.clone(),
+                clock_day: snapshot.clock_day,
+                random_seed: 1,
+                inputs: vec![SemanticInput::Observe {
+                    point: "retained-controls".into(),
+                }],
+                validity: vec![],
+            },
+            completed: row(true),
+            unfinished: row(false),
+        })
+        .collect()
+}
+
+fn cancel() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(false))
+}
+
 // Frozen original verification plus the new positively paid None-profile path:
 // full verify frame384 + replay root(4*(56+48+64+32)) + dispatch32 + ten branch2.
 const OLD_VERIFY_UNITS: u64 = 600_002;
@@ -200,7 +250,7 @@ impl ProductStore {
             if case == "selected" {
                 self.assert_decoded_lifecycle_acceptance(candidate, request, &old_accepted, true);
                 let mut host = LifecycleAcceptanceHost::prepare(
-                    self, candidate, request, &crate::witnesses(self), ProofBudget::default(), crate::cancel(),
+                    self, candidate, request, &witnesses(self), ProofBudget::default(), cancel(),
                 ).unwrap();
                 let explicit = host.explicit_host_accept_for_test(self).unwrap();
                 self.assert_decoded_lifecycle_acceptance(candidate, request, &explicit, false);

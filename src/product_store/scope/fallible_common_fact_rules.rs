@@ -826,15 +826,18 @@ pub(crate) fn lifecycle_criteria<'a>(predicate: &'a Expr, cx: &mut AllocationCon
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod fixture {
+        include!("../../../tests/fixtures/product_scope/mod.rs");
+    }
     use crate::product_store::scope::common_fact_admission::{ProofBudget, ProofMeter};
     use std::sync::{atomic::AtomicBool, Arc};
 
     fn app() -> crate::product_contract::FallibleDecodedCapturedProgram {
-        let mut source = crate::fixture::program(false).program;
+        let mut source = fixture::program(false).program;
         source.entities.push(serde_json::from_value(serde_json::json!({"id":"requirement","label":"Requirement","fields":[{"id":"job","label":"Job","value_type":{"kind":"reference","entity":"job"}},{"id":"secret","label":"Secret","value_type":{"kind":"boolean"}}],"unique":[["job"]],"constraints":[]})).unwrap());
         source.entities.push(serde_json::from_value(serde_json::json!({"id":"history","label":"History","fields":[{"id":"job","label":"Job","value_type":{"kind":"reference","entity":"job"}},{"id":"sequence","label":"Sequence","value_type":{"kind":"integer"}},{"id":"archived","label":"Archived","value_type":{"kind":"boolean"}}],"unique":[["job","sequence"]],"constraints":[]})).unwrap());
         source.state.push(crate::product_contract::StateDefinition { id: "input".into(), label: "Input".into(), value_type: Type::Text, initial: DataValue::Text { value: String::new() } });
-        let captured = crate::fixture::capture(serde_json::to_value(source).unwrap());
+        let captured = fixture::capture(serde_json::to_value(source).unwrap());
         let mut cx = AllocationContext::new();
         let value = crate::product_json::parse_json_bytes(&serde_json::to_vec(&captured).unwrap(), &mut cx).unwrap();
         crate::product_contract::decode_captured_program_fallible(value, &mut cx).unwrap()
@@ -875,17 +878,17 @@ mod tests {
     }
 
     fn app_with_view(kind: crate::product_contract::ViewKind) -> crate::product_contract::FallibleDecodedCapturedProgram {
-        let mut source = crate::fixture::program(false).program;
+        let mut source = fixture::program(false).program;
         source.initial_view = "view".into();
         source.views = vec![crate::product_contract::ViewDefinition { id: "view".into(), label: "View".into(), kind, actions: vec![], keys: vec![] }];
-        let captured = crate::fixture::capture(serde_json::to_value(source).unwrap());
+        let captured = fixture::capture(serde_json::to_value(source).unwrap());
         let mut cx = AllocationContext::new();
         let value = crate::product_json::parse_json_bytes(&serde_json::to_vec(&captured).unwrap(), &mut cx).unwrap();
         crate::product_contract::decode_captured_program_fallible(value, &mut cx).unwrap()
     }
 
     fn decode_program(source: crate::product_contract::AppDefinition) -> crate::product_contract::FallibleDecodedCapturedProgram {
-        let captured = crate::fixture::capture(serde_json::to_value(source).unwrap());
+        let captured = fixture::capture(serde_json::to_value(source).unwrap());
         let mut cx = AllocationContext::new();
         let value = crate::product_json::parse_json_bytes(&serde_json::to_vec(&captured).unwrap(), &mut cx).unwrap();
         crate::product_contract::decode_captured_program_fallible(value, &mut cx).unwrap()
@@ -893,7 +896,7 @@ mod tests {
 
     #[test]
     fn decoded_rule_projections_preserve_recipe_rules_and_allocation_refusal() {
-        let mut before_source = crate::fixture::program(false).program;
+        let mut before_source = fixture::program(false).program;
         before_source.initial_view = "root-list".into();
         before_source.views.clear();
         before_source.observables.clear();
@@ -989,7 +992,7 @@ mod tests {
         let mut retry = AllocationContext::new();
         assert_eq!(decoded_rule_projections(AppRef::Decoded(before.app()), AppRef::Decoded(after.app()), "job", &mut retry).unwrap(), recipes);
 
-        let mut changed_rows_source = crate::fixture::program(false).program;
+        let mut changed_rows_source = fixture::program(false).program;
         changed_rows_source.views.clear();
         changed_rows_source.initial_view = "root-list".into();
         changed_rows_source.views.push(crate::product_contract::ViewDefinition {
@@ -1060,12 +1063,12 @@ mod tests {
 
     #[test]
     fn decoded_rule_actions_keeps_postcondition_refusal_and_allocation_retry() {
-        let mut source = crate::fixture::program(false).program;
+        let mut source = fixture::program(false).program;
         source.actions = vec![crate::product_contract::ActionDefinition {
             id: "postcondition".into(), label: "Postcondition".into(), parameters: std::collections::BTreeMap::new(),
             guards: vec![], steps: vec![crate::product_contract::Statement::Assert { condition: boolean(true), message: "ok".into() }], ensures: vec![boolean(true)],
         }];
-        let captured = crate::fixture::capture(serde_json::to_value(source).unwrap());
+        let captured = fixture::capture(serde_json::to_value(source).unwrap());
         let mut decode_cx = AllocationContext::new();
         let value = crate::product_json::parse_json_bytes(&serde_json::to_vec(&captured).unwrap(), &mut decode_cx).unwrap();
         let app = crate::product_contract::decode_captured_program_fallible(value, &mut decode_cx).unwrap();
@@ -1112,7 +1115,7 @@ mod tests {
 
     #[test]
     fn decoded_rule_actions_accepts_unchanged_root_update_only_under_unfinished_guard() {
-        let mut source = crate::fixture::program(false).program;
+        let mut source = fixture::program(false).program;
         let root = Expr::Variable { name: "root".into() };
         let done = Expr::Field { record: Box::new(root.clone()), field: "done".into() };
         source.actions = vec![crate::product_contract::ActionDefinition {
@@ -1120,7 +1123,7 @@ mod tests {
             guards: vec![Expr::Not { value: Box::new(Expr::Equal { left: Box::new(done.clone()), right: Box::new(boolean(true)) }) }],
             steps: vec![crate::product_contract::Statement::Update { record: root, values: [("done".into(), boolean(false))].into_iter().collect() }], ensures: vec![],
         }];
-        let captured = crate::fixture::capture(serde_json::to_value(source).unwrap());
+        let captured = fixture::capture(serde_json::to_value(source).unwrap());
         let mut decode_cx = AllocationContext::new();
         let value = crate::product_json::parse_json_bytes(&serde_json::to_vec(&captured).unwrap(), &mut decode_cx).unwrap();
         let app = crate::product_contract::decode_captured_program_fallible(value, &mut decode_cx).unwrap();
@@ -1135,12 +1138,12 @@ mod tests {
 
     #[test]
     fn decoded_rule_actions_refuses_archive_delete_and_preserves_decoded_action() {
-        let mut source = crate::fixture::program(false).program;
+        let mut source = fixture::program(false).program;
         source.actions = vec![crate::product_contract::ActionDefinition {
             id: "archive".into(), label: "Archive".into(), parameters: [("root".into(), Type::reference("job"))].into_iter().collect(),
             guards: vec![], steps: vec![crate::product_contract::Statement::Archive { record: Expr::Variable { name: "root".into() } }], ensures: vec![],
         }];
-        let captured = crate::fixture::capture(serde_json::to_value(source).unwrap());
+        let captured = fixture::capture(serde_json::to_value(source).unwrap());
         let mut decode_cx = AllocationContext::new();
         let value = crate::product_json::parse_json_bytes(&serde_json::to_vec(&captured).unwrap(), &mut decode_cx).unwrap();
         let app = crate::product_contract::decode_captured_program_fallible(value, &mut decode_cx).unwrap();
@@ -1158,13 +1161,13 @@ mod tests {
     #[test]
     fn decoded_rule_actions_only_accepts_empty_common_final_state_reset_without_transition_evidence() {
         let decode = |value: &str| {
-            let mut source = crate::fixture::program(false).program;
+            let mut source = fixture::program(false).program;
             source.state.push(crate::product_contract::StateDefinition { id: "input".into(), label: "Input".into(), value_type: Type::Text, initial: DataValue::Text { value: String::new() } });
             source.actions = vec![crate::product_contract::ActionDefinition {
                 id: "reset".into(), label: "Reset".into(), parameters: Default::default(), guards: vec![],
                 steps: vec![crate::product_contract::Statement::SetState { state: "input".into(), value: Expr::Literal { value_type: Type::Text, value: DataValue::Text { value: value.into() } } }], ensures: vec![],
             }];
-            let captured = crate::fixture::capture(serde_json::to_value(source).unwrap());
+            let captured = fixture::capture(serde_json::to_value(source).unwrap());
             let mut cx = AllocationContext::new();
             let value = crate::product_json::parse_json_bytes(&serde_json::to_vec(&captured).unwrap(), &mut cx).unwrap();
             crate::product_contract::decode_captured_program_fallible(value, &mut cx).unwrap()
