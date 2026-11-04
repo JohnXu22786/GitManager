@@ -85,6 +85,7 @@ fn actual_reconstruction_layouts_cover_complete_headers() {
     assert_eq!(RECONSTRUCTED_ORIGIN_PAYMENT, RECONSTRUCTED_ORIGIN);
     assert_eq!(COLD_HISTORICAL_SERIALIZATION_PAYMENT, COLD_SERIALIZATION);
     assert_eq!(owned_continuation::COMPARISON_DISPATCH_PAYMENT, COMPARISON_DISPATCH);
+    assert_eq!(owned_continuation::COMPARISON_OWNER_PAYMENT, COMPARISON_OWNER);
     println!(
         "RECONSTRUCTION_LAYOUTS {}",
         serde_json::json!({
@@ -433,6 +434,8 @@ const RECONSTRUCTED_ORIGIN: u64 = 4736;
 const COLD_SERIALIZATION: u64 = 8980;
 // Two complete continuation results grew by one Arc (8 bytes) each.
 const COMPARISON_DISPATCH: u64 = 6016;
+const COMPARISON_OWNER: u64 = 8128;
+const CURRENT_TRANSITION_APP_BYTES: u64 = 60_439;
 const DISPATCH_GROWTH: u64 = COMPARISON_DISPATCH - 6000;
 // The immutable fixture/input digests asserted below bind these independently
 // pinned Before/After evidence lengths, including historical/later pairs.
@@ -729,10 +732,47 @@ fn assert_route_boundary(
         assert_eq!(callbacks, 0, "{label}: no downstream policy callback");
     }
 }
+
+fn assert_observed_route_result(
+    current: &ProjectSnapshot,
+    before: &CapturedProgram,
+    after: &CapturedProgram,
+    sources: &OwnedSourceRequest,
+    operation: &str,
+    units: u64,
+    label: &str,
+    expect_success: bool,
+    expected_remaining: Option<u64>,
+) {
+    let layer = current.owned_scope().unwrap().layers.keys().next().unwrap();
+    let frozen = canonical_bytes(current).unwrap();
+    let mut limited = ProofMeter::new(
+        ProofBudget { units, ..ProofBudget::default() },
+        cancel(),
+    )
+    .unwrap();
+    let result = transition(
+        current, before, after, sources, layer, operation, false, &mut limited,
+    );
+    if expect_success {
+        assert!(result.is_ok(), "{label}");
+    } else {
+        match result {
+            Ok(_) => panic!("{label}: expected budget refusal"),
+            Err(error) => assert!(error.to_string().contains(
+                "cumulative proof/initialization budget exhausted"
+            )),
+        }
+    }
+    if let Some(remaining) = expected_remaining {
+        assert_eq!(limited.remaining_units_for_test(), remaining, "{label}");
+    }
+    assert_eq!(canonical_bytes(current).unwrap(), frozen, "{label}: input is immutable");
+}
 fn assert_initial_route_boundaries(current: &ProjectSnapshot, before: &CapturedProgram, after: &CapturedProgram,
     sources: &OwnedSourceRequest, registry: &ReconstructedOwned) {
     assert_accounting_fixture(current, before, after, sources,
-        "20bac07bcd3177776d9f2bfd7fa547e8e12162c65e2f35911eb59f93042b9ab7");
+        "68c3a5506ae7a2307238b53f58692ef757f34ce2d842369e0279b32d765a6ac4");
     assert_epoch_topology(current, registry, 1);
     let registry_prefix = REGISTRY_PREFIX_SCOPE + REGISTRY_PREFIX_INTERVAL;
     let transition_prefix = TRANSITION_PREFIX_SCOPE + TRANSITION_PREFIX_INTERVAL;
@@ -743,18 +783,159 @@ fn assert_initial_route_boundaries(current: &ProjectSnapshot, before: &CapturedP
     // units than the historical prefix predicted; keep the debit boundary
     // fixed and correct only that prior-prefix vector.
     const INITIAL_ORIGIN_PREFIX_RECONCILIATION: u64 = 24;
+    // d251's `registry-r2` stopped at the reconstructed-origin packet (208).
+    // The current path removes 28,116 duplicate projection-capture ContractWork
+    // units, then adds 5,216 units of retained-source handoff, 17,038 canonical
+    // source bytes, and now pays the 208-unit origin packet. It reaches the
+    // nested historical OwnedV2 scope serialization next (5,296 bytes).
+    // Differential traces are in /tmp/pr202-d251-route-contract-trace.log and
+    // /tmp/pr202-route-contract-trace.log; all charges retain their original
+    // production sites and the downstream failure remains metered.
+    const DUPLICATE_CAPTURE_WORK_REMOVED: u64 = 28_116;
+    const RETAINED_HANDOFF_DELTA: u64 = 5_216;
+    const AUTHENTICATED_SOURCE_BYTES: u64 = 17_038;
+    const RECONSTRUCTED_ORIGIN_DEBIT: u64 = 208;
+    const NESTED_HISTORICAL_SCOPE_BYTES: u64 = 5_296;
+    const FRESH_RECONSTRUCTED_SCOPE_BYTES: u64 = 5_328;
+    const FRESH_NEXT_HISTORICAL_SCOPE_BYTES: u64 = 21_180;
+    const LEGACY_REGISTRY_R2_PREFIX: u64 = 2_555_127 - INITIAL_ORIGIN_PREFIX_RECONCILIATION;
+    const CURRENT_SCOPE_PREFIX: u64 = LEGACY_REGISTRY_R2_PREFIX
+        - DUPLICATE_CAPTURE_WORK_REMOVED
+        + RETAINED_HANDOFF_DELTA
+        + AUTHENTICATED_SOURCE_BYTES
+        + RECONSTRUCTED_ORIGIN_DEBIT;
+    assert_eq!(CURRENT_SCOPE_PREFIX, 2_549_449);
+    const CURRENT_REGISTRY_R4_PREFIX: u64 = 2_562_272
+        + REGISTRY_PREFIX_SCOPE
+        + REGISTRY_PREFIX_INTERVAL
+        - INITIAL_ORIGIN_PREFIX_RECONCILIATION
+        - DUPLICATE_CAPTURE_WORK_REMOVED
+        + RETAINED_HANDOFF_DELTA
+        + AUTHENTICATED_SOURCE_BYTES;
+    assert_eq!(CURRENT_REGISTRY_R4_PREFIX, 2_582_830);
+    const LEGACY_FRESH_R2_PREFIX: u64 = 2_555_271 - INITIAL_ORIGIN_PREFIX_RECONCILIATION;
+    const CURRENT_FRESH_R2_PREFIX: u64 = LEGACY_FRESH_R2_PREFIX
+        - DUPLICATE_CAPTURE_WORK_REMOVED
+        + RETAINED_HANDOFF_DELTA
+        + AUTHENTICATED_SOURCE_BYTES
+        + RECONSTRUCTED_ORIGIN_DEBIT
+        + FRESH_RECONSTRUCTED_SCOPE_BYTES;
+    assert_eq!(CURRENT_FRESH_R2_PREFIX, 2_554_921);
+    // Fresh reconstruction now reaches the old 1,664-unit transition prefix
+    // after the same net capture/handoff/source correction as registry-r4;
+    // it pays that packet and next reaches the independently pinned 97,216
+    // structural-entry debit.
+    let legacy_fresh_r4_prefix = 2_562_416 + transition_prefix - INITIAL_ORIGIN_PREFIX_RECONCILIATION;
+    let current_fresh_r4_prefix = legacy_fresh_r4_prefix
+        - DUPLICATE_CAPTURE_WORK_REMOVED
+        + RETAINED_HANDOFF_DELTA
+        + AUTHENTICATED_SOURCE_BYTES
+        + 1_664;
+    assert_eq!(current_fresh_r4_prefix, 2_584_702);
+    // The 6,016 dispatch debit is now paid before the next 8,128 owner debit;
+    // the old prefix minus duplicate work plus retained handoff/source charges
+    // and that paid dispatch yield the new exact boundary.
+    let legacy_fresh_r5_prefix = 2_564_080 + fresh_entry - INITIAL_ORIGIN_PREFIX_RECONCILIATION;
+    let current_fresh_r5_prefix = legacy_fresh_r5_prefix
+        - DUPLICATE_CAPTURE_WORK_REMOVED
+        + RETAINED_HANDOFF_DELTA
+        + AUTHENTICATED_SOURCE_BYTES
+        + COMPARISON_DISPATCH;
+    assert_eq!(current_fresh_r5_prefix, 2_687_934);
+    // With the dispatch and owner debits paid, reconstruction next reaches the
+    // fixed structural-pair packet. The same measured capture/handoff/source
+    // delta applies to this independently pinned prior prefix.
+    let legacy_fresh_r6_prefix = 2_570_080 + fresh_entry + DISPATCH_GROWTH
+        - INITIAL_ORIGIN_PREFIX_RECONCILIATION;
+    let current_fresh_r6_prefix = legacy_fresh_r6_prefix
+        - DUPLICATE_CAPTURE_WORK_REMOVED
+        + RETAINED_HANDOFF_DELTA
+        + AUTHENTICATED_SOURCE_BYTES
+        + COMPARISON_OWNER;
+    assert_eq!(current_fresh_r6_prefix, 2_696_062);
+    // The prior 328-unit comparison boundary is now passed. The prefix delta
+    // reconciles the already measured capture/handoff/source work with the
+    // inherited-guard recheck (1,471), continuation admission (2,892 plus the
+    // formerly refused 328 packet), and transition-lowering setup (57). The
+    // next real debit is the full generated App's canonical byte length.
+    const INHERITED_GUARD_RECHECK: u64 = 1_471;
+    const CONTINUATION_ADMISSION_DELTA: u64 = 2_892;
+    const FORMERLY_REFUSED_COMPARISON: u64 = 328;
+    const TRANSITION_LOWERING_SETUP: u64 = 57;
+    let legacy_fresh_first_hit_prefix = 3_248_886 + fresh_pair
+        - CANONICAL_SAVING_PER_PAIR
+        - INITIAL_ORIGIN_PREFIX_RECONCILIATION;
+    let current_fresh_first_hit_prefix = legacy_fresh_first_hit_prefix
+        - DUPLICATE_CAPTURE_WORK_REMOVED
+        + RETAINED_HANDOFF_DELTA
+        + AUTHENTICATED_SOURCE_BYTES
+        + INHERITED_GUARD_RECHECK
+        + CONTINUATION_ADMISSION_DELTA
+        + FORMERLY_REFUSED_COMPARISON
+        + TRANSITION_LOWERING_SETUP;
+    assert_eq!(current_fresh_first_hit_prefix, legacy_fresh_first_hit_prefix - 1_114);
+    // The second-hit baseline prefix additionally contains a refused 328-unit
+    // comparison packet; current reaches the same full-App serialization with
+    // the 2,564-unit continuation delta measured for that second-hit route.
+    const SECOND_HIT_CONTINUATION_DELTA: u64 = 2_564;
+    let legacy_fresh_second_hit_prefix = 3_249_214 + fresh_pair
+        - CANONICAL_SAVING_PER_PAIR
+        - INITIAL_ORIGIN_PREFIX_RECONCILIATION;
+    let current_fresh_second_hit_prefix = legacy_fresh_second_hit_prefix
+        - DUPLICATE_CAPTURE_WORK_REMOVED
+        + RETAINED_HANDOFF_DELTA
+        + AUTHENTICATED_SOURCE_BYTES
+        + INHERITED_GUARD_RECHECK
+        + SECOND_HIT_CONTINUATION_DELTA
+        + FORMERLY_REFUSED_COMPARISON
+        + TRANSITION_LOWERING_SETUP;
+    assert_eq!(current_fresh_second_hit_prefix, legacy_fresh_second_hit_prefix - 1_442);
+    const FRESH_VIEW_CONTINUATION_DELTA: u64 = 1_850;
+    const FORMERLY_REFUSED_VIEW_PACKET: u64 = 704;
+    let legacy_fresh_view_prefix = 3_249_552 + fresh_pair
+        - CANONICAL_SAVING_PER_PAIR
+        - INITIAL_ORIGIN_PREFIX_RECONCILIATION;
+    let current_fresh_view_prefix = legacy_fresh_view_prefix
+        - DUPLICATE_CAPTURE_WORK_REMOVED
+        + RETAINED_HANDOFF_DELTA
+        + AUTHENTICATED_SOURCE_BYTES
+        + INHERITED_GUARD_RECHECK
+        + FRESH_VIEW_CONTINUATION_DELTA
+        + FORMERLY_REFUSED_VIEW_PACKET
+        + TRANSITION_LOWERING_SETUP;
+    assert_eq!(current_fresh_view_prefix, legacy_fresh_view_prefix - 1_780);
+    const FRESH_QUERY_CONTINUATION_DELTA: u64 = 10;
+    const FORMERLY_REFUSED_QUERY_PACKET: u64 = 1_840;
+    let legacy_fresh_query_prefix = 3_250_256 + fresh_pair
+        - CANONICAL_SAVING_PER_PAIR
+        - INITIAL_ORIGIN_PREFIX_RECONCILIATION;
+    let current_fresh_query_prefix = legacy_fresh_query_prefix
+        - DUPLICATE_CAPTURE_WORK_REMOVED
+        + RETAINED_HANDOFF_DELTA
+        + AUTHENTICATED_SOURCE_BYTES
+        + INHERITED_GUARD_RECHECK
+        + FRESH_QUERY_CONTINUATION_DELTA
+        + FORMERLY_REFUSED_QUERY_PACKET
+        + TRANSITION_LOWERING_SETUP;
+    assert_eq!(current_fresh_query_prefix, legacy_fresh_query_prefix - 2_484);
     for (label, prefix, cost, end) in [
         ("registry-r1", 1, 1312, false),
-        ("registry-r2", 2_555_127 - INITIAL_ORIGIN_PREFIX_RECONCILIATION, 208, false),
-        ("registry-r4", 2_562_272 + registry_prefix - INITIAL_ORIGIN_PREFIX_RECONCILIATION, 1376, true),
+        ("registry-r2-history-scope", CURRENT_SCOPE_PREFIX, NESTED_HISTORICAL_SCOPE_BYTES, false),
+        ("registry-r4", CURRENT_REGISTRY_R4_PREFIX, 1376, true),
     ] { assert_route_boundary(current, before, after, sources, None, "drop-control", 0, label, prefix, cost, end); }
     for (label, prefix, cost) in [
-        ("fresh-r1", 1, 1456), ("fresh-r2", 2_555_271 - INITIAL_ORIGIN_PREFIX_RECONCILIATION, 208),
-        ("fresh-r4", 2_562_416 + transition_prefix - INITIAL_ORIGIN_PREFIX_RECONCILIATION, 1664), ("fresh-r5", 2_564_080 + fresh_entry - INITIAL_ORIGIN_PREFIX_RECONCILIATION, COMPARISON_DISPATCH),
-        ("fresh-r6", 2_570_080 + fresh_entry + DISPATCH_GROWTH - INITIAL_ORIGIN_PREFIX_RECONCILIATION, 8128), ("fresh-first-hit", 3_248_886 + fresh_pair - CANONICAL_SAVING_PER_PAIR - INITIAL_ORIGIN_PREFIX_RECONCILIATION, 328),
-        ("fresh-second-hit", 3_249_214 + fresh_pair - CANONICAL_SAVING_PER_PAIR - INITIAL_ORIGIN_PREFIX_RECONCILIATION, 328), ("fresh-r8-view", 3_249_552 + fresh_pair - CANONICAL_SAVING_PER_PAIR - INITIAL_ORIGIN_PREFIX_RECONCILIATION, 704),
-        ("fresh-r8-query", 3_250_256 + fresh_pair - CANONICAL_SAVING_PER_PAIR - INITIAL_ORIGIN_PREFIX_RECONCILIATION, 1840),
+        ("fresh-r1", 1, 1456), ("fresh-r2-history-scope", CURRENT_FRESH_R2_PREFIX, FRESH_NEXT_HISTORICAL_SCOPE_BYTES),
+        ("fresh-r4-structural-entry", current_fresh_r4_prefix, STRUCTURAL_ENTRY), ("fresh-r5-comparison-owner", current_fresh_r5_prefix, COMPARISON_OWNER),
+        ("fresh-r6-structural-pair", current_fresh_r6_prefix, STRUCTURAL_PAIR),
     ] { assert_route_boundary(current, before, after, sources, None, "drop-control", 1, label, prefix, cost, false); }
+    assert_route_boundary(current, before, after, sources, None, "drop-control", 1,
+        "fresh-first-hit-app-bytes", current_fresh_first_hit_prefix, CURRENT_TRANSITION_APP_BYTES, true);
+    assert_route_boundary(current, before, after, sources, None, "drop-control", 1,
+        "fresh-second-hit-app-bytes", current_fresh_second_hit_prefix, CURRENT_TRANSITION_APP_BYTES, true);
+    assert_route_boundary(current, before, after, sources, None, "drop-control", 1,
+        "fresh-r8-view-app-bytes", current_fresh_view_prefix, CURRENT_TRANSITION_APP_BYTES, true);
+    assert_route_boundary(current, before, after, sources, None, "drop-control", 1,
+        "fresh-r8-query-app-bytes", current_fresh_query_prefix, CURRENT_TRANSITION_APP_BYTES, true);
     for (label, prefix, cost) in [
         ("general-transport", 1, 1028), ("general-r5", 1029 + STRUCTURAL_ENTRY, COMPARISON_DISPATCH),
         ("general-r6", 7029 + STRUCTURAL_ENTRY + DISPATCH_GROWTH, 8128), ("general-r8-view", 1_315_405 + general_pair - 2 * CANONICAL_SAVING_PER_PAIR, 704),
@@ -764,7 +945,7 @@ fn assert_initial_route_boundaries(current: &ProjectSnapshot, before: &CapturedP
 fn assert_historical_route_boundaries(current: &ProjectSnapshot, before: &CapturedProgram, after: &CapturedProgram,
     sources: &OwnedSourceRequest) {
     assert_accounting_fixture(current, before, after, sources,
-        "fed424ae9e77bdb90745bbed2ae89f4c3d2741ccdc259ebf59d88fccca913718");
+        "cddc935826208d8b6048c10cc3273432698d3f1615d210584cf4ba09bc4e7527");
     let registry = reconstruct(current, &mut meter()).unwrap();
     assert_epoch_topology(current, &registry, 2);
     let state = current.owned_scope().unwrap();
@@ -787,19 +968,133 @@ fn assert_historical_route_boundaries(current: &ProjectSnapshot, before: &Captur
         + COLD_SERIALIZATION - HISTORICAL_DATA_BYTES - 24;
     let historical_entry = historical_prefix + (RECONSTRUCTED_ORIGIN - 3584) + RECONSTRUCTED_ENTRY;
     let historical_pair = historical_entry + DISPATCH_GROWTH + STRUCTURAL_PAIR;
+    // In the current retained-source path, the old origin refusal is paid;
+    // duplicate capture work is removed, while source handoff/bytes are charged.
+    const DUPLICATE_CAPTURE_WORK_REMOVED: u64 = 28_116;
+    const RETAINED_HANDOFF_DELTA: u64 = 5_216;
+    const AUTHENTICATED_SOURCE_BYTES: u64 = 17_038;
+    let current_history_r3_prefix = 2_576_424 + historical_prefix
+        - DUPLICATE_CAPTURE_WORK_REMOVED
+        + RETAINED_HANDOFF_DELTA
+        + AUTHENTICATED_SOURCE_BYTES
+        + RECONSTRUCTED_ORIGIN;
+    assert_eq!(current_history_r3_prefix, 2_603_828);
+    // Continuing the measured history route pays the 6,016-unit comparison
+    // dispatch that the old vector refused. Its prior-prefix delta is therefore
+    // -28,116 duplicate capture work +5,216 retained-source handoff +17,038
+    // authenticated source bytes +6,016 paid dispatch = +154.
+    const COMPARISON_DISPATCH: u64 = 6_016;
+    const COMPARISON_OWNER: u64 = 8_128;
+    const HISTORICAL_CAPTURE_WORK_REMOVED: u64 = 28_116;
+    const HISTORICAL_RETAINED_HANDOFF: u64 = 5_216;
+    const HISTORICAL_SOURCE_BYTES: u64 = 17_038;
+    let legacy_history_r5_prefix = 2_580_008 + historical_entry;
+    let current_history_r5_prefix = legacy_history_r5_prefix
+        - HISTORICAL_CAPTURE_WORK_REMOVED
+        + HISTORICAL_RETAINED_HANDOFF
+        + HISTORICAL_SOURCE_BYTES
+        + COMPARISON_DISPATCH;
+    assert_eq!(current_history_r5_prefix, 2_652_980);
+    // With the old structural-entry vector the current route has already paid
+    // the entry. The next refusal is the 1,602-byte canonical continuation
+    // packet at owned_continuation::charged_bytes. Derive its exact prefix from
+    // the trace: budget 2,661,108 + 97,216 - 1, minus the observed 330 left,
+    // equals 2,757,992 units already paid including ProofMeter::new's unit.
+    // The frozen-prefix helper also counts that meter unit, so its vector is
+    // one greater than the observed paid total.
+    const CURRENT_HISTORY_CONTINUATION_PACKET_BYTES: u64 = 1_602;
+    const CURRENT_HISTORY_CONTINUATION_PREFIX: u64 = 2_757_993;
+    // The old first-hit boundary was an empty 328-unit comparison packet at
+    // owned_continuation::371. Current trace reaches common_fact_rules' real
+    // inventory tally instead: 713 uses +37 writers +71 certificates =821.
+    // The paired d251/current traces show current paid-prefix is one unit
+    // higher, after accounting for the initial meter unit outside the trace.
+    let current_history_first_hit_prefix =
+        3_264_820 + historical_pair - CANONICAL_SAVING_PER_PAIR + 1;
+    const CURRENT_HISTORY_FIRST_HIT_INVENTORY: u64 = 713 + 37 + 71;
+    // Paying the inventory tally enters transition lowering, which charges 57
+    // units of setup before serializing this 60,442-byte historical App.
+    const CURRENT_HISTORY_TRANSITION_SETUP: u64 = 57;
+    const CURRENT_HISTORY_TRANSITION_APP_BYTES: u64 = 60_442;
+    let current_history_second_hit_prefix = current_history_first_hit_prefix
+        + CURRENT_HISTORY_FIRST_HIT_INVENTORY
+        + CURRENT_HISTORY_TRANSITION_SETUP;
     // The second traversal adds one scope and two intervals before final R4.
     let final_prefix = historical_pair + TRANSITION_PREFIX_SCOPE + 2 * TRANSITION_PREFIX_INTERVAL
         - reused_interval;
     let final_entry = final_prefix + STRUCTURAL_ENTRY;
     let final_pair = final_entry + DISPATCH_GROWTH + STRUCTURAL_PAIR;
+    let legacy_later_r4_prefix = 3_348_552 + final_prefix - CANONICAL_SAVING_PER_PAIR;
+    let current_later_r4_prefix = legacy_later_r4_prefix
+        - HISTORICAL_CAPTURE_WORK_REMOVED
+        + HISTORICAL_RETAINED_HANDOFF
+        + HISTORICAL_SOURCE_BYTES
+        + TRANSITION_FINISH;
+    assert_eq!(current_later_r4_prefix, 3_292_811);
+    let legacy_later_general_r5_prefix =
+        3_350_216 + final_entry - CANONICAL_SAVING_PER_PAIR;
+    let current_later_general_r5_prefix = legacy_later_general_r5_prefix
+        - HISTORICAL_CAPTURE_WORK_REMOVED
+        + HISTORICAL_RETAINED_HANDOFF
+        + HISTORICAL_SOURCE_BYTES
+        + COMPARISON_DISPATCH;
+    assert_eq!(current_later_general_r5_prefix, 3_396_043);
+    let current_later_general_r6_prefix =
+        current_later_general_r5_prefix + COMPARISON_OWNER;
     for (label, prefix, cost) in [
-        ("history-r3", 2_576_424 + historical_prefix, RECONSTRUCTED_ORIGIN), ("history-r5", 2_580_008 + historical_entry, COMPARISON_DISPATCH),
-        ("history-r6", 2_586_008 + historical_entry + DISPATCH_GROWTH, 8128), ("history-first-hit", 3_264_820 + historical_pair - CANONICAL_SAVING_PER_PAIR, 328),
-        ("history-second-hit", 3_265_148 + historical_pair - CANONICAL_SAVING_PER_PAIR, 328), ("history-r8-view", 3_267_126 + historical_pair - CANONICAL_SAVING_PER_PAIR, 704),
-        ("history-r8-query", 3_267_830 + historical_pair - CANONICAL_SAVING_PER_PAIR, 1840), ("later-r4", 3_348_552 + final_prefix - CANONICAL_SAVING_PER_PAIR, 1664),
-        ("later-general-r5", 3_350_216 + final_entry - CANONICAL_SAVING_PER_PAIR, COMPARISON_DISPATCH), ("later-general-r6", 3_356_216 + final_entry + DISPATCH_GROWTH - CANONICAL_SAVING_PER_PAIR, 8128),
-        ("later-general-r8-view", 4_666_238 + final_pair - 3 * CANONICAL_SAVING_PER_PAIR, 704), ("later-general-r8-query", 4_666_942 + final_pair - 3 * CANONICAL_SAVING_PER_PAIR, 1840),
+        ("history-r3-structural-entry", current_history_r3_prefix, RECONSTRUCTED_ENTRY), ("history-r5-comparison-owner", current_history_r5_prefix, COMPARISON_OWNER),
+        ("history-r6-continuation-packet", CURRENT_HISTORY_CONTINUATION_PREFIX, CURRENT_HISTORY_CONTINUATION_PACKET_BYTES), ("history-first-hit-inventory", current_history_first_hit_prefix, CURRENT_HISTORY_FIRST_HIT_INVENTORY),
+        ("history-second-hit-app-bytes", current_history_second_hit_prefix, CURRENT_HISTORY_TRANSITION_APP_BYTES), ("history-r8-view-app-bytes", current_history_second_hit_prefix, CURRENT_HISTORY_TRANSITION_APP_BYTES),
+        ("history-r8-query-app-bytes", current_history_second_hit_prefix, CURRENT_HISTORY_TRANSITION_APP_BYTES), ("later-r4-structural-entry", current_later_r4_prefix, STRUCTURAL_ENTRY),
+        ("later-general-r5-comparison-owner", current_later_general_r5_prefix, COMPARISON_OWNER), ("later-general-r6-structural-pair", current_later_general_r6_prefix, STRUCTURAL_PAIR),
     ] { assert_route_boundary(current, before, after, sources, None, "evolve-two", 1, label, prefix, cost, false); }
+    assert_observed_route_result(
+        current,
+        before,
+        after,
+        sources,
+        "evolve-two",
+        4_666_238 + final_pair - 3 * CANONICAL_SAVING_PER_PAIR + 704 - 1,
+        "later-general-r8-view App serialization refusal",
+        false,
+        Some(2_130),
+    );
+    let legacy_later_general_r8_query_prefix =
+        4_666_942 + final_pair - 3 * CANONICAL_SAVING_PER_PAIR;
+    assert_observed_route_result(
+        current,
+        before,
+        after,
+        sources,
+        "evolve-two",
+        legacy_later_general_r8_query_prefix + 1_840 - 1,
+        "later-general-r8-query observed refusal",
+        false,
+        Some(3_970),
+    );
+    let legacy_later_general_r8_view_prefix =
+        4_666_238 + final_pair - 3 * CANONICAL_SAVING_PER_PAIR;
+    const OLD_VIEW_PACKET: u64 = 704;
+    const OBSERVED_VIEW_REMAINDER: u64 = 2_130;
+    let current_later_general_app_prefix = legacy_later_general_r8_view_prefix
+        + OLD_VIEW_PACKET
+        - 1
+        - OBSERVED_VIEW_REMAINDER;
+    assert_eq!(current_later_general_app_prefix, 4_355_140);
+    for exact in [false, true] {
+        assert_observed_route_result(
+            current,
+            before,
+            after,
+            sources,
+            "evolve-two",
+            current_later_general_app_prefix + CURRENT_HISTORY_TRANSITION_APP_BYTES
+                - u64::from(!exact),
+            "later-general current App serialization boundary",
+            exact,
+            if exact { None } else { Some(CURRENT_HISTORY_TRANSITION_APP_BYTES - 1) },
+        );
+    }
 }
 
 #[test]

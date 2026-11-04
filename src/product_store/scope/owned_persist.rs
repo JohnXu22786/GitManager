@@ -2004,7 +2004,10 @@ macro_rules! reconstruct_body {
             .layers
             .get(id)
             .ok_or_else(|| err("committed layer missing"))?;
-        if $layer.identity()? != *id || $layer.operation != $manifest.operation {
+        if $layer.identity()? != *id
+            || ($manifest.transition == ScopeTransition::Adoption
+                && $layer.operation != $manifest.operation)
+        {
             return Err(err("committed composition tail does not identify its new layer"));
         }
         let $init = $state

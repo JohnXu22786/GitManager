@@ -638,6 +638,7 @@ pub(super) fn derive_retained<'s>(
     {
         return Err(error("stale authenticated snapshot/source basis"));
     }
+    // Reuse the source baseline already authenticated by the caller.
     let before = &baseline.program;
     let after = &candidate.program;
     super::owned_resolve::analyze_retained_sources(baseline, candidate, &request.sources, meter,

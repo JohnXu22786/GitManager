@@ -1,6 +1,8 @@
 //! Fresh synthetic P5 All-population fixture. No restored/private acceptance claim.
 //! Uses only the existing common-fact constructors and production entry points.
-use crate::common::*;
+#[path = "../common_fact/mod.rs"]
+mod common;
+use common::*;
 use crate::product_contract::*;
 use crate::product_decisions::*;
 use crate::product_runtime::LocalRuntime;
@@ -60,7 +62,7 @@ pub fn observed_count(scene: &AcceptedScene) -> i64 {
 }
 
 pub fn pair() -> (CapturedProgram, CapturedProgram) {
-    let (a, b) = crate::common::pair();
+    let (a, b) = common::pair();
     let (mut a, mut b) = (a.program, b.program);
     // Re-arm memory for this exact active owner on every later withdrawal.
     // Update existing rows before the unchanged create-if-absent gate so a
@@ -117,7 +119,7 @@ pub fn sources(a: &CapturedProgram, b: &CapturedProgram) -> OwnedSourceRequest {
     OwnedSourceRequest { before: canonical_digest(IdentityDomain::Source, a).unwrap(), after: canonical_digest(IdentityDomain::Source, b).unwrap(), root_entity: "job".into(), edits }
 }
 pub fn request(s: &ProductStore, a: &CapturedProgram, b: &CapturedProgram) -> OwnedPreviewRequest {
-    let mut r = crate::common::request(s, a, b);
+    let mut r = common::request(s, a, b);
     r.inventory.sources = sources(a, b);
     r.purpose = "Fresh synthetic PropertiesOnly P5 All journey".into();
     r

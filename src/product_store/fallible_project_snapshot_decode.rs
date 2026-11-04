@@ -1167,12 +1167,12 @@ mod tests {
     }
 
     fn runtime_commit_snapshot() -> serde_json::Value {
-        let mut app = crate::fixture::organizer();
+        let mut app = crate::product_store::runtime_test_fixture::organizer();
         let mut emit = app["actions"][2]["steps"][0].clone();
-        emit["items"] = crate::fixture::query("person");
+        emit["items"] = crate::product_store::runtime_test_fixture::query("person");
         app["actions"][0]["steps"].as_array_mut().unwrap().push(emit);
-        let program = crate::fixture::capture(app);
-        let data = crate::fixture::seed(&program);
+        let program = crate::product_store::runtime_test_fixture::capture(app);
+        let data = crate::product_store::runtime_test_fixture::seed(&program);
         let session = crate::product_contract::SessionState::initial(&program.program).unwrap();
         let active_revision = crate::product_contract::canonical_digest(
             IdentityDomain::Source,
@@ -1187,7 +1187,7 @@ mod tests {
             data,
             session,
             clock_day: 20_000,
-            decisions: crate::fixture::decisions(),
+            decisions: crate::product_store::runtime_test_fixture::decisions(),
             adoptions: Vec::new(),
             operations: std::collections::BTreeMap::new(),
             artifacts: Vec::new(),
@@ -1203,7 +1203,7 @@ mod tests {
             crate::product_contract::RuntimeLimits::default(), &mut allocations,
         ).unwrap();
         crate::product_runtime::LocalRuntime::default().apply_decoded(
-            &mut run, &crate::fixture::add("Ada"), "runtime-add", &mut allocations,
+            &mut run, &crate::product_store::runtime_test_fixture::add("Ada"), "runtime-add", &mut allocations,
         ).unwrap();
         run
     }
@@ -1217,7 +1217,7 @@ mod tests {
         let expected_data = run.data().identity_with(&mut AllocationContext::new()).unwrap();
         let expected_session = run.session().identity_with(&mut AllocationContext::new()).unwrap();
         let expected_trace_digest = run.trace()[0].input_digest.clone();
-        let input = crate::fixture::add("Ada");
+        let input = crate::product_store::runtime_test_fixture::add("Ada");
         let expected_store_request = crate::product_contract::canonical_digest(IdentityDomain::Input, &input).unwrap();
         let expected_artifacts = run.artifacts().len();
         let replayed = crate::product_runtime::LocalRuntime::default().apply_decoded(

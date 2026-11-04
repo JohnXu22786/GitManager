@@ -3,6 +3,9 @@
 mod files;
 #[cfg(test)]
 pub(crate) use files::file_sync_testing;
+#[cfg(test)]
+#[path = "../../tests/fixtures/product_runtime/mod.rs"]
+pub(crate) mod runtime_test_fixture;
 mod json;
 mod pointer;
 use pointer::Pointer;

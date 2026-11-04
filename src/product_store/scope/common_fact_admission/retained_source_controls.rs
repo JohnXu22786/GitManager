@@ -182,7 +182,7 @@ fn retained_source_layout_and_complete_positive_payment() {
         ("CBody",size_of::<RetainedCaptureBody>())];
     eprintln!("RETAINED_ALL_WIDTHS {:?}",all);
 
-    assert_eq!(&widths[..7],&[40,96,120,16,864,840,64]);
+    assert_eq!(&widths[..7],&[40,112,136,16,872,840,64]);
     assert_eq!(RETAINED_SOURCE_HANDOFF_G,4 * RETAINED_SOURCE_REGIONS.iter().map(|n|*n as u64).sum::<u64>()+14*128);
     assert!(RETAINED_SOURCE_REGIONS.iter().all(|n|*n>0 && *n<16384));
     assert!(RETAINED_SOURCE_HANDOFF_G<5_647_146);
@@ -315,7 +315,8 @@ fn closed_sources(contract:&str,runtime:&str,admission:&str,inventory:&str,struc
     let tail=region(inventory,"impl InventoryTail", "pub(super) fn derive_retained");
     assert!(!tail.contains("program()?"));
     let entry=inventory.split_once("pub(super) fn derive_retained").unwrap().1;
-    assert_eq!(entry.matches("snapshot.program()?").count(),1);
+    assert!(entry.contains("baseline: &'s CapturedProgram"));
+    assert!(!entry.contains("snapshot.program()?"));
     assert!(entry.find("let before = &baseline.program;").unwrap()<entry.find("analyze_retained_sources(").unwrap());
     assert!(entry.find("let after = &candidate.program;").unwrap()<entry.find("analyze_retained_sources(").unwrap());
 }
@@ -335,7 +336,7 @@ fn retained_source_closed_call_and_capture_sets_reject_mutations() {
             (1,"projection_capture_body!(validation, program, data, day, body)\n        };","projection_capture_body!(validation, other_source, data, day, body)\n        };"),
             (2,"profile: None };","profile: previous_profile };"),
             (2,"meter.charge(RETAINED_SOURCE_HANDOFF_G)?","meter.charge(0)?"),
-            (3,"let baseline = snapshot.program()?;\n    let before = &baseline.program;","let baseline = snapshot.program()?;\n    let before = &snapshot.program()?.program;"),
+            (3,"// Reuse the source baseline already authenticated by the caller.\n    let before = &baseline.program;","// Reuse the source baseline already authenticated by the caller.\n    let before = &candidate.program;"),
         ] {
             let mut changed=text.clone();changed[index]=changed[index].replacen(from,to,1);assert_ne!(changed[index],text[index]);
             let changed=changed.map(|s|s.replace('\n',newline));
