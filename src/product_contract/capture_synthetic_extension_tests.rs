@@ -101,8 +101,12 @@ fn synthetic_count_escapes_widths_vectors_and_deepest_valid_graph() {
     }}}
     for count in [0,1,3] {let values=(0..count).map(|_|serde_json::from_value(boolean()).unwrap()).collect::<Vec<_>>();parity("id","b","e",&Expr::And{values:values.clone()});parity("id","b","e",&Expr::Or{values});}
     let app=app();let mut e:Expr=serde_json::from_value(boolean()).unwrap();
-    for _ in 0..MAX_EXPR_DEPTH-2 {e=Expr::Not{value:Box::new(e)};}
+    // The synthetic Assert + Equal wrappers consume two expression depths.
+    for _ in 0..MAX_EXPR_DEPTH {e=Expr::Not{value:Box::new(e)};}
     paid_extension(&app,&e,&mut Work::default()).unwrap();parity("id","b","e",&e);
+    let mut too_deep:Expr=serde_json::from_value(boolean()).unwrap();
+    for _ in 0..=MAX_EXPR_DEPTH {too_deep=Expr::Not{value:Box::new(too_deep)};}
+    assert!(paid_extension(&app,&too_deep,&mut Work::default()).is_err(),"projection root depth still obeys the hard expression limit");
     let mut typ=Type::Integer;let mut value=DataValue::Integer{value:0};
     for _ in 0..MAX_TYPE_DEPTH {value=DataValue::List{item_type:typ.clone(),items:vec![value]};typ=Type::list(typ);}
     let e=Expr::Literal{value_type:typ,value};paid_extension(&app,&e,&mut Work::default()).unwrap();parity("id","b","e",&e);

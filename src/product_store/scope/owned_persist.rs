@@ -14,6 +14,14 @@ pub(crate) struct ReconstructedOwned {
     pub manifests: BTreeMap<Digest, OwnedCompositionV2>,
     pub initializations: BTreeMap<Digest, OwnedInitializationV2>,
 }
+pub(super) struct OwnedCaptureReuse {
+    pub projections: Vec<OwnedProjectionRecipe>,
+    pub captured: BTreeMap<String, Values>,
+}
+pub(super) struct AuthenticatedAdmissionBaseline {
+    pub source: CapturedProgram,
+    pub capture_reuse: Option<OwnedCaptureReuse>,
+}
 
 // V11 producing fixed packets. Each is checked over the complete lowered
 // owner/Result/argument/cleanup layouts; all prior payment families remain.
@@ -1378,7 +1386,10 @@ fn historical_basis(
         validate_recording_continuation(&result, meter)?;
     }
     if matches!(purpose, BasisPurpose::Continuation) {
-        if !matches!(&result.scope, ScopeEnvelope::OwnedV2(s) if s.layers.len() == 1 && s.initializations.len() == 1 && !s.adoptions.is_empty())
+        if !matches!(&result.scope, ScopeEnvelope::OwnedV2(s)
+            if !s.layers.is_empty()
+                && s.initializations.len() == s.layers.len()
+                && s.adoptions.len() >= s.layers.len())
         {
             return Err(err(
                 "continuation basis lacks committed original layer and initialization",
@@ -1409,7 +1420,7 @@ fn historical_basis(
 fn inventory(proof: &VerifiedOwnedPreviewPlan) -> Result<OwnedInventoryV2> {
     Ok(OwnedInventoryV2 {
         structure: analyze_owned_sources(
-            proof.snapshot.program()?,
+            &proof.baseline,
             &proof.candidate,
             &proof.request.inventory.sources,
         )?,
@@ -1503,7 +1514,6 @@ fn reconstruct_recipe(
         ));
     }
     if manifest.transition != ScopeTransition::Adoption
-        || manifest.previous.is_some()
         || !manifest.correspondences.is_empty()
     {
         return Err(err(
@@ -1513,24 +1523,43 @@ fn reconstruct_recipe(
     if manifest.basis != layer.basis
         || manifest.operation != layer.operation
         || manifest.business != layer.candidate
-        || manifest.layers != [id.clone()]
-        || manifest.active != BTreeSet::from([id.clone()])
+        || manifest.layers.last() != Some(&id)
     {
         return Err(err(
             "composition changed exact layer/basis/active inventory",
         ));
     }
-    let basis = historical_basis(
-        snapshot,
-        &layer.basis,
-        graphs,
-        BasisPurpose::FirstEntry,
-        meter,
-    )?;
-    if matches!(&basis.scope, ScopeEnvelope::OwnedV2(s) if !s.layers.is_empty()) {
-        return Err(err(
-            "second committed owned layer is unsupported, including after withdrawal",
-        ));
+    let basis_purpose = if manifest.previous.is_some() {
+        BasisPurpose::Continuation
+    } else {
+        BasisPurpose::FirstEntry
+    };
+    let basis = historical_basis(snapshot, &layer.basis, graphs, basis_purpose, meter)?;
+    let (mut expected_layers, mut expected_active, expected_previous) = match &basis.scope {
+        ScopeEnvelope::ScalarV1(_) => (Vec::new(), BTreeSet::new(), None),
+        ScopeEnvelope::OwnedV2(state) if state.layers.is_empty() => {
+            (Vec::new(), BTreeSet::new(), None)
+        }
+        ScopeEnvelope::OwnedV2(state) => {
+            let mut matches = state.compositions.values()
+                .filter(|composition| composition.output == layer.basis.frozen.active);
+            let prior = matches.next().ok_or_else(|| err("owned basis active composition missing"))?;
+            if matches.next().is_some() {
+                return Err(err("owned basis active composition is ambiguous"));
+            }
+            (prior.layers.clone(), prior.active.clone(), Some(layer.basis.frozen.active.clone()))
+        }
+    };
+    if expected_layers.contains(&id) {
+        return Err(err("owned layer identity is already present in its basis"));
+    }
+    expected_layers.push(id.clone());
+    expected_active.insert(id.clone());
+    if manifest.layers != expected_layers
+        || manifest.active != expected_active
+        || manifest.previous != expected_previous
+    {
+        return Err(err("composition does not extend the exact committed OwnedV2 lineage"));
     }
     let candidate = program(snapshot, &layer.candidate)?;
     // Freshness covers the entire authenticated retained schema and every row.
@@ -1648,7 +1677,7 @@ fn check_correspondence(
 ) -> Result<()> {
     let b = &manifest.basis.frozen;
     if proof.version != OWNED_SCOPE_VERSION
-        || proof.source != *prepared.proof.snapshot.program()?
+        || proof.source != prepared.proof.baseline
         || proof.original != b.data
         || proof.target != manifest.output
         || proof.day != b.day
@@ -1890,7 +1919,7 @@ macro_rules! reconstruct_body {
     let mut $origin = None;
     $($completed_scope)*
     let $state = $snapshot.owned_scope()?;
-    if $state.layers.len() > 1
+    if $state.layers.len() > MAX_LAYERS
         || $state.compositions.len() > MAX_ITEMS
         || $state.rehearsals.len() > MAX_ITEMS
         || $state.correspondences.len() > MAX_ITEMS
@@ -1969,13 +1998,15 @@ macro_rules! reconstruct_body {
             .compositions
             .get(&receipt.composition)
             .ok_or_else(|| err("adoption composition missing"))?;
-        let [id] = $manifest.layers.as_slice() else {
-            return Err(err("committed composition needs one original layer"));
-        };
+        let id = $manifest.layers.last()
+            .ok_or_else(|| err("committed composition has no layer tail"))?;
         let $layer = $state
             .layers
             .get(id)
             .ok_or_else(|| err("committed layer missing"))?;
+        if $layer.identity()? != *id || $layer.operation != $manifest.operation {
+            return Err(err("committed composition tail does not identify its new layer"));
+        }
         let $init = $state
             .initializations
             .iter()
@@ -1997,7 +2028,7 @@ macro_rules! reconstruct_body {
         if receipt.plan != adoption.plan.identity()? {
             return Err(err("owned plan identity differs"));
         }
-        let recipe = if $result.epochs.is_empty() {
+        let recipe = if $manifest.transition == ScopeTransition::Adoption {
             if receipt.initialization != Some($init.identity()?)
                 || operation.request
                     != owned_wire::adoption_request(&adoption.plan, after, $manifest, $init)?
@@ -2269,10 +2300,15 @@ $($prospective_arc)*
     }
     // Every protected source and live storage cell must belong to reconstructed
     // committed proofs. Prospective namespaces never enter the live schema.
+    let authenticated_owned_candidates: BTreeSet<_> = $result.epochs.iter()
+        .filter_map(|epoch| $result.manifests.get(&epoch.output))
+        .filter(|manifest| manifest.transition == ScopeTransition::Adoption)
+        .map(|manifest| manifest.business.clone())
+        .collect();
     let mut declared = BTreeMap::new();
     for source in &$snapshot.programs {
         let id = revision(source)?;
-        if !$result.recipes.contains_key(&id) {
+        if !$result.recipes.contains_key(&id) && !authenticated_owned_candidates.contains(&id) {
             compiler::reject_reserved(&source.program)?;
         }
         if $state.compositions.values().any(|m| m.output == id) {
@@ -2691,6 +2727,48 @@ pub(super) fn validate(snapshot: &ProjectSnapshot) -> Result<()> {
     reconstruct(snapshot, &mut meter).map(|_| ())
 }
 
+/// Return the last authenticated authoring source for ordinary continuation.
+/// The active OwnedV2 program is compiler output and contains protected
+/// metadata; it is never presented as fresh external-authored source.
+pub(super) fn admission_baseline(
+    snapshot: &ProjectSnapshot,
+    meter: &mut ProofMeter,
+) -> Result<AuthenticatedAdmissionBaseline> {
+    if matches!(&snapshot.scope, ScopeEnvelope::OwnedV2(state) if !state.layers.is_empty()) {
+        let registry = reconstruct(snapshot, meter)?;
+        let active = snapshot.program()?;
+        registry.resolve(active)?;
+        // Reconstructing this pair proves which business source and recipe
+        // produced the active artifact. The next independent layer is compiled
+        // incrementally on that exact artifact so its old protections survive.
+        let _ = registry.effective_pair(snapshot, &snapshot.active_revision)?;
+        meter.charge(active.source_bytes.len() as u64)?;
+        let capture_reuse = (|| -> Result<Option<OwnedCaptureReuse>> {
+            let manifest = registry.manifests.get(&snapshot.active_revision)
+                .ok_or_else(|| err("active owned manifest missing"))?;
+            let layer_id = manifest.layers.last()
+                .ok_or_else(|| err("active owned manifest has no layer"))?;
+            let state = snapshot.owned_scope()?;
+            let layer = state.layers.get(layer_id)
+                .ok_or_else(|| err("active owned layer missing"))?;
+            let initialization = registry.initializations.get(&snapshot.active_revision)
+                .ok_or_else(|| err("active owned initialization missing"))?;
+            if initialization.after_data != snapshot.data.identity()? {
+                return Ok(None);
+            }
+            Ok(Some(OwnedCaptureReuse {
+                projections: layer.inventory.projections.clone(),
+                captured: layer.inventory.captured.clone(),
+            }))
+        })()?;
+        Ok(AuthenticatedAdmissionBaseline { source: active.clone(), capture_reuse })
+    } else {
+        let source = snapshot.program()?;
+        meter.charge(source.source_bytes.len() as u64)?;
+        Ok(AuthenticatedAdmissionBaseline { source: source.clone(), capture_reuse: None })
+    }
+}
+
 fn basis_recipe(snapshot: &ProjectSnapshot) -> Result<OwnedBasisV2> {
     Ok(OwnedBasisV2 {
         container_format: super::super::FORMAT,
@@ -2698,7 +2776,7 @@ fn basis_recipe(snapshot: &ProjectSnapshot) -> Result<OwnedBasisV2> {
             ScopeEnvelope::ScalarV1(s) if *s == ScopeState::default() => {
                 OwnedBasisFamilyV2::ScalarEmpty
             }
-            ScopeEnvelope::OwnedV2(s) if s.layers.is_empty() && !s.rehearsals.is_empty() => {
+            ScopeEnvelope::OwnedV2(s) if !s.layers.is_empty() || !s.rehearsals.is_empty() => {
                 OwnedBasisFamilyV2::OwnedV2
             }
             _ => return Err(err("first owned recipe needs an empty committed lineage")),
@@ -2739,16 +2817,45 @@ pub(super) fn recipe_layer(preview: &PreparedOwnedPreview, operation: &str) -> R
         inventory: inventory(original)?,
     })
 }
-pub(super) fn recipe_manifest(layer: &OwnedLayerV2, target: &CapturedProgram, operation: &str) -> Result<OwnedCompositionV2> {
+pub(super) fn recipe_manifest(
+    snapshot: &ProjectSnapshot,
+    layer: &OwnedLayerV2,
+    target: &CapturedProgram,
+    operation: &str,
+) -> Result<OwnedCompositionV2> {
+    let (mut layers, mut active, previous) = match &snapshot.scope {
+        ScopeEnvelope::ScalarV1(_) => (Vec::new(), BTreeSet::new(), None),
+        ScopeEnvelope::OwnedV2(state) if state.layers.is_empty() => {
+            (Vec::new(), BTreeSet::new(), None)
+        }
+        ScopeEnvelope::OwnedV2(state) => {
+            if state.layers.len() >= MAX_LAYERS {
+                return Err(err("owned layer limit reached"));
+            }
+            let mut prior = state.compositions.values()
+                .filter(|manifest| manifest.output == snapshot.active_revision);
+            let manifest = prior.next().ok_or_else(|| err("active owned composition missing"))?;
+            if prior.next().is_some() {
+                return Err(err("active owned composition is ambiguous"));
+            }
+            (manifest.layers.clone(), manifest.active.clone(), Some(snapshot.active_revision.clone()))
+        }
+    };
+    let id = layer.identity()?;
+    if layers.contains(&id) || !active.iter().all(|existing| layers.contains(existing)) {
+        return Err(err("owned layer chain is duplicated or inconsistent"));
+    }
+    layers.push(id.clone());
+    active.insert(id);
     Ok(OwnedCompositionV2 {
         version: OWNED_SCOPE_VERSION,
         lowering: OWNED_LOWERING_VERSION,
         basis: layer.basis.clone(),
         transition: ScopeTransition::Adoption,
         business: layer.candidate.clone(),
-        layers: vec![layer.identity()?],
-        active: BTreeSet::from([layer.identity()?]),
-        previous: None,
+        layers,
+        active,
+        previous,
         operation: operation.into(),
         runtime: RUNTIME_VERSION.into(),
         driver: DRIVER_VERSION.into(),
@@ -2789,21 +2896,7 @@ pub(super) fn recipe(
     )?;
     let (target, metadata) = owned_lowering::compile_owned(&proof, &layer.identity()?, meter)?;
     let data = owned_preview::initialize(&proof, &target, &metadata, meter)?;
-    let manifest = OwnedCompositionV2 {
-        version: OWNED_SCOPE_VERSION,
-        lowering: OWNED_LOWERING_VERSION,
-        basis: layer.basis.clone(),
-        transition: ScopeTransition::Adoption,
-        business: layer.candidate.clone(),
-        layers: vec![layer.identity()?],
-        active: BTreeSet::from([layer.identity()?]),
-        previous: None,
-        operation: operation.into(),
-        runtime: RUNTIME_VERSION.into(),
-        driver: DRIVER_VERSION.into(),
-        output: revision(&target)?,
-        correspondences: vec![],
-    };
+    let manifest = recipe_manifest(&original.snapshot, &layer, &target, operation)?;
     let prepared = PreparedOwnedPreview::from_retained(proof, target, metadata, data)?;
     let init = initialization(&layer, &prepared)?;
     Ok((layer, manifest, init, prepared))

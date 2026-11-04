@@ -701,6 +701,7 @@ fn frozen_derive_inner_before_retained_reuse(
     meter.charge(1)?;
     Ok(VerifiedOwnedPreviewPlan {
         snapshot: snapshot.clone(),
+        baseline: snapshot.program()?.clone(),
         candidate: candidate.clone(),
         request: request.clone(),
         accepted: accepted.copy_internal(),

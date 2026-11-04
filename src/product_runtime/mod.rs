@@ -117,7 +117,7 @@ fn codec_adapter_error(error: crate::product_backup::fallible_codec::CodecError)
 /// No data frame, row, day, meter, cancellation state or evaluated value is kept.
 #[derive(Default)]
 pub(crate) struct ProjectionValidation<'a> {
-    sources: Vec<&'a CapturedProgram>,
+    sources: Vec<ProjectionSource<'a>>,
     types: std::collections::BTreeSet<Vec<u8>>,
     bytes: usize,
     #[cfg(test)]
@@ -125,25 +125,29 @@ pub(crate) struct ProjectionValidation<'a> {
     #[cfg(test)]
     type_checks: usize,
 }
+struct ProjectionSource<'a> {
+    program: &'a CapturedProgram,
+    facts: CaptureFacts,
+}
 impl<'a> ProjectionValidation<'a> {
-    fn source(&mut self, program: &'a CapturedProgram) -> Result<Option<usize>> {
+    fn source(&mut self, program: &'a CapturedProgram) -> Result<(Option<usize>, CaptureFacts)> {
         if let Some(index) = self
             .sources
             .iter()
-            .position(|prior| std::ptr::eq(*prior, program) || *prior == program)
+            .position(|prior| std::ptr::eq(prior.program, program) || prior.program == program)
         {
-            return Ok(Some(index));
+            return Ok((Some(index), self.sources[index].facts));
         }
         #[cfg(test)]
         {
             self.source_checks += 1;
         }
-        program.validate()?;
+        let facts = program.validate_capture_facts()?;
         if self.sources.len() == MAX_ITEMS {
-            return Ok(None);
+            return Ok((None, facts));
         }
-        self.sources.push(program);
-        Ok(Some(self.sources.len() - 1))
+        self.sources.push(ProjectionSource { program, facts });
+        Ok((Some(self.sources.len() - 1), facts))
     }
     #[cfg(test)]
     pub(crate) fn counts(&self) -> (usize, usize) {
@@ -859,10 +863,10 @@ impl LocalRuntime {
         expected: &Type,
         day: i32,
     ) -> Result<DataValue> {
-        let source = checks.source(program)?;
+        let (source, facts) = checks.source(program)?;
         data.validate()?;
         self.evaluate_projection_inner(
-            program, data, row, binding, expression, expected, day, limits, checks, source,
+            program, data, row, binding, expression, expected, day, limits, checks, source, facts,
         )
     }
     /// Evaluate a scalar proof expression directly against bounded persisted
@@ -1113,7 +1117,7 @@ impl LocalRuntime {
         expected: &Type,
         day: i32,
     ) -> Result<DataValue> {
-        let source = checks.source(program)?;
+        let (source, facts) = checks.source(program)?;
         data.validate()?;
         if values.len() > MAX_ITEMS {
             return Err(invalid("historical projection row exceeds bounds"));
@@ -1163,6 +1167,7 @@ impl LocalRuntime {
             limits,
             checks,
             source,
+            facts,
         )
     }
     fn evaluate_projection_inner(
@@ -1177,6 +1182,7 @@ impl LocalRuntime {
         limits: RuntimeLimits,
         checks: &mut ProjectionValidation<'_>,
         source: Option<usize>,
+        facts: CaptureFacts,
     ) -> Result<DataValue> {
         validate_day(day)?;
         limits.validate()?;
@@ -1199,26 +1205,13 @@ impl LocalRuntime {
             {
                 checks.type_checks += 1;
             }
-            let mut app = program.program.clone();
-            let mut id = "gm_scope_projection".to_owned();
-            while app.actions.iter().any(|a| a.id == id) {
-                id.push('_');
-            }
-            app.actions.push(ActionDefinition {
-                id,
-                label: "Host projection type check".into(),
-                parameters: BTreeMap::from([(binding.to_owned(), Type::reference(&row.entity))]),
-                guards: vec![],
-                ensures: vec![],
-                steps: vec![Statement::Assert {
-                    condition: Expr::Equal {
-                        left: Box::new(expression.clone()),
-                        right: Box::new(expression.clone()),
-                    },
-                    message: "Projection type check".into(),
-                }],
-            });
-            app.validate()?;
+            validate_projection_extension(
+                &program.program,
+                facts,
+                &row.entity,
+                binding,
+                expression,
+            )?;
         }
         let session = SessionState::initial(&program.program)?;
         let mut meter = Meter::new(limits.clone(), limits.fuel, self.cancelled.clone());

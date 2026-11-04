@@ -142,6 +142,13 @@ fn replay(
         ));
     }
     let runtime = LocalRuntime::with_cancellation(meter.cancelled());
+    let active_program = snapshot.program()?;
+    let committed_owned = matches!(&snapshot.scope, ScopeEnvelope::OwnedV2(state) if !state.layers.is_empty());
+    let owned_context = if matches!(&snapshot.scope, ScopeEnvelope::OwnedV2(_)) {
+        Some(super::owned_replay::OwnedExecutionContext::new(snapshot)?)
+    } else {
+        None
+    };
     let mut checks = ProjectionValidation::default();
     let mut result = vec![];
     for witness in witnesses {
@@ -174,13 +181,41 @@ fn replay(
             OwnedSourceSide::Before => (snapshot.program()?, &request.inventory.lifecycle.before),
             OwnedSourceSide::After => (candidate, &request.inventory.lifecycle.after),
         };
-        let run = runtime.replay(
-            program,
-            scenario,
-            &snapshot.decisions,
-            meter.runtime()?,
-            "lifecycle-support",
-        )?;
+        let use_context = program == active_program || committed_owned;
+        let run = if let Some(context) = owned_context.as_ref().filter(|_| use_context) {
+            let admission = if program == active_program {
+                context.begin_replay(
+                    program,
+                    scenario,
+                    &snapshot.decisions,
+                    meter.cancelled(),
+                )?
+            } else {
+                context.begin_append_only_candidate_replay(
+                    program,
+                    scenario,
+                    &snapshot.decisions,
+                    request,
+                    meter.cancelled(),
+                )?
+            };
+            runtime.replay_admitted(
+                program,
+                scenario,
+                &snapshot.decisions,
+                meter.runtime()?,
+                "lifecycle-support",
+                Some(admission.as_ref()),
+            )?
+        } else {
+            runtime.replay(
+                program,
+                scenario,
+                &snapshot.decisions,
+                meter.runtime()?,
+                "lifecycle-support",
+            )?
+        };
         meter.charge(2)?;
         if let Some(profile) = profile.as_deref_mut() {
             profile.observe(&run.limits, false, meter)?;

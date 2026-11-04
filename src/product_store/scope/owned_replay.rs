@@ -1391,6 +1391,53 @@ impl OwnedExecutionContext {
             graph: graph.clone(),
             initial_frame: (scenario.seed.clone(), scenario.clock_day),
             operations,
+            allow_unregistered_candidate: false,
+            meter: std::sync::Mutex::new(meter),
+        }))
+    }
+    /// Mint a one-run admission only for the exact append-only source candidate
+    /// used by ordinary lifecycle acceptance. Its inherited code and reserved
+    /// schema are validated against the checked active recipe first.
+    pub(super) fn begin_append_only_candidate_replay(
+        &self,
+        target: &CapturedProgram,
+        scenario: &ScenarioSpec,
+        graph: &DecisionGraph,
+        request: &OwnedPreviewRequest,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<Box<dyn crate::product_runtime::ReplayAdmission>> {
+        if graph != &self.snapshot.decisions
+            || scenario.seed != self.snapshot.data
+            || scenario.session != self.snapshot.session
+            || scenario.clock_day != self.snapshot.clock_day
+            || scenario.random_seed != 0
+        {
+            return Err(err("append-only candidate replay frame differs from current owned basis"));
+        }
+        let mut meter = self.meter(cancelled)?;
+        let active = self.snapshot.program()?;
+        compiler::validate_owned_append_only_candidate(
+            active,
+            target,
+            &request.inventory.sources,
+            &mut meter,
+        )?;
+        if request.inventory.snapshot != canonical_digest(IdentityDomain::Data, &self.snapshot)?
+            || request.inventory.sources.before != canonical_digest(IdentityDomain::Source, active)?
+            || request.inventory.sources.after != canonical_digest(IdentityDomain::Source, target)?
+        {
+            return Err(err("append-only candidate replay request/source binding differs"));
+        }
+        meter.charge(canonical_bytes(&(scenario, graph))?.len() as u64)?;
+        let operations = scenario.replay_operation_ids()?;
+        Ok(Box::new(OwnedRunAdmission {
+            context: self.clone(),
+            target: target.clone(),
+            scenario: scenario.clone(),
+            graph: graph.clone(),
+            initial_frame: (scenario.seed.clone(), scenario.clock_day),
+            operations,
+            allow_unregistered_candidate: true,
             meter: std::sync::Mutex::new(meter),
         }))
     }
@@ -1524,6 +1571,7 @@ impl OwnedExecutionContext {
             graph: graph.clone(),
             initial_frame: (seed, original.clock_day),
             operations,
+            allow_unregistered_candidate: false,
             meter: std::sync::Mutex::new(meter),
         };
         Ok((actual, Box::new(admission)))
@@ -1538,6 +1586,7 @@ struct OwnedRunAdmission {
     graph: DecisionGraph,
     initial_frame: (DataSnapshot, i32),
     operations: Vec<Id>,
+    allow_unregistered_candidate: bool,
     meter: std::sync::Mutex<ProofMeter>,
 }
 impl crate::product_runtime::ReplayAdmission for OwnedRunAdmission {
@@ -1601,7 +1650,9 @@ impl crate::product_runtime::ReplayAdmission for OwnedRunAdmission {
                 .lock()
                 .map_err(|_| err("owned replay lock failed"))?;
             meter.charge(1)?;
-            if let Some(recipe) = self.context.prepared(target)? {
+            if self.allow_unregistered_candidate {
+                data.validate()?;
+            } else if let Some(recipe) = self.context.prepared(target)? {
                 validate_recipe_history_from(
                     recipe,
                     &self.initial_frame.0,

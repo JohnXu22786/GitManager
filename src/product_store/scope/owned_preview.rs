@@ -77,6 +77,14 @@ pub(super) fn initialize_frame(
     captures: &BTreeMap<String, Values>,
     meter: &mut ProofMeter,
 ) -> AdmissionResult<DataSnapshot> {
+    if lowering::inherited_state_only_append(proof) {
+        if target.program.entities != proof.baseline.program.entities {
+            return Err(refuse("initialization", "inherited no-op source changed the authenticated schema"));
+        }
+        meter.charge(canonical_bytes(original)?.len() as u64)?;
+        original.validate()?;
+        return Ok(original.clone());
+    }
     let mut data = original.clone();
     for entity in &target.program.entities {
         if let Some(prior) = data.schema.iter_mut().find(|e| e.id == entity.id) {
@@ -948,7 +956,7 @@ pub(super) fn initial_owned_recipe(
     let (target, metadata) = lowering::compile_owned(&proof, &layer.identity()?, meter)?;
     let data = initialize(&proof, &target, &metadata, meter)?;
     meter.charge(super::owned_persist::RECIPE_MANIFEST_CALL)?;
-    let manifest = super::owned_persist::recipe_manifest(&layer, &target, operation)?;
+    let manifest = super::owned_persist::recipe_manifest(current, &layer, &target, operation)?;
     let prepared = PreparedOwnedPreview::from_retained_arc(proof, target, metadata, data)?;
     let initialization = super::owned_persist::initialization(&layer, &prepared)?;
     meter.charge(0)?;

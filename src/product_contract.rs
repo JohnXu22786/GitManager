@@ -95,7 +95,7 @@ use capture_work::Audit;
 use capture_owned::OwnedWork;
 pub(crate) use capture_work::{ContractWork, WorkFailure, ContractWorkError, ContractWorkResult};
 pub(crate) use capture_canonical::canonical_bytes_with_work;
-pub(crate) use capture_validation::{with_capture_validation, CaptureValidation, validate_value_with_work,
+pub(crate) use capture_validation::{with_capture_validation, validate_projection_extension, CaptureFacts, CaptureValidation, validate_value_with_work,
     with_ordinary_source_facts, ReadyCaptureSource, SourcePreparation, SourceConsumer};
 
 use ring::digest::{digest, SHA256};
@@ -3518,6 +3518,9 @@ impl CapturedProgram {
         Ok(self)
     }
     pub fn validate(&self) -> Result<()> {self.validate_audited(Audit::none()).map(|_|())}
+    pub(crate) fn validate_capture_facts(&self) -> Result<CaptureFacts> {
+        self.validate_audited(Audit::none())
+    }
     fn validate_audited(&self,a:Audit<'_>)->Result<capture_validation::CaptureFacts> {
         a.pay(8)?;
         #[cfg(test)]

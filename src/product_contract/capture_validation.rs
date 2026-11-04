@@ -5,7 +5,8 @@ use super::*;
 use serde::ser::SerializeMap;
 use std::mem::size_of;
 
-pub(super) struct CaptureFacts {
+#[derive(Clone, Copy)]
+pub(crate) struct CaptureFacts {
     pub(super) total_nodes: usize,
     pub(super) action_prefix_nodes: usize,
     pub(super) canonical_len: usize,
@@ -18,6 +19,17 @@ pub(crate) struct CaptureValidation<'h, 's, H: ContractWork + ?Sized> {
     pub(super) facts: Option<CaptureFacts>,
     frame_valid: bool,
     first_failure: Option<ContractWorkError>,
+}
+
+pub(crate) fn validate_projection_extension(
+    app: &AppDefinition,
+    facts: CaptureFacts,
+    entity: &str,
+    binding: &str,
+    expr: &Expr,
+) -> Result<()> {
+    extension(app, (facts.total_nodes, facts.action_prefix_nodes, facts.canonical_len, facts.action_count),
+        entity, binding, expr, Audit::none())
 }
 // Lexical expansion preserves the ordinary entrance without a new wrapper.
 macro_rules! capture_validation_body {
@@ -434,17 +446,21 @@ fn extension(
     a.pay(8)?;
     validator.node(0)?;
     a.nonempty("Projection type check")?;
-    a.pay(16)?; // Original expect + Expr dispatch before Equal's node.
     validator.node(1)?;
-    // Both actual depth2 occurrences use the SAME original Validator and node counter.
-    let actual = validator.comparison_operands(expr, expr, &env, 2, true, false)?;
-    let expected = Type::Boolean;
-    let equal = a.type_equal(&actual, &expected)?;
-    a.type_message(44, &expected, &actual)?;
-    a.require_owned(
-        equal,
-        format!("expression type mismatch: expected {expected:?}, found {actual:?}"),
-    )?;
+    // Projection extensions are checked as the expression they actually are;
+    // the removed temporary Assert/Equal action is not part of the program AST.
+    // Keep its exact historical wire-size accounting and conservatively count
+    // the duplicate operand nodes, while enforcing the hard depth cap from the
+    // real expression root.
+    let expression_start = validator.nodes;
+    let _actual = validator.expr(expr, &env, 0, true)?;
+    let expression_nodes = validator.nodes.checked_sub(expression_start)
+        .ok_or_else(|| a.overflow())?;
+    let duplicate_nodes = u64::try_from(expression_nodes)
+        .ok().and_then(|count| count.checked_mul(8)).ok_or_else(|| a.overflow())?;
+    a.pay(duplicate_nodes)?;
+    validator.nodes = validator.nodes.checked_add(expression_nodes)
+        .ok_or_else(|| a.overflow())?;
     a.pay(6)?;
     let suffix = total.checked_sub(prefix).ok_or_else(|| a.overflow())?;
     let augmented = validator

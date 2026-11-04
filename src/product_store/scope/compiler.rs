@@ -994,6 +994,90 @@ pub(super) fn reject_reserved(app: &AppDefinition) -> Result<()> {
         Ok(())
     }
 }
+
+/// A later independent OwnedV2 layer may extend an already compiled source,
+/// but it must preserve the previous program byte-for-byte outside append-only
+/// action tails. This keeps all inherited metadata and guards under the exact
+/// validated predecessor recipe. The new tail cannot name protected fields.
+pub(super) fn validate_owned_append_only_candidate(
+    baseline: &CapturedProgram,
+    candidate: &CapturedProgram,
+    request: &OwnedSourceRequest,
+    meter: &mut super::common_fact_admission::ProofMeter,
+) -> Result<()> {
+    let byte_work = baseline
+        .source_bytes
+        .len()
+        .checked_add(candidate.source_bytes.len())
+        .ok_or_else(|| error("source work overflow"))?;
+    meter.charge(byte_work as u64)?;
+    let before = &baseline.program;
+    let after = &candidate.program;
+    if before.version != after.version
+        || before.id != after.id
+        || before.label != after.label
+        || before.entities != after.entities
+        || before.state != after.state
+        || before.outputs != after.outputs
+        || before.observables != after.observables
+        || before.views != after.views
+        || before.initial_view != after.initial_view
+        || before.actions.len() != after.actions.len()
+    {
+        return Err(error("an inherited OwnedV2 source may only receive action-tail additions"));
+    }
+    fn contains_reserved(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::String(value) => value.starts_with(RESERVED_PREFIX),
+            serde_json::Value::Array(values) => values.iter().any(contains_reserved),
+            serde_json::Value::Object(values) => values
+                .iter()
+                .any(|(key, value)| key.starts_with(RESERVED_PREFIX) || contains_reserved(value)),
+            _ => false,
+        }
+    }
+    let mut used = BTreeSet::new();
+    for (old, new) in before.actions.iter().zip(&after.actions) {
+        meter.charge(4 + old.id.len() as u64 + old.steps.len() as u64)?;
+        if old.id != new.id
+            || old.label != new.label
+            || old.parameters != new.parameters
+            || old.guards != new.guards
+            || old.ensures != new.ensures
+            || new.steps.len() < old.steps.len()
+            || !new.steps.starts_with(&old.steps)
+        {
+            return Err(error("inherited action code or protection changed"));
+        }
+        let tail = &new.steps[old.steps.len()..];
+        if tail.is_empty() {
+            continue;
+        }
+        let mut edits = request.edits.iter().filter(|edit| edit.before.action == old.id);
+        let edit = edits
+            .next()
+            .ok_or_else(|| error("action-tail addition lacks an exact source edit"))?;
+        if edits.next().is_some()
+            || !used.insert(edit.id.as_str())
+            || !edit.before.list_path.is_empty()
+            || edit.before.start != old.steps.len()
+            || edit.before.len != 0
+            || !edit.after.list_path.is_empty()
+            || edit.after.start != old.steps.len()
+            || edit.after.len != tail.len()
+        {
+            return Err(error("inherited layer accepts only one exact top-level action-tail edit"));
+        }
+        meter.charge(canonical_bytes(&tail)?.len() as u64)?;
+        if contains_reserved(&serde_json::to_value(tail)?) {
+            return Err(error("new action tail uses the inherited protected metadata namespace"));
+        }
+    }
+    if used.len() != request.edits.len() {
+        return Err(error("source edits do not exactly describe append-only action tails"));
+    }
+    Ok(())
+}
 fn normalize_labels(app: &mut AppDefinition) {
     app.label.clear();
     for entity in &mut app.entities {

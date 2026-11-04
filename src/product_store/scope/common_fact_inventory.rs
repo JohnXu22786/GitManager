@@ -606,36 +606,40 @@ impl ProductStore {
 
 pub(super) struct InventoryTail<'s> {
     baseline: &'s AppDefinition,
+    source_baseline: &'s CapturedProgram,
     snapshot: &'s ProjectSnapshot,
     candidate: &'s AppDefinition,
     request: &'s CommonFactInventoryRequest,
     basis: Digest,
+    capture_reuse: Option<&'s super::owned_persist::OwnedCaptureReuse>,
     finish: super::common_fact_admission::RetainedFinish<'s>,
 }
 impl InventoryTail<'_> {
     pub(super) fn prepare(self, structure: OwnedStructuralReport,
         meter: &mut super::common_fact_admission::ProofMeter,
     ) -> Result<super::common_fact_admission::PreparedRetainedCapture> {
-        let Self { baseline, snapshot, candidate, request, basis, finish } = self;
+        let Self { baseline, source_baseline, snapshot, candidate, request, basis, capture_reuse, finish } = self;
         let before = baseline;
         let after = candidate;
         let inventory = common_fact_inventory_tail!(snapshot, request, basis, structure, before, after)?;
-        finish.prepare(inventory, meter)
+        finish.prepare(source_baseline, capture_reuse, inventory, meter)
     }
 }
 pub(super) fn derive_retained<'s>(
-    snapshot: &'s ProjectSnapshot, candidate: &'s CapturedProgram, request: &'s CommonFactInventoryRequest,
+    snapshot: &'s ProjectSnapshot, baseline: &'s CapturedProgram, candidate: &'s CapturedProgram, request: &'s CommonFactInventoryRequest,
     meter: &mut super::common_fact_admission::ProofMeter,
     finish: super::common_fact_admission::RetainedFinish<'s>,
     consume: super::common_fact_admission::CaptureTail<'s>,
+    capture_reuse: Option<&'s super::owned_persist::OwnedCaptureReuse>,
 ) -> Result<super::common_fact_admission::CapturedRetainedCapture> {
     let basis = canonical_digest(IdentityDomain::Data, snapshot)?;
-    if basis != request.snapshot || snapshot.active_revision != request.sources.before {
+    if basis != request.snapshot
+        || canonical_digest(IdentityDomain::Source, baseline)? != request.sources.before
+    {
         return Err(error("stale authenticated snapshot/source basis"));
     }
-    let baseline = snapshot.program()?;
     let before = &baseline.program;
     let after = &candidate.program;
     super::owned_resolve::analyze_retained_sources(baseline, candidate, &request.sources, meter,
-        InventoryTail { baseline: before, snapshot, candidate: after, request, basis, finish }, consume)
+        InventoryTail { baseline: before, source_baseline: baseline, snapshot, candidate: after, request, basis, capture_reuse, finish }, consume)
 }

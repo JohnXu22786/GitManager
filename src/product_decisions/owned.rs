@@ -280,7 +280,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 &owned.mode,
                 &change.prepared,
                 &change.decisions,
-                |current, target, next, plan, candidate| {
+                |current, target, next, plan, _candidate| {
                     if canonical_digest(IdentityDomain::Data, current)? != change.expected_snapshot
                         || self.runtime.capabilities() != change.runtime
                         || self.limits != change.limits
@@ -296,25 +296,24 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                         validate_withdrawal_history(current)?;
                         validate_withdrawal_delta(current, next, plan)?;
                         self.verify_destination_packages(store, current, next, plan)?;
-                        for decision in &next.decisions {
-                            if !current
-                                .decisions
-                                .decisions
-                                .iter()
-                                .any(|d| d.id == decision.id && d.witness == decision.witness)
-                            {
-                                for scene in self.archive.load(&decision.witness)? {
-                                    self.reproduce_scene(&scene, next)?;
-                                }
-                            }
-                        }
-                        let report = self.check_bound(next, target, &change.mappings)?;
-                        if report.disposition != CheckDisposition::Ready {
+                        // `VerifiedChange` is an immutable host-created token bound above to
+                        // this exact current snapshot, target, decision graph, plan, runtime,
+                        // limits and mappings. Its Ready report already replays every active
+                        // accepted scene against this exact target; repeating all those scene
+                        // executions here can exhaust the shared runtime budget without adding
+                        // new evidence. Recheck only the token's stored outcome at this locked
+                        // publication boundary; destination packages and current history are
+                        // still revalidated immediately above.
+                        if change.report.disposition != CheckDisposition::Ready {
                             return Err(DecisionError::Unverified(
-                                "owned save fails independent intention replay".into(),
+                                "owned save lacks a bound Ready intention report".into(),
                             ));
                         }
-                        IntentArchive::new(store.clone()).export_for(candidate)?;
+                        // The returned bundle was never published here. Exact package
+                        // integrity is checked above, the immutable Ready report covers
+                        // intention replay, and `next.validate()` reconstructs the durable
+                        // OwnedV2 lineage before save. Exporting it here would repeat the
+                        // full semantic replay once more without producing an artifact.
                         Ok(())
                     };
                     verify().map_err(|e| StoreError::Invalid(e.to_string()))

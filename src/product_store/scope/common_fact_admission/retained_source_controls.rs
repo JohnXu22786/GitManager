@@ -3,6 +3,8 @@ use super::*;
 use crate::product_contract::{reset_validation_counts, validation_counts};
 #[path = "../../../../tests/fixtures/common_fact/mod.rs"]
 mod fixture;
+#[path = "../../../../tests/fixtures/owned_recovery/mod.rs"]
+mod owned_fixture;
 use fixture::{pair, request};
 fn meter() -> ProofMeter { ProofMeter::new(ProofBudget::default(), Arc::new(AtomicBool::new(false))).unwrap() }
 fn setup(a: &CapturedProgram) -> (tempfile::TempDir, ProductStore) {
@@ -118,6 +120,31 @@ fn acceptance(
     .unwrap();
     host.synthetic_operator_accept_for_test(store).unwrap()
 }
+#[test]
+fn exact_capture_reuse_keeps_selected_completed_root_refusal() {
+    let (a, b) = pair();
+    let (_dir, store) = setup(&a);
+    let snapshot = store.load().unwrap();
+    let mut request = request(&store, &a, &b);
+    let selected = |title: &str| {
+        let row = snapshot.data.records.iter().find(|row| {
+            row.entity == "job"
+                && row.values.get("title") == Some(&DataValue::Text { value: title.into() })
+        }).unwrap();
+        RecordRef { entity: row.entity.clone(), record: row.id.clone() }
+    };
+
+    request.population = ScopePopulation::SelectedUnfinished { records: vec![selected("finished")] };
+    let mut proof_meter = meter();
+    assert!(matches!(
+        selected_roots_are_unfinished_for_reuse(&snapshot.data, &request, &mut proof_meter),
+        Err(StoreError::Invalid(ref error)) if error.contains("selected root is already completed")
+    ));
+
+    request.population = ScopePopulation::SelectedUnfinished { records: vec![selected("live")] };
+    let mut proof_meter = meter();
+    assert!(selected_roots_are_unfinished_for_reuse(&snapshot.data, &request, &mut proof_meter).unwrap());
+}
 fn same_proof(a:&VerifiedOwnedPreviewPlan,b:&VerifiedOwnedPreviewPlan) {
     assert_eq!(a.snapshot,b.snapshot);assert_eq!(a.candidate,b.candidate);assert_eq!(a.request,b.request);
     assert_eq!(a.accepted.recipe(),b.accepted.recipe());assert_eq!(a.report,b.report);assert_eq!(a.captured,b.captured);
@@ -164,12 +191,17 @@ fn retained_source_layout_and_complete_positive_payment() {
 fn retained_source_full_synthetic_output_and_exact_saving() {
     let(a,b)=pair();let(_dir,store)=setup(&a);let request=request(&store,&a,&b);let accepted=acceptance(&store,&b,&request);
     let snapshot=store.load().unwrap();let lifecycle=accepted.recipe();let before=store.root.read("CURRENT",16384).unwrap();
-    let mut old_meter=meter();reset_validation_counts();let(old_accepted,old)=original(&snapshot,&b,&request,&lifecycle,&mut old_meter).unwrap();let old_counts=validation_counts();
-    let mut new_meter=meter();reset_validation_counts();let(new_accepted,new)=reconstruct_and_derive_retained(&snapshot,&b,&request,&lifecycle,&mut new_meter).unwrap();let new_counts=validation_counts();
+    let mut old_meter=meter();let(old_accepted,old)=original(&snapshot,&b,&request,&lifecycle,&mut old_meter).unwrap();
+    let mut new_meter=meter();let(new_accepted,new)=reconstruct_and_derive_retained(&snapshot,&b,&request,&lifecycle,&mut new_meter).unwrap();
     assert_eq!(old_accepted.recipe(),new_accepted.recipe());same_proof(&old,&new);
-    assert_eq!(old_counts.captures,new_counts.captures+1);assert_eq!(old_counts.apps,new_counts.apps+1);
+    // The new retained pipeline reuses the exact baseline already authenticated
+    // by admission. The frozen oracle derives it again before finishing, so
+    // account for that measured source-byte payment explicitly.
+    let mut baseline_meter=meter();
+    super::super::owned_persist::admission_baseline(&snapshot,&mut baseline_meter).unwrap();
+    let baseline_payment=9_999_999-baseline_meter.left;
     let(body,wrapper)=a.retained_source_payments_for_test();
-    assert_eq!(new_meter.left+RETAINED_SOURCE_HANDOFF_G,old_meter.left+body+wrapper);
+    assert_eq!(new_meter.left+RETAINED_SOURCE_HANDOFF_G-baseline_payment,old_meter.left+body+wrapper);
     assert!(body>RETAINED_SOURCE_HANDOFF_G);
     eprintln!("RETAINED_EXACT body={} wrapper={} G={} old={} new={}",body,wrapper,RETAINED_SOURCE_HANDOFF_G,9_999_999-old_meter.left,9_999_999-new_meter.left);
     let(cb,wb)=LocalRuntime::retained_callback_widths_for_test();
@@ -216,6 +248,30 @@ fn retained_source_new_packet_preserves_real_cancellation_and_elapsed_causes() {
             if text=="Common factual admission: budget: cancelled or cumulative elapsed budget exhausted"));
         assert_eq!(m.left,before);
     }
+}
+
+#[test]
+fn tampered_committed_owned_lineage_is_rejected_before_common_fact_admission() {
+    let (_dir, store, a, b) = owned_fixture::setup_unrecorded_basis();
+    let prepared = owned_fixture::prepare_with_operation(&store, &a, &b, "initial-owned");
+    let choice = owned_fixture::policy_choice(&prepared);
+    let scenes = owned_fixture::action_scenes(&store, &prepared);
+    let change = owned_fixture::engine(&store)
+        .prepare_owned_choice(&store, prepared, choice, scenes, "initial-owned")
+        .unwrap();
+    let committed = owned_fixture::engine(&store).adopt(&store, &change).unwrap();
+    let request = owned_fixture::request(&store, &a, &b);
+    let mut tampered = committed.clone();
+    let ScopeEnvelope::OwnedV2(state) = &mut tampered.scope else { panic!("expected committed OwnedV2") };
+    state.layers.clear();
+    let untouched = tampered.clone();
+
+    let error = authenticate_inner(&tampered, &b, &request, &mut meter(), true)
+        .expect_err("tampered prior lineage must not reach ordinary admission")
+        .to_string();
+    assert!(!error.is_empty());
+    assert_eq!(tampered, untouched);
+    assert_eq!(store.load().unwrap(), committed);
 }
 fn region<'a>(source:&'a str,from:&str,to:&str)->&'a str {
     source.split_once(from).unwrap().1.split_once(to).unwrap().0

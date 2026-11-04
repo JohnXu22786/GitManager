@@ -126,6 +126,23 @@ pub fn setup() -> (tempfile::TempDir, ProductStore, CapturedProgram, CapturedPro
     let (a, b) = pair();
     setup_pair(a, b)
 }
+pub fn setup_unrecorded_basis() -> (tempfile::TempDir, ProductStore, CapturedProgram, CapturedProgram) {
+    let (a, b) = pair();
+    let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+    let store = ProductStore::create(dir.path().join("store"), &a, 20000).unwrap();
+    for title in ["live", "reserve", "complete-original", "finished"] {
+        add(&store, &format!("add-{title}"), title);
+    }
+    job_action(&store, "finish-before-policy", "complete", "finished");
+    for title in ["live", "reserve"] {
+        let owner = row(&store.load().unwrap().data, title);
+        apply(&store, &format!("register-{title}"), invoke("register", [
+            ("owner".into(), reference(&owner)), ("name".into(), value("shared-material")),
+        ].into()));
+    }
+    apply(&store, "material-arrived", material_input(&store, "arrive", "before policy"));
+    (dir, store, a, b)
+}
 pub fn setup_pair(a: CapturedProgram, b: CapturedProgram) -> (tempfile::TempDir, ProductStore, CapturedProgram, CapturedProgram) {
     let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let s = ProductStore::create(dir.path().join("store"), &a, 20000).unwrap();
@@ -154,11 +171,14 @@ pub fn setup_pair(a: CapturedProgram, b: CapturedProgram) -> (tempfile::TempDir,
     (dir, s, a, b)
 }
 pub fn prepare(s: &ProductStore, a: &CapturedProgram, b: &CapturedProgram) -> PreparedOwnedScopedChangeV2 {
+    prepare_with_operation(s, a, b, "initial-owned")
+}
+pub fn prepare_with_operation(s: &ProductStore, a: &CapturedProgram, b: &CapturedProgram, operation: &str) -> PreparedOwnedScopedChangeV2 {
     let before = s.load().unwrap();
     let r = request(s, a, b);
     let witnesses: Vec<_> = [OwnedSourceSide::Before, OwnedSourceSide::After].into_iter().map(|side| LifecycleWitness { side, scenario: scenario(s, "lifecycle", vec![]), completed: row(&before.data, "finished"), unfinished: row(&before.data, "live") }).collect();
     let accepted = LifecycleAcceptanceHost::prepare(s, b, &r, &witnesses, ProofBudget::default(), cancel()).unwrap().synthetic_operator_accept_for_test(s).unwrap();
-    let (p, report) = engine(s).prepare_owned_change(s, b, &r, &accepted, "initial-owned", ProofBudget::default(), cancel()).unwrap();
+    let (p, report) = engine(s).prepare_owned_change(s, b, &r, &accepted, operation, ProofBudget::default(), cancel()).unwrap();
     assert_eq!(report.disposition, CheckDisposition::Ready);
     assert_eq!(s.load().unwrap(), before);
     p
@@ -183,7 +203,8 @@ pub fn action_scenes(s: &ProductStore, p: &PreparedOwnedScopedChangeV2) -> Vec<A
         ("arrive", vec![invoke("begin", [("job".into(), reference(&live))].into()), withdrawal, invoke("arrive", [("material".into(), material), ("note".into(), value("scene"))].into())]),
     ];
     scenes.into_iter().map(|(id, inputs)| {
-        let scene = engine(s).accept_owned_scene(s, p, &scenario(s, id, inputs), Disclosure::Synthetic).unwrap();
+        let scene = engine(s).accept_owned_scene(s, p, &scenario(s, id, inputs), Disclosure::Synthetic)
+            .unwrap_or_else(|error| panic!("owned action scene {id} was refused: {error:?}"));
         assert!(observed_count(&scene) < 2);
         scene
     }).collect()

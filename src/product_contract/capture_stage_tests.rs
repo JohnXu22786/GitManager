@@ -320,14 +320,17 @@ fn with_nodes(target:usize)->CapturedProgram {
     capture(v)
 }
 #[test]
-fn synthetic_depth_both_occurrences_suffix_and_action_limits_match_native() {
+fn projection_extension_checks_real_root_depth_and_hard_action_limits() {
     let c=capture(fixture::minimal());
     for depth in [14,15,16] {
         let mut e=yes();
         for _ in 0..depth { e=json!({"kind":"not","value":e}); }
         let e=expr(e);
-        assert_eq!(static_paid(&c,"row","record",&e),static_old(&c,"row","record",&e).map(|_|()));
+        assert!(static_paid(&c,"row","record",&e).is_ok(),"root depth {depth}");
     }
+    let mut too_deep=yes();
+    for _ in 0..=MAX_EXPR_DEPTH { too_deep=json!({"kind":"not","value":too_deep}); }
+    assert!(static_paid(&c,"row","record",&expr(too_deep)).is_err());
     for t in [8188,8189,8190,8192] {
         let c=with_nodes(t);
         let d=DataSnapshot::empty("project",&c.program).unwrap();
