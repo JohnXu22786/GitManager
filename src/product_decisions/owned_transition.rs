@@ -439,7 +439,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                             IntentArchive::new(store.clone())
                                 .export_for_locked_withdrawal(candidate, capsule)?;
                         } else {
-                            IntentArchive::new(store.clone()).export_for(candidate)?;
+                            IntentArchive::new(store.clone()).export_for_validated(candidate, None)?;
                         }
                         ])
                     };
@@ -447,7 +447,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 },
                 |current| {
                     IntentArchive::new(store.clone())
-                        .export_for(current)
+                        .export_for_validated(current, None)
                         .map(|_| ())
                         .map_err(into_store_error)
                 },

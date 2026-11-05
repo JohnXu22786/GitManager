@@ -317,14 +317,24 @@ pub(crate) fn validate_bundle_with_archive(
                 },
             )?;
         } else {
-            crate::product_store::scope::check_retained_transition_policies_with_initials(
-                snapshot, |check, loan| {
-                    check.charge(HISTORICAL_INITIAL_RETAINED_PAYMENT)?;
-                    RetainedPolicyDecisionCapture { accepted: &accepted, ranges: &accepted_ranges }
-                        .run_initial(check, loan)
-                },
-            )?;
+            // Public, ordinary archive validation retains the original full
+            // historical reconstruction budget. Component loans stay in the
+            // validated-archive and exact internal-transaction paths.
+            retained_bundle_body!(snapshot,
+                crate::product_store::scope::check_retained_transition_policies,
+                [], accepted, accepted_ranges);
         }
+    ], [Ok(())])
+}
+fn validate_bundle_with_initials(snapshot: &ProjectSnapshot, bundle: &IntentionBundle) -> Result<()> {
+    validate_bundle_body!(snapshot, bundle, accepted, accepted_ranges, [
+        crate::product_store::scope::check_retained_transition_policies_with_initials(
+            snapshot, |check, loan| {
+                check.charge(HISTORICAL_INITIAL_RETAINED_PAYMENT)?;
+                RetainedPolicyDecisionCapture { accepted: &accepted, ranges: &accepted_ranges }
+                    .run_initial(check, loan)
+            },
+        )?;
     ], [Ok(())])
 }
 fn validate_bundle_locked(
@@ -451,7 +461,13 @@ impl IntentArchive {
         snapshot: &ProjectSnapshot,
         archive: Option<&crate::product_store::scope::ValidatedOwnedArchive<'_>>,
     ) -> Result<IntentionBundle> {
-        export_bundle_body!(self, snapshot, bundle, [validate_bundle_with_archive(snapshot, &bundle, archive)?;], [Ok(bundle)])
+        if let Some(archive) = archive {
+            export_bundle_body!(self, snapshot, bundle, [validate_bundle_with_archive(snapshot, &bundle, Some(archive))?;], [Ok(bundle)])
+        } else {
+            // Internal transaction callers have already bound the exact
+            // candidate and may reuse its reconstructed initial components.
+            export_bundle_body!(self, snapshot, bundle, [validate_bundle_with_initials(snapshot, &bundle)?;], [Ok(bundle)])
+        }
     }
     pub(super) fn export_for_locked_withdrawal(
         &self, snapshot: &ProjectSnapshot, capsule: &LockedArchivePolicy<'_>,

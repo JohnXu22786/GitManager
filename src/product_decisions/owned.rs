@@ -320,7 +320,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 },
                 |current| {
                     IntentArchive::new(store.clone())
-                        .export_for(current)
+                        .export_for_validated(current, None)
                         .map(|_| ())
                         .map_err(|e| StoreError::Invalid(e.to_string()))
                 },

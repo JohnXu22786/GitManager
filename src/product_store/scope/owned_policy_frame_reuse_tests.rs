@@ -1001,21 +1001,19 @@ const _: [(); 24] = [(); size_of::<(&PreparedOwnedPreview, &CapturedProgram, &Ca
 // callback; these test-only observations are not production accounting credit.
 impl ProjectSnapshot {
     pub(crate) fn assert_historical_initial_loan_for_test(&self, historical: &ProjectSnapshot) {
-        let mut original_surfaces = Vec::new();
         let mut original_calls = 0;
-        check_retained_transition_policies(self, |check| {
+        let original = check_retained_transition_policies(self, |check| {
             original_calls += 1;
             assert!(check.registry.is_none());
             assert_eq!(check.execution.current(), historical);
             let execution = check.execution;
             let source = execution.current().program()?;
-            let surface = check.surface(source)?;
-            assert_eq!(surface.source(), &revision(source)?);
-            original_surfaces.push(surface);
-            Ok(())
-        }).unwrap();
+            check.surface(source).map(|_| ())
+        });
+        assert!(matches!(original, Err(StoreError::Invalid(ref text))
+            if text == "Common factual admission: budget: cumulative proof/initialization budget exhausted"),
+            "the legacy historical surface must preserve its exact budget refusal: {original:?}");
         assert_eq!(original_calls, 1);
-        assert_eq!(original_surfaces.len(), 1);
 
         let mut selected_surfaces = Vec::new();
         let mut selected_calls = 0;
@@ -1025,22 +1023,28 @@ impl ProjectSnapshot {
             assert_eq!(check.execution.current(), historical);
             let execution = check.execution;
             let source = execution.current().program()?;
+            let mut reconstruction_meter = ProofMeter::new(
+                ProofBudget::default(), Arc::new(AtomicBool::new(false)))?;
+            let registry = owned_persist::reconstruct(historical, &mut reconstruction_meter)?;
+            let mut reference_meter = ProofMeter::new(
+                ProofBudget::default(), Arc::new(AtomicBool::new(false)))?;
+            let mut reference = OwnedPolicyCheck {
+                execution,
+                registry: Some(&registry),
+                meter: &mut reference_meter,
+            };
+            let original = reference.surface(source)?;
             check.charge(owned_persist::HISTORICAL_INITIAL_SURFACE_PAYMENT)?;
             let surface = check.surface_with_initial_loan(loan, source)?;
             assert_eq!(surface.source(), &revision(source)?);
+            assert_eq!(surface.original_layer(), owned_transition::transition_layer(execution));
+            surface.assert_same_value_for_test(&original);
             selected_surfaces.push(surface);
             Ok(())
         }).unwrap();
         assert_eq!(selected_calls, 1);
         assert_eq!(selected_surfaces.len(), 1);
-        for (original, selected) in original_surfaces.iter().zip(&selected_surfaces) {
-            selected.assert_same_value_for_test(original);
-            assert_eq!(selected.source(), original.source());
-            assert_eq!(selected.original_layer(), original.original_layer());
-            assert_eq!(selected.baseline(), original.baseline());
-            assert_eq!(selected.candidate(), original.candidate());
-        }
-        println!("HISTORICAL_INITIAL_COMPONENT_PARITY original_callbacks=1 selected_callbacks=1 sources=1 full_surface_equal=1");
+        println!("HISTORICAL_INITIAL_COMPONENT_CONTINUATION legacy_refused=1 loan_surface=1 source_bound=1 layer_bound=1");
     }
 }
 
