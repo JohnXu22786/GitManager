@@ -28,6 +28,7 @@ impl PartialEq for PreparedOwnedScopedChangeV2 {
             && self.execution.target == other.execution.target
             && self.execution.initialized == other.execution.initialized
             && self.execution.proof.snapshot == other.execution.proof.snapshot
+            && self.execution.proof.baseline == other.execution.proof.baseline
             && self.execution.proof.candidate == other.execution.proof.candidate
             && self.execution.proof.report == other.execution.proof.report
             && self.execution.metadata == other.execution.metadata
@@ -187,21 +188,9 @@ pub(crate) fn prepare_owned(
     cancelled: Arc<AtomicBool>,
 ) -> Result<PreparedOwnedScopedChangeV2> {
     let mut meter = ProofMeter::new(budget, cancelled.clone())?;
-    let proof = common_fact_admission::derive_for_decision(
-        current, candidate, request, accepted, &mut meter,
+    let (layer, manifest, initialization, execution, compatibility) = owned_preview::initial_owned_recipe(
+        current, candidate, request, accepted, operation, &mut meter,
     )?;
-    let preview = owned_preview::build(proof, &mut meter)?;
-    let (layer, manifest, initialization, execution) =
-        owned_persist::recipe(&preview, operation, &mut meter)?;
-    let compatibility = LocalRuntime::with_cancellation(cancelled.clone()).compatibility_at(
-        &execution.target,
-        &execution.initialized,
-        current.clock_day,
-    )?;
-    if compatibility.state != CompatibilityState::Compatible {
-        return Err(StoreError::Incompatible(compatibility));
-    }
-    meter.charge(1)?;
     Ok(PreparedOwnedScopedChangeV2 {
         execution: Arc::new(execution),
         layer,
@@ -243,9 +232,10 @@ impl ProductStore {
         // The raw basis intentionally lacks required protected cells. Preserve
         // that honest report; only the privately regenerated initializer can
         // establish compatible execution, never an ordinary schema merge.
-        if runtime.compatibility_at(target, &current.data, current.clock_day)? != plan.compatibility
-            || runtime.compatibility_at(target, prepared.initialized(), current.clock_day)?
-                != prepared.compatibility
+        let raw_compatibility = runtime.compatibility_at(target, &current.data, current.clock_day)?;
+        let initialized_compatibility = runtime.compatibility_at(target, prepared.initialized(), current.clock_day)?;
+        if raw_compatibility != plan.compatibility
+            || initialized_compatibility != prepared.compatibility
             || prepared.compatibility.state != CompatibilityState::Compatible
         {
             return Err(refuse(
@@ -377,9 +367,8 @@ impl ProductStore {
             ScopeEnvelope::ScalarV1(s) if *s == ScopeState::default() => {
                 OwnedScopeStateV2::default()
             }
-            ScopeEnvelope::OwnedV2(s) if s.layers.is_empty() && !s.rehearsals.is_empty() => {
-                s.clone()
-            }
+            ScopeEnvelope::OwnedV2(s) if s.layers.len() < MAX_LAYERS
+                && (s.layers.is_empty() || !s.compositions.is_empty()) => s.clone(),
             _ => return Err(refuse("owned adoption", "first committed lineage required")),
         };
         next.revision = current
@@ -434,6 +423,7 @@ impl ProductStore {
                 operation: adoption.plan.id.clone(),
                 request,
                 revision: next.revision,
+                trace_digest: None,
             },
         );
         verify(&current, target, decisions, &adoption.plan, &next)?;

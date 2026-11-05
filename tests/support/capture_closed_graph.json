@@ -1,0 +1,1692 @@
+{
+  "schema_source": "src/product_contract.rs",
+  "source_start_line": 204,
+  "source_end_line": 588,
+  "totals": {
+    "owned_types": 25,
+    "enum_variants": 64,
+    "named_fields": 161
+  },
+  "scope": "Complete current transitive AppDefinition owned graph; Id=String and Values=BTreeMap<Id, DataValue> aliases recorded separately. kind tags are synthesized and are not counted among161 named fields.",
+  "aliases": {
+    "Id": "String",
+    "Values": "BTreeMap<Id, DataValue>"
+  },
+  "types": [
+    {
+      "type": "Type",
+      "kind": "enum",
+      "serde_attributes": [
+        "tag = \"kind\", rename_all = \"snake_case\", deny_unknown_fields"
+      ],
+      "derive": [
+        "Clone, Debug, PartialEq, Eq, Serialize, Deserialize"
+      ],
+      "variants": [
+        {
+          "name": "Boolean",
+          "wire_name": "boolean",
+          "fields": [],
+          "canonical_keys": [
+            "kind"
+          ]
+        },
+        {
+          "name": "Integer",
+          "wire_name": "integer",
+          "fields": [],
+          "canonical_keys": [
+            "kind"
+          ]
+        },
+        {
+          "name": "Text",
+          "wire_name": "text",
+          "fields": [],
+          "canonical_keys": [
+            "kind"
+          ]
+        },
+        {
+          "name": "Date",
+          "wire_name": "date",
+          "fields": [],
+          "canonical_keys": [
+            "kind"
+          ]
+        },
+        {
+          "name": "Reference",
+          "wire_name": "reference",
+          "fields": [
+            {
+              "name": "entity",
+              "rust_type": "Id"
+            }
+          ],
+          "canonical_keys": [
+            "entity",
+            "kind"
+          ]
+        },
+        {
+          "name": "List",
+          "wire_name": "list",
+          "fields": [
+            {
+              "name": "item",
+              "rust_type": "Box<Type>"
+            }
+          ],
+          "canonical_keys": [
+            "item",
+            "kind"
+          ]
+        },
+        {
+          "name": "Optional",
+          "wire_name": "optional",
+          "fields": [
+            {
+              "name": "item",
+              "rust_type": "Box<Type>"
+            }
+          ],
+          "canonical_keys": [
+            "item",
+            "kind"
+          ]
+        }
+      ]
+    },
+    {
+      "type": "DataValue",
+      "kind": "enum",
+      "serde_attributes": [
+        "tag = \"kind\", rename_all = \"snake_case\", deny_unknown_fields"
+      ],
+      "derive": [
+        "Clone, Debug, PartialEq, Eq, Serialize, Deserialize"
+      ],
+      "variants": [
+        {
+          "name": "Null",
+          "wire_name": "null",
+          "fields": [],
+          "canonical_keys": [
+            "kind"
+          ]
+        },
+        {
+          "name": "Boolean",
+          "wire_name": "boolean",
+          "fields": [
+            {
+              "name": "value",
+              "rust_type": "bool"
+            }
+          ],
+          "canonical_keys": [
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "name": "Integer",
+          "wire_name": "integer",
+          "fields": [
+            {
+              "name": "value",
+              "rust_type": "i64"
+            }
+          ],
+          "canonical_keys": [
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "name": "Text",
+          "wire_name": "text",
+          "fields": [
+            {
+              "name": "value",
+              "rust_type": "String"
+            }
+          ],
+          "canonical_keys": [
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "name": "Date",
+          "wire_name": "date",
+          "fields": [
+            {
+              "name": "days",
+              "rust_type": "i32"
+            }
+          ],
+          "canonical_keys": [
+            "days",
+            "kind"
+          ]
+        },
+        {
+          "name": "Reference",
+          "wire_name": "reference",
+          "fields": [
+            {
+              "name": "entity",
+              "rust_type": "Id"
+            },
+            {
+              "name": "record",
+              "rust_type": "Id"
+            }
+          ],
+          "canonical_keys": [
+            "entity",
+            "kind",
+            "record"
+          ]
+        },
+        {
+          "name": "List",
+          "wire_name": "list",
+          "fields": [
+            {
+              "name": "item_type",
+              "rust_type": "Type"
+            },
+            {
+              "name": "items",
+              "rust_type": "Vec<DataValue>"
+            }
+          ],
+          "canonical_keys": [
+            "item_type",
+            "items",
+            "kind"
+          ]
+        }
+      ]
+    },
+    {
+      "type": "Expr",
+      "kind": "enum",
+      "serde_attributes": [
+        "tag = \"kind\", rename_all = \"snake_case\", deny_unknown_fields"
+      ],
+      "derive": [
+        "Clone, Debug, PartialEq, Eq, Serialize, Deserialize"
+      ],
+      "variants": [
+        {
+          "name": "Literal",
+          "wire_name": "literal",
+          "fields": [
+            {
+              "name": "value_type",
+              "rust_type": "Type"
+            },
+            {
+              "name": "value",
+              "rust_type": "DataValue"
+            }
+          ],
+          "canonical_keys": [
+            "kind",
+            "value",
+            "value_type"
+          ]
+        },
+        {
+          "name": "Variable",
+          "wire_name": "variable",
+          "fields": [
+            {
+              "name": "name",
+              "rust_type": "Id"
+            }
+          ],
+          "canonical_keys": [
+            "kind",
+            "name"
+          ]
+        },
+        {
+          "name": "Field",
+          "wire_name": "field",
+          "fields": [
+            {
+              "name": "record",
+              "rust_type": "Box<Expr>"
+            },
+            {
+              "name": "field",
+              "rust_type": "Id"
+            }
+          ],
+          "canonical_keys": [
+            "field",
+            "kind",
+            "record"
+          ]
+        },
+        {
+          "name": "State",
+          "wire_name": "state",
+          "fields": [
+            {
+              "name": "state",
+              "rust_type": "Id"
+            }
+          ],
+          "canonical_keys": [
+            "kind",
+            "state"
+          ]
+        },
+        {
+          "name": "Today",
+          "wire_name": "today",
+          "fields": [],
+          "canonical_keys": [
+            "kind"
+          ]
+        },
+        {
+          "name": "Query",
+          "wire_name": "query",
+          "fields": [
+            {
+              "name": "entity",
+              "rust_type": "Id"
+            },
+            {
+              "name": "binding",
+              "rust_type": "Id"
+            },
+            {
+              "name": "predicate",
+              "rust_type": "Box<Expr>"
+            },
+            {
+              "name": "sort",
+              "rust_type": "Vec<SortKey>"
+            },
+            {
+              "name": "limit",
+              "rust_type": "usize"
+            },
+            {
+              "name": "include_archived",
+              "rust_type": "bool"
+            }
+          ],
+          "canonical_keys": [
+            "binding",
+            "entity",
+            "include_archived",
+            "kind",
+            "limit",
+            "predicate",
+            "sort"
+          ]
+        },
+        {
+          "name": "Filter",
+          "wire_name": "filter",
+          "fields": [
+            {
+              "name": "items",
+              "rust_type": "Box<Expr>"
+            },
+            {
+              "name": "binding",
+              "rust_type": "Id"
+            },
+            {
+              "name": "predicate",
+              "rust_type": "Box<Expr>"
+            }
+          ],
+          "canonical_keys": [
+            "binding",
+            "items",
+            "kind",
+            "predicate"
+          ]
+        },
+        {
+          "name": "Map",
+          "wire_name": "map",
+          "fields": [
+            {
+              "name": "items",
+              "rust_type": "Box<Expr>"
+            },
+            {
+              "name": "binding",
+              "rust_type": "Id"
+            },
+            {
+              "name": "value",
+              "rust_type": "Box<Expr>"
+            }
+          ],
+          "canonical_keys": [
+            "binding",
+            "items",
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "name": "Count",
+          "wire_name": "count",
+          "fields": [
+            {
+              "name": "items",
+              "rust_type": "Box<Expr>"
+            }
+          ],
+          "canonical_keys": [
+            "items",
+            "kind"
+          ]
+        },
+        {
+          "name": "Any",
+          "wire_name": "any",
+          "fields": [
+            {
+              "name": "items",
+              "rust_type": "Box<Expr>"
+            },
+            {
+              "name": "binding",
+              "rust_type": "Id"
+            },
+            {
+              "name": "predicate",
+              "rust_type": "Box<Expr>"
+            }
+          ],
+          "canonical_keys": [
+            "binding",
+            "items",
+            "kind",
+            "predicate"
+          ]
+        },
+        {
+          "name": "All",
+          "wire_name": "all",
+          "fields": [
+            {
+              "name": "items",
+              "rust_type": "Box<Expr>"
+            },
+            {
+              "name": "binding",
+              "rust_type": "Id"
+            },
+            {
+              "name": "predicate",
+              "rust_type": "Box<Expr>"
+            }
+          ],
+          "canonical_keys": [
+            "binding",
+            "items",
+            "kind",
+            "predicate"
+          ]
+        },
+        {
+          "name": "Sum",
+          "wire_name": "sum",
+          "fields": [
+            {
+              "name": "items",
+              "rust_type": "Box<Expr>"
+            }
+          ],
+          "canonical_keys": [
+            "items",
+            "kind"
+          ]
+        },
+        {
+          "name": "Contains",
+          "wire_name": "contains",
+          "fields": [
+            {
+              "name": "items",
+              "rust_type": "Box<Expr>"
+            },
+            {
+              "name": "value",
+              "rust_type": "Box<Expr>"
+            }
+          ],
+          "canonical_keys": [
+            "items",
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "name": "Equal",
+          "wire_name": "equal",
+          "fields": [
+            {
+              "name": "left",
+              "rust_type": "Box<Expr>"
+            },
+            {
+              "name": "right",
+              "rust_type": "Box<Expr>"
+            }
+          ],
+          "canonical_keys": [
+            "kind",
+            "left",
+            "right"
+          ]
+        },
+        {
+          "name": "Less",
+          "wire_name": "less",
+          "fields": [
+            {
+              "name": "left",
+              "rust_type": "Box<Expr>"
+            },
+            {
+              "name": "right",
+              "rust_type": "Box<Expr>"
+            }
+          ],
+          "canonical_keys": [
+            "kind",
+            "left",
+            "right"
+          ]
+        },
+        {
+          "name": "Add",
+          "wire_name": "add",
+          "fields": [
+            {
+              "name": "left",
+              "rust_type": "Box<Expr>"
+            },
+            {
+              "name": "right",
+              "rust_type": "Box<Expr>"
+            }
+          ],
+          "canonical_keys": [
+            "kind",
+            "left",
+            "right"
+          ]
+        },
+        {
+          "name": "Subtract",
+          "wire_name": "subtract",
+          "fields": [
+            {
+              "name": "left",
+              "rust_type": "Box<Expr>"
+            },
+            {
+              "name": "right",
+              "rust_type": "Box<Expr>"
+            }
+          ],
+          "canonical_keys": [
+            "kind",
+            "left",
+            "right"
+          ]
+        },
+        {
+          "name": "Concat",
+          "wire_name": "concat",
+          "fields": [
+            {
+              "name": "left",
+              "rust_type": "Box<Expr>"
+            },
+            {
+              "name": "right",
+              "rust_type": "Box<Expr>"
+            }
+          ],
+          "canonical_keys": [
+            "kind",
+            "left",
+            "right"
+          ]
+        },
+        {
+          "name": "TextContains",
+          "wire_name": "text_contains",
+          "fields": [
+            {
+              "name": "text",
+              "rust_type": "Box<Expr>"
+            },
+            {
+              "name": "search",
+              "rust_type": "Box<Expr>"
+            }
+          ],
+          "canonical_keys": [
+            "kind",
+            "search",
+            "text"
+          ]
+        },
+        {
+          "name": "Lower",
+          "wire_name": "lower",
+          "fields": [
+            {
+              "name": "value",
+              "rust_type": "Box<Expr>"
+            }
+          ],
+          "canonical_keys": [
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "name": "And",
+          "wire_name": "and",
+          "fields": [
+            {
+              "name": "values",
+              "rust_type": "Vec<Expr>"
+            }
+          ],
+          "canonical_keys": [
+            "kind",
+            "values"
+          ]
+        },
+        {
+          "name": "Or",
+          "wire_name": "or",
+          "fields": [
+            {
+              "name": "values",
+              "rust_type": "Vec<Expr>"
+            }
+          ],
+          "canonical_keys": [
+            "kind",
+            "values"
+          ]
+        },
+        {
+          "name": "Not",
+          "wire_name": "not",
+          "fields": [
+            {
+              "name": "value",
+              "rust_type": "Box<Expr>"
+            }
+          ],
+          "canonical_keys": [
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "name": "If",
+          "wire_name": "if",
+          "fields": [
+            {
+              "name": "condition",
+              "rust_type": "Box<Expr>"
+            },
+            {
+              "name": "then_value",
+              "rust_type": "Box<Expr>"
+            },
+            {
+              "name": "else_value",
+              "rust_type": "Box<Expr>"
+            }
+          ],
+          "canonical_keys": [
+            "condition",
+            "else_value",
+            "kind",
+            "then_value"
+          ]
+        },
+        {
+          "name": "Coalesce",
+          "wire_name": "coalesce",
+          "fields": [
+            {
+              "name": "value",
+              "rust_type": "Box<Expr>"
+            },
+            {
+              "name": "fallback",
+              "rust_type": "Box<Expr>"
+            }
+          ],
+          "canonical_keys": [
+            "fallback",
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "name": "DateAdd",
+          "wire_name": "date_add",
+          "fields": [
+            {
+              "name": "date",
+              "rust_type": "Box<Expr>"
+            },
+            {
+              "name": "days",
+              "rust_type": "Box<Expr>"
+            }
+          ],
+          "canonical_keys": [
+            "date",
+            "days",
+            "kind"
+          ]
+        },
+        {
+          "name": "DateDifference",
+          "wire_name": "date_difference",
+          "fields": [
+            {
+              "name": "later",
+              "rust_type": "Box<Expr>"
+            },
+            {
+              "name": "earlier",
+              "rust_type": "Box<Expr>"
+            }
+          ],
+          "canonical_keys": [
+            "earlier",
+            "kind",
+            "later"
+          ]
+        }
+      ]
+    },
+    {
+      "type": "SortKey",
+      "kind": "struct",
+      "serde_attributes": [
+        "deny_unknown_fields"
+      ],
+      "derive": [
+        "Clone, Debug, PartialEq, Eq, Serialize, Deserialize"
+      ],
+      "fields": [
+        {
+          "name": "value",
+          "rust_type": "Expr"
+        },
+        {
+          "name": "descending",
+          "rust_type": "bool"
+        }
+      ],
+      "canonical_keys": [
+        "descending",
+        "value"
+      ]
+    },
+    {
+      "type": "FieldDefinition",
+      "kind": "struct",
+      "serde_attributes": [
+        "deny_unknown_fields"
+      ],
+      "derive": [
+        "Clone, Debug, PartialEq, Eq, Serialize, Deserialize"
+      ],
+      "fields": [
+        {
+          "name": "id",
+          "rust_type": "Id"
+        },
+        {
+          "name": "label",
+          "rust_type": "String"
+        },
+        {
+          "name": "value_type",
+          "rust_type": "Type"
+        }
+      ],
+      "canonical_keys": [
+        "id",
+        "label",
+        "value_type"
+      ]
+    },
+    {
+      "type": "EntityDefinition",
+      "kind": "struct",
+      "serde_attributes": [
+        "deny_unknown_fields"
+      ],
+      "derive": [
+        "Clone, Debug, PartialEq, Eq, Serialize, Deserialize"
+      ],
+      "fields": [
+        {
+          "name": "id",
+          "rust_type": "Id"
+        },
+        {
+          "name": "label",
+          "rust_type": "String"
+        },
+        {
+          "name": "fields",
+          "rust_type": "Vec<FieldDefinition>"
+        },
+        {
+          "name": "unique",
+          "rust_type": "Vec<Vec<Id>>"
+        },
+        {
+          "name": "constraints",
+          "rust_type": "Vec<Expr>"
+        }
+      ],
+      "canonical_keys": [
+        "constraints",
+        "fields",
+        "id",
+        "label",
+        "unique"
+      ]
+    },
+    {
+      "type": "StateDefinition",
+      "kind": "struct",
+      "serde_attributes": [
+        "deny_unknown_fields"
+      ],
+      "derive": [
+        "Clone, Debug, PartialEq, Eq, Serialize, Deserialize"
+      ],
+      "fields": [
+        {
+          "name": "id",
+          "rust_type": "Id"
+        },
+        {
+          "name": "label",
+          "rust_type": "String"
+        },
+        {
+          "name": "value_type",
+          "rust_type": "Type"
+        },
+        {
+          "name": "initial",
+          "rust_type": "DataValue"
+        }
+      ],
+      "canonical_keys": [
+        "id",
+        "initial",
+        "label",
+        "value_type"
+      ]
+    },
+    {
+      "type": "ActionDefinition",
+      "kind": "struct",
+      "serde_attributes": [
+        "deny_unknown_fields"
+      ],
+      "derive": [
+        "Clone, Debug, PartialEq, Eq, Serialize, Deserialize"
+      ],
+      "fields": [
+        {
+          "name": "id",
+          "rust_type": "Id"
+        },
+        {
+          "name": "label",
+          "rust_type": "String"
+        },
+        {
+          "name": "parameters",
+          "rust_type": "BTreeMap<Id, Type>"
+        },
+        {
+          "name": "guards",
+          "rust_type": "Vec<Expr>"
+        },
+        {
+          "name": "steps",
+          "rust_type": "Vec<Statement>"
+        },
+        {
+          "name": "ensures",
+          "rust_type": "Vec<Expr>"
+        }
+      ],
+      "canonical_keys": [
+        "ensures",
+        "guards",
+        "id",
+        "label",
+        "parameters",
+        "steps"
+      ]
+    },
+    {
+      "type": "Statement",
+      "kind": "enum",
+      "serde_attributes": [
+        "tag = \"kind\", rename_all = \"snake_case\", deny_unknown_fields"
+      ],
+      "derive": [
+        "Clone, Debug, PartialEq, Eq, Serialize, Deserialize"
+      ],
+      "variants": [
+        {
+          "name": "Create",
+          "wire_name": "create",
+          "fields": [
+            {
+              "name": "entity",
+              "rust_type": "Id"
+            },
+            {
+              "name": "values",
+              "rust_type": "BTreeMap<Id, Expr>"
+            },
+            {
+              "name": "bind",
+              "rust_type": "Id"
+            }
+          ],
+          "canonical_keys": [
+            "bind",
+            "entity",
+            "kind",
+            "values"
+          ]
+        },
+        {
+          "name": "Update",
+          "wire_name": "update",
+          "fields": [
+            {
+              "name": "record",
+              "rust_type": "Expr"
+            },
+            {
+              "name": "values",
+              "rust_type": "BTreeMap<Id, Expr>"
+            }
+          ],
+          "canonical_keys": [
+            "kind",
+            "record",
+            "values"
+          ]
+        },
+        {
+          "name": "Archive",
+          "wire_name": "archive",
+          "fields": [
+            {
+              "name": "record",
+              "rust_type": "Expr"
+            }
+          ],
+          "canonical_keys": [
+            "kind",
+            "record"
+          ]
+        },
+        {
+          "name": "SetState",
+          "wire_name": "set_state",
+          "fields": [
+            {
+              "name": "state",
+              "rust_type": "Id"
+            },
+            {
+              "name": "value",
+              "rust_type": "Expr"
+            }
+          ],
+          "canonical_keys": [
+            "kind",
+            "state",
+            "value"
+          ]
+        },
+        {
+          "name": "Collection",
+          "wire_name": "collection",
+          "fields": [
+            {
+              "name": "target",
+              "rust_type": "CollectionTarget"
+            },
+            {
+              "name": "operation",
+              "rust_type": "CollectionOperation"
+            },
+            {
+              "name": "items",
+              "rust_type": "Expr"
+            }
+          ],
+          "canonical_keys": [
+            "items",
+            "kind",
+            "operation",
+            "target"
+          ]
+        },
+        {
+          "name": "ForEach",
+          "wire_name": "for_each",
+          "fields": [
+            {
+              "name": "items",
+              "rust_type": "Expr"
+            },
+            {
+              "name": "binding",
+              "rust_type": "Id"
+            },
+            {
+              "name": "steps",
+              "rust_type": "Vec<Statement>"
+            }
+          ],
+          "canonical_keys": [
+            "binding",
+            "items",
+            "kind",
+            "steps"
+          ]
+        },
+        {
+          "name": "Assert",
+          "wire_name": "assert",
+          "fields": [
+            {
+              "name": "condition",
+              "rust_type": "Expr"
+            },
+            {
+              "name": "message",
+              "rust_type": "String"
+            }
+          ],
+          "canonical_keys": [
+            "condition",
+            "kind",
+            "message"
+          ]
+        },
+        {
+          "name": "Emit",
+          "wire_name": "emit",
+          "fields": [
+            {
+              "name": "output",
+              "rust_type": "Id"
+            },
+            {
+              "name": "items",
+              "rust_type": "Expr"
+            },
+            {
+              "name": "binding",
+              "rust_type": "Id"
+            },
+            {
+              "name": "columns",
+              "rust_type": "BTreeMap<Id, Expr>"
+            }
+          ],
+          "canonical_keys": [
+            "binding",
+            "columns",
+            "items",
+            "kind",
+            "output"
+          ]
+        }
+      ]
+    },
+    {
+      "type": "CollectionTarget",
+      "kind": "enum",
+      "serde_attributes": [
+        "tag = \"kind\", rename_all = \"snake_case\", deny_unknown_fields"
+      ],
+      "derive": [
+        "Clone, Debug, PartialEq, Eq, Serialize, Deserialize"
+      ],
+      "variants": [
+        {
+          "name": "State",
+          "wire_name": "state",
+          "fields": [
+            {
+              "name": "state",
+              "rust_type": "Id"
+            }
+          ],
+          "canonical_keys": [
+            "kind",
+            "state"
+          ]
+        },
+        {
+          "name": "Field",
+          "wire_name": "field",
+          "fields": [
+            {
+              "name": "record",
+              "rust_type": "Expr"
+            },
+            {
+              "name": "field",
+              "rust_type": "Id"
+            }
+          ],
+          "canonical_keys": [
+            "field",
+            "kind",
+            "record"
+          ]
+        }
+      ]
+    },
+    {
+      "type": "CollectionOperation",
+      "kind": "enum",
+      "serde_attributes": [
+        "rename_all = \"snake_case\""
+      ],
+      "derive": [
+        "Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize"
+      ],
+      "variants": [
+        {
+          "name": "Insert",
+          "wire_name": "insert",
+          "fields": [],
+          "canonical_keys": null
+        },
+        {
+          "name": "Remove",
+          "wire_name": "remove",
+          "fields": [],
+          "canonical_keys": null
+        }
+      ]
+    },
+    {
+      "type": "OutputFormat",
+      "kind": "enum",
+      "serde_attributes": [
+        "rename_all = \"snake_case\""
+      ],
+      "derive": [
+        "Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize"
+      ],
+      "variants": [
+        {
+          "name": "Csv",
+          "wire_name": "csv",
+          "fields": [],
+          "canonical_keys": null
+        },
+        {
+          "name": "Json",
+          "wire_name": "json",
+          "fields": [],
+          "canonical_keys": null
+        }
+      ]
+    },
+    {
+      "type": "OutputDefinition",
+      "kind": "struct",
+      "serde_attributes": [
+        "deny_unknown_fields"
+      ],
+      "derive": [
+        "Clone, Debug, PartialEq, Eq, Serialize, Deserialize"
+      ],
+      "fields": [
+        {
+          "name": "id",
+          "rust_type": "Id"
+        },
+        {
+          "name": "label",
+          "rust_type": "String"
+        },
+        {
+          "name": "format",
+          "rust_type": "OutputFormat"
+        },
+        {
+          "name": "columns",
+          "rust_type": "Vec<FieldDefinition>"
+        }
+      ],
+      "canonical_keys": [
+        "columns",
+        "format",
+        "id",
+        "label"
+      ]
+    },
+    {
+      "type": "ObservableDefinition",
+      "kind": "struct",
+      "serde_attributes": [
+        "deny_unknown_fields"
+      ],
+      "derive": [
+        "Clone, Debug, PartialEq, Eq, Serialize, Deserialize"
+      ],
+      "fields": [
+        {
+          "name": "id",
+          "rust_type": "Id"
+        },
+        {
+          "name": "label",
+          "rust_type": "String"
+        },
+        {
+          "name": "value",
+          "rust_type": "Expr"
+        }
+      ],
+      "canonical_keys": [
+        "id",
+        "label",
+        "value"
+      ]
+    },
+    {
+      "type": "Column",
+      "kind": "struct",
+      "serde_attributes": [
+        "deny_unknown_fields"
+      ],
+      "derive": [
+        "Clone, Debug, PartialEq, Eq, Serialize, Deserialize"
+      ],
+      "fields": [
+        {
+          "name": "id",
+          "rust_type": "Id"
+        },
+        {
+          "name": "label",
+          "rust_type": "String"
+        },
+        {
+          "name": "value",
+          "rust_type": "Expr"
+        }
+      ],
+      "canonical_keys": [
+        "id",
+        "label",
+        "value"
+      ]
+    },
+    {
+      "type": "StateControl",
+      "kind": "struct",
+      "serde_attributes": [
+        "deny_unknown_fields"
+      ],
+      "derive": [
+        "Clone, Debug, PartialEq, Eq, Serialize, Deserialize"
+      ],
+      "fields": [
+        {
+          "name": "id",
+          "rust_type": "Id"
+        },
+        {
+          "name": "label",
+          "rust_type": "String"
+        },
+        {
+          "name": "state",
+          "rust_type": "Id"
+        },
+        {
+          "name": "on_change",
+          "rust_type": "Option<Id>"
+        }
+      ],
+      "canonical_keys": [
+        "id",
+        "label",
+        "on_change",
+        "state"
+      ]
+    },
+    {
+      "type": "SelectionBinding",
+      "kind": "struct",
+      "serde_attributes": [
+        "deny_unknown_fields"
+      ],
+      "derive": [
+        "Clone, Debug, PartialEq, Eq, Serialize, Deserialize"
+      ],
+      "fields": [
+        {
+          "name": "id",
+          "rust_type": "Id"
+        },
+        {
+          "name": "state",
+          "rust_type": "Id"
+        },
+        {
+          "name": "on_change",
+          "rust_type": "Option<Id>"
+        }
+      ],
+      "canonical_keys": [
+        "id",
+        "on_change",
+        "state"
+      ]
+    },
+    {
+      "type": "FormInput",
+      "kind": "struct",
+      "serde_attributes": [
+        "deny_unknown_fields"
+      ],
+      "derive": [
+        "Clone, Debug, PartialEq, Eq, Serialize, Deserialize"
+      ],
+      "fields": [
+        {
+          "name": "parameter",
+          "rust_type": "Id"
+        },
+        {
+          "name": "label",
+          "rust_type": "String"
+        }
+      ],
+      "canonical_keys": [
+        "label",
+        "parameter"
+      ]
+    },
+    {
+      "type": "ViewKind",
+      "kind": "enum",
+      "serde_attributes": [
+        "tag = \"kind\", rename_all = \"snake_case\", deny_unknown_fields"
+      ],
+      "derive": [
+        "Clone, Debug, PartialEq, Eq, Serialize, Deserialize"
+      ],
+      "variants": [
+        {
+          "name": "List",
+          "wire_name": "list",
+          "fields": [
+            {
+              "name": "entity",
+              "rust_type": "Id"
+            },
+            {
+              "name": "rows",
+              "rust_type": "Expr"
+            },
+            {
+              "name": "columns",
+              "rust_type": "Vec<Column>"
+            },
+            {
+              "name": "controls",
+              "rust_type": "Vec<StateControl>"
+            },
+            {
+              "name": "selection",
+              "rust_type": "Option<SelectionBinding>"
+            }
+          ],
+          "canonical_keys": [
+            "columns",
+            "controls",
+            "entity",
+            "kind",
+            "rows",
+            "selection"
+          ]
+        },
+        {
+          "name": "Detail",
+          "wire_name": "detail",
+          "fields": [
+            {
+              "name": "entity",
+              "rust_type": "Id"
+            },
+            {
+              "name": "record",
+              "rust_type": "Expr"
+            },
+            {
+              "name": "columns",
+              "rust_type": "Vec<Column>"
+            }
+          ],
+          "canonical_keys": [
+            "columns",
+            "entity",
+            "kind",
+            "record"
+          ]
+        },
+        {
+          "name": "Form",
+          "wire_name": "form",
+          "fields": [
+            {
+              "name": "action",
+              "rust_type": "Id"
+            },
+            {
+              "name": "fields",
+              "rust_type": "Vec<FormInput>"
+            },
+            {
+              "name": "defaults",
+              "rust_type": "Values"
+            }
+          ],
+          "canonical_keys": [
+            "action",
+            "defaults",
+            "fields",
+            "kind"
+          ]
+        }
+      ]
+    },
+    {
+      "type": "ActionPlacement",
+      "kind": "enum",
+      "serde_attributes": [
+        "rename_all = \"snake_case\""
+      ],
+      "derive": [
+        "Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize"
+      ],
+      "variants": [
+        {
+          "name": "Toolbar",
+          "wire_name": "toolbar",
+          "fields": [],
+          "canonical_keys": null
+        },
+        {
+          "name": "Row",
+          "wire_name": "row",
+          "fields": [],
+          "canonical_keys": null
+        }
+      ]
+    },
+    {
+      "type": "ActionBinding",
+      "kind": "struct",
+      "serde_attributes": [
+        "deny_unknown_fields"
+      ],
+      "derive": [
+        "Clone, Debug, PartialEq, Eq, Serialize, Deserialize"
+      ],
+      "fields": [
+        {
+          "name": "id",
+          "rust_type": "Id"
+        },
+        {
+          "name": "label",
+          "rust_type": "String"
+        },
+        {
+          "name": "placement",
+          "rust_type": "ActionPlacement"
+        },
+        {
+          "name": "action",
+          "rust_type": "Id"
+        },
+        {
+          "name": "arguments",
+          "rust_type": "BTreeMap<Id, Expr>"
+        },
+        {
+          "name": "enabled",
+          "rust_type": "Expr"
+        }
+      ],
+      "canonical_keys": [
+        "action",
+        "arguments",
+        "enabled",
+        "id",
+        "label",
+        "placement"
+      ]
+    },
+    {
+      "type": "KeyModifier",
+      "kind": "enum",
+      "serde_attributes": [
+        "rename_all = \"snake_case\""
+      ],
+      "derive": [
+        "Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize"
+      ],
+      "variants": [
+        {
+          "name": "Control",
+          "wire_name": "control",
+          "fields": [],
+          "canonical_keys": null
+        },
+        {
+          "name": "Alt",
+          "wire_name": "alt",
+          "fields": [],
+          "canonical_keys": null
+        },
+        {
+          "name": "Shift",
+          "wire_name": "shift",
+          "fields": [],
+          "canonical_keys": null
+        },
+        {
+          "name": "Command",
+          "wire_name": "command",
+          "fields": [],
+          "canonical_keys": null
+        }
+      ]
+    },
+    {
+      "type": "KeyBinding",
+      "kind": "struct",
+      "serde_attributes": [
+        "deny_unknown_fields"
+      ],
+      "derive": [
+        "Clone, Debug, PartialEq, Eq, Serialize, Deserialize"
+      ],
+      "fields": [
+        {
+          "name": "key",
+          "rust_type": "String"
+        },
+        {
+          "name": "modifiers",
+          "rust_type": "BTreeSet<KeyModifier>"
+        },
+        {
+          "name": "binding",
+          "rust_type": "Id"
+        }
+      ],
+      "canonical_keys": [
+        "binding",
+        "key",
+        "modifiers"
+      ]
+    },
+    {
+      "type": "ViewDefinition",
+      "kind": "struct",
+      "serde_attributes": [
+        "deny_unknown_fields"
+      ],
+      "derive": [
+        "Clone, Debug, PartialEq, Eq, Serialize, Deserialize"
+      ],
+      "fields": [
+        {
+          "name": "id",
+          "rust_type": "Id"
+        },
+        {
+          "name": "label",
+          "rust_type": "String"
+        },
+        {
+          "name": "kind",
+          "rust_type": "ViewKind"
+        },
+        {
+          "name": "actions",
+          "rust_type": "Vec<ActionBinding>"
+        },
+        {
+          "name": "keys",
+          "rust_type": "Vec<KeyBinding>"
+        }
+      ],
+      "canonical_keys": [
+        "actions",
+        "id",
+        "keys",
+        "kind",
+        "label"
+      ]
+    },
+    {
+      "type": "AppDefinition",
+      "kind": "struct",
+      "serde_attributes": [
+        "deny_unknown_fields"
+      ],
+      "derive": [
+        "Clone, Debug, PartialEq, Eq, Serialize, Deserialize"
+      ],
+      "fields": [
+        {
+          "name": "version",
+          "rust_type": "u32"
+        },
+        {
+          "name": "id",
+          "rust_type": "Id"
+        },
+        {
+          "name": "label",
+          "rust_type": "String"
+        },
+        {
+          "name": "entities",
+          "rust_type": "Vec<EntityDefinition>"
+        },
+        {
+          "name": "state",
+          "rust_type": "Vec<StateDefinition>"
+        },
+        {
+          "name": "actions",
+          "rust_type": "Vec<ActionDefinition>"
+        },
+        {
+          "name": "outputs",
+          "rust_type": "Vec<OutputDefinition>"
+        },
+        {
+          "name": "observables",
+          "rust_type": "Vec<ObservableDefinition>"
+        },
+        {
+          "name": "views",
+          "rust_type": "Vec<ViewDefinition>"
+        },
+        {
+          "name": "initial_view",
+          "rust_type": "Id"
+        }
+      ],
+      "canonical_keys": [
+        "actions",
+        "entities",
+        "id",
+        "initial_view",
+        "label",
+        "observables",
+        "outputs",
+        "state",
+        "version",
+        "views"
+      ]
+    }
+  ]
+}

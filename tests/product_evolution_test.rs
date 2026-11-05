@@ -8,8 +8,18 @@ mod product_decisions;
 mod product_discovery;
 #[path = "../src/product_protocol.rs"]
 mod product_protocol;
+#[path = "../src/product_locations.rs"]
+mod product_locations;
+#[path = "../src/product_backup.rs"]
+mod product_backup;
 #[path = "../src/product_provider/mod.rs"]
 mod product_provider;
+#[path = "../src/product_alloc.rs"]
+mod product_alloc;
+#[path = "../src/product_json.rs"]
+mod product_json;
+#[path = "../src/product_app.rs"]
+mod product_app;
 #[path = "../src/product_runtime/mod.rs"]
 mod product_runtime;
 #[path = "../src/product_scenarios/mod.rs"]

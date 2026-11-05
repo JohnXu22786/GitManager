@@ -1,0 +1,283 @@
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Type {
+    Boolean,
+    Integer,
+    Text,
+    Date,
+    Reference { entity: Id },
+    List { item: Box<Type> },
+    Optional { item: Box<Type> },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DataValue {
+    Null,
+    Boolean {
+        value: bool,
+    },
+    Integer {
+        value: i64,
+    },
+    Text {
+        value: String,
+    },
+    /// Gregorian day number relative to 1970-01-01; arithmetic must be checked.
+    Date {
+        days: i32,
+    },
+    Reference {
+        entity: Id,
+        record: Id,
+    },
+    List {
+        item_type: Type,
+        items: Vec<DataValue>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Expr {
+    Literal {
+        value_type: Type,
+        value: DataValue,
+    },
+    Variable {
+        name: Id,
+    },
+    Field {
+        record: Box<Expr>,
+        field: Id,
+    },
+    State {
+        state: Id,
+    },
+    Today,
+    Query {
+        entity: Id,
+        binding: Id,
+        predicate: Box<Expr>,
+        sort: Vec<SortKey>,
+        limit: usize,
+        include_archived: bool,
+    },
+    Filter {
+        items: Box<Expr>,
+        binding: Id,
+        predicate: Box<Expr>,
+    },
+    Map {
+        items: Box<Expr>,
+        binding: Id,
+        value: Box<Expr>,
+    },
+    Count {
+        items: Box<Expr>,
+    },
+    Any {
+        items: Box<Expr>,
+        binding: Id,
+        predicate: Box<Expr>,
+    },
+    All {
+        items: Box<Expr>,
+        binding: Id,
+        predicate: Box<Expr>,
+    },
+    Sum {
+        items: Box<Expr>,
+    },
+    Contains {
+        items: Box<Expr>,
+        value: Box<Expr>,
+    },
+    Equal {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    Less {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    Add {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    Subtract {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    Concat {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    TextContains {
+        text: Box<Expr>,
+        search: Box<Expr>,
+    },
+    Lower {
+        value: Box<Expr>,
+    },
+    And {
+        values: Vec<Expr>,
+    },
+    Or {
+        values: Vec<Expr>,
+    },
+    Not {
+        value: Box<Expr>,
+    },
+    If {
+        condition: Box<Expr>,
+        then_value: Box<Expr>,
+        else_value: Box<Expr>,
+    },
+    Coalesce {
+        value: Box<Expr>,
+        fallback: Box<Expr>,
+    },
+    DateAdd {
+        date: Box<Expr>,
+        days: Box<Expr>,
+    },
+    DateDifference {
+        later: Box<Expr>,
+        earlier: Box<Expr>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SortKey {
+    pub value: Expr,
+    pub descending: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActionDefinition {
+    pub id: Id,
+    pub label: String,
+    pub parameters: BTreeMap<Id, Type>,
+    pub guards: Vec<Expr>,
+    pub steps: Vec<Statement>,
+    pub ensures: Vec<Expr>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Statement {
+    Create {
+        entity: Id,
+        values: BTreeMap<Id, Expr>,
+        bind: Id,
+    },
+    Update {
+        record: Expr,
+        values: BTreeMap<Id, Expr>,
+    },
+    Archive {
+        record: Expr,
+    },
+    SetState {
+        state: Id,
+        value: Expr,
+    },
+    Collection {
+        target: CollectionTarget,
+        operation: CollectionOperation,
+        items: Expr,
+    },
+    ForEach {
+        items: Expr,
+        binding: Id,
+        steps: Vec<Statement>,
+    },
+    Assert {
+        condition: Expr,
+        message: String,
+    },
+    Emit {
+        output: Id,
+        items: Expr,
+        binding: Id,
+        columns: BTreeMap<Id, Expr>,
+    },
+}
+
+#[derive(Serialize)]
+pub(super) struct SyntheticAction<'a> {
+    id: &'a str,
+    label: &'static str,
+    parameters: Parameters<'a>,
+    guards: [(); 0],
+    steps: [SyntheticAssert<'a>; 1],
+    ensures: [(); 0],
+}
+struct Parameters<'a> {
+    binding: &'a str,
+    entity: &'a str,
+}
+#[derive(Serialize)]
+struct Reference<'a> {
+    kind: &'static str,
+    entity: &'a str,
+}
+impl Serialize for Parameters<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut map = s.serialize_map(Some(1))?;
+        map.serialize_entry(
+            self.binding,
+            &Reference {
+                kind: "reference",
+                entity: self.entity,
+            },
+        )?;
+        map.end()
+    }
+}
+#[derive(Serialize)]
+struct SyntheticAssert<'a> {
+    kind: &'static str,
+    condition: SyntheticEqual<'a>,
+    message: &'static str,
+}
+#[derive(Serialize)]
+struct SyntheticEqual<'a> {
+    kind: &'static str,
+    left: &'a Expr,
+    right: &'a Expr,
+}
+// The one-entry Parameters map is a borrowed custom serializer, not a BTree.
+// Describe its actual fields without the generic map's BTree iterator reserve.
+impl capture_canonical::ManualShape for Parameters<'_> {
+    fn describe(&self, s: &mut capture_canonical::Shape<'_>) -> Result<()> {
+        let mut object = s.object()?;
+        object.field(self.binding, &Reference { kind: "reference", entity: self.entity })?;
+        object.end()
+    }
+}
+impl SyntheticAction<'_> {
+    pub(super) fn describe(&self, s: &mut capture_canonical::Shape<'_>) -> Result<()> {
+        let mut object = s.object()?;
+        object.field("id", &self.id)?;
+        object.field("label", &self.label)?;
+        object.manual_field("parameters", &self.parameters)?;
+        object.field("guards", &self.guards)?;
+        object.field("steps", &self.steps)?;
+        object.field("ensures", &self.ensures)?;
+        object.end()
+    }
+}
+
+
+pub fn canonical_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+    serde_json::to_value(value)
+        .and_then(|mut value| {
+            value.sort_all_objects();
+            serde_json::to_vec(&value)
+        })
+        .map_err(|e| ContractError(e.to_string()))
+}

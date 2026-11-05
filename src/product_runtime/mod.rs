@@ -1,13 +1,38 @@
 //! Production interpreter for the closed, typed local-application language.
 //! Runs own copied state. Only the project store/controller can commit it.
 mod compatibility;
+mod capture_cost;
+mod capture_native;
+pub(crate) fn decoded_capture_account_output(value: &DataValue, current: usize, limits: &RuntimeLimits,
+    work: &mut dyn ContractWork) -> Result<usize>
+{
+    capture::decoded_capture_account_output(value, current, limits, work)
+}
+pub(crate) fn decoded_capture_validate_value(value: &DataValue, expected: &Type,
+    work: &mut dyn ContractWork) -> Result<()>
+{
+    capture::decoded_capture_validate_value(value, expected, work)
+}
+pub(crate) fn decoded_capture_value_copy_cost(value: &DataValue, work: &mut dyn ContractWork) -> Result<()> {
+    capture::decoded_capture_value_copy_cost(value, work)
+}
+mod capture_eval;
+mod capture_key;
+mod fallible_lower;
+mod query_order;
+mod owned_env;
+use owned_env::ManagedEnv;
+pub(crate) use capture::{ProjectionHost, ProjectionReservation};
 mod eval;
 mod execute;
+#[cfg(test)]
+pub(crate) use execute::decoded_shared_transaction_kernel_parity_and_atomicity;
 mod view;
+use crate::product_alloc;
 
 use crate::product_contract::*;
 use crate::product_protocol::RuntimeView;
-use eval::{Env, Eval};
+use eval::{Env, EnvAccess, Eval};
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
@@ -15,6 +40,7 @@ use std::sync::{
     Arc,
 };
 use std::time::Instant;
+use serde::Serialize;
 
 pub const PROTECTED_FIELD_PREFIX: &str = "gm_scope_";
 /// Host admission is separate from executable semantics. The interpreter still
@@ -64,16 +90,34 @@ pub fn has_protected_fields(program: &CapturedProgram) -> bool {
             .any(|f| f.id.starts_with(PROTECTED_FIELD_PREFIX))
     })
 }
+
+#[cfg(test)]
+#[path = "fallible_projection_tests.rs"]
+mod fallible_projection_tests;
 pub const RUNTIME_VERSION: &str = "local-interpreter/4";
 pub const DRIVER_VERSION: &str = "semantic-input/3";
 type Result<T> = std::result::Result<T, AdapterError>;
+
+fn app_adapter_error(error: AppValidationError) -> AdapterError {
+    match error {
+        AppValidationError::Contract(error) => AdapterError::Invalid(error),
+        AppValidationError::Allocation(failure) => AdapterError::Allocation(failure),
+    }
+}
+
+fn codec_adapter_error(error: crate::product_backup::fallible_codec::CodecError) -> AdapterError {
+    match error {
+        crate::product_backup::fallible_codec::CodecError::Allocation(failure) => AdapterError::Allocation(failure),
+        _ => AdapterError::Failed("decoded runtime evidence codec invariant".into()),
+    }
+}
 
 /// Successful immutable checks retained only by one history-verification call.
 /// Borrowing captures prevents mutation or pointer reuse during this lifetime.
 /// No data frame, row, day, meter, cancellation state or evaluated value is kept.
 #[derive(Default)]
 pub(crate) struct ProjectionValidation<'a> {
-    sources: Vec<&'a CapturedProgram>,
+    sources: Vec<ProjectionSource<'a>>,
     types: std::collections::BTreeSet<Vec<u8>>,
     bytes: usize,
     #[cfg(test)]
@@ -81,25 +125,29 @@ pub(crate) struct ProjectionValidation<'a> {
     #[cfg(test)]
     type_checks: usize,
 }
+struct ProjectionSource<'a> {
+    program: &'a CapturedProgram,
+    facts: CaptureFacts,
+}
 impl<'a> ProjectionValidation<'a> {
-    fn source(&mut self, program: &'a CapturedProgram) -> Result<Option<usize>> {
+    fn source(&mut self, program: &'a CapturedProgram) -> Result<(Option<usize>, CaptureFacts)> {
         if let Some(index) = self
             .sources
             .iter()
-            .position(|prior| std::ptr::eq(*prior, program) || *prior == program)
+            .position(|prior| std::ptr::eq(prior.program, program) || prior.program == program)
         {
-            return Ok(Some(index));
+            return Ok((Some(index), self.sources[index].facts));
         }
         #[cfg(test)]
         {
             self.source_checks += 1;
         }
-        program.validate()?;
+        let facts = program.validate_capture_facts()?;
         if self.sources.len() == MAX_ITEMS {
-            return Ok(None);
+            return Ok((None, facts));
         }
-        self.sources.push(program);
-        Ok(Some(self.sources.len() - 1))
+        self.sources.push(ProjectionSource { program, facts });
+        Ok((Some(self.sources.len() - 1), facts))
     }
     #[cfg(test)]
     pub(crate) fn counts(&self) -> (usize, usize) {
@@ -128,6 +176,54 @@ fn diagnostic(error: &AdapterError) -> String {
         message.push_str("...");
     }
     message
+}
+
+struct BoundedDiagnostic<'a> {
+    value: String,
+    truncated: bool,
+    allocations: &'a mut product_alloc::AllocationContext,
+    failure: Option<product_alloc::AllocationFailure>,
+}
+impl std::fmt::Write for BoundedDiagnostic<'_> {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        if self.truncated || value.is_empty() { return Ok(()); }
+        let remaining = MAX_TEXT_BYTES.saturating_sub(self.value.len());
+        let take = if value.len() <= remaining { value.len() } else { remaining };
+        let mut end = take;
+        while !value.is_char_boundary(end) { end -= 1; }
+        if let Err(failure) = product_alloc::try_reserve_string(
+            &mut self.value, end, self.allocations, product_alloc::AllocationSite::String,
+        ) {
+            self.failure = Some(failure);
+            return Err(std::fmt::Error);
+        }
+        self.value.push_str(&value[..end]);
+        if end < value.len() {
+            self.truncated = true;
+            let mut prefix = MAX_TEXT_BYTES.saturating_sub(3).min(self.value.len());
+            while !self.value.is_char_boundary(prefix) { prefix -= 1; }
+            self.value.truncate(prefix);
+        }
+        Ok(())
+    }
+}
+
+fn diagnostic_decoded(
+    error: &AdapterError,
+    allocations: &mut product_alloc::AllocationContext,
+) -> Result<String> {
+    let mut output = BoundedDiagnostic {
+        value: String::new(), truncated: false, allocations, failure: None,
+    };
+    let formatted = std::fmt::write(&mut output, format_args!("{error:?}"));
+    if let Some(failure) = output.failure { return Err(AdapterError::Allocation(failure)); }
+    if formatted.is_err() { return Err(failed("runtime diagnostic formatting failed")); }
+    if output.truncated {
+        product_alloc::try_append_str(
+            &mut output.value, "...", output.allocations, product_alloc::AllocationSite::String,
+        ).map_err(AdapterError::Allocation)?;
+    }
+    Ok(output.value)
 }
 
 /// The prepared branch owns its validation capability; it cannot be paired
@@ -230,6 +326,171 @@ pub struct ProductRun {
     observations: Vec<Observation>,
     receipts: BTreeMap<Id, (Digest, TraceStep)>,
 }
+
+/// Transaction-local run owner for callers that already hold the fallibly
+/// decoded program, data and session graphs. The legacy `ProductRun` remains
+/// unchanged; ProductStore can migrate its apply path to this owner without
+/// materializing the legacy runtime DTOs.
+pub(crate) struct DecodedProductRun<'a> {
+    program: &'a FallibleDecodedCapturedProgram,
+    data: FallibleDecodedDataSnapshot,
+    session: FallibleDecodedSessionState,
+    day: i32,
+    initial_day: i32,
+    seed: u64,
+    limits: RuntimeLimits,
+    fuel: u64,
+    trace: Vec<DecodedTraceStep>,
+    observations: Vec<view::DecodedRuntimeObservation>,
+    outputs: Vec<FallibleDecodedLocalArtifact>,
+    receipts: Vec<DecodedOperationReceipt>,
+}
+
+#[derive(Debug)]
+pub(crate) struct DecodedTraceStep {
+    pub(crate) index: usize,
+    pub(crate) operation_id: String,
+    pub(crate) input_digest: Digest,
+    /// Store-level idempotency digest for the original SemanticInput alone.
+    pub(crate) store_request_digest: Digest,
+    pub(crate) action: Option<String>,
+    pub(crate) before_data: Digest,
+    pub(crate) after_data: Digest,
+    pub(crate) before_session: Digest,
+    pub(crate) after_session: Digest,
+    pub(crate) outputs: Vec<Digest>,
+    pub(crate) outcome: StepOutcome,
+    pub(crate) diagnostic: Option<String>,
+}
+
+pub(crate) struct DecodedOperationReceipt {
+    pub(crate) operation_id: String,
+    pub(crate) step: usize,
+}
+
+impl DecodedProductRun<'_> {
+    pub(crate) fn data(&self) -> &FallibleDecodedDataSnapshot { &self.data }
+    pub(crate) fn session(&self) -> &FallibleDecodedSessionState { &self.session }
+    pub(crate) fn trace(&self) -> &[DecodedTraceStep] { &self.trace }
+    pub(crate) fn observations(&self) -> &[view::DecodedRuntimeObservation] { &self.observations }
+    pub(crate) fn artifacts(&self) -> &[FallibleDecodedLocalArtifact] { &self.outputs }
+    pub(crate) fn clock_day(&self) -> i32 { self.day }
+    pub(crate) fn initial_day(&self) -> i32 { self.initial_day }
+    pub(crate) fn matches_program_revision_with(
+        &self,
+        revision: &Digest,
+        allocations: &mut product_alloc::AllocationContext,
+    ) -> std::result::Result<bool, AppValidationError> {
+        Ok(self.program.revision_with(allocations)? == *revision)
+    }
+    pub(crate) fn operation_receipts(&self) -> &[DecodedOperationReceipt] { &self.receipts }
+    pub(crate) fn trace_step_applied(&self, index: usize) -> bool {
+        self.trace.get(index).is_some_and(|step| step.outcome == StepOutcome::Applied)
+    }
+    pub(crate) fn into_commit_parts(self) -> (
+        FallibleDecodedDataSnapshot,
+        FallibleDecodedSessionState,
+        i32,
+        Vec<FallibleDecodedLocalArtifact>,
+    ) {
+        (self.data, self.session, self.day, self.outputs)
+    }
+}
+impl DecodedTraceStep {
+    fn try_clone_with(
+        &self,
+        allocations: &mut product_alloc::AllocationContext,
+    ) -> Result<Self> {
+        let copy_string = |value: &str, allocations: &mut product_alloc::AllocationContext| {
+            product_alloc::try_copy_str(value, allocations, product_alloc::AllocationSite::String)
+                .map_err(AdapterError::Allocation)
+        };
+        let mut outputs = Vec::new();
+        product_alloc::try_reserve(&mut outputs, self.outputs.len(), allocations, product_alloc::AllocationSite::Vector)
+            .map_err(AdapterError::Allocation)?;
+        for digest in &self.outputs {
+            outputs.push(try_clone_digest(digest, allocations)?);
+        }
+        Ok(Self {
+            index: self.index,
+            operation_id: copy_string(&self.operation_id, allocations)?,
+            input_digest: try_clone_digest(&self.input_digest, allocations)?,
+            store_request_digest: try_clone_digest(&self.store_request_digest, allocations)?,
+            action: self.action.as_deref().map(|value| copy_string(value, allocations)).transpose()?,
+            before_data: try_clone_digest(&self.before_data, allocations)?,
+            after_data: try_clone_digest(&self.after_data, allocations)?,
+            before_session: try_clone_digest(&self.before_session, allocations)?,
+            after_session: try_clone_digest(&self.after_session, allocations)?,
+            outputs,
+            outcome: self.outcome,
+            diagnostic: self.diagnostic.as_deref().map(|value| copy_string(value, allocations)).transpose()?,
+        })
+    }
+}
+
+fn try_clone_digest(
+    digest: &Digest,
+    allocations: &mut product_alloc::AllocationContext,
+) -> Result<Digest> {
+    let value = product_alloc::try_copy_str(digest.as_str(), allocations, product_alloc::AllocationSite::String)
+        .map_err(AdapterError::Allocation)?;
+    Digest::from_owned_lower_hex(value).ok_or_else(|| failed("decoded digest copy invariant"))
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum DecodedObserveInput<'a> {
+    Observe { point: &'a str },
+}
+
+#[derive(Serialize)]
+struct DecodedObserveTrace<'a> {
+    index: usize,
+    input: DecodedObserveInput<'a>,
+    before_data: &'a Digest,
+    after_data: &'a Digest,
+    before_session: &'a Digest,
+    after_session: &'a Digest,
+    outputs: &'a [Digest],
+    outcome: StepOutcome,
+    diagnostic: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct DecodedRunBindingWire<'a> {
+    source: &'a SourceBinding,
+    artifact: &'a ArtifactRef,
+    data_digest: &'a Digest,
+    input_digest: &'a Digest,
+    scenario_digest: &'a Digest,
+    decision_digest: &'a Digest,
+    session_digest: &'a Digest,
+    runtime_version: &'static str,
+    driver_version: &'static str,
+}
+
+#[derive(Serialize)]
+struct DecodedRunEvidenceWire<'a> {
+    version: u32,
+    id: &'a str,
+    origin: ExecutionOrigin,
+    binding: DecodedRunBindingWire<'a>,
+    source_after: &'a SourceBinding,
+    state: EvidenceState,
+    trace: &'a [DecodedObserveTrace<'a>],
+    observations: &'a [view::DecodedRuntimeObservation],
+    limits: &'a RuntimeLimits,
+    errors: &'a [String],
+    uncovered: &'a [String],
+}
+impl crate::product_backup::fallible_codec::BackupWire for DecodedRunEvidenceWire<'_> {}
+
+#[derive(Serialize)]
+struct DecodedObserveRequest<'a>(DecodedObserveInput<'a>, &'a ArtifactRef);
+impl crate::product_backup::fallible_codec::BackupWire for DecodedObserveRequest<'_> {}
+#[derive(Serialize)]
+struct DecodedApplyRequest<'a>(&'a SemanticInput, &'a ArtifactRef);
+impl crate::product_backup::fallible_codec::BackupWire for DecodedApplyRequest<'_> {}
 impl ProductRun {
     pub fn trace(&self) -> &[TraceStep] {
         &self.trace
@@ -244,6 +505,196 @@ impl ProductRun {
         self.state.day
     }
 }
+
+impl LocalRuntime {
+    pub(crate) fn start_decoded<'a>(
+        &self,
+        program: &'a FallibleDecodedCapturedProgram,
+        data: &FallibleDecodedDataSnapshot,
+        session: &FallibleDecodedSessionState,
+        clock_day: i32,
+        random_seed: u64,
+        limits: RuntimeLimits,
+        allocations: &mut product_alloc::AllocationContext,
+    ) -> Result<DecodedProductRun<'a>> {
+        program.validate_with(allocations).map_err(app_adapter_error)?;
+        data.validate_with(allocations).map_err(app_adapter_error)?;
+        program.validate_session_with(session, allocations).map_err(app_adapter_error)?;
+        validate_day(clock_day).map_err(AdapterError::Invalid)?;
+        limits.validate().map_err(AdapterError::Invalid)?;
+        if data.project_id() != program.project_id() {
+            return Err(invalid("program and data belong to different projects"));
+        }
+        let (compatibility, merged) = self.decoded_compatibility_with(program, data, clock_day, allocations)?;
+        if compatibility != CompatibilityState::Compatible {
+            return Err(AdapterError::Unsupported(format!("decoded data is not compatible with the current app: {compatibility:?}")));
+        }
+        let mut initial = Meter::with_allocations(
+            limits.clone(), limits.fuel, self.cancelled.clone(),
+            std::mem::replace(allocations, product_alloc::AllocationContext::new()),
+        );
+        let constraints = execute::constraints_decoded(program, &merged, session, clock_day, &mut initial);
+        *allocations = initial.allocations;
+        constraints?;
+        let data = data.try_clone_with(allocations).map_err(|error| match error {
+            FallibleDataSnapshotCloneError::Allocation(failure) => AdapterError::Allocation(failure),
+            FallibleDataSnapshotCloneError::Invariant => failed("decoded initial data copy invariant"),
+        })?;
+        let session = session.try_clone_with(allocations).map_err(app_adapter_error)?;
+        Ok(DecodedProductRun {
+            program,
+            data,
+            session,
+            day: clock_day,
+            initial_day: clock_day,
+            seed: random_seed,
+            fuel: limits.fuel,
+            limits,
+            trace: Vec::new(),
+            observations: Vec::new(),
+            outputs: Vec::new(),
+            receipts: Vec::new(),
+        })
+    }
+
+    /// Apply semantic inputs while keeping persisted data and session in their
+    /// fallible decoded owners for the full transaction.
+    pub(crate) fn apply_decoded(
+        &self,
+        run: &mut DecodedProductRun<'_>,
+        input: &SemanticInput,
+        operation_id: &str,
+        allocations: &mut product_alloc::AllocationContext,
+    ) -> Result<DecodedTraceStep> {
+        if !valid_id(operation_id) { return Err(invalid("invalid operation ID")); }
+        validate_input_shape(input)?;
+        let request = crate::product_backup::fallible_codec::canonical_digest(
+            IdentityDomain::Input,
+            &DecodedApplyRequest(input, run.program.artifact()),
+            allocations,
+        ).map_err(codec_adapter_error)?;
+        let store_request = crate::product_backup::fallible_codec::canonical_digest(
+            IdentityDomain::Input,
+            input,
+            allocations,
+        ).map_err(codec_adapter_error)?;
+        if let Some(receipt) = run.receipts.iter().find(|receipt| receipt.operation_id == operation_id) {
+            return if run.trace[receipt.step].input_digest == request {
+                run.trace[receipt.step].try_clone_with(allocations)
+            } else {
+                Err(AdapterError::Stale("Operation ID belongs to another input".into()))
+            };
+        }
+        if run.data.events().iter().any(|event| event.operation_id() == operation_id) {
+            return Err(AdapterError::Stale(
+                "Operation already committed; resolve its persisted receipt before retrying".into(),
+            ));
+        }
+        if run.trace.len() >= run.limits.action_steps {
+            return Err(exhausted("input action limit"));
+        }
+
+        let before_data = run.data.identity_with(allocations).map_err(app_adapter_error)?;
+        let before_session = run.session.identity_with(allocations).map_err(codec_adapter_error)?;
+        if let SemanticInput::Observe { point } = input {
+            if run.observations.iter().any(|observation| observation.point() == point) {
+                return Err(invalid("observation point already used"));
+            }
+        }
+        let app = AppRef::from(run.program.app());
+        let action = execute::input_action_decoded(input, app);
+        let mut next_data = run.data.try_clone_with(allocations).map_err(|error| match error {
+            FallibleDataSnapshotCloneError::Allocation(failure) => AdapterError::Allocation(failure),
+            FallibleDataSnapshotCloneError::Invariant => failed("decoded input snapshot copy invariant"),
+        })?;
+        let mut next_session = run.session.try_clone_with(allocations).map_err(app_adapter_error)?;
+        let mut next_day = run.day;
+        let mut next_observation = None;
+        let owned_allocations = std::mem::replace(allocations, product_alloc::AllocationContext::new());
+        let mut meter = Meter::with_allocations(run.limits.clone(), run.fuel, self.cancelled.clone(), owned_allocations);
+        meter.decoded_output_base_count = run.outputs.len();
+        meter.decoded_output_base_bytes = run.outputs.iter()
+            .map(FallibleDecodedLocalArtifact::byte_len).fold(0usize, usize::saturating_add);
+        let result = (|| {
+            meter.tick(1)?;
+            match input {
+                SemanticInput::Observe { point } => {
+                    if !valid_id(point) { return Err(invalid("invalid observation point")); }
+                    next_observation = Some(view::observe_decoded_with_meter(
+                        run.program, &next_data, &next_session, run.day, point, &run.outputs, &mut meter,
+                    )?);
+                }
+                SemanticInput::Invoke { .. }
+                | SemanticInput::Control { .. }
+                | SemanticInput::Activate { .. }
+                | SemanticInput::Submit { .. }
+                | SemanticInput::Navigate { .. }
+                | SemanticInput::AdvanceClock { .. } => execute::input_decoded(
+                    run.program, &mut next_data, &mut next_session, &mut next_day,
+                    input, operation_id, run.seed, &mut meter,
+                )?,
+            }
+            meter.tick(1)?;
+            Ok(())
+        })();
+        *allocations = meter.allocations;
+        if matches!(&result, Err(AdapterError::Allocation(_))) { return result.map(|_| unreachable!()); }
+        let emitted = std::mem::take(&mut meter.decoded_outputs);
+        let output_digests = if result.is_ok() {
+            execute::decoded_output_digests(&emitted, allocations)?
+        } else { Vec::new() };
+
+        let (outcome, diagnostic) = match &result {
+            Ok(()) => (StepOutcome::Applied, None),
+            Err(AdapterError::Invalid(_)) => (StepOutcome::Rejected, Some(diagnostic_decoded(result.as_ref().unwrap_err(), allocations)?)),
+            Err(AdapterError::BudgetExhausted(_)) => (StepOutcome::BudgetExhausted, Some(diagnostic_decoded(result.as_ref().unwrap_err(), allocations)?)),
+            Err(error) => (StepOutcome::Failed, Some(diagnostic_decoded(error, allocations)?)),
+        };
+        let after_data = if result.is_ok() { next_data.identity_with(allocations).map_err(app_adapter_error)? } else { try_clone_digest(&before_data, allocations)? };
+        let after_session = if result.is_ok() { next_session.identity_with(allocations).map_err(codec_adapter_error)? } else { try_clone_digest(&before_session, allocations)? };
+        let step_action = action.map(|action| product_alloc::try_copy_str(action, allocations, product_alloc::AllocationSite::String).map_err(AdapterError::Allocation)).transpose()?;
+        let step = DecodedTraceStep {
+            index: run.trace.len(),
+            operation_id: product_alloc::try_copy_str(operation_id, allocations, product_alloc::AllocationSite::String).map_err(AdapterError::Allocation)?,
+            input_digest: request,
+            store_request_digest: store_request,
+            action: step_action,
+            before_data,
+            after_data,
+            before_session,
+            after_session,
+            outputs: output_digests,
+            outcome,
+            diagnostic,
+        };
+        product_alloc::try_reserve(&mut run.trace, 1, allocations, product_alloc::AllocationSite::Vector).map_err(AdapterError::Allocation)?;
+        let receipt_operation = if result.is_ok() {
+            product_alloc::try_reserve(&mut run.receipts, 1, allocations, product_alloc::AllocationSite::Vector).map_err(AdapterError::Allocation)?;
+            product_alloc::try_copy_str(operation_id, allocations, product_alloc::AllocationSite::String).map_err(AdapterError::Allocation)?
+        } else { String::new() };
+        let returned_step = if result.is_ok() { Some(step.try_clone_with(allocations)?) } else { None };
+        if result.is_ok() && next_observation.is_some() {
+            product_alloc::try_reserve(&mut run.observations, 1, allocations, product_alloc::AllocationSite::Vector).map_err(AdapterError::Allocation)?;
+        }
+        if result.is_ok() {
+            product_alloc::try_reserve(&mut run.outputs, emitted.len(), allocations, product_alloc::AllocationSite::Vector).map_err(AdapterError::Allocation)?;
+        }
+        run.fuel = meter.fuel;
+        if result.is_ok() {
+            run.data = next_data;
+            run.session = next_session;
+            run.day = next_day;
+            if let Some(observation) = next_observation {
+                run.observations.push(observation);
+            }
+            run.outputs.extend(emitted);
+            run.receipts.push(DecodedOperationReceipt { operation_id: receipt_operation, step: step.index });
+        }
+        run.trace.push(step);
+        result?;
+        Ok(returned_step.expect("successful decoded apply prepared its result"))
+    }
+}
 struct Meter {
     limits: RuntimeLimits,
     fuel: u64,
@@ -251,9 +702,22 @@ struct Meter {
     writes: usize,
     started: Instant,
     cancelled: Arc<AtomicBool>,
+    allocations: product_alloc::AllocationContext,
+    row: Option<capture::RowStop>,
+    decoded_outputs: Vec<FallibleDecodedLocalArtifact>,
+    decoded_output_base_count: usize,
+    decoded_output_base_bytes: usize,
 }
 impl Meter {
     fn new(limits: RuntimeLimits, fuel: u64, cancelled: Arc<AtomicBool>) -> Self {
+        Self::with_allocations(limits, fuel, cancelled, product_alloc::AllocationContext::new())
+    }
+    fn with_allocations(
+        limits: RuntimeLimits,
+        fuel: u64,
+        cancelled: Arc<AtomicBool>,
+        allocations: product_alloc::AllocationContext,
+    ) -> Self {
         Self {
             limits,
             fuel,
@@ -261,9 +725,17 @@ impl Meter {
             writes: 0,
             started: Instant::now(),
             cancelled,
+            allocations,
+            row: None,
+            decoded_outputs: Vec::new(),
+            decoded_output_base_count: 0,
+            decoded_output_base_bytes: 0,
         }
     }
     fn tick(&mut self, cost: u64) -> Result<()> {
+        if self.row.is_some() {
+            return self.row_charge(cost).map_err(capture_cost::resource);
+        }
         if self.cancelled.load(Ordering::Relaxed) {
             return Err(AdapterError::Cancelled);
         }
@@ -304,6 +776,7 @@ impl Meter {
         }
     }
     fn value(&mut self, value: &DataValue) -> Result<()> {
+        if self.row.is_some() { return self.row_value(value); }
         self.tick(1)?;
         match value {
             DataValue::List { items, .. } => {
@@ -322,6 +795,7 @@ impl Meter {
         }
         Ok(())
     }
+    fn into_allocations(self) -> product_alloc::AllocationContext { self.allocations }
 }
 impl LocalRuntime {
     pub fn with_cancellation(cancelled: Arc<AtomicBool>) -> Self {
@@ -333,6 +807,24 @@ impl LocalRuntime {
     pub fn with_admission(mut self, admission: Arc<dyn ReplayAdmission>) -> Self {
         self.admission = Some(admission);
         self
+    }
+    #[cfg(test)]
+    pub(crate) fn observe_with_allocations(
+        &self,
+        run: &ProductRun,
+        point: &str,
+        allocations: product_alloc::AllocationContext,
+    ) -> (Result<Observation>, usize) {
+        let mut meter = Meter::with_allocations(
+            run.limits.clone(),
+            run.fuel.get(),
+            self.cancelled.clone(),
+            allocations,
+        );
+        let result = view::observe(&run.program, &run.state, point, &mut meter);
+        let requests = meter.allocations.growth_requests();
+        run.fuel.set(meter.fuel);
+        (result, requests)
     }
     /// Host-only bounded evaluation for metadata initialization. This uses the
     /// production evaluator, validates the expression in a typed action, and
@@ -371,11 +863,216 @@ impl LocalRuntime {
         expected: &Type,
         day: i32,
     ) -> Result<DataValue> {
-        let source = checks.source(program)?;
+        let (source, facts) = checks.source(program)?;
         data.validate()?;
         self.evaluate_projection_inner(
-            program, data, row, binding, expression, expected, day, limits, checks, source,
+            program, data, row, binding, expression, expected, day, limits, checks, source, facts,
         )
+    }
+    /// Evaluate a scalar proof expression directly against bounded persisted
+    /// owners. The legacy and decoded paths share `Eval`; no map conversion or
+    /// cloned compatibility model is introduced.
+    pub(crate) fn evaluate_decoded_record_projection_with(
+        &self,
+        program: &FallibleDecodedCapturedProgram,
+        data: &FallibleDecodedDataSnapshot,
+        row: &RecordRef,
+        binding: &str,
+        expression: &Expr,
+        expected: &Type,
+        day: i32,
+        limits: RuntimeLimits,
+        allocations: product_alloc::AllocationContext,
+    ) -> Result<DataValue> {
+        self.evaluate_decoded_record_projection_and_allocations(
+            program, data, row, binding, expression, expected, day, limits, allocations,
+        ).map(|(value, _)| value).map_err(|(error, _)| error)
+    }
+    /// Variant for callers that perform several projections in one fallible
+    /// operation. Returning the charged context keeps all projection work on
+    /// the caller's single refusal counter rather than resetting it per row.
+    pub(crate) fn evaluate_decoded_record_projection_and_allocations(
+        &self,
+        program: &FallibleDecodedCapturedProgram,
+        data: &FallibleDecodedDataSnapshot,
+        row: &RecordRef,
+        binding: &str,
+        expression: &Expr,
+        expected: &Type,
+        day: i32,
+        limits: RuntimeLimits,
+        mut allocations: product_alloc::AllocationContext,
+    ) -> std::result::Result<
+        (DataValue, product_alloc::AllocationContext),
+        (AdapterError, product_alloc::AllocationContext),
+    > {
+        fn app_error(error: AppValidationError) -> AdapterError {
+            match error {
+                AppValidationError::Contract(error) => AdapterError::Invalid(error),
+                AppValidationError::Allocation(failure) => AdapterError::Allocation(failure),
+            }
+        }
+        // Keep the caller's complete allocation accounting available on every
+        // error path, including preflight failures before the evaluator meter
+        // is constructed.
+        let prepared = (|| -> Result<(FallibleDecodedSessionState, ManagedEnv)> {
+            validate_day(day)?;
+            limits.validate()?;
+            program.validate_with(&mut allocations).map_err(app_error)?;
+            data.validate_with(&mut allocations).map_err(app_error)?;
+            if program.project_id() != data.project_id() || !valid_id(binding) {
+                return Err(invalid("projection project or binding mismatch"));
+            }
+            let view = DataSnapshotView::from(data);
+            if view.record(&row.entity, &row.record).is_none() {
+                return Err(invalid("record reference does not exist"));
+            }
+            let actual = crate::product_contract::decoded_expression_type_with(
+                program.app(), expression, binding, &row.entity, &mut allocations,
+            ).map_err(app_error)?;
+            if actual != *expected { return Err(invalid("projection result type mismatch")); }
+            let session = program.initial_session_with(&mut allocations).map_err(AdapterError::Allocation)?;
+            program.validate_session_with(&session, &mut allocations).map_err(app_error)?;
+            let value = DataValue::Reference {
+                entity: product_alloc::try_copy_str(&row.entity, &mut allocations, product_alloc::AllocationSite::String).map_err(AdapterError::Allocation)?,
+                record: product_alloc::try_copy_str(&row.record, &mut allocations, product_alloc::AllocationSite::String).map_err(AdapterError::Allocation)?,
+            };
+            let mut managed = ManagedEnv::new();
+            let env_entity = product_alloc::try_copy_str(&row.entity, &mut allocations, product_alloc::AllocationSite::String)
+                .map_err(AdapterError::Allocation)?;
+            let typ = Type::Reference { entity: env_entity };
+            let binding = product_alloc::try_copy_str(binding, &mut allocations, product_alloc::AllocationSite::String)
+                .map_err(AdapterError::Allocation)?;
+            managed.try_bind(&binding, &typ, &value, &mut allocations).map_err(AdapterError::Allocation)?;
+            Ok((session, managed))
+        })();
+        let (session, managed) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => return Err((error, allocations)),
+        };
+        let mut meter = Meter::with_allocations(limits.clone(), limits.fuel, self.cancelled.clone(), allocations);
+        let result = {
+            let mut evaluator = Eval::fallible(program.app(), data, &session, day, &mut meter);
+            evaluator.eval(expression, &managed).and_then(|result| {
+                validate_value(&result, expected, 0)?;
+                Ok(result)
+            })
+        };
+        let allocations = meter.into_allocations();
+        match result {
+            Ok(value) => Ok((value, allocations)),
+            Err(error) => Err((error, allocations)),
+        }
+    }
+    pub(crate) fn evaluate_decoded_historical_record_projection_with(
+        &self,
+        program: &FallibleDecodedCapturedProgram,
+        data: &FallibleDecodedDataSnapshot,
+        row: &RecordRef,
+        values: &FallibleValues,
+        archived: bool,
+        binding: &str,
+        expression: &Expr,
+        expected: &Type,
+        day: i32,
+        limits: RuntimeLimits,
+        allocations: product_alloc::AllocationContext,
+    ) -> Result<DataValue> {
+        self.evaluate_decoded_historical_record_projection_and_allocations(
+            program, data, row, values, archived, binding, expression, expected, day, limits,
+            allocations,
+        ).map(|(value, _)| value).map_err(|(error, _)| error)
+    }
+    pub(crate) fn evaluate_decoded_historical_record_projection_and_allocations(
+        &self,
+        program: &FallibleDecodedCapturedProgram,
+        data: &FallibleDecodedDataSnapshot,
+        row: &RecordRef,
+        values: &FallibleValues,
+        archived: bool,
+        binding: &str,
+        expression: &Expr,
+        expected: &Type,
+        day: i32,
+        limits: RuntimeLimits,
+        mut allocations: product_alloc::AllocationContext,
+    ) -> std::result::Result<(DataValue, product_alloc::AllocationContext), (AdapterError, product_alloc::AllocationContext)> {
+        fn app_error(error: AppValidationError) -> AdapterError {
+            match error {
+                AppValidationError::Contract(error) => AdapterError::Invalid(error),
+                AppValidationError::Allocation(failure) => AdapterError::Allocation(failure),
+            }
+        }
+        let preflight = (|| -> std::result::Result<(), AdapterError> {
+            validate_day(day)?;
+            limits.validate()?;
+            program.validate_with(&mut allocations).map_err(app_error)?;
+            data.validate_with(&mut allocations).map_err(app_error)?;
+            if values.len() > MAX_ITEMS { return Err(invalid("historical projection row exceeds bounds")); }
+            let base = DataSnapshotView::from(data);
+            let storage = base.schema().iter().find(|entity| entity.id == row.entity)
+                .ok_or_else(|| invalid("historical projection storage entity missing"))?;
+            for (id, value) in values.iter() {
+                let field = storage.fields.iter().find(|field| field.id == *id)
+                    .ok_or_else(|| invalid("historical projection field missing"))?;
+                validate_value(value, &field.value_type, 0)?;
+            }
+            let producer = AppRef::from(program.app()).entities().iter().find(|entity| entity.id == row.entity)
+                .ok_or_else(|| invalid("historical producer entity missing"))?;
+            for field in &producer.fields {
+                validate_value(values.get(&field.id).unwrap_or(&DataValue::Null), &field.value_type, 0)?;
+            }
+            if program.project_id() != data.project_id() || !valid_id(binding) {
+                return Err(invalid("projection project or binding mismatch"));
+            }
+            Ok(())
+        })();
+        if let Err(error) = preflight { return Err((error, allocations)); }
+        let base = DataSnapshotView::from(data);
+        let mut meter = Meter::with_allocations(limits.clone(), limits.fuel, self.cancelled.clone(), allocations);
+        let result = (|| -> Result<DataValue> {
+            let mut historical_record = None;
+            for candidate in base.records() {
+                let comparison_bytes = candidate.entity().len()
+                    .saturating_add(row.entity.len())
+                    .saturating_add(candidate.id().len())
+                    .saturating_add(row.record.len());
+                meter.tick(u64::try_from(comparison_bytes).unwrap_or(u64::MAX))?;
+                if candidate.entity() == row.entity && candidate.id() == row.record {
+                    historical_record = Some(candidate);
+                    break;
+                }
+            }
+            let historical_record = historical_record
+                .ok_or_else(|| invalid("historical projection record missing"))?;
+            let actual = crate::product_contract::decoded_expression_type_with(
+                program.app(), expression, binding, &row.entity, &mut meter.allocations,
+            ).map_err(app_error)?;
+            if actual != *expected { return Err(invalid("projection result type mismatch")); }
+            let session = program.initial_session_with(&mut meter.allocations).map_err(AdapterError::Allocation)?;
+            program.validate_session_with(&session, &mut meter.allocations).map_err(app_error)?;
+            let value = DataValue::Reference {
+                entity: product_alloc::try_copy_str(&row.entity, &mut meter.allocations, product_alloc::AllocationSite::String).map_err(AdapterError::Allocation)?,
+                record: product_alloc::try_copy_str(&row.record, &mut meter.allocations, product_alloc::AllocationSite::String).map_err(AdapterError::Allocation)?,
+            };
+            let env_entity = product_alloc::try_copy_str(&row.entity, &mut meter.allocations, product_alloc::AllocationSite::String)
+                .map_err(AdapterError::Allocation)?;
+            let typ = Type::Reference { entity: env_entity };
+            let env_binding = product_alloc::try_copy_str(binding, &mut meter.allocations, product_alloc::AllocationSite::String)
+                .map_err(AdapterError::Allocation)?;
+            let mut managed = ManagedEnv::new();
+            managed.try_bind(&env_binding, &typ, &value, &mut meter.allocations).map_err(AdapterError::Allocation)?;
+            let data_view = DataSnapshotView::fallible_historical(data, historical_record, values, archived);
+            let mut evaluator = Eval::fallible_view(program.app(), data_view, &session, day, &mut meter);
+            let result = evaluator.eval(expression, &managed)?;
+            validate_value(&result, expected, 0)?;
+            Ok(result)
+        })();
+        let allocations = meter.into_allocations();
+        match result {
+            Ok(value) => Ok((value, allocations)),
+            Err(error) => Err((error, allocations)),
+        }
     }
     /// Evaluate an independently proven own-row historical expression. Validate
     /// the coherent current data and every producer-row value first; global
@@ -420,7 +1117,7 @@ impl LocalRuntime {
         expected: &Type,
         day: i32,
     ) -> Result<DataValue> {
-        let source = checks.source(program)?;
+        let (source, facts) = checks.source(program)?;
         data.validate()?;
         if values.len() > MAX_ITEMS {
             return Err(invalid("historical projection row exceeds bounds"));
@@ -470,6 +1167,7 @@ impl LocalRuntime {
             limits,
             checks,
             source,
+            facts,
         )
     }
     fn evaluate_projection_inner(
@@ -484,6 +1182,7 @@ impl LocalRuntime {
         limits: RuntimeLimits,
         checks: &mut ProjectionValidation<'_>,
         source: Option<usize>,
+        facts: CaptureFacts,
     ) -> Result<DataValue> {
         validate_day(day)?;
         limits.validate()?;
@@ -506,37 +1205,18 @@ impl LocalRuntime {
             {
                 checks.type_checks += 1;
             }
-            let mut app = program.program.clone();
-            let mut id = "gm_scope_projection".to_owned();
-            while app.actions.iter().any(|a| a.id == id) {
-                id.push('_');
-            }
-            app.actions.push(ActionDefinition {
-                id,
-                label: "Host projection type check".into(),
-                parameters: BTreeMap::from([(binding.to_owned(), Type::reference(&row.entity))]),
-                guards: vec![],
-                ensures: vec![],
-                steps: vec![Statement::Assert {
-                    condition: Expr::Equal {
-                        left: Box::new(expression.clone()),
-                        right: Box::new(expression.clone()),
-                    },
-                    message: "Projection type check".into(),
-                }],
-            });
-            app.validate()?;
+            validate_projection_extension(
+                &program.program,
+                facts,
+                &row.entity,
+                binding,
+                expression,
+            )?;
         }
         let session = SessionState::initial(&program.program)?;
         let mut meter = Meter::new(limits.clone(), limits.fuel, self.cancelled.clone());
         let env = Env::from([(binding.to_owned(), (Type::reference(&row.entity), value))]);
-        let mut evaluator = Eval {
-            app: &program.program,
-            data,
-            session: &session,
-            day,
-            meter: &mut meter,
-        };
+        let mut evaluator = Eval::legacy(&program.program, data, &session, day, &mut meter);
         if evaluator.typ(expression, &env)? != *expected {
             return Err(invalid("projection result type mismatch"));
         }
@@ -562,6 +1242,65 @@ impl LocalRuntime {
     ) -> Result<CompatibilityReport> {
         validate_day(day)?;
         compatibility::check(&ProgramSource::ordinary(program), current, Some(day))
+    }
+    fn decoded_compatibility_with(
+        &self,
+        program: &FallibleDecodedCapturedProgram,
+        current: &FallibleDecodedDataSnapshot,
+        day: i32,
+        allocations: &mut product_alloc::AllocationContext,
+    ) -> Result<(CompatibilityState, FallibleDecodedDataSnapshot)> {
+        fn app_error(error: AppValidationError) -> AdapterError {
+            match error {
+                AppValidationError::Contract(error) => AdapterError::Invalid(error),
+                AppValidationError::Allocation(failure) => AdapterError::Allocation(failure),
+            }
+        }
+        validate_day(day)?;
+        program.validate_with(allocations).map_err(app_error)?;
+        current.validate_with(allocations).map_err(app_error)?;
+        if program.project_id() != current.project_id() { return Err(invalid("compatibility project mismatch")); }
+
+        let app = AppRef::from(program.app());
+        let mut state = CompatibilityState::Compatible;
+        for stored in current.schema() {
+            if let Some(target) = app.entities().iter().find(|entity| entity.id == stored.id) {
+                for field in &stored.fields {
+                    if !target.fields.iter().any(|candidate| candidate.id == field.id)
+                        && !matches!(field.value_type, Type::Optional { .. })
+                    { state = CompatibilityState::Incompatible; }
+                }
+            } else if DataSnapshotView::from(current).records().any(|record| record.entity() == stored.id) {
+                state = CompatibilityState::RetainedButUnavailable;
+            }
+        }
+        let merged = match current.merge_app_with(program.app(), allocations) {
+            Ok(merged) => merged,
+            Err(AppValidationError::Allocation(failure)) => return Err(AdapterError::Allocation(failure)),
+            Err(AppValidationError::Contract(_)) => return Ok((CompatibilityState::Incompatible, current.try_clone_with(allocations).map_err(|error| match error {
+                FallibleDataSnapshotCloneError::Allocation(failure) => AdapterError::Allocation(failure),
+                FallibleDataSnapshotCloneError::Invariant => failed("decoded compatibility data copy invariant"),
+            })?)),
+        };
+        let session = program.initial_session_with(allocations).map_err(AdapterError::Allocation)?;
+        let limits = RuntimeLimits { fuel: 10_000_000, ..RuntimeLimits::default() };
+        let owned_allocations = std::mem::replace(allocations, product_alloc::AllocationContext::new());
+        let mut meter = Meter::with_allocations(limits.clone(), limits.fuel, Arc::new(AtomicBool::new(false)), owned_allocations);
+        match execute::constraints_decoded(program, &merged, &session, day, &mut meter) {
+            Ok(()) => { *allocations = meter.allocations; Ok((state, merged)) },
+            Err(AdapterError::Allocation(failure)) => { *allocations = meter.allocations; Err(AdapterError::Allocation(failure)) },
+            Err(_) => { *allocations = meter.allocations; Ok((CompatibilityState::Incompatible, merged)) },
+        }
+    }
+    pub(crate) fn compatibility_decoded_state_at(
+        &self,
+        program: &FallibleDecodedCapturedProgram,
+        current: &FallibleDecodedDataSnapshot,
+        day: i32,
+        mut allocations: product_alloc::AllocationContext,
+    ) -> Result<CompatibilityState> {
+        self.decoded_compatibility_with(program, current, day, &mut allocations)
+            .map(|(state, _)| state)
     }
     /// Resume daily work with its actual committed artifact receipts. Scenario
     /// replay intentionally starts with no new emissions; it uses `start`.
@@ -788,8 +1527,334 @@ impl LocalRuntime {
         result.validate()?;
         Ok(result)
     }
+
+    /// Replay the lifecycle runtime's strict one-Observe scenario directly over
+    /// fallible decoded owners. The returned RunEvidence DTO can only be minted
+    /// here after the shared-meter observation and the single-step evidence
+    /// invariants have both been checked.
+    pub(crate) fn replay_decoded_observe_with(
+        &self,
+        program: &FallibleDecodedCapturedProgram,
+        scenario: &FallibleDecodedScenarioSpec,
+        decisions: &FallibleDecodedDecisionGraph,
+        limits: RuntimeLimits,
+        id: &str,
+        allocations: &mut product_alloc::AllocationContext,
+    ) -> Result<FallibleDecodedRunEvidence> {
+        if program.has_protected_fields() {
+            return Err(AdapterError::Unsupported(
+                "Protected scope history needs a verified host admission context".into(),
+            ));
+        }
+        if !valid_id(id) { return Err(invalid("invalid run ID")); }
+        scenario.validate_with(program, allocations).map_err(|error| match error {
+            AppValidationError::Contract(error) => AdapterError::Invalid(error),
+            AppValidationError::Allocation(failure) => AdapterError::Allocation(failure),
+        })?;
+        decisions.validate_with(allocations).map_err(|error| match error {
+            DecisionValidationError::Contract(error) => AdapterError::Invalid(error),
+            DecisionValidationError::Allocation(failure) => AdapterError::Allocation(failure),
+        })?;
+        let Some(point) = scenario.single_observe_point() else {
+            return Err(invalid("decoded replay requires exactly one Observe input and no validity properties"));
+        };
+        if scenario.has_validity() {
+            return Err(invalid("decoded replay requires exactly one Observe input and no validity properties"));
+        }
+
+        // Keep the legacy binding construction order: seed, input, scenario,
+        // decisions, and session identities are computed before runtime start.
+        let data_digest = scenario.seed_identity_with(allocations).map_err(codec_adapter_error)?;
+        let input_digest = scenario.input_identity_with(allocations).map_err(codec_adapter_error)?;
+        let scenario_digest = scenario.identity_with(allocations).map_err(codec_adapter_error)?;
+        let decision_digest = decisions.identity_with(allocations).map_err(|error| match error {
+            DecisionValidationError::Contract(error) => AdapterError::Invalid(error),
+            DecisionValidationError::Allocation(failure) => AdapterError::Allocation(failure),
+        })?;
+        let session_digest = scenario.session_identity_with(allocations).map_err(codec_adapter_error)?;
+
+        // This is the decoded counterpart of start_source's complete preflight
+        // and initial compatibility/resource checks. It does not materialize
+        // or mutate a ProductRun copy.
+        program.validate_with(allocations).map_err(app_adapter_error)?;
+        scenario.validate_seed_with(allocations).map_err(app_adapter_error)?;
+        scenario.validate_session_with(program).map_err(app_adapter_error)?;
+        validate_day(scenario.clock_day()).map_err(AdapterError::Invalid)?;
+        limits.validate().map_err(AdapterError::Invalid)?;
+        let start_data = scenario.seed_with(allocations).map_err(app_adapter_error)?;
+        let start_session = scenario.session_with(allocations).map_err(app_adapter_error)?;
+        crate::product_store::scope::validate_initial_runtime_fallible(
+            program, &start_data, &start_session,
+            scenario.clock_day(), limits.clone(), allocations,
+        ).map_err(|error| match error {
+            crate::product_store::scope::CompatibilityFailure::Allocation(failure) => AdapterError::Allocation(failure),
+            crate::product_store::scope::CompatibilityFailure::Store(crate::product_store::StoreError::Runtime(error)) => error,
+            crate::product_store::scope::CompatibilityFailure::Store(crate::product_store::StoreError::Invalid(message)) => {
+                AdapterError::Invalid(ContractError(message))
+            }
+            crate::product_store::scope::CompatibilityFailure::Store(error) => {
+                AdapterError::Failed(format!("decoded runtime start failed: {error:?}"))
+            }
+        })?;
+
+        // ScenarioSpec::replay_operation_ids performs this after start. The
+        // single Observe path has a stable index-zero replay operation ID.
+        let operation_id = scenario.observe_operation_id_with(allocations).map_err(app_adapter_error)?;
+        if !valid_id(&operation_id) { return Err(invalid("invalid operation ID")); }
+        let observe_input = DecodedObserveInput::Observe { point };
+        // apply computes this request identity before checking persisted event
+        // collisions, even though Observe has no mutation receipt of its own.
+        crate::product_backup::fallible_codec::canonical_digest(
+            IdentityDomain::Input,
+            &DecodedObserveRequest(observe_input, program.artifact()),
+            allocations,
+        ).map_err(codec_adapter_error)?;
+
+        let apply_error = if start_data.events().iter()
+            .any(|event| event.operation_id() == operation_id)
+        {
+            Some(AdapterError::Stale(
+                "Operation already committed; resolve its persisted receipt before retrying".into(),
+            ))
+        } else {
+            None
+        };
+        let had_early_apply_error = apply_error.is_some();
+        let before_data = if had_early_apply_error { None } else {
+            Some(start_data.identity_with(allocations).map_err(app_adapter_error)?)
+        };
+        let before_session = if had_early_apply_error { None } else {
+            Some(start_session.identity_with(allocations).map_err(codec_adapter_error)?)
+        };
+        let before_data = before_data.as_ref().unwrap_or(&data_digest);
+        let before_session = before_session.as_ref().unwrap_or(&session_digest);
+        let mut observation = None;
+        let mut step_error = apply_error;
+        if step_error.is_none() {
+            // Prefix tick, input-shape/input validation, view observation, and
+            // suffix tick use one meter and one allocation context, matching
+            // LocalRuntime::apply's ordering.
+            let owned_allocations = std::mem::replace(allocations, product_alloc::AllocationContext::new());
+            let mut meter = Meter::with_allocations(
+                limits.clone(), limits.fuel, self.cancelled.clone(), owned_allocations,
+            );
+            let result = (|| {
+                meter.tick(1)?;
+                if !valid_id(point) { return Err(invalid("invalid observation point")); }
+                scenario.validate_replay_input(program).map_err(app_adapter_error)?;
+                if scenario.single_observe_point().is_none() {
+                    return Err(invalid("invalid observation input"));
+                }
+                let result = view::observe_decoded_with_meter(
+                    program, &start_data, &start_session, scenario.clock_day(), point, &[], &mut meter,
+                )?;
+                meter.tick(1)?;
+                Ok(result)
+            })();
+            *allocations = meter.allocations;
+            match result {
+                Ok(value) => observation = Some(value),
+                Err(error @ AdapterError::Allocation(_)) => return Err(error),
+                Err(error) => step_error = Some(error),
+            }
+        }
+
+        let (outcome, diagnostic_text, state) = match (&observation, &step_error) {
+            (Some(_), None) => (StepOutcome::Applied, None, EvidenceState::Observed),
+            (None, Some(error)) => {
+                let text = diagnostic_decoded(error, allocations)?;
+                let outcome = match error {
+                    AdapterError::Invalid(_) => StepOutcome::Rejected,
+                    AdapterError::BudgetExhausted(_) => StepOutcome::BudgetExhausted,
+                    _ => StepOutcome::Failed,
+                };
+                let state = if matches!(error, AdapterError::Cancelled | AdapterError::BudgetExhausted(_)) {
+                    EvidenceState::Inconclusive
+                } else {
+                    EvidenceState::Failed
+                };
+                (outcome, Some(text), state)
+            }
+            _ => return Err(failed("decoded Observe replay state invariant")),
+        };
+        let after_data = if had_early_apply_error { None } else {
+            Some(start_data.identity_with(allocations).map_err(app_adapter_error)?)
+        };
+        let after_session = if had_early_apply_error { None } else {
+            Some(start_session.identity_with(allocations).map_err(codec_adapter_error)?)
+        };
+        let after_data = after_data.as_ref().unwrap_or(before_data);
+        let after_session = after_session.as_ref().unwrap_or(before_session);
+        let output_digests: [Digest; 0] = [];
+        let trace_step = DecodedObserveTrace {
+            index: 0,
+            input: DecodedObserveInput::Observe { point },
+            before_data,
+            after_data,
+            before_session,
+            after_session,
+            outputs: &output_digests,
+            outcome,
+            diagnostic: diagnostic_text.as_deref(),
+        };
+        let trace: &[DecodedObserveTrace<'_>] = if step_error.is_some() && observation.is_none() && had_early_apply_error {
+            &[]
+        } else {
+            std::slice::from_ref(&trace_step)
+        };
+        let observations: &[view::DecodedRuntimeObservation] = match observation.as_ref() {
+            Some(value) => std::slice::from_ref(value),
+            None => &[],
+        };
+        let errors: &[String] = match diagnostic_text.as_ref() {
+            Some(value) => std::slice::from_ref(value),
+            None => &[],
+        };
+        let wire = DecodedRunEvidenceWire {
+            version: CONTRACT_VERSION,
+            id,
+            origin: ExecutionOrigin::ProductionRuntime,
+            binding: DecodedRunBindingWire {
+                source: program.binding(),
+                artifact: program.artifact(),
+                data_digest: &data_digest,
+                input_digest: &input_digest,
+                scenario_digest: &scenario_digest,
+                decision_digest: &decision_digest,
+                session_digest: &session_digest,
+                runtime_version: RUNTIME_VERSION,
+                driver_version: DRIVER_VERSION,
+            },
+            source_after: program.binding(),
+            state,
+            trace,
+            observations,
+            limits: &limits,
+            errors,
+            uncovered: &[],
+        };
+        let value = crate::product_backup::fallible_codec::try_serialize_value(&wire, allocations)
+            .map_err(codec_adapter_error)?;
+        let evidence = decode_run_evidence_runtime(value, allocations).map_err(app_adapter_error)?;
+        evidence.validate_single_observe(allocations).map_err(|error| match error {
+            RuntimeEvidenceError::Contract(error) => AdapterError::Invalid(error),
+            RuntimeEvidenceError::Allocation(failure) => AdapterError::Allocation(failure),
+        })?;
+        Ok(evidence)
+    }
 }
 impl LocalRuntime {
+    /// Evaluate the ordinary constraint pass used by compatibility checking
+    /// over the bounded decoded model. Allocation refusal is returned as the
+    /// outer error so callers can keep it distinct from a semantic
+    /// incompatibility, matching the legacy compatibility report contract.
+    pub(crate) fn check_decoded_compatibility_constraints(
+        &self,
+        program: &FallibleDecodedCapturedProgram,
+        merged: &FallibleDecodedDataSnapshot,
+        day: i32,
+        allocations: &mut product_alloc::AllocationContext,
+    ) -> std::result::Result<std::result::Result<(), AdapterError>, AdapterError> {
+        let session = program.initial_session_with(allocations).map_err(AdapterError::Allocation)?;
+        let limits = RuntimeLimits { fuel: 10_000_000, ..RuntimeLimits::default() };
+        let owned_allocations = std::mem::replace(allocations, product_alloc::AllocationContext::new());
+        let mut meter = Meter::with_allocations(
+            limits.clone(), limits.fuel, Arc::new(AtomicBool::new(false)), owned_allocations,
+        );
+        let result = execute::constraints_decoded(program, merged, &session, day, &mut meter);
+        *allocations = meter.allocations;
+        match result {
+            Err(error @ AdapterError::Allocation(_)) => Err(error),
+            Ok(()) => Ok(Ok(())),
+            Err(error) => Ok(Err(error)),
+        }
+    }
+
+    /// Decoded counterpart of the validation work performed before an
+    /// ordinary runtime run is published. `compatibility` and `issues` are
+    /// the freshly recomputed report values, not persisted claims.
+    pub(crate) fn validate_decoded_initial_runtime(
+        &self,
+        program: &FallibleDecodedCapturedProgram,
+        data: &FallibleDecodedDataSnapshot,
+        session: &FallibleDecodedSessionState,
+        clock_day: i32,
+        limits: RuntimeLimits,
+        compatibility: CompatibilityState,
+        issues: &[String],
+        allocations: &mut product_alloc::AllocationContext,
+    ) -> Result<()> {
+        program.validate_with(allocations).map_err(|error| match error {
+            AppValidationError::Contract(error) => AdapterError::Invalid(error),
+            AppValidationError::Allocation(failure) => AdapterError::Allocation(failure),
+        })?;
+        data.validate_with(allocations).map_err(|error| match error {
+            AppValidationError::Contract(error) => AdapterError::Invalid(error),
+            AppValidationError::Allocation(failure) => AdapterError::Allocation(failure),
+        })?;
+        program.validate_session_with(session, allocations).map_err(|error| match error {
+            AppValidationError::Contract(error) => AdapterError::Invalid(error),
+            AppValidationError::Allocation(failure) => AdapterError::Allocation(failure),
+        })?;
+        validate_day(clock_day)?;
+        limits.validate()?;
+        if data.project_id() != program.project_id() {
+            return Err(invalid("program and data belong to different projects"));
+        }
+        self.validate_decoded_initial_runtime_after_report(
+            program, data, session, clock_day, limits, compatibility, issues, allocations,
+        )
+    }
+
+    pub(crate) fn validate_decoded_initial_runtime_after_report(
+        &self,
+        _program: &FallibleDecodedCapturedProgram,
+        data: &FallibleDecodedDataSnapshot,
+        session: &FallibleDecodedSessionState,
+        _clock_day: i32,
+        limits: RuntimeLimits,
+        compatibility: CompatibilityState,
+        issues: &[String],
+        allocations: &mut product_alloc::AllocationContext,
+    ) -> Result<()> {
+        if compatibility != CompatibilityState::Compatible {
+            let mut message = String::new();
+            for (index, issue) in issues.iter().enumerate() {
+                if index != 0 {
+                    product_alloc::try_append_str(&mut message, "; ", allocations, product_alloc::AllocationSite::String)
+                        .map_err(AdapterError::Allocation)?;
+                }
+                product_alloc::try_append_str(&mut message, issue, allocations, product_alloc::AllocationSite::String)
+                    .map_err(AdapterError::Allocation)?;
+            }
+            return Err(AdapterError::Unsupported(message));
+        }
+
+        let owned_allocations = std::mem::replace(allocations, product_alloc::AllocationContext::new());
+        let mut meter = Meter::with_allocations(
+            limits.clone(), 10_000_000, Arc::new(AtomicBool::new(false)), owned_allocations,
+        );
+        let data_view = DataSnapshotView::from(data);
+        let result = (|| {
+            meter.collection(data_view.record_count())?;
+            for row in data_view.records() {
+                for (_, value) in row.values().iter() { meter.value(value)?; }
+            }
+            for (_, value) in session.values().iter() {
+                meter.value(value)?;
+                check_references_decoded(value, data_view)?;
+            }
+            if let Some(focus) = session.focused_record() {
+                if data_view.record(&focus.entity, &focus.record).is_none() {
+                    return Err(invalid("record reference does not exist"));
+                }
+            }
+            Ok(())
+        })();
+        *allocations = meter.allocations;
+        result
+    }
+
     fn start_source(
         &self,
         program: &ProgramSource,
@@ -1061,6 +2126,18 @@ fn check_references(value: &DataValue, data: &DataSnapshot) -> Result<()> {
     }
     Ok(())
 }
+fn check_references_decoded(value: &DataValue, data: DataSnapshotView<'_>) -> Result<()> {
+    match value {
+        DataValue::Reference { entity, record } => {
+            if data.record(entity, record).is_none() { return Err(invalid("record reference does not exist")); }
+        }
+        DataValue::List { items, .. } => {
+            for item in items { check_references_decoded(item, data)?; }
+        }
+        _ => {}
+    }
+    Ok(())
+}
 pub(crate) fn merged_data(
     program: &CapturedProgram,
     current: &DataSnapshot,
@@ -1073,3 +2150,13 @@ pub(crate) fn merged_definition_data(
 ) -> Result<DataSnapshot> {
     compatibility::merge(program, current)
 }
+
+// Capture-row API/payment controls are staged before the APIs exist.
+mod capture;
+pub(crate) fn projection_capture_entry_units<H: ProjectionHost>() -> u64 {
+    capture::projection_capture_entry_units::<H>()
+}
+#[cfg(test)]
+mod capture_row_controls;
+#[cfg(test)]
+mod capture_native_controls;

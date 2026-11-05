@@ -3,8 +3,8 @@
 use super::common_fact_admission::{refuse, AdmissionResult, ProofMeter};
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
-#[derive(Clone, Debug)]
-enum Kind {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Kind {
     Root,
     Aux {
         owner: Id,
@@ -87,6 +87,8 @@ struct Rules<'a> {
     certs: Vec<CommonFactCertificate>,
     discovered: BTreeSet<(Id, Id)>,
     all_roots_active: bool,
+    retained: Option<&'a super::owned_continuation::RetainedOwned>,
+    inherited_action_prefixes: &'a BTreeMap<Id, usize>,
 }
 fn literal(expr: &Expr) -> Option<&DataValue> {
     if let Expr::Literal { value, .. } = expr {
@@ -159,17 +161,21 @@ fn all_statements<'a>(steps: &'a [Statement], out: &mut Vec<&'a Statement>) {
         }
     }
 }
-fn schemas(
+pub(super) fn schemas(
     before: &AppDefinition,
     data: &DataSnapshot,
     after: &AppDefinition,
     request: &OwnedPreviewRequest,
     inventory: &CommonFactInventory,
+    retained: Option<&super::owned_continuation::RetainedOwned>,
 ) -> AdmissionResult<BTreeMap<Id, Kind>> {
     let root = &request.inventory.sources.root_entity;
+    if let Some(retained) = retained {
+        retained.verify_schema(before, data, after, request)?;
+    }
     for e in &data.schema {
-        if before.entities.iter().find(|x| x.id == e.id) != Some(e)
-            || after.entities.iter().find(|x| x.id == e.id) != Some(e)
+        if retained.is_none() && (before.entities.iter().find(|x| x.id == e.id) != Some(e)
+            || after.entities.iter().find(|x| x.id == e.id) != Some(e))
         {
             return Err(refuse(
                 &format!("entity {}", e.id),
@@ -191,13 +197,23 @@ fn schemas(
                 "schema constraints are outside the total admission grammar",
             ));
         }
+        if entity.fields.iter().any(|field| {
+            field.id.starts_with(RESERVED_PREFIX)
+                && matches!(field.value_type, Type::Reference { .. })
+        }) {
+            return Err(refuse(&entity.id, "protected metadata cannot define relation ownership"));
+        }
         let refs: Vec<_> = entity
             .fields
             .iter()
-            .filter(|f| matches!(f.value_type, Type::Reference { .. }))
+            .filter(|f| {
+                !f.id.starts_with(RESERVED_PREFIX)
+                    && matches!(f.value_type, Type::Reference { .. })
+            })
             .collect();
         if entity.fields.iter().any(|f| {
-            super::common_fact_inventory::relation(&f.value_type).is_some()
+            !f.id.starts_with(RESERVED_PREFIX)
+                && super::common_fact_inventory::relation(&f.value_type).is_some()
                 && !matches!(f.value_type, Type::Reference { .. })
         }) {
             return Err(refuse(
@@ -219,7 +235,7 @@ fn schemas(
             Kind::Root
         } else if let Some(aux) = request.auxiliary.iter().find(|a| a.entity == entity.id) {
             if before.entities.iter().any(|e| e.id == entity.id)
-                || data.schema.iter().any(|e| e.id == entity.id)
+                || (retained.is_none() && data.schema.iter().any(|e| e.id == entity.id))
                 || owner.as_ref() != Some(&aux.owner_field)
                 || refs.len() != 1
                 || entity.unique != vec![vec![aux.owner_field.clone()]]
@@ -248,7 +264,11 @@ fn schemas(
             if entity
                 .fields
                 .iter()
-                .any(|f| !fields.contains(&f.id) && f.value_type != Type::Boolean)
+                .any(|f| {
+                    !fields.contains(&f.id)
+                        && !f.id.starts_with(RESERVED_PREFIX)
+                        && f.value_type != Type::Boolean
+                })
             {
                 return Err(refuse(
                     &entity.id,
@@ -1297,14 +1317,24 @@ impl Rules<'_> {
                         || !control.policy.is_empty()
                         || path.len() != 1
                         || i + 1 != steps.len()
-                        || !matches!(literal(value),Some(DataValue::Text{value}) if value.is_empty())
                     {
                         return Err(refuse(
                             &at,
                             "input reset must be literal empty, common, top-level and final",
                         ));
                     }
-                    self.certify(&at, &format!("closed input reset {state}"), step)?;
+                    if matches!(literal(value),Some(DataValue::Text{value}) if value.is_empty()) {
+                        self.certify(&at, &format!("closed input reset {state}"), step)?;
+                    } else if match self.retained {
+                        Some(retained) => retained.permits_state_marker(
+                            self.inventory, self.side, &action.id, &path, step, self.meter,
+                        )?,
+                        None => false,
+                    } {
+                        self.certify(&at, &format!("closed continuation common final text marker {state}"), step)?;
+                    } else {
+                        return Err(refuse(&at, "input reset must be literal empty, common, top-level and final"));
+                    }
                 }
                 Statement::Assert { condition, .. } => {
                     let v = self.expr(condition, env, false, false, &at)?;
@@ -1330,6 +1360,14 @@ impl Rules<'_> {
             let mut controls = Value::plain(Type::Boolean);
             let mut unfinished = BTreeSet::new();
             let mixed = self.mixed(action);
+            let prefix = self
+                .inherited_action_prefixes
+                .get(&action.id)
+                .copied()
+                .unwrap_or(0);
+            if prefix > action.steps.len() {
+                return Err(refuse(&action.id, "inherited action prefix is outside the candidate"));
+            }
             for (i, guard) in action.guards.iter().enumerate() {
                 let at = format!("{} guard[{i}]", action.id);
                 let v = self.expr(guard, &env, true, false, &at)?;
@@ -1339,15 +1377,22 @@ impl Rules<'_> {
             if mixed && !controls.policy.is_empty() {
                 return Err(refuse(&action.id,"common factual admission depends on private policy rather than exact lifecycle facet"));
             }
-            if !action.ensures.is_empty() {
+            if prefix == 0 && !action.ensures.is_empty() {
                 return Err(refuse(
                     &action.id,
                     "action postconditions are outside closed total admission grammar",
                 ));
             }
+            // Prior action code belongs to the reconstructed predecessor
+            // recipe. Analyze only the exact newly appended tail for this layer.
+            for step in &action.steps[..prefix] {
+                if let Statement::Create { entity, bind, .. } = step {
+                    env.insert(bind.clone(), Value::plain(Type::reference(entity)));
+                }
+            }
             self.statements(
                 action,
-                &action.steps,
+                &action.steps[prefix..],
                 &[],
                 &mut env,
                 &controls,
@@ -1873,6 +1918,21 @@ pub(super) fn verify(
         meter,
     )
 }
+
+pub(super) fn verify_from_baseline(
+    baseline: &CapturedProgram,
+    candidate: &CapturedProgram,
+    request: &OwnedPreviewRequest,
+    inventory: &CommonFactInventory,
+    data: &DataSnapshot,
+    meter: &mut ProofMeter,
+) -> AdmissionResult<(
+    Vec<CommonFactCertificate>,
+    Vec<OwnedProjectionRecipe>,
+    Vec<String>,
+)> {
+    verify_pair_frame(baseline, candidate, request, inventory, data, None, meter)
+}
 pub(super) fn verify_frame(
     snapshot: &ProjectSnapshot,
     candidate: &CapturedProgram,
@@ -1885,7 +1945,20 @@ pub(super) fn verify_frame(
     Vec<OwnedProjectionRecipe>,
     Vec<String>,
 )> {
-    let before = &snapshot.program()?.program;
+    verify_pair_frame(snapshot.program()?, candidate, request, inventory, data, None, meter)
+}
+/// The retained mode can only be constructed from the original reconstructed
+/// initializer/layout. No schema/row stripping is used for current frames.
+pub(super) fn verify_pair_frame(
+    baseline: &CapturedProgram,
+    candidate: &CapturedProgram,
+    request: &OwnedPreviewRequest,
+    inventory: &CommonFactInventory,
+    data: &DataSnapshot,
+    retained: Option<&super::owned_continuation::RetainedOwned>,
+    meter: &mut ProofMeter,
+) -> AdmissionResult<(Vec<CommonFactCertificate>, Vec<OwnedProjectionRecipe>, Vec<String>)> {
+    let before = &baseline.program;
     let after = &candidate.program;
     let first = lifecycle(&request.inventory.lifecycle.before)?;
     let second = lifecycle(&request.inventory.lifecycle.after)?;
@@ -1901,7 +1974,15 @@ pub(super) fn verify_frame(
                 "paired variant lacks an exact single-root correspondence; split at a proved root frontier"));
         }
     }
-    let kinds = schemas(before, data, after, request, inventory)?;
+    let kinds = schemas(before, data, after, request, inventory, retained)?;
+    let mut inherited_action_prefixes = BTreeMap::new();
+    if before.entities.iter().any(|entity| {
+        entity.fields.iter().any(|field| field.id.starts_with(RESERVED_PREFIX))
+    }) {
+        for action in &before.actions {
+            inherited_action_prefixes.insert(action.id.clone(), action.steps.len());
+        }
+    }
     // Every allowed LocalRuntime run has <= 10,000,000 cumulative fuel. Each
     // business write consumes fuel, so this exact retained-data margin rules out
     // policy-selected revision overflow throughout that entire isolated run.
@@ -1971,6 +2052,8 @@ pub(super) fn verify_frame(
                 certs: vec![],
                 discovered: BTreeSet::new(),
                 all_roots_active,
+                retained,
+                inherited_action_prefixes: &inherited_action_prefixes,
             };
             rules.actions()?;
             rules.observations()?;
@@ -2036,4 +2119,143 @@ pub(super) fn verify_frame(
     meter
         .charge((inventory.uses.len() + inventory.structure.writers.len() + certs.len()) as u64)?;
     Ok((certs, projections, comparison))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{atomic::AtomicBool, Arc};
+
+    #[test]
+    fn inherited_private_guard_controls_appended_root_create() {
+        let done = DataValue::Text { value: "done".into() };
+        let text = |value: &str| Expr::Literal {
+            value_type: Type::Text,
+            value: DataValue::Text { value: value.into() },
+        };
+        let boolean = |value| Expr::Literal {
+            value_type: Type::Boolean,
+            value: DataValue::Boolean { value },
+        };
+        let app = AppDefinition {
+            version: 1,
+            id: "inherited_guard".into(),
+            label: "Inherited guard".into(),
+            entities: vec![EntityDefinition {
+                id: "job".into(),
+                label: "Job".into(),
+                fields: vec![
+                    FieldDefinition { id: "status".into(), label: "Status".into(), value_type: Type::Text },
+                    FieldDefinition { id: "private_policy".into(), label: "Private policy".into(), value_type: Type::Boolean },
+                ],
+                unique: vec![],
+                constraints: vec![],
+            }],
+            state: vec![],
+            actions: vec![ActionDefinition {
+                id: "root_create".into(),
+                label: "Create root".into(),
+                parameters: [("job".into(), Type::reference("job"))].into(),
+                guards: vec![Expr::Equal {
+                    left: Box::new(Expr::Field {
+                        record: Box::new(Expr::Variable { name: "job".into() }),
+                        field: "private_policy".into(),
+                    }),
+                    right: Box::new(boolean(true)),
+                }],
+                steps: vec![
+                    Statement::SetState { state: "prior".into(), value: text("") },
+                    Statement::Create {
+                        entity: "job".into(),
+                        bind: "created".into(),
+                        values: [("status".into(), text("ready"))].into(),
+                    },
+                ],
+                ensures: vec![],
+            }],
+            outputs: vec![],
+            observables: vec![],
+            views: vec![],
+            initial_view: "jobs".into(),
+        };
+        let identity = canonical_digest(IdentityDomain::Evidence, &"inherited-guard-test").unwrap();
+        let inventory = CommonFactInventory {
+            snapshot: identity.clone(),
+            retained_data: identity.clone(),
+            retained_schema: vec![],
+            before_schema: vec![],
+            after_schema: vec![],
+            structure: OwnedStructuralReport {
+                before: identity.clone(),
+                after: identity.clone(),
+                root_entity: "job".into(),
+                edits: vec![],
+                common_statements: vec![],
+                writers: vec![OwnedWriter {
+                    side: OwnedSourceSide::After,
+                    source: identity.clone(),
+                    action: "root_create".into(),
+                    path: vec![1],
+                    kind: OwnedStatementKind::Create,
+                    entity: "job".into(),
+                    field: None,
+                    value_type: None,
+                }],
+                changes: vec![],
+            },
+            lifecycle: CommonFactLifecycleSuggestion {
+                entity: "job".into(),
+                before: Expr::Equal {
+                    left: Box::new(Expr::Field {
+                        record: Box::new(Expr::Variable { name: "record".into() }),
+                        field: "status".into(),
+                    }),
+                    right: Box::new(text("done")),
+                },
+                after: Expr::Equal {
+                    left: Box::new(Expr::Field {
+                        record: Box::new(Expr::Variable { name: "record".into() }),
+                        field: "status".into(),
+                    }),
+                    right: Box::new(text("done")),
+                },
+                meaning: "Done jobs are completed".into(),
+            },
+            lifecycle_writers: vec![],
+            actions: vec![],
+            uses: vec![],
+            references: vec![],
+            identity_hazards: vec![],
+            obligations: vec![],
+            resources: CommonFactResources {
+                total_record_cap: MAX_COLLECTION,
+                stored_records: 0,
+                includes_archived_and_auxiliary: true,
+                ordinary_defaults: RuntimeLimits::default(),
+                max_query_limit_proves_order_independence: true,
+                failures_commit_fuel_and_trace: true,
+            },
+        };
+        let kinds = BTreeMap::from([("job".into(), Kind::Root)]);
+        let policy = BTreeSet::from([("job".into(), "private_policy".into())]);
+        let prefixes = BTreeMap::from([("root_create".into(), 1)]);
+        let mut proof_meter = ProofMeter::new(ProofBudget::default(), Arc::new(AtomicBool::new(false))).unwrap();
+        let mut rules = Rules {
+            app: &app,
+            inventory: &inventory,
+            kinds: &kinds,
+            policy: &policy,
+            lifecycle: ("status", &done),
+            side: OwnedSourceSide::After,
+            meter: &mut proof_meter,
+            certs: vec![],
+            discovered: BTreeSet::new(),
+            all_roots_active: true,
+            retained: None,
+            inherited_action_prefixes: &prefixes,
+        };
+
+        let error = rules.actions().expect_err("private inherited guard must govern the appended root create");
+        assert!(error.to_string().contains("common factual admission depends on private policy"));
+    }
 }
