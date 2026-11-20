@@ -100,7 +100,7 @@ fn assert_defaults(lifecycle: &OwnedLifecycleV2) {
 }
 // Only a read of the original clock. Never changes started/millis or replaces a meter.
 fn remaining_millis(meter: &ProofMeter) -> u64 {
-    meter.millis.saturating_sub(
+    meter.budget_millis().saturating_sub(
         meter.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
     )
 }
@@ -800,14 +800,9 @@ fn initial_owned_limits_profile_packets_refuse_before_state_changes() {
     let root = InitialLimitsProfile::ROOT as u64 + 64;
     assert_eq!(INITIAL_CAPTURE_PROFILE_TRANSPORT, 496);
     assert_eq!(AcceptedPreviewLifecycle::PROFILE_VERIFY_FRAME, 384);
-    eprintln!("initial frames finish={} inventory={} capture={} verify={}", FINISH_PROFILE_FRAME,
-        std::mem::size_of::<CommonFactInventory>(), INITIAL_CAPTURE_PROFILE_TRANSPORT,
-        AcceptedPreviewLifecycle::PROFILE_VERIFY_FRAME);
     // Concrete native widths, not an inferred native traversal credit.
     assert_eq!(std::mem::size_of::<InitialLimitsProfile>(), 24);
     assert_eq!(std::mem::size_of::<RuntimeLimits>(), 48);
-    eprintln!("initial profile root={} result_width={}", root,
-        std::mem::size_of::<AdmissionResult<()>>());
     for (packet, operation) in [(root, 0), (256, 1), (64, 2)] {
         for exact in [false, true] {
             let mut m = meter();

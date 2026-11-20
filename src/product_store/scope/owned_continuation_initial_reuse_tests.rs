@@ -207,6 +207,7 @@ impl PreparedOwnedPreview {
                 &Dependencies::new(),
                 &Dependencies::new(),
                 &origins,
+                0,
                 &mut actual,
             )
             .err()
@@ -221,6 +222,7 @@ impl PreparedOwnedPreview {
                 OwnedSourceSide::Before,
                 &Dependencies::new(),
                 &Dependencies::new(),
+                0,
                 &mut expected,
             );
             let expected_error = if fail_first {
@@ -235,6 +237,7 @@ impl PreparedOwnedPreview {
                     OwnedSourceSide::After,
                     &Dependencies::new(),
                     &Dependencies::new(),
+                    0,
                     &mut expected,
                 )
                 .err()

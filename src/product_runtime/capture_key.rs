@@ -117,7 +117,6 @@ fn expr_shape(e:&Expr,depth:usize,nodes:&mut usize,work:&mut dyn ContractWork)->
         Expr::DateDifference{later,earlier}=>Ok(child(later)?&&child(earlier)?),
     }
 }
-
 // length Type: arguments, return/error, accumulator/order, and maximum complete variant-field arm.
 const LENGTH_TYP_FRAME:u64=64+4*(size_of::<&Type>()+size_of::<&mut dyn ContractWork>()+size_of::<Result<u64>>()+size_of::<AdapterError>()+size_of::<u64>()+size_of::<KeyOrder>()+max_arm(&[0,0,0,0,0+size_of::<&String>(),0+size_of::<&Box<Type>>(),0+size_of::<&Box<Type>>()])+size_of::<u64>()) as u64;
 fn length_typ(a:&Type,work:&mut dyn ContractWork)->Result<u64>{
@@ -1031,14 +1030,46 @@ pub(super) fn search(cache:&[Box<OwnedCaptureKey>],key:&OwnedCaptureKey,work:&mu
         }
     }pay(work,0)?;Ok(Err(low))
 }
-pub(super) const PUBLISH_FRAME:u64=64+4*(size_of::<&mut Vec<Box<OwnedCaptureKey>>>()+size_of::<&mut usize>()+size_of::<Option<OwnedCaptureKey>>()+size_of::<OwnedCaptureKey>()+size_of::<&mut dyn ContractWork>()+size_of::<Result<()>>()+size_of::<AdapterError>()+size_of::<usize>()*6+size_of::<u64>()*4+size_of::<Box<OwnedCaptureKey>>()+size_of::<std::result::Result<usize,usize>>()) as u64;
-pub(super) fn publish(cache:&mut Vec<Box<OwnedCaptureKey>>,cache_bytes:&mut usize,key:Option<OwnedCaptureKey>,work:&mut dyn ContractWork)->Result<()>{
-    let Some(key)=key else{return Ok(())};
+fn compare_parts_values(key_entity:&str,key_binding:&str,key_expression:&Expr,key_expected:&Type,key_limits:&RuntimeLimits,
+    entity:&str,binding:&str,expression:&Expr,expected:&Type,
+    limits:&RuntimeLimits,work:&mut dyn ContractWork)->Result<KeyOrder>{
     pay(work,32)?;
-    if cache.len()>=MAX_ITEMS{return Ok(())}
+    macro_rules! field{($frame:expr,$call:expr)=>{let order=invoke!(work,$frame,$call)?;if order!=KeyOrder::Equal{return Ok(order)}}}
+    field!(COMPARE_TEXT_FRAME,compare_text(key_entity,entity,work));
+    field!(COMPARE_TEXT_FRAME,compare_text(key_binding,binding,work));
+    field!(COMPARE_EXPR_FRAME,compare_expr(key_expression,expression,work));
+    field!(COMPARE_TYP_FRAME,compare_typ(key_expected,expected,work));
+    field!(COMPARE_LIMITS_FRAME,compare_limits(key_limits,limits,work));
+    pay(work,0)?;Ok(KeyOrder::Equal)
+}
+fn compare_parts(key:&OwnedCaptureKey,entity:&str,binding:&str,expression:&Expr,expected:&Type,
+    limits:&RuntimeLimits,work:&mut dyn ContractWork)->Result<KeyOrder>{
+    compare_parts_values(&key.entity,&key.binding,&key.expression,&key.expected,&key.limits,
+        entity,binding,expression,expected,limits,work)
+}
+// Use the same ordering as search so borrowed lookups find the exact owned key.
+fn search_parts(cache:&[Box<OwnedCaptureKey>],entity:&str,binding:&str,expression:&Expr,
+    expected:&Type,limits:&RuntimeLimits,work:&mut dyn ContractWork)->Result<std::result::Result<usize,usize>>{
+    pay(work,32)?;let mut low=0usize;let mut high=cache.len();
+    while low<high{pay(work,32)?;let mid=low+(high-low)/2;pay(work,16)?;
+        match invoke!(work,COMPARE_FRAME,compare_parts(&cache[mid],entity,binding,expression,expected,limits,work))?{
+            KeyOrder::Less=>low=mid+1,KeyOrder::Greater=>high=mid,
+            KeyOrder::Equal=>{pay(work,0)?;return Ok(Ok(mid))},
+        }
+    }pay(work,0)?;Ok(Err(low))
+}
+pub(super) fn binding_matches(cache:&[Box<OwnedCaptureKey>],index:usize,binding:&str,work:&mut dyn ContractWork)->Result<bool>{
+    let Some(key)=cache.get(index) else { return Ok(false); };
+    cost::eq_string(&key.binding,binding,work)
+}
+pub(super) const PUBLISH_FRAME:u64=64+4*(size_of::<&mut Vec<Box<OwnedCaptureKey>>>()+size_of::<&mut usize>()+size_of::<Option<OwnedCaptureKey>>()+size_of::<OwnedCaptureKey>()+size_of::<&mut dyn ContractWork>()+size_of::<Result<()>>()+size_of::<AdapterError>()+size_of::<usize>()*6+size_of::<u64>()*4+size_of::<Box<OwnedCaptureKey>>()+size_of::<std::result::Result<usize,usize>>()) as u64;
+pub(super) fn publish(cache:&mut Vec<Box<OwnedCaptureKey>>,cache_bytes:&mut usize,key:Option<OwnedCaptureKey>,work:&mut dyn ContractWork)->Result<Option<(usize,bool)>>{
+    let Some(key)=key else{return Ok(None)};
+    pay(work,32)?;
+    if cache.len()>=MAX_ITEMS{return Ok(None)}
     let bytes=cache_bytes.checked_add(key.wire_len).ok_or_else(cost::overflow)?;
-    if bytes>MAX_WIRE_BYTES{return Ok(())}
-    let index=match invoke!(work,SEARCH_FRAME,search(cache,&key,work))?{Ok(_)=>return Ok(()),Err(index)=>index};
+    if bytes>MAX_WIRE_BYTES{return Ok(None)}
+    let index=match invoke!(work,SEARCH_FRAME,search(cache,&key,work))?{Ok(index)=>return Ok(Some((index,false))),Err(index)=>index};
     pay(work,64)?;
     let capacity=cache.capacity();let length=cache.len();
     let target=if length==capacity{capacity.checked_mul(2).ok_or_else(cost::overflow)?.max(1).min(MAX_ITEMS)}else{capacity};
@@ -1056,17 +1087,22 @@ pub(super) fn publish(cache:&mut Vec<Box<OwnedCaptureKey>>,cache_bytes:&mut usiz
     // claimed as exact work. No fallible check/debit after the first mutation.
     let key=Box::new(key);
     if length==capacity{cache.reserve_exact(target-length);}
-    cache.insert(index,key);*cache_bytes=bytes;Ok(())
+    cache.insert(index,key);*cache_bytes=bytes;Ok(Some((index,true)))
 }
-pub(super) fn key(entity:&str,binding:&str,expression:&Expr,expected:&Type,limits:&RuntimeLimits,work:&mut dyn ContractWork)->Result<Option<OwnedCaptureKey>>{
+fn valid_shape(entity:&str,binding:&str,expression:&Expr,expected:&Type,work:&mut dyn ContractWork)->Result<bool>{
     pay(work,0)?;pay(work,4)?;let mut nodes=0;
-    if !text_shape(entity,work)?||!text_shape(binding,work)?||!expr_shape(expression,0,&mut nodes,work)?||!type_shape(expected,0,work)?{return Ok(None)}
+    Ok(text_shape(entity,work)?&&text_shape(binding,work)?&&expr_shape(expression,0,&mut nodes,work)?&&type_shape(expected,0,work)?)
+}
+fn key_body(entity:&str,binding:&str,expression:&Expr,expected:&Type,limits:&RuntimeLimits,
+    known_expression_len:Option<usize>,work:&mut dyn ContractWork)->Result<OwnedCaptureKey>{
     pay(work,32)?;
     // Six-element array: seven punctuation bytes and the constant source 0.
     let mut length=8u64;
     length=wire_add!(work,length,invoke!(work,LENGTH_TEXT_FRAME,length_text(entity,work))?);
     length=wire_add!(work,length,invoke!(work,LENGTH_TEXT_FRAME,length_text(binding,work))?);
-    length=wire_add!(work,length,invoke!(work,LENGTH_EXPR_FRAME,length_expr(expression,work))?);
+    let expression_len=if let Some(len)=known_expression_len{cost::number(len)?}
+        else{invoke!(work,LENGTH_EXPR_FRAME,length_expr(expression,work))?};
+    length=wire_add!(work,length,expression_len);
     length=wire_add!(work,length,invoke!(work,LENGTH_TYP_FRAME,length_typ(expected,work))?);
     length=wire_add!(work,length,invoke!(work,LENGTH_LIMITS_FRAME,length_limits(limits,work))?);
     pay(work,16)?;let wire_len=usize::try_from(length).map_err(|_|cost::overflow())?;
@@ -1075,7 +1111,35 @@ pub(super) fn key(entity:&str,binding:&str,expression:&Expr,expected:&Type,limit
     let expression=invoke!(work,COPY_EXPR_FRAME,copy_expr(expression,work))?;
     let expected=invoke!(work,COPY_TYP_FRAME,copy_typ(expected,work))?;
     let limits=invoke!(work,COPY_LIMITS_FRAME,copy_limits(limits,work))?;
-    pay(work,0)?;Ok(Some(OwnedCaptureKey{entity,binding,expression,expected,limits,wire_len}))
+    pay(work,0)?;Ok(OwnedCaptureKey{entity,binding,expression,expected,limits,wire_len})
+}
+pub(super) fn key(entity:&str,binding:&str,expression:&Expr,expected:&Type,limits:&RuntimeLimits,work:&mut dyn ContractWork)->Result<Option<OwnedCaptureKey>>{
+    if !valid_shape(entity,binding,expression,expected,work)? { return Ok(None); }
+    Ok(Some(key_body(entity,binding,expression,expected,limits,None,work)?))
+}
+pub(super) fn lookup_cached(cache:&[Box<OwnedCaptureKey>],entity:&str,binding:&str,expression:&Expr,
+    expected:&Type,limits:&RuntimeLimits,work:&mut dyn ContractWork)->Result<Option<usize>>{
+    if !cache.is_empty() {
+        // Every cached key was published only after full shape validation.
+        // Compare the borrowed candidate against that exact key first: equality
+        // proves it inherits the same validated shape, without rebuilding an
+        // owned key or repeating the full shape walk. A miss still takes the
+        // complete capture-extension validation path in ProjectionCapture.
+        pay(work,SEARCH_FRAME)?;
+        if let Ok(index)=search_parts(cache,entity,binding,expression,expected,limits,work)? {
+            return Ok(Some(index));
+        }
+    }
+    Ok(None)
+}
+// Caller must first complete CaptureValidation::validate_extension for these
+// exact immutable arguments. That audited walk enforces the same text, depth,
+// node and collection bounds as valid_shape, as well as the expression's
+// semantic/type constraints, so repeating valid_shape here would charge and
+// traverse the same input twice.
+pub(super) fn key_after_validation(entity:&str,binding:&str,expression:&Expr,expected:&Type,
+    limits:&RuntimeLimits,expression_len:usize,work:&mut dyn ContractWork)->Result<OwnedCaptureKey>{
+    key_body(entity,binding,expression,expected,limits,Some(expression_len),work)
 }
 #[cfg(test)]
 pub(super) fn bytes_for_test(key:&OwnedCaptureKey)->Vec<u8>{canonical_bytes(&(0usize,&key.entity,&key.binding,&key.expression,&key.expected,&key.limits)).unwrap()}

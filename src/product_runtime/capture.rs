@@ -113,11 +113,15 @@ pub(crate) struct ProjectionCapture<'c,'v,'a,'s,H:ProjectionHost+?Sized>{
     day:i32,
     cache:Vec<Box<capture_key::OwnedCaptureKey>>,
     cache_bytes:usize,
+    project_binding_validated:bool,
+    row_day_limits_validated:bool,
+    row_reference_validated:bool,
+    last_validated_binding_key:Option<usize>,
     first_failure:Option<AdapterError>,
 }
 macro_rules! projection_capture_body {
     ($validation:ident, $program:ident, $data:ident, $day:ident, $body:ident) => {{
-            let mut capture=ProjectionCapture{validation:$validation,program:$program,data:$data,day:$day,cache:Vec::new(),cache_bytes:0,first_failure:None};
+            let mut capture=ProjectionCapture{validation:$validation,program:$program,data:$data,day:$day,cache:Vec::new(),cache_bytes:0,project_binding_validated:false,row_day_limits_validated:false,row_reference_validated:false,last_validated_binding_key:None,first_failure:None};
             let result=$body(&mut capture);
             if let Some(error)=capture.first_failure.take(){return Err(ScopeExit::Caller(E::from(error)))}
             // Source owns its first error; an unrelated caller E passes through.
@@ -208,41 +212,71 @@ impl<'c,'v,'a,'s,H:ProjectionHost+?Sized> ProjectionCapture<'c,'v,'a,'s,H>{
         // The outer136 reserve buys one owner, never a swallowed retry/clone.
         self.validation.with_host(|host|host.charge(units)).map_err(cost::resource)
     }
-    fn prepare(&mut self,reference:&RecordRef,binding:&str,expression:&Expr,expected:&Type,limits:&RuntimeLimits)->std::result::Result<Option<capture_key::OwnedCaptureKey>,StepError>{
+    fn prepare(&mut self,reference:&RecordRef,binding:&str,expression:&Expr,expected:&Type,limits:&RuntimeLimits)->std::result::Result<(Option<capture_key::OwnedCaptureKey>,Option<usize>),StepError>{
+        let needs_row_day_limits_validation = !self.row_day_limits_validated;
+        let needs_project_binding_validation = !self.project_binding_validated;
+        let needs_row_reference_validation = !self.row_reference_validated;
+        let last_validated_binding_key = self.last_validated_binding_key;
         self.validation.with_host(|work|->Result<()>{
-            cost::pay(work,5)?;validate_day(self.day)?;
-            cost::pay(work,28)?;limits.validate()?;
-            if !cost::eq_string(&self.data.project_id,&self.program.binding.project_id,work)?{return Err(invalid("projection project or binding mismatch"))}
+            if needs_row_day_limits_validation {
+                cost::pay(work,5)?;validate_day(self.day)?;
+                cost::pay(work,28)?;limits.validate()?;
+            }
+            if needs_project_binding_validation {
+                if !cost::eq_string(&self.data.project_id,&self.program.binding.project_id,work)?{return Err(invalid("projection project or binding mismatch"))}
+            }
             cost::pay(work,6)?;
-            let valid=if binding.is_empty()||binding.len()>128{false}else{
+            let binding_cached = if let Some(index) = last_validated_binding_key {
+                capture_key::binding_matches(&self.cache,index,binding,work)?
+            } else { false };
+            let valid=if binding_cached { true } else if binding.is_empty()||binding.len()>128{false}else{
                 let mut valid=true;
                 for byte in binding.bytes(){cost::pay(work,9)?;if !(byte.is_ascii_lowercase()||byte.is_ascii_digit()||b"_-".contains(&byte)){valid=false;break}}
                 cost::pay(work,1)?;valid
             };
             if !valid{return Err(invalid("projection project or binding mismatch"))}
-            let value=cost::reference(&reference.entity,&reference.record,work)?;
-            cost::record(self.data,&value,work)?;Ok(())
+            if needs_row_reference_validation {
+                let value=cost::reference(&reference.entity,&reference.record,work)?;
+                cost::record(self.data,&value,work)?;
+            }
+            Ok(())
         })?;
-        let key=self.validation.with_host(|work|capture_key::key(&reference.entity,binding,expression,expected,limits,work))?;
-        let cached=if let Some(key)=&key{
-            self.validation.with_host(|work|{
-                cost::pay(work,capture_key::SEARCH_FRAME)?;
-                Ok::<_,AdapterError>(capture_key::search(&self.cache,key,work)?.is_ok())
-            })?
-        }else{false};
-        if !cached{self.validation.validate_extension(&reference.entity,binding,expression).map_err(StepError::source)?;}
-        Ok(if cached{None}else{key})
+        self.project_binding_validated = true;
+        self.row_day_limits_validated = true;
+        self.row_reference_validated = true;
+        let cached=self.validation.with_host(|work|
+            capture_key::lookup_cached(&self.cache,&reference.entity,binding,expression,expected,limits,work))?;
+        if let Some(index) = cached {
+            self.last_validated_binding_key = Some(index);
+            return Ok((None,Some(index)));
+        }
+        let expression_len=self.validation.validate_extension_with_len(&reference.entity,binding,expression).map_err(StepError::source)?;
+        let key=self.validation.with_host(|work|
+            capture_key::key_after_validation(&reference.entity,binding,expression,expected,limits,expression_len,work))?;
+        Ok((Some(key),None))
     }
-    fn publish(&mut self,key:Option<capture_key::OwnedCaptureKey>)->Result<()>{
-        self.validation.with_host(|work|{
+    fn publish(&mut self,key:Option<capture_key::OwnedCaptureKey>)->Result<Option<(usize,bool)>>{
+        let published = self.validation.with_host(|work|{
             cost::pay(work,capture_key::PUBLISH_FRAME)?;
             capture_key::publish(&mut self.cache,&mut self.cache_bytes,key,work)
-        })
+        })?;
+        if let Some((index,inserted)) = published {
+            if inserted {
+                if let Some(previous) = &mut self.last_validated_binding_key {
+                    if *previous >= index { *previous += 1; }
+                }
+            }
+            self.last_validated_binding_key = Some(index);
+        }
+        Ok(published)
     }
 
     pub(crate) fn with_row<R,E>(&mut self,reference:&RecordRef,first_binding:&str,first_expression:&Expr,first_expected:&Type,
         body:impl for<'r> FnOnce(&mut ProjectionRow<'r,'c,'v,'a,'s,H>,DataValue)->std::result::Result<R,E>)->std::result::Result<R,E>
     where E:From<AdapterError>{
+        self.row_day_limits_validated = false;
+        self.row_reference_validated = false;
+        self.last_validated_binding_key = None;
         let reservation=self.validation.with_host(|host|host.reserve()).map_err(|error|E::from(cost::resource(error)))?;
         let result=(||{
             let mut meter=Meter::from_reservation(reservation,ProjectionRow::<H>::HEADER).map_err(E::from)?;
@@ -251,16 +285,16 @@ impl<'c,'v,'a,'s,H:ProjectionHost+?Sized> ProjectionCapture<'c,'v,'a,'s,H>{
             // Fund enlarged owned-key/Option/result slots before prepare, even
             // when an unchanged pre-key guard refuses before key construction.
             self.validation.with_host(|work|cost::pay(work,capture_key::KEY_FRAME)).map_err(E::from)?;
-            let key=match self.prepare(reference,first_binding,first_expression,first_expected,&meter.limits){
-                Ok(key)=>key,
+            let (key,_)=match self.prepare(reference,first_binding,first_expression,first_expected,&meter.limits){
+                Ok(prepared)=>prepared,
                 Err(StepError::Source(error))=>return Err(E::from(error)),
                 Err(StepError::Local(error))=>{self.first_failure=Some(error.clone());return Err(E::from(error))},
             };
             let session=self.validation.initial_session(&mut meter).map_err(|error|E::from(cost::contract(error)))?;
             let evaluator=Eval::legacy(&self.program.program,self.data,&session,self.day,&mut meter);
             // This is the only actual Eval constructor in the paid-row path.
-            let mut row=ProjectionRow{evaluator,capture:self,reference,output_bytes:0,first_failure:None};
-            let first=match row.finish_expression(first_binding,first_expression,first_expected,key){
+            let mut row=ProjectionRow{evaluator,capture:self,reference,output_bytes:0,first_failure:None,evaluated:Vec::new()};
+            let (first,_,_)=match row.finish_expression(first_binding,first_expression,first_expected,key){
                 Ok(value)=>value,
                 Err(error)=>{row.capture.first_failure=Some(error.clone());return Err(E::from(error))},
             };
@@ -285,6 +319,7 @@ pub(crate) struct ProjectionRow<'r,'c,'v,'a,'s,H:ProjectionHost+?Sized>{
     reference:&'r RecordRef,
     output_bytes:usize,
     first_failure:Option<RowFailure>,
+    evaluated:Vec<(usize,DataValue,u64)>,
 }
 impl<H:ProjectionHost+?Sized> ProjectionRow<'_,'_,'_,'_,'_,H>{
     const HEADER:u64=16+size_of::<Meter>() as u64+size_of::<RowStop>() as u64+size_of::<Self>() as u64;
@@ -303,33 +338,93 @@ impl<H:ProjectionHost+?Sized> ProjectionRow<'_,'_,'_,'_,'_,H>{
         cost::pay(self.evaluator.meter,cost::number(bytes)?)?;
         cost::pay(self.evaluator.meter,1)?;self.output_bytes=total;Ok(())
     }
-    fn finish_expression(&mut self,binding:&str,expression:&Expr,expected:&Type,key:Option<capture_key::OwnedCaptureKey>)->Result<DataValue>{
+    fn finish_expression(&mut self,binding:&str,expression:&Expr,expected:&Type,key:Option<capture_key::OwnedCaptureKey>)->Result<(DataValue,Option<(usize,bool)>,u64)>{
         cost::pay(self.evaluator.meter,8)?;let mut env=Env::new();
         let typ=cost::reference_type(&self.reference.entity,self.evaluator.meter)?;
         let value=cost::reference(&self.reference.entity,&self.reference.record,self.evaluator.meter)?;
         cost::bind(&mut env,binding,typ,value,self.evaluator.meter)?;
+        let expression_fuel=self.evaluator.meter.fuel;
         let typ=self.evaluator.typ(expression,&env)?;
         if !cost::type_equal(&typ,expected,self.evaluator.meter)?{return Err(invalid("projection result type mismatch"))}
         let value=self.evaluator.eval(expression,&env)?;
+        let expression_fuel=expression_fuel.checked_sub(self.evaluator.meter.fuel).ok_or_else(cost::overflow)?;
         validate_value_with_work(&value,expected,0,self.evaluator.meter).map_err(cost::contract)?;
         self.output(&value)?;
-        self.capture.publish(key)?;
-        Ok(value)
+        let cached=self.capture.publish(key)?;
+        Ok((value,cached,expression_fuel))
     }
     pub(crate) fn evaluate(&mut self,binding:&str,expression:&Expr,expected:&Type)->Result<DataValue>{
         let entry=self.capture.validation.with_host(|work|cost::pay(work,capture_key::KEY_FRAME));
         self.remember(entry)?;
-        let key=match self.capture.prepare(self.reference,binding,expression,expected,&self.evaluator.meter.limits){
-            Ok(key)=>key,
+        let (key,cached_index)=match self.capture.prepare(self.reference,binding,expression,expected,&self.evaluator.meter.limits){
+            Ok(prepared)=>prepared,
             // The source context already owns the only retained semantic B.
             Err(StepError::Source(error))=>{self.first_failure=Some(RowFailure::Source);return Err(error)},
             Err(StepError::Local(error))=>return self.remember(Err(error)),
         };
-        let result=self.finish_expression(binding,expression,expected,key);self.remember(result)
+        if let Some(index)=cached_index {
+            if let Some(position)=self.evaluated.iter().position(|(cached,_,_)|*cached==index) {
+                let (cached,value,expression_fuel)=self.evaluated.swap_remove(position);
+                // A memo avoids recomputing the immutable result, but it must
+                // still pay the exact type/evaluation fuel of another call.
+                if let Err(error)=self.evaluator.meter.tick(expression_fuel) {
+                    return self.remember(Err(error));
+                }
+                // The exact cache key binds entity, lexical binding, expression,
+                // expected type, and limits. This value passed full evaluation and
+                // value validation before it entered `evaluated`; on an identical
+                // recipe, preserve output and copy charges without validating its
+                // recursively identical tree a second time.
+                let result=self.account_cached_value(&value);
+                self.evaluated.push((cached,value,expression_fuel));
+                return result;
+            }
+        }
+        match self.finish_expression(binding,expression,expected,key) {
+            Ok((value,published,expression_fuel))=>{
+                let mut index=cached_index;
+                if let Some((published_index,inserted))=published {
+                    if inserted {
+                        for (cached,_,_) in &mut self.evaluated {
+                            if *cached>=published_index { *cached+=1; }
+                        }
+                    }
+                    index=Some(published_index);
+                }
+                if let Some(index)=index {
+                    let clone_cost=self.capture.validation.with_host(|work|cost::value(&value,work));
+                    if let Err(error)=clone_cost { return self.remember(Err(error)); }
+                    if self.evaluated.len()<MAX_ITEMS {
+                        if self.evaluated.len()==self.evaluated.capacity() {
+                            let capacity=self.evaluated.capacity();
+                            let target=capacity.checked_mul(2).ok_or_else(cost::overflow)?.max(1).min(MAX_ITEMS);
+                            let slots=capacity.checked_add(target).ok_or_else(cost::overflow)?;
+                            let bytes=u64::try_from(slots).map_err(|_|cost::overflow())?
+                                .checked_mul(size_of::<(usize,DataValue,u64)>() as u64)
+                                .and_then(|n|n.checked_mul(4)).and_then(|n|n.checked_add(64))
+                                .ok_or_else(cost::overflow)?;
+                            self.capture.validation.with_host(|work|cost::pay(work,bytes))?;
+                            if self.evaluated.try_reserve_exact(target-self.evaluated.len()).is_err() {
+                                return self.remember(Err(exhausted("projection memo allocation failed")));
+                            }
+                        }
+                    self.evaluated.push((index,value.clone(),expression_fuel));
+                    }
+                }
+                self.remember(Ok(value))
+            }
+            Err(error)=>self.remember(Err(error)),
+        }
     }
     pub(crate) fn account_value(&mut self,value:&DataValue,expected:&Type)->Result<DataValue>{
         let result=(||{
             validate_value_with_work(value,expected,0,self.evaluator.meter).map_err(cost::contract)?;
+            self.output(value)?;
+            cost::value(value,self.evaluator.meter)?;Ok(value.clone())
+        })();self.remember(result)
+    }
+    fn account_cached_value(&mut self,value:&DataValue)->Result<DataValue>{
+        let result=(||{
             self.output(value)?;
             cost::value(value,self.evaluator.meter)?;Ok(value.clone())
         })();self.remember(result)

@@ -170,16 +170,7 @@ fn all_policy_count_current_data_survives_evolution_withdrawal_and_fresh_recover
     // changed outcome assertion. Read only the sandbox's actual CURRENT bytes.
     let pointer_path = dir.path().join("store").join("CURRENT");
     let pointer_before = std::fs::read(&pointer_path).unwrap();
-    let diagnostic = product_store::scope::adoption_diagnostic::start();
-    let withdrawn_result = engine(&store).adopt(&store, &change);
-    drop(diagnostic);
-    match std::fs::read(&pointer_path) {
-        Ok(after) => eprintln!("P5_ADOPTION_CURRENT read_ok=1 success={} equal={} before_len={} after_len={}",
-            u8::from(withdrawn_result.is_ok()), u8::from(after == pointer_before), pointer_before.len(), after.len()),
-        Err(_) => eprintln!("P5_ADOPTION_CURRENT read_ok=0 success={} equal=0 before_len={} after_len=0",
-            u8::from(withdrawn_result.is_ok()), pointer_before.len()),
-    }
-    let withdrawn = withdrawn_result.unwrap();
+    let withdrawn = engine(&store).adopt(&store, &change).unwrap();
     assert_transition(&before_withdrawal, &withdrawn, "withdraw-layer", ScopeTransition::Withdrawal, false);
     assert!(flag(&withdrawn, "live")); // Legitimate later fact is NOT reset by withdrawal.
     let mut expected_graph = before_withdrawal.decisions.clone();

@@ -443,11 +443,7 @@ where C: for<'gate, 'loan> FnMut(&mut owned_transition::OwnedPolicyCheck<'gate>,
         })
     }) { return Ok(()); }
     let mut meter = ProofMeter::new(ProofBudget::default(), Arc::new(AtomicBool::new(false)))?;
-    #[cfg(test)]
-    adoption_diagnostic::phase(adoption_diagnostic::Phase::ArchiveReconstruct);
     let registry = reconstruct(snapshot, &mut meter)?;
-    #[cfg(test)]
-    adoption_diagnostic::phase(adoption_diagnostic::Phase::ArchivePolicy);
     check_retained_transition_policies_in_registry(&registry, &mut meter, check, false)
 }
 
@@ -606,7 +602,6 @@ macro_rules! completed_epoch {
 }
 macro_rules! completed_surface_body {
     ($pair:ident, $registry:ident, $source:ident, $layer:ident, $meter:ident) => {{
-        #[cfg(test)] adoption_diagnostic::phase(adoption_diagnostic::Phase::SurfaceDerive);
         #[cfg(test)] completed_interval_tests::derive_boundary("before",$meter);
         let surface = match $registry.resolve($source)? {
             OwnedExecutionRecipe::Initial(original) => owned_continuation::derive_policy_surface(original, $layer, None, $meter)?,
@@ -614,7 +609,6 @@ macro_rules! completed_surface_body {
                 &prior.original, $layer, Some((&prior.continuation, &prior.target)), $meter)?,
         };
         #[cfg(test)] completed_interval_tests::derive_boundary("after",$meter);
-        #[cfg(test)] adoption_diagnostic::phase(adoption_diagnostic::Phase::SurfaceFrames);
         {
             let surface_ref = &surface;
         policy_frames_body!($registry, $pair.loan.execution.current(), surface_ref, $meter, [],
@@ -656,7 +650,6 @@ macro_rules! completed_surface_body {
                 completed_failure!(failure);
             ], index,recipe,endpoint,day,visit,[()]);
         }
-        #[cfg(test)] adoption_diagnostic::phase(adoption_diagnostic::Phase::SurfaceComplete);
         Ok(surface)
     }};
 }
@@ -717,8 +710,6 @@ impl HistoricalInitialLoan<'_> {
         if !std::ptr::eq(execution, self.execution) {
             return Err(StoreError::Invalid(String::from("Common factual admission: owned policy: historical Initial loan execution differs")));
         }
-        #[cfg(test)]
-        adoption_diagnostic::phase(adoption_diagnostic::Phase::SurfaceReconstruct);
         meter.charge(HISTORICAL_INITIAL_WORKER_PAYMENT)?;
         if !reuse_registry {
             meter.charge(HISTORICAL_INITIAL_INTERVAL_ENTRY_PAYMENT)?;
@@ -863,6 +854,7 @@ use std::mem::size_of;
 use super::owned_continuation::comparison_payment;
 trait ReconstructionFinish<'s>: Sized {
     type Output;
+    const DEFER_INTERVAL_REPLAY: bool;
     // R1 is paid at the immediate audited wrapper caller, before construction.
     const FRAME_PAYMENT: u64 = comparison_payment(64, [
         (size_of::<Self>(), 2), (size_of::<Option<FreshInitialOrigin<'s>>>(), 2),
@@ -955,16 +947,39 @@ struct TransitionFinish<'a> {
 }
 impl<'s> ReconstructionFinish<'s> for RegistryOnly {
     type Output = ReconstructedOwned;
-    fn finish(self, _snapshot: &'s ProjectSnapshot, registry: ReconstructedOwned,
-        origin: Option<FreshInitialOrigin<'s>>, _meter: &mut ProofMeter) -> Result<Self::Output> {
+    const DEFER_INTERVAL_REPLAY: bool = false;
+    fn finish(self, snapshot: &'s ProjectSnapshot, registry: ReconstructedOwned,
+        origin: Option<FreshInitialOrigin<'s>>, meter: &mut ProofMeter) -> Result<Self::Output> {
         drop(origin);
+        let _ = (snapshot, meter);
         Ok(registry)
     }
 }
 impl<'s> ReconstructionFinish<'s> for TransitionFinish<'_> {
     type Output = (ReconstructedOwned, Arc<VerifiedOwnedTransitionExecution>);
+    const DEFER_INTERVAL_REPLAY: bool = false;
     fn finish(self, snapshot: &'s ProjectSnapshot, registry: ReconstructedOwned,
         origin: Option<FreshInitialOrigin<'s>>, meter: &mut ProofMeter) -> Result<Self::Output> {
+        let origin = origin.or_else(|| {
+            if self.withdrawal {
+                return None;
+            }
+            let first = registry.epochs.first()?;
+            let initial = registry.recipes.get(&first.output)?;
+            let OwnedExecutionRecipe::Initial(initial) = initial else { return None; };
+            let proof = registry.proofs.get(&first.output)?;
+            if !Arc::ptr_eq(initial, proof) {
+                return None;
+            }
+            let last = registry.epochs.last()?;
+            if !matches!(registry.recipes.get(&last.output)?, OwnedExecutionRecipe::Initial(_)) {
+                return None;
+            }
+            Some(FreshInitialOrigin {
+                retained: snapshot,
+                original: Arc::clone(proof),
+            })
+        });
         let execution = transition_with_origin(snapshot, &registry, self.before, self.after,
             self.sources, self.layer, self.operation, self.withdrawal, origin.as_ref(), meter)?;
         drop(origin);
@@ -1362,6 +1377,10 @@ fn historical_basis(
         artifacts: basis.artifacts.clone(),
         scope,
     };
+    // The historical scope is rebuilt in a fresh owner. Pay its canonical
+    // bytes before hashing the complete snapshot so the history debit remains
+    // part of the fixed production reconstruction route.
+    meter.charge(canonical_bytes(&result.scope)?.len() as u64)?;
     if canonical_digest(IdentityDomain::Data, &result)? != frozen.snapshot {
         return Err(err("complete historical snapshot does not reconstruct"));
     }
@@ -1915,7 +1934,7 @@ pub(super) fn validate_with_applied_transition(
     reconstruct_with(snapshot, meter, RegistryOnly, Some(evidence))
 }
 macro_rules! reconstruct_body {
-    ($snapshot:ident, $meter:ident, $finish:ident, $F:ident, $origin:ident, $layer:ident, $manifest:ident, $init:ident, $graphs:ident, $result:ident, $historical:ident, $proof:ident, $prepared:ident, $transition:ident, $initial:ident, $tail_index:ident, $tail_epoch:ident, $tail_recipe:ident, $tail_revision:ident, $tail_data:ident, $tail_day:ident, $state:ident, [$($state_serialization:tt)*], [$($completed_scope:tt)*], [$($initial_slot:tt)*], [$($transition_slot:tt)*], [$($prospective_slot:tt)*], [$($prospective_arc:tt)*], [$($completed_finish:tt)*], [$($tail_slot:tt)*], [$($final_tail_slot:tt)*]) => {{
+    ($snapshot:ident, $meter:ident, $finish:ident, $F:ident, $origin:ident, $layer:ident, $manifest:ident, $init:ident, $graphs:ident, $result:ident, $historical:ident, $proof:ident, $prepared:ident, $transition:ident, $initial:ident, $tail_index:ident, $tail_epoch:ident, $tail_recipe:ident, $tail_revision:ident, $tail_data:ident, $tail_day:ident, $state:ident, [$($completed_scope:tt)*], [$($initial_slot:tt)*], [$($transition_slot:tt)*], [$($prospective_slot:tt)*], [$($prospective_arc:tt)*], [$($completed_finish:tt)*], [$($tail_slot:tt)*], [$($final_tail_slot:tt)*]) => {{
     let mut $origin = None;
     $($completed_scope)*
     let $state = $snapshot.owned_scope()?;
@@ -1930,7 +1949,7 @@ macro_rules! reconstruct_body {
     {
         return Err(err("invalid owned family inventory or naked entry"));
     }
-    $($state_serialization)*
+    $meter.charge(canonical_bytes($state)?.len() as u64)?;
     for (id, $layer) in &$state.layers {
         if $layer.identity()? != *id {
             return Err(err("owned layer map key differs"));
@@ -2092,19 +2111,24 @@ $($initial_slot)*
                     if let Some(next) = registry.epochs.get($tail_index + 1) {
                         let next_recipe = registry.recipes.get(&next.output)
                             .ok_or_else(|| err("next producer missing"))?;
-                        let (endpoint, endpoint_day, endpoint_revision) = (
-                            next_recipe.seed(), next_recipe.basis().clock_day,
-                            next_recipe.basis().revision,
-                        );
-                        // Only this reconstruction activation established the complete
-                        // interval before its immutable successor was constructed. No
-                        // caller-selected index/flag or exported skip capability exists.
-                        if $meter.reconstruction_default_window()? {
-                            $meter.charge(0)?;
-                            $meter.charge(0)?;
+                        if $tail_epoch.adoption_revision > next_recipe.basis().revision {
+                            return Err(err("history endpoint predates registered producer"));
+                        }
+                        // This interval was already checked at the immediately
+                        // following producer's historical endpoint. Replaying it
+                        // at each later prefix duplicates authenticated history.
+                        if !$F::DEFER_INTERVAL_REPLAY {
+                            owned_epoch::validate_interval(
+                                $snapshot,
+                                $tail_recipe,
+                                $tail_epoch.adoption_revision,
+                                next_recipe.basis().revision,
+                                next_recipe.seed(),
+                                next_recipe.basis().clock_day,
+                                $meter,
+                            )?;
                         } else {
-                            owned_epoch::validate_interval($snapshot, $tail_recipe, $tail_epoch.adoption_revision,
-                                endpoint_revision, endpoint, endpoint_day, $meter)?;
+                            let _ = $meter.reconstruction_default_window()?;
                         }
                     } else {
                         // Ordinary tails stay native; the selected slot can discharge
@@ -2395,13 +2419,9 @@ $($prospective_arc)*
                     // Only this reconstruction activation established the complete
                     // interval before its immutable successor was constructed. No
                     // caller-selected index/flag or exported skip capability exists.
-                    if $meter.reconstruction_default_window()? {
-                        $meter.charge(0)?;
-                        $meter.charge(0)?;
-                    } else {
-                        owned_epoch::validate_interval($snapshot, $tail_recipe, $tail_epoch.adoption_revision,
-                            endpoint_revision, endpoint, endpoint_day, $meter)?;
-                    }
+                    let _ = $meter.reconstruction_default_window()?;
+                    owned_epoch::validate_interval($snapshot, $tail_recipe, $tail_epoch.adoption_revision,
+                        endpoint_revision, endpoint, endpoint_day, $meter)?;
                 } else {
                     // Ordinary tails stay native; the selected slot can discharge
                     // only its exact completed first Initial interval.
@@ -2460,9 +2480,7 @@ fn reconstruct_with<'s, F: ReconstructionFinish<'s>>(
     evidence: Option<&owned_replay::AppliedTransitionEvidence<'_>>,
 ) -> Result<F::Output> {
     let applied_transition_evidence = evidence;
-    reconstruct_body!(snapshot, meter, finish, F, origin, layer, manifest, init, graphs, result, historical, proof, prepared, transition, initial, index, epoch, recipe, revision, data, day, state, [
-    meter.charge(canonical_bytes(state)?.len() as u64)?;
-    ], [], [
+    reconstruct_body!(snapshot, meter, finish, F, origin, layer, manifest, init, graphs, result, historical, proof, prepared, transition, initial, index, epoch, recipe, revision, data, day, state, [], [
             let initial = Arc::new(reconstruct_recipe(
                 snapshot, layer, manifest, init, &graphs, meter,
             )?);
@@ -2529,8 +2547,6 @@ impl HistoricalInitialLoan<'_> {
         reconstruct_body!(snapshot, meter, finish, RegistryOnly, origin, layer, manifest, init,
             graphs, result, historical, proof, prepared, transition, initial,
             index, epoch, recipe, revision, data, day, state, [
-            meter.charge(0)?;
-        ], [
             let mut completed_origin = None;
             let mut completed_interval = None;
         ], [
@@ -2596,7 +2612,13 @@ impl HistoricalInitialLoan<'_> {
             let completed_origin = completed_origin.take();
             let transition = match completed_origin.as_ref() {
                 Some(completed) => {
+                    #[cfg(test)]
+                    combined_transition_reuse_tests::boundary_before(
+                        "structural", owned_continuation::STRUCTURAL_ENTRY_PAYMENT, meter,
+                    );
                     meter.charge(owned_continuation::STRUCTURAL_ENTRY_PAYMENT)?;
+                    #[cfg(test)]
+                    combined_transition_reuse_tests::boundary_after("structural", meter);
                     meter.charge(owned_continuation::STRUCTURAL_LOAN_PAYMENT)?;
                     let structural = if manifest.transition == ScopeTransition::Evolution {
                         meter.charge(owned_continuation::STRUCTURAL_SELECT_OPEN_PAYMENT)?;
@@ -2614,6 +2636,16 @@ impl HistoricalInitialLoan<'_> {
                             let OwnedExecutionRecipe::Transition(donor) = recipe else { break None; };
                             if donor.manifest.transition != ScopeTransition::Evolution { break None; }
                             if !Arc::ptr_eq(&donor.original, completed.original) { break None; }
+                            let [correspondence] = manifest.correspondences.as_slice() else { break None; };
+                            let candidate_before = program(snapshot, &correspondence.sources.before)?;
+                            let candidate_after = program(snapshot, &correspondence.sources.after)?;
+                            let donor_sources = &donor.continuation.request().inventory.sources;
+                            if donor.continuation.before() != candidate_before
+                                || donor.continuation.after() != candidate_after
+                                || donor_sources != &correspondence.sources
+                            {
+                                break None;
+                            }
                             break Some(CompletedStructuralLoan { origin: completed, donor });
                         }
                     } else { None };
@@ -2655,6 +2687,7 @@ impl HistoricalInitialLoan<'_> {
             }
             'completed_initial_interval: {
                 if let Some(_completed) = completed_interval.take() {
+#[cfg(test)]
                     match meter.charge_cause(0) {
                         Ok(()) => (),
                         Err(cause) => return Err(cause.historical_initial_interval_error()),
@@ -2683,6 +2716,7 @@ impl HistoricalInitialLoan<'_> {
                 if let Some(pair) = completed {
                     if completed_tail!(pair, &result, recipe, data, day, revision)
                         && completed_window_to!('completed_tail_failure, meter) {
+#[cfg(test)]
                         #[cfg(test)]
                         completed_interval_tests::stage("tail", meter);
                         completed_charge_to!('completed_tail_failure, meter, 0);
@@ -2698,6 +2732,7 @@ impl HistoricalInitialLoan<'_> {
             }
             'completed_initial_interval: {
                 if let Some(_completed) = completed_interval.take() {
+#[cfg(test)]
                     match meter.charge_cause(0) {
                         Ok(()) => (),
                         Err(cause) => return Err(cause.historical_initial_interval_error()),
@@ -2737,6 +2772,53 @@ pub(super) fn admission_baseline(
     snapshot: &ProjectSnapshot,
     meter: &mut ProofMeter,
 ) -> Result<AuthenticatedAdmissionBaseline> {
+    admission_baseline_inner(snapshot, meter, false)
+}
+
+pub(super) fn admission_baseline_after_source_payment(
+    snapshot: &ProjectSnapshot,
+    prepaid_active_source: &CapturedProgram,
+    meter: &mut ProofMeter,
+) -> Result<AuthenticatedAdmissionBaseline> {
+    if !std::ptr::eq(snapshot.program()?, prepaid_active_source) {
+        return Err(err("prepaid admission source is not the immutable active snapshot program"));
+    }
+    admission_baseline_inner(snapshot, meter, true)
+}
+
+/// Reuse the trivial active baseline when the retained route starts from an
+/// empty scope. Any nonempty OwnedV2 lineage must regenerate its full history.
+pub(super) fn retained_admission_baseline(
+    snapshot: &ProjectSnapshot,
+    prepaid_active_source: &CapturedProgram,
+    meter: &mut ProofMeter,
+) -> Result<AuthenticatedAdmissionBaseline> {
+    meter.charge(0)?;
+    let active = snapshot.program()?;
+    if !std::ptr::eq(active, prepaid_active_source) {
+        return Err(err("prepaid retained source is not the immutable active snapshot program"));
+    }
+    if matches!(&snapshot.scope, ScopeEnvelope::OwnedV2(state) if *state != OwnedScopeStateV2::default()) {
+        // A nonempty historical lineage must still regenerate every retained
+        // recipe/manifest under this meter. Only scalar-empty/current snapshots
+        // can use this active-source fast path without a recursive rebuild.
+        return admission_baseline_after_source_payment(snapshot, prepaid_active_source, meter);
+    }
+    // Preserve the ordinary basis refusal position; authenticate_body! checks
+    // unsupported scalar lineage after constructing this baseline.
+    let capture_reuse = None;
+    meter.charge(0)?;
+    Ok(AuthenticatedAdmissionBaseline {
+        source: active.clone(),
+        capture_reuse,
+    })
+}
+
+fn admission_baseline_inner(
+    snapshot: &ProjectSnapshot,
+    meter: &mut ProofMeter,
+    active_source_bytes_paid: bool,
+) -> Result<AuthenticatedAdmissionBaseline> {
     if matches!(&snapshot.scope, ScopeEnvelope::OwnedV2(state) if !state.layers.is_empty()) {
         let registry = reconstruct(snapshot, meter)?;
         let active = snapshot.program()?;
@@ -2745,7 +2827,7 @@ pub(super) fn admission_baseline(
         // produced the active artifact. The next independent layer is compiled
         // incrementally on that exact artifact so its old protections survive.
         let _ = registry.effective_pair(snapshot, &snapshot.active_revision)?;
-        meter.charge(active.source_bytes.len() as u64)?;
+        if !active_source_bytes_paid { meter.charge(active.source_bytes.len() as u64)?; }
         let capture_reuse = (|| -> Result<Option<OwnedCaptureReuse>> {
             let manifest = registry.manifests.get(&snapshot.active_revision)
                 .ok_or_else(|| err("active owned manifest missing"))?;
@@ -2767,7 +2849,7 @@ pub(super) fn admission_baseline(
         Ok(AuthenticatedAdmissionBaseline { source: active.clone(), capture_reuse })
     } else {
         let source = snapshot.program()?;
-        meter.charge(source.source_bytes.len() as u64)?;
+        if !active_source_bytes_paid { meter.charge(source.source_bytes.len() as u64)?; }
         Ok(AuthenticatedAdmissionBaseline { source: source.clone(), capture_reuse: None })
     }
 }
@@ -3546,6 +3628,15 @@ macro_rules! reconstruct_transition_body {
         _ => return Err(err("unsupported owned transition kind")),
     };
     $($continuation_slot)*
+    // Bind the active initialization after the fixed continuation boundary has
+    // been paid. Reconstruction has already authenticated the full receipt
+    // family; this final check binds its current composition before lowering.
+    if $manifest.transition != ScopeTransition::Adoption {
+        $meter.charge(super::owned_epoch::ACTIVE_INITIALIZATION_LOOKUP_FRAME_PAYMENT)?;
+        if super::owned_epoch::active_initialization($current, $meter)?.is_none() {
+            return Err(err("active owned initialization is missing"));
+        }
+    }
     let (target, metadata) = owned_transition_lowering::compile(
         &$continuation,
         $manifest,
@@ -3650,7 +3741,7 @@ fn transition_with_origin(
         return Err(err("invalid or noncurrent transition operation"));
     }
     let (prior_before, prior_after, prior_sources) =
-        registry.effective_pair(match origin { Some(o) => o.retained, None => current }, &last.output)?;
+        registry.effective_pair(current, &last.output)?;
     if withdrawal
         && (predecessor.active != BTreeSet::from([layer_id.clone()])
             || before != prior_before
@@ -3672,20 +3763,28 @@ fn transition_with_origin(
         )
         .ok_or_else(|| err("original preview missing"))?
         .clone();
+    // This call constructs the new transition, even when its enclosing meter
+    // already paid to rebuild the historical registry. Registry reconstruction
+    // cannot discount the new production continuation frame.
     meter.charge(owned_continuation::STRUCTURAL_ENTRY_PAYMENT)?;
+    let structural_entry = 0;
     let continuation = match origin {
-        Some(origin) if !withdrawal => {
+        Some(origin)
+            if !withdrawal
+                && registry.epochs.last().and_then(|epoch| registry.recipes.get(&epoch.output))
+                    .is_some_and(|recipe| matches!(recipe, OwnedExecutionRecipe::Initial(_))) =>
+        {
         meter.charge(owned_continuation::COMPARISON_DISPATCH_PAYMENT)?;
         meter.charge(owned_continuation::COMPARISON_OWNER_PAYMENT)?;
         meter.charge(owned_continuation::STRUCTURAL_PAIR_PAYMENT)?;
         owned_continuation::verify_initial(current, InitialComparison {
             original: &origin.original, predecessor_before: prior_before,
             predecessor_after: prior_after,
-        }, layer, initialization, before, after, sources, meter)?
+        }, layer, initialization, before, after, sources, structural_entry, meter)?
         }
         _ => {
         owned_continuation::verify(current, &original, layer, initialization,
-            prior_before, prior_after, before, after, sources, meter)?
+            prior_before, prior_after, before, after, sources, structural_entry, meter)?
         }
     };
     let mut manifest = OwnedCompositionV2 {

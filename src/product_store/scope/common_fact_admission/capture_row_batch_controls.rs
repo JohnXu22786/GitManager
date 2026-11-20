@@ -290,7 +290,7 @@ fn frozen_capture_frame_before_row_batch(
             entity: row.entity.clone(),
             record: row.id.clone(),
         };
-        let completed = runtime.evaluate_record_projection_with(
+        let completed = runtime.evaluate_record_projection_before_extension_refactor_with(
             &mut checks,
             meter.runtime()?,
             baseline,
@@ -313,7 +313,7 @@ fn frozen_capture_frame_before_row_batch(
         let mut values = Values::new();
         for projection in projections {
             let value = if let Some(expr) = &projection.baseline {
-                runtime.evaluate_record_projection_with(
+                runtime.evaluate_record_projection_before_extension_refactor_with(
                     &mut checks,
                     meter.runtime()?,
                     baseline,

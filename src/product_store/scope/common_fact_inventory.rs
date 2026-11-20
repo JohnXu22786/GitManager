@@ -385,7 +385,7 @@ pub(super) fn derive_pair(
 ) -> Result<CommonFactInventory> {
     let basis = canonical_digest(IdentityDomain::Data, snapshot)?;
     if basis != request.snapshot {
-        return Err(error("stale authenticated current frame"));
+        return Err(error("stale authenticated snapshot/source basis"));
     }
     derive_pair_inner(snapshot, baseline, candidate, request, basis)
 }

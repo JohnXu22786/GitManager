@@ -499,6 +499,71 @@ pub(super) fn event_revision(prepared: &OwnedExecutionRecipe, values: &Values, p
     }
     Ok(actual)
 }
+type InitializationRowWrites = BTreeMap<u64, BTreeMap<String, BTreeMap<String, u64>>>;
+
+/// Authenticate each initialization's original event prefix once, then build
+/// the exact per-row write deltas used by the final revision comparison. The
+/// old per-row helper reserialized the same prefix and rescanned the same event
+/// frames for every owned record, although neither input changes during one
+/// replay. All indexing, comparisons, copies, and map entries remain charged.
+pub(super) fn initialization_row_writes(
+    initializations: &[&OwnedInitializationV2],
+    events: &[crate::product_contract::BusinessEvent],
+    start_revision: u64,
+    end_revision: u64,
+    meter: &mut ProofMeter,
+) -> Result<InitializationRowWrites> {
+    let mut result = InitializationRowWrites::new();
+    for initialization in initializations {
+        meter.charge(1)?;
+        if initialization.adoption_revision <= start_revision
+            || initialization.adoption_revision > end_revision
+        {
+            continue;
+        }
+        let event_count = usize::try_from(initialization.original_event_count)
+            .map_err(|_| err("initialization event count overflow"))?;
+        let Some(prefix) = events.get(..event_count) else {
+            return Err(err("initialization event prefix is absent"));
+        };
+        // The caller has already paid the complete current DataSnapshot's
+        // canonical byte length before building this index. The authenticated
+        // prefix is a bounded slice of that same event owner, so reuse that
+        // byte debit instead of charging its same bytes a second time.
+        if canonical_digest(IdentityDomain::Data, &prefix)? != initialization.original_events {
+            return Err(err("initialization event prefix differs from authenticated history"));
+        }
+        meter.charge(4 + std::mem::size_of::<BTreeMap<String, BTreeMap<String, u64>>>() as u64)?;
+        let mut rows = BTreeMap::<String, BTreeMap<String, u64>>::new();
+        for event in events {
+            meter.charge(1)?;
+            if event.sequence <= initialization.original_event_count as u64 {
+                continue;
+            }
+            for change in &event.changes {
+                meter.charge(1 + change.entity.len() as u64 + change.record.len() as u64)?;
+                let writes = rows
+                    .get_mut(&change.entity)
+                    .and_then(|records| records.get_mut(&change.record));
+                if let Some(writes) = writes {
+                    *writes = writes.checked_add(1)
+                        .ok_or_else(|| err("initialization event write count overflow"))?;
+                    continue;
+                }
+                // Pay the owned key copies and map node before allocating them.
+                meter.charge(4 + std::mem::size_of::<String>() as u64 * 2)?;
+                let records = rows.entry(change.entity.clone()).or_default();
+                records.insert(change.record.clone(), 1);
+            }
+        }
+        meter.charge(4 + std::mem::size_of::<u64>() as u64
+            + std::mem::size_of::<BTreeMap<String, BTreeMap<String, u64>>>() as u64)?;
+        if result.insert(initialization.adoption_revision, rows).is_some() {
+            return Err(err("duplicate initialization revision in authenticated history"));
+        }
+    }
+    Ok(result)
+}
 /// Rebuild every event's exact value frame before checking new seals. Evaluating
 /// against the final shared facts would silently rewrite completed history.
 pub(super) fn validate_history(
@@ -532,16 +597,35 @@ pub(super) fn validate_recipe_history_from(
 /// owner validation. It cannot replace or skip any history proof.
 macro_rules! recipe_history_body {
     ($prepared:ident, $seed:expr, $seed_day:expr, $data:expr, $day:expr, $meter:expr,
+     [$($seed_call:tt)*], [$($row_call:tt)*], [$($event_call:tt)*], [$($final_call:tt)*], $frame:ident, $row:ident, $old:ident, $event:ident,
+     [$($serialization:tt)*]) => {
+        crate::product_store::scope::owned_replay::recipe_history_body!($prepared, $seed, $seed_day, $data, $day, $meter,
+            [$($seed_call)*], [$($row_call)*], [$($event_call)*], [$($final_call)*], $frame, $row, $old, $event,
+            &[] as &[&OwnedInitializationV2], None as Option<&OwnedInitializationV2>, 0u64, 0u64, [$($serialization)*])
+    };
+    ($prepared:ident, $seed:expr, $seed_day:expr, $data:expr, $day:expr, $meter:expr,
      [$($seed_call:tt)*], [$($row_call:tt)*], [$($event_call:tt)*], [$($final_call:tt)*], $frame:ident, $row:ident, $old:ident, $event:ident) => {
         crate::product_store::scope::owned_replay::recipe_history_body!($prepared, $seed, $seed_day, $data, $day, $meter,
             [$($seed_call)*], [$($row_call)*], [$($event_call)*], [$($final_call)*], $frame, $row, $old, $event,
+            &[] as &[&OwnedInitializationV2], None as Option<&OwnedInitializationV2>, 0u64, 0u64, [$meter.charge(canonical_bytes($data)?.len() as u64)?;])
+    };
+    ($prepared:ident, $seed:expr, $seed_day:expr, $data:expr, $day:expr, $meter:expr,
+     [$($seed_call:tt)*], [$($row_call:tt)*], [$($event_call:tt)*], [$($final_call:tt)*], $frame:ident, $row:ident, $old:ident, $event:ident,
+     $initializations:expr, $active_initialization:expr, $start_revision:expr, $end_revision:expr) => {
+        crate::product_store::scope::owned_replay::recipe_history_body!($prepared, $seed, $seed_day, $data, $day, $meter,
+            [$($seed_call)*], [$($row_call)*], [$($event_call)*], [$($final_call)*], $frame, $row, $old, $event,
+            $initializations, $active_initialization, $start_revision, $end_revision,
             [$meter.charge(canonical_bytes($data)?.len() as u64)?;])
     };
     ($prepared:ident, $seed:expr, $seed_day:expr, $data:expr, $day:expr, $meter:expr,
      [$($seed_call:tt)*], [$($row_call:tt)*], [$($event_call:tt)*], [$($final_call:tt)*], $frame:ident, $row:ident, $old:ident, $event:ident,
+     $initializations:expr, $active_initialization:expr, $start_revision:expr, $end_revision:expr,
      [$($serialization:tt)*]) => {{
     $($serialization)*
     $data.validate()?;
+    let initialization_writes = crate::product_store::scope::owned_replay::initialization_row_writes(
+        $initializations, &$data.events, $start_revision, $end_revision, $meter,
+    )?;
     validate_day($day)?;
     if $data.schema != $seed.schema
         || $data.project_id != $seed.project_id
@@ -749,22 +833,58 @@ macro_rules! recipe_history_body {
             .iter()
             .find(|r| r.entity == expected.entity && r.id == expected.id)
             .ok_or_else(|| crate::product_store::scope::owned_replay::err("retained record missing"))?;
+        let is_owned = crate::product_store::scope::owned_replay::owned_entity($prepared, &expected.entity);
         if actual.values != expected.values
             || actual.archived != expected.archived
             || actual.created_program != expected.created_program
-            || actual.revision < expected.revision
+            || if is_owned {
+                actual.revision < expected.revision
+            } else {
+                actual.revision != expected.revision
+            }
         {
             return Err(crate::product_store::scope::owned_replay::err("current row differs from authenticated event history"));
         }
-        // Owned revision stamps are emitted in the same actual business Update,
-        // including the completion capture Update. They add no write or ordinal.
-        if crate::product_store::scope::owned_replay::owned_entity($prepared, &expected.entity)
-            && (actual.revision != expected.revision
-                || actual.revision > (i64::MAX as u64).saturating_sub(10_000_000))
-        {
-            return Err(crate::product_store::scope::owned_replay::err(
-                "current owned revision differs from its exact protected history",
-            ));
+        // A later owned layer can advance the row's store revision while it
+        // initializes fields. That allowance comes only from this authenticated
+        // recipe's exact initialization additions for the same record.
+        if is_owned {
+            let later_initialization_advance = $initializations
+                .iter()
+                .filter(|initialization| {
+                    (initialization.adoption_revision > $start_revision
+                        )
+                        && initialization.adoption_revision <= $end_revision
+                })
+                .try_fold(0u64, |total, initialization| {
+                    let advance = if initialization.additions.iter().any(|addition|
+                        addition.record.entity == expected.entity
+                            && addition.record.record == expected.id)
+                    {
+                        $meter.charge(3)?;
+                        initialization_writes
+                            .get(&initialization.adoption_revision)
+                            .and_then(|rows| rows.get(&expected.entity))
+                            .and_then(|records| records.get(&expected.id))
+                            .copied()
+                            .unwrap_or(0)
+                    } else { 0 };
+                    total
+                        .checked_add(advance)
+                        .ok_or_else(|| crate::product_store::scope::owned_replay::err("initialized row revision overflow"))
+                })
+                ?;
+            let expected_revision = expected
+                .revision
+                .checked_add(later_initialization_advance)
+                .ok_or_else(|| crate::product_store::scope::owned_replay::err("initialized row revision overflow"))?;
+            if actual.revision != expected_revision
+                || actual.revision > (i64::MAX as u64).saturating_sub(10_000_000)
+            {
+                return Err(crate::product_store::scope::owned_replay::err(
+                    "current owned revision differs from event history and authenticated initialization",
+                ));
+            }
         }
         // Initial sealed rows never receive any business write at all.
         if $seed.records.iter().any(|r| {
@@ -792,9 +912,37 @@ pub(super) fn validate_recipe_history_with(
     meter: &mut ProofMeter,
     visit: &mut dyn FnMut(&DataSnapshot, &mut ProofMeter) -> Result<()>,
 ) -> Result<()> {
+    validate_recipe_history_with_initializations(
+        prepared,
+        seed,
+        seed_day,
+        data,
+        day,
+        meter,
+        &[],
+        None,
+        0,
+        0,
+        visit,
+    )
+}
+pub(super) fn validate_recipe_history_with_initializations(
+    prepared: &OwnedExecutionRecipe,
+    seed: &DataSnapshot,
+    seed_day: i32,
+    data: &DataSnapshot,
+    day: i32,
+    meter: &mut ProofMeter,
+    initializations: &[&OwnedInitializationV2],
+    _active_initialization: Option<&OwnedInitializationV2>,
+    start_revision: u64,
+    end_revision: u64,
+    visit: &mut dyn FnMut(&DataSnapshot, &mut ProofMeter) -> Result<()>,
+) -> Result<()> {
     recipe_history_body!(prepared, seed, seed_day, data, day, meter,
         [visit(seed, meter)?;], [protected_row(prepared, &frame, row, old, event.day, meter)?;],
-        [visit(&frame, meter)?;], [visit(data, meter)], frame, row, old, event)
+        [visit(&frame, meter)?;], [visit(data, meter)], frame, row, old, event,
+        initializations, _active_initialization, start_revision, end_revision)
 }
 
 #[derive(Clone)]
@@ -1184,9 +1332,9 @@ impl OwnedExecutionContext {
             ));
         }
         if let Some(recipe) = self.prepared(target)? {
-            if original.session != recipe.basis().session || original.random_seed != 0 {
+            if original.session != recipe.basis().session {
                 return Err(err(
-                    "new owned experience changed its exact session/random frame",
+                    "new owned experience changed its exact session frame",
                 ));
             }
         }
@@ -1212,7 +1360,6 @@ impl OwnedExecutionContext {
         if scenario.seed == *recipe.seed()
             && scenario.session == recipe.basis().session
             && scenario.clock_day == recipe.basis().clock_day
-            && scenario.random_seed == 0
         {
             if let OwnedExecutionRecipe::Initial(p) = recipe {
                 original.seed = p.proof.snapshot.data.clone();
@@ -1221,9 +1368,8 @@ impl OwnedExecutionContext {
             || scenario.seed != self.snapshot.data
             || scenario.session != self.snapshot.session
             || scenario.clock_day != self.snapshot.clock_day
-            || scenario.random_seed != 0
         {
-            return Err(err("owned replay session/day/random frame changed"));
+            return Err(err("owned replay seed/session/day frame changed"));
         }
         let target_identity = revision(target)?;
         for receipt in self
@@ -1410,9 +1556,8 @@ impl OwnedExecutionContext {
             || scenario.seed != self.snapshot.data
             || scenario.session != self.snapshot.session
             || scenario.clock_day != self.snapshot.clock_day
-            || scenario.random_seed != 0
         {
-            return Err(err("append-only candidate replay frame differs from current owned basis"));
+            return Err(err("append-only candidate seed/session/day differs from current owned basis"));
         }
         let mut meter = self.meter(cancelled)?;
         let active = self.snapshot.program()?;

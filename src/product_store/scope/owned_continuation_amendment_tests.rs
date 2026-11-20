@@ -167,6 +167,7 @@ fn check(
         OwnedSourceSide::Before,
         &Dependencies::from([Dependency::Field("root".into(), "policy".into())]),
         &Dependencies::from([Dependency::Field("root".into(), "policy".into())]),
+        0,
         &mut meter(),
     )
     .map(|_| ())
@@ -352,6 +353,7 @@ fn empty_logical_gap_cannot_switch_equal_header_sibling_scope() {
         OwnedSourceSide::Before,
         &seed,
         &Dependencies::new(),
+        0,
         &mut meter()
     )
     .is_ok());
@@ -364,6 +366,7 @@ fn empty_logical_gap_cannot_switch_equal_header_sibling_scope() {
             OwnedSourceSide::Before,
             &seed,
             &Dependencies::new(),
+            0,
             &mut meter(),
         )
         .map(|_| ()),

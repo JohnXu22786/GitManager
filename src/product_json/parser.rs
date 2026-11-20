@@ -35,6 +35,15 @@ use crate::product_alloc::{self as alloc, ordered::OrderedMap,
     AllocationContext, AllocationFailure, AllocationSite};
 
 type Result<T> = std::result::Result<T, Error>;
+const MAX_PARSER_CONTAINERS: usize = 127;
+enum ContainerKind { Array, Object }
+enum ReadValue { Scalar(Value), Container(ContainerKind) }
+enum ParseFrame {
+    Array { values: Vec<Value>, first: bool },
+    Object { values: OrderedMap<String, Value>, first: bool, pending_key: Option<String> },
+}
+enum FrameStep { ReadValue, Close }
+
 pub(super) fn parse(bytes: &[u8], cx: &mut AllocationContext) -> Result<Value> {
     parse_with_policy(bytes, cx, Policy::Proposal)
 }
@@ -45,7 +54,7 @@ pub(super) fn parse_store(bytes: &[u8], cx: &mut AllocationContext) -> Result<Va
 enum Policy { Proposal, Store }
 fn parse_with_policy(bytes: &[u8], cx: &mut AllocationContext, policy: Policy) -> Result<Value> {
     let mut parser = Parser { bytes, index: 0, cx, policy };
-    let value = parser.value(0)?;
+    let value = parser.value()?;
     if parser.whitespace().is_some() { return Err(parser.peek_error(Code::TrailingCharacters)); }
     Ok(value)
 }
@@ -83,15 +92,15 @@ impl Parser<'_, '_> {
     fn allocation(&self, failure: AllocationFailure) -> Error {
         self.at(Cause::Allocation(failure), self.index)
     }
-    fn value(&mut self, depth: usize) -> Result<Value> {
+    fn read_value(&mut self, depth: usize) -> Result<ReadValue> {
         match self.whitespace() {
             None => Err(self.peek_error(Code::EofWhileParsingValue)),
-            Some(b'n') => { self.index += 1; self.ident(b"ull")?; Ok(Value::Null) }
-            Some(b't') => { self.index += 1; self.ident(b"rue")?; Ok(Value::Bool(true)) }
-            Some(b'f') => { self.index += 1; self.ident(b"alse")?; Ok(Value::Bool(false)) }
-            Some(b'-') => { self.index += 1; self.number_value(false) }
-            Some(b'0'..=b'9') => self.number_value(true),
-            Some(b'"') => { self.index += 1; self.string().map(Value::String) }
+            Some(b'n') => { self.index += 1; self.ident(b"ull")?; Ok(ReadValue::Scalar(Value::Null)) }
+            Some(b't') => { self.index += 1; self.ident(b"rue")?; Ok(ReadValue::Scalar(Value::Bool(true))) }
+            Some(b'f') => { self.index += 1; self.ident(b"alse")?; Ok(ReadValue::Scalar(Value::Bool(false))) }
+            Some(b'-') => { self.index += 1; self.number_value(false).map(ReadValue::Scalar) }
+            Some(b'0'..=b'9') => self.number_value(true).map(ReadValue::Scalar),
+            Some(b'"') => { self.index += 1; self.string().map(Value::String).map(ReadValue::Scalar) }
             Some(b'[' | b'{') => {
                 // Serde decrements its initial 128 before consuming the token.
                 if self.policy == Policy::Store && depth >= 127 {
@@ -101,10 +110,139 @@ impl Parser<'_, '_> {
                 if self.policy == Policy::Proposal && depth >= MAX_NESTING_DEPTH {
                     return Err(self.at(Cause::NestingTooDeep, self.index));
                 }
-                if object { self.object(depth + 1) } else { self.array(depth + 1) }
+                Ok(ReadValue::Container(if object { ContainerKind::Object } else { ContainerKind::Array }))
             }
             Some(_) => Err(self.peek_error(Code::ExpectedSomeValue)),
         }
+    }
+    fn value(&mut self) -> Result<Value> {
+        // JSON depth is explicitly bounded by the proposal/store policies.
+        // Keep parser frames in this fixed local array instead of recursively
+        // calling value -> array/object -> value: accepted 64-level inputs
+        // must work on the default Rust test-thread stack.
+        let mut frames: [Option<ParseFrame>; MAX_PARSER_CONTAINERS] =
+            std::array::from_fn(|_| None);
+        let mut frame_count = 0usize;
+        let mut completed = None;
+        match self.read_value(0)? {
+            ReadValue::Scalar(value) => completed = Some(value),
+            ReadValue::Container(kind) => {
+                frames[0] = Some(Self::new_frame(kind));
+                frame_count = 1;
+            }
+        }
+
+        loop {
+            if let Some(value) = completed.take() {
+                if frame_count == 0 { return Ok(value); }
+                match frames[frame_count - 1].as_mut().expect("active parser frame") {
+                    ParseFrame::Array { values, .. } => {
+                        alloc::try_push(values, value, self.cx, AllocationSite::Vector)
+                            .map_err(|e| self.allocation(e))?;
+                    }
+                    ParseFrame::Object { values, pending_key, .. } => {
+                        let key = pending_key.take().expect("object value has a parsed key");
+                        if self.policy == Policy::Store && values.contains_key(key.as_str()) {
+                            // Strict's visitor checks a repeated key only after
+                            // fully decoding its value, then consumes `}` if
+                            // present before positioning the duplicate error.
+                            if self.whitespace() == Some(b'}') { self.index += 1; }
+                            return Err(self.at(Cause::StoreDuplicateObjectMember, self.index));
+                        }
+                        values.try_insert(key, value, self.cx)
+                            .map_err(|e| self.allocation(e))?;
+                    }
+                }
+                continue;
+            }
+
+            let step = match frames[frame_count - 1].as_mut().expect("active parser frame") {
+                ParseFrame::Array { first, .. } => match self.whitespace() {
+                    None => return Err(self.peek_error(Code::EofWhileParsingList)),
+                    Some(b']') => { self.index += 1; FrameStep::Close }
+                    Some(_) if *first => { *first = false; FrameStep::ReadValue }
+                    Some(b',') => {
+                        self.index += 1;
+                        match self.whitespace() {
+                            Some(b']') => return Err(self.peek_error(Code::TrailingComma)),
+                            None => return Err(self.peek_error(Code::EofWhileParsingValue)),
+                            _ => FrameStep::ReadValue,
+                        }
+                    }
+                    _ => return Err(self.peek_error(Code::ExpectedListCommaOrEnd)),
+                },
+                ParseFrame::Object { values, first, pending_key } => match self.whitespace() {
+                    None => return Err(self.peek_error(Code::EofWhileParsingObject)),
+                    Some(b'}') => { self.index += 1; FrameStep::Close }
+                    Some(_) if *first => {
+                        *first = false;
+                        if self.peek() != Some(b'"') {
+                            return Err(self.peek_error(Code::KeyMustBeAString));
+                        }
+                        self.object_key(values, pending_key)?;
+                        FrameStep::ReadValue
+                    }
+                    Some(b',') => {
+                        self.index += 1;
+                        match self.whitespace() {
+                            Some(b'"') => (),
+                            Some(b'}') => return Err(self.peek_error(Code::TrailingComma)),
+                            None => return Err(self.peek_error(Code::EofWhileParsingValue)),
+                            _ => return Err(self.peek_error(Code::KeyMustBeAString)),
+                        }
+                        self.object_key(values, pending_key)?;
+                        FrameStep::ReadValue
+                    }
+                    _ => return Err(self.peek_error(Code::ExpectedObjectCommaOrEnd)),
+                },
+            };
+
+            match step {
+                FrameStep::Close => {
+                    let frame = frames[frame_count - 1].take().expect("closing parser frame");
+                    frame_count -= 1;
+                    completed = Some(match frame {
+                        ParseFrame::Array { values, .. } => Value::Array(values),
+                        ParseFrame::Object { values, .. } => Value::Object(values),
+                    });
+                }
+                FrameStep::ReadValue => match self.read_value(frame_count)? {
+                    ReadValue::Scalar(value) => completed = Some(value),
+                    ReadValue::Container(kind) => {
+                        // read_value has already enforced the policy's exact
+                        // 64/127-container boundary before this push.
+                        frames[frame_count] = Some(Self::new_frame(kind));
+                        frame_count += 1;
+                    }
+                },
+            }
+        }
+    }
+    fn new_frame(kind: ContainerKind) -> ParseFrame {
+        match kind {
+            ContainerKind::Array => ParseFrame::Array { values: Vec::new(), first: true },
+            ContainerKind::Object => ParseFrame::Object {
+                values: OrderedMap::new(), first: true, pending_key: None,
+            },
+        }
+    }
+    fn object_key(
+        &mut self,
+        values: &OrderedMap<String, Value>,
+        pending_key: &mut Option<String>,
+    ) -> Result<()> {
+        self.index += 1; // opening key quote
+        let key = self.string()?;
+        if self.policy == Policy::Proposal && values.contains_key(key.as_str()) {
+            return Err(self.at(Cause::DuplicateObjectMember, self.index));
+        }
+        match self.whitespace() {
+            Some(b':') => self.index += 1,
+            None => return Err(self.peek_error(Code::EofWhileParsingObject)),
+            _ => return Err(self.peek_error(Code::ExpectedColon)),
+        }
+        *pending_key = Some(key);
+        Ok(())
     }
     fn ident(&mut self, expected: &[u8]) -> Result<()> {
         for &byte in expected {
@@ -115,75 +253,6 @@ impl Parser<'_, '_> {
             }
         }
         Ok(())
-    }
-    fn array(&mut self, depth: usize) -> Result<Value> {
-        let mut values = Vec::new();
-        let mut first = true;
-        loop {
-            match self.whitespace() {
-                None => return Err(self.peek_error(Code::EofWhileParsingList)),
-                Some(b']') => { self.index += 1; return Ok(Value::Array(values)); }
-                Some(_) if first => first = false,
-                Some(b',') => {
-                    self.index += 1;
-                    match self.whitespace() {
-                        Some(b']') => return Err(self.peek_error(Code::TrailingComma)),
-                        None => return Err(self.peek_error(Code::EofWhileParsingValue)),
-                        _ => (),
-                    }
-                }
-                _ => return Err(self.peek_error(Code::ExpectedListCommaOrEnd)),
-            }
-            let value = self.value(depth)?;
-            alloc::try_push(&mut values, value, self.cx, AllocationSite::Vector)
-                .map_err(|e| self.allocation(e))?;
-        }
-    }
-    fn object(&mut self, depth: usize) -> Result<Value> {
-        let mut values = OrderedMap::new();
-        let mut first = true;
-        loop {
-            let next = self.whitespace();
-            match next {
-                None => return Err(self.peek_error(Code::EofWhileParsingObject)),
-                Some(b'}') => { self.index += 1; return Ok(Value::Object(values)); }
-                Some(_) if first => {
-                    first = false;
-                    if next != Some(b'"') { return Err(self.peek_error(Code::KeyMustBeAString)); }
-                }
-                Some(b',') => {
-                    self.index += 1;
-                    match self.whitespace() {
-                        Some(b'"') => (),
-                        Some(b'}') => return Err(self.peek_error(Code::TrailingComma)),
-                        None => return Err(self.peek_error(Code::EofWhileParsingValue)),
-                        _ => return Err(self.peek_error(Code::KeyMustBeAString)),
-                    }
-                }
-                _ => return Err(self.peek_error(Code::ExpectedObjectCommaOrEnd)),
-            }
-            self.index += 1; // opening key quote
-            let key = self.string()?;
-            if self.policy == Policy::Proposal && values.contains_key(key.as_str()) {
-                return Err(self.at(Cause::DuplicateObjectMember, self.index));
-            }
-            match self.whitespace() {
-                Some(b':') => self.index += 1,
-                None => return Err(self.peek_error(Code::EofWhileParsingObject)),
-                _ => return Err(self.peek_error(Code::ExpectedColon)),
-            }
-            let value = self.value(depth)?;
-            if self.policy == Policy::Store && values.contains_key(key.as_str()) {
-                // Strict's visitor returns an unpositioned custom error AFTER
-                // next_entry decodes the value. deserialize_any then calls
-                // end_map even on that error, and only afterwards fixes its
-                // position. end_map skips whitespace and consumes only `}`;
-                // its own error loses to the visitor's duplicate error.
-                if self.whitespace() == Some(b'}') { self.index += 1; }
-                return Err(self.at(Cause::StoreDuplicateObjectMember, self.index));
-            }
-            values.try_insert(key, value, self.cx).map_err(|e| self.allocation(e))?;
-        }
     }
     fn append(&mut self, output: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
         alloc::try_extend_bytes(output, bytes, self.cx, AllocationSite::String)

@@ -486,7 +486,9 @@ impl<'gate> OwnedPolicyCheck<'gate> {
                 meter: &mut local_meter,
             };
             wrong.charge(const { policy_frame_open_payment::<()>() })?;
-            let dispatch = RecordContinuationDispatch { capture: (), run: |_, _, _| panic!("wrong origin cannot open recorder") };
+            let dispatch: RecordContinuationDispatch<'_, (), ()> = RecordContinuationDispatch {
+                capture: (), run: |_, _, _| panic!("wrong origin cannot open recorder"),
+            };
             let before = wrong.meter.remaining_units_for_test();
             let error = capsule.with_policy_frame_recorder(&mut wrong, dispatch).unwrap_err();
             assert!(matches!(error, StoreError::Invalid(ref text) if text == "Common factual admission: owned policy frames: recorder is not the fresh locked check"));

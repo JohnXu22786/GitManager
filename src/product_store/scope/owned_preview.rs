@@ -151,7 +151,19 @@ pub(super) fn initialize_frame(
     data.validate()?;
     let mut stripped = data.clone();
     stripped.schema = original.schema.clone();
-    let fields: BTreeSet<_> = metadata.fields(proof).into_iter().map(|f| f.id).collect();
+    let original_root_fields: BTreeSet<_> = original
+        .schema
+        .iter()
+        .find(|entity| entity.id == metadata.root)
+        .into_iter()
+        .flat_map(|entity| entity.fields.iter().map(|field| field.id.clone()))
+        .collect();
+    let fields: BTreeSet<_> = metadata
+        .fields(proof)
+        .into_iter()
+        .map(|field| field.id)
+        .filter(|id| !original_root_fields.contains(id))
+        .collect();
     for row in &mut stripped.records {
         if row.entity == metadata.root {
             row.values.retain(|id, _| !fields.contains(id));
@@ -203,13 +215,25 @@ fn regenerate(
     if current != proof.snapshot {
         return Err(refuse("basis", "prepared preview is stale"));
     }
-    let regenerated = super::common_fact_admission::derive(
-        &current,
-        &proof.candidate,
-        &proof.request,
-        &proof.accepted,
-        meter,
-    )?;
+    let regenerated = if proof.report.projections.is_empty() && proof.captured.is_empty() {
+        super::common_fact_admission::derive(
+            &current,
+            &proof.candidate,
+            &proof.request,
+            &proof.accepted,
+            meter,
+        )?
+    } else {
+        super::common_fact_admission::derive_with_capture_reuse(
+            &current,
+            &proof.candidate,
+            &proof.request,
+            &proof.accepted,
+            meter,
+            &proof.report.projections,
+            &proof.captured,
+        )?
+    };
     if regenerated.report != proof.report || regenerated.captured != proof.captured {
         return Err(refuse("proof", "admission regeneration differs"));
     }

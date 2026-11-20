@@ -18,7 +18,7 @@ pub(super) fn overflow() -> AdapterError { exhausted("capture work arithmetic ov
 pub(super) fn add(a:u64,b:u64)->Result<u64> { a.checked_add(b).ok_or_else(overflow) }
 pub(super) fn mul(a:u64,b:u64)->Result<u64> { a.checked_mul(b).ok_or_else(overflow) }
 pub(super) fn number(n:usize)->Result<u64> { u64::try_from(n).map_err(|_|overflow()) }
-pub(super) fn pay(work:&mut dyn ContractWork,n:u64)->Result<()> {work.charge(n).map_err(resource)}
+pub(super) fn pay(work:&mut dyn ContractWork,n:u64)->Result<()> { work.charge(n).map_err(resource) }
 pub(super) fn string(value:&str,work:&mut dyn ContractWork)->Result<()> {
     pay(work,8)?;
     let n=capture_payment::string_copy_bytes(value.len()).map_err(contract)?;

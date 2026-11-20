@@ -116,6 +116,27 @@ impl<'w> Shape<'w> {
             .ok_or_else(|| self.audit.overflow())?;
         self.add(encoded, amount)
     }
+    // This route is restricted to identifiers already accepted by the source
+    // and extension validators. They are lowercase ASCII, so their JSON length
+    // is known from the byte length without rescanning for escapes.
+    pub(super) fn identifier(&mut self, value: &str) -> Result<()> {
+        self.node()?;
+        self.audit.pay(12)?;
+        let len = self.audit.usize(value.len())?;
+        let encoded = len.checked_add(2).ok_or_else(|| self.audit.overflow())?;
+        let native = len.checked_mul(6).and_then(|n| n.checked_add(encoded))
+            .ok_or_else(|| self.audit.overflow())?;
+        self.add(encoded, native)
+    }
+    pub(super) fn ascii_literal(&mut self, value: &'static str) -> Result<()> {
+        self.node()?;
+        self.audit.pay(12)?;
+        let len = self.audit.usize(value.len())?;
+        let encoded = len.checked_add(2).ok_or_else(|| self.audit.overflow())?;
+        let native = len.checked_mul(6).and_then(|n| n.checked_add(encoded))
+            .ok_or_else(|| self.audit.overflow())?;
+        self.add(encoded, native)
+    }
     pub(super) fn digest(&mut self, value: &Digest) -> Result<()> {
         // Never call Digest::serialize here: derive(into=String) would clone first.
         self.audit.pay(10)?;
@@ -259,6 +280,54 @@ impl Container<'_, '_> {
         self.shape.audit.pay(2)?;
         value.serialize(&mut *self.shape)
     }
+    pub(super) fn literal_identifier_field(&mut self, key: &'static str, value: &str) -> Result<()> {
+        self.separator()?;
+        self.shape.audit.pay(2)?;
+        self.shape.ascii_literal(key)?;
+        self.shape.add(1, 1)?;
+        self.shape.pairs = self.shape.pairs.checked_add(1)
+            .ok_or_else(|| self.shape.audit.overflow())?;
+        self.shape.audit.pay(2)?;
+        self.shape.identifier(value)
+    }
+    pub(super) fn literal_ascii_field(&mut self, key: &'static str, value: &'static str) -> Result<()> {
+        self.separator()?;
+        self.shape.audit.pay(2)?;
+        self.shape.ascii_literal(key)?;
+        self.shape.add(1, 1)?;
+        self.shape.pairs = self.shape.pairs.checked_add(1)
+            .ok_or_else(|| self.shape.audit.overflow())?;
+        self.shape.audit.pay(2)?;
+        self.shape.ascii_literal(value)
+    }
+    pub(super) fn literal_manual_field<T: ManualShape + ?Sized>(
+        &mut self,
+        key: &'static str,
+        value: &T,
+    ) -> Result<()> {
+        self.separator()?;
+        self.shape.audit.pay(2)?;
+        self.shape.ascii_literal(key)?;
+        self.shape.add(1, 1)?;
+        self.shape.pairs = self.shape.pairs.checked_add(1)
+            .ok_or_else(|| self.shape.audit.overflow())?;
+        self.shape.audit.pay(2)?;
+        value.describe(self.shape)
+    }
+    pub(super) fn identifier_key_manual_field(
+        &mut self,
+        key: &str,
+        value: &impl ManualShape,
+    ) -> Result<()> {
+        self.separator()?;
+        self.shape.audit.pay(2)?;
+        self.shape.identifier(key)?;
+        self.shape.add(1, 1)?;
+        self.shape.pairs = self.shape.pairs.checked_add(1)
+            .ok_or_else(|| self.shape.audit.overflow())?;
+        self.shape.audit.pay(2)?;
+        value.describe(self.shape)
+    }
     pub(super) fn manual_field<T: ManualShape + ?Sized>(
         &mut self,
         key: &str,
@@ -267,6 +336,22 @@ impl Container<'_, '_> {
         self.key(key)?;
         self.shape.audit.pay(2)?;
         value.describe(self.shape)
+    }
+    pub(super) fn duplicate_manual_field<T: ManualShape + ?Sized>(
+        &mut self,
+        first_key: &str,
+        second_key: &str,
+        value: &T,
+    ) -> Result<()> {
+        self.key(first_key)?;
+        self.shape.audit.pay(2)?;
+        let before = self.shape.bytes;
+        value.describe(self.shape)?;
+        let encoded = self.shape.bytes.checked_sub(before)
+            .ok_or_else(|| self.shape.audit.overflow())?;
+        self.key(second_key)?;
+        self.shape.audit.pay(6)?;
+        self.shape.add(encoded, 0)
     }
     fn key(&mut self, key: &str) -> Result<()> {
         let index = self.count;
@@ -810,6 +895,11 @@ struct AppLengthCounter<'w> {
     size: usize,
     overflowed: bool,
 }
+const SYNTHETIC_COUNT_ROOT: usize = 2 * size_of::<AppLengthCounter<'static>>()
+    + 2 * size_of::<serde_json::Serializer<&mut AppLengthCounter<'static>>>()
+    + 2 * size_of::<serde_json::Result<()>>()
+    + 2 * size_of::<Result<usize>>() + 2 * size_of::<Result<()>>()
+    + 8 * size_of::<u64>() + 4 * size_of::<Option<u64>>();
 impl AppLengthCounter<'_> {
     fn add_len(&mut self, n: usize) -> std::io::Result<()> {
         if self.overflowed {
@@ -936,12 +1026,6 @@ pub(super) fn app_canonical_len_audited(app: &AppDefinition, a: Audit<'_>) -> Re
     counter.finish(native)
 }
 
-const SYNTHETIC_COUNT_ROOT: usize = 2 * size_of::<AppLengthCounter<'static>>()
-    + 2 * size_of::<serde_json::Serializer<&mut AppLengthCounter<'static>>>()
-    + 2 * size_of::<serde_json::Result<()>>()
-    + 2 * size_of::<Result<usize>>() + 2 * size_of::<Result<()>>()
-    + 8 * size_of::<u64>() + 4 * size_of::<Option<u64>>();
-
 // Concrete extension-only admission. No arbitrary Serialize or caller length is
 // accepted. The caller has already checked BOTH occurrences at Expr depth two.
 #[cfg_attr(test, track_caller)]
@@ -954,27 +1038,23 @@ pub(super) fn synthetic_canonical_len_audited(
         super::capture_work::diagnostic::Phase::Canonical,
     );
     a.pay(0)?;
-    a.pay(SYNTHETIC_COUNT_ROOT as u64)?;
     a.pay(96)?;
     // Paid concrete walk of this exact borrowed action, not an App-only bound
     // or caller-supplied authority. The semantic prefix has already succeeded.
     let height = a.usize(action.serialization_height(a)?)?;
-    // Two lifetime slots per level in EACH descriptor/native traversal. The
+    // Two lifetime slots per level cover the single descriptor traversal. The
     // bounded logical frame includes derive references, Container/Compound,
     // custom Parameters/Reference, iterators, Result and integer/escape scratch.
     let frame = a.usize(size_of::<usize>())?.checked_mul(64)
         .and_then(|n| n.checked_add(64)).ok_or_else(|| a.overflow())?;
-    a.amount(height.checked_mul(frame).and_then(|n| n.checked_mul(4)))?;
+    a.amount(Some(height.checked_mul(frame).and_then(|n| n.checked_mul(4)).ok_or_else(|| a.overflow())?))?;
     let mut shape = Shape::new(a)?;
     a.pay(2)?;
     shape.canonical = false;
     shape.simple_app = true;
-    action.describe(&mut shape)?;
-    reserve_synthetic_count(&shape)?;
-    // The same checked sink implementation, NOT the App-only reservation.
-    let mut counter = AppLengthCounter { audit: a, size: 0, overflowed: false };
-    let native = serde_json::to_writer(&mut counter, action);
-    counter.finish(native)
+    capture_validation::describe_synthetic_action(action, &mut shape)?;
+    a.pay(0)?;
+    usize::try_from(shape.bytes).map_err(|_| a.overflow())
 }
 
 fn reserve_synthetic_count(shape: &Shape<'_>) -> Result<()> {
@@ -1236,33 +1316,33 @@ impl ManualShape for Expr {
         match self {
             Expr::Literal { value_type, value } => {
                 let mut c = s.object()?;
-                c.manual_field("kind", "literal")?;
-                c.manual_field("value_type", value_type)?;
-                c.manual_field("value", value)?;
+                c.literal_ascii_field("kind", "literal")?;
+                c.literal_manual_field("value_type", value_type)?;
+                c.literal_manual_field("value", value)?;
                 c.end()
             }
             Expr::Variable { name } => {
                 let mut c = s.object()?;
-                c.manual_field("kind", "variable")?;
-                c.manual_field("name", name)?;
+                c.literal_ascii_field("kind", "variable")?;
+                c.literal_identifier_field("name", name)?;
                 c.end()
             }
             Expr::Field { record, field } => {
                 let mut c = s.object()?;
-                c.manual_field("kind", "field")?;
-                c.manual_field("record", record)?;
-                c.manual_field("field", field)?;
+                c.literal_ascii_field("kind", "field")?;
+                c.literal_manual_field("record", record)?;
+                c.literal_identifier_field("field", field)?;
                 c.end()
             }
             Expr::State { state } => {
                 let mut c = s.object()?;
-                c.manual_field("kind", "state")?;
-                c.manual_field("state", state)?;
+                c.literal_ascii_field("kind", "state")?;
+                c.literal_identifier_field("state", state)?;
                 c.end()
             }
             Expr::Today => {
                 let mut c = s.object()?;
-                c.manual_field("kind", "today")?;
+                c.literal_ascii_field("kind", "today")?;
                 c.end()
             }
             Expr::Query {
@@ -1274,13 +1354,13 @@ impl ManualShape for Expr {
                 include_archived,
             } => {
                 let mut c = s.object()?;
-                c.manual_field("kind", "query")?;
-                c.manual_field("entity", entity)?;
-                c.manual_field("binding", binding)?;
-                c.manual_field("predicate", predicate)?;
-                c.manual_field("sort", sort)?;
-                c.manual_field("limit", limit)?;
-                c.manual_field("include_archived", include_archived)?;
+                c.literal_ascii_field("kind", "query")?;
+                c.literal_identifier_field("entity", entity)?;
+                c.literal_identifier_field("binding", binding)?;
+                c.literal_manual_field("predicate", predicate)?;
+                c.literal_manual_field("sort", sort)?;
+                c.literal_manual_field("limit", limit)?;
+                c.literal_manual_field("include_archived", include_archived)?;
                 c.end()
             }
             Expr::Filter {
@@ -1289,10 +1369,10 @@ impl ManualShape for Expr {
                 predicate,
             } => {
                 let mut c = s.object()?;
-                c.manual_field("kind", "filter")?;
-                c.manual_field("items", items)?;
-                c.manual_field("binding", binding)?;
-                c.manual_field("predicate", predicate)?;
+                c.literal_ascii_field("kind", "filter")?;
+                c.literal_manual_field("items", items)?;
+                c.literal_identifier_field("binding", binding)?;
+                c.literal_manual_field("predicate", predicate)?;
                 c.end()
             }
             Expr::Map {
@@ -1301,16 +1381,16 @@ impl ManualShape for Expr {
                 value,
             } => {
                 let mut c = s.object()?;
-                c.manual_field("kind", "map")?;
-                c.manual_field("items", items)?;
-                c.manual_field("binding", binding)?;
-                c.manual_field("value", value)?;
+                c.literal_ascii_field("kind", "map")?;
+                c.literal_manual_field("items", items)?;
+                c.literal_identifier_field("binding", binding)?;
+                c.literal_manual_field("value", value)?;
                 c.end()
             }
             Expr::Count { items } => {
                 let mut c = s.object()?;
-                c.manual_field("kind", "count")?;
-                c.manual_field("items", items)?;
+                c.literal_ascii_field("kind", "count")?;
+                c.literal_manual_field("items", items)?;
                 c.end()
             }
             Expr::Any {
@@ -1319,10 +1399,10 @@ impl ManualShape for Expr {
                 predicate,
             } => {
                 let mut c = s.object()?;
-                c.manual_field("kind", "any")?;
-                c.manual_field("items", items)?;
-                c.manual_field("binding", binding)?;
-                c.manual_field("predicate", predicate)?;
+                c.literal_ascii_field("kind", "any")?;
+                c.literal_manual_field("items", items)?;
+                c.literal_identifier_field("binding", binding)?;
+                c.literal_manual_field("predicate", predicate)?;
                 c.end()
             }
             Expr::All {
@@ -1331,89 +1411,89 @@ impl ManualShape for Expr {
                 predicate,
             } => {
                 let mut c = s.object()?;
-                c.manual_field("kind", "all")?;
-                c.manual_field("items", items)?;
-                c.manual_field("binding", binding)?;
-                c.manual_field("predicate", predicate)?;
+                c.literal_ascii_field("kind", "all")?;
+                c.literal_manual_field("items", items)?;
+                c.literal_identifier_field("binding", binding)?;
+                c.literal_manual_field("predicate", predicate)?;
                 c.end()
             }
             Expr::Sum { items } => {
                 let mut c = s.object()?;
-                c.manual_field("kind", "sum")?;
-                c.manual_field("items", items)?;
+                c.literal_ascii_field("kind", "sum")?;
+                c.literal_manual_field("items", items)?;
                 c.end()
             }
             Expr::Contains { items, value } => {
                 let mut c = s.object()?;
-                c.manual_field("kind", "contains")?;
-                c.manual_field("items", items)?;
-                c.manual_field("value", value)?;
+                c.literal_ascii_field("kind", "contains")?;
+                c.literal_manual_field("items", items)?;
+                c.literal_manual_field("value", value)?;
                 c.end()
             }
             Expr::Equal { left, right } => {
                 let mut c = s.object()?;
-                c.manual_field("kind", "equal")?;
-                c.manual_field("left", left)?;
-                c.manual_field("right", right)?;
+                c.literal_ascii_field("kind", "equal")?;
+                c.literal_manual_field("left", left)?;
+                c.literal_manual_field("right", right)?;
                 c.end()
             }
             Expr::Less { left, right } => {
                 let mut c = s.object()?;
-                c.manual_field("kind", "less")?;
-                c.manual_field("left", left)?;
-                c.manual_field("right", right)?;
+                c.literal_ascii_field("kind", "less")?;
+                c.literal_manual_field("left", left)?;
+                c.literal_manual_field("right", right)?;
                 c.end()
             }
             Expr::Add { left, right } => {
                 let mut c = s.object()?;
-                c.manual_field("kind", "add")?;
-                c.manual_field("left", left)?;
-                c.manual_field("right", right)?;
+                c.literal_ascii_field("kind", "add")?;
+                c.literal_manual_field("left", left)?;
+                c.literal_manual_field("right", right)?;
                 c.end()
             }
             Expr::Subtract { left, right } => {
                 let mut c = s.object()?;
-                c.manual_field("kind", "subtract")?;
-                c.manual_field("left", left)?;
-                c.manual_field("right", right)?;
+                c.literal_ascii_field("kind", "subtract")?;
+                c.literal_manual_field("left", left)?;
+                c.literal_manual_field("right", right)?;
                 c.end()
             }
             Expr::Concat { left, right } => {
                 let mut c = s.object()?;
-                c.manual_field("kind", "concat")?;
-                c.manual_field("left", left)?;
-                c.manual_field("right", right)?;
+                c.literal_ascii_field("kind", "concat")?;
+                c.literal_manual_field("left", left)?;
+                c.literal_manual_field("right", right)?;
                 c.end()
             }
             Expr::TextContains { text, search } => {
                 let mut c = s.object()?;
-                c.manual_field("kind", "text_contains")?;
-                c.manual_field("text", text)?;
-                c.manual_field("search", search)?;
+                c.literal_ascii_field("kind", "text_contains")?;
+                c.literal_manual_field("text", text)?;
+                c.literal_manual_field("search", search)?;
                 c.end()
             }
             Expr::Lower { value } => {
                 let mut c = s.object()?;
-                c.manual_field("kind", "lower")?;
-                c.manual_field("value", value)?;
+                c.literal_ascii_field("kind", "lower")?;
+                c.literal_manual_field("value", value)?;
                 c.end()
             }
             Expr::And { values } => {
                 let mut c = s.object()?;
-                c.manual_field("kind", "and")?;
-                c.manual_field("values", values)?;
+                c.literal_ascii_field("kind", "and")?;
+                c.literal_manual_field("values", values)?;
                 c.end()
             }
             Expr::Or { values } => {
                 let mut c = s.object()?;
-                c.manual_field("kind", "or")?;
-                c.manual_field("values", values)?;
+                c.literal_ascii_field("kind", "or")?;
+                c.literal_manual_field("values", values)?;
                 c.end()
             }
             Expr::Not { value } => {
                 let mut c = s.object()?;
-                c.manual_field("kind", "not")?;
-                c.manual_field("value", value)?;
+                c.literal_ascii_field("kind", "not")?;
+                c.literal_manual_field("value", value)?;
                 c.end()
             }
             Expr::If {
@@ -1422,31 +1502,31 @@ impl ManualShape for Expr {
                 else_value,
             } => {
                 let mut c = s.object()?;
-                c.manual_field("kind", "if")?;
-                c.manual_field("condition", condition)?;
-                c.manual_field("then_value", then_value)?;
-                c.manual_field("else_value", else_value)?;
+                c.literal_ascii_field("kind", "if")?;
+                c.literal_manual_field("condition", condition)?;
+                c.literal_manual_field("then_value", then_value)?;
+                c.literal_manual_field("else_value", else_value)?;
                 c.end()
             }
             Expr::Coalesce { value, fallback } => {
                 let mut c = s.object()?;
-                c.manual_field("kind", "coalesce")?;
-                c.manual_field("value", value)?;
-                c.manual_field("fallback", fallback)?;
+                c.literal_ascii_field("kind", "coalesce")?;
+                c.literal_manual_field("value", value)?;
+                c.literal_manual_field("fallback", fallback)?;
                 c.end()
             }
             Expr::DateAdd { date, days } => {
                 let mut c = s.object()?;
-                c.manual_field("kind", "date_add")?;
-                c.manual_field("date", date)?;
-                c.manual_field("days", days)?;
+                c.literal_ascii_field("kind", "date_add")?;
+                c.literal_manual_field("date", date)?;
+                c.literal_manual_field("days", days)?;
                 c.end()
             }
             Expr::DateDifference { later, earlier } => {
                 let mut c = s.object()?;
-                c.manual_field("kind", "date_difference")?;
-                c.manual_field("later", later)?;
-                c.manual_field("earlier", earlier)?;
+                c.literal_ascii_field("kind", "date_difference")?;
+                c.literal_manual_field("later", later)?;
+                c.literal_manual_field("earlier", earlier)?;
                 c.end()
             }
         }

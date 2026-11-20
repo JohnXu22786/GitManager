@@ -53,11 +53,8 @@ pub(crate) struct ProofMeter {
     millis: u64,
     cancelled: Arc<AtomicBool>,
     additional_cancelled: Option<Arc<AtomicBool>>,
-    #[cfg(test)]
-    adoption_diagnostic: (u64, u8, u32, u8),
 }
 impl ProofMeter {
-    #[cfg_attr(test, track_caller)]
     pub(super) fn new(budget: ProofBudget, cancelled: Arc<AtomicBool>) -> AdmissionResult<Self> {
         if budget.units == 0
             || budget.units > 10_000_000
@@ -72,19 +69,19 @@ impl ProofMeter {
             millis: budget.elapsed_millis,
             cancelled,
             additional_cancelled: None,
-            #[cfg(test)]
-            adoption_diagnostic: adoption_diagnostic::meter(std::panic::Location::caller()),
         };
         result.charge(1)?;
         Ok(result)
     }
+    const RECONSTRUCTED_REGISTRY: u64 = 1 << 63;
+    pub(super) fn budget_millis(&self) -> u64 { self.millis & !Self::RECONSTRUCTED_REGISTRY }
+    pub(super) fn mark_reconstructed(&mut self) { self.millis |= Self::RECONSTRUCTED_REGISTRY; }
+    pub(super) fn reconstruction_paid(&self) -> bool { self.millis & Self::RECONSTRUCTED_REGISTRY != 0 }
     pub(super) fn watch_cancellation(&mut self, token: &Arc<AtomicBool>) {
         self.additional_cancelled = Some(token.clone());
     }
     #[cfg_attr(test, track_caller)]
     pub(super) fn charge_cause(&mut self, units: u64) -> std::result::Result<(), ProofChargeFailure> {
-        #[cfg(test)]
-        let caller = std::panic::Location::caller();
         let stopped = if self.cancelled.load(Ordering::Relaxed) {
             Some(ProofChargeFailure::Cancelled)
         } else if self
@@ -93,26 +90,21 @@ impl ProofMeter {
             .is_some_and(|c| c.load(Ordering::Relaxed))
         {
             Some(ProofChargeFailure::Cancelled)
-        } else if self.started.elapsed().as_millis() >= u128::from(self.millis) {
+        } else if self.started.elapsed().as_millis() >= u128::from(self.budget_millis()) {
             Some(ProofChargeFailure::Elapsed)
         } else {
             None
         };
         if let Some(cause) = stopped {
-            #[cfg(test)]
-            adoption_diagnostic::refusal(self.adoption_diagnostic, self.left, units, 2, caller);
             return Err(cause);
         }
-        self.left = self.left.checked_sub(units).ok_or_else(|| {
-            #[cfg(test)]
-            adoption_diagnostic::refusal(self.adoption_diagnostic, self.left, units, 1, caller);
-            ProofChargeFailure::Fuel
-        })?;
+        self.left = self.left.checked_sub(units).ok_or(ProofChargeFailure::Fuel)?;
         Ok(())
     }
     #[cfg_attr(test, track_caller)]
     pub(crate) fn charge(&mut self, units: u64) -> AdmissionResult<()> {
-        self.charge_cause(units).map_err(|cause| match cause {
+        let result = self.charge_cause(units);
+        result.map_err(|cause| match cause {
             ProofChargeFailure::Cancelled | ProofChargeFailure::Elapsed => refuse(
                 "budget", "cancelled or cumulative elapsed budget exhausted",
             ),
@@ -123,12 +115,11 @@ impl ProofMeter {
     }
     /// Reserve the entire allowed evaluation fuel before each execution. A new
     /// interpreter meter never replenishes this enclosing preparation budget.
-    #[cfg_attr(test, track_caller)]
     pub(super) fn runtime(&mut self) -> AdmissionResult<RuntimeLimits> {
         let mut limits = RuntimeLimits::default();
         self.charge(limits.fuel)?;
         let remaining = self
-            .millis
+            .budget_millis()
             .saturating_sub(self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
         if remaining == 0 {
             return Err(refuse("budget", "cumulative elapsed budget exhausted"));
@@ -139,7 +130,7 @@ impl ProofMeter {
     // The caller paid F7 before entry. No reservation, refund or new clock.
     pub(super) fn policy_frame_default_window(&mut self) -> AdmissionResult<bool> {
         self.charge(0)?;
-        let remaining = u128::from(self.millis).checked_sub(self.started.elapsed().as_millis());
+        let remaining = u128::from(self.budget_millis()).checked_sub(self.started.elapsed().as_millis());
         Ok(match remaining {
             Some(remaining) => remaining >= u128::from(RuntimeLimits::default().elapsed_millis),
             None => false,
@@ -149,7 +140,7 @@ impl ProofMeter {
     // Same live query semantics as F7, but no F7/receipt authority is reused.
     pub(super) fn reconstruction_default_window(&mut self) -> AdmissionResult<bool> {
         self.charge(0)?;
-        let remaining = u128::from(self.millis).checked_sub(self.started.elapsed().as_millis());
+        let remaining = u128::from(self.budget_millis()).checked_sub(self.started.elapsed().as_millis());
         Ok(match remaining {
             Some(remaining) => remaining >= u128::from(RuntimeLimits::default().elapsed_millis),
             None => false,
@@ -157,7 +148,7 @@ impl ProofMeter {
     }
     // The selected caller prepays the complete packet and performs the live poll.
     pub(super) fn reconstruction_default_window_after_poll(&self) -> bool {
-        let remaining = u128::from(self.millis).checked_sub(self.started.elapsed().as_millis());
+        let remaining = u128::from(self.budget_millis()).checked_sub(self.started.elapsed().as_millis());
         match remaining {
             Some(remaining) => remaining >= u128::from(RuntimeLimits::default().elapsed_millis),
             None => false,
@@ -208,17 +199,20 @@ impl ProjectionHost for ProofMeter {
         const HEADER: u64 = 40 + std::mem::size_of::<ProjectionReservation>() as u64;
         self.charge_cause(HEADER).map_err(ProofChargeFailure::work)?;
         let mut limits = RuntimeLimits::default();
-        let host_deadline = self.started.checked_add(std::time::Duration::from_millis(self.millis))
+        let host_deadline = self.started.checked_add(std::time::Duration::from_millis(self.budget_millis()))
             .ok_or(WorkFailure::BudgetExhausted("cumulative elapsed budget exhausted"))?;
         let reservation_now = Instant::now();
-        let remaining = self.millis.saturating_sub(
+        let remaining = self.budget_millis().saturating_sub(
             self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
         );
         if remaining == 0 {
             return Err(WorkFailure::BudgetExhausted("cumulative elapsed budget exhausted"));
         }
         let row_window = limits.elapsed_millis;
-        limits.elapsed_millis = row_window.min(remaining);
+        // Keep the canonical runtime limits stable across rows so the exact
+        // capture-key memo can reuse immutable expression validation. The
+        // per-row deadline below is clamped to the remaining host deadline and
+        // remains the enforcement boundary for elapsed work.
         let row_deadline = reservation_now.checked_add(std::time::Duration::from_millis(row_window))
             .ok_or(WorkFailure::BudgetExhausted("cumulative elapsed budget exhausted"))?
             .min(host_deadline);
@@ -295,6 +289,16 @@ pub struct VerifiedOwnedPreviewPlan {
     pub(super) report: CommonFactAdmissionReport,
     pub(super) captured: BTreeMap<String, Values>,
 }
+#[derive(Clone, Copy)]
+pub(super) struct CaptureReuseView<'a> {
+    projections: &'a [OwnedProjectionRecipe],
+    captured: &'a BTreeMap<String, Values>,
+}
+impl<'a> From<&'a super::owned_persist::OwnedCaptureReuse> for CaptureReuseView<'a> {
+    fn from(reuse: &'a super::owned_persist::OwnedCaptureReuse) -> Self {
+        Self { projections: &reuse.projections, captured: &reuse.captured }
+    }
+}
 impl VerifiedOwnedPreviewPlan {
     pub fn report(&self) -> &CommonFactAdmissionReport {
         &self.report
@@ -307,13 +311,23 @@ pub(super) fn request_identity(request: &OwnedPreviewRequest) -> AdmissionResult
     )?)
 }
 macro_rules! authenticate_body {
-    ($snapshot:ident, $candidate:ident, $request:ident, $meter:ident, $verify_snapshot:ident, $baseline:ident, $baseline_out:ident, $reuse_out:ident, $tail:expr) => {{
-    $meter.charge(($candidate.source_bytes.len() + $snapshot.program()?.source_bytes.len()) as u64)?;
+    ($snapshot:ident, $candidate:ident, $request:ident, $meter:ident, $verify_snapshot:ident, $charge_active_source:expr, $retained_baseline:expr, $baseline:ident, $baseline_out:ident, $reuse_out:ident, $tail:expr) => {{
+    let paid_active_source = $snapshot.program()?;
+    let source_bytes = $candidate.source_bytes.len()
+        .checked_add(if $charge_active_source { paid_active_source.source_bytes.len() } else { 0 })
+        .ok_or_else(|| refuse("basis", "authenticated source byte length overflow"))?;
+    $meter.charge(source_bytes as u64)?;
     if $verify_snapshot {
         $snapshot.validate()?;
     }
     $candidate.validate()?;
-    let authenticated_baseline = super::owned_persist::admission_baseline($snapshot, $meter)?;
+    let authenticated_baseline = if $retained_baseline {
+        super::owned_persist::retained_admission_baseline($snapshot, paid_active_source, $meter)?
+    } else {
+        super::owned_persist::admission_baseline_after_source_payment(
+            $snapshot, paid_active_source, $meter,
+        )?
+    };
     let $baseline = authenticated_baseline.source;
     $baseline_out = Some($baseline.clone());
     $reuse_out = authenticated_baseline.capture_reuse;
@@ -409,7 +423,7 @@ fn authenticate_inner_with_baseline(
 ) -> AdmissionResult<(CommonFactInventory, CapturedProgram, Option<super::owned_persist::OwnedCaptureReuse>)> {
     let mut baseline_out = None;
     let mut reuse_out = None;
-    let inventory = authenticate_body!(snapshot, candidate, request, meter, verify_snapshot, baseline, baseline_out, reuse_out,
+    let inventory = authenticate_body!(snapshot, candidate, request, meter, verify_snapshot, true, false, baseline, baseline_out, reuse_out,
         super::common_fact_inventory::derive_pair(snapshot, &baseline, candidate, &request.inventory))?;
     Ok((inventory, baseline_out.ok_or_else(|| refuse("basis", "authenticated source baseline missing"))?, reuse_out))
 }
@@ -484,7 +498,7 @@ impl InitialLimitsProfile {
         meter.charge(64)?;
         let elapsed = meter.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
         let eligible = self.full && self.lifecycle == 6 && self.rows >= 2
-            && meter.millis.saturating_sub(elapsed) >= RuntimeLimits::default().elapsed_millis;
+            && meter.budget_millis().saturating_sub(elapsed) >= RuntimeLimits::default().elapsed_millis;
         meter.charge(0)?;
         Ok(eligible)
     }
@@ -504,7 +518,7 @@ pub(super) fn derive_initial_for_decision(
     accepted.verify_profiled(snapshot, candidate, request, meter, Some(&mut profile))?;
     meter.charge(2)?;
     meter.charge(FINISH_PROFILE_FRAME)?;
-    let proof = finish_derived_plan_profiled(snapshot, &baseline, capture_reuse.as_ref(), candidate, request, accepted, meter, false, inventory, Some(&mut profile))?;
+    let proof = finish_derived_plan_profiled(snapshot, &baseline, capture_reuse.as_ref().map(CaptureReuseView::from), candidate, request, accepted, meter, false, inventory, Some(&mut profile))?;
     meter.charge(0)?;
     meter.charge(64)?;
     Ok((proof, profile))
@@ -526,6 +540,18 @@ pub(super) fn derive(
     meter: &mut ProofMeter,
 ) -> AdmissionResult<VerifiedOwnedPreviewPlan> {
     derive_inner(snapshot, candidate, request, accepted, meter, true)
+}
+pub(super) fn derive_with_capture_reuse(
+    snapshot: &ProjectSnapshot,
+    candidate: &CapturedProgram,
+    request: &OwnedPreviewRequest,
+    accepted: &super::owned_lifecycle::AcceptedPreviewLifecycle,
+    meter: &mut ProofMeter,
+    projections: &[OwnedProjectionRecipe],
+    captured: &BTreeMap<String, Values>,
+) -> AdmissionResult<VerifiedOwnedPreviewPlan> {
+    derive_inner_with_capture_reuse(snapshot, candidate, request, accepted, meter, true,
+        Some(CaptureReuseView { projections, captured }))
 }
 // This closed composition alone may reuse the verification it just performed.
 // A live default-sized window is an explicit resource-sensitive eligibility
@@ -559,6 +585,48 @@ macro_rules! finish_admission_body {
     }};
 }
 
+fn retained_guard(
+    snapshot: &ProjectSnapshot,
+    candidate: &CapturedProgram,
+    request: &OwnedPreviewRequest,
+    lifecycle: &OwnedLifecycleV2,
+    accepted: &super::owned_lifecycle::AcceptedPreviewLifecycle,
+    meter: &mut ProofMeter,
+) -> AdmissionResult<()> {
+    let RuntimeLimits {
+        fuel, collection_items, action_steps, transaction_writes, output_bytes,
+        elapsed_millis,
+    } = RuntimeLimits::default();
+    let default_limits = |limits: &RuntimeLimits| {
+        let RuntimeLimits {
+            fuel: actual_fuel,
+            collection_items: actual_collection_items,
+            action_steps: actual_action_steps,
+            transaction_writes: actual_transaction_writes,
+            output_bytes: actual_output_bytes,
+            elapsed_millis: actual_elapsed_millis,
+        } = limits;
+        *actual_fuel == fuel
+            && *actual_collection_items == collection_items
+            && *actual_action_steps == action_steps
+            && *actual_transaction_writes == transaction_writes
+            && *actual_output_bytes == output_bytes
+            && *actual_elapsed_millis == elapsed_millis
+    };
+    let eligible = match lifecycle.evidence.as_slice() {
+        [before, after] if default_limits(&before.limits) && default_limits(&after.limits) => {
+            let elapsed = meter.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            meter.budget_millis().saturating_sub(elapsed) >= elapsed_millis
+        }
+        _ => false,
+    };
+    if !eligible {
+        accepted.verify(snapshot, candidate, request, meter)?;
+    }
+    meter.charge(5)?;
+    Ok(())
+}
+
 pub(super) fn reconstruct_and_derive_retained(
     snapshot: &ProjectSnapshot,
     candidate: &CapturedProgram,
@@ -576,47 +644,13 @@ pub(super) fn reconstruct_and_derive_retained(
             CaptureTail { snapshot, request })?;
     let proof = finish_admission_body!(snapshot, baseline_source, candidate, request, accepted, meter, inventory,
         certificates, projections, comparison, captured)?;
+    meter.charge(FINISH_PROFILE_FRAME)?;
     Ok((accepted, proof))
 }
 
 macro_rules! retained_guard_body {
     ($snapshot:ident, $candidate:ident, $request:ident, $lifecycle:ident, $accepted:ident, $meter:ident) => {{
-    let RuntimeLimits {
-        fuel, collection_items, action_steps, transaction_writes, output_bytes,
-        elapsed_millis,
-    } = RuntimeLimits::default();
-    // Exhaustive fields deliberately make a future runtime limit an explicit
-    // eligibility decision rather than silently reusing incomplete evidence.
-    let default_limits = |limits: &RuntimeLimits| {
-        let RuntimeLimits {
-            fuel: actual_fuel,
-            collection_items: actual_collection_items,
-            action_steps: actual_action_steps,
-            transaction_writes: actual_transaction_writes,
-            output_bytes: actual_output_bytes,
-            elapsed_millis: actual_elapsed_millis,
-        } = limits;
-        *actual_fuel == fuel
-            && *actual_collection_items == collection_items
-            && *actual_action_steps == action_steps
-            && *actual_transaction_writes == transaction_writes
-            && *actual_output_bytes == output_bytes
-            && *actual_elapsed_millis == elapsed_millis
-    };
-    let eligible = match $lifecycle.evidence.as_slice() {
-        [before, after] if default_limits(&before.limits) && default_limits(&after.limits) => {
-            let elapsed = $meter.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-            $meter.millis.saturating_sub(elapsed) >= elapsed_millis
-        }
-        _ => false,
-    };
-    if !eligible {
-        $accepted.verify($snapshot, $candidate, $request, $meter)?;
-    }
-    // Includes the suffix boundary and the factory's returned pair/headers.
-    // This live check retains both tokens and the original elapsed deadline.
-    $meter.charge(5)?;
-
+        retained_guard($snapshot, $candidate, $request, $lifecycle, $accepted, $meter)?;
     }};
 }
 
@@ -633,8 +667,10 @@ fn finish_reconstructed_plan(
     meter: &mut ProofMeter,
 ) -> AdmissionResult<VerifiedOwnedPreviewPlan> {
     retained_guard_body!(snapshot, candidate, request, lifecycle, accepted, meter);
-    let baseline = super::owned_persist::admission_baseline(snapshot, meter)?;
-    finish_derived_plan(snapshot, &baseline.source, baseline.capture_reuse.as_ref(), candidate, request, accepted, meter, false, inventory)
+    let baseline = super::owned_persist::admission_baseline_after_source_payment(
+        snapshot, snapshot.program()?, meter,
+    )?;
+    finish_derived_plan(snapshot, &baseline.source, baseline.capture_reuse.as_ref().map(CaptureReuseView::from), candidate, request, accepted, meter, false, inventory)
 }
 
 fn derive_inner(
@@ -645,11 +681,22 @@ fn derive_inner(
     meter: &mut ProofMeter,
     verify_snapshot: bool,
 ) -> AdmissionResult<VerifiedOwnedPreviewPlan> {
+    derive_inner_with_capture_reuse(snapshot, candidate, request, accepted, meter, verify_snapshot, None)
+}
+fn derive_inner_with_capture_reuse(
+    snapshot: &ProjectSnapshot,
+    candidate: &CapturedProgram,
+    request: &OwnedPreviewRequest,
+    accepted: &super::owned_lifecycle::AcceptedPreviewLifecycle,
+    meter: &mut ProofMeter,
+    verify_snapshot: bool,
+    proof_reuse: Option<CaptureReuseView<'_>>,
+) -> AdmissionResult<VerifiedOwnedPreviewPlan> {
     let (inventory, baseline, capture_reuse) = authenticate_inner_with_baseline(snapshot, candidate, request, meter, verify_snapshot)?;
     accepted.verify(snapshot, candidate, request, meter)?;
     meter.charge(2)?;
     finish_derived_plan(
-        snapshot, &baseline, capture_reuse.as_ref(), candidate, request, accepted, meter, verify_snapshot, inventory,
+        snapshot, &baseline, capture_reuse.as_ref().map(CaptureReuseView::from).or(proof_reuse), candidate, request, accepted, meter, verify_snapshot, inventory,
     )
 }
 // Added wrapper arguments include the owned inventory itself, not merely its
@@ -660,7 +707,7 @@ const FINISH_PROFILE_FRAME: u64 = 4 * (6 * std::mem::size_of::<&()>()
 fn finish_derived_plan(
     snapshot: &ProjectSnapshot,
     baseline: &CapturedProgram,
-    capture_reuse: Option<&super::owned_persist::OwnedCaptureReuse>,
+    capture_reuse: Option<CaptureReuseView<'_>>,
     candidate: &CapturedProgram,
     request: &OwnedPreviewRequest,
     accepted: &super::owned_lifecycle::AcceptedPreviewLifecycle,
@@ -675,7 +722,7 @@ fn finish_derived_plan(
 fn finish_derived_plan_profiled(
     snapshot: &ProjectSnapshot,
     baseline: &CapturedProgram,
-    capture_reuse: Option<&super::owned_persist::OwnedCaptureReuse>,
+    capture_reuse: Option<CaptureReuseView<'_>>,
     candidate: &CapturedProgram,
     request: &OwnedPreviewRequest,
     accepted: &super::owned_lifecycle::AcceptedPreviewLifecycle,
@@ -709,9 +756,13 @@ fn finish_derived_plan_profiled(
         None
     };
     let captured = if let Some(reuse) = exact_reuse {
-        let work = canonical_bytes(&reuse.projections)?.len()
-            .checked_add(canonical_bytes(&reuse.captured)?.len())
+        let projections_bytes = paid_canonical_bytes(&reuse.projections, meter)?;
+        let captured_bytes = paid_canonical_bytes(reuse.captured, meter)?;
+        let work = projections_bytes.len()
+            .checked_add(captured_bytes.len())
             .ok_or_else(|| refuse("capture", "reused capture work overflow"))?;
+        // The maps are cloned only after their complete typed wire owners and
+        // output sizes have been paid.
         meter.charge(work as u64)?;
         reuse.captured.clone()
     } else {
@@ -978,6 +1029,14 @@ fn selected_roots_are_unfinished_for_reuse(
     }
     Ok(true)
 }
+fn paid_canonical_bytes<T: Serialize + ?Sized>(
+    value: &T,
+    meter: &mut ProofMeter,
+) -> AdmissionResult<Vec<u8>> {
+    crate::product_contract::canonical_bytes_with_work(value, meter)
+        .map_err(|error| StoreError::from(capture_formula_error(error)))
+}
+
 fn locked_owned_frame_capture(
     data: &DataSnapshot,
     request: &OwnedPreviewRequest,
@@ -1002,13 +1061,13 @@ fn locked_owned_frame_capture(
     {
         return Ok(None);
     }
-    let inspected = canonical_bytes(&(
+    let inspected = paid_canonical_bytes(&(
         &data.records,
         &request.inventory.sources.root_entity,
         &request.inventory.lifecycle.before,
         &request.population,
         projections,
-    ))?.len();
+    ), meter)?.len();
     meter.charge(inspected as u64)?;
     let mut captured = BTreeMap::new();
     for record in &data.records {
@@ -1055,11 +1114,14 @@ fn locked_owned_frame_capture(
                 return Err(refuse(&projection.location,
                     "sealed OwnedV2 projection lost its authenticated saved value"));
             };
+            let value_bytes = paid_canonical_bytes(value, meter)?;
+            meter.charge(value_bytes.len() as u64)?;
             values.insert(projection.location.clone(), value.clone());
         }
         captured.insert(record.id.clone(), values);
     }
-    meter.charge(canonical_bytes(&captured)?.len() as u64)?;
+    let captured_bytes = paid_canonical_bytes(&captured, meter)?;
+    meter.charge(captured_bytes.len() as u64)?;
     Ok(Some(captured))
 }
 macro_rules! capture_frame_body {
@@ -1195,9 +1257,10 @@ fn capture_frame_batched_profiled(
     ContractWork::charge(meter, 13).map_err(capture_resource_error)?;
     let mut captured = BTreeMap::new();
     let runtime = LocalRuntime::with_cancellation(meter.cancelled());
-    runtime.with_projection_capture(baseline, data, day, meter, |capture| {
+    let result=runtime.with_projection_capture(baseline, data, day, meter, |capture| {
         capture_frame_body!(capture, data, request, projections, profile, captured)
-    })
+    });
+    result
 }
 
 // All arithmetic is evaluated only in constants. Overflow or an unsupported
@@ -1307,9 +1370,10 @@ impl RetainedFinish<'_> {
     ) -> AdmissionResult<PreparedRetainedCapture>
     {
         let Self { snapshot, candidate, request, accepted, lifecycle } = self;
+        // authenticate_body! has already established the baseline and checked
+        // request operations. Preserve its refusal order before this guard.
         meter.charge(32)?;
-        retained_guard_body!(snapshot, candidate, request, lifecycle, accepted, meter);
-        meter.charge(FINISH_PROFILE_FRAME)?;
+        retained_guard(snapshot, candidate, request, lifecycle, accepted, meter)?;
         let (certificates, projections, comparison) =
             super::common_fact_rules::verify_from_baseline(baseline, candidate, request, &inventory, &snapshot.data, meter)?;
         meter.charge(INITIAL_CAPTURE_PROFILE_TRANSPORT)?;
@@ -1326,7 +1390,8 @@ impl RetainedFinish<'_> {
             None
         };
         let (captured, reused) = if let Some(reuse) = exact_reuse {
-            let work = canonical_bytes(&reuse.captured)?.len() as u64;
+            let captured_bytes = paid_canonical_bytes(&reuse.captured, meter)?;
+            let work = captured_bytes.len() as u64;
             meter.charge(work)?;
             (reuse.captured.clone(), true)
         } else if capture_reuse.is_some() {
@@ -1371,7 +1436,10 @@ fn authenticate_retained<'s>(snapshot: &'s ProjectSnapshot, candidate: &'s Captu
     let verify_snapshot = false;
     let mut baseline_out = None;
     let mut reuse_out = None;
-    let captured = authenticate_body!(snapshot, candidate, request, meter, verify_snapshot, baseline, baseline_out, reuse_out,
+    // The retained path still reads the exact active source to construct its
+    // authenticated baseline; charge both immutable source byte strings even
+    // though lifecycle reconstruction already authenticated their identity.
+    let captured = authenticate_body!(snapshot, candidate, request, meter, verify_snapshot, true, true, baseline, baseline_out, reuse_out,
         super::common_fact_inventory::derive_retained(snapshot, &baseline, candidate, &request.inventory, meter, finish, consume, reuse_out.as_ref()))?;
     let baseline = baseline_out.ok_or_else(|| refuse("basis", "authenticated retained source baseline missing"))?;
     Ok((captured, baseline))
@@ -1398,76 +1466,6 @@ fn capture_frame_retained<'g, 's>(ready: ReadyCaptureSource<'g, 's, ProofMeter>,
 impl ProofMeter {
     pub(super) fn remaining_units_for_test(&self) -> u64 {
         self.left
-    }
-}
-
-// Numeric, test-only diagnosis of one strict withdrawal-adoption call. This
-// cannot reserve, refund, mutate, expose or construct a proof capability.
-#[cfg(test)]
-pub(crate) mod adoption_diagnostic {
-    use std::cell::Cell;
-    thread_local! {
-        static STATE: Cell<(bool, u64, u8, bool)> = const { Cell::new((false, 0, 0, false)) };
-    }
-    #[derive(Clone, Copy)]
-    #[repr(u8)]
-    pub(crate) enum Phase {
-        Entry = 1, LockedLoad = 2, Request = 3, Retry = 4,
-        Regenerate = 5, Plan = 6, Graph = 7, CallbackBinding = 8,
-        WithdrawalGraph = 9, Policy = 10, Packages = 11,
-        RemainingReplay = 12, Bundle = 13, NextValidate = 14,
-        Resume = 15, Save = 16, Pointer = 17, ErrorLoad = 18,
-        ErrorConfirm = 19,
-        ArchiveReconstruct = 20, ArchivePolicy = 21,
-        SurfaceReconstruct = 22, SurfaceDerive = 23,
-        SurfaceFrames = 24, SurfaceComplete = 25,
-    }
-    pub(crate) struct Guard((bool, u64, u8, bool));
-    pub(crate) fn start() -> Guard {
-        Guard(STATE.with(|s| s.replace((true, 0, Phase::Entry as u8, false))))
-    }
-    impl Drop for Guard {
-        fn drop(&mut self) { STATE.with(|s| s.set(self.0)); }
-    }
-    pub(crate) fn phase(phase: Phase) {
-        STATE.with(|s| { let (active, next, _, failed) = s.get();
-            if active { s.set((active, next, phase as u8, failed)); }
-        });
-    }
-    pub(super) fn meter(at: &std::panic::Location<'_>) -> (u64, u8, u32, u8) {
-        STATE.with(|s| {
-            let (active, next, phase, failed) = s.get();
-            if !active { return (0, 0, 0, 0); }
-            let next = next.saturating_add(1);
-            s.set((active, next, phase, failed));
-            let file = if at.file().ends_with("common_fact_admission.rs") { 1 }
-                else if at.file().ends_with("owned_transition.rs") { 2 }
-                else if at.file().ends_with("owned_persist.rs") { 3 }
-                else if at.file().ends_with("owned_replay.rs") { 4 }
-                else if at.file().ends_with("owned_lifecycle.rs") { 5 }
-                else if at.file().ends_with("owned_preview.rs") { 6 }
-                else if at.file().ends_with("owned_choice.rs") { 7 }
-                else { 0 };
-            (next, file, at.line(), phase)
-        })
-    }
-    pub(super) fn refusal(meter: (u64, u8, u32, u8), left: u64, requested: u64, reason: u8, caller: &std::panic::Location<'_>) {
-        STATE.with(|s| {
-            let (active, next, phase, failed) = s.get();
-            if active && !failed {
-                s.set((active, next, phase, true));
-                let charge_file = if caller.file().ends_with("common_fact_admission.rs") { 1 }
-                    else if caller.file().ends_with("owned_transition.rs") { 2 }
-                    else if caller.file().ends_with("owned_persist.rs") { 3 }
-                    else if caller.file().ends_with("owned_replay.rs") { 4 }
-                    else if caller.file().ends_with("owned_lifecycle.rs") { 5 }
-                    else if caller.file().ends_with("owned_preview.rs") { 6 }
-                    else if caller.file().ends_with("owned_choice.rs") { 7 }
-                    else { 0 };
-                eprintln!("P5_ADOPTION_FIRST_REFUSAL meter={} file={} line={} origin_phase={} phase={} left={} requested={} reason={} charge_file={} charge_line={}",
-                    meter.0, meter.1, meter.2, meter.3, phase, left, requested, reason, charge_file, caller.line());
-            }
-        });
     }
 }
 

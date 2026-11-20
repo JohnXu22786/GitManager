@@ -4,7 +4,9 @@ use super::common_fact_admission::{refuse, AdmissionResult, ProofMeter};
 use super::owned_lowering::{self, Metadata};
 use super::*;
 use serde::Serialize;
-use super::owned_persist::{err, CompletedInitialOrigin, FreshInitialOrigin, ReconstructedOwned};
+use super::owned_persist::{
+    err, CompletedInitialOrigin, FreshInitialOrigin, OwnedExecutionRecipe, ReconstructedOwned,
+};
 use std::sync::Arc;
 
 #[path = "owned_state_consumers.rs"]
@@ -353,16 +355,18 @@ impl ClosedContinuationRules {
         seed: &Dependencies,
         controlled: &Dependencies,
         origins: &ComparisonOrigins<'_>,
+        structural_entry: u64,
         meter: &mut ProofMeter,
     ) -> AdmissionResult<Self> {        closed_continuation_body!(original, predecessor_before, predecessor_after, predecessor_sources, before, after, request, inventory, seed, controlled, origins, meter, sources, predecessor, [
         let original_sources = &original.proof.request.inventory.sources;
         let original_before = continuation(
             original.proof.snapshot.program()?, before, original_sources, sources,
-            OwnedSourceSide::Before, seed, controlled, meter,
+            OwnedSourceSide::Before, seed, controlled, 0, meter,
         )?;
         let original_after = continuation(
             &original.proof.candidate, after, original_sources, sources,
-            OwnedSourceSide::After, seed, controlled, meter,
+            OwnedSourceSide::After, seed, controlled,
+            if matches!(origins, ComparisonOrigins::FreshInitial(_)) { structural_entry } else { 0 }, meter,
         )?;
         ], [
         let predecessor = match origins {
@@ -374,9 +378,9 @@ impl ClosedContinuationRules {
             }
             ComparisonOrigins::General { .. } => Some([
                 continuation(predecessor_before, before, predecessor_sources, sources,
-                    OwnedSourceSide::Before, seed, controlled, meter)?,
+                    OwnedSourceSide::Before, seed, controlled, 0, meter)?,
                 continuation(predecessor_after, after, predecessor_sources, sources,
-                    OwnedSourceSide::After, seed, controlled, meter)?,
+                    OwnedSourceSide::After, seed, controlled, structural_entry, meter)?,
             ]),
         };
         ], [Arc::new([original_before, original_after])])
@@ -390,6 +394,7 @@ impl ClosedContinuationRules {
         _origins: &super::owned_persist::CompletedInitialOrigin<'_, '_>,
         snapshot: &ProjectSnapshot,
         structural: Option<&super::owned_persist::CompletedStructuralLoan<'_, '_, '_>>,
+        structural_entry: u64,
         meter: &mut ProofMeter,
     ) -> AdmissionResult<Self> {
         if let Some(loan) = structural {
@@ -397,6 +402,9 @@ impl ClosedContinuationRules {
             if std::ptr::eq(retained, snapshot) {
                 // Return only this complete Closed result. The caller still runs
                 // all frame/projection/report/target and full historical checks.
+                #[cfg(test)] super::owned_persist::combined_transition_reuse_tests::boundary_before("structural", structural_entry, meter);
+                meter.charge(structural_entry)?;
+                #[cfg(test)] super::owned_persist::combined_transition_reuse_tests::boundary_after("structural", meter);
                 return closed_continuation_body!(original, predecessor_before,
                     predecessor_after, predecessor_sources, before, after, request,
                     inventory, seed, controlled, _origins, meter, sources, predecessor, [
@@ -406,15 +414,18 @@ impl ClosedContinuationRules {
                     // Original proofs completed in the exact immutable donor.
             meter.charge(COMPLETED_INITIAL_WINDOW_PAYMENT)?;
             let predecessor = if meter.reconstruction_default_window()? {
+                #[cfg(test)] super::owned_persist::combined_transition_reuse_tests::boundary_before("structural", structural_entry, meter);
+                meter.charge(structural_entry)?;
+                #[cfg(test)] super::owned_persist::combined_transition_reuse_tests::boundary_after("structural", meter);
                 meter.charge(COMPLETED_INITIAL_HIT_PAYMENT)?;
                 meter.charge(COMPLETED_INITIAL_HIT_PAYMENT)?;
                 None
             } else {
                 Some([
                     continuation(predecessor_before, before, predecessor_sources, sources,
-                        OwnedSourceSide::Before, seed, controlled, meter)?,
+                        OwnedSourceSide::Before, seed, controlled, 0, meter)?,
                     continuation(predecessor_after, after, predecessor_sources, sources,
-                        OwnedSourceSide::After, seed, controlled, meter)?,
+                        OwnedSourceSide::After, seed, controlled, structural_entry, meter)?,
                 ])
             };
                 ], [Arc::clone(&donor.continuation.original_proofs)]);
@@ -425,11 +436,11 @@ impl ClosedContinuationRules {
         let original_sources = &original.proof.request.inventory.sources;
         let original_before = continuation(
             original.proof.snapshot.program()?, before, original_sources, sources,
-            OwnedSourceSide::Before, seed, controlled, meter,
+            OwnedSourceSide::Before, seed, controlled, 0, meter,
         )?;
         let original_after = continuation(
             &original.proof.candidate, after, original_sources, sources,
-            OwnedSourceSide::After, seed, controlled, meter,
+            OwnedSourceSide::After, seed, controlled, 0, meter,
         )?;
         ], [
             // On a native miss both original proofs completed in this activation.
@@ -441,9 +452,9 @@ impl ClosedContinuationRules {
             } else {
                 Some([
                     continuation(predecessor_before, before, predecessor_sources, sources,
-                        OwnedSourceSide::Before, seed, controlled, meter)?,
+                        OwnedSourceSide::Before, seed, controlled, 0, meter)?,
                     continuation(predecessor_after, after, predecessor_sources, sources,
-                        OwnedSourceSide::After, seed, controlled, meter)?,
+                        OwnedSourceSide::After, seed, controlled, 0, meter)?,
                 ])
             };
         ], [Arc::new([original_before, original_after])])
@@ -475,6 +486,11 @@ fn state_marker_key(
     meter.charge(
         u64::try_from(text.len()).map_err(|_| refuse("budget", "text byte count overflow"))?,
     )?;
+    // The caller's closed snapshot and continuation structure bind this key to
+    // the exact source tree. The statement's action/path is unique within that
+    // tree, while `state` and `text` carry the marker semantics; serializing the
+    // entire expression here repeats already authenticated, potentially large
+    // syntax without strengthening the lookup.
     charged_bytes(&(side, action, path, state, step), meter)
 }
 /// Plain syntax candidates only. No caller can turn this set into a capability.
@@ -1354,6 +1370,7 @@ fn continuation(
     side: OwnedSourceSide,
     seed: &Dependencies,
     controlled: &Dependencies,
+    structural_entry: u64,
     meter: &mut ProofMeter,
 ) -> AdmissionResult<VerifiedSourceContinuation> {
     same_shell(&old.program, &new.program, side, &old_sources.root_entity)?;
@@ -1489,8 +1506,15 @@ fn continuation(
         &influenced,
         frozen,
     );
-    // This is the original first poll, with its one-unit floor plus the complete
-    // fixed owner/transport payment before constructing the canonical owner.
+    #[cfg(test)] super::owned_persist::combined_transition_reuse_tests::boundary_before("structural", structural_entry, meter);
+    meter.charge(structural_entry)?;
+    #[cfg(test)] super::owned_persist::combined_transition_reuse_tests::boundary_after("structural", meter);
+    if structural_entry != 0 {
+        meter.charge(COMPARISON_DISPATCH_PAYMENT)?;
+        meter.charge(COMPARISON_OWNER_PAYMENT)?;
+    }
+    // Preserve the original complete owner/transport payment before building
+    // canonical bytes, after the structural and dispatch boundary packets.
     meter.charge(CONTINUATION_CANONICAL_PAYMENT)?;
     let bytes = crate::product_contract::CanonicalEvidenceBytes::from_value(&evidence)?;
     let count = u64::try_from(bytes.len())
@@ -1687,6 +1711,7 @@ pub(super) fn verify(
     before: &CapturedProgram,
     after: &CapturedProgram,
     sources: &OwnedSourceRequest,
+    structural_entry: u64,
     meter: &mut ProofMeter,
 ) -> AdmissionResult<VerifiedOwnedContinuation> {
     meter.charge(COMPARISON_DISPATCH_PAYMENT)?;
@@ -1694,7 +1719,7 @@ pub(super) fn verify(
     meter.charge(STRUCTURAL_PAIR_PAYMENT)?;
     verify_with_origins(current, ComparisonOrigins::General {
         original, predecessor_before, predecessor_after,
-    }, layer, initialization, before, after, sources, meter)
+    }, layer, initialization, before, after, sources, structural_entry, meter)
 }
 
 // Only the closed persistence dispatcher can construct the argument. Its caller
@@ -1708,10 +1733,11 @@ pub(super) fn verify_initial(
     before: &CapturedProgram,
     after: &CapturedProgram,
     sources: &OwnedSourceRequest,
+    structural_entry: u64,
     meter: &mut ProofMeter,
 ) -> AdmissionResult<VerifiedOwnedContinuation> {
     verify_with_origins(current, ComparisonOrigins::FreshInitial(origin), layer,
-        initialization, before, after, sources, meter)
+        initialization, before, after, sources, structural_entry, meter)
 }
 
 macro_rules! continuation_value_terminal {
@@ -1906,6 +1932,7 @@ fn verify_with_origins(
     before: &CapturedProgram,
     after: &CapturedProgram,
     sources: &OwnedSourceRequest,
+    structural_entry: u64,
     meter: &mut ProofMeter,
 ) -> AdmissionResult<VerifiedOwnedContinuation> {    verify_continuation_body!(current, origins, layer, initialization, before, after, sources, meter, original, predecessor_before, predecessor_after, predecessor_sources, request, inventory, seed, controlled, closed, source, [
     let (original, predecessor_before, predecessor_after) = match &origins {
@@ -1930,6 +1957,7 @@ fn verify_with_origins(
         &seed,
         &controlled,
         &origins,
+        structural_entry,
         meter,
     )?;
     ], result)
@@ -1948,13 +1976,15 @@ pub(super) fn reconstruct_transition(
         match origin { Some(o) => o.retained(), None => snapshot }, [
         #[cfg(test)]
         super::owned_persist::combined_transition_reuse_tests::ordinary(origin.is_some(), manifest.transition);
-        #[cfg(test)]
-        super::owned_persist::combined_transition_reuse_tests::boundary_before("structural", RECONSTRUCTED_STRUCTURAL_ENTRY_PAYMENT, meter);
+        #[cfg(test)] super::owned_persist::combined_transition_reuse_tests::boundary_before("structural", RECONSTRUCTED_STRUCTURAL_ENTRY_PAYMENT, meter);
         meter.charge(RECONSTRUCTED_STRUCTURAL_ENTRY_PAYMENT)?;
-        #[cfg(test)]
-        super::owned_persist::combined_transition_reuse_tests::boundary_after("structural", meter);
+        #[cfg(test)] super::owned_persist::combined_transition_reuse_tests::boundary_after("structural", meter);
         let continuation = match origin {
-            Some(origin) if manifest.transition == ScopeTransition::Evolution => {
+            Some(origin)
+                if manifest.transition == ScopeTransition::Evolution
+                    && registry.epochs.last()
+                        .and_then(|epoch| registry.recipes.get(&epoch.output))
+                        .is_some_and(|recipe| matches!(recipe, OwnedExecutionRecipe::Initial(_))) => {
                 #[cfg(test)]
                 super::owned_persist::combined_transition_reuse_tests::boundary_next("dispatch", COMPARISON_DISPATCH_PAYMENT, meter);
                 meter.charge(COMPARISON_DISPATCH_PAYMENT)?;
@@ -1986,6 +2016,7 @@ pub(super) fn reconstruct_transition(
         &seed,
         &controlled,
         &origins,
+        RECONSTRUCTED_STRUCTURAL_ENTRY_PAYMENT,
         meter,
     )?;
     #[cfg(test)]
@@ -2025,6 +2056,7 @@ pub(super) fn reconstruct_transition(
         &seed,
         &controlled,
         &origins,
+        RECONSTRUCTED_STRUCTURAL_ENTRY_PAYMENT,
         meter,
     )?;
     #[cfg(test)]
@@ -2163,11 +2195,13 @@ pub(super) fn reconstruct_transition_completed(
                 meter.charge(COMPLETED_INITIAL_CLOSED_PAYMENT)?;
                 let closed = ClosedContinuationRules::verify_completed_initial(original, predecessor_before,
                     predecessor_after, predecessor_sources, before, after, &request, &inventory,
-                    &seed, &controlled, origin, snapshot, structural, meter)?;
+                    &seed, &controlled, origin, snapshot, structural,
+                    0, meter)?;
             ], value)
         } else {
             verify(current, &original, layer, initialization,
-                prior_before, prior_after, before, after, sources, meter)?
+                prior_before, prior_after, before, after, sources,
+                0, meter)?
         };
     ])
 }

@@ -163,7 +163,7 @@ fn typed_key_exact_debit_boundaries_refuse_before_unfunded_work(){
 fn paid_key(entity:&str,binding:&str,expression:&Expr,expected:&Type,limits:&RuntimeLimits,work:&mut dyn ContractWork)->Result<Option<OwnedCaptureKey>>{pay(work,KEY_FRAME)?;key(entity,binding,expression,expected,limits,work)}
 fn paid_compare(a:&OwnedCaptureKey,b:&OwnedCaptureKey,work:&mut dyn ContractWork)->Result<Cmp>{pay(work,COMPARE_FRAME)?;compare(a,b,work)}
 fn paid_search(cache:&[Box<OwnedCaptureKey>],key:&OwnedCaptureKey,work:&mut dyn ContractWork)->Result<std::result::Result<usize,usize>>{pay(work,SEARCH_FRAME)?;search(cache,key,work)}
-fn paid_publish(cache:&mut Vec<Box<OwnedCaptureKey>>,bytes:&mut usize,key:Option<OwnedCaptureKey>,work:&mut dyn ContractWork)->Result<()>{pay(work,PUBLISH_FRAME)?;publish(cache,bytes,key,work)}
+fn paid_publish(cache:&mut Vec<Box<OwnedCaptureKey>>,bytes:&mut usize,key:Option<OwnedCaptureKey>,work:&mut dyn ContractWork)->Result<()>{pay(work,PUBLISH_FRAME)?;publish(cache,bytes,key,work).map(|_|())}
 
 #[test]
 fn typed_key_long_equal_prefix_and_distinct_allocations_are_exact(){

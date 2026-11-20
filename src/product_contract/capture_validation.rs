@@ -28,7 +28,7 @@ pub(crate) fn validate_projection_extension(
     binding: &str,
     expr: &Expr,
 ) -> Result<()> {
-    extension(app, (facts.total_nodes, facts.action_prefix_nodes, facts.canonical_len, facts.action_count),
+        extension(app, (facts.total_nodes, facts.action_prefix_nodes, facts.canonical_len, facts.action_count),
         entity, binding, expr, Audit::none())
 }
 // Lexical expansion preserves the ordinary entrance without a new wrapper.
@@ -227,6 +227,14 @@ impl<H: ContractWork + ?Sized> CaptureValidation<'_, '_, H> {
         binding: &str,
         expr: &Expr,
     ) -> ContractWorkResult<()> {
+        self.validate_extension_with_len(entity, binding, expr).map(|_| ())
+    }
+    pub(crate) fn validate_extension_with_len(
+        &mut self,
+        entity: &str,
+        binding: &str,
+        expr: &Expr,
+    ) -> ContractWorkResult<usize> {
         self.ensure_source_and_data()?;
         let program = &self.program.program;
         let facts = self
@@ -241,7 +249,7 @@ impl<H: ContractWork + ?Sized> CaptureValidation<'_, '_, H> {
             facts.action_count,
         );
         self.run_host(|a| {
-            extension(
+            extension_expression_len(
                 program,
                 (total, prefix, len, count),
                 entity,
@@ -403,6 +411,16 @@ fn extension(
     expr: &Expr,
     a: Audit<'_>,
 ) -> Result<()> {
+    extension_expression_len(app, facts, entity, binding, expr, a).map(|_| ())
+}
+fn extension_expression_len(
+    app: &AppDefinition,
+    facts: (usize, usize, usize, usize),
+    entity: &str,
+    binding: &str,
+    expr: &Expr,
+    a: Audit<'_>,
+) -> Result<usize> {
     a.pay(0)?;
     a.pay(16)?;
     let (total, prefix, wire, actions) = facts;
@@ -498,15 +516,101 @@ fn extension(
         bytes = capture_canonical::canonical_bytes_audited(&synthetic, a)?;
         bytes.len()
     };
+    // The closed synthetic wire form is fixed except for the three validated
+    // identifiers and its two identical expression operands. Recover the
+    // already-counted expression wire size once, so downstream cache-key
+    // admission does not walk the same AST again solely to count bytes.
+    a.pay(32)?;
+    let overhead = 224usize
+        .checked_add(id.len().checked_add(2).ok_or_else(|| a.overflow())?)
+        .and_then(|n| n.checked_add(binding.len().checked_add(2)?))
+        .and_then(|n| n.checked_add(entity.len().checked_add(2)?))
+        .ok_or_else(|| a.overflow())?;
+    let expression_pair = synthetic_len.checked_sub(overhead).ok_or_else(|| a.overflow())?;
+    a.require(expression_pair % 2 == 0, "synthetic expression length is not paired")?;
+    let expression_len = expression_pair / 2;
     a.pay(6)?;
     let len = wire
         .checked_add(synthetic_len)
         .and_then(|n| n.checked_add(usize::from(actions > 0)))
         .ok_or_else(|| a.overflow())?;
     a.require(len <= MAX_WIRE_BYTES, "program exceeds byte budget")?;
-    a.pay(0)
+    a.pay(0)?;
+    Ok(expression_len)
 }
 
+
+pub(super) fn describe_synthetic_action(
+    action: &SyntheticAction<'_>,
+    shape: &mut capture_canonical::Shape<'_>,
+) -> Result<()> {
+    use capture_canonical::ManualShape;
+    let SyntheticAction { id, label, parameters, guards, steps, ensures } = action;
+    let mut root = shape.object()?;
+    root.literal_identifier_field("id", id)?;
+    root.literal_ascii_field("label", label)?;
+    root.literal_manual_field("parameters", &OptimizedParameters {
+        binding: parameters.binding,
+        entity: parameters.entity,
+    })?;
+    root.field("guards", guards)?;
+    root.literal_manual_field("steps", steps)?;
+    root.field("ensures", ensures)?;
+    root.end()
+}
+
+impl capture_canonical::ManualShape for Reference<'_> {
+    fn describe(&self, shape: &mut capture_canonical::Shape<'_>) -> Result<()> {
+        let mut object = shape.object()?;
+        object.literal_ascii_field("kind", self.kind)?;
+        object.literal_identifier_field("entity", self.entity)?;
+        object.end()
+    }
+}
+#[derive(Serialize)]
+struct OptimizedParameters<'a> {
+    binding: &'a str,
+    entity: &'a str,
+}
+impl capture_canonical::ManualShape for OptimizedParameters<'_> {
+    fn describe(&self, shape: &mut capture_canonical::Shape<'_>) -> Result<()> {
+        let mut object = shape.object()?;
+        object.identifier_key_manual_field(
+            self.binding,
+            &Reference { kind: "reference", entity: self.entity },
+        )?;
+        object.end()
+    }
+}
+impl capture_canonical::ManualShape for SyntheticEqual<'_> {
+    fn describe(&self, shape: &mut capture_canonical::Shape<'_>) -> Result<()> {
+        let mut object = shape.object()?;
+        object.literal_ascii_field("kind", self.kind)?;
+        if std::ptr::eq(self.left, self.right) {
+            object.duplicate_manual_field("left", "right", self.left)?;
+        } else {
+            object.manual_field("left", self.left)?;
+            object.manual_field("right", self.right)?;
+        }
+        object.end()
+    }
+}
+impl capture_canonical::ManualShape for SyntheticAssert<'_> {
+    fn describe(&self, shape: &mut capture_canonical::Shape<'_>) -> Result<()> {
+        let mut object = shape.object()?;
+        object.literal_ascii_field("kind", self.kind)?;
+        object.literal_manual_field("condition", &self.condition)?;
+        object.literal_ascii_field("message", self.message)?;
+        object.end()
+    }
+}
+impl capture_canonical::ManualShape for [SyntheticAssert<'_>; 1] {
+    fn describe(&self, shape: &mut capture_canonical::Shape<'_>) -> Result<()> {
+        let mut sequence = shape.array(1)?;
+        sequence.manual_element(&self[0])?;
+        sequence.end()
+    }
+}
 
 // A paid, concrete height walk, used only to reserve this action's two later
 // serialization stacks. These are actual logical frame/lifetime slots, never
@@ -524,10 +628,12 @@ impl SyntheticAction<'_> {
         let SyntheticAction { id: _, label: _, parameters: _, guards: [], steps: [step], ensures: [] } = self;
         let SyntheticAssert { kind: _, condition: SyntheticEqual { kind: _, left, right }, message: _ } = step;
         // action / steps / assert / equal. Parameters / Reference has height3.
-        // Visit BOTH occurrences, even though this lexical owner borrows one Expr.
-        let left = synthetic_expr_height(left, a)?;
-        let right = synthetic_expr_height(right, a)?;
-        left.max(right).checked_add(4).ok_or_else(|| a.overflow())
+        // The duplicate operand has the same wire shape and maximum height; one
+        // bounded traversal establishes both without walking the same AST twice.
+        let same_expr = std::ptr::eq(*left, *right);
+        let left_height = synthetic_expr_height(left, a)?;
+        let right_height = if same_expr { left_height } else { synthetic_expr_height(right, a)? };
+        left_height.max(right_height).checked_add(4).ok_or_else(|| a.overflow())
     }
 }
 fn synthetic_expr_height(expr: &Expr, a: Audit<'_>) -> Result<usize> {

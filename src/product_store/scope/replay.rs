@@ -31,6 +31,28 @@ pub(crate) struct RetainedScene {
     scenario: ScenarioSpec,
 }
 impl RetainedScene {
+    pub(crate) fn from_verified_archive_parts(
+        current: &ProjectSnapshot,
+        decision: &ScopedDecision,
+        scene: &crate::product_decisions::AcceptedScene,
+        witness: &Digest,
+    ) -> Result<Self> {
+        if !current.decisions.decisions.contains(decision)
+            || &decision.witness != witness
+            || !decision.scenarios.contains(&scene.scenario().identity()?)
+        {
+            return Err(compiler::error(
+                "retained scene differs from its exact witness/source/frame",
+            ));
+        }
+        Ok(Self {
+            snapshot: canonical_digest(IdentityDomain::Data, current)?,
+            decision: decision.clone(),
+            program: scene.program().clone(),
+            scenario: scene.scenario().clone(),
+        })
+    }
+
     pub(crate) fn from_verified_archive(
         current: &ProjectSnapshot,
         decision: &ScopedDecision,
@@ -86,6 +108,9 @@ pub struct ScopedExecutionContext {
     correspondences: BTreeMap<Digest, correspondence::VerifiedCorrespondence>,
 }
 impl ScopedExecutionContext {
+    pub(crate) fn current_snapshot(&self) -> &ProjectSnapshot {
+        &self.snapshot
+    }
     pub(crate) fn require_current_scene_snapshot(&self, expected: &ProjectSnapshot) -> Result<()> {
         if self.snapshot != *expected {
             return Err(StoreError::Invalid(

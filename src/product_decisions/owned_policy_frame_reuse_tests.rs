@@ -19,7 +19,7 @@ fn policy_frame_export_lexical_packets_are_exact() {
         "receipt_decision": std::mem::size_of::<super::super::owned_policy::ReceiptDecisionCall<'_, '_, '_>>(),
         "continuation_capture": std::mem::size_of::<RecordContinuationCapture<'_, '_, LocalRuntime>>(),
         "continuation_dispatch": std::mem::size_of::<crate::product_store::scope::RecordContinuationDispatch<'_, RecordContinuationCapture<'_, '_, LocalRuntime>>>(),
-        "f0": policy_frame_continuation_payment::<LocalRuntime>(),
+        "f0": policy_frame_continuation_payment_for::<LocalRuntime, Option<crate::product_store::scope::ValidatedOwnedCandidate>>(),
         "fp": super::super::owned_policy::POLICY_FRAME_DECISION_RECORD_PAYMENT,
         "fa": super::super::owned_policy::POLICY_FRAME_DECISION_CONSUME_PAYMENT,
         "f5": super::super::bundle::POLICY_FRAME_EXPORT_PAYMENT,
@@ -34,11 +34,14 @@ fn policy_frame_export_lexical_packets_are_exact() {
     // The owning archive embeds ProductStore/OsString and varies by target;
     // 3040 is the recorded-layout floor, not a target-independent exact cost.
     let expected = super::super::bundle::archive_payment(
-        2816, [(std::mem::size_of::<IntentArchive>(), 4)]).max(3040);
+        2816, [
+            (std::mem::size_of::<IntentArchive>(), 4),
+            (std::mem::size_of::<Option<crate::product_store::scope::ValidatedOwnedCandidate>>(), 4),
+        ]).max(3040);
     assert_eq!(super::super::bundle::POLICY_FRAME_EXPORT_PAYMENT, expected,
         "the reviewed lexical owner formula replaces the removed export/validation transport");
     super::super::bundle::assert_policy_frame_export_layouts_for_test();
-    for cost in [policy_frame_continuation_payment::<LocalRuntime>(),
+    for cost in [policy_frame_continuation_payment_for::<LocalRuntime, Option<crate::product_store::scope::ValidatedOwnedCandidate>>(),
         super::super::owned_policy::POLICY_FRAME_DECISION_RECORD_PAYMENT,
         super::super::owned_policy::POLICY_FRAME_DECISION_CONSUME_PAYMENT,
         super::super::bundle::POLICY_FRAME_EXPORT_PAYMENT] {
@@ -58,7 +61,9 @@ impl<'gate> RecordContinuationCapture<'_, 'gate, LocalRuntime> {
         if evolved { check.assert_fused_row_continuation_for_test(recorder, source)?; }
         // This is the exact concrete production continuation, including history,
         // all obligations, package/replay, independent reconstruction and export.
-        self.verify(check, recorder).map_err(into_store_error)?;
+        let validated = self.verify(check, recorder).map_err(into_store_error)?;
+        assert!(validated.as_ref().is_some_and(|token| token.belongs_to(candidate)),
+            "locked continuation must return the validation token for this exact candidate");
         check.assert_policy_frame_receipt_for_test(capsule, recorder, source, candidate, evolved, decision, &scenes, false);
         // The deleted production export wrapper no longer returns a bundle.
         // Actual pre-discard bundle parity is checked only in the separately
@@ -98,7 +103,7 @@ impl DecisionEngine<LocalRuntime> {
         self.with_owned_transition(context.clone(), || {
         result = Some(store.adopt_owned_transition_verified(change.revision, &prepared,
             &change.prepared, &change.decisions, secondary.clone(),
-            |current, fresh, next, plan, candidate, check, capsule| {
+            |current, fresh, next, plan, candidate, check, capsule, _validated_candidate| {
                 reached = true;
                 let capsule = capsule.expect("actual locked writer");
                 if *variant == "clipped-profile" {
@@ -110,10 +115,10 @@ impl DecisionEngine<LocalRuntime> {
                 }
 
                 if *variant == "f0-short" || *variant == "f0-exact" {
-                    let cost = policy_frame_continuation_payment::<LocalRuntime>();
+                    let cost = policy_frame_continuation_payment_for::<LocalRuntime, Option<crate::product_store::scope::ValidatedOwnedCandidate>>();
                     check.leave_policy_frame_units_for_test(cost - u64::from(*variant == "f0-short"));
                 }
-                check.charge(policy_frame_continuation_payment::<LocalRuntime>())?;
+                check.charge(policy_frame_continuation_payment_for::<LocalRuntime, Option<crate::product_store::scope::ValidatedOwnedCandidate>>())?;
                 if *variant == "cancel-primary" {
                     prepared.cancellation().store(true, std::sync::atomic::Ordering::Release);
                 } else if let Some(secondary) = &secondary {
@@ -142,7 +147,7 @@ impl DecisionEngine<LocalRuntime> {
                 };
                 let dispatch = crate::product_store::scope::RecordContinuationDispatch { capture, run };
                 capsule.with_policy_frame_recorder(check, dispatch)
-            }, |_| panic!("fresh operation cannot enter retry"), None));
+            }, |_| panic!("fresh operation cannot enter retry"), &mut None, None));
             Ok(())
         }).unwrap();
         let result = result.unwrap();
@@ -298,7 +303,10 @@ impl<'gate> RecordContinuationCapture<'_, 'gate, LocalRuntime> {
     fn assert_cancelled_for_test(self, check: &mut crate::product_store::scope::OwnedPolicyCheck<'gate>, recorder: &mut crate::product_store::scope::PolicyFrameRecorder<'gate>) -> std::result::Result<(), StoreError> {
         recorder.assert_policy_frame_empty_for_test();
         let before = check.policy_frame_units_for_test();
-        let error = self.verify(check, recorder).unwrap_err();
+        let error = match self.verify(check, recorder) {
+            Err(error) => error,
+            Ok(_) => panic!("cancelled continuation unexpectedly produced a validation token"),
+        };
         assert!(matches!(error, DecisionError::Store(StoreError::Invalid(ref text)) if text == "Common factual admission: budget: cancelled or cumulative elapsed budget exhausted"), "{error:?}");
         check.assert_policy_frame_units_for_test(before);
         recorder.assert_policy_frame_empty_for_test();

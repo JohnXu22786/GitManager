@@ -17,17 +17,9 @@ pub(super) fn into_store_error(error: DecisionError) -> StoreError {
 macro_rules! locked_verification_body {
     ($engine:ident, $store:ident, $current:ident, $fresh:ident, $next:ident, $plan:ident,
      $candidate:ident, $change:ident, $check:ident, $ids:ident, [$($policy:tt)*], [$($export:tt)*]) => {{
-                        #[cfg(test)]
-                        crate::product_store::scope::adoption_diagnostic::phase(
-                            crate::product_store::scope::adoption_diagnostic::Phase::WithdrawalGraph,
-                        );
                         validate_withdrawal_history($current)?;
                         validate_withdrawal_delta($current, $next, $plan)?;
                         if $fresh.is_withdrawal() {
-                            #[cfg(test)]
-                            crate::product_store::scope::adoption_diagnostic::phase(
-                                crate::product_store::scope::adoption_diagnostic::Phase::Policy,
-                            );
                             $check.charge(6)?;
                             $($policy)*
                             if $ids != $plan.retire_decisions {
@@ -36,15 +28,7 @@ macro_rules! locked_verification_body {
                         } else if $next != &$current.decisions || !$plan.retire_decisions.is_empty() {
                             return Err(invalid("implementation transition changed intentions"));
                         }
-                        #[cfg(test)]
-                        crate::product_store::scope::adoption_diagnostic::phase(
-                            crate::product_store::scope::adoption_diagnostic::Phase::Packages,
-                        );
                         $engine.verify_destination_packages($store, $current, $next, $plan)?;
-                        #[cfg(test)]
-                        crate::product_store::scope::adoption_diagnostic::phase(
-                            crate::product_store::scope::adoption_diagnostic::Phase::RemainingReplay,
-                        );
                         let report = $engine.check_bound($next, $fresh.target(), &$change.mappings)?;
                         if report.disposition != CheckDisposition::Ready {
                             return Err(DecisionError::Unverified(
@@ -52,10 +36,6 @@ macro_rules! locked_verification_body {
                                     .into(),
                             ));
                         }
-                        #[cfg(test)]
-                        crate::product_store::scope::adoption_diagnostic::phase(
-                            crate::product_store::scope::adoption_diagnostic::Phase::Bundle,
-                        );
                         $($export)*
                         Ok(())
     }};
@@ -73,10 +53,13 @@ pub(super) struct RecordContinuationCapture<'call, 'gate, R: RuntimeAdapter> {
     pub(super) capsule: &'call crate::product_store::scope::LockedArchivePolicy<'gate>,
 }
 const fn policy_frame_continuation_payment<R: RuntimeAdapter>() -> u64 {
-    crate::product_store::scope::policy_frame_open_payment::<RecordContinuationCapture<'_, '_, R>>()
+    policy_frame_continuation_payment_for::<R, ()>()
+}
+const fn policy_frame_continuation_payment_for<R: RuntimeAdapter, O>() -> u64 {
+    crate::product_store::scope::policy_frame_open_payment_for::<RecordContinuationCapture<'_, '_, R>, O>()
 }
 impl<'gate, R: RuntimeAdapter> RecordContinuationCapture<'_, 'gate, R> {
-    fn run(self, check: &mut crate::product_store::scope::OwnedPolicyCheck<'gate>, recorder: &mut crate::product_store::scope::PolicyFrameRecorder<'gate>) -> std::result::Result<(), StoreError> {
+    fn run(self, check: &mut crate::product_store::scope::OwnedPolicyCheck<'gate>, recorder: &mut crate::product_store::scope::PolicyFrameRecorder<'gate>) -> std::result::Result<Option<crate::product_store::scope::ValidatedOwnedCandidate>, StoreError> {
         self.verify(check, recorder).map_err(into_store_error)
     }
 
@@ -403,11 +386,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 &change.prepared,
                 &change.decisions,
                 self.runtime.cancellation_token(),
-                |current, fresh, next, plan, candidate, check, archive_policy| {
-                    #[cfg(test)]
-                    crate::product_store::scope::adoption_diagnostic::phase(
-                        crate::product_store::scope::adoption_diagnostic::Phase::CallbackBinding,
-                    );
+                |current, fresh, next, plan, candidate, check, archive_policy, validated_candidate| {
                     if canonical_digest(IdentityDomain::Data, current)? != change.expected_snapshot
                         || self.runtime.capabilities() != change.runtime
                         || self.limits != change.limits
@@ -420,14 +399,15 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                         ));
                     }
                     if let Some(capsule) = archive_policy {
-                        check.charge(const { policy_frame_continuation_payment::<R>() })?;
+                        check.charge(const { policy_frame_continuation_payment_for::<R, Option<crate::product_store::scope::ValidatedOwnedCandidate>>() })?;
                         let capture = RecordContinuationCapture {
                             engine: self, store, current, fresh, next, plan, candidate, change, capsule,
                         };
                         let dispatch = crate::product_store::scope::RecordContinuationDispatch {
                             capture, run: RecordContinuationCapture::run,
                         };
-                        return capsule.with_policy_frame_recorder(check, dispatch);
+                        *validated_candidate = capsule.with_policy_frame_recorder(check, dispatch)?;
+                        return Ok(());
                     }
                     let mut verify = || -> Result<()> {
                         locked_verification_body!(self, store, current, fresh, next, plan, candidate, change, check, ids, [
@@ -440,6 +420,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                                 .export_for_locked_withdrawal(candidate, capsule)?;
                         } else {
                             IntentArchive::new(store.clone()).export_for_validated(candidate, None)?;
+                            *validated_candidate = Some(crate::product_store::scope::ValidatedOwnedCandidate::for_snapshot(candidate));
                         }
                         ])
                     };
@@ -451,6 +432,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                         .map(|_| ())
                         .map_err(into_store_error)
                 },
+                &mut None,
                 #[cfg(test)]
                 fault,
             )?)

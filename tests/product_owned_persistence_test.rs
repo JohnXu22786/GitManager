@@ -149,6 +149,25 @@ fn verify(
 fn cancel() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))
 }
+
+fn assert_compiled_action_tail(steps: &[Statement], expected: &Statement) {
+    fn flatten<'a>(steps: &'a [Statement], output: &mut Vec<&'a Statement>) {
+        for step in steps {
+            output.push(step);
+            if let Statement::ForEach { steps, .. } = step {
+                flatten(steps, output);
+            }
+        }
+    }
+    let mut ordered = Vec::new();
+    flatten(steps, &mut ordered);
+    let positions = ordered
+        .iter()
+        .enumerate()
+        .filter_map(|(index, step)| (**step == *expected).then_some(index))
+        .collect::<Vec<_>>();
+    assert_eq!(positions.len(), 1, "authored action tail must compile exactly once");
+}
 fn prepare(s: &ProductStore, b: &CapturedProgram, r: &OwnedPreviewRequest) -> PreparedOwnedPreview {
     let proof = verify(s, b, r).unwrap();
     s.prepare_owned_preview(&proof, ProofBudget::default(), cancel())
@@ -2247,4 +2266,436 @@ fn committed_checkpoint_preserves_session_day_without_blocking_later_inputs() {
     assert_ne!(later.session, snapshot.session);
     later.validate().unwrap();
     assert_eq!(store.load().unwrap(), later);
+}
+#[test]
+fn second_owned_layer_is_adopted_from_the_active_compilation_and_survives_cold_restore() {
+    let (a, b) = pair();
+    let (_dir, original) = setup(&a);
+    let first_request = request(&original, &a, &b);
+    let first = prepare(&original, &b, &first_request);
+    let first_snapshot = owned_snapshot_for_test(&first, "first-owned-layer", false).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let store =
+        ProductStore::create_recovered_with(root.path().join("owned"), &first_snapshot, |_| Ok(()))
+            .unwrap();
+
+    let active = store.load().unwrap().program().unwrap().clone();
+    assert!(active.program.views.iter().any(|view| view.id == "history"));
+    assert!(active.program.observables.iter().any(|observable| observable.id == "ready_count"));
+    let mut next_app = active.program.clone();
+    let action = next_app
+        .actions
+        .iter_mut()
+        .find(|action| action.id == "add")
+        .unwrap();
+    let tail_start = action.steps.len();
+    action.steps.push(Statement::SetState {
+        state: "name_input".into(),
+        value: text(""),
+    });
+    let (_, inherited_nodes) = active.program.validation_node_counts_for_test().unwrap();
+    let (_, candidate_nodes) = next_app.validation_node_counts_for_test().unwrap();
+    assert!(inherited_nodes <= MAX_AST_NODES && candidate_nodes <= MAX_AST_NODES);
+    let next_source = CapturedProgram::capture(
+        &serde_json::to_vec(&next_app).unwrap(),
+        &active.binding.project_id,
+        active.binding.producer.clone(),
+        active.binding.task.clone(),
+    )
+    .unwrap();
+    let current = store.load().unwrap();
+    let second_request = OwnedPreviewRequest {
+        inventory: CommonFactInventoryRequest {
+            snapshot: canonical_digest(IdentityDomain::Data, &current).unwrap(),
+            sources: OwnedSourceRequest {
+                before: canonical_digest(IdentityDomain::Source, &active).unwrap(),
+                after: canonical_digest(IdentityDomain::Source, &next_source).unwrap(),
+                root_entity: "job".into(),
+                edits: vec![OwnedSpanEdit {
+                    id: "append-second-layer-assertion".into(),
+                    before: endpoint(&active, "add", vec![], tail_start, 0, None),
+                    after: endpoint(&next_source, "add", vec![], tail_start, 1, None),
+                }],
+            },
+            lifecycle: first_request.inventory.lifecycle.clone(),
+        },
+        auxiliary: vec![],
+        population: ScopePopulation::All,
+        excluded_records: vec![],
+        operations: next_source
+            .program
+            .actions
+            .iter()
+            .map(|action| action.id.clone())
+            .collect(),
+        availability: first_request.availability.clone(),
+        purpose: "Append a second cumulative owned layer".into(),
+    };
+    let second_witnesses = witnesses(&store);
+    let mut lifecycle_host = LifecycleAcceptanceHost::prepare(
+        &store,
+        &next_source,
+        &second_request,
+        &second_witnesses,
+        ProofBudget::default(),
+        cancel(),
+    )
+    .unwrap();
+    let accepted = lifecycle_host
+        .synthetic_operator_accept_for_test(&store)
+        .unwrap();
+    let prepared = product_store::scope::prepare_owned(
+        &current,
+        &next_source,
+        &second_request,
+        &accepted,
+        "second-owned-layer",
+        ProofBudget::default(),
+        cancel(),
+    )
+    .unwrap();
+    assert_eq!(prepared.basis(), &current);
+    assert_eq!(prepared.target().program.label, active.program.label);
+    assert_eq!(prepared.target().program.views, active.program.views);
+    assert_eq!(prepared.target().program.observables, active.program.observables);
+    assert_eq!(
+        prepared
+            .target()
+            .program
+            .actions
+            .iter()
+            .map(|action| &action.id)
+            .collect::<Vec<_>>(),
+        next_app
+            .actions
+            .iter()
+            .map(|action| &action.id)
+            .collect::<Vec<_>>()
+    );
+    let compiled_add = prepared
+        .target()
+        .program
+        .actions
+        .iter()
+        .find(|action| action.id == "add")
+        .unwrap();
+    assert_compiled_action_tail(
+        &compiled_add.steps,
+        next_app
+            .actions
+            .iter()
+            .find(|action| action.id == "add")
+            .unwrap()
+            .steps
+            .last()
+            .unwrap(),
+    );
+    for previous in &active.program.entities {
+        let cumulative = prepared
+            .target()
+            .program
+            .entities
+            .iter()
+            .find(|entity| entity.id == previous.id)
+            .unwrap();
+        for field in &previous.fields {
+            assert!(
+                cumulative.fields.contains(field),
+                "prior field {}.{} was dropped",
+                previous.id,
+                field.id
+            );
+        }
+    }
+
+    let plan = AdoptionPlan {
+        version: CONTRACT_VERSION,
+        id: prepared.operation_id().into(),
+        project_id: current.data.project_id.clone(),
+        expected_generation: current.data.generation,
+        expected_data: current.data.identity().unwrap(),
+        expected_decisions: current.decisions.identity().unwrap(),
+        expected_session: current.session.identity().unwrap(),
+        current_source: active.binding.clone(),
+        target: prepared.target().artifact.clone(),
+        scope: prepared.scope(),
+        compatibility: product_runtime::LocalRuntime::default()
+            .compatibility_at(prepared.target(), &current.data, current.clock_day)
+            .unwrap(),
+        required_decisions: current
+            .decisions
+            .decisions
+            .iter()
+            .filter(|decision| decision.status == DecisionStatus::Active)
+            .map(|decision| decision.id.clone())
+            .collect(),
+        checks: vec![],
+        evidence: vec![],
+        retire_decisions: vec![],
+    };
+    let mode = product_store::scope::OwnedChoiceMode::Activate;
+    let adoption = store
+        .prepare_owned_adoption(plan, &prepared, &mode)
+        .unwrap();
+    let adopted = store
+        .adopt_owned_verified(
+            current.revision,
+            &prepared,
+            &mode,
+            &adoption,
+            &current.decisions,
+            |basis, fresh, graph, _plan, _next| {
+                assert_eq!(basis, &current);
+                assert_eq!(fresh, prepared.target());
+                assert_eq!(graph, &current.decisions);
+                Ok(())
+            },
+            |_| Ok(()),
+            None,
+        )
+        .unwrap();
+    let state = adopted.owned_scope().unwrap();
+    assert_eq!(state.layers.len(), 2);
+    assert_eq!(state.adoptions.len(), 2);
+    assert_eq!(state.initializations.len(), 2);
+    assert_ne!(state.layers.keys().next(), state.layers.keys().last());
+    let initialized_row = &state.initializations[1].additions[0].record;
+    let mut tampered_revision = adopted.clone();
+    let tampered_record = tampered_revision
+        .data
+        .records
+        .iter_mut()
+        .find(|row| row.entity == initialized_row.entity && row.id == initialized_row.record)
+        .unwrap();
+    tampered_record.revision += 1;
+    assert!(
+        tampered_revision.validate().is_err(),
+        "an unrecorded row revision advance must not be accepted as layer initialization"
+    );
+    for layer in state.layers.values() {
+        assert!(layer
+            .inventory
+            .projections
+            .iter()
+            .all(|projection| projection.capture_required));
+    }
+    let prior_additions = &first_snapshot.owned_scope().unwrap().initializations[0].additions;
+    for addition in prior_additions {
+        let current = adopted
+            .data
+            .records
+            .iter()
+            .find(|row| row.entity == addition.record.entity && row.id == addition.record.record)
+            .unwrap();
+        for (field, value) in &addition.values {
+            assert_eq!(
+                current.values.get(field),
+                Some(value),
+                "second layer changed prior protected value {}.{}",
+                addition.record.record,
+                field
+            );
+        }
+    }
+    let active_after_second = adopted.program().unwrap().clone();
+    assert_eq!(
+        active_after_second
+            .program
+            .actions
+            .iter()
+            .map(|action| &action.id)
+            .collect::<Vec<_>>(),
+        next_app
+            .actions
+            .iter()
+            .map(|action| &action.id)
+            .collect::<Vec<_>>()
+    );
+    let adopted_add = active_after_second
+        .program
+        .actions
+        .iter()
+        .find(|action| action.id == "add")
+        .unwrap();
+    assert_compiled_action_tail(
+        &adopted_add.steps,
+        next_app
+            .actions
+            .iter()
+            .find(|action| action.id == "add")
+            .unwrap()
+            .steps
+            .last()
+            .unwrap(),
+    );
+    for previous in &active.program.entities {
+        let cumulative = active_after_second
+            .program
+            .entities
+            .iter()
+            .find(|entity| entity.id == previous.id)
+            .unwrap();
+        for field in &previous.fields {
+            assert!(
+                cumulative.fields.contains(field),
+                "committed second layer dropped {}.{}",
+                previous.id,
+                field.id
+            );
+        }
+    }
+
+    let store_path = root.path().join("owned");
+    drop(store);
+    let cold = ProductStore::open(&store_path).unwrap();
+    assert_eq!(cold.load().unwrap(), adopted);
+    let completed = cold
+        .load()
+        .unwrap()
+        .data
+        .records
+        .iter()
+        .find(|record| {
+            record.entity == "job"
+                && record.values.get("status")
+                    == Some(&DataValue::Text {
+                        value: "done".into(),
+                    })
+        })
+        .unwrap()
+        .clone();
+    let newly_completed = row(&adopted.data, "live");
+    let after_complete = cold
+        .apply(
+            adopted.revision,
+            "second-layer-followup-complete",
+            &invoke(
+                "complete",
+                [("job".into(), reference(&newly_completed))].into(),
+            ),
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    let event_id = after_complete.data.events.last().unwrap().id.clone();
+    let history = cold.runtime_view().unwrap().history;
+    assert!(history
+        .results
+        .iter()
+        .any(|result| result.record == newly_completed
+            && result.origin == product_protocol::HistoryOrigin::ObservedAtCompletion
+            && result.event == Some(event_id.clone())));
+    let after_add = cold
+        .apply(
+            after_complete.revision,
+            "second-layer-followup-add",
+            &invoke(
+                "add",
+                [(
+                    "title".into(),
+                    DataValue::Text {
+                        value: "after second layer".into(),
+                    },
+                )]
+                .into(),
+            ),
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    assert!(after_add
+        .data
+        .records
+        .iter()
+        .any(|record| record.values.get("title")
+            == Some(&DataValue::Text {
+                value: "after second layer".into()
+            })));
+    assert_eq!(
+        after_add
+            .data
+            .records
+            .iter()
+            .find(|record| record.id == completed.id),
+        Some(&completed)
+    );
+    let backup = product_backup::VerifiedBackup::capture(&cold).unwrap();
+    let backup_bytes = backup.to_bytes().unwrap();
+    let decoded = product_backup::VerifiedBackup::from_bytes(&backup_bytes).unwrap();
+    let restored_root = tempfile::tempdir().unwrap();
+    let recent = product_locations::RecentTools::open(restored_root.path()).unwrap();
+    let restored_path = restored_root.path().join("restored");
+    let created = decoded.recover_tool(&restored_path, &recent, 1).unwrap();
+    assert!(created.registration.is_ok());
+    drop(created);
+    let restored_identity = backup.summary().unwrap().identity;
+    let restored = product_backup::open_verified(&restored_path, Some(&restored_identity))
+        .unwrap()
+        .store;
+    assert_eq!(restored.load().unwrap(), after_add);
+    assert_eq!(
+        restored
+            .load()
+            .unwrap()
+            .operations
+            .get("second-layer-followup-add")
+            .unwrap()
+            .revision,
+        after_add.revision
+    );
+    assert_eq!(
+        restored.runtime_view().unwrap().history.results,
+        history.results
+    );
+    assert_eq!(
+        restored
+            .load()
+            .unwrap()
+            .program()
+            .unwrap()
+            .program
+            .actions
+            .iter()
+            .map(|action| &action.id)
+            .collect::<Vec<_>>(),
+        next_app
+            .actions
+            .iter()
+            .map(|action| &action.id)
+            .collect::<Vec<_>>()
+    );
+    let post_restore = restored
+        .apply(
+            after_add.revision,
+            "second-layer-backup-followup-add",
+            &invoke(
+                "add",
+                [(
+                    "title".into(),
+                    DataValue::Text {
+                        value: "after backup restore".into(),
+                    },
+                )]
+                .into(),
+            ),
+            RuntimeLimits::default(),
+        )
+        .unwrap();
+    assert!(post_restore.data.records.iter().any(|record| {
+        record.values.get("title")
+            == Some(&DataValue::Text {
+                value: "after backup restore".into(),
+            })
+    }));
+    assert_eq!(
+        post_restore
+            .operations
+            .get("second-layer-backup-followup-add")
+            .unwrap()
+            .revision,
+        post_restore.revision
+    );
+    let reopened = product_backup::open_verified(&restored_path, Some(&restored_identity))
+        .unwrap()
+        .store;
+    assert_eq!(reopened.load().unwrap(), post_restore);
+    assert_eq!(reopened.runtime_view().unwrap().history.results, history.results);
 }

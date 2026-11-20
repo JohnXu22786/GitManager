@@ -109,11 +109,14 @@ pub(super) struct SelectedFrameCall<'a> {
     pub(super) layer: &'a OwnedLayerV2,
     pub(super) meter: &'a mut ProofMeter,
 }
-pub(crate) struct RecordContinuationDispatch<'gate, C> {
+pub(crate) struct RecordContinuationDispatch<'gate, C, O = ()> {
     pub(crate) capture: C,
-    pub(crate) run: for<'call, 'slot> fn(C, &'call mut OwnedPolicyCheck<'gate>, &'slot mut PolicyFrameRecorder<'gate>) -> Result<()>,
+    pub(crate) run: for<'call, 'slot> fn(C, &'call mut OwnedPolicyCheck<'gate>, &'slot mut PolicyFrameRecorder<'gate>) -> Result<O>,
 }
 pub(crate) const fn policy_frame_open_payment<C>() -> u64 {
+    policy_frame_open_payment_for::<C, ()>()
+}
+pub(crate) const fn policy_frame_open_payment_for<C, O>() -> u64 {
     let actual = comparison_payment(64, [
         (size_of::<PolicyFrameRecorder<'_>>(), 4),
         (size_of::<Option<CompletedPolicyFrames<'_>>>(), 4),
@@ -121,15 +124,15 @@ pub(crate) const fn policy_frame_open_payment<C>() -> u64 {
         (size_of::<&mut OwnedPolicyCheck<'_>>(), 8),
         (size_of::<&VerifiedOwnedTransitionExecution>(), 8),
         (size_of::<C>(), 4),
-        (size_of::<RecordContinuationDispatch<'_, C>>(), 4),
+        (size_of::<RecordContinuationDispatch<'_, C, O>>(), 4),
         (size_of::<std::result::Result<(), crate::product_decisions::DecisionError>>(), 8),
-        (size_of::<Result<()>>(), 8),
+        (size_of::<Result<O>>(), 8),
     ]);
     // The old fixed transport floor plus the actual concrete capture/dispatch
     // preserves every generic caller price, not just the unit capture case.
     let prior_floor = comparison_payment(3200, [
         (size_of::<C>(), 4),
-        (size_of::<RecordContinuationDispatch<'_, C>>(), 4),
+        (size_of::<RecordContinuationDispatch<'_, C, O>>(), 4),
     ]);
     if actual < prior_floor { prior_floor } else { actual }
 }
@@ -230,9 +233,9 @@ pub(crate) const POLICY_FRAME_CONSUME_PAYMENT: u64 = comparison_payment(64, [
     (size_of::<Result<()>>(), 4),
 ]);
 impl<'gate> LockedArchivePolicy<'gate> {
-    pub(crate) fn with_policy_frame_recorder<C>(
-        &self, check: &mut OwnedPolicyCheck<'gate>, dispatch: RecordContinuationDispatch<'gate, C>,
-    ) -> Result<()> {
+    pub(crate) fn with_policy_frame_recorder<C, O>(
+        &self, check: &mut OwnedPolicyCheck<'gate>, dispatch: RecordContinuationDispatch<'gate, C, O>,
+    ) -> Result<O> {
         // F0 including C and the zero-capture continuation was prepaid before
         // this call. The capsule cannot be obtained by preview/general callers.
         if !std::ptr::eq(check.execution, self.execution)
@@ -284,8 +287,6 @@ impl SurfaceRecordCall<'_, '_> {
             .ok_or_else(|| refuse("owned policy", "original layer missing"))?;
         let registry = recorder.registry;
         registry.check_snapshot(execution.current())?;
-        #[cfg(test)]
-        adoption_diagnostic::phase(adoption_diagnostic::Phase::SurfaceDerive);
         let source_recipe = registry.resolve(source)?;
         let surface = match source_recipe {
             owned_persist::OwnedExecutionRecipe::Initial(original) =>
@@ -294,8 +295,6 @@ impl SurfaceRecordCall<'_, '_> {
                 owned_continuation::derive_policy_surface(&prior.original, layer,
                     Some((&prior.continuation, &prior.target)), check.meter)?,
         };
-        #[cfg(test)]
-        adoption_diagnostic::phase(adoption_diagnostic::Phase::SurfaceFrames);
         check.meter.charge(POLICY_FRAME_SCOPE_PAYMENT)?;
         {
             let scope = PolicyFrameScope { snapshot: execution.current(), meter: check.meter };
@@ -311,8 +310,6 @@ impl SurfaceRecordCall<'_, '_> {
         }
         recorder.completed = Some(CompletedPolicyFrames { registry, snapshot: execution.current(),
             recipe: source_recipe, layer_id, layer });
-        #[cfg(test)]
-        adoption_diagnostic::phase(adoption_diagnostic::Phase::SurfaceComplete);
         Ok(surface)
     }
 }
@@ -327,8 +324,6 @@ impl SurfaceConsumeCall<'_, '_, '_> {
         match check.registry {
             Some(registry) => {
                 registry.check_snapshot(execution.current())?;
-                #[cfg(test)]
-                adoption_diagnostic::phase(adoption_diagnostic::Phase::SurfaceDerive);
                 let recipe = registry.resolve(source)?;
                 let surface = match recipe {
                     owned_persist::OwnedExecutionRecipe::Initial(original) =>
@@ -337,16 +332,10 @@ impl SurfaceConsumeCall<'_, '_, '_> {
                         owned_continuation::derive_policy_surface(&prior.original, layer,
                             Some((&prior.continuation, &prior.target)), check.meter)?,
                 };
-                #[cfg(test)]
-                adoption_diagnostic::phase(adoption_diagnostic::Phase::SurfaceFrames);
                 registry.validate_policy_frames_reusing(execution.current(), &surface, layer, recipe, recorder, check.meter)?;
-                #[cfg(test)]
-                adoption_diagnostic::phase(adoption_diagnostic::Phase::SurfaceComplete);
                 Ok(surface)
             }
             None => {
-                #[cfg(test)]
-                adoption_diagnostic::phase(adoption_diagnostic::Phase::SurfaceReconstruct);
                 let registry = owned_persist::reconstruct(execution.current(), check.meter)?;
                 policy_surface_from_registry(execution, &registry, source, layer, check.meter)
             }
@@ -415,8 +404,6 @@ impl<'gate> OwnedPolicyCheck<'gate> {
             None => {
                 // Archive fallback retains its fresh old-position reconstruction;
                 // an endpoint registry cannot cover a historical prefix.
-                #[cfg(test)]
-                adoption_diagnostic::phase(adoption_diagnostic::Phase::SurfaceReconstruct);
                 let registry = owned_persist::reconstruct(execution.current(), self.meter)?;
                 policy_surface_from_registry(execution, &registry, source, layer, self.meter)
             }
@@ -709,6 +696,7 @@ impl ProductStore {
         secondary: Option<Arc<AtomicBool>>,
         verify: F,
         verify_retry: V,
+        validated_candidate: &mut Option<ValidatedOwnedCandidate>,
         #[cfg(test)] fault: Option<FaultPoint>,
     ) -> Result<ProjectSnapshot>
     where
@@ -720,15 +708,13 @@ impl ProductStore {
             &ProjectSnapshot,
             &mut OwnedPolicyCheck<'gate>,
             Option<&LockedArchivePolicy<'gate>>,
+            &mut Option<ValidatedOwnedCandidate>,
         ) -> Result<()>,
         V: Fn(&ProjectSnapshot) -> Result<()>,
     {
-        #[cfg(test)]
-        adoption_diagnostic::phase(adoption_diagnostic::Phase::LockedLoad);
+        *validated_candidate = None;
         let _lock = self.root.lock()?;
         let current = self.load()?;
-        #[cfg(test)]
-        adoption_diagnostic::phase(adoption_diagnostic::Phase::Request);
         let request = prepared.request(&adoption.plan, decisions)?;
         if let Some(receipt) = current.operations.get(&adoption.plan.id) {
             if receipt.request != request {
@@ -736,8 +722,6 @@ impl ProductStore {
                     "owned operation ID belongs to a different request".into(),
                 ));
             }
-            #[cfg(test)]
-            adoption_diagnostic::phase(adoption_diagnostic::Phase::Retry);
             self.confirm_owned_transition_current(&current, &verify_retry)?;
             return Ok(current);
         }
@@ -746,8 +730,6 @@ impl ProductStore {
                 "owned transition revision changed".into(),
             ));
         }
-        #[cfg(test)]
-        adoption_diagnostic::phase(adoption_diagnostic::Phase::Regenerate);
         let mut meter = ProofMeter::new(prepared.budget, prepared.cancelled.clone())?;
         if let Some(token) = &secondary {
             meter.watch_cancellation(token);
@@ -781,14 +763,10 @@ impl ProductStore {
                 "complete recipe does not regenerate",
             ));
         }
-        #[cfg(test)]
-        adoption_diagnostic::phase(adoption_diagnostic::Phase::Plan);
         if adoption.target != revision(fresh.target())? {
             return Err(refuse("owned transition", "target differs"));
         }
         self.check_owned_transition_plan(&current, &adoption.plan, &fresh)?;
-        #[cfg(test)]
-        adoption_diagnostic::phase(adoption_diagnostic::Phase::Graph);
         owned_epoch::validate_transition_graph(
             &current,
             &fresh.execution.manifest,
@@ -857,14 +835,19 @@ impl ProductStore {
                 &next,
                 &mut check,
                 archive_policy.as_ref(),
+                validated_candidate,
             )?;
         }
         drop(registry);
-        #[cfg(test)]
-        adoption_diagnostic::phase(adoption_diagnostic::Phase::NextValidate);
-        next.validate()?;
-        #[cfg(test)]
-        adoption_diagnostic::phase(adoption_diagnostic::Phase::Resume);
+        match validated_candidate.take() {
+            Some(validation) if validation.belongs_to(&next) => {}
+            Some(_) => {
+                return Err(StoreError::Invalid(
+                    "owned transition validation token belongs to another candidate".into(),
+                ))
+            }
+            None => next.validate()?,
+        }
         LocalRuntime::with_cancellation(
             secondary
                 .clone()
@@ -880,8 +863,6 @@ impl ProductStore {
             &next.artifacts,
         )?;
         meter.charge(0)?;
-        #[cfg(test)]
-        adoption_diagnostic::phase(adoption_diagnostic::Phase::Save);
         let result = self.save_with_checkpoint(
             &next,
             true,
@@ -899,8 +880,6 @@ impl ProductStore {
                     }
                     _ => {}
                 }
-                #[cfg(test)]
-                adoption_diagnostic::phase(adoption_diagnostic::Phase::Pointer);
                 meter.charge(0)
             },
             #[cfg(test)]
@@ -911,16 +890,12 @@ impl ProductStore {
             Err(error) => {
                 // The pointer is the commit linearization point. Complete
                 // confirmation even when cancellation arrived after activation.
-                #[cfg(test)]
-                adoption_diagnostic::phase(adoption_diagnostic::Phase::ErrorLoad);
                 let actual = self.load()?;
                 if actual
                     .operations
                     .get(&adoption.plan.id)
                     .is_some_and(|r| r.request == request)
                 {
-                    #[cfg(test)]
-                    adoption_diagnostic::phase(adoption_diagnostic::Phase::ErrorConfirm);
                     self.confirm_owned_transition_current(&actual, &verify_retry)?;
                 }
                 Err(error)
@@ -995,8 +970,6 @@ pub(super) fn policy_surface_from_registry(
     layer: &OwnedLayerV2,
     meter: &mut ProofMeter,
 ) -> Result<owned_continuation::VerifiedOwnedPolicySurface> {
-    #[cfg(test)]
-    adoption_diagnostic::phase(adoption_diagnostic::Phase::SurfaceDerive);
     let surface = match registry.resolve(source)? {
         owned_persist::OwnedExecutionRecipe::Initial(original) => {
             owned_continuation::derive_policy_surface(original, layer, None, meter)?
@@ -1010,11 +983,7 @@ pub(super) fn policy_surface_from_registry(
             )?
         }
     };
-    #[cfg(test)]
-    adoption_diagnostic::phase(adoption_diagnostic::Phase::SurfaceFrames);
     registry.validate_policy_frames(execution.current(), &surface, meter)?;
-    #[cfg(test)]
-    adoption_diagnostic::phase(adoption_diagnostic::Phase::SurfaceComplete);
     Ok(surface)
 }
 pub(crate) fn transition_policy_scope(
@@ -1043,11 +1012,7 @@ macro_rules! retained_transition_policy_body {
         return Ok(());
     }
     let mut $meter = ProofMeter::new(ProofBudget::default(), Arc::new(AtomicBool::new(false)))?;
-    #[cfg(test)]
-    adoption_diagnostic::phase(adoption_diagnostic::Phase::ArchiveReconstruct);
     let registry = owned_persist::reconstruct($snapshot, &mut $meter)?;
-    #[cfg(test)]
-    adoption_diagnostic::phase(adoption_diagnostic::Phase::ArchivePolicy);
     for $execution in registry.checked_withdrawals() {
         $meter.charge(1)?;
         $meter.charge(6)?;

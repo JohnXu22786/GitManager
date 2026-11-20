@@ -611,7 +611,7 @@ fn adopt_component(
             &adoption,
             &current.decisions,
             None,
-            |before, fresh, graph, _plan, next, gate, _archive_policy| {
+            |before, fresh, graph, _plan, next, gate, _archive_policy, _validated_candidate| {
                 adoption_calls += 1;
                 assert_eq!(before, &current);
                 assert_eq!(fresh.seed(), &current.data);
@@ -621,6 +621,7 @@ fn adopt_component(
                 Ok(())
             },
             |_| panic!("not a retry"),
+            &mut None,
             None,
         )
         .unwrap();

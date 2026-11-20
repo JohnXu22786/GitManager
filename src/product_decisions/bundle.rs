@@ -113,8 +113,8 @@ macro_rules! retained_bundle_body {
     }};
 }
 macro_rules! validate_bundle_body {
-    ($snapshot:ident, $bundle:ident, $accepted:ident, $accepted_ranges:ident, [$($finish:tt)*], [$($terminal:tt)*]) => {{
-    $snapshot.validate()?;
+    ($snapshot:ident, $bundle:ident, $accepted:ident, $accepted_ranges:ident, $validated_archive:ident, $validation:block, [$($finish:tt)*], [$($terminal:tt)*]) => {{
+    let $validated_archive = $validation;
     validate_withdrawal_history($snapshot)?;
     if $bundle.version != 1
         || $bundle.snapshot != canonical_digest(IdentityDomain::Data, $snapshot)?
@@ -300,36 +300,22 @@ macro_rules! validate_bundle_body {
     }};
 }
 pub fn validate_bundle(snapshot: &ProjectSnapshot, bundle: &IntentionBundle) -> Result<()> {
-    validate_bundle_with_archive(snapshot, bundle, None)
+    validate_bundle_full_history(snapshot, bundle)
 }
 pub(crate) fn validate_bundle_with_archive(
     snapshot: &ProjectSnapshot,
     bundle: &IntentionBundle,
     archive: Option<&crate::product_store::scope::ValidatedOwnedArchive<'_>>,
 ) -> Result<()> {
-    validate_bundle_body!(snapshot, bundle, accepted, accepted_ranges, [
-        if let Some(archive) = archive {
-            crate::product_store::scope::check_retained_transition_policies_with_archive(
-                snapshot, archive, |check, loan| {
-                    check.charge(HISTORICAL_INITIAL_RETAINED_PAYMENT)?;
-                    RetainedPolicyDecisionCapture { accepted: &accepted, ranges: &accepted_ranges }
-                        .run_initial(check, loan)
-                },
-            )?;
-        } else {
-            // Public, ordinary archive validation retains the original full
-            // historical reconstruction budget. Component loans stay in the
-            // validated-archive and exact internal-transaction paths.
-            retained_bundle_body!(snapshot,
-                crate::product_store::scope::check_retained_transition_policies,
-                [], accepted, accepted_ranges);
+    let Some(archive) = archive else { return validate_bundle_full_history(snapshot, bundle) };
+    validate_bundle_body!(snapshot, bundle, accepted, accepted_ranges, _validated_archive, {
+        if !archive.belongs_to(snapshot) {
+            return Err(invalid("validated owned archive belongs to another snapshot"));
         }
-    ], [Ok(())])
-}
-fn validate_bundle_with_initials(snapshot: &ProjectSnapshot, bundle: &IntentionBundle) -> Result<()> {
-    validate_bundle_body!(snapshot, bundle, accepted, accepted_ranges, [
-        crate::product_store::scope::check_retained_transition_policies_with_initials(
-            snapshot, |check, loan| {
+        None::<crate::product_store::scope::ValidatedOwnedArchive<'_>>
+    }, [
+        crate::product_store::scope::check_retained_transition_policies_with_archive(
+            snapshot, archive, |check, loan| {
                 check.charge(HISTORICAL_INITIAL_RETAINED_PAYMENT)?;
                 RetainedPolicyDecisionCapture { accepted: &accepted, ranges: &accepted_ranges }
                     .run_initial(check, loan)
@@ -337,10 +323,27 @@ fn validate_bundle_with_initials(snapshot: &ProjectSnapshot, bundle: &IntentionB
         )?;
     ], [Ok(())])
 }
+fn validate_bundle_full_history(snapshot: &ProjectSnapshot, bundle: &IntentionBundle) -> Result<()> {
+    validate_bundle_body!(snapshot, bundle, accepted, accepted_ranges, _validated_archive, {
+        snapshot.validate()?;
+        None::<crate::product_store::scope::ValidatedOwnedArchive<'_>>
+    }, [
+        retained_bundle_body!(snapshot,
+            crate::product_store::scope::check_retained_transition_policies,
+            [], accepted, accepted_ranges);
+    ], [Ok(())])
+}
+fn validate_bundle_with_initials(snapshot: &ProjectSnapshot, bundle: &IntentionBundle) -> Result<()> {
+    let archive = snapshot.validate_with_archive()?;
+    validate_bundle_with_archive(snapshot, bundle, archive.as_ref())
+}
 fn validate_bundle_locked(
     snapshot: &ProjectSnapshot, bundle: &IntentionBundle, capsule: &LockedArchivePolicy<'_>,
 ) -> Result<()> {
-    validate_bundle_body!(snapshot, bundle, accepted, accepted_ranges, [
+    validate_bundle_body!(snapshot, bundle, accepted, accepted_ranges, _validated_archive, {
+        snapshot.validate()?;
+        None::<crate::product_store::scope::ValidatedOwnedArchive<'_>>
+    }, [
         retained_bundle_body!(snapshot, crate::product_store::scope::check_retained_transition_policies_locked, [capsule,], accepted, accepted_ranges);
     ], [Ok(())])
 }
@@ -358,6 +361,7 @@ pub(super) const POLICY_FRAME_EXPORT_PAYMENT: u64 = {
         (size_of::<RetainedPolicyDispatch<RetainedPolicyDecisionCapture<'_>>>(), 4),
         (size_of::<Result<()>>(), 8),
         (size_of::<std::result::Result<(), StoreError>>(), 8),
+        (size_of::<Option<crate::product_store::scope::ValidatedOwnedCandidate>>(), 4),
     ]);
     if actual > 3040 { actual } else { 3040 }
 };
@@ -425,9 +429,9 @@ macro_rules! export_bundle_body {
     }};
 }
 impl<'gate, R: RuntimeAdapter> owned_transition::RecordContinuationCapture<'_, 'gate, R> {
-    pub(super) fn verify(self, check: &mut crate::product_store::scope::OwnedPolicyCheck<'gate>, recorder: &mut PolicyFrameRecorder<'gate>) -> Result<()> {
+    pub(super) fn verify(self, check: &mut crate::product_store::scope::OwnedPolicyCheck<'gate>, recorder: &mut PolicyFrameRecorder<'gate>) -> Result<Option<crate::product_store::scope::ValidatedOwnedCandidate>> {
         let Self { engine, store, current, fresh, next, plan, candidate, change, capsule } = self;
-        owned_transition::locked_verification_body!(engine, store, current, fresh, next, plan, candidate, change, check, ids, [
+        let verification: Result<()> = owned_transition::locked_verification_body!(engine, store, current, fresh, next, plan, candidate, change, check, ids, [
             let ids = owned_policy::check_withdrawal_recorded(&engine.archive, check, recorder).map_err(owned_transition::into_store_error)?;
         ], [
             check.charge(LOCKED_ARCHIVE_EXPORT_PAYMENT)?;
@@ -440,7 +444,9 @@ impl<'gate, R: RuntimeAdapter> owned_transition::RecordContinuationCapture<'_, '
                     export_bundle_body!(archive, candidate, bundle, [
                         {
                             let bundle_ref = &bundle;
-                            validate_bundle_body!(candidate, bundle_ref, accepted, accepted_ranges, [
+                            validate_bundle_body!(candidate, bundle_ref, accepted, accepted_ranges, _validated_archive, {
+                                candidate.validate_with_archive()?
+                            }, [
                                 let capture = RetainedPolicyDecisionCapture { accepted: &accepted, ranges: &accepted_ranges };
                                 let dispatch = RetainedPolicyDispatch { capture, run: RetainedPolicyDecisionCapture::run };
                                 crate::product_store::scope::check_retained_transition_policies_with_frames(candidate, capsule, recorder, dispatch)?;
@@ -449,7 +455,9 @@ impl<'gate, R: RuntimeAdapter> owned_transition::RecordContinuationCapture<'_, '
                     ], [bundle])
                 };
             }
-        ])
+        ]);
+        verification?;
+        Ok(Some(crate::product_store::scope::ValidatedOwnedCandidate::for_snapshot(candidate)))
     }
 }
 impl IntentArchive {
@@ -464,8 +472,6 @@ impl IntentArchive {
         if let Some(archive) = archive {
             export_bundle_body!(self, snapshot, bundle, [validate_bundle_with_archive(snapshot, &bundle, Some(archive))?;], [Ok(bundle)])
         } else {
-            // Internal transaction callers have already bound the exact
-            // candidate and may reuse its reconstructed initial components.
             export_bundle_body!(self, snapshot, bundle, [validate_bundle_with_initials(snapshot, &bundle)?;], [Ok(bundle)])
         }
     }
@@ -557,6 +563,7 @@ pub(super) fn assert_policy_frame_export_layouts_for_test() {
         (size_of::<RetainedPolicyDispatch<RetainedPolicyDecisionCapture<'_>>>(), 4),
         (size_of::<Result<()>>(), 8),
         (size_of::<std::result::Result<(), StoreError>>(), 8),
+        (size_of::<Option<crate::product_store::scope::ValidatedOwnedCandidate>>(), 4),
     ]);
     assert_eq!(POLICY_FRAME_EXPORT_PAYMENT, actual.max(3040));
     assert_eq!(LOCKED_ARCHIVE_EXPORT_PAYMENT, 3232);

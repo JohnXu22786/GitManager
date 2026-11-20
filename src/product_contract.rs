@@ -1341,7 +1341,7 @@ impl From<Digest> for String {
 #[path = "product_contract/identity_domain.rs"]
 mod identity_domain;
 pub use self::identity_domain::IdentityDomain;
-fn bytes_digest(domain: IdentityDomain, bytes: &[u8]) -> Digest {
+pub(crate) fn bytes_digest(domain: IdentityDomain, bytes: &[u8]) -> Digest {
     let mut input = b"gitmanager.product.v1\0".to_vec();
     input.extend(serde_json::to_vec(&domain).expect("finite enum"));
     input.push(0);
@@ -3103,6 +3103,11 @@ impl AppDefinition {
     }
     pub fn validate(&self) -> Result<()> {
         self.validate_audited(Audit::none()).map(|_| ())
+    }
+    #[cfg(test)]
+    pub(crate) fn validation_node_counts_for_test(&self) -> Result<(usize, usize)> {
+        self.validate_audited(Audit::none())
+            .map(|facts| (facts.action_prefix_nodes, facts.total_nodes))
     }
     fn validate_audited(&self, a: Audit<'_>) -> Result<capture_validation::CaptureFacts> {
         let mut app_validation_cx = crate::product_alloc::AllocationContext::new();

@@ -142,6 +142,68 @@ macro_rules! validate_interval_body {
 }
 pub(super) use validate_interval_body;
 
+// One activation/floor plus argument, result and cleanup ownership for the
+// direct current-initialization lookup performed by reconstructed loans.
+pub(super) const ACTIVE_INITIALIZATION_LOOKUP_FRAME_PAYMENT: u64 = 1 + 4 * (
+    std::mem::size_of::<&ProjectSnapshot>()
+        + std::mem::size_of::<&mut ProofMeter>()
+        + std::mem::size_of::<u64>()
+        + std::mem::size_of::<bool>()
+) as u64;
+
+pub(super) fn active_initialization<'a>(
+    snapshot: &'a ProjectSnapshot,
+    meter: &mut ProofMeter,
+) -> Result<Option<(&'a OwnedInitializationV2, u64)>> {
+    let state = snapshot.owned_scope()?;
+    let mut active_composition = None;
+    for composition in state.compositions.values() {
+        meter.charge(1)?;
+        if composition.output == snapshot.active_revision {
+            if active_composition.replace(composition).is_some() {
+                return Err(err("active output has ambiguous owned compositions"));
+            }
+        }
+    }
+    let Some(composition) = active_composition else {
+        return Ok(None);
+    };
+    let composition_bytes = canonical_bytes(&("owned-scope-composition/2", composition))?;
+    meter.charge(composition_bytes.len() as u64)?;
+    let composition_id = crate::product_contract::bytes_digest(IdentityDomain::Adoption, &composition_bytes);
+    let mut active_adoption = None;
+    for adoption in &state.adoptions {
+        meter.charge(1)?;
+        if adoption.composition == composition_id {
+            if active_adoption.replace(adoption).is_some() {
+                return Err(err("active composition has ambiguous adoption receipts"));
+            }
+        }
+    }
+    let Some(adoption) = active_adoption else {
+        return Ok(None);
+    };
+    let Some(initialization_id) = &adoption.initialization else {
+        return Ok(None);
+    };
+    let mut active_initialization = None;
+    for initialization in &state.initializations {
+        meter.charge(1)?;
+        if initialization.adoption_revision == adoption.revision {
+            let bytes = canonical_bytes(&("owned-scope-initialization/2", initialization))?;
+            meter.charge(bytes.len() as u64)?;
+            let identity = crate::product_contract::bytes_digest(IdentityDomain::Adoption, &bytes);
+            if &identity == initialization_id && active_initialization.replace(initialization).is_some() {
+                return Err(err("active adoption initialization is ambiguous"));
+            }
+        }
+    }
+    let Some(initialization) = active_initialization else {
+        return Err(err("active adoption initialization is missing"));
+    };
+    Ok(Some((initialization, adoption.revision)))
+}
+
 pub(super) fn validate_interval(
     snapshot: &ProjectSnapshot,
     recipe: &OwnedExecutionRecipe,
@@ -151,14 +213,32 @@ pub(super) fn validate_interval(
     day: i32,
     meter: &mut ProofMeter,
 ) -> Result<()> {
+    let state = snapshot.owned_scope()?;
+    // `reconstruct_with` has already checked each initialization identity
+    // against its ordered adoption receipt before it validates any interval.
+    // Select by the interval's authenticated revision bound directly: the
+    // current composition may be a no-initialization transition even though a
+    // later committed layer initialization advanced a protected row.
+    let mut committed_initializations = Vec::new();
+    for initialization in &state.initializations {
+        meter.charge(1)?;
+        if initialization.adoption_revision > end_revision { continue; }
+        meter.charge(4 + std::mem::size_of::<&OwnedInitializationV2>() as u64)?;
+        committed_initializations.push(initialization);
+    }
     validate_interval_body!(snapshot, recipe, adoption_revision, end_revision, data, meter, [
-    owned_replay::validate_recipe_history_from(
+    owned_replay::validate_recipe_history_with_initializations(
         recipe,
         recipe.seed(),
         recipe.basis().clock_day,
         data,
         day,
         meter,
+        &committed_initializations,
+        None,
+        adoption_revision,
+        end_revision,
+        &mut |_, _| Ok(()),
     )
     ])
 }

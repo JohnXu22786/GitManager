@@ -34,10 +34,10 @@ use crate::product_contract::*;
 use crate::product_protocol::RuntimeView;
 use eval::{Env, EnvAccess, Eval};
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex, OnceLock,
 };
 use std::time::Instant;
 use serde::Serialize;
@@ -307,6 +307,17 @@ pub struct LocalRuntime {
     admission: Option<Arc<dyn ReplayAdmission>>,
 }
 #[derive(Clone)]
+struct CachedCompatibility {
+    program: Digest,
+    data: Digest,
+    day: i32,
+    report: CompatibilityReport,
+}
+const MAX_CACHED_COMPATIBILITY: usize = 4;
+const MAX_CACHED_COMPATIBILITY_ITEMS: usize = 1024;
+const MAX_CACHED_COMPATIBILITY_ISSUE_BYTES: usize = 16 * 1024;
+static COMPATIBILITY_CACHE: OnceLock<Mutex<VecDeque<CachedCompatibility>>> = OnceLock::new();
+#[derive(Clone)]
 struct State {
     data: DataSnapshot,
     session: SessionState,
@@ -507,6 +518,50 @@ impl ProductRun {
 }
 
 impl LocalRuntime {
+    fn compatibility_report(
+        &self,
+        program: &ProgramSource,
+        current: &DataSnapshot,
+        day: i32,
+    ) -> Result<CompatibilityReport> {
+        let data = current.identity()?;
+        let program_identity = program.artifact.program_digest.clone();
+        let cache = COMPATIBILITY_CACHE.get_or_init(|| Mutex::new(VecDeque::new()));
+        let cached = cache.lock().ok().and_then(|mut entries| {
+            let index = entries.iter().position(|entry| {
+                entry.program == program_identity && entry.data == data && entry.day == day
+            })?;
+            let entry = entries.remove(index)?;
+            let report = entry.report.clone();
+            entries.push_back(entry);
+            Some(report)
+        });
+        if let Some(report) = cached {
+            return Ok(report);
+        }
+        let report = compatibility::check_validated(program, current, Some(day), data.clone())?;
+        let item_count = report.retained_records.len()
+            .saturating_add(report.retained_events.len())
+            .saturating_add(report.retained_fields.len());
+        let issue_bytes = report.issues.iter().map(String::len).sum::<usize>();
+        if item_count <= MAX_CACHED_COMPATIBILITY_ITEMS
+            && issue_bytes <= MAX_CACHED_COMPATIBILITY_ISSUE_BYTES
+        {
+            if let Ok(mut entries) = cache.lock() {
+                if entries.len() == MAX_CACHED_COMPATIBILITY {
+                    entries.pop_front();
+                }
+                entries.push_back(CachedCompatibility {
+                    program: program_identity,
+                    data,
+                    day,
+                    report: report.clone(),
+                });
+            }
+        }
+        Ok(report)
+    }
+
     pub(crate) fn start_decoded<'a>(
         &self,
         program: &'a FallibleDecodedCapturedProgram,
@@ -868,6 +923,82 @@ impl LocalRuntime {
         self.evaluate_projection_inner(
             program, data, row, binding, expression, expected, day, limits, checks, source, facts,
         )
+    }
+    /// Frozen `936c0d5` projection path for the independent row-batch oracle.
+    /// It preserves the old full-AppDefinition validation on each uncached
+    /// projection type check while production uses the bounded extension walk.
+    #[cfg(test)]
+    pub(crate) fn evaluate_record_projection_before_extension_refactor_with<'a>(
+        &self,
+        checks: &mut ProjectionValidation<'a>,
+        limits: RuntimeLimits,
+        program: &'a CapturedProgram,
+        data: &DataSnapshot,
+        row: &RecordRef,
+        binding: &str,
+        expression: &Expr,
+        expected: &Type,
+        day: i32,
+    ) -> Result<DataValue> {
+        let (source, _) = checks.source(program)?;
+        data.validate()?;
+        validate_day(day)?;
+        limits.validate()?;
+        if data.project_id != program.binding.project_id || !valid_id(binding) {
+            return Err(invalid("projection project or binding mismatch"));
+        }
+        let value = DataValue::Reference {
+            entity: row.entity.clone(),
+            record: row.record.clone(),
+        };
+        eval::record(data, &value)?;
+        let key = source
+            .map(|source| {
+                canonical_bytes(&(source, &row.entity, binding, expression, expected, &limits))
+            })
+            .transpose()?;
+        let cached = key.as_ref().is_some_and(|key| checks.types.contains(key));
+        if !cached {
+            checks.type_checks += 1;
+            let mut app = program.program.clone();
+            let mut id = "gm_scope_projection".to_owned();
+            while app.actions.iter().any(|action| action.id == id) {
+                id.push('_');
+            }
+            app.actions.push(ActionDefinition {
+                id,
+                label: "Host projection type check".into(),
+                parameters: BTreeMap::from([(binding.to_owned(), Type::reference(&row.entity))]),
+                guards: vec![],
+                ensures: vec![],
+                steps: vec![Statement::Assert {
+                    condition: Expr::Equal {
+                        left: Box::new(expression.clone()),
+                        right: Box::new(expression.clone()),
+                    },
+                    message: "Projection type check".into(),
+                }],
+            });
+            app.validate()?;
+        }
+        let session = SessionState::initial(&program.program)?;
+        let mut meter = Meter::new(limits.clone(), limits.fuel, self.cancelled.clone());
+        let env = Env::from([(binding.to_owned(), (Type::reference(&row.entity), value))]);
+        let mut evaluator = Eval::legacy(&program.program, data, &session, day, &mut meter);
+        if evaluator.typ(expression, &env)? != *expected {
+            return Err(invalid("projection result type mismatch"));
+        }
+        let result = evaluator.eval(expression, &env)?;
+        validate_value(&result, expected, 0)?;
+        if !cached {
+            if let Some(key) = key {
+                if checks.types.len() < MAX_ITEMS && key.len() <= MAX_WIRE_BYTES - checks.bytes {
+                    checks.bytes += key.len();
+                    checks.types.insert(key);
+                }
+            }
+        }
+        Ok(result)
     }
     /// Evaluate a scalar proof expression directly against bounded persisted
     /// owners. The legacy and decoded paths share `Eval`; no map conversion or
@@ -1872,7 +2003,7 @@ impl LocalRuntime {
         if data.project_id != program.binding.project_id {
             return Err(invalid("program and data belong to different projects"));
         }
-        let report = compatibility::check(program, data, Some(clock_day))?;
+        let report = self.compatibility_report(program, data, clock_day)?;
         if report.state != CompatibilityState::Compatible {
             return Err(AdapterError::Unsupported(report.issues.join("; ")));
         }

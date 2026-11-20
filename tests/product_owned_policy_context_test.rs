@@ -583,10 +583,8 @@ fn combined_transition_reuse_fourth_epoch_route() {
     let change = engine(&fixture.store).prepare_owned_implementation_evolution(&fixture.store,
         prepared, "combined-inactive").unwrap();
     assert_eq!(fixture.store.load().unwrap(), before);
-    let diagnostic = product_store::scope::adoption_diagnostic::start();
     let result = product_store::ProjectSnapshot::with_combined_accounting_for_test(||
         engine(&fixture.store).adopt(&fixture.store, &change));
-    drop(diagnostic);
     if result.is_err() {
         assert_eq!(fixture.store.load().unwrap(), before);
         assert_eq!(std::fs::read(fixture.dir.path().join("store/CURRENT")).unwrap(), fixture.pointer);

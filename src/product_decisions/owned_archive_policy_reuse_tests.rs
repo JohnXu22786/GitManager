@@ -35,7 +35,7 @@ impl DecisionEngine<LocalRuntime> {
             let secondary = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let result = store.adopt_owned_transition_verified(change.revision, &prepared,
                 &change.prepared, &change.decisions, Some(secondary.clone()),
-                |locked, fresh, graph, plan, candidate, check, capsule| {
+                |locked, fresh, graph, plan, candidate, check, capsule, _validated_candidate| {
                     reached = true;
                     let capsule = capsule.expect("only real fresh withdrawal mints a capsule");
                     assert_eq!(locked, &current);
@@ -87,7 +87,7 @@ impl DecisionEngine<LocalRuntime> {
                         }
                     }
                     Err(StoreError::Invalid(SENTINEL.into()))
-                }, |_| panic!("fresh operation cannot use retry"), None);
+                }, |_| panic!("fresh operation cannot use retry"), &mut None, None);
             assert!(reached);
             let expected = if mode == "payments" && attempt == 0 {
                 "Common factual admission: budget: cumulative proof/initialization budget exhausted"
