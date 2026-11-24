@@ -90,6 +90,9 @@ impl ValidatedOwnedSnapshot {
     pub(crate) fn registry(&self) -> &ValidatedOwnedRegistry {
         &self.registry
     }
+    pub(crate) fn belongs_to(&self, snapshot: &ProjectSnapshot) -> bool {
+        self.snapshot == *snapshot
+    }
 }
 
 /// Opaque validation result bound to one immutable owned snapshot.

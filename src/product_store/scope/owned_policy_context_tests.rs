@@ -242,7 +242,7 @@ impl ProductStore {
         let mut reached = false;
         let result = self.adopt_owned_transition_verified(
             current.revision, &prepared, &adoption, &graph, Some(secondary),
-            |locked_current, fresh, _, _, _, check, _archive_policy| {
+            |locked_current, fresh, _, _, _, check, _archive_policy, _validated_candidate| {
                 reached = true;
                 assert_eq!(locked_current, &current);
                 assert_eq!(fresh.basis(), locked_current);
@@ -257,6 +257,7 @@ impl ProductStore {
                 verify(check)
             },
             |_| panic!("new operation must reach the locked callback, not retry"),
+            &mut None,
             None,
         );
         assert!(reached, "the actual locked adoption callback must be reached");

@@ -34,10 +34,10 @@ use crate::product_contract::*;
 use crate::product_protocol::RuntimeView;
 use eval::{Env, EnvAccess, Eval};
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex, OnceLock,
 };
 use std::time::Instant;
 use serde::Serialize;
@@ -307,6 +307,17 @@ pub struct LocalRuntime {
     admission: Option<Arc<dyn ReplayAdmission>>,
 }
 #[derive(Clone)]
+struct CachedCompatibility {
+    program: Digest,
+    data: Digest,
+    day: i32,
+    report: CompatibilityReport,
+}
+const MAX_CACHED_COMPATIBILITY: usize = 4;
+const MAX_CACHED_COMPATIBILITY_ITEMS: usize = 1024;
+const MAX_CACHED_COMPATIBILITY_ISSUE_BYTES: usize = 16 * 1024;
+static COMPATIBILITY_CACHE: OnceLock<Mutex<VecDeque<CachedCompatibility>>> = OnceLock::new();
+#[derive(Clone)]
 struct State {
     data: DataSnapshot,
     session: SessionState,
@@ -507,6 +518,50 @@ impl ProductRun {
 }
 
 impl LocalRuntime {
+    fn compatibility_report(
+        &self,
+        program: &ProgramSource,
+        current: &DataSnapshot,
+        day: i32,
+    ) -> Result<CompatibilityReport> {
+        let data = current.identity()?;
+        let program_identity = program.artifact.program_digest.clone();
+        let cache = COMPATIBILITY_CACHE.get_or_init(|| Mutex::new(VecDeque::new()));
+        let cached = cache.lock().ok().and_then(|mut entries| {
+            let index = entries.iter().position(|entry| {
+                entry.program == program_identity && entry.data == data && entry.day == day
+            })?;
+            let entry = entries.remove(index)?;
+            let report = entry.report.clone();
+            entries.push_back(entry);
+            Some(report)
+        });
+        if let Some(report) = cached {
+            return Ok(report);
+        }
+        let report = compatibility::check_validated(program, current, Some(day), data.clone())?;
+        let item_count = report.retained_records.len()
+            .saturating_add(report.retained_events.len())
+            .saturating_add(report.retained_fields.len());
+        let issue_bytes = report.issues.iter().map(String::len).sum::<usize>();
+        if item_count <= MAX_CACHED_COMPATIBILITY_ITEMS
+            && issue_bytes <= MAX_CACHED_COMPATIBILITY_ISSUE_BYTES
+        {
+            if let Ok(mut entries) = cache.lock() {
+                if entries.len() == MAX_CACHED_COMPATIBILITY {
+                    entries.pop_front();
+                }
+                entries.push_back(CachedCompatibility {
+                    program: program_identity,
+                    data,
+                    day,
+                    report: report.clone(),
+                });
+            }
+        }
+        Ok(report)
+    }
+
     pub(crate) fn start_decoded<'a>(
         &self,
         program: &'a FallibleDecodedCapturedProgram,
@@ -1872,7 +1927,7 @@ impl LocalRuntime {
         if data.project_id != program.binding.project_id {
             return Err(invalid("program and data belong to different projects"));
         }
-        let report = compatibility::check(program, data, Some(clock_day))?;
+        let report = self.compatibility_report(program, data, clock_day)?;
         if report.state != CompatibilityState::Compatible {
             return Err(AdapterError::Unsupported(report.issues.join("; ")));
         }

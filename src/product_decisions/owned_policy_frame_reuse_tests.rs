@@ -98,7 +98,7 @@ impl DecisionEngine<LocalRuntime> {
         self.with_owned_transition(context.clone(), || {
         result = Some(store.adopt_owned_transition_verified(change.revision, &prepared,
             &change.prepared, &change.decisions, secondary.clone(),
-            |current, fresh, next, plan, candidate, check, capsule| {
+            |current, fresh, next, plan, candidate, check, capsule, _validated_candidate| {
                 reached = true;
                 let capsule = capsule.expect("actual locked writer");
                 if *variant == "clipped-profile" {
@@ -142,7 +142,7 @@ impl DecisionEngine<LocalRuntime> {
                 };
                 let dispatch = crate::product_store::scope::RecordContinuationDispatch { capture, run };
                 capsule.with_policy_frame_recorder(check, dispatch)
-            }, |_| panic!("fresh operation cannot enter retry"), None));
+            }, |_| panic!("fresh operation cannot enter retry"), &mut None, None));
             Ok(())
         }).unwrap();
         let result = result.unwrap();

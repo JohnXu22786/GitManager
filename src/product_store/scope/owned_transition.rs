@@ -709,6 +709,7 @@ impl ProductStore {
         secondary: Option<Arc<AtomicBool>>,
         verify: F,
         verify_retry: V,
+        validated_candidate: &mut Option<ValidatedOwnedSnapshot>,
         #[cfg(test)] fault: Option<FaultPoint>,
     ) -> Result<ProjectSnapshot>
     where
@@ -720,9 +721,11 @@ impl ProductStore {
             &ProjectSnapshot,
             &mut OwnedPolicyCheck<'gate>,
             Option<&LockedArchivePolicy<'gate>>,
+            &mut Option<ValidatedOwnedSnapshot>,
         ) -> Result<()>,
         V: Fn(&ProjectSnapshot) -> Result<()>,
     {
+        *validated_candidate = None;
         #[cfg(test)]
         adoption_diagnostic::phase(adoption_diagnostic::Phase::LockedLoad);
         let _lock = self.root.lock()?;
@@ -857,12 +860,21 @@ impl ProductStore {
                 &next,
                 &mut check,
                 archive_policy.as_ref(),
+                validated_candidate,
             )?;
         }
         drop(registry);
         #[cfg(test)]
         adoption_diagnostic::phase(adoption_diagnostic::Phase::NextValidate);
-        next.validate()?;
+        match validated_candidate.take() {
+            Some(validation) if validation.belongs_to(&next) => {}
+            Some(_) => {
+                return Err(StoreError::Invalid(
+                    "owned transition validation token belongs to another candidate".into(),
+                ))
+            }
+            None => next.validate()?,
+        }
         #[cfg(test)]
         adoption_diagnostic::phase(adoption_diagnostic::Phase::Resume);
         LocalRuntime::with_cancellation(

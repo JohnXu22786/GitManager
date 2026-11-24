@@ -35,9 +35,23 @@ pub(super) fn check(
     if program.binding.project_id != current.project_id {
         return Err(invalid("compatibility project mismatch"));
     }
+    let current_data = current.identity()?;
+    check_validated(program, current, day, current_data)
+}
+
+/// The caller has already validated the immutable program and data frame.
+pub(super) fn check_validated(
+    program: &ProgramSource,
+    current: &DataSnapshot,
+    day: Option<i32>,
+    current_data: Digest,
+) -> Result<CompatibilityReport> {
+    if program.binding.project_id != current.project_id {
+        return Err(invalid("compatibility project mismatch"));
+    }
     let mut report = CompatibilityReport {
         state: CompatibilityState::Compatible,
-        current_data: current.identity()?,
+        current_data,
         target_program: program.artifact.program_digest.clone(),
         retained_records: current
             .records

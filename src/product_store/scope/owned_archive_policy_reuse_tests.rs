@@ -190,11 +190,11 @@ impl ProductStore {
         let pointer = self.root.read_and_sync("CURRENT", MAX_STORE_BYTES).unwrap();
         let mut prefix = None;
         let result = self.adopt_owned_transition_verified(current.revision, prepared, adoption, graph, None,
-            |_, _, _, _, _, check, capsule| {
+            |_, _, _, _, _, check, capsule, _validated_candidate| {
                 assert!(capsule.is_some());
                 prefix = Some(prepared.budget.units - check.meter.remaining_units_for_test());
                 Err(StoreError::Invalid(SENTINEL.into()))
-            }, |_| panic!("not retry"), None);
+            }, |_| panic!("not retry"), &mut None, None);
         assert_invalid(&result, SENTINEL);
         let prefix = prefix.unwrap();
         for extra in [0, 1] {
@@ -202,12 +202,12 @@ impl ProductStore {
             bounded.budget.units = prefix - 1 + extra;
             let mut reached = false;
             let result = self.adopt_owned_transition_verified(current.revision, &bounded, adoption, graph, None,
-                |_, _, _, _, _, check, capsule| {
+                |_, _, _, _, _, check, capsule, _validated_candidate| {
                     reached = true;
                     assert!(capsule.is_some());
                     assert_eq!(check.meter.remaining_units_for_test(), 0);
                     Err(StoreError::Invalid(SENTINEL.into()))
-                }, |_| panic!("not retry"), None);
+                }, |_| panic!("not retry"), &mut None, None);
             assert_eq!(reached, extra == 1);
             assert_invalid(&result, if extra == 1 { SENTINEL } else { FUEL });
             assert_eq!(self.root.read_and_sync("CURRENT", MAX_STORE_BYTES).unwrap(), pointer);

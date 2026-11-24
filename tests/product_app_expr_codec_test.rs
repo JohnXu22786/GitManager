@@ -315,6 +315,23 @@ fn byte_entrypoints_preserve_parser_errors_and_existing_product_limits(){
     let oversized=vec![b' ';json::MAX_INPUT_BYTES+1];
     let e=bad(app::Statement::decode_json(&oversized,&mut Cx::new()));assert!(matches!(e,app::AppDecodeError::Json(json::Error{cause:json::Cause::InputTooLarge,..})));
 }
+#[test]
+fn iterative_not_decode_preserves_delayed_field_error_order(){
+    for mode in [Mode::DirectValue,Mode::BufferedContent]{
+        let e=bad(app::decode_value::<app::Expr>(value(r#"["not",["today"],false]"#),mode,&mut Cx::new()));
+        assert!(matches!(e,app::AppDecodeError::Schema(app::SchemaFailure::InvalidLength{
+            actual:2,expected:app::Expected::Sequence(1),
+        })));
+    }
+    let e=bad(app::Expr::decode_json(
+        br#"{"kind":"not","value":["today"],"zzz":false}"#,&mut Cx::new()));
+    assert!(matches!(e,app::AppDecodeError::Schema(app::SchemaFailure::UnknownField{key,..})if key=="zzz"));
+
+    let input=value(r#"["not",["today"],false]"#);
+    let mut cx=fault(1,true);
+    let e=bad(app::decode_value::<app::Expr>(input,Mode::DirectValue,&mut cx));
+    assert!(matches!(e,app::AppDecodeError::Allocation(_)));
+}
 const SWEEP_QUERY:&str=r#"["query","e","b",["if",["today"],["count",["today"]],["not",["today"]]],[[["lower",["today"]],false]],7,false]"#;
 const SWEEP_AND:&str=r#"["and",[["count",["today"]],["or",[["today"],["today"]]]]]"#;
 const SWEEP_STEPS:&str=r#"["for_each",["today"],"row",[["create","e",{"kind":["count",["today"]],"type":["today"],"value":["today"]},"b"],["update",["today"],{"binding":["today"]}]]]"#;
