@@ -3,7 +3,17 @@
 mod files;
 #[cfg(test)]
 pub(crate) use files::file_sync_testing;
+#[cfg(test)]
+#[path = "../../tests/fixtures/product_runtime/mod.rs"]
+pub(crate) mod runtime_test_fixture;
 mod json;
+mod pointer;
+use pointer::Pointer;
+mod pointer_codec;
+#[allow(dead_code)]
+pub(crate) mod fallible_project_snapshot_decode;
+use crate::product_alloc::{try_copy_str, AllocationContext, AllocationFailure, AllocationSite};
+use pointer_codec::PointerDecodeError;
 mod recovery_destination;
 pub(crate) use recovery_destination::RecoveryDestination;
 pub mod scope;
@@ -28,6 +38,12 @@ const MAX_STORE_BYTES: usize = 16 * 1024 * 1024;
 /// individual source/provider document still has its separate 1 MiB cap.
 pub(crate) const MAX_INTENTION_OBJECT_BYTES: usize = MAX_STORE_BYTES;
 type Result<T> = std::result::Result<T, StoreError>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointerCodecFailure {
+    Allocation(AllocationFailure),
+    Malformed,
+    EncodingInvariant,
+}
 #[derive(Debug)]
 pub enum StoreError {
     Io(io::Error),
@@ -40,6 +56,7 @@ pub enum StoreError {
     Incompatible(CompatibilityReport),
     Runtime(AdapterError),
     Corrupt(String),
+    PointerCodec(PointerCodecFailure),
     #[cfg(test)]
     Interrupted(FaultPoint),
 }
@@ -69,6 +86,32 @@ impl From<serde_json::Error> for StoreError {
         Self::Corrupt(e.to_string())
     }
 }
+impl From<AllocationFailure> for StoreError {
+    fn from(failure: AllocationFailure) -> Self {
+        Self::PointerCodec(PointerCodecFailure::Allocation(failure))
+    }
+}
+impl From<PointerDecodeError> for StoreError {
+    fn from(error: PointerDecodeError) -> Self {
+        match error {
+            PointerDecodeError::Json(error) => match error.cause {
+                crate::product_json::Cause::Allocation(failure) => failure.into(),
+                _ => Self::PointerCodec(PointerCodecFailure::Malformed),
+            },
+            PointerDecodeError::Schema(_) | PointerDecodeError::InvalidDigest => {
+                Self::PointerCodec(PointerCodecFailure::Malformed)
+            }
+        }
+    }
+}
+impl From<crate::product_json::canonical::EncodeError> for StoreError {
+    fn from(error: crate::product_json::canonical::EncodeError) -> Self {
+        match error {
+            crate::product_json::canonical::EncodeError::Allocation(failure) => failure.into(),
+            _ => Self::PointerCodec(PointerCodecFailure::EncodingInvariant),
+        }
+    }
+}
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FaultPoint {
@@ -77,6 +120,8 @@ pub enum FaultPoint {
     AfterPointer,
     AfterUpgradeObject,
     AfterUpgradeJournal,
+    CancelPrimaryBeforePointer,
+    CancelSecondaryBeforePointer,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +130,8 @@ pub struct OperationReceipt {
     pub operation: Id,
     pub request: Digest,
     pub revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_digest: Option<Digest>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -125,9 +172,15 @@ impl ProjectSnapshot {
         self.validate_container()?;
         scope::verify_snapshot(self)
     }
+    pub(crate) fn validate_with_archive(
+        &self,
+    ) -> Result<Option<scope::ValidatedOwnedArchive<'_>>> {
+        self.validate_container()?;
+        scope::verify_snapshot_with_archive(self)
+    }
     // Historical owned bases must satisfy every ordinary container invariant
     // without recursively re-entering reconstruction of the same proof family.
-    fn validate_container(&self) -> Result<()> {
+    pub(crate) fn validate_container(&self) -> Result<()> {
         if self.magic != MAGIC {
             return Err(StoreError::Corrupt("not a generated-tool project".into()));
         }
@@ -220,15 +273,6 @@ impl ProjectSnapshot {
         Ok(())
     }
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Pointer {
-    magic: String,
-    version: u32,
-    project_id: Id,
-    revision: u64,
-    object: Digest,
-}
 /// Prepared locally against exact current identities. This is a rehearsal, not
 /// authorization: the host must obtain the user's choice before calling adopt.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -258,12 +302,14 @@ struct ValidationIdentity {
     family: &'static str,
     compiler: u32,
     verifier: u32,
+    owned_lowerings: [u32;2],
     limits: RuntimeLimits,
 }
 struct ValidatedSnapshot {
     pointer: Pointer,
     bytes: Vec<u8>,
     identity: ValidationIdentity,
+    owned_registry: Option<scope::ValidatedOwnedRegistry>,
 }
 #[derive(Default)]
 struct ValidationCache {
@@ -288,6 +334,25 @@ impl ProductStore {
     }
     fn clear_validation_cache(&self) {
         self.validation_cache_guard().verified = None;
+    }
+    fn validation_identity(snapshot: &ProjectSnapshot) -> ValidationIdentity {
+        let runtime = LocalRuntime::default();
+        ValidationIdentity {
+            runtime: runtime.capabilities(),
+            driver: DRIVER_VERSION,
+            container: FORMAT,
+            family: match &snapshot.scope {
+                scope::ScopeEnvelope::ScalarV1(_) => "scalar_v1",
+                scope::ScopeEnvelope::OwnedV2(_) => "owned_v2",
+            },
+            compiler: match &snapshot.scope {
+                scope::ScopeEnvelope::ScalarV1(_) => scope::COMPILER_VERSION,
+                scope::ScopeEnvelope::OwnedV2(_) => scope::OWNED_LOWERING_VERSION,
+            },
+            verifier: scope::SCOPE_VERIFIER_REVISION,
+            owned_lowerings: scope::SUPPORTED_OWNED_LOWERINGS,
+            limits: RuntimeLimits::default(),
+        }
     }
     #[cfg(test)]
     pub(crate) fn validation_cache_stats(&self) -> (usize, usize) {
@@ -385,11 +450,23 @@ impl ProductStore {
     where
         F: FnOnce(&ProductStore) -> Result<()>,
     {
-        Self::create_recovered_at(path.as_ref(), None, snapshot, before_activate)
+        Self::create_recovered_at(path.as_ref(), None, snapshot, None, before_activate)
     }
-    pub(crate) fn create_recovered_selected<F>(
+    pub(crate) fn create_recovered_with_validated<F>(
+        path: impl AsRef<Path>,
+        snapshot: &ProjectSnapshot,
+        archive: Option<&scope::ValidatedOwnedArchive<'_>>,
+        before_activate: F,
+    ) -> Result<Self>
+    where
+        F: FnOnce(&ProductStore) -> Result<()>,
+    {
+        Self::create_recovered_at(path.as_ref(), None, snapshot, archive, before_activate)
+    }
+    pub(crate) fn create_recovered_selected_validated<F>(
         destination: &RecoveryDestination,
         snapshot: &ProjectSnapshot,
+        archive: Option<&scope::ValidatedOwnedArchive<'_>>,
         before_activate: F,
     ) -> Result<Self>
     where
@@ -399,6 +476,7 @@ impl ProductStore {
             destination.path(),
             Some(destination),
             snapshot,
+            archive,
             before_activate,
         )
     }
@@ -406,12 +484,27 @@ impl ProductStore {
         path: &Path,
         selected: Option<&RecoveryDestination>,
         snapshot: &ProjectSnapshot,
+        archive: Option<&scope::ValidatedOwnedArchive<'_>>,
         before_activate: F,
     ) -> Result<Self>
     where
         F: FnOnce(&ProductStore) -> Result<()>,
     {
-        snapshot.validate()?;
+        let owned_registry = match archive {
+            Some(archive) if archive.belongs_to(snapshot) => {
+                snapshot.validate_container()?;
+                Some(archive.registry())
+            }
+            Some(_) => {
+                return Err(StoreError::Invalid(
+                    "validated owned archive belongs to another snapshot".into(),
+                ));
+            }
+            None => {
+                snapshot.validate()?;
+                None
+            }
+        };
         if canonical_bytes(snapshot)?.len() > MAX_STORE_BYTES {
             return Err(StoreError::Invalid(
                 "recovery snapshot exceeds the byte limit".into(),
@@ -445,12 +538,11 @@ impl ProductStore {
         store.require_unactivated()?;
         before_activate(&store)?;
         store.pinned()?;
-        store.save(
-            snapshot,
-            false,
-            #[cfg(test)]
-            None,
-        )?;
+        if let Some(registry) = owned_registry {
+            store.save_after_validated_snapshot(snapshot, registry, #[cfg(test)] None)?;
+        } else {
+            store.save(snapshot, false, #[cfg(test)] None)?;
+        }
         Ok(store)
     }
 
@@ -472,7 +564,7 @@ impl ProductStore {
             .upgrade_requires_reopen
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            return Err(StoreError::RestartRequired);
+            return Err(StoreError::RestartRequired.into());
         }
         self.pinned()?;
         match self.root.read("CURRENT", 16 * 1024) {
@@ -567,61 +659,119 @@ impl ProductStore {
         }
         result
     }
+    #[cfg(test)]
+    pub(crate) fn load_with_allocation_context(
+        &self,
+        allocations: &mut AllocationContext,
+    ) -> Result<ProjectSnapshot> {
+        let result = self
+            .load_current_with_archive_allocations(false, allocations, |snapshot, _| {
+                Ok(snapshot.clone())
+            })
+            .and_then(|snapshot| {
+                self.require_upgrade_complete(&snapshot)?;
+                Ok(snapshot)
+            });
+        if result.is_err() {
+            self.clear_validation_cache();
+        }
+        result
+    }
     fn load_current(&self) -> Result<ProjectSnapshot> {
+        self.load_current_with_archive(false, |snapshot, _| Ok(snapshot.clone()))
+    }
+    pub(crate) fn with_verified_snapshot<T, E>(
+        &self,
+        consume: impl FnOnce(
+            &ProjectSnapshot,
+            Option<&scope::ValidatedOwnedArchive<'_>>,
+        ) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E>
+    where
+        E: From<StoreError>,
+    {
+        let result = self.load_current_with_archive(true, |snapshot, archive| {
+            self.require_upgrade_complete(snapshot)?;
+            consume(snapshot, archive)
+        });
+        if result.is_err() {
+            self.clear_validation_cache();
+        }
+        result
+    }
+    fn load_current_with_archive<T, E>(
+        &self,
+        include_archive: bool,
+        consume: impl FnOnce(
+            &ProjectSnapshot,
+            Option<&scope::ValidatedOwnedArchive<'_>>,
+        ) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E>
+    where
+        E: From<StoreError>,
+    {
+        let mut allocations = AllocationContext::new();
+        self.load_current_with_archive_allocations(include_archive, &mut allocations, consume)
+    }
+    fn load_current_with_archive_allocations<T, E>(
+        &self,
+        include_archive: bool,
+        allocations: &mut AllocationContext,
+        consume: impl FnOnce(
+            &ProjectSnapshot,
+            Option<&scope::ValidatedOwnedArchive<'_>>,
+        ) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E>
+    where
+        E: From<StoreError>,
+    {
         if self
             .upgrade_requires_reopen
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            return Err(StoreError::RestartRequired);
+            return Err(StoreError::RestartRequired.into());
         }
         self.pinned()?;
-        let pointer: Pointer = json::parse(&self.root.read("CURRENT", 16 * 1024)?)?;
+        let pointer_bytes = self.root.read("CURRENT", 16 * 1024).map_err(StoreError::from)?;
+        let pointer = pointer_codec::decode_pointer(&pointer_bytes, allocations)
+            .map_err(StoreError::from)?;
         if pointer.magic != MAGIC {
-            return Err(StoreError::Corrupt("not a generated-tool project".into()));
+            return Err(StoreError::Corrupt("not a generated-tool project".into()).into());
         }
         if matches!(pointer.version, 1 | 2) {
-            return Err(StoreError::UpgradeRequired);
+            return Err(StoreError::UpgradeRequired.into());
         }
         if pointer.version != FORMAT {
-            return Err(StoreError::UnsupportedFormat(pointer.version));
+            return Err(StoreError::UnsupportedFormat(pointer.version).into());
         }
         let bytes = self.root.read(
             &format!("object-{}.json", pointer.object.as_str()),
             MAX_STORE_BYTES,
-        )?;
-        let snapshot: ProjectSnapshot = json::parse(&bytes)?;
-        if canonical_digest(IdentityDomain::Data, &snapshot)? != pointer.object {
+        ).map_err(StoreError::from)?;
+        let snapshot: ProjectSnapshot = json::parse(&bytes).map_err(StoreError::from)?;
+        if canonical_digest(IdentityDomain::Data, &snapshot).map_err(StoreError::from)? != pointer.object {
             return Err(StoreError::Corrupt(
                 "snapshot checksum mismatch; use a verified checkpoint".into(),
-            ));
+            ).into());
         }
         if snapshot.revision != pointer.revision || snapshot.data.project_id != pointer.project_id {
             return Err(StoreError::Corrupt(
                 "pointer does not match snapshot".into(),
-            ));
+            ).into());
         }
         self.pinned()?;
         let runtime = LocalRuntime::default();
-        let identity = ValidationIdentity {
-            runtime: runtime.capabilities(),
-            driver: DRIVER_VERSION,
-            container: FORMAT,
-            family: match &snapshot.scope {
-                scope::ScopeEnvelope::ScalarV1(_) => "scalar_v1",
-                scope::ScopeEnvelope::OwnedV2(_) => "owned_v2",
-            },
-            compiler: match &snapshot.scope {
-                scope::ScopeEnvelope::ScalarV1(_) => scope::COMPILER_VERSION,
-                scope::ScopeEnvelope::OwnedV2(_) => scope::OWNED_LOWERING_VERSION,
-            },
-            verifier: scope::SCOPE_VERIFIER_REVISION,
-            limits: RuntimeLimits::default(),
-        };
-        let reused = {
+        let identity = Self::validation_identity(&snapshot);
+        let (reused, cached_registry) = {
             let mut cache = self.validation_cache_guard();
             let reused = cache.verified.as_ref().is_some_and(|checked| {
                 checked.pointer == pointer && checked.bytes == bytes && checked.identity == identity
             });
+            let registry = if reused {
+                cache.verified.as_ref().and_then(|checked| checked.owned_registry.clone())
+            } else {
+                None
+            };
             if reused {
                 #[cfg(test)]
                 {
@@ -634,14 +784,17 @@ impl ProductStore {
                     cache.validations += 1;
                 }
             }
-            reused
+            (reused, registry)
         };
-        if !reused {
+        let archive = if !reused {
             // Only these pure checks are reusable. The complete object was
             // freshly read, strictly parsed and hashed above on every load.
-            // Referenced intention objects are still independently read and
-            // verified by archive/backup admission; they are not cached here.
-            snapshot.validate()?;
+            // The owned registry is retained only with the exact immutable
+            // pointer, bytes and verifier identity below. Referenced intention
+            // objects are still independently read by archive admission.
+            snapshot.validate_container()?;
+            let archive = scope::verify_snapshot_with_archive(&snapshot)?;
+            let owned_registry = archive.as_ref().map(|archive| archive.registry());
             runtime.start(
                 snapshot.program()?,
                 &snapshot.data,
@@ -649,15 +802,27 @@ impl ProductStore {
                 snapshot.clock_day,
                 0,
                 identity.limits.clone(),
-            )?;
+            ).map_err(StoreError::from)?;
             self.pinned()?;
             self.validation_cache_guard().verified = Some(ValidatedSnapshot {
                 pointer,
                 bytes,
                 identity,
+                owned_registry,
             });
-        }
-        Ok(snapshot)
+            if include_archive { archive } else { None }
+        } else if include_archive {
+            // The cache token matches this freshly read pointer, bytes and
+            // verifier identity. Its scoped registry is snapshot-digest-bound.
+            if let Some(registry) = cached_registry {
+                Some(scope::validated_archive(&snapshot, registry))
+            } else {
+                scope::verify_snapshot_with_archive(&snapshot)?
+            }
+        } else {
+            None
+        };
+        consume(&snapshot, archive.as_ref())
     }
     fn save(
         &self,
@@ -665,12 +830,99 @@ impl ProductStore {
         replace_current: bool,
         #[cfg(test)] fault: Option<FaultPoint>,
     ) -> Result<()> {
+        self.save_with_checkpoint(snapshot, replace_current, || Ok(()), #[cfg(test)] fault)
+    }
+    // Only the transition writer supplies a live guard. The ordinary save
+    // wrapper retains its exact validation/publication/error order.
+    fn save_with_checkpoint(
+        &self,
+        snapshot: &ProjectSnapshot,
+        replace_current: bool,
+        checkpoint: impl FnOnce() -> Result<()>,
+        #[cfg(test)] fault: Option<FaultPoint>,
+    ) -> Result<()> {
+        self.save_with_checkpoint_mode(snapshot, replace_current, checkpoint, false, None, #[cfg(test)] fault)
+    }
+    fn save_after_applied_transition(
+        &self,
+        snapshot: &ProjectSnapshot,
+        owned_registry: Option<scope::ValidatedOwnedRegistry>,
+        #[cfg(test)] fault: Option<FaultPoint>,
+    ) -> Result<()> {
+        self.save_with_checkpoint_mode(snapshot, true, || Ok(()), true, owned_registry, #[cfg(test)] fault)
+    }
+    fn save_after_validated_snapshot(
+        &self,
+        snapshot: &ProjectSnapshot,
+        owned_registry: scope::ValidatedOwnedRegistry,
+        #[cfg(test)] fault: Option<FaultPoint>,
+    ) -> Result<()> {
+        self.save_with_checkpoint_mode(
+            snapshot,
+            false,
+            || Ok(()),
+            true,
+            Some(owned_registry),
+            #[cfg(test)] fault,
+        )
+    }
+    fn save_with_checkpoint_mode(
+        &self,
+        snapshot: &ProjectSnapshot,
+        replace_current: bool,
+        checkpoint: impl FnOnce() -> Result<()>,
+        applied_transition_verified: bool,
+        owned_registry: Option<scope::ValidatedOwnedRegistry>,
+        #[cfg(test)] fault: Option<FaultPoint>,
+    ) -> Result<()> {
+        let mut allocations = AllocationContext::new();
+        self.save_with_checkpoint_mode_allocations(
+            snapshot,
+            replace_current,
+            checkpoint,
+            applied_transition_verified,
+            owned_registry,
+            &mut allocations,
+            #[cfg(test)]
+            fault,
+        )
+    }
+    #[cfg(test)]
+    pub(crate) fn save_with_allocation_context(
+        &self,
+        snapshot: &ProjectSnapshot,
+        allocations: &mut AllocationContext,
+    ) -> Result<()> {
+        self.save_with_checkpoint_mode_allocations(
+            snapshot,
+            true,
+            || Ok(()),
+            false,
+            None,
+            allocations,
+            None,
+        )
+    }
+    fn save_with_checkpoint_mode_allocations(
+        &self,
+        snapshot: &ProjectSnapshot,
+        replace_current: bool,
+        checkpoint: impl FnOnce() -> Result<()>,
+        applied_transition_verified: bool,
+        owned_registry: Option<scope::ValidatedOwnedRegistry>,
+        allocations: &mut AllocationContext,
+        #[cfg(test)] fault: Option<FaultPoint>,
+    ) -> Result<()> {
         self.clear_validation_cache();
         self.pinned()?;
         if !replace_current {
             self.require_unactivated()?;
         }
-        snapshot.validate()?;
+        if applied_transition_verified {
+            snapshot.validate_container()?;
+        } else {
+            snapshot.validate()?;
+        }
         let bytes = canonical_bytes(snapshot)?;
         if bytes.len() > MAX_STORE_BYTES {
             return Err(StoreError::Invalid(
@@ -694,9 +946,13 @@ impl ProductStore {
         }
         self.pinned()?;
         let pointer = Pointer {
-            magic: MAGIC.into(),
+            magic: try_copy_str(MAGIC, allocations, AllocationSite::String)?,
             version: FORMAT,
-            project_id: snapshot.data.project_id.clone(),
+            project_id: try_copy_str(
+                &snapshot.data.project_id,
+                allocations,
+                AllocationSite::String,
+            )?,
             revision: snapshot.revision,
             object,
         };
@@ -706,11 +962,25 @@ impl ProductStore {
         }
         // The preflight avoids staging into a known competing project; only
         // atomic no-clobber publication closes a subsequent activation race.
-        self.root
-            .publish("CURRENT", &canonical_bytes(&pointer)?, replace_current)?;
+        let pointer_bytes = pointer_codec::encode_pointer(&pointer, allocations)
+            .map_err(StoreError::from)?;
+        self.root.publish_with_checkpoint(
+            "CURRENT",
+            &pointer_bytes,
+            replace_current,
+            checkpoint,
+        )?;
         #[cfg(test)]
         if fault == Some(FaultPoint::AfterPointer) {
             return Err(StoreError::Interrupted(FaultPoint::AfterPointer));
+        }
+        if applied_transition_verified {
+            self.validation_cache_guard().verified = Some(ValidatedSnapshot {
+                pointer,
+                bytes,
+                identity: Self::validation_identity(snapshot),
+                owned_registry,
+            });
         }
         Ok(())
     }
@@ -782,7 +1052,7 @@ impl ProductStore {
             limits,
             &snapshot.artifacts,
         )?;
-        runtime.apply(&mut run, input, operation)?;
+        let step = runtime.apply(&mut run, input, operation)?;
         snapshot.data = runtime.data(&run).clone();
         snapshot.session = runtime.session(&run).clone();
         snapshot.clock_day = run.clock_day();
@@ -797,12 +1067,18 @@ impl ProductStore {
                 operation: operation.into(),
                 request,
                 revision: snapshot.revision,
+                trace_digest: None,
             },
         );
-        scope::verify_transition(&before, &snapshot)?;
-        self.save(
+        let stored_request = &snapshot.operations.get(operation)
+            .ok_or_else(|| StoreError::Corrupt("applied operation receipt missing".into()))?
+            .request;
+        let owned_registry = scope::verify_transition_after_apply(
+            &before, &snapshot, operation, &step, stored_request,
+        )?;
+        self.save_after_applied_transition(
             &snapshot,
-            true,
+            owned_registry,
             #[cfg(test)]
             fault,
         )?;
@@ -1145,6 +1421,7 @@ impl ProductStore {
                 operation: prepared.plan.id.clone(),
                 request,
                 revision: current.revision,
+                trace_digest: None,
             },
         );
         let revision = current.revision;

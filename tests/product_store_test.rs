@@ -2,8 +2,20 @@
 mod fixture;
 #[path = "../src/product_contract.rs"]
 mod product_contract;
+#[path = "../src/product_decisions/mod.rs"]
+mod product_decisions;
 #[path = "../src/product_protocol.rs"]
 mod product_protocol;
+#[path = "../src/product_locations.rs"]
+mod product_locations;
+#[path = "../src/product_alloc.rs"]
+mod product_alloc;
+#[path = "../src/product_json.rs"]
+mod product_json;
+#[path = "../src/product_app.rs"]
+mod product_app;
+#[path = "../src/product_backup.rs"]
+mod product_backup;
 #[path = "../src/product_runtime/mod.rs"]
 mod product_runtime;
 #[path = "../src/product_store/mod.rs"]
@@ -11,11 +23,103 @@ mod product_store;
 use fixture::*;
 use product_contract::*;
 use product_store::*;
+use product_alloc::{AllocationContext as Cx, AllocationFailureKind as FailureKind};
 use serde_json::json;
 use std::fs;
 
 fn create(path: &std::path::Path) -> ProductStore {
     ProductStore::create(path, &capture(organizer()), 20000).unwrap()
+}
+#[test]
+fn current_pointer_codec_round_trips_creation_open_and_recovery_canonically() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("source");
+    let source = create(&source_path);
+    let snapshot = source.load().unwrap();
+    let source_bytes = fs::read(source_path.join("CURRENT")).unwrap();
+    let source_value: serde_json::Value = serde_json::from_slice(&source_bytes).unwrap();
+    assert_eq!(source_bytes, canonical_bytes(&source_value).unwrap());
+    assert_eq!(ProductStore::open(&source_path).unwrap().load().unwrap(), snapshot);
+
+    // The pre-codec derived-struct parser also accepted positional sequences.
+    let array_pointer = serde_json::to_vec(&serde_json::json!([
+        source_value["magic"], source_value["version"], source_value["project_id"],
+        source_value["revision"], source_value["object"],
+    ])).unwrap();
+    fs::write(source_path.join("CURRENT"), &array_pointer).unwrap();
+    assert_eq!(ProductStore::open(&source_path).unwrap().load().unwrap(), snapshot);
+    let array_with_trailing_elements = serde_json::to_vec(&serde_json::json!([
+        source_value["magic"], source_value["version"], source_value["project_id"],
+        source_value["revision"], source_value["object"], null, {"ignored": [1, 2]},
+    ])).unwrap();
+    fs::write(source_path.join("CURRENT"), &array_with_trailing_elements).unwrap();
+    assert_eq!(ProductStore::open(&source_path).unwrap().load().unwrap(), snapshot);
+    fs::write(source_path.join("CURRENT"), &source_bytes).unwrap();
+
+    let recovered_path = dir.path().join("recovered");
+    let recovered = ProductStore::create_recovered(&recovered_path, &snapshot).unwrap();
+    let recovered_bytes = fs::read(recovered_path.join("CURRENT")).unwrap();
+    let recovered_value: serde_json::Value = serde_json::from_slice(&recovered_bytes).unwrap();
+    assert_eq!(recovered_bytes, canonical_bytes(&recovered_value).unwrap());
+    assert_eq!(recovered_bytes, source_bytes);
+    assert_eq!(recovered.load().unwrap(), snapshot);
+}
+
+#[test]
+fn current_pointer_decode_refusal_is_fixed_preserves_bytes_and_can_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tool");
+    let store = create(&path);
+    let before = fs::read(path.join("CURRENT")).unwrap();
+    let mut normal = Cx::new();
+    let expected = store.load_with_allocation_context(&mut normal).unwrap();
+    assert_eq!(expected, store.load().unwrap());
+    let requests = normal.growth_requests();
+    assert!(requests > 0);
+
+    for nth in 1..=requests {
+        let mut allocations = Cx::fail_nth_growth(std::num::NonZeroUsize::new(nth).unwrap(), true);
+        assert!(matches!(
+            store.load_with_allocation_context(&mut allocations),
+            Err(StoreError::PointerCodec(PointerCodecFailure::Allocation(failure)))
+                if failure.kind == FailureKind::Injected
+        ));
+        assert_eq!(allocations.first_failure().unwrap().kind, FailureKind::Injected);
+        assert_eq!(fs::read(path.join("CURRENT")).unwrap(), before);
+        assert_eq!(store.load().unwrap(), expected);
+    }
+}
+
+#[test]
+fn current_pointer_encode_refusal_keeps_activation_and_cleans_publication_temp() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tool");
+    let store = create(&path);
+    let snapshot = store.load().unwrap();
+    let before = fs::read(path.join("CURRENT")).unwrap();
+    let mut normal = Cx::new();
+    store.save_with_allocation_context(&snapshot, &mut normal).unwrap();
+    let requests = normal.growth_requests();
+    assert!(requests >= 3, "pointer construction and output reservation are metered");
+    assert_eq!(fs::read(path.join("CURRENT")).unwrap(), before);
+
+    for nth in 1..=requests {
+        let mut allocations = Cx::fail_nth_growth(std::num::NonZeroUsize::new(nth).unwrap(), true);
+        assert!(matches!(
+            store.save_with_allocation_context(&snapshot, &mut allocations),
+            Err(StoreError::PointerCodec(PointerCodecFailure::Allocation(failure)))
+                if failure.kind == FailureKind::Injected
+        ));
+        assert_eq!(allocations.first_failure().unwrap().kind, FailureKind::Injected);
+        assert_eq!(fs::read(path.join("CURRENT")).unwrap(), before);
+        assert!(fs::read_dir(&path).unwrap().all(|entry| {
+            !entry.unwrap().file_name().to_string_lossy().starts_with(".pending-")
+        }));
+        assert_eq!(store.load().unwrap(), snapshot);
+    }
+
+    store.save_with_allocation_context(&snapshot, &mut Cx::new()).unwrap();
+    assert_eq!(store.load().unwrap(), snapshot);
 }
 #[test]
 fn restart_and_exact_retry_preserve_current_work() {
@@ -75,18 +179,24 @@ fn corrupted_and_future_format_stores_are_never_writable() {
     let store = create(&path);
     let current = fs::read(path.join("CURRENT")).unwrap();
     fs::write(path.join("CURRENT"), b"broken").unwrap();
-    assert!(store.load().is_err());
+    assert!(matches!(
+        store.load(),
+        Err(StoreError::PointerCodec(PointerCodecFailure::Malformed))
+    ));
     assert!(store
         .apply(0, "add", &add("Ada"), RuntimeLimits::default())
         .is_err());
     assert_eq!(fs::read(path.join("CURRENT")).unwrap(), b"broken");
     let mut pointer: serde_json::Value = serde_json::from_slice(&current).unwrap();
-    pointer["version"] = json!(99);
-    fs::write(path.join("CURRENT"), serde_json::to_vec(&pointer).unwrap()).unwrap();
-    assert!(matches!(
-        store.load(),
-        Err(StoreError::UnsupportedFormat(_))
-    ));
+    for version in [1, 2, 99] {
+        pointer["version"] = json!(version);
+        fs::write(path.join("CURRENT"), serde_json::to_vec(&pointer).unwrap()).unwrap();
+        match store.load() {
+            Err(StoreError::UpgradeRequired) if matches!(version, 1 | 2) => {}
+            Err(StoreError::UnsupportedFormat(actual)) if actual == version => {}
+            other => panic!("unexpected classification for Pointer version {version}: {other:?}"),
+        }
+    }
 }
 #[test]
 fn adoption_and_recovery_keep_later_records_values_and_event_facts() {
@@ -255,7 +365,10 @@ fn corrupted_immutable_object_and_duplicate_pointer_keys_are_rejected() {
     let pointer = original_pointer.replacen("\"version\":3", "\"version\":3,\"version\":3", 1);
     assert_ne!(pointer, original_pointer);
     fs::write(path.join("CURRENT"), pointer).unwrap();
-    assert!(store.load().is_err());
+    assert!(matches!(
+        store.load(),
+        Err(StoreError::PointerCodec(PointerCodecFailure::Malformed))
+    ));
 }
 
 #[cfg(unix)]

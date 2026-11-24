@@ -1,0 +1,1712 @@
+{
+  "actions": [
+    {
+      "ensures": [],
+      "guards": [],
+      "id": "add",
+      "label": "add",
+      "parameters": {
+        "title": {
+          "kind": "text"
+        }
+      },
+      "steps": [
+        {
+          "bind": "made",
+          "entity": "job",
+          "kind": "create",
+          "values": {
+            "status": {
+              "kind": "literal",
+              "value": {
+                "kind": "text",
+                "value": "ready"
+              },
+              "value_type": {
+                "kind": "text"
+              }
+            },
+            "title": {
+              "kind": "variable",
+              "name": "title"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "ensures": [],
+      "guards": [
+        {
+          "kind": "equal",
+          "left": {
+            "field": "status",
+            "kind": "field",
+            "record": {
+              "kind": "variable",
+              "name": "job"
+            }
+          },
+          "right": {
+            "kind": "literal",
+            "value": {
+              "kind": "text",
+              "value": "ready"
+            },
+            "value_type": {
+              "kind": "text"
+            }
+          }
+        }
+      ],
+      "id": "complete",
+      "label": "complete",
+      "parameters": {
+        "job": {
+          "entity": "job",
+          "kind": "reference"
+        }
+      },
+      "steps": [
+        {
+          "kind": "update",
+          "record": {
+            "kind": "variable",
+            "name": "job"
+          },
+          "values": {
+            "status": {
+              "kind": "literal",
+              "value": {
+                "kind": "text",
+                "value": "done"
+              },
+              "value_type": {
+                "kind": "text"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "ensures": [],
+      "guards": [
+        {
+          "kind": "not",
+          "value": {
+            "kind": "equal",
+            "left": {
+              "field": "status",
+              "kind": "field",
+              "record": {
+                "kind": "variable",
+                "name": "owner"
+              }
+            },
+            "right": {
+              "kind": "literal",
+              "value": {
+                "kind": "text",
+                "value": "done"
+              },
+              "value_type": {
+                "kind": "text"
+              }
+            }
+          }
+        }
+      ],
+      "id": "register",
+      "label": "register",
+      "parameters": {
+        "name": {
+          "kind": "text"
+        },
+        "owner": {
+          "entity": "job",
+          "kind": "reference"
+        }
+      },
+      "steps": [
+        {
+          "binding": "gate",
+          "items": {
+            "binding": "j",
+            "entity": "job",
+            "include_archived": false,
+            "kind": "query",
+            "limit": 10000,
+            "predicate": {
+              "kind": "and",
+              "values": [
+                {
+                  "kind": "equal",
+                  "left": {
+                    "kind": "variable",
+                    "name": "j"
+                  },
+                  "right": {
+                    "kind": "variable",
+                    "name": "owner"
+                  }
+                },
+                {
+                  "kind": "equal",
+                  "left": {
+                    "items": {
+                      "binding": "m",
+                      "entity": "material",
+                      "include_archived": false,
+                      "kind": "query",
+                      "limit": 10000,
+                      "predicate": {
+                        "kind": "equal",
+                        "left": {
+                          "field": "name",
+                          "kind": "field",
+                          "record": {
+                            "kind": "variable",
+                            "name": "m"
+                          }
+                        },
+                        "right": {
+                          "kind": "variable",
+                          "name": "name"
+                        }
+                      },
+                      "sort": []
+                    },
+                    "kind": "count"
+                  },
+                  "right": {
+                    "kind": "literal",
+                    "value": {
+                      "kind": "integer",
+                      "value": 0
+                    },
+                    "value_type": {
+                      "kind": "integer"
+                    }
+                  }
+                }
+              ]
+            },
+            "sort": []
+          },
+          "kind": "for_each",
+          "steps": [
+            {
+              "bind": "made",
+              "entity": "material",
+              "kind": "create",
+              "values": {
+                "name": {
+                  "kind": "variable",
+                  "name": "name"
+                },
+                "received": {
+                  "kind": "literal",
+                  "value": {
+                    "kind": "boolean",
+                    "value": false
+                  },
+                  "value_type": {
+                    "kind": "boolean"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        {
+          "binding": "material",
+          "items": {
+            "binding": "m",
+            "entity": "material",
+            "include_archived": false,
+            "kind": "query",
+            "limit": 10000,
+            "predicate": {
+              "kind": "equal",
+              "left": {
+                "field": "name",
+                "kind": "field",
+                "record": {
+                  "kind": "variable",
+                  "name": "m"
+                }
+              },
+              "right": {
+                "kind": "variable",
+                "name": "name"
+              }
+            },
+            "sort": []
+          },
+          "kind": "for_each",
+          "steps": [
+            {
+              "binding": "link_gate",
+              "items": {
+                "binding": "j",
+                "entity": "job",
+                "include_archived": false,
+                "kind": "query",
+                "limit": 10000,
+                "predicate": {
+                  "kind": "and",
+                  "values": [
+                    {
+                      "kind": "equal",
+                      "left": {
+                        "kind": "variable",
+                        "name": "j"
+                      },
+                      "right": {
+                        "kind": "variable",
+                        "name": "owner"
+                      }
+                    },
+                    {
+                      "kind": "equal",
+                      "left": {
+                        "items": {
+                          "binding": "r",
+                          "entity": "requirement",
+                          "include_archived": false,
+                          "kind": "query",
+                          "limit": 10000,
+                          "predicate": {
+                            "kind": "and",
+                            "values": [
+                              {
+                                "kind": "equal",
+                                "left": {
+                                  "field": "job",
+                                  "kind": "field",
+                                  "record": {
+                                    "kind": "variable",
+                                    "name": "r"
+                                  }
+                                },
+                                "right": {
+                                  "kind": "variable",
+                                  "name": "owner"
+                                }
+                              },
+                              {
+                                "kind": "equal",
+                                "left": {
+                                  "field": "material",
+                                  "kind": "field",
+                                  "record": {
+                                    "kind": "variable",
+                                    "name": "r"
+                                  }
+                                },
+                                "right": {
+                                  "kind": "variable",
+                                  "name": "material"
+                                }
+                              }
+                            ]
+                          },
+                          "sort": []
+                        },
+                        "kind": "count"
+                      },
+                      "right": {
+                        "kind": "literal",
+                        "value": {
+                          "kind": "integer",
+                          "value": 0
+                        },
+                        "value_type": {
+                          "kind": "integer"
+                        }
+                      }
+                    }
+                  ]
+                },
+                "sort": []
+              },
+              "kind": "for_each",
+              "steps": [
+                {
+                  "bind": "made_link",
+                  "entity": "requirement",
+                  "kind": "create",
+                  "values": {
+                    "job": {
+                      "kind": "variable",
+                      "name": "owner"
+                    },
+                    "material": {
+                      "kind": "variable",
+                      "name": "material"
+                    },
+                    "required": {
+                      "kind": "literal",
+                      "value": {
+                        "kind": "boolean",
+                        "value": true
+                      },
+                      "value_type": {
+                        "kind": "boolean"
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "binding": "job",
+          "items": {
+            "binding": "j",
+            "entity": "job",
+            "include_archived": false,
+            "kind": "query",
+            "limit": 10000,
+            "predicate": {
+              "kind": "not",
+              "value": {
+                "kind": "equal",
+                "left": {
+                  "field": "status",
+                  "kind": "field",
+                  "record": {
+                    "kind": "variable",
+                    "name": "j"
+                  }
+                },
+                "right": {
+                  "kind": "literal",
+                  "value": {
+                    "kind": "text",
+                    "value": "done"
+                  },
+                  "value_type": {
+                    "kind": "text"
+                  }
+                }
+              }
+            },
+            "sort": []
+          },
+          "kind": "for_each",
+          "steps": [
+            {
+              "kind": "update",
+              "record": {
+                "kind": "variable",
+                "name": "job"
+              },
+              "values": {
+                "status": {
+                  "condition": {
+                    "kind": "equal",
+                    "left": {
+                      "field": "status",
+                      "kind": "field",
+                      "record": {
+                        "kind": "variable",
+                        "name": "job"
+                      }
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": {
+                        "kind": "text",
+                        "value": "done"
+                      },
+                      "value_type": {
+                        "kind": "text"
+                      }
+                    }
+                  },
+                  "else_value": {
+                    "condition": {
+                      "binding": "ready_link",
+                      "items": {
+                        "binding": "q",
+                        "entity": "requirement",
+                        "include_archived": false,
+                        "kind": "query",
+                        "limit": 10000,
+                        "predicate": {
+                          "kind": "and",
+                          "values": [
+                            {
+                              "kind": "equal",
+                              "left": {
+                                "field": "job",
+                                "kind": "field",
+                                "record": {
+                                  "kind": "variable",
+                                  "name": "q"
+                                }
+                              },
+                              "right": {
+                                "kind": "variable",
+                                "name": "job"
+                              }
+                            },
+                            {
+                              "field": "required",
+                              "kind": "field",
+                              "record": {
+                                "kind": "variable",
+                                "name": "q"
+                              }
+                            }
+                          ]
+                        },
+                        "sort": []
+                      },
+                      "kind": "all",
+                      "predicate": {
+                        "field": "received",
+                        "kind": "field",
+                        "record": {
+                          "field": "material",
+                          "kind": "field",
+                          "record": {
+                            "kind": "variable",
+                            "name": "ready_link"
+                          }
+                        }
+                      }
+                    },
+                    "else_value": {
+                      "kind": "literal",
+                      "value": {
+                        "kind": "text",
+                        "value": "waiting"
+                      },
+                      "value_type": {
+                        "kind": "text"
+                      }
+                    },
+                    "kind": "if",
+                    "then_value": {
+                      "condition": {
+                        "kind": "equal",
+                        "left": {
+                          "field": "status",
+                          "kind": "field",
+                          "record": {
+                            "kind": "variable",
+                            "name": "job"
+                          }
+                        },
+                        "right": {
+                          "kind": "literal",
+                          "value": {
+                            "kind": "text",
+                            "value": "active"
+                          },
+                          "value_type": {
+                            "kind": "text"
+                          }
+                        }
+                      },
+                      "else_value": {
+                        "kind": "literal",
+                        "value": {
+                          "kind": "text",
+                          "value": "ready"
+                        },
+                        "value_type": {
+                          "kind": "text"
+                        }
+                      },
+                      "kind": "if",
+                      "then_value": {
+                        "kind": "literal",
+                        "value": {
+                          "kind": "text",
+                          "value": "active"
+                        },
+                        "value_type": {
+                          "kind": "text"
+                        }
+                      }
+                    }
+                  },
+                  "kind": "if",
+                  "then_value": {
+                    "kind": "literal",
+                    "value": {
+                      "kind": "text",
+                      "value": "done"
+                    },
+                    "value_type": {
+                      "kind": "text"
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        },
+        {
+          "kind": "set_state",
+          "state": "name_input",
+          "value": {
+            "kind": "literal",
+            "value": {
+              "kind": "text",
+              "value": ""
+            },
+            "value_type": {
+              "kind": "text"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "ensures": [],
+      "guards": [
+        {
+          "kind": "not",
+          "value": {
+            "kind": "equal",
+            "left": {
+              "field": "status",
+              "kind": "field",
+              "record": {
+                "field": "job",
+                "kind": "field",
+                "record": {
+                  "kind": "variable",
+                  "name": "link"
+                }
+              }
+            },
+            "right": {
+              "kind": "literal",
+              "value": {
+                "kind": "text",
+                "value": "done"
+              },
+              "value_type": {
+                "kind": "text"
+              }
+            }
+          }
+        }
+      ],
+      "id": "remove",
+      "label": "remove",
+      "parameters": {
+        "link": {
+          "entity": "requirement",
+          "kind": "reference"
+        }
+      },
+      "steps": [
+        {
+          "kind": "update",
+          "record": {
+            "kind": "variable",
+            "name": "link"
+          },
+          "values": {
+            "required": {
+              "kind": "literal",
+              "value": {
+                "kind": "boolean",
+                "value": false
+              },
+              "value_type": {
+                "kind": "boolean"
+              }
+            }
+          }
+        },
+        {
+          "binding": "job",
+          "items": {
+            "binding": "j",
+            "entity": "job",
+            "include_archived": false,
+            "kind": "query",
+            "limit": 10000,
+            "predicate": {
+              "kind": "not",
+              "value": {
+                "kind": "equal",
+                "left": {
+                  "field": "status",
+                  "kind": "field",
+                  "record": {
+                    "kind": "variable",
+                    "name": "j"
+                  }
+                },
+                "right": {
+                  "kind": "literal",
+                  "value": {
+                    "kind": "text",
+                    "value": "done"
+                  },
+                  "value_type": {
+                    "kind": "text"
+                  }
+                }
+              }
+            },
+            "sort": []
+          },
+          "kind": "for_each",
+          "steps": [
+            {
+              "kind": "update",
+              "record": {
+                "kind": "variable",
+                "name": "job"
+              },
+              "values": {
+                "status": {
+                  "condition": {
+                    "kind": "equal",
+                    "left": {
+                      "field": "status",
+                      "kind": "field",
+                      "record": {
+                        "kind": "variable",
+                        "name": "job"
+                      }
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": {
+                        "kind": "text",
+                        "value": "done"
+                      },
+                      "value_type": {
+                        "kind": "text"
+                      }
+                    }
+                  },
+                  "else_value": {
+                    "condition": {
+                      "binding": "ready_link",
+                      "items": {
+                        "binding": "q",
+                        "entity": "requirement",
+                        "include_archived": false,
+                        "kind": "query",
+                        "limit": 10000,
+                        "predicate": {
+                          "kind": "and",
+                          "values": [
+                            {
+                              "kind": "equal",
+                              "left": {
+                                "field": "job",
+                                "kind": "field",
+                                "record": {
+                                  "kind": "variable",
+                                  "name": "q"
+                                }
+                              },
+                              "right": {
+                                "kind": "variable",
+                                "name": "job"
+                              }
+                            },
+                            {
+                              "field": "required",
+                              "kind": "field",
+                              "record": {
+                                "kind": "variable",
+                                "name": "q"
+                              }
+                            }
+                          ]
+                        },
+                        "sort": []
+                      },
+                      "kind": "all",
+                      "predicate": {
+                        "field": "received",
+                        "kind": "field",
+                        "record": {
+                          "field": "material",
+                          "kind": "field",
+                          "record": {
+                            "kind": "variable",
+                            "name": "ready_link"
+                          }
+                        }
+                      }
+                    },
+                    "else_value": {
+                      "kind": "literal",
+                      "value": {
+                        "kind": "text",
+                        "value": "waiting"
+                      },
+                      "value_type": {
+                        "kind": "text"
+                      }
+                    },
+                    "kind": "if",
+                    "then_value": {
+                      "condition": {
+                        "kind": "equal",
+                        "left": {
+                          "field": "status",
+                          "kind": "field",
+                          "record": {
+                            "kind": "variable",
+                            "name": "job"
+                          }
+                        },
+                        "right": {
+                          "kind": "literal",
+                          "value": {
+                            "kind": "text",
+                            "value": "active"
+                          },
+                          "value_type": {
+                            "kind": "text"
+                          }
+                        }
+                      },
+                      "else_value": {
+                        "kind": "literal",
+                        "value": {
+                          "kind": "text",
+                          "value": "ready"
+                        },
+                        "value_type": {
+                          "kind": "text"
+                        }
+                      },
+                      "kind": "if",
+                      "then_value": {
+                        "kind": "literal",
+                        "value": {
+                          "kind": "text",
+                          "value": "active"
+                        },
+                        "value_type": {
+                          "kind": "text"
+                        }
+                      }
+                    }
+                  },
+                  "kind": "if",
+                  "then_value": {
+                    "kind": "literal",
+                    "value": {
+                      "kind": "text",
+                      "value": "done"
+                    },
+                    "value_type": {
+                      "kind": "text"
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "ensures": [],
+      "guards": [
+        {
+          "field": "received",
+          "kind": "field",
+          "record": {
+            "kind": "variable",
+            "name": "material"
+          }
+        }
+      ],
+      "id": "withdraw",
+      "label": "withdraw",
+      "parameters": {
+        "material": {
+          "entity": "material",
+          "kind": "reference"
+        },
+        "note": {
+          "kind": "text"
+        }
+      },
+      "steps": [
+        {
+          "kind": "update",
+          "record": {
+            "kind": "variable",
+            "name": "material"
+          },
+          "values": {
+            "received": {
+              "kind": "literal",
+              "value": {
+                "kind": "boolean",
+                "value": false
+              },
+              "value_type": {
+                "kind": "boolean"
+              }
+            }
+          }
+        },
+        {
+          "bind": "event",
+          "entity": "event",
+          "kind": "create",
+          "values": {
+            "material": {
+              "kind": "variable",
+              "name": "material"
+            },
+            "note": {
+              "kind": "variable",
+              "name": "note"
+            },
+            "sequence": {
+              "kind": "add",
+              "left": {
+                "items": {
+                  "binding": "e",
+                  "entity": "event",
+                  "include_archived": false,
+                  "kind": "query",
+                  "limit": 10000,
+                  "predicate": {
+                    "kind": "literal",
+                    "value": {
+                      "kind": "boolean",
+                      "value": true
+                    },
+                    "value_type": {
+                      "kind": "boolean"
+                    }
+                  },
+                  "sort": []
+                },
+                "kind": "count"
+              },
+              "right": {
+                "kind": "literal",
+                "value": {
+                  "kind": "integer",
+                  "value": 1
+                },
+                "value_type": {
+                  "kind": "integer"
+                }
+              }
+            }
+          }
+        },
+        {
+          "binding": "job",
+          "items": {
+            "binding": "j",
+            "entity": "job",
+            "include_archived": false,
+            "kind": "query",
+            "limit": 10000,
+            "predicate": {
+              "kind": "not",
+              "value": {
+                "kind": "equal",
+                "left": {
+                  "field": "status",
+                  "kind": "field",
+                  "record": {
+                    "kind": "variable",
+                    "name": "j"
+                  }
+                },
+                "right": {
+                  "kind": "literal",
+                  "value": {
+                    "kind": "text",
+                    "value": "done"
+                  },
+                  "value_type": {
+                    "kind": "text"
+                  }
+                }
+              }
+            },
+            "sort": []
+          },
+          "kind": "for_each",
+          "steps": [
+            {
+              "kind": "update",
+              "record": {
+                "kind": "variable",
+                "name": "job"
+              },
+              "values": {
+                "status": {
+                  "condition": {
+                    "kind": "equal",
+                    "left": {
+                      "field": "status",
+                      "kind": "field",
+                      "record": {
+                        "kind": "variable",
+                        "name": "job"
+                      }
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": {
+                        "kind": "text",
+                        "value": "done"
+                      },
+                      "value_type": {
+                        "kind": "text"
+                      }
+                    }
+                  },
+                  "else_value": {
+                    "condition": {
+                      "binding": "ready_link",
+                      "items": {
+                        "binding": "q",
+                        "entity": "requirement",
+                        "include_archived": false,
+                        "kind": "query",
+                        "limit": 10000,
+                        "predicate": {
+                          "kind": "and",
+                          "values": [
+                            {
+                              "kind": "equal",
+                              "left": {
+                                "field": "job",
+                                "kind": "field",
+                                "record": {
+                                  "kind": "variable",
+                                  "name": "q"
+                                }
+                              },
+                              "right": {
+                                "kind": "variable",
+                                "name": "job"
+                              }
+                            },
+                            {
+                              "field": "required",
+                              "kind": "field",
+                              "record": {
+                                "kind": "variable",
+                                "name": "q"
+                              }
+                            }
+                          ]
+                        },
+                        "sort": []
+                      },
+                      "kind": "all",
+                      "predicate": {
+                        "field": "received",
+                        "kind": "field",
+                        "record": {
+                          "field": "material",
+                          "kind": "field",
+                          "record": {
+                            "kind": "variable",
+                            "name": "ready_link"
+                          }
+                        }
+                      }
+                    },
+                    "else_value": {
+                      "kind": "literal",
+                      "value": {
+                        "kind": "text",
+                        "value": "waiting"
+                      },
+                      "value_type": {
+                        "kind": "text"
+                      }
+                    },
+                    "kind": "if",
+                    "then_value": {
+                      "condition": {
+                        "kind": "equal",
+                        "left": {
+                          "field": "status",
+                          "kind": "field",
+                          "record": {
+                            "kind": "variable",
+                            "name": "job"
+                          }
+                        },
+                        "right": {
+                          "kind": "literal",
+                          "value": {
+                            "kind": "text",
+                            "value": "active"
+                          },
+                          "value_type": {
+                            "kind": "text"
+                          }
+                        }
+                      },
+                      "else_value": {
+                        "kind": "literal",
+                        "value": {
+                          "kind": "text",
+                          "value": "ready"
+                        },
+                        "value_type": {
+                          "kind": "text"
+                        }
+                      },
+                      "kind": "if",
+                      "then_value": {
+                        "kind": "literal",
+                        "value": {
+                          "kind": "text",
+                          "value": "active"
+                        },
+                        "value_type": {
+                          "kind": "text"
+                        }
+                      }
+                    }
+                  },
+                  "kind": "if",
+                  "then_value": {
+                    "kind": "literal",
+                    "value": {
+                      "kind": "text",
+                      "value": "done"
+                    },
+                    "value_type": {
+                      "kind": "text"
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "entities": [
+    {
+      "constraints": [],
+      "fields": [
+        {
+          "id": "title",
+          "label": "title",
+          "value_type": {
+            "kind": "text"
+          }
+        },
+        {
+          "id": "status",
+          "label": "status",
+          "value_type": {
+            "kind": "text"
+          }
+        }
+      ],
+      "id": "job",
+      "label": "job",
+      "unique": []
+    },
+    {
+      "constraints": [],
+      "fields": [
+        {
+          "id": "name",
+          "label": "name",
+          "value_type": {
+            "kind": "text"
+          }
+        },
+        {
+          "id": "received",
+          "label": "received",
+          "value_type": {
+            "kind": "boolean"
+          }
+        }
+      ],
+      "id": "material",
+      "label": "material",
+      "unique": [
+        [
+          "name"
+        ]
+      ]
+    },
+    {
+      "constraints": [],
+      "fields": [
+        {
+          "id": "job",
+          "label": "job",
+          "value_type": {
+            "entity": "job",
+            "kind": "reference"
+          }
+        },
+        {
+          "id": "material",
+          "label": "material",
+          "value_type": {
+            "entity": "material",
+            "kind": "reference"
+          }
+        },
+        {
+          "id": "required",
+          "label": "required",
+          "value_type": {
+            "kind": "boolean"
+          }
+        }
+      ],
+      "id": "requirement",
+      "label": "requirement",
+      "unique": [
+        [
+          "job",
+          "material"
+        ]
+      ]
+    },
+    {
+      "constraints": [],
+      "fields": [
+        {
+          "id": "material",
+          "label": "material",
+          "value_type": {
+            "entity": "material",
+            "kind": "reference"
+          }
+        },
+        {
+          "id": "sequence",
+          "label": "sequence",
+          "value_type": {
+            "kind": "integer"
+          }
+        },
+        {
+          "id": "note",
+          "label": "note",
+          "value_type": {
+            "kind": "text"
+          }
+        }
+      ],
+      "id": "event",
+      "label": "event",
+      "unique": []
+    }
+  ],
+  "id": "common_facts",
+  "initial_view": "jobs",
+  "label": "Common facts",
+  "observables": [
+    {
+      "id": "ready_count",
+      "label": "Ready",
+      "value": {
+        "items": {
+          "binding": "j",
+          "entity": "job",
+          "include_archived": false,
+          "kind": "query",
+          "limit": 10000,
+          "predicate": {
+            "kind": "equal",
+            "left": {
+              "condition": {
+                "kind": "equal",
+                "left": {
+                  "field": "status",
+                  "kind": "field",
+                  "record": {
+                    "kind": "variable",
+                    "name": "j"
+                  }
+                },
+                "right": {
+                  "kind": "literal",
+                  "value": {
+                    "kind": "text",
+                    "value": "done"
+                  },
+                  "value_type": {
+                    "kind": "text"
+                  }
+                }
+              },
+              "else_value": {
+                "condition": {
+                  "binding": "ready_link",
+                  "items": {
+                    "binding": "q",
+                    "entity": "requirement",
+                    "include_archived": false,
+                    "kind": "query",
+                    "limit": 10000,
+                    "predicate": {
+                      "kind": "and",
+                      "values": [
+                        {
+                          "kind": "equal",
+                          "left": {
+                            "field": "job",
+                            "kind": "field",
+                            "record": {
+                              "kind": "variable",
+                              "name": "q"
+                            }
+                          },
+                          "right": {
+                            "kind": "variable",
+                            "name": "j"
+                          }
+                        },
+                        {
+                          "field": "required",
+                          "kind": "field",
+                          "record": {
+                            "kind": "variable",
+                            "name": "q"
+                          }
+                        }
+                      ]
+                    },
+                    "sort": []
+                  },
+                  "kind": "all",
+                  "predicate": {
+                    "field": "received",
+                    "kind": "field",
+                    "record": {
+                      "field": "material",
+                      "kind": "field",
+                      "record": {
+                        "kind": "variable",
+                        "name": "ready_link"
+                      }
+                    }
+                  }
+                },
+                "else_value": {
+                  "kind": "literal",
+                  "value": {
+                    "kind": "text",
+                    "value": "waiting"
+                  },
+                  "value_type": {
+                    "kind": "text"
+                  }
+                },
+                "kind": "if",
+                "then_value": {
+                  "condition": {
+                    "kind": "equal",
+                    "left": {
+                      "field": "status",
+                      "kind": "field",
+                      "record": {
+                        "kind": "variable",
+                        "name": "j"
+                      }
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": {
+                        "kind": "text",
+                        "value": "active"
+                      },
+                      "value_type": {
+                        "kind": "text"
+                      }
+                    }
+                  },
+                  "else_value": {
+                    "kind": "literal",
+                    "value": {
+                      "kind": "text",
+                      "value": "ready"
+                    },
+                    "value_type": {
+                      "kind": "text"
+                    }
+                  },
+                  "kind": "if",
+                  "then_value": {
+                    "kind": "literal",
+                    "value": {
+                      "kind": "text",
+                      "value": "active"
+                    },
+                    "value_type": {
+                      "kind": "text"
+                    }
+                  }
+                }
+              },
+              "kind": "if",
+              "then_value": {
+                "kind": "literal",
+                "value": {
+                  "kind": "text",
+                  "value": "done"
+                },
+                "value_type": {
+                  "kind": "text"
+                }
+              }
+            },
+            "right": {
+              "kind": "literal",
+              "value": {
+                "kind": "text",
+                "value": "ready"
+              },
+              "value_type": {
+                "kind": "text"
+              }
+            }
+          },
+          "sort": []
+        },
+        "kind": "count"
+      }
+    }
+  ],
+  "outputs": [],
+  "state": [
+    {
+      "id": "name_input",
+      "initial": {
+        "kind": "text",
+        "value": ""
+      },
+      "label": "Name",
+      "value_type": {
+        "kind": "text"
+      }
+    }
+  ],
+  "version": 1,
+  "views": [
+    {
+      "actions": [
+        {
+          "action": "register",
+          "arguments": {
+            "name": {
+              "kind": "state",
+              "state": "name_input"
+            },
+            "owner": {
+              "kind": "variable",
+              "name": "row"
+            }
+          },
+          "enabled": {
+            "kind": "not",
+            "value": {
+              "kind": "equal",
+              "left": {
+                "field": "status",
+                "kind": "field",
+                "record": {
+                  "kind": "variable",
+                  "name": "row"
+                }
+              },
+              "right": {
+                "kind": "literal",
+                "value": {
+                  "kind": "text",
+                  "value": "done"
+                },
+                "value_type": {
+                  "kind": "text"
+                }
+              }
+            }
+          },
+          "id": "register",
+          "label": "Register",
+          "placement": "row"
+        }
+      ],
+      "id": "jobs",
+      "keys": [],
+      "kind": {
+        "columns": [
+          {
+            "id": "title",
+            "label": "Title",
+            "value": {
+              "field": "title",
+              "kind": "field",
+              "record": {
+                "kind": "variable",
+                "name": "row"
+              }
+            }
+          },
+          {
+            "id": "status",
+            "label": "Status",
+            "value": {
+              "condition": {
+                "kind": "equal",
+                "left": {
+                  "field": "status",
+                  "kind": "field",
+                  "record": {
+                    "kind": "variable",
+                    "name": "row"
+                  }
+                },
+                "right": {
+                  "kind": "literal",
+                  "value": {
+                    "kind": "text",
+                    "value": "done"
+                  },
+                  "value_type": {
+                    "kind": "text"
+                  }
+                }
+              },
+              "else_value": {
+                "condition": {
+                  "binding": "ready_link",
+                  "items": {
+                    "binding": "q",
+                    "entity": "requirement",
+                    "include_archived": false,
+                    "kind": "query",
+                    "limit": 10000,
+                    "predicate": {
+                      "kind": "and",
+                      "values": [
+                        {
+                          "kind": "equal",
+                          "left": {
+                            "field": "job",
+                            "kind": "field",
+                            "record": {
+                              "kind": "variable",
+                              "name": "q"
+                            }
+                          },
+                          "right": {
+                            "kind": "variable",
+                            "name": "row"
+                          }
+                        },
+                        {
+                          "field": "required",
+                          "kind": "field",
+                          "record": {
+                            "kind": "variable",
+                            "name": "q"
+                          }
+                        }
+                      ]
+                    },
+                    "sort": []
+                  },
+                  "kind": "all",
+                  "predicate": {
+                    "field": "received",
+                    "kind": "field",
+                    "record": {
+                      "field": "material",
+                      "kind": "field",
+                      "record": {
+                        "kind": "variable",
+                        "name": "ready_link"
+                      }
+                    }
+                  }
+                },
+                "else_value": {
+                  "kind": "literal",
+                  "value": {
+                    "kind": "text",
+                    "value": "waiting"
+                  },
+                  "value_type": {
+                    "kind": "text"
+                  }
+                },
+                "kind": "if",
+                "then_value": {
+                  "condition": {
+                    "kind": "equal",
+                    "left": {
+                      "field": "status",
+                      "kind": "field",
+                      "record": {
+                        "kind": "variable",
+                        "name": "row"
+                      }
+                    },
+                    "right": {
+                      "kind": "literal",
+                      "value": {
+                        "kind": "text",
+                        "value": "active"
+                      },
+                      "value_type": {
+                        "kind": "text"
+                      }
+                    }
+                  },
+                  "else_value": {
+                    "kind": "literal",
+                    "value": {
+                      "kind": "text",
+                      "value": "ready"
+                    },
+                    "value_type": {
+                      "kind": "text"
+                    }
+                  },
+                  "kind": "if",
+                  "then_value": {
+                    "kind": "literal",
+                    "value": {
+                      "kind": "text",
+                      "value": "active"
+                    },
+                    "value_type": {
+                      "kind": "text"
+                    }
+                  }
+                }
+              },
+              "kind": "if",
+              "then_value": {
+                "kind": "literal",
+                "value": {
+                  "kind": "text",
+                  "value": "done"
+                },
+                "value_type": {
+                  "kind": "text"
+                }
+              }
+            }
+          }
+        ],
+        "controls": [
+          {
+            "id": "name",
+            "label": "Name",
+            "on_change": null,
+            "state": "name_input"
+          }
+        ],
+        "entity": "job",
+        "kind": "list",
+        "rows": {
+          "binding": "j",
+          "entity": "job",
+          "include_archived": false,
+          "kind": "query",
+          "limit": 10000,
+          "predicate": {
+            "kind": "literal",
+            "value": {
+              "kind": "boolean",
+              "value": true
+            },
+            "value_type": {
+              "kind": "boolean"
+            }
+          },
+          "sort": []
+        },
+        "selection": null
+      },
+      "label": "Jobs"
+    },
+    {
+      "actions": [],
+      "id": "history",
+      "keys": [],
+      "kind": {
+        "columns": [
+          {
+            "id": "note",
+            "label": "Note",
+            "value": {
+              "field": "note",
+              "kind": "field",
+              "record": {
+                "kind": "variable",
+                "name": "row"
+              }
+            }
+          }
+        ],
+        "controls": [],
+        "entity": "event",
+        "kind": "list",
+        "rows": {
+          "binding": "e",
+          "entity": "event",
+          "include_archived": false,
+          "kind": "query",
+          "limit": 10000,
+          "predicate": {
+            "kind": "literal",
+            "value": {
+              "kind": "boolean",
+              "value": true
+            },
+            "value_type": {
+              "kind": "boolean"
+            }
+          },
+          "sort": [
+            {
+              "descending": true,
+              "value": {
+                "field": "sequence",
+                "kind": "field",
+                "record": {
+                  "kind": "variable",
+                  "name": "e"
+                }
+              }
+            }
+          ]
+        },
+        "selection": null
+      },
+      "label": "History"
+    }
+  ]
+}

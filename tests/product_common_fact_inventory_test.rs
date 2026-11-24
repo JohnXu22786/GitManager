@@ -3,8 +3,20 @@
 mod fixture;
 #[path = "../src/product_contract.rs"]
 mod product_contract;
+#[path = "../src/product_decisions/mod.rs"]
+mod product_decisions;
 #[path = "../src/product_protocol.rs"]
 mod product_protocol;
+#[path = "../src/product_locations.rs"]
+mod product_locations;
+#[path = "../src/product_backup.rs"]
+mod product_backup;
+#[path = "../src/product_alloc.rs"]
+mod product_alloc;
+#[path = "../src/product_json.rs"]
+mod product_json;
+#[path = "../src/product_app.rs"]
+mod product_app;
 #[path = "../src/product_runtime/mod.rs"]
 mod product_runtime;
 #[path = "../src/product_store/mod.rs"]
@@ -13,6 +25,21 @@ use fixture::{boolean, capture, field, int, var};
 use product_contract::*;
 use product_store::{scope::*, ProductStore};
 use serde_json::{json, Value};
+use std::sync::{atomic::AtomicBool, Arc};
+
+fn cancel() -> Arc<AtomicBool> { Arc::new(AtomicBool::new(false)) }
+fn witnesses(store: &ProductStore) -> Vec<LifecycleWitness> {
+    let snapshot = store.load().unwrap();
+    let row = |done: bool| {
+        let row = snapshot.data.records.iter().find(|row| row.entity == "job" && ((row.values.get("done") == Some(&DataValue::Boolean { value: true })) == done)).unwrap();
+        RecordRef { entity: row.entity.clone(), record: row.id.clone() }
+    };
+    [OwnedSourceSide::Before, OwnedSourceSide::After].into_iter().map(|side| LifecycleWitness {
+        side,
+        scenario: ScenarioSpec { version: 1, id: "test".into(), label: "test".into(), seed: snapshot.data.clone(), session: snapshot.session.clone(), clock_day: snapshot.clock_day, random_seed: 1, inputs: vec![SemanticInput::Observe { point: "test".into() }], validity: vec![] },
+        completed: row(true), unfinished: row(false),
+    }).collect()
+}
 
 fn query(entity: &str) -> Expr {
     Expr::Query {
@@ -711,4 +738,9 @@ fn inventory_does_not_confuse_action_prefix_with_lifecycle_predicate() {
         .iter()
         .any(|w| w.field.as_deref() == Some("production")));
     assert!(!has(&r, "mixed_lifecycle_transition", "calculate [1, 0]"));
+}
+
+#[test]
+fn decoded_shared_transaction_kernel() {
+    product_runtime::decoded_shared_transaction_kernel_parity_and_atomicity().unwrap();
 }

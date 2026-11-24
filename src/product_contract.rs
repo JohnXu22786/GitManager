@@ -4,8 +4,99 @@
 //! model's claims. Use the production `RuntimeAdapter` to obtain observations.
 //! There is deliberately no eval, shell, URL, file-path or credential operation.
 
+// One lexical V1 semantic prefix, with no callable semantic-only authority.
+// The ordinary/count tail remains in its original scope with the Validator.
+macro_rules! validate_app_semantics {
+    ($this:ident, $a:ident, $validator:ident, $action_prefix_nodes:ident, $cx:expr) => {
+        $a.pay(12)?;
+        #[cfg(test)]
+        count_validation(|counts| counts.apps += 1);
+        $a.version($this.version)?;
+        $a.check_id(&$this.id)?;
+        $a.nonempty(&$this.label)?;
+        $a.require(
+            !$this.entities.is_empty() && !$this.views.is_empty(),
+            "application needs entities and views",
+        )?;
+        $a.unique($this.entities.iter().map(|e| e.id.as_str()))?;
+        $a.unique($this.state.iter().map(|s| s.id.as_str()))?;
+        $a.unique($this.actions.iter().map(|$a| $a.id.as_str()))?;
+        $a.unique($this.outputs.iter().map(|o| o.id.as_str()))?;
+        $a.unique($this.observables.iter().map(|o| o.id.as_str()))?;
+        $a.unique($this.views.iter().map(|v| v.id.as_str()))?;
+        $a.require(
+            $a.find(&$this.views, &$this.initial_view, |v| &v.id)?.is_some(),
+            "unknown initial view",
+        )?;
+        $a.pay(8)?;
+        let mut $validator = Validator::new_app(AppRef::from($this), $a, $cx);
+        validate_entities(&$this.entities, &mut $validator)?;
+        $a.slice($this.state.len())?;
+        for state in &$this.state {
+            $a.pay(12)?;
+            $a.nonempty(&state.label)?;
+            $validator.typ(&state.value_type, 0)?;
+            validate_value_audited(&state.initial, &state.value_type, 0, $a)?;
+        }
+        $a.slice($this.outputs.len())?;
+        for output in &$this.outputs {
+            $a.pay(12)?;
+            $a.nonempty(&output.label)?;
+            $a.require(!output.columns.is_empty(), "output needs columns")?;
+            $a.unique(output.columns.iter().map(|c| c.id.as_str()))?;
+            $a.slice(output.columns.len())?;
+        for column in &output.columns {
+            $a.pay(12)?;
+                $a.nonempty(&column.label)?;
+                $validator.typ(&column.value_type, 0)?;
+                $a.require(
+                    column.value_type.is_scalar(),
+                    "output columns must be scalar",
+                )?;
+            }
+        }
+        $a.slice($this.actions.len())?;
+        for action in &$this.actions {
+            $validator.action_definition(action)?;
+        }
+        $a.pay(1)?;
+        let $action_prefix_nodes = $validator.nodes;
+        $a.slice($this.observables.len())?;
+        for observable in &$this.observables {
+            $a.pay(12)?;
+            $a.nonempty(&observable.label)?;
+            $a.pay(8)?;
+            let env = $validator.empty_environment();
+            $validator.expr(&observable.value, &env, 0, true)?;
+        }
+        $a.slice($this.views.len())?;
+        for view in &$this.views {
+            $a.pay(12)?;
+            $validator.view(view)?;
+        }
+    };
+}
+
 #[path = "tool_proposal_input.rs"]
 mod bounded_input;
+#[path = "product_contract/capture_work.rs"]
+mod capture_work;
+#[path = "product_contract/capture_owned.rs"]
+mod capture_owned;
+#[path = "product_contract/capture_payment.rs"]
+pub(crate) mod capture_payment;
+#[path = "product_contract/capture_canonical.rs"]
+mod capture_canonical;
+#[path = "product_contract/capture_typed.rs"]
+mod capture_typed;
+#[path = "product_contract/capture_validation.rs"]
+mod capture_validation;
+use capture_work::Audit;
+use capture_owned::OwnedWork;
+pub(crate) use capture_work::{ContractWork, WorkFailure, ContractWorkError, ContractWorkResult};
+pub(crate) use capture_canonical::canonical_bytes_with_work;
+pub(crate) use capture_validation::{with_capture_validation, validate_projection_extension, CaptureFacts, CaptureValidation, validate_value_with_work,
+    with_ordinary_source_facts, ReadyCaptureSource, SourcePreparation, SourceConsumer};
 
 use ring::digest::{digest, SHA256};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -13,6 +104,1094 @@ use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
+
+#[path = "product_contract/values_map.rs"]
+#[allow(dead_code)]
+mod values_map;
+pub(crate) fn try_clone_type_with(
+    value: &Type,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<Type, crate::product_alloc::AllocationFailure> {
+    values_map::try_clone_type(value, cx)
+}
+pub(crate) fn try_clone_data_value_with(
+    value: &DataValue,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<DataValue, crate::product_alloc::AllocationFailure> {
+    values_map::try_clone_data_value(value, cx)
+}
+pub(crate) fn try_clone_expr_with(
+    value: &Expr,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<Expr, AppValidationError> {
+    let syntax = crate::product_backup::fallible_codec::try_serialize_value(value, cx)
+        .map_err(|error| match error {
+            crate::product_backup::fallible_codec::CodecError::Allocation(failure) => AppValidationError::Allocation(failure),
+            _ => AppValidationError::Contract(ContractError("expression copy invariant".into())),
+        })?;
+    fallible_expr_decode::decode_expr(syntax, cx).map_err(|error| match error {
+        fallible_value_decode::ValueDecodeError::Allocation(failure) => AppValidationError::Allocation(failure),
+        _ => AppValidationError::Contract(ContractError("expression copy invariant".into())),
+    })
+}
+pub(crate) fn try_clone_entity_definition_with(
+    value: &EntityDefinition,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<EntityDefinition, AppValidationError> {
+    let syntax = crate::product_backup::fallible_codec::try_serialize_value(value, cx)
+        .map_err(|error| match error {
+            crate::product_backup::fallible_codec::CodecError::Allocation(failure) => AppValidationError::Allocation(failure),
+            _ => AppValidationError::Contract(ContractError("entity definition copy invariant".into())),
+        })?;
+    fallible_entity_decode::decode_entity_definition(syntax, cx).map_err(|error| match error {
+        fallible_value_decode::ValueDecodeError::Allocation(failure) => AppValidationError::Allocation(failure),
+        _ => AppValidationError::Contract(ContractError("entity definition copy invariant".into())),
+    })
+}
+#[path = "product_contract/fallible_value_decode.rs"]
+#[allow(dead_code)]
+pub(crate) mod fallible_value_decode;
+#[path = "product_contract/fallible_expr_decode.rs"]
+#[allow(dead_code)]
+pub(crate) mod fallible_expr_decode;
+#[path = "product_contract/fallible_entity_decode.rs"]
+#[allow(dead_code)]
+pub(crate) mod fallible_entity_decode;
+#[path = "product_contract/fallible_persisted_decode.rs"]
+#[allow(dead_code)]
+mod fallible_persisted_decode;
+#[path = "product_contract/fallible_snapshot_decode.rs"]
+#[allow(dead_code)]
+mod fallible_snapshot_decode;
+#[path = "product_contract/fallible_snapshot_validate.rs"]
+mod fallible_snapshot_validate;
+pub(crate) use fallible_snapshot_validate::DataValueTuple as FallibleDataValueTuple;
+/// Read-only lexical map view shared by legacy BTreeMap owners and fallible
+/// sorted owners. Validation uses it without materializing either model.
+pub(crate) trait StringValueMap<V> {
+    type Iter<'a>: Iterator<Item = (&'a String, &'a V)>
+    where
+        Self: 'a,
+        V: 'a;
+    fn len(&self) -> usize;
+    fn get(&self, key: &str) -> Option<&V>;
+    fn contains_key(&self, key: &str) -> bool;
+    fn iter(&self) -> Self::Iter<'_>;
+}
+impl<V> StringValueMap<V> for BTreeMap<String, V> {
+    type Iter<'a> = std::collections::btree_map::Iter<'a, String, V> where V: 'a;
+    fn len(&self) -> usize { BTreeMap::len(self) }
+    fn get(&self, key: &str) -> Option<&V> { BTreeMap::get(self, key) }
+    fn contains_key(&self, key: &str) -> bool { BTreeMap::contains_key(self, key) }
+    fn iter(&self) -> Self::Iter<'_> { BTreeMap::iter(self) }
+}
+impl<V> StringValueMap<V> for fallible_app_decode::FallibleMap<V> {
+    type Iter<'a> = fallible_app_decode::FallibleMapIter<'a, V> where V: 'a;
+    fn len(&self) -> usize { fallible_app_decode::FallibleMap::len(self) }
+    fn get(&self, key: &str) -> Option<&V> { fallible_app_decode::FallibleMap::get(self, key) }
+    fn contains_key(&self, key: &str) -> bool { fallible_app_decode::FallibleMap::contains_key(self, key) }
+    fn iter(&self) -> Self::Iter<'_> { fallible_app_decode::FallibleMap::iter(self) }
+}
+impl StringValueMap<DataValue> for FallibleValues {
+    type Iter<'a> = values_map::FallibleValuesIter<'a>;
+    fn len(&self) -> usize { self.len() }
+    fn get(&self, key: &str) -> Option<&DataValue> { self.get(key) }
+    fn contains_key(&self, key: &str) -> bool { self.contains_key(key) }
+    fn iter(&self) -> Self::Iter<'_> { self.iter() }
+}
+/// Opaque bridge into fallible persisted data/session DTOs for sibling decoders.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct FallibleDecodedDataSnapshot(fallible_snapshot_decode::DecodedDataSnapshot);
+#[derive(Serialize)]
+#[serde(transparent)]
+pub(crate) struct FallibleEntitySchemaIdentity<'a>(&'a [EntityDefinition]);
+#[derive(Serialize)]
+#[serde(transparent)]
+pub(crate) struct FallibleBusinessRecordsIdentity<'a>(&'a [fallible_persisted_decode::DecodedRecord]);
+#[derive(Serialize)]
+#[serde(transparent)]
+pub(crate) struct FallibleBusinessEventsIdentity<'a>(&'a [fallible_persisted_decode::DecodedBusinessEvent]);
+pub(crate) struct FallibleActionEventIdentity<'a> {
+    pub(crate) operation: &'a str,
+    pub(crate) program: &'a Digest,
+}
+impl Serialize for FallibleActionEventIdentity<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        let mut tuple = serializer.serialize_tuple(2)?;
+        tuple.serialize_element(self.operation)?;
+        tuple.serialize_element(self.program)?;
+        tuple.end()
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FallibleDataSnapshotCloneError {
+    Allocation(crate::product_alloc::AllocationFailure),
+    Invariant,
+}
+impl FallibleDecodedDataSnapshot {
+    pub(crate) fn empty_with(
+        project: &str,
+        app: &fallible_app_decode::DecodedAppDefinition,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Self, AppValidationError> {
+        app.validate_with(cx)?;
+        check_id(project).map_err(AppValidationError::Contract)?;
+        let project_id = crate::product_alloc::try_copy_str(project, cx, crate::product_alloc::AllocationSite::String)
+            .map_err(AppValidationError::Allocation)?;
+        let app = app.try_clone_with(cx)?;
+        let value = fallible_snapshot_decode::DecodedDataSnapshot {
+            version: CONTRACT_VERSION,
+            project_id,
+            generation: 0,
+            schema: app.entities,
+            records: Vec::new(),
+            events: Vec::new(),
+        };
+        let snapshot = Self(value);
+        snapshot.validate_with(cx)?;
+        Ok(snapshot)
+    }
+    pub(crate) fn validate(&self) -> std::result::Result<(), ContractError> {
+        self.0.validate()
+    }
+    pub(crate) fn validate_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), AppValidationError> {
+        self.0.validate_with(cx).map_err(|error| match error {
+            fallible_snapshot_validate::SnapshotValidationError::Contract(error) => AppValidationError::Contract(error),
+            fallible_snapshot_validate::SnapshotValidationError::Allocation(failure) => AppValidationError::Allocation(failure),
+        })
+    }
+    pub(crate) fn canonical_bytes_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Vec<u8>, crate::product_backup::fallible_codec::CodecError> {
+        crate::product_backup::fallible_codec::canonical_bytes(self, cx)
+    }
+    pub(crate) fn canonical_digest_with(
+        &self,
+        domain: IdentityDomain,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Digest, crate::product_backup::fallible_codec::CodecError> {
+        crate::product_backup::fallible_codec::canonical_digest(domain, self, cx)
+    }
+    pub(crate) fn identity_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Digest, AppValidationError> {
+        self.validate_with(cx)?;
+        crate::product_backup::fallible_codec::canonical_digest(IdentityDomain::Data, self, cx)
+            .map_err(|error| match error {
+                crate::product_backup::fallible_codec::CodecError::Allocation(failure) => AppValidationError::Allocation(failure),
+                _ => AppValidationError::Contract(ContractError("data identity encoding failed".into())),
+            })
+    }
+    pub(crate) fn schema_identity_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Digest, AppValidationError> {
+        self.validate_with(cx)?;
+        crate::product_backup::fallible_codec::canonical_digest(IdentityDomain::Schema, &FallibleEntitySchemaIdentity(&self.0.schema), cx)
+            .map_err(|error| match error {
+                crate::product_backup::fallible_codec::CodecError::Allocation(failure) => AppValidationError::Allocation(failure),
+                _ => AppValidationError::Contract(ContractError("schema identity encoding failed".into())),
+            })
+    }
+    pub(crate) fn business_projection_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Digest, crate::product_backup::fallible_codec::CodecError> {
+        crate::product_backup::fallible_codec::canonical_digest(IdentityDomain::Data, &FallibleBusinessRecordsIdentity(&self.0.records), cx)
+    }
+    pub(crate) fn events_digest_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Digest, crate::product_backup::fallible_codec::CodecError> {
+        crate::product_backup::fallible_codec::canonical_digest(IdentityDomain::Data, &FallibleBusinessEventsIdentity(&self.0.events), cx)
+    }
+    pub(crate) fn try_clone_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Self, FallibleDataSnapshotCloneError> {
+        let value = crate::product_backup::fallible_codec::try_serialize_value(self, cx)
+            .map_err(|error| match error {
+                crate::product_backup::fallible_codec::CodecError::Allocation(failure) => {
+                    FallibleDataSnapshotCloneError::Allocation(failure)
+                }
+                _ => FallibleDataSnapshotCloneError::Invariant,
+            })?;
+        fallible_snapshot_decode::decode_data_snapshot(value, cx)
+            .map(Self)
+            .map_err(|error| match error {
+                fallible_value_decode::ValueDecodeError::Allocation(failure) => {
+                    FallibleDataSnapshotCloneError::Allocation(failure)
+                }
+                _ => FallibleDataSnapshotCloneError::Invariant,
+            })
+    }
+    pub(crate) fn merge_app_with(
+        &self,
+        app: &fallible_app_decode::DecodedAppDefinition,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Self, AppValidationError> {
+        use crate::product_alloc::{try_push, try_reserve, AllocationSite};
+        app.validate_with(cx)?;
+        let mut next = self.try_clone_with(cx).map_err(|error| match error {
+            FallibleDataSnapshotCloneError::Allocation(failure) => AppValidationError::Allocation(failure),
+            FallibleDataSnapshotCloneError::Invariant => AppValidationError::Contract(ContractError("data snapshot copy invariant".into())),
+        })?;
+        let app = app.try_clone_with(cx)?;
+        let missing_entities = app.entities.iter().filter(|entity| !next.0.schema.iter().any(|stored| stored.id == entity.id)).count();
+        try_reserve(&mut next.0.schema, missing_entities, cx, AllocationSite::Vector).map_err(AppValidationError::Allocation)?;
+        for mut entity in app.entities {
+            if let Some(stored) = next.0.schema.iter_mut().find(|stored| stored.id == entity.id) {
+                for field in &entity.fields {
+                    if let Some(old) = stored.fields.iter().find(|old| old.id == field.id) {
+                        if old.value_type != field.value_type {
+                            return Err(AppValidationError::Contract(ContractError(format!("Field {}.{} changes its recorded type; a compatible forward repair is required", entity.id, field.id))));
+                        }
+                    }
+                }
+                let added = entity.fields.iter().filter(|field| !stored.fields.iter().any(|old| old.id == field.id)).count();
+                try_reserve(&mut stored.fields, added, cx, AllocationSite::Vector).map_err(AppValidationError::Allocation)?;
+                for field in entity.fields.drain(..) {
+                    if !stored.fields.iter().any(|old| old.id == field.id) {
+                        try_push(&mut stored.fields, field, cx, AllocationSite::Vector).map_err(AppValidationError::Allocation)?;
+                    }
+                }
+                stored.label = entity.label;
+                stored.unique = entity.unique;
+                stored.constraints = entity.constraints;
+            } else {
+                try_push(&mut next.0.schema, entity, cx, AllocationSite::Vector).map_err(AppValidationError::Allocation)?;
+            }
+        }
+        next.0.validate_with(cx).map_err(|error| match error {
+            fallible_snapshot_validate::SnapshotValidationError::Contract(error) => AppValidationError::Contract(error),
+            fallible_snapshot_validate::SnapshotValidationError::Allocation(failure) => AppValidationError::Allocation(failure),
+        })?;
+        Ok(next)
+    }
+    pub(crate) fn project_id(&self) -> &str { &self.0.project_id }
+    pub(crate) fn generation(&self) -> u64 { self.0.generation }
+    pub(crate) fn events_start_with(&self, prefix: &Self) -> bool {
+        self.0.events.starts_with(&prefix.0.events)
+    }
+    pub(crate) fn record_count(&self) -> usize { self.0.records.len() }
+    pub(crate) fn records(&self) -> &[fallible_persisted_decode::DecodedRecord] { &self.0.records }
+    pub(crate) fn try_append_record(
+        &mut self,
+        entity: &str,
+        id: &str,
+        revision: u64,
+        created_program: &Digest,
+        values: FallibleValues,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), AppValidationError> {
+        use crate::product_alloc::{try_copy_str, try_push, AllocationSite};
+        let entity = try_copy_str(entity, cx, AllocationSite::String)
+            .map_err(AppValidationError::Allocation)?;
+        let id = try_copy_str(id, cx, AllocationSite::String)
+            .map_err(AppValidationError::Allocation)?;
+        let created_program = try_copy_str(created_program.as_str(), cx, AllocationSite::String)
+            .map_err(AppValidationError::Allocation)?;
+        let created_program = Digest::from_owned_lower_hex(created_program)
+            .ok_or_else(|| AppValidationError::Contract(ContractError("created program digest invariant".into())))?;
+        let record = fallible_persisted_decode::DecodedRecord {
+            entity,
+            id,
+            revision,
+            created_program,
+            archived: false,
+            values,
+        };
+        try_push(&mut self.0.records, record, cx, AllocationSite::Vector)
+            .map_err(AppValidationError::Allocation)
+    }
+    /// Append one accepted action's history using the fallible persisted
+    /// owner. The caller passes the pre-action view and a transaction-local
+    /// clone, so any allocation or validation refusal can be discarded without
+    /// exposing a partial generation/event commit.
+    pub(crate) fn try_append_action_event(
+        &mut self,
+        previous: DataSnapshotView<'_>,
+        generation: u64,
+        operation_id: &str,
+        action: &str,
+        day: i32,
+        program: &Digest,
+        outputs: &[Digest],
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), AppValidationError> {
+        use crate::product_alloc::{try_copy_str, try_push, try_reserve, try_reserve_string, AllocationSite};
+
+        let mut changes = Vec::new();
+        try_reserve(&mut changes, self.record_count(), cx, AllocationSite::Vector)
+            .map_err(AppValidationError::Allocation)?;
+        for after in self.records() {
+            let after = DataRecordView { inner: DataRecordKind::Fallible(after) };
+            let before = previous.record(after.entity(), after.id());
+            if before.is_some_and(|before| records_equal(before, after)) {
+                continue;
+            }
+            let entity = try_copy_str(after.entity(), cx, AllocationSite::String)
+                .map_err(AppValidationError::Allocation)?;
+            let record = try_copy_str(after.id(), cx, AllocationSite::String)
+                .map_err(AppValidationError::Allocation)?;
+            let before = before.map(|record| clone_values(record.values(), cx)).transpose()
+                .map_err(AppValidationError::Allocation)?;
+            let after_values = clone_values(after.values(), cx)
+                .map_err(AppValidationError::Allocation)?;
+            try_push(&mut changes, fallible_persisted_decode::DecodedRecordChange {
+                entity, record, before, after: after_values, archived: after.archived(),
+            }, cx, AllocationSite::Vector).map_err(AppValidationError::Allocation)?;
+        }
+        let mut event_outputs = Vec::new();
+        try_reserve(&mut event_outputs, outputs.len(), cx, AllocationSite::Vector)
+            .map_err(AppValidationError::Allocation)?;
+        for digest in outputs {
+            let value = try_copy_str(digest.as_str(), cx, AllocationSite::String)
+                .map_err(AppValidationError::Allocation)?;
+            let value = Digest::from_owned_lower_hex(value)
+                .ok_or_else(|| AppValidationError::Contract(ContractError("output digest invariant".into())))?;
+            try_push(&mut event_outputs, value, cx, AllocationSite::Vector)
+                .map_err(AppValidationError::Allocation)?;
+        }
+        let event_identity = crate::product_backup::fallible_codec::canonical_digest(
+            IdentityDomain::Input,
+            &FallibleActionEventIdentity { operation: operation_id, program },
+            cx,
+        ).map_err(|error| match error {
+            crate::product_backup::fallible_codec::CodecError::Allocation(failure) => AppValidationError::Allocation(failure),
+            _ => AppValidationError::Contract(ContractError("event identity encoding failed".into())),
+        })?;
+        let mut id = String::new();
+        try_reserve_string(&mut id, 38, cx, AllocationSite::String).map_err(AppValidationError::Allocation)?;
+        id.push_str("event-");
+        id.push_str(&event_identity.as_str()[..32]);
+        let operation_id = try_copy_str(operation_id, cx, AllocationSite::String)
+            .map_err(AppValidationError::Allocation)?;
+        let action = try_copy_str(action, cx, AllocationSite::String)
+            .map_err(AppValidationError::Allocation)?;
+        let program = try_copy_str(program.as_str(), cx, AllocationSite::String)
+            .map_err(AppValidationError::Allocation)?;
+        let program = Digest::from_owned_lower_hex(program)
+            .ok_or_else(|| AppValidationError::Contract(ContractError("event program digest invariant".into())))?;
+        let event = fallible_persisted_decode::DecodedBusinessEvent {
+            id, sequence: generation, operation_id, action, day, program,
+            changes, outputs: event_outputs,
+        };
+        try_push(&mut self.0.events, event, cx, AllocationSite::Vector)
+            .map_err(AppValidationError::Allocation)?;
+        self.0.generation = generation;
+        self.validate_with(cx)
+    }
+    pub(crate) fn events(&self) -> &[fallible_persisted_decode::DecodedBusinessEvent] { &self.0.events }
+    pub(crate) fn schema(&self) -> &[EntityDefinition] { &self.0.schema }
+    pub(crate) fn record_producers(&self) -> impl Iterator<Item = &Digest> {
+        self.0.records.iter().map(|record| &record.created_program)
+    }
+    pub(crate) fn event_producers(&self) -> impl Iterator<Item = &Digest> {
+        self.0.events.iter().map(|event| &event.program)
+    }
+    pub(crate) fn output_digests(&self) -> impl Iterator<Item = &Digest> {
+        self.0.events.iter().flat_map(|event| event.outputs.iter())
+    }
+    pub(crate) fn record_values_mut(&mut self, entity: &str, id: &str) -> Option<&mut FallibleValues> {
+        self.0.records.iter_mut().find(|record| record.entity == entity && record.id == id).map(|record| &mut record.values)
+    }
+    /// Mutable transaction access remains on the decoded owner. It never
+    /// exposes a legacy `DataSnapshot` or an infallibly copied map.
+    pub(crate) fn record_mut(
+        &mut self,
+        entity: &str,
+        id: &str,
+    ) -> Option<&mut fallible_persisted_decode::DecodedRecord> {
+        self.0.records.iter_mut().find(|record| record.entity == entity && record.id == id)
+    }
+    pub(crate) fn try_update_record_by(
+        &mut self,
+        entity: &str,
+        id: &str,
+        values: FallibleValues,
+        archive: bool,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), AppValidationError> {
+        let row = self.record_mut(entity, id)
+            .ok_or_else(|| AppValidationError::Contract(ContractError("record does not exist".into())))?;
+        if row.archived {
+            return Err(AppValidationError::Contract(ContractError("archived historical records cannot be modified".into())));
+        }
+        let revision = row.revision.checked_add(1)
+            .ok_or_else(|| AppValidationError::Contract(ContractError("record revision overflow".into())))?;
+        row.values.try_extend_owned(values, cx).map_err(AppValidationError::Allocation)?;
+        row.archived = archive;
+        row.revision = revision;
+        Ok(())
+    }
+    pub(crate) fn business_projection_matches_after_removing<'a, I>(
+        &self,
+        before: &Self,
+        additions: I,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<bool, FallibleDataSnapshotCloneError>
+    where
+        I: IntoIterator<Item = (&'a RecordRef, &'a FallibleValues)>,
+    {
+        let mut business = self.try_clone_with(cx)?;
+        for (reference, values) in additions {
+            let Some(record) = business.0.records.iter_mut().find(|record| {
+                record.entity == reference.entity && record.id == reference.record
+            }) else { return Ok(false) };
+            for (key, _) in values.iter() { record.values.remove(key); }
+        }
+        Ok(business.0.records == before.0.records
+            && self.0.events == before.0.events
+            && self.0.generation == before.0.generation)
+    }
+}
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct FallibleDecodedSessionState(fallible_persisted_decode::DecodedSessionState);
+impl FallibleDecodedSessionState {
+    pub(crate) fn view(&self) -> &str { self.0.view() }
+    pub(crate) fn values(&self) -> &FallibleValues { self.0.values() }
+    pub(crate) fn focused_record(&self) -> Option<&RecordRef> { self.0.focused_record() }
+    pub(crate) fn values_mut(&mut self) -> &mut FallibleValues { &mut self.0.values }
+    pub(crate) fn try_set_view_and_clear_focus(
+        &mut self,
+        view: &str,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), crate::product_alloc::AllocationFailure> {
+        self.0.try_set_view_and_clear_focus(view, cx)
+    }
+    pub(crate) fn identity_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Digest, crate::product_backup::fallible_codec::CodecError> {
+        crate::product_backup::fallible_codec::canonical_digest(IdentityDomain::Session, self, cx)
+    }
+    pub(crate) fn try_clone_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Self, AppValidationError> {
+        let value = crate::product_backup::fallible_codec::try_serialize_value(self, cx)
+            .map_err(|error| match error {
+                crate::product_backup::fallible_codec::CodecError::Allocation(failure) => AppValidationError::Allocation(failure),
+                _ => AppValidationError::Contract(ContractError("session copy invariant".into())),
+            })?;
+        fallible_persisted_decode::decode_session_state(value, cx).map(Self).map_err(|error| match error {
+            fallible_value_decode::ValueDecodeError::Allocation(failure) => AppValidationError::Allocation(failure),
+            _ => AppValidationError::Contract(ContractError("session copy invariant".into())),
+        })
+    }
+}
+#[derive(Debug, Serialize)]
+pub(crate) struct FallibleDecodedCapturedProgram(fallible_capture_decode::DecodedCapturedProgram);
+impl FallibleDecodedCapturedProgram {
+    pub(crate) fn validate_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), AppValidationError> {
+        self.0.validate_with(cx)
+    }
+    pub(crate) fn validate_app_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), AppValidationError> {
+        self.0.validate_app_with(cx)
+    }
+    pub(crate) fn validate_session_with(
+        &self,
+        session: &FallibleDecodedSessionState,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), AppValidationError> {
+        self.0.validate_session_with(&session.0, cx)
+    }
+    pub(crate) fn project_id(&self) -> &str { self.0.project_id() }
+    pub(crate) fn binding(&self) -> &SourceBinding { self.0.binding() }
+    pub(crate) fn artifact(&self) -> &ArtifactRef { self.0.artifact() }
+    pub(crate) fn program_digest(&self) -> &Digest { self.0.program_digest() }
+    pub(crate) fn app(&self) -> &fallible_app_decode::DecodedAppDefinition { self.0.app() }
+    pub(crate) fn has_protected_fields(&self) -> bool {
+        self.0.app().entities.iter().any(|entity| {
+            entity.fields.iter().any(|field| field.id.starts_with(crate::product_runtime::PROTECTED_FIELD_PREFIX))
+        })
+    }
+    pub(crate) fn revision_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Digest, AppValidationError> {
+        self.0.revision_with(cx)
+    }
+    pub(crate) fn initial_session_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<FallibleDecodedSessionState, crate::product_alloc::AllocationFailure> {
+        self.0.app().initial_session_with(cx).map(FallibleDecodedSessionState)
+    }
+    pub(crate) fn try_clone_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Self, AppValidationError> {
+        let value = crate::product_backup::fallible_codec::try_serialize_value(self, cx)
+            .map_err(|error| match error {
+                crate::product_backup::fallible_codec::CodecError::Allocation(failure) => AppValidationError::Allocation(failure),
+                _ => AppValidationError::Contract(ContractError("captured program copy invariant".into())),
+            })?;
+        fallible_capture_decode::decode_captured_program(value, cx)
+            .map(Self)
+            .map_err(|error| match error {
+                fallible_value_decode::ValueDecodeError::Allocation(failure) => AppValidationError::Allocation(failure),
+                _ => AppValidationError::Contract(ContractError("captured program copy invariant".into())),
+            })
+    }
+}
+#[derive(Debug, Serialize)]
+pub(crate) struct FallibleDecodedScenarioSpec(fallible_scenario_decode::DecodedScenarioSpec);
+impl FallibleDecodedScenarioSpec {
+    pub(crate) fn id(&self) -> &str { self.0.id() }
+    pub(crate) fn clock_day(&self) -> i32 { self.0.clock_day() }
+    pub(crate) fn random_seed(&self) -> u64 { self.0.random_seed() }
+    pub(crate) fn input_count(&self) -> usize { self.0.input_count() }
+    pub(crate) fn has_validity(&self) -> bool { self.0.has_validity() }
+    pub(crate) fn single_observe_point(&self) -> Option<&str> { self.0.single_observe_point() }
+    pub(crate) fn matches_frame(&self, scenario: &Self) -> bool { self.0.matches_frame(&scenario.0) }
+
+    pub(crate) fn validate_replay_input(
+        &self,
+        program: &FallibleDecodedCapturedProgram,
+    ) -> std::result::Result<(), AppValidationError> {
+        self.0.validate_replay_input(program.app())
+    }
+
+    pub(crate) fn validate_seed_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), AppValidationError> {
+        self.0.validate_seed_with(cx)
+    }
+
+    pub(crate) fn validate_session_with(
+        &self,
+        program: &FallibleDecodedCapturedProgram,
+    ) -> std::result::Result<(), AppValidationError> {
+        self.0.validate_session_with(program.app())
+    }
+
+    pub(crate) fn input_identity_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Digest, crate::product_backup::fallible_codec::CodecError> {
+        self.0.input_identity_with(cx)
+    }
+
+    pub(crate) fn seed_identity_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Digest, crate::product_backup::fallible_codec::CodecError> {
+        self.0.seed_identity_with(cx)
+    }
+
+    pub(crate) fn session_identity_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Digest, crate::product_backup::fallible_codec::CodecError> {
+        self.0.session_identity_with(cx)
+    }
+
+    pub(crate) fn session_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<FallibleDecodedSessionState, AppValidationError> {
+        self.0.session_with(cx).map(FallibleDecodedSessionState)
+    }
+
+    pub(crate) fn observe_operation_id_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<String, AppValidationError> {
+        self.0.observe_operation_id_with(cx)
+    }
+
+    pub(crate) fn validate_with(
+        &self,
+        program: &FallibleDecodedCapturedProgram,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), AppValidationError> {
+        self.0.validate_with(program.app(), cx)
+    }
+
+    pub(crate) fn seed_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<FallibleDecodedDataSnapshot, AppValidationError> {
+        let value = crate::product_backup::fallible_codec::try_serialize_value(self.0.seed(), cx)
+            .map_err(|error| match error {
+                crate::product_backup::fallible_codec::CodecError::Allocation(failure) => AppValidationError::Allocation(failure),
+                _ => AppValidationError::Contract(ContractError("scenario seed copy invariant".into())),
+            })?;
+        fallible_snapshot_decode::decode_data_snapshot(value, cx)
+            .map(FallibleDecodedDataSnapshot)
+            .map_err(|error| match error {
+                fallible_value_decode::ValueDecodeError::Allocation(failure) => AppValidationError::Allocation(failure),
+                _ => AppValidationError::Contract(ContractError("scenario seed copy invariant".into())),
+            })
+    }
+
+    pub(crate) fn identity_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Digest, crate::product_backup::fallible_codec::CodecError> {
+        crate::product_backup::fallible_codec::canonical_digest(IdentityDomain::Scenario, self, cx)
+    }
+
+    pub(crate) fn try_clone_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Self, AppValidationError> {
+        let value = crate::product_backup::fallible_codec::try_serialize_value(self, cx)
+            .map_err(|error| match error {
+                crate::product_backup::fallible_codec::CodecError::Allocation(failure) => AppValidationError::Allocation(failure),
+                _ => AppValidationError::Contract(ContractError("scenario copy invariant".into())),
+            })?;
+        fallible_scenario_decode::decode_scenario_spec(value, cx).map(Self)
+            .map_err(|error| match error {
+                fallible_value_decode::ValueDecodeError::Allocation(failure) => AppValidationError::Allocation(failure),
+                _ => AppValidationError::Contract(ContractError("scenario copy invariant".into())),
+            })
+    }
+
+    pub(crate) fn with_seed_and_id(
+        &self,
+        seed: &FallibleDecodedDataSnapshot,
+        id: Option<&str>,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Self, AppValidationError> {
+        let mut value = crate::product_backup::fallible_codec::try_serialize_value(self, cx)
+            .map_err(|error| match error {
+                crate::product_backup::fallible_codec::CodecError::Allocation(failure) => AppValidationError::Allocation(failure),
+                _ => AppValidationError::Contract(ContractError("scenario projection copy invariant".into())),
+            })?;
+        let mut seed_value = crate::product_backup::fallible_codec::try_serialize_value(seed, cx)
+            .map_err(|error| match error {
+                crate::product_backup::fallible_codec::CodecError::Allocation(failure) => AppValidationError::Allocation(failure),
+                _ => AppValidationError::Contract(ContractError("scenario projection seed invariant".into())),
+            })?;
+        let crate::product_json::Value::Object(fields) = &mut value else {
+            return Err(AppValidationError::Contract(ContractError("scenario projection object invariant".into())));
+        };
+        let Some(seed_field) = fields.get_mut("seed") else {
+            return Err(AppValidationError::Contract(ContractError("scenario projection seed field invariant".into())));
+        };
+        std::mem::swap(seed_field, &mut seed_value);
+        if let Some(id) = id {
+            let copied = crate::product_alloc::try_copy_str(id, cx, crate::product_alloc::AllocationSite::String)
+                .map_err(AppValidationError::Allocation)?;
+            let Some(id_field) = fields.get_mut("id") else {
+                return Err(AppValidationError::Contract(ContractError("scenario projection id field invariant".into())));
+            };
+            *id_field = crate::product_json::Value::String(copied);
+        }
+        fallible_scenario_decode::decode_scenario_spec(value, cx).map(Self)
+            .map_err(|error| match error {
+                fallible_value_decode::ValueDecodeError::Allocation(failure) => AppValidationError::Allocation(failure),
+                _ => AppValidationError::Contract(ContractError("scenario projection decode invariant".into())),
+            })
+    }
+
+    pub(crate) fn scope_replay_namespace_with(
+        original: &Self,
+        mapped: &Self,
+        source: &FallibleDecodedCapturedProgram,
+        target: &FallibleDecodedCapturedProgram,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Digest, crate::product_backup::fallible_codec::CodecError> {
+        fallible_scenario_decode::scope_replay_namespace(
+            &original.0, &mapped.0, source.binding(), target.binding(), cx,
+        )
+    }
+}
+#[derive(Debug, Serialize)]
+pub(crate) struct FallibleDecodedRunEvidence(fallible_run_evidence_decode::DecodedRunEvidence);
+impl crate::product_backup::fallible_codec::BackupWire for FallibleDecodedRunEvidence {}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RuntimeEvidenceError {
+    Contract(ContractError),
+    Allocation(crate::product_alloc::AllocationFailure),
+}
+impl FallibleDecodedRunEvidence {
+    pub(crate) fn state(&self) -> EvidenceState { self.0.state() }
+    pub(crate) fn trace_count(&self) -> usize { self.0.trace_count() }
+    pub(crate) fn observation_count(&self) -> usize { self.0.observation_count() }
+    pub(crate) fn limits(&self) -> &RuntimeLimits { self.0.limits() }
+    pub(crate) fn validate_single_observe(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), RuntimeEvidenceError> {
+        self.0.validate_single_observe(cx).map_err(|error| match error {
+            AppValidationError::Contract(error) => RuntimeEvidenceError::Contract(error),
+            AppValidationError::Allocation(failure) => RuntimeEvidenceError::Allocation(failure),
+        })
+    }
+
+    pub(crate) fn identity_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Digest, RuntimeEvidenceError> {
+        self.validate_single_observe(cx)?;
+        crate::product_backup::fallible_codec::canonical_digest(IdentityDomain::Evidence, self, cx)
+            .map_err(|error| match error {
+                crate::product_backup::fallible_codec::CodecError::Allocation(failure) => RuntimeEvidenceError::Allocation(failure),
+                _ => RuntimeEvidenceError::Contract(ContractError("runtime evidence identity encoding failed".into())),
+            })
+    }
+}
+#[derive(Debug, Serialize)]
+pub(crate) struct FallibleDecodedDecisionGraph(fallible_decision_decode::DecodedDecisionGraph);
+impl FallibleDecodedDecisionGraph {
+    pub(crate) fn revision(&self) -> u64 { self.0.revision }
+
+    pub(crate) fn is_empty_checkpoint(&self) -> bool {
+        self.0.revision == 0 && self.0.decisions.is_empty()
+    }
+
+    pub(crate) fn active_ids_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Vec<String>, DecisionValidationError> {
+        let mut ids = Vec::new();
+        crate::product_alloc::try_reserve(&mut ids, self.0.decisions.len(), cx, crate::product_alloc::AllocationSite::Vector)
+            .map_err(DecisionValidationError::Allocation)?;
+        for decision in &self.0.decisions {
+            if decision.status == DecisionStatus::Active {
+                let id = crate::product_alloc::try_copy_str(&decision.id, cx, crate::product_alloc::AllocationSite::String)
+                    .map_err(DecisionValidationError::Allocation)?;
+                crate::product_alloc::try_push(&mut ids, id, cx, crate::product_alloc::AllocationSite::Vector)
+                    .map_err(DecisionValidationError::Allocation)?;
+            }
+        }
+        Ok(ids)
+    }
+
+    pub(crate) fn accepted_for_scope(
+        &self,
+        id: &str,
+        plan: &FallibleDecodedAdoptionPlan,
+        artifact: &Digest,
+    ) -> bool {
+        self.0.accepted_for_scope(id, plan.0.scope(), artifact)
+    }
+
+    pub(crate) fn contains_decision(&self, id: &str) -> bool {
+        self.0.decisions.iter().any(|decision| decision.id == id)
+    }
+
+    pub(crate) fn matches_scope(&self, id: &str, plan: &FallibleDecodedAdoptionPlan) -> bool {
+        self.0.decisions.iter().any(|decision| decision.id == id && decision.scope.same_as(plan.0.scope()))
+    }
+
+    pub(crate) fn pending_nonbinary_witness(&self, id: &str, witness: &Digest) -> bool {
+        self.0.decisions.iter().any(|decision| {
+            decision.id == id && &decision.witness == witness
+                && matches!(decision.status, DecisionStatus::Pending | DecisionStatus::Superseded { .. })
+                && matches!(decision.outcome,
+                    DecisionOutcome::EitherAcceptable | DecisionOutcome::BothNeeded
+                        | DecisionOutcome::NeitherFits | DecisionOutcome::Deferred)
+        })
+    }
+
+    pub(crate) fn ids_matching_with(
+        &self,
+        ids: &[String],
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Vec<String>, DecisionValidationError> {
+        let mut wanted = crate::product_alloc::ordered::OrderedSet::new();
+        for id in ids {
+            wanted.try_insert(id.as_str(), cx).map_err(DecisionValidationError::Allocation)?;
+        }
+        let mut result = Vec::new();
+        crate::product_alloc::try_reserve(&mut result, ids.len(), cx, crate::product_alloc::AllocationSite::Vector)
+            .map_err(DecisionValidationError::Allocation)?;
+        for decision in &self.0.decisions {
+            if wanted.contains(decision.id.as_str()) {
+                let id = crate::product_alloc::try_copy_str(&decision.id, cx, crate::product_alloc::AllocationSite::String)
+                    .map_err(DecisionValidationError::Allocation)?;
+                crate::product_alloc::try_push(&mut result, id, cx, crate::product_alloc::AllocationSite::Vector)
+                    .map_err(DecisionValidationError::Allocation)?;
+            }
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn try_clone_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Self, DecisionValidationError> {
+        let value = crate::product_backup::fallible_codec::try_serialize_value(self, cx)
+            .map_err(|error| match error {
+                crate::product_backup::fallible_codec::CodecError::Allocation(failure) => DecisionValidationError::Allocation(failure),
+                _ => DecisionValidationError::Contract(ContractError("decision canonical encoding failed".into())),
+            })?;
+        let decoded = decode_decision_graph_fallible(value, cx).map_err(|error| match error {
+            fallible_value_decode::ValueDecodeError::Allocation(failure) => DecisionValidationError::Allocation(failure),
+            _ => DecisionValidationError::Contract(ContractError("decision copy invariant".into())),
+        })?;
+        Ok(decoded)
+    }
+
+    pub(crate) fn rewind_adoption_with(
+        &self,
+        expected: &Digest,
+        retired: &[String],
+        adoption: &str,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(Self, Vec<String>, Vec<String>), DecisionValidationError> {
+        let (graph, active, pending) = self.0.rewind_adoption_with(expected, retired, adoption, cx)?;
+        Ok((Self(graph), active, pending))
+    }
+
+    pub(crate) fn validate_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), DecisionValidationError> {
+        validate_decision_graph_with(self.0.version, &self.0.decisions, cx)
+    }
+
+    pub(crate) fn identity_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Digest, DecisionValidationError> {
+        self.validate_with(cx)?;
+        crate::product_backup::fallible_codec::canonical_digest(
+            IdentityDomain::Decision,
+            self,
+            cx,
+        )
+        .map_err(|error| match error {
+            crate::product_backup::fallible_codec::CodecError::Allocation(failure) => {
+                DecisionValidationError::Allocation(failure)
+            }
+            _ => DecisionValidationError::Contract(ContractError("decision canonical encoding failed".into())),
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DecisionValidationError {
+    Contract(ContractError),
+    Allocation(crate::product_alloc::AllocationFailure),
+}
+impl From<ContractError> for DecisionValidationError {
+    fn from(value: ContractError) -> Self { Self::Contract(value) }
+}
+#[derive(Debug, Serialize)]
+pub(crate) struct FallibleDecodedLocalArtifact(fallible_local_artifact_decode::DecodedLocalArtifact);
+impl FallibleDecodedLocalArtifact {
+    pub(crate) fn from_rows_with(
+        output: &str,
+        format: OutputFormat,
+        columns: &[FieldDefinition],
+        rows: Vec<FallibleValues>,
+        max_bytes: usize,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Self, AppValidationError> {
+        fallible_local_artifact_decode::DecodedLocalArtifact::from_rows(output, format, columns, rows, max_bytes, cx)
+            .map(Self)
+    }
+    pub(crate) fn try_clone_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Self, AppValidationError> {
+        let value = crate::product_backup::fallible_codec::try_serialize_value(self, cx)
+            .map_err(|error| match error {
+                crate::product_backup::fallible_codec::CodecError::Allocation(failure) => AppValidationError::Allocation(failure),
+                _ => AppValidationError::Contract(ContractError("artifact copy invariant".into())),
+            })?;
+        decode_local_artifact_fallible(value, cx).map_err(|error| match error {
+            fallible_value_decode::ValueDecodeError::Allocation(failure) => AppValidationError::Allocation(failure),
+            _ => AppValidationError::Contract(ContractError("artifact copy invariant".into())),
+        })
+    }
+    pub(crate) fn validate_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), AppValidationError> {
+        self.0.validate_with(cx)
+    }
+    pub(crate) fn digest(&self) -> &Digest { self.0.digest() }
+    pub(crate) fn byte_len(&self) -> usize { self.0.byte_len() }
+    pub(crate) fn bytes(&self) -> &[u8] { self.0.bytes() }
+}
+
+pub(crate) fn decoded_output_byte_len_with(
+    format: OutputFormat,
+    columns: &[FieldDefinition],
+    rows: &[FallibleValues],
+    max_bytes: usize,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<usize, AppValidationError> {
+    fallible_local_artifact_decode::encoded_output_byte_len_with(format, columns, rows, max_bytes, cx)
+}
+impl crate::product_backup::fallible_codec::BackupWire for FallibleDecodedLocalArtifact {}
+#[derive(Debug, Serialize)]
+pub(crate) struct FallibleDecodedAdoptionPlan(fallible_decision_decode::DecodedAdoptionPlan);
+impl FallibleDecodedAdoptionPlan {
+    pub(crate) fn id(&self) -> &str { self.0.id() }
+    pub(crate) fn project_id(&self) -> &str { self.0.project_id() }
+    pub(crate) fn expected_generation(&self) -> u64 { self.0.expected_generation() }
+    pub(crate) fn expected_data(&self) -> &Digest { self.0.expected_data() }
+    pub(crate) fn expected_decisions(&self) -> &Digest { self.0.expected_decisions() }
+    pub(crate) fn expected_session(&self) -> &Digest { self.0.expected_session() }
+    pub(crate) fn current_source(&self) -> &SourceBinding { self.0.current_source() }
+    pub(crate) fn target(&self) -> &ArtifactRef { self.0.target() }
+    pub(crate) fn required_decisions(&self) -> &[String] { self.0.required_decisions() }
+    pub(crate) fn retire_decisions(&self) -> &[String] { self.0.retire_decisions() }
+    pub(crate) fn evidence(&self) -> &[Digest] { self.0.evidence() }
+    pub(crate) fn compatibility(&self) -> &crate::product_store::scope::DecodedCompatibilityReport { self.0.compatibility() }
+    pub(crate) fn scope_matches_layer(
+        &self,
+        request: &crate::product_store::scope::DecodedScopeRequest,
+        basis_generation: u64,
+    ) -> bool {
+        self.0.scope_matches_layer(request, basis_generation)
+    }
+    pub(crate) fn identity_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Digest, DecisionValidationError> {
+        self.0.identity_with(cx)
+    }
+
+    pub(crate) fn validate_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), DecisionValidationError> {
+        self.0.validate_with(cx)
+    }
+}
+pub(crate) fn decode_data_snapshot_fallible(
+    value: crate::product_json::Value,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<FallibleDecodedDataSnapshot, fallible_value_decode::ValueDecodeError> {
+    fallible_snapshot_decode::decode_data_snapshot(value, cx).map(FallibleDecodedDataSnapshot)
+}
+pub(crate) fn decode_session_state_fallible(
+    value: crate::product_json::Value,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<FallibleDecodedSessionState, fallible_value_decode::ValueDecodeError> {
+    fallible_persisted_decode::decode_session_state(value, cx).map(FallibleDecodedSessionState)
+}
+pub(crate) fn decode_record_ref_fallible(
+    value: crate::product_json::Value,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<RecordRef, fallible_value_decode::ValueDecodeError> {
+    fallible_persisted_decode::decode_record_ref(value, cx)
+}
+pub(crate) fn decode_captured_program_fallible(
+    value: crate::product_json::Value,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<FallibleDecodedCapturedProgram, fallible_value_decode::ValueDecodeError> {
+    fallible_capture_decode::decode_captured_program(value, cx).map(FallibleDecodedCapturedProgram)
+}
+pub(crate) fn capture_generated_app_fallible(
+    app: fallible_app_decode::DecodedAppDefinition,
+    project: &str,
+    producer: Producer,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<FallibleDecodedCapturedProgram, AppValidationError> {
+    fallible_capture_decode::capture_generated_app(app, project, producer, cx)
+        .map(FallibleDecodedCapturedProgram)
+}
+pub(crate) fn decode_scenario_spec_fallible(
+    value: crate::product_json::Value,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<FallibleDecodedScenarioSpec, fallible_value_decode::ValueDecodeError> {
+    fallible_scenario_decode::decode_scenario_spec(value, cx).map(FallibleDecodedScenarioSpec)
+}
+pub(crate) fn decode_run_evidence_fallible(
+    value: crate::product_json::Value,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<FallibleDecodedRunEvidence, fallible_value_decode::ValueDecodeError> {
+    fallible_run_evidence_decode::decode_run_evidence(value, cx).map(FallibleDecodedRunEvidence)
+}
+pub(crate) fn decode_run_evidence_runtime(
+    value: crate::product_json::Value,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<FallibleDecodedRunEvidence, AppValidationError> {
+    fallible_run_evidence_decode::decode_run_evidence(value, cx)
+        .map(FallibleDecodedRunEvidence)
+        .map_err(|error| match error {
+            fallible_value_decode::ValueDecodeError::Allocation(failure) => AppValidationError::Allocation(failure),
+            _ => AppValidationError::Contract(ContractError("decoded runtime evidence construction invariant".into())),
+        })
+}
+pub(crate) fn decode_decision_graph_fallible(
+    value: crate::product_json::Value,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<FallibleDecodedDecisionGraph, fallible_value_decode::ValueDecodeError> {
+    fallible_decision_decode::decode_decision_graph(value, cx).map(FallibleDecodedDecisionGraph)
+}
+pub(crate) fn decode_local_artifact_fallible(
+    value: crate::product_json::Value,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<FallibleDecodedLocalArtifact, fallible_value_decode::ValueDecodeError> {
+    fallible_local_artifact_decode::decode_local_artifact(value, cx).map(FallibleDecodedLocalArtifact)
+}
+pub(crate) fn decode_adoption_plan_fallible(
+    value: crate::product_json::Value,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<FallibleDecodedAdoptionPlan, fallible_value_decode::ValueDecodeError> {
+    fallible_decision_decode::decode_adoption_plan(value, cx).map(FallibleDecodedAdoptionPlan)
+}
+pub(crate) fn decode_source_binding_fallible(
+    value: crate::product_json::Value,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<SourceBinding, fallible_value_decode::ValueDecodeError> {
+    fallible_capture_decode::decode_source_binding(value, cx)
+}
+pub(crate) fn decode_artifact_ref_fallible(
+    value: crate::product_json::Value,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<ArtifactRef, fallible_value_decode::ValueDecodeError> {
+    fallible_capture_decode::decode_artifact(value, cx)
+}
+pub(crate) fn decode_run_binding_fallible(
+    value: crate::product_json::Value,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<RunBinding, fallible_value_decode::ValueDecodeError> {
+    fallible_run_evidence_decode::decode_run_binding(value, cx)
+}
+
+#[path = "product_contract/fallible_decision_decode.rs"]
+#[allow(dead_code)]
+mod fallible_decision_decode;
+impl crate::product_backup::fallible_codec::BackupWire for fallible_decision_decode::DecodedDecisionGraph {}
+impl crate::product_backup::fallible_codec::BackupWire for fallible_decision_decode::DecodedAdoptionPlan {}
+impl crate::product_backup::fallible_codec::BackupWire for fallible_persisted_decode::DecodedSessionState {}
+#[path = "product_contract/fallible_app_decode.rs"]
+#[allow(dead_code)]
+pub(crate) mod fallible_app_decode;
+#[path = "product_contract/fallible_capture_decode.rs"]
+#[allow(dead_code)]
+mod fallible_capture_decode;
+pub(crate) use fallible_capture_decode::DecodedCapturedProgram as DecodedCapturedProgramWire;
+#[path = "product_contract/fallible_local_artifact_decode.rs"]
+#[allow(dead_code)]
+mod fallible_local_artifact_decode;
+pub(crate) use fallible_local_artifact_decode::{ArtifactReceipt as FallibleArtifactReceipt, JsonScalar as FallibleJsonScalar, OutputRow as FallibleOutputRow};
+#[path = "product_contract/fallible_scenario_decode.rs"]
+#[allow(dead_code)]
+mod fallible_scenario_decode;
+#[path = "product_contract/fallible_observation_decode.rs"]
+#[allow(dead_code)]
+mod fallible_observation_decode;
+#[path = "product_contract/fallible_run_evidence_decode.rs"]
+#[allow(dead_code)]
+mod fallible_run_evidence_decode;
+#[allow(unused_imports)]
+pub(crate) use values_map::FallibleValues;
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -65,6 +1244,14 @@ impl fmt::Display for ContractError {
     }
 }
 impl std::error::Error for ContractError {}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AppValidationError {
+    Contract(ContractError),
+    Allocation(crate::product_alloc::AllocationFailure),
+}
+impl From<ContractError> for AppValidationError {
+    fn from(value: ContractError) -> Self { Self::Contract(value) }
+}
 type Result<T> = std::result::Result<T, ContractError>;
 fn require(condition: bool, message: impl Into<String>) -> Result<()> {
     if condition {
@@ -105,12 +1292,31 @@ fn version(version: u32) -> Result<()> {
     require(version == CONTRACT_VERSION, "unsupported contract version")
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(try_from = "String")]
 pub struct Digest(String);
+impl Serialize for Digest {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        // `into = String` cloned the digest before reaching the serializer.
+        // A borrowed string has identical wire bytes and permits fallible
+        // serializers to account for every owned output buffer themselves.
+        serializer.serialize_str(&self.0)
+    }
+}
 impl Digest {
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Validate and consume the original String without allocating an error.
+    pub(crate) fn from_owned_lower_hex(value: String) -> Option<Self> {
+        if value.len() == 64
+            && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            Some(Self(value))
+        } else {
+            None
+        }
     }
 }
 impl TryFrom<String> for Digest {
@@ -132,26 +1338,9 @@ impl From<Digest> for String {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum IdentityDomain {
-    Source,
-    Program,
-    SemanticProgram,
-    Data,
-    Schema,
-    Input,
-    Session,
-    Observation,
-    Output,
-    OutputBytes,
-    Request,
-    Scenario,
-    Decision,
-    Evolution,
-    Adoption,
-    Evidence,
-}
+#[path = "product_contract/identity_domain.rs"]
+mod identity_domain;
+pub use self::identity_domain::IdentityDomain;
 fn bytes_digest(domain: IdentityDomain, bytes: &[u8]) -> Digest {
     let mut input = b"gitmanager.product.v1\0".to_vec();
     input.extend(serde_json::to_vec(&domain).expect("finite enum"));
@@ -169,25 +1358,30 @@ fn bytes_digest(domain: IdentityDomain, bytes: &[u8]) -> Digest {
 /// typed values, and contains no whitespace. This is a versioned local format,
 /// not a claim of cross-language RFC 8785 floating-point canonicalization.
 pub fn canonical_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    fn sorted(value: JsonValue) -> JsonValue {
-        match value {
-            JsonValue::Object(map) => JsonValue::Object(
-                map.into_iter()
-                    .collect::<BTreeMap<_, _>>()
-                    .into_iter()
-                    .map(|(k, v)| (k, sorted(v)))
-                    .collect(),
-            ),
-            JsonValue::Array(array) => JsonValue::Array(array.into_iter().map(sorted).collect()),
-            scalar => scalar,
-        }
-    }
     serde_json::to_value(value)
-        .and_then(|v| serde_json::to_vec(&sorted(v)))
+        .and_then(|mut value| {
+            value.sort_all_objects();
+            serde_json::to_vec(&value)
+        })
         .map_err(|e| ContractError(e.to_string()))
 }
 pub fn canonical_digest<T: Serialize>(domain: IdentityDomain, value: &T) -> Result<Digest> {
     Ok(bytes_digest(domain, &canonical_bytes(value)?))
+}
+/// A fresh canonical encoding, not a semantic proof or admission capability.
+/// No raw-byte constructor, mutable view, extraction, clone or wire format exists.
+pub(crate) struct CanonicalEvidenceBytes(Vec<u8>);
+impl CanonicalEvidenceBytes {
+    pub(crate) fn from_value<T: Serialize>(value: &T) -> Result<Self> {
+        Ok(Self(canonical_bytes(value)?))
+    }
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+    pub(crate) fn into_evidence_digest(self) -> Digest {
+        // The original variable-size domain buffer, SHA-256 and hex work remain.
+        bytes_digest(IdentityDomain::Evidence, &self.0)
+    }
 }
 fn parse<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     let value = bounded_input::parse_json_bytes(bytes).map_err(|e| ContractError(e.to_string()))?;
@@ -579,56 +1773,705 @@ pub struct AppDefinition {
     pub initial_view: Id,
 }
 
-struct Validator<'a> {
-    app: &'a AppDefinition,
-    nodes: usize,
+#[derive(Clone, Copy)]
+pub(crate) enum AppRef<'a> {
+    Legacy(&'a AppDefinition),
+    Decoded(&'a fallible_app_decode::DecodedAppDefinition),
+    Snapshot,
+}
+#[derive(Clone, Copy)]
+pub(crate) enum ViewRef<'a> {
+    Legacy(&'a ViewDefinition),
+    Decoded(&'a fallible_app_decode::DecodedViewDefinition),
+}
+#[derive(Clone, Copy)]
+pub(crate) enum ViewKindRef<'a> {
+    List { entity: &'a str, rows: &'a Expr, columns: ColumnSlice<'a>, controls: ControlSlice<'a>, selection: Option<SelectionRef<'a>> },
+    Detail { entity: &'a str, record: &'a Expr, columns: ColumnSlice<'a> },
+    Form { action: &'a str, fields: FormInputSlice<'a>, defaults: DataValueMapRef<'a> },
+}
+#[derive(Clone, Copy)]
+pub(crate) enum ColumnSlice<'a> { Legacy(&'a [Column]), Decoded(&'a [fallible_app_decode::DecodedColumn]) }
+pub(crate) enum ColumnIter<'a> { Legacy(std::slice::Iter<'a, Column>), Decoded(std::slice::Iter<'a, fallible_app_decode::DecodedColumn>) }
+#[derive(Clone, Copy)]
+pub(crate) enum ColumnRef<'a> { Legacy(&'a Column), Decoded(&'a fallible_app_decode::DecodedColumn) }
+impl<'a> Iterator for ColumnIter<'a> {
+    type Item = ColumnRef<'a>;
+    fn next(&mut self) -> Option<Self::Item> { match self { Self::Legacy(v) => v.next().map(ColumnRef::Legacy), Self::Decoded(v) => v.next().map(ColumnRef::Decoded) } }
+}
+impl ExactSizeIterator for ColumnIter<'_> {}
+impl ColumnSlice<'_> { pub(crate) fn iter(&self) -> ColumnIter<'_> { match self { Self::Legacy(v) => ColumnIter::Legacy(v.iter()), Self::Decoded(v) => ColumnIter::Decoded(v.iter()) } } }
+impl ColumnRef<'_> { pub(crate) fn id(&self) -> &str { match self { Self::Legacy(v) => &v.id, Self::Decoded(v) => &v.id } } pub(crate) fn value(&self) -> &Expr { match self { Self::Legacy(v) => &v.value, Self::Decoded(v) => &v.value } } }
+#[derive(Clone, Copy)]
+pub(crate) enum ControlSlice<'a> { Legacy(&'a [StateControl]), Decoded(&'a [fallible_app_decode::DecodedStateControl]) }
+pub(crate) enum ControlIter<'a> { Legacy(std::slice::Iter<'a, StateControl>), Decoded(std::slice::Iter<'a, fallible_app_decode::DecodedStateControl>) }
+#[derive(Clone, Copy)]
+pub(crate) enum ControlRef<'a> { Legacy(&'a StateControl), Decoded(&'a fallible_app_decode::DecodedStateControl) }
+impl<'a> Iterator for ControlIter<'a> { type Item = ControlRef<'a>; fn next(&mut self) -> Option<Self::Item> { match self { Self::Legacy(v) => v.next().map(ControlRef::Legacy), Self::Decoded(v) => v.next().map(ControlRef::Decoded) } } }
+impl ExactSizeIterator for ControlIter<'_> {}
+impl<'a> ControlSlice<'a> { pub(crate) fn iter(&self) -> ControlIter<'a> { match self { Self::Legacy(v) => ControlIter::Legacy(v.iter()), Self::Decoded(v) => ControlIter::Decoded(v.iter()) } } }
+impl<'a> ControlRef<'a> { pub(crate) fn id(&self) -> &'a str { match self { Self::Legacy(v) => &v.id, Self::Decoded(v) => &v.id } } pub(crate) fn label(&self) -> &'a str { match self { Self::Legacy(v) => &v.label, Self::Decoded(v) => &v.label } } pub(crate) fn state(&self) -> &'a str { match self { Self::Legacy(v) => &v.state, Self::Decoded(v) => &v.state } } pub(crate) fn on_change(&self) -> Option<&'a str> { match self { Self::Legacy(v) => v.on_change.as_deref(), Self::Decoded(v) => v.on_change.as_deref() } } }
+#[derive(Clone, Copy)]
+pub(crate) enum SelectionRef<'a> { Legacy(&'a SelectionBinding), Decoded(&'a fallible_app_decode::DecodedSelectionBinding) }
+impl<'a> SelectionRef<'a> { pub(crate) fn id(&self) -> &'a str { match self { Self::Legacy(v) => &v.id, Self::Decoded(v) => &v.id } } pub(crate) fn state(&self) -> &'a str { match self { Self::Legacy(v) => &v.state, Self::Decoded(v) => &v.state } } pub(crate) fn on_change(&self) -> Option<&'a str> { match self { Self::Legacy(v) => v.on_change.as_deref(), Self::Decoded(v) => v.on_change.as_deref() } } }
+#[derive(Clone, Copy)]
+pub(crate) enum FormInputSlice<'a> { Legacy(&'a [FormInput]), Decoded(&'a [fallible_app_decode::DecodedFormInput]) }
+pub(crate) enum FormInputIter<'a> { Legacy(std::slice::Iter<'a, FormInput>), Decoded(std::slice::Iter<'a, fallible_app_decode::DecodedFormInput>) }
+#[derive(Clone, Copy)]
+pub(crate) enum FormInputRef<'a> { Legacy(&'a FormInput), Decoded(&'a fallible_app_decode::DecodedFormInput) }
+impl<'a> Iterator for FormInputIter<'a> { type Item = FormInputRef<'a>; fn next(&mut self) -> Option<Self::Item> { match self { Self::Legacy(v) => v.next().map(FormInputRef::Legacy), Self::Decoded(v) => v.next().map(FormInputRef::Decoded) } } }
+impl ExactSizeIterator for FormInputIter<'_> {}
+impl FormInputSlice<'_> { pub(crate) fn iter(&self) -> FormInputIter<'_> { match self { Self::Legacy(v) => FormInputIter::Legacy(v.iter()), Self::Decoded(v) => FormInputIter::Decoded(v.iter()) } } }
+impl FormInputRef<'_> { pub(crate) fn parameter(&self) -> &str { match self { Self::Legacy(v) => &v.parameter, Self::Decoded(v) => &v.parameter } } pub(crate) fn label(&self) -> &str { match self { Self::Legacy(v) => &v.label, Self::Decoded(v) => &v.label } } }
+#[derive(Clone, Copy)]
+pub(crate) enum BindingSlice<'a> { Legacy(&'a [ActionBinding]), Decoded(&'a [fallible_app_decode::DecodedActionBinding]) }
+pub(crate) enum BindingIter<'a> { Legacy(std::slice::Iter<'a, ActionBinding>), Decoded(std::slice::Iter<'a, fallible_app_decode::DecodedActionBinding>) }
+#[derive(Clone, Copy)]
+pub(crate) enum BindingRef<'a> { Legacy(&'a ActionBinding), Decoded(&'a fallible_app_decode::DecodedActionBinding) }
+impl<'a> Iterator for BindingIter<'a> { type Item = BindingRef<'a>; fn next(&mut self) -> Option<Self::Item> { match self { Self::Legacy(v) => v.next().map(BindingRef::Legacy), Self::Decoded(v) => v.next().map(BindingRef::Decoded) } } }
+impl ExactSizeIterator for BindingIter<'_> {}
+impl<'a> BindingSlice<'a> { pub(crate) fn iter(&self) -> BindingIter<'a> { match self { Self::Legacy(v) => BindingIter::Legacy(v.iter()), Self::Decoded(v) => BindingIter::Decoded(v.iter()) } } }
+impl<'a> BindingRef<'a> { pub(crate) fn id(&self) -> &'a str { match self { Self::Legacy(v) => &v.id, Self::Decoded(v) => &v.id } } pub(crate) fn label(&self) -> &'a str { match self { Self::Legacy(v) => &v.label, Self::Decoded(v) => &v.label } } pub(crate) fn placement(&self) -> ActionPlacement { match self { Self::Legacy(v) => v.placement, Self::Decoded(v) => v.placement } } pub(crate) fn action(&self) -> &'a str { match self { Self::Legacy(v) => &v.action, Self::Decoded(v) => &v.action } } pub(crate) fn arguments(&self) -> StringMapRef<'a, Expr> { match self { Self::Legacy(v) => StringMapRef::Legacy(&v.arguments), Self::Decoded(v) => StringMapRef::Fallible(&v.arguments) } } pub(crate) fn enabled(&self) -> &'a Expr { match self { Self::Legacy(v) => &v.enabled, Self::Decoded(v) => &v.enabled } } }
+#[derive(Clone, Copy)]
+pub(crate) enum KeySlice<'a> { Legacy(&'a [KeyBinding]), Decoded(&'a [fallible_app_decode::DecodedKeyBinding]) }
+pub(crate) enum KeyIter<'a> { Legacy(std::slice::Iter<'a, KeyBinding>), Decoded(std::slice::Iter<'a, fallible_app_decode::DecodedKeyBinding>) }
+#[derive(Clone, Copy)]
+pub(crate) enum KeyRef<'a> { Legacy(&'a KeyBinding), Decoded(&'a fallible_app_decode::DecodedKeyBinding) }
+impl<'a> Iterator for KeyIter<'a> { type Item = KeyRef<'a>; fn next(&mut self) -> Option<Self::Item> { match self { Self::Legacy(v) => v.next().map(KeyRef::Legacy), Self::Decoded(v) => v.next().map(KeyRef::Decoded) } } }
+impl ExactSizeIterator for KeyIter<'_> {}
+impl KeySlice<'_> { pub(crate) fn iter(&self) -> KeyIter<'_> { match self { Self::Legacy(v) => KeyIter::Legacy(v.iter()), Self::Decoded(v) => KeyIter::Decoded(v.iter()) } } }
+impl KeyRef<'_> { pub(crate) fn key(&self) -> &str { match self { Self::Legacy(v) => &v.key, Self::Decoded(v) => &v.key } } pub(crate) fn modifier_count(&self) -> usize { match self { Self::Legacy(v) => v.modifiers.len(), Self::Decoded(v) => v.modifiers.len() } } pub(crate) fn modifier(&self, index: usize) -> Option<KeyModifier> { match self { Self::Legacy(v) => v.modifiers.iter().nth(index).copied(), Self::Decoded(v) => v.modifiers.0.iter().nth(index).copied() } } pub(crate) fn binding(&self) -> &str { match self { Self::Legacy(v) => &v.binding, Self::Decoded(v) => &v.binding } } }
+impl<'a> ViewRef<'a> {
+    pub(crate) fn id(&self) -> &str { match self { Self::Legacy(v) => &v.id, Self::Decoded(v) => &v.id } }
+    pub(crate) fn kind(&self) -> ViewKindRef<'a> { match self { Self::Legacy(v) => match &v.kind {
+        ViewKind::List { entity, rows, columns, controls, selection } => ViewKindRef::List { entity, rows, columns: ColumnSlice::Legacy(columns), controls: ControlSlice::Legacy(controls), selection: selection.as_ref().map(SelectionRef::Legacy) },
+        ViewKind::Detail { entity, record, columns } => ViewKindRef::Detail { entity, record, columns: ColumnSlice::Legacy(columns) },
+        ViewKind::Form { action, fields, defaults } => ViewKindRef::Form { action, fields: FormInputSlice::Legacy(fields), defaults: DataValueMapRef::Legacy(defaults) },
+    }, Self::Decoded(v) => match &v.kind {
+        fallible_app_decode::DecodedViewKind::List { entity, rows, columns, controls, selection } => ViewKindRef::List { entity, rows, columns: ColumnSlice::Decoded(columns), controls: ControlSlice::Decoded(controls), selection: selection.as_ref().map(SelectionRef::Decoded) },
+        fallible_app_decode::DecodedViewKind::Detail { entity, record, columns } => ViewKindRef::Detail { entity, record, columns: ColumnSlice::Decoded(columns) },
+        fallible_app_decode::DecodedViewKind::Form { action, fields, defaults } => ViewKindRef::Form { action, fields: FormInputSlice::Decoded(fields), defaults: DataValueMapRef::Fallible(defaults) },
+    } } }
+    pub(crate) fn actions(&self) -> BindingSlice<'a> { match self { Self::Legacy(v) => BindingSlice::Legacy(&v.actions), Self::Decoded(v) => BindingSlice::Decoded(&v.actions) } }
+    pub(crate) fn keys(&self) -> KeySlice<'a> { match self { Self::Legacy(v) => KeySlice::Legacy(&v.keys), Self::Decoded(v) => KeySlice::Decoded(&v.keys) } }
+}
+pub(crate) enum StringMapRef<'a, V> {
+    Legacy(&'a BTreeMap<String, V>),
+    Fallible(&'a fallible_app_decode::FallibleMap<V>),
+}
+#[derive(Clone, Copy)]
+pub(crate) enum DataValueMapRef<'a> { Legacy(&'a BTreeMap<String, DataValue>), Fallible(&'a FallibleValues) }
+pub(crate) enum DataValueMapIter<'a> { Legacy(std::collections::btree_map::Iter<'a, String, DataValue>), Fallible(values_map::FallibleValuesIter<'a>) }
+impl<'a> Iterator for DataValueMapIter<'a> {
+    type Item = (&'a String, &'a DataValue);
+    fn next(&mut self) -> Option<Self::Item> { match self { Self::Legacy(iter) => iter.next(), Self::Fallible(iter) => iter.next() } }
+}
+impl ExactSizeIterator for DataValueMapIter<'_> {}
+impl DataValueMapRef<'_> { pub(crate) fn iter(&self) -> DataValueMapIter<'_> { match self { Self::Legacy(v) => DataValueMapIter::Legacy(v.iter()), Self::Fallible(v) => DataValueMapIter::Fallible(v.iter()) } } }
+impl<V> Copy for StringMapRef<'_, V> {}
+impl<V> Clone for StringMapRef<'_, V> { fn clone(&self) -> Self { *self } }
+impl<V> StringMapRef<'_, V> { pub(crate) fn is_empty(&self) -> bool { self.len()==0 } }
+pub(crate) enum StringMapIter<'a, V> {
+    Legacy(std::collections::btree_map::Iter<'a, String, V>),
+    Fallible(fallible_app_decode::FallibleMapIter<'a, V>),
+}
+impl<'a, V> Iterator for StringMapIter<'a, V> {
+    type Item = (&'a String, &'a V);
+    fn next(&mut self) -> Option<Self::Item> { match self { Self::Legacy(i) => i.next(), Self::Fallible(i) => i.next() } }
+}
+impl<V> ExactSizeIterator for StringMapIter<'_, V> {}
+impl<V> StringValueMap<V> for StringMapRef<'_, V> {
+    type Iter<'a> = StringMapIter<'a, V> where Self: 'a, V: 'a;
+    fn len(&self) -> usize { match self { Self::Legacy(m) => m.len(), Self::Fallible(m) => m.len() } }
+    fn get(&self, key: &str) -> Option<&V> { match self { Self::Legacy(m) => m.get(key), Self::Fallible(m) => m.get(key) } }
+    fn contains_key(&self, key: &str) -> bool { match self { Self::Legacy(m) => m.contains_key(key), Self::Fallible(m) => m.contains_key(key) } }
+    fn iter(&self) -> Self::Iter<'_> { match self { Self::Legacy(m) => StringMapIter::Legacy(m.iter()), Self::Fallible(m) => StringMapIter::Fallible(m.iter()) } }
+}
+#[derive(Clone, Copy)]
+pub(crate) enum ActionRef<'a> {
+    Legacy(&'a ActionDefinition),
+    Decoded(&'a fallible_app_decode::DecodedActionDefinition),
+}
+pub(crate) enum ActionSlice<'a> {
+    Legacy(&'a [ActionDefinition]),
+    Decoded(&'a [fallible_app_decode::DecodedActionDefinition]),
+}
+pub(crate) enum ActionIter<'a> {
+    Legacy(std::slice::Iter<'a, ActionDefinition>),
+    Decoded(std::slice::Iter<'a, fallible_app_decode::DecodedActionDefinition>),
+}
+impl<'a> Iterator for ActionIter<'a> {
+    type Item = ActionRef<'a>;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Legacy(iter) => iter.next().map(ActionRef::Legacy),
+            Self::Decoded(iter) => iter.next().map(ActionRef::Decoded),
+        }
+    }
+}
+impl<'a> ActionSlice<'a> {
+    pub(crate) fn iter(&self) -> ActionIter<'a> {
+        match self {
+            Self::Legacy(items) => ActionIter::Legacy(items.iter()),
+            Self::Decoded(items) => ActionIter::Decoded(items.iter()),
+        }
+    }
+}
+impl<'a> ActionRef<'a> {
+    pub(crate) fn id(&self) -> &'a str { match self { Self::Legacy(v) => &v.id, Self::Decoded(v) => &v.id } }
+    pub(crate) fn label(&self) -> &'a str { match self { Self::Legacy(v) => &v.label, Self::Decoded(v) => &v.label } }
+    pub(crate) fn parameters(&self) -> StringMapRef<'_, Type> { match self { Self::Legacy(v) => StringMapRef::Legacy(&v.parameters), Self::Decoded(v) => StringMapRef::Fallible(&v.parameters) } }
+    pub(crate) fn guards(&self) -> &[Expr] { match self { Self::Legacy(v) => &v.guards, Self::Decoded(v) => &v.guards } }
+    pub(crate) fn ensures(&self) -> &[Expr] { match self { Self::Legacy(v) => &v.ensures, Self::Decoded(v) => &v.ensures } }
+    pub(crate) fn steps(&self) -> StatementSlice<'a> { match self { Self::Legacy(v) => StatementSlice::Legacy(&v.steps), Self::Decoded(v) => StatementSlice::Decoded(&v.steps) } }
+}
+trait ActionNode {
+    fn action_id(&self) -> &str;
+    fn action_label(&self) -> &str;
+    fn action_parameters(&self) -> StringMapRef<'_, Type>;
+    fn action_guards(&self) -> &[Expr];
+    fn action_ensures(&self) -> &[Expr];
+    fn action_steps(&self) -> StatementSlice<'_>;
+}
+impl ActionNode for ActionDefinition {
+    fn action_id(&self) -> &str { &self.id }
+    fn action_label(&self) -> &str { &self.label }
+    fn action_parameters(&self) -> StringMapRef<'_, Type> { StringMapRef::Legacy(&self.parameters) }
+    fn action_guards(&self) -> &[Expr] { &self.guards }
+    fn action_ensures(&self) -> &[Expr] { &self.ensures }
+    fn action_steps(&self) -> StatementSlice<'_> { StatementSlice::Legacy(&self.steps) }
+}
+impl ActionNode for fallible_app_decode::DecodedActionDefinition {
+    fn action_id(&self) -> &str { &self.id }
+    fn action_label(&self) -> &str { &self.label }
+    fn action_parameters(&self) -> StringMapRef<'_, Type> { StringMapRef::Fallible(&self.parameters) }
+    fn action_guards(&self) -> &[Expr] { &self.guards }
+    fn action_ensures(&self) -> &[Expr] { &self.ensures }
+    fn action_steps(&self) -> StatementSlice<'_> { StatementSlice::Decoded(&self.steps) }
+}
+impl ActionNode for ActionRef<'_> {
+    fn action_id(&self) -> &str { self.id() }
+    fn action_label(&self) -> &str { self.label() }
+    fn action_parameters(&self) -> StringMapRef<'_, Type> { self.parameters() }
+    fn action_guards(&self) -> &[Expr] { self.guards() }
+    fn action_ensures(&self) -> &[Expr] { self.ensures() }
+    fn action_steps(&self) -> StatementSlice<'_> { self.steps() }
+}
+trait ColumnNode { fn id(&self)->&str; fn label(&self)->&str; fn value(&self)->&Expr; }
+impl ColumnNode for Column { fn id(&self)->&str{&self.id} fn label(&self)->&str{&self.label} fn value(&self)->&Expr{&self.value} }
+impl ColumnNode for fallible_app_decode::DecodedColumn { fn id(&self)->&str{&self.id} fn label(&self)->&str{&self.label} fn value(&self)->&Expr{&self.value} }
+trait ControlNode { fn id(&self)->&str; fn label(&self)->&str; fn state(&self)->&str; fn on_change(&self)->Option<&str>; }
+impl ControlNode for StateControl { fn id(&self)->&str{&self.id} fn label(&self)->&str{&self.label} fn state(&self)->&str{&self.state} fn on_change(&self)->Option<&str>{self.on_change.as_deref()} }
+impl ControlNode for fallible_app_decode::DecodedStateControl { fn id(&self)->&str{&self.id} fn label(&self)->&str{&self.label} fn state(&self)->&str{&self.state} fn on_change(&self)->Option<&str>{self.on_change.as_deref()} }
+trait SelectionNode { fn id(&self)->&str; fn state(&self)->&str; fn on_change(&self)->Option<&str>; }
+impl SelectionNode for SelectionBinding { fn id(&self)->&str{&self.id} fn state(&self)->&str{&self.state} fn on_change(&self)->Option<&str>{self.on_change.as_deref()} }
+impl SelectionNode for fallible_app_decode::DecodedSelectionBinding { fn id(&self)->&str{&self.id} fn state(&self)->&str{&self.state} fn on_change(&self)->Option<&str>{self.on_change.as_deref()} }
+trait FormInputNode { fn parameter(&self)->&str; fn label(&self)->&str; }
+impl FormInputNode for FormInput { fn parameter(&self)->&str{&self.parameter} fn label(&self)->&str{&self.label} }
+impl FormInputNode for fallible_app_decode::DecodedFormInput { fn parameter(&self)->&str{&self.parameter} fn label(&self)->&str{&self.label} }
+trait BindingNode { fn id(&self)->&str; fn label(&self)->&str; fn placement(&self)->ActionPlacement; fn action(&self)->&str; fn arguments(&self)->StringMapRef<'_,Expr>; fn enabled(&self)->&Expr; }
+impl BindingNode for ActionBinding { fn id(&self)->&str{&self.id} fn label(&self)->&str{&self.label} fn placement(&self)->ActionPlacement{self.placement} fn action(&self)->&str{&self.action} fn arguments(&self)->StringMapRef<'_,Expr>{StringMapRef::Legacy(&self.arguments)} fn enabled(&self)->&Expr{&self.enabled} }
+impl BindingNode for fallible_app_decode::DecodedActionBinding { fn id(&self)->&str{&self.id} fn label(&self)->&str{&self.label} fn placement(&self)->ActionPlacement{self.placement} fn action(&self)->&str{&self.action} fn arguments(&self)->StringMapRef<'_,Expr>{StringMapRef::Fallible(&self.arguments)} fn enabled(&self)->&Expr{&self.enabled} }
+trait KeyNode { fn key(&self)->&str; fn mask(&self)->u8; fn modifier_count(&self)->usize; fn binding(&self)->&str; }
+impl KeyNode for KeyBinding { fn key(&self)->&str{&self.key} fn mask(&self)->u8{self.modifiers.iter().fold(0,|m,v|m|match v{KeyModifier::Control=>1,KeyModifier::Alt=>2,KeyModifier::Shift=>4,KeyModifier::Command=>8})} fn modifier_count(&self)->usize{self.modifiers.len()} fn binding(&self)->&str{&self.binding} }
+impl KeyNode for fallible_app_decode::DecodedKeyBinding { fn key(&self)->&str{&self.key} fn mask(&self)->u8{self.modifiers.mask()} fn modifier_count(&self)->usize{self.modifiers.len()} fn binding(&self)->&str{&self.binding} }
+enum ViewKindView<'a, V: ViewNode> {
+    List { entity:&'a str, rows:&'a Expr, columns:&'a [V::Column], controls:&'a [V::Control], selection:Option<&'a V::Selection> },
+    Detail { entity:&'a str, record:&'a Expr, columns:&'a [V::Column] },
+    Form { action:&'a str, fields:&'a [V::FormInput], defaults:&'a V::Defaults },
+}
+trait ViewNode {
+    type Column: ColumnNode; type Control: ControlNode; type Selection: SelectionNode; type FormInput: FormInputNode;
+    type Binding: BindingNode; type Key: KeyNode; type Defaults: StringValueMap<DataValue>;
+    fn id(&self)->&str; fn label(&self)->&str; fn kind(&self)->ViewKindView<'_,Self> where Self:Sized;
+    fn actions(&self)->&[Self::Binding]; fn keys(&self)->&[Self::Key];
+    fn visit_expressions(&self, visit: &mut dyn FnMut(&Expr)) where Self: Sized {
+        match self.kind() {
+            ViewKindView::List { rows, columns, .. } => {
+                visit(rows);
+                for column in columns { visit(column.value()); }
+            }
+            ViewKindView::Detail { record, columns, .. } => {
+                visit(record);
+                for column in columns { visit(column.value()); }
+            }
+            ViewKindView::Form { .. } => {}
+        }
+        for binding in self.actions() {
+            visit(binding.enabled());
+            for (_, value) in binding.arguments().iter() { visit(value); }
+        }
+    }
+    fn visit_action_expressions(&self, visit: &mut dyn FnMut(&Expr)) where Self: Sized {
+        for binding in self.actions() {
+            visit(binding.enabled());
+            for (_, value) in binding.arguments().iter() { visit(value); }
+        }
+    }
+}
+impl ViewNode for ViewDefinition {
+    type Column=Column; type Control=StateControl; type Selection=SelectionBinding; type FormInput=FormInput; type Binding=ActionBinding; type Key=KeyBinding; type Defaults=Values;
+    fn id(&self)->&str{&self.id} fn label(&self)->&str{&self.label} fn actions(&self)->&[Self::Binding]{&self.actions} fn keys(&self)->&[Self::Key]{&self.keys}
+    fn kind(&self)->ViewKindView<'_,Self>{match &self.kind{ViewKind::List{entity,rows,columns,controls,selection}=>ViewKindView::List{entity,rows,columns,controls,selection:selection.as_ref()},ViewKind::Detail{entity,record,columns}=>ViewKindView::Detail{entity,record,columns},ViewKind::Form{action,fields,defaults}=>ViewKindView::Form{action,fields,defaults}}}
+}
+impl ViewNode for fallible_app_decode::DecodedViewDefinition {
+    type Column=fallible_app_decode::DecodedColumn; type Control=fallible_app_decode::DecodedStateControl; type Selection=fallible_app_decode::DecodedSelectionBinding; type FormInput=fallible_app_decode::DecodedFormInput; type Binding=fallible_app_decode::DecodedActionBinding; type Key=fallible_app_decode::DecodedKeyBinding; type Defaults=FallibleValues;
+    fn id(&self)->&str{&self.id} fn label(&self)->&str{&self.label} fn actions(&self)->&[Self::Binding]{&self.actions} fn keys(&self)->&[Self::Key]{&self.keys}
+    fn kind(&self)->ViewKindView<'_,Self>{use fallible_app_decode::DecodedViewKind as K;match &self.kind{K::List{entity,rows,columns,controls,selection}=>ViewKindView::List{entity,rows,columns,controls,selection:selection.as_ref()},K::Detail{entity,record,columns}=>ViewKindView::Detail{entity,record,columns},K::Form{action,fields,defaults}=>ViewKindView::Form{action,fields,defaults}}}
+}
+#[derive(Clone, Copy)]
+pub(crate) enum StatementSlice<'a> {
+    Legacy(&'a [Statement]),
+    Decoded(&'a [fallible_app_decode::DecodedStatement]),
+}
+#[derive(Clone, Copy)]
+pub(crate) enum StatementView<'a> {
+    Create { entity: &'a str, values: StringMapRef<'a, Expr>, bind: &'a str },
+    Update { record: &'a Expr, values: StringMapRef<'a, Expr> },
+    Archive { record: &'a Expr },
+    SetState { state: &'a str, value: &'a Expr },
+    Collection { target: &'a CollectionTarget, operation: CollectionOperation, items: &'a Expr },
+    ForEach { items: &'a Expr, binding: &'a str, steps: StatementSlice<'a> },
+    Assert { condition: &'a Expr, message: &'a str },
+    Emit { output: &'a str, items: &'a Expr, binding: &'a str, columns: StringMapRef<'a, Expr> },
+}
+trait StatementNode { fn statement_view(&self) -> StatementView<'_>; }
+impl StatementNode for Statement {
+    fn statement_view(&self) -> StatementView<'_> { match self {
+        Self::Create { entity, values, bind } => StatementView::Create { entity, values: StringMapRef::Legacy(values), bind },
+        Self::Update { record, values } => StatementView::Update { record, values: StringMapRef::Legacy(values) },
+        Self::Archive { record } => StatementView::Archive { record },
+        Self::SetState { state, value } => StatementView::SetState { state, value },
+        Self::Collection { target, operation, items } => StatementView::Collection { target, operation: *operation, items },
+        Self::ForEach { items, binding, steps } => StatementView::ForEach { items, binding, steps: StatementSlice::Legacy(steps) },
+        Self::Assert { condition, message } => StatementView::Assert { condition, message },
+        Self::Emit { output, items, binding, columns } => StatementView::Emit { output, items, binding, columns: StringMapRef::Legacy(columns) },
+    }}
+}
+impl StatementNode for fallible_app_decode::DecodedStatement {
+    fn statement_view(&self) -> StatementView<'_> { use fallible_app_decode::DecodedStatement as S; match self {
+        S::Create { entity, values, bind } => StatementView::Create { entity, values: StringMapRef::Fallible(values), bind },
+        S::Update { record, values } => StatementView::Update { record, values: StringMapRef::Fallible(values) },
+        S::Archive { record } => StatementView::Archive { record },
+        S::SetState { state, value } => StatementView::SetState { state, value },
+        S::Collection { target, operation, items } => StatementView::Collection { target, operation: *operation, items },
+        S::ForEach { items, binding, steps } => StatementView::ForEach { items, binding, steps: StatementSlice::Decoded(steps) },
+        S::Assert { condition, message } => StatementView::Assert { condition, message },
+        S::Emit { output, items, binding, columns } => StatementView::Emit { output, items, binding, columns: StringMapRef::Fallible(columns) },
+    }}
+}
+impl StatementSlice<'_> {
+    fn visit(&self, f: &mut dyn FnMut(&dyn StatementNode) -> Result<()>) -> Result<()> {
+        match self {
+            Self::Legacy(items) => for item in *items { f(item)?; },
+            Self::Decoded(items) => for item in *items { f(item)?; },
+        }
+        Ok(())
+    }
+}
+impl<'a> StatementSlice<'a> {
+    pub(crate) fn len(&self) -> usize { match self { Self::Legacy(v) => v.len(), Self::Decoded(v) => v.len() } }
+    pub(crate) fn is_empty(&self) -> bool { self.len() == 0 }
+    pub(crate) fn slice_prefix(self, end: usize) -> Self { match self { Self::Legacy(v) => Self::Legacy(&v[..end]), Self::Decoded(v) => Self::Decoded(&v[..end]) } }
+    pub(crate) fn slice_range(self, start: usize, len: usize) -> Self { let end=start+len; match self { Self::Legacy(v) => Self::Legacy(&v[start..end]), Self::Decoded(v) => Self::Decoded(&v[start..end]) } }
+    pub(crate) fn get(&self, index: usize) -> Option<StatementView<'a>> {
+        match self {
+            Self::Legacy(items) => items.get(index).map(StatementNode::statement_view),
+            Self::Decoded(items) => items.get(index).map(StatementNode::statement_view),
+        }
+    }
+    pub(crate) fn statement_digest_with(
+        &self, index: usize, cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Digest, crate::product_backup::fallible_codec::CodecError> {
+        match self {
+            Self::Legacy(items) => crate::product_backup::fallible_codec::canonical_digest(
+                IdentityDomain::Evidence, items.get(index).ok_or(crate::product_backup::fallible_codec::CodecError::SerializationInvariant)?, cx,
+            ),
+            Self::Decoded(items) => crate::product_backup::fallible_codec::canonical_digest(
+                IdentityDomain::Evidence, items.get(index).ok_or(crate::product_backup::fallible_codec::CodecError::SerializationInvariant)?, cx,
+            ),
+        }
+    }
+    pub(crate) fn span_digest_with(
+        &self, start: usize, len: usize, cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<Digest, crate::product_backup::fallible_codec::CodecError> {
+        let end = start.checked_add(len).ok_or(crate::product_backup::fallible_codec::CodecError::SerializationInvariant)?;
+        match self {
+            Self::Legacy(items) => crate::product_backup::fallible_codec::canonical_digest(IdentityDomain::Evidence, &("owned-span/1", items.get(start..end).ok_or(crate::product_backup::fallible_codec::CodecError::SerializationInvariant)?), cx),
+            Self::Decoded(items) => crate::product_backup::fallible_codec::canonical_digest(IdentityDomain::Evidence, &("owned-span/1", items.get(start..end).ok_or(crate::product_backup::fallible_codec::CodecError::SerializationInvariant)?), cx),
+        }
+    }
+}
+impl<'a> AppRef<'a> {
+    pub(crate) fn is_fallible(&self) -> bool { matches!(self, Self::Decoded(_)) }
+    pub(crate) fn legacy(&self) -> Option<&'a AppDefinition> { match self { Self::Legacy(app) => Some(app), _ => None } }
+    pub(crate) fn entities(&self) -> &'a [EntityDefinition] {
+        match self {
+            Self::Legacy(app) => &app.entities,
+            Self::Decoded(app) => &app.entities,
+            Self::Snapshot => &[],
+        }
+    }
+    pub(crate) fn states(&self) -> &'a [StateDefinition] {
+        match self {
+            Self::Legacy(app) => &app.state,
+            Self::Decoded(app) => &app.state,
+            Self::Snapshot => &[],
+        }
+    }
+    pub(crate) fn outputs(&self) -> &'a [OutputDefinition] {
+        match self {
+            Self::Legacy(app) => &app.outputs,
+            Self::Decoded(app) => &app.outputs,
+            Self::Snapshot => &[],
+        }
+    }
+    pub(crate) fn view_count(&self) -> usize {
+        match self { Self::Legacy(app) => app.views.len(), Self::Decoded(app) => app.views.len(), Self::Snapshot => 0 }
+    }
+    pub(crate) fn view(&self, index: usize) -> Option<ViewRef<'a>> {
+        match self {
+            Self::Legacy(app) => app.views.get(index).map(ViewRef::Legacy),
+            Self::Decoded(app) => app.views.get(index).map(ViewRef::Decoded),
+            Self::Snapshot => None,
+        }
+    }
+    pub(crate) fn id(&self) -> Option<&'a str> {
+        match self { Self::Legacy(app) => Some(&app.id), Self::Decoded(app) => Some(&app.id), Self::Snapshot => None }
+    }
+    pub(crate) fn label(&self) -> Option<&'a str> {
+        match self { Self::Legacy(app) => Some(&app.label), Self::Decoded(app) => Some(&app.label), Self::Snapshot => None }
+    }
+    pub(crate) fn version(&self) -> Option<u32> {
+        match self { Self::Legacy(app) => Some(app.version), Self::Decoded(app) => Some(app.version), Self::Snapshot => None }
+    }
+    pub(crate) fn initial_view(&self) -> Option<&'a str> {
+        match self { Self::Legacy(app) => Some(&app.initial_view), Self::Decoded(app) => Some(&app.initial_view), Self::Snapshot => None }
+    }
+    pub(crate) fn observable_count(&self) -> usize {
+        match self { Self::Legacy(app) => app.observables.len(), Self::Decoded(app) => app.observables.len(), Self::Snapshot => 0 }
+    }
+    pub(crate) fn observable(&self, index: usize) -> Option<(&'a str, &'a Expr)> {
+        match self {
+            Self::Legacy(app) => app.observables.get(index).map(|v| (v.id.as_str(), &v.value)),
+            Self::Decoded(app) => app.observables.get(index).map(|v| (v.id.as_str(), &v.value)),
+            Self::Snapshot => None,
+        }
+    }
+    pub(crate) fn column_expression(&self, view: &str, column: &str) -> Option<(&'a str, &'a Expr)> {
+        match self {
+            Self::Legacy(app) => app.views.iter().find(|v| v.id == view).and_then(|view| match &view.kind {
+                ViewKind::List { entity, columns, .. } | ViewKind::Detail { entity, columns, .. } => columns.iter().find(|c| c.id == column).map(|c| (entity.as_str(), &c.value)),
+                ViewKind::Form { .. } => None,
+            }),
+            Self::Decoded(app) => app.views.iter().find(|v| v.id == view).and_then(|view| match &view.kind {
+                fallible_app_decode::DecodedViewKind::List { entity, columns, .. } | fallible_app_decode::DecodedViewKind::Detail { entity, columns, .. } => columns.iter().find(|c| c.id == column).map(|c| (entity.as_str(), &c.value)),
+                fallible_app_decode::DecodedViewKind::Form { .. } => None,
+            }),
+            Self::Snapshot => None,
+        }
+    }
+    pub(crate) fn visit_view_action_expressions(&self, visit: &mut dyn FnMut(&Expr)) {
+        match self {
+            Self::Legacy(app) => for view in &app.views { view.visit_action_expressions(visit); },
+            Self::Decoded(app) => for view in &app.views { view.visit_action_expressions(visit); },
+            Self::Snapshot => {}
+        }
+    }
+    pub(crate) fn visit_expressions(&self, visit: &mut dyn FnMut(&Expr)) {
+        fn statements(steps: StatementSlice<'_>, visit: &mut dyn FnMut(&Expr)) {
+            for index in 0..steps.len() {
+                match steps.get(index).expect("bounded statement index") {
+                    StatementView::Create { values, .. } => for (_, value) in values.iter() { visit(value); },
+                    StatementView::Update { record, values } => {
+                        visit(record);
+                        for (_, value) in values.iter() { visit(value); }
+                    }
+                    StatementView::Archive { record } => visit(record),
+                    StatementView::SetState { value, .. } => visit(value),
+                    StatementView::Collection { target, items, .. } => {
+                        if let CollectionTarget::Field { record, .. } = target { visit(record); }
+                        visit(items);
+                    }
+                    StatementView::ForEach { items, steps, .. } => { visit(items); statements(steps, visit); }
+                    StatementView::Assert { condition, .. } => visit(condition),
+                    StatementView::Emit { items, columns, .. } => {
+                        visit(items);
+                        for (_, value) in columns.iter() { visit(value); }
+                    }
+                }
+            }
+        }
+        match self {
+            Self::Legacy(app) => {
+                for entity in &app.entities { for constraint in &entity.constraints { visit(constraint); } }
+                for action in &app.actions {
+                    for expr in action.guards.iter().chain(&action.ensures) { visit(expr); }
+                    statements(StatementSlice::Legacy(&action.steps), visit);
+                }
+                for observable in &app.observables { visit(&observable.value); }
+                for view in &app.views { view.visit_expressions(visit); }
+            }
+            Self::Decoded(app) => {
+                for entity in &app.entities { for constraint in &entity.constraints { visit(constraint); } }
+                for action in &app.actions {
+                    for expr in action.guards.iter().chain(&action.ensures) { visit(expr); }
+                    statements(StatementSlice::Decoded(&action.steps), visit);
+                }
+                for observable in &app.observables { visit(&observable.value); }
+                for view in &app.views { view.visit_expressions(visit); }
+            }
+            Self::Snapshot => {}
+        }
+    }
+    pub(crate) fn entity_field_type(&self, entity: &str, field: &str) -> Option<&'a Type> {
+        let entities = match self {
+            Self::Legacy(app) => app.entities.as_slice(),
+            Self::Decoded(app) => app.entities.as_slice(),
+            Self::Snapshot => return None,
+        };
+        entities.iter().find(|e| e.id == entity)
+            .and_then(|e| e.fields.iter().find(|f| f.id == field))
+            .map(|f| &f.value_type)
+    }
+    pub(crate) fn state_type(&self, id: &str) -> Option<&'a Type> {
+        let states = match self {
+            Self::Legacy(app) => app.state.as_slice(),
+            Self::Decoded(app) => app.state.as_slice(),
+            Self::Snapshot => return None,
+        };
+        states.iter().find(|s| s.id == id).map(|s| &s.value_type)
+    }
+    pub(crate) fn action(&self, id: &str) -> Option<ActionRef<'a>> {
+        match self {
+            Self::Legacy(app) => app.actions.iter().find(|a| a.id == id).map(ActionRef::Legacy),
+            Self::Decoded(app) => app.actions.iter().find(|a| a.id == id).map(ActionRef::Decoded),
+            Self::Snapshot => None,
+        }
+    }
+    pub(crate) fn actions(&self) -> ActionSlice<'a> {
+        match self {
+            Self::Legacy(app) => ActionSlice::Legacy(&app.actions),
+            Self::Decoded(app) => ActionSlice::Decoded(&app.actions),
+            Self::Snapshot => ActionSlice::Legacy(&[]),
+        }
+    }
+    pub(crate) fn view_entity(&self, id: &str) -> Option<Option<&'a str>> {
+        match self {
+            Self::Legacy(app) => app.views.iter().find(|v| v.id == id).map(|v| match &v.kind {
+                ViewKind::List { entity, .. } | ViewKind::Detail { entity, .. } => Some(entity.as_str()),
+                ViewKind::Form { .. } => None,
+            }),
+            Self::Decoded(app) => app.views.iter().find(|v| v.id == id).map(|v| match &v.kind {
+                fallible_app_decode::DecodedViewKind::List { entity, .. }
+                | fallible_app_decode::DecodedViewKind::Detail { entity, .. } => Some(entity.as_str()),
+                fallible_app_decode::DecodedViewKind::Form { .. } => None,
+            }),
+            Self::Snapshot => None,
+        }
+    }
+}
+impl<'a> From<&'a AppDefinition> for AppRef<'a> {
+    fn from(value: &'a AppDefinition) -> Self { Self::Legacy(value) }
+}
+impl<'a> From<&'a fallible_app_decode::DecodedAppDefinition> for AppRef<'a> {
+    fn from(value: &'a fallible_app_decode::DecodedAppDefinition) -> Self { Self::Decoded(value) }
+}
+enum AppEnvironment {
+    Legacy(BTreeMap<Id, Type>),
+    Decoded(fallible_app_decode::FallibleMap<Type>),
 }
 type Environment = BTreeMap<Id, Type>;
-impl<'a> Validator<'a> {
+enum EnvironmentIter<'a> {
+    Legacy(std::collections::btree_map::Iter<'a, Id, Type>),
+    Decoded(fallible_app_decode::FallibleMapIter<'a, Type>),
+}
+impl<'a> Iterator for EnvironmentIter<'a> {
+    type Item = (&'a String, &'a Type);
+    fn next(&mut self) -> Option<Self::Item> {
+        match self { Self::Legacy(iter) => iter.next(), Self::Decoded(iter) => iter.next() }
+    }
+}
+impl ExactSizeIterator for EnvironmentIter<'_> {}
+impl StringValueMap<Type> for AppEnvironment {
+    type Iter<'a> = EnvironmentIter<'a> where Self: 'a, Type: 'a;
+    fn len(&self) -> usize {
+        match self { Self::Legacy(map) => map.len(), Self::Decoded(map) => map.len() }
+    }
+    fn get(&self, key: &str) -> Option<&Type> {
+        match self { Self::Legacy(map) => map.get(key), Self::Decoded(map) => map.get(key) }
+    }
+    fn contains_key(&self, key: &str) -> bool {
+        match self { Self::Legacy(map) => map.contains_key(key), Self::Decoded(map) => map.contains_key(key) }
+    }
+    fn iter(&self) -> Self::Iter<'_> {
+        match self { Self::Legacy(map) => EnvironmentIter::Legacy(map.iter()), Self::Decoded(map) => EnvironmentIter::Decoded(map.iter()) }
+    }
+}
+fn charge_type_map_clone<M: StringValueMap<Type>>(audit: Audit<'_>, map: &M) -> Result<()> {
+    if !audit.enabled() { return Ok(()); }
+    audit.pay(1)?;
+    audit.map_iter(map.len())?;
+    for (key, value) in map.iter() {
+        audit.pay(4)?;
+        key.pay_owned(audit)?;
+        value.pay_owned(audit)?;
+    }
+    audit.pay(crate::product_contract::bounded_input::capture_payment_core::CLONE_DESCRIPTOR)?;
+    audit.amount(crate::product_contract::bounded_input::capture_payment_core::btree_clone::<String, Type>(map.len(), 0))
+}
+impl AppEnvironment {
+    fn empty(app: AppRef<'_>) -> Self {
+        match app { AppRef::Decoded(_) => Self::Decoded(fallible_app_decode::FallibleMap::new()), _ => Self::Legacy(BTreeMap::new()) }
+    }
+}
+struct Validator<'a, 'w, 'c> {
+    entities: &'a [EntityDefinition],
+    state: &'a [StateDefinition],
+    actions: &'a [ActionDefinition],
+    outputs: &'a [OutputDefinition],
+    app: AppRef<'a>,
+    allocation: Option<&'c mut crate::product_alloc::AllocationContext>,
+    allocation_failure: Option<crate::product_alloc::AllocationFailure>,
+    nodes: usize,
+    audit: Audit<'w>,
+}
+impl<'a, 'w, 'c> Validator<'a, 'w, 'c> {
+    fn new(app: &'a AppDefinition, audit: Audit<'w>) -> Self {
+        Self { entities:&app.entities, state:&app.state, actions:&app.actions, outputs:&app.outputs,
+            app:AppRef::Legacy(app), allocation:None, allocation_failure:None, nodes:0, audit }
+    }
+    fn new_app(app: AppRef<'a>, audit: Audit<'w>, allocation: &'c mut crate::product_alloc::AllocationContext) -> Self {
+        let (entities,state,actions,outputs)=match app {
+            AppRef::Legacy(app)=>(app.entities.as_slice(),app.state.as_slice(),app.actions.as_slice(),app.outputs.as_slice()),
+            AppRef::Decoded(app)=>(app.entities.as_slice(),app.state.as_slice(),&[][..],app.outputs.as_slice()),
+            AppRef::Snapshot => (&[][..],&[][..],&[][..],&[][..]),
+        };
+        Self { entities, state, actions, outputs, app, allocation:Some(allocation), allocation_failure:None, nodes:0, audit }
+    }
+    fn is_decoded(&self) -> bool { matches!(self.app, AppRef::Decoded(_)) }
+    fn empty_environment(&self) -> AppEnvironment { AppEnvironment::empty(self.app) }
+    fn clone_environment(&mut self, env: &AppEnvironment) -> Result<AppEnvironment> {
+        let a = self.audit;
+        match env {
+            AppEnvironment::Legacy(map) => Ok(AppEnvironment::Legacy(a.clone_owned(map)?)),
+            AppEnvironment::Decoded(map) => {
+                charge_type_map_clone(a, map)?;
+                let result = map.try_clone_with(self.allocation.as_deref_mut().expect("decoded app has allocation context"), |value, cx| values_map::try_clone_type(value, cx));
+                match result {
+                    Ok(copy) => Ok(AppEnvironment::Decoded(copy)),
+                    Err(failure) => { self.allocation_failure = Some(failure); Err(ContractError(String::new())) }
+                }
+            }
+        }
+    }
+    fn insert_environment(&mut self, env: &mut AppEnvironment, key: &str, value: Type) -> Result<()> {
+        let a = self.audit;
+        match env {
+            AppEnvironment::Legacy(map) => a.insert_string(map, key, value),
+            AppEnvironment::Decoded(map) => {
+                a.string(key.len())?;
+                a.insert::<String, Type>(map.len(), a.comparator(key.len())?)?;
+                let cx = self.allocation.as_deref_mut().expect("decoded app has allocation context");
+                let owned_key = crate::product_alloc::try_copy_str(key, cx, crate::product_alloc::AllocationSite::String)
+                    .and_then(|key| map.try_insert(key, value, cx).map(|_| ()))
+                    .map_err(|failure| { self.allocation_failure = Some(failure); ContractError(String::new()) });
+                owned_key
+            }
+        }
+    }
+    fn parameter_environment(&mut self, parameters: StringMapRef<'_, Type>) -> Result<AppEnvironment> {
+        let a = self.audit;
+        match parameters {
+            StringMapRef::Legacy(map) => Ok(AppEnvironment::Legacy(a.clone_owned(map)?)),
+            StringMapRef::Fallible(map) => {
+                charge_type_map_clone(a, map)?;
+                let cx = self.allocation.as_deref_mut().expect("decoded app has allocation context");
+                match map.try_clone_with(cx, |value, cx| values_map::try_clone_type(value, cx)) {
+                    Ok(copy) => Ok(AppEnvironment::Decoded(copy)),
+                    Err(failure) => { self.allocation_failure = Some(failure); Err(ContractError(String::new())) }
+                }
+            }
+        }
+    }
+    fn action_definition<A: ActionNode>(&mut self, action: &A) -> Result<()> {
+        let a = self.audit;
+        a.pay(12)?;
+        a.nonempty(action.action_label())?;
+        let steps = action.action_steps();
+        a.require(!steps.is_empty(), "action needs steps")?;
+        let parameters = action.action_parameters();
+        a.map_iter(parameters.len())?;
+        a.unique(parameters.iter().map(|(key, _)| key.as_str()))?;
+        a.map_iter(parameters.len())?;
+        for (_, typ) in parameters.iter() { a.pay(12)?; self.typ(typ, 0)?; }
+        let mut env = self.parameter_environment(parameters)?;
+        let guards = action.action_guards();
+        let ensures = action.action_ensures();
+        a.bounded(guards.len())?;
+        a.bounded(ensures.len())?;
+        a.slice(guards.len())?;
+        for guard in guards { a.pay(12)?; self.expect(guard, &env, &Type::Boolean, 0, true)?; }
+        self.statements(steps, &mut env, 0)?;
+        a.slice(ensures.len())?;
+        for condition in ensures { a.pay(12)?; self.expect(condition, &env, &Type::Boolean, 0, true)?; }
+        Ok(())
+    }
     fn node(&mut self, depth: usize) -> Result<()> {
-        self.nodes += 1;
-        require(
+        let a = self.audit;
+        a.pay(8)?;
+        self.nodes = self.nodes.checked_add(1).ok_or_else(|| a.overflow())?;
+        a.require(
             depth <= MAX_EXPR_DEPTH && self.nodes <= MAX_AST_NODES,
             "AST depth or node budget exceeded",
         )
     }
     fn entity(&self, id: &str) -> Result<&'a EntityDefinition> {
-        self.app
-            .entities
-            .iter()
-            .find(|e| e.id == id)
-            .ok_or_else(|| ContractError(format!("unknown entity: {id}")))
+        let a=self.audit;
+        if let Some(value)=a.find(self.entities,id,|v|&v.id)? { return Ok(value); }
+        a.pay(2)?;a.format(id.len().checked_add(16).ok_or_else(||a.overflow())?)?;
+        Err(ContractError(format!("unknown entity: {id}")))
     }
     fn state(&self, id: &str) -> Result<&'a StateDefinition> {
-        self.app
-            .state
-            .iter()
-            .find(|s| s.id == id)
-            .ok_or_else(|| ContractError(format!("unknown state: {id}")))
+        let a=self.audit;
+        if let Some(value)=a.find(self.state,id,|v|&v.id)? { return Ok(value); }
+        a.pay(2)?;a.format(id.len().checked_add(15).ok_or_else(||a.overflow())?)?;
+        Err(ContractError(format!("unknown state: {id}")))
     }
     fn action(&self, id: &str) -> Result<&'a ActionDefinition> {
-        self.app
-            .actions
-            .iter()
-            .find(|a| a.id == id)
-            .ok_or_else(|| ContractError(format!("unknown action: {id}")))
+        let a=self.audit;
+        if let Some(value)=a.find(self.actions,id,|v|&v.id)? { return Ok(value); }
+        a.pay(2)?;a.format(id.len().checked_add(16).ok_or_else(||a.overflow())?)?;
+        Err(ContractError(format!("unknown action: {id}")))
+    }
+    fn action_any(&self, id: &str) -> Result<ActionRef<'a>> {
+        let a=self.audit;
+        let found = match self.app {
+            AppRef::Legacy(app) => a.find(&app.actions,id,|v|&v.id)?.map(ActionRef::Legacy),
+            AppRef::Decoded(app) => a.find(&app.actions,id,|v|&v.id)?.map(ActionRef::Decoded),
+            AppRef::Snapshot => a.find(self.actions,id,|v|&v.id)?.map(ActionRef::Legacy),
+        };
+        if let Some(value)=found { return Ok(value); }
+        a.pay(2)?;a.format(id.len().checked_add(16).ok_or_else(||a.overflow())?)?;
+        Err(ContractError(format!("unknown action: {id}")))
     }
     fn field(&self, entity: &str, field: &str) -> Result<&'a FieldDefinition> {
-        self.entity(entity)?
-            .fields
-            .iter()
-            .find(|f| f.id == field)
-            .ok_or_else(|| ContractError(format!("unknown field: {entity}.{field}")))
+        let a=self.audit;
+        if let Some(value)=a.find(&self.entity(entity)?.fields,field,|v|&v.id)? {return Ok(value);}
+        a.pay(3)?;a.format(entity.len().checked_add(field.len()).and_then(|n|n.checked_add(16)).ok_or_else(||a.overflow())?)?;
+        Err(ContractError(format!("unknown field: {entity}.{field}")))
     }
     fn typ(&self, typ: &Type, depth: usize) -> Result<()> {
-        require(depth <= MAX_TYPE_DEPTH, "type nesting budget exceeded")?;
+        let a = self.audit;
+        a.pay(8)?;
+        a.require(depth <= MAX_TYPE_DEPTH, "type nesting budget exceeded")?;
         match typ {
             Type::Reference { entity } => {
                 self.entity(entity)?;
             }
             Type::List { item } => self.typ(item, depth + 1)?,
             Type::Optional { item } => {
-                require(
+                a.require(
                     !matches!(item.as_ref(), Type::Optional { .. }),
                     "nested optional type",
                 )?;
@@ -638,79 +2481,133 @@ impl<'a> Validator<'a> {
         }
         Ok(())
     }
-    fn bound(env: &Environment, name: &str, typ: Type) -> Result<Environment> {
-        check_id(name)?;
-        require(
-            !env.contains_key(name),
-            format!("binding shadows existing variable: {name}"),
-        )?;
-        let mut env = env.clone();
-        env.insert(name.into(), typ);
+    fn bound_for<M: StringValueMap<Type>>(&mut self, env: &M, name: &str, typ: Type) -> Result<AppEnvironment> {
+        let a = self.audit;
+        a.pay(8)?;
+        a.check_id(name)?;
+        let available = !a.has(env, name)?;
+        a.pay(8)?;
+        if a.enabled() && available {
+            a.pay(1)?;
+        } else {
+        a.pay(2)?;a.format(name.len().checked_add(35).ok_or_else(|| a.overflow())?)?;
+        a.require_owned(available, format!("binding shadows existing variable: {name}"))?;
+        }
+        let mut env = if self.is_decoded() {
+            let mut copied = fallible_app_decode::FallibleMap::new();
+            charge_type_map_clone(a, env)?;
+            for (key, value) in env.iter() {
+                let key = crate::product_alloc::try_copy_str(key, self.allocation.as_deref_mut().expect("decoded app has allocation context"), crate::product_alloc::AllocationSite::String)
+                    .map_err(|failure| { self.allocation_failure = Some(failure); ContractError(String::new()) })?;
+                let value = values_map::try_clone_type(value, self.allocation.as_deref_mut().expect("decoded app has allocation context"))
+                    .map_err(|failure| { self.allocation_failure = Some(failure); ContractError(String::new()) })?;
+                copied.try_insert(key,value,self.allocation.as_deref_mut().expect("decoded app has allocation context"))
+                    .map_err(|failure| { self.allocation_failure = Some(failure); ContractError(String::new()) })?;
+            }
+            AppEnvironment::Decoded(copied)
+        } else {
+            a.pay(1)?;
+            a.map_iter(env.len())?;
+            for (key,value) in env.iter() { a.pay(4)?; key.pay_owned(a)?; value.pay_owned(a)?; }
+            a.pay(crate::product_contract::bounded_input::capture_payment_core::CLONE_DESCRIPTOR)?;
+            a.amount(crate::product_contract::bounded_input::capture_payment_core::btree_clone::<String,Type>(env.len(),0))?;
+            AppEnvironment::Legacy(env.iter().map(|(k,v)|(k.clone(),v.clone())).collect())
+        };
+        self.insert_environment(&mut env, name, typ)?;
         Ok(env)
     }
-    fn expect(
+    fn bound(&self, env: &Environment, name: &str, typ: Type) -> Result<Environment> {
+        let a=self.audit;
+        a.pay(8)?;
+        a.check_id(name)?;
+        let available=!a.has(env,name)?;
+        a.pay(8)?;
+        if a.enabled() && available { a.pay(1)?; } else {
+            a.pay(2)?;a.format(name.len().checked_add(35).ok_or_else(||a.overflow())?)?;
+            a.require_owned(available,format!("binding shadows existing variable: {name}"))?;
+        }
+        let mut env=a.clone_owned(env)?;
+        a.insert_string(&mut env,name,typ)?;
+        Ok(env)
+    }
+    fn expect<M: StringValueMap<Type>>(
         &mut self,
         expr: &Expr,
-        env: &Environment,
+        env: &M,
         expected: &Type,
         depth: usize,
         state: bool,
     ) -> Result<()> {
+        let a = self.audit;
+        a.pay(8)?;
         let actual = self.expr(expr, env, depth, state)?;
-        require(
-            &actual == expected,
-            format!("expression type mismatch: expected {expected:?}, found {actual:?}"),
-        )
+        let equal = a.type_equal(&actual, expected)?;
+        a.pay(8)?;
+        if a.enabled() && equal {
+            a.pay(1)?;
+            Ok(())
+        } else {
+        a.type_message(44, expected, &actual)?;
+        a.require_owned(equal, format!("expression type mismatch: expected {expected:?}, found {actual:?}"))
+        }
     }
-    fn list_item(
+    fn list_item<M: StringValueMap<Type>>(
         &mut self,
         expr: &Expr,
-        env: &Environment,
+        env: &M,
         depth: usize,
         state: bool,
     ) -> Result<Type> {
+        let a = self.audit;
+        a.pay(8)?;
         match self.expr(expr, env, depth, state)? {
             Type::List { item } => Ok(*item),
-            _ => Err(ContractError("expected collection".into())),
+            _ => Err(a.error("expected collection")?),
         }
     }
-    fn record_entity(
+    fn record_entity<M: StringValueMap<Type>>(
         &mut self,
         expr: &Expr,
-        env: &Environment,
+        env: &M,
         depth: usize,
         state: bool,
     ) -> Result<Id> {
+        let a = self.audit;
+        a.pay(8)?;
         match self.expr(expr, env, depth, state)? {
             Type::Reference { entity } => Ok(entity),
-            _ => Err(ContractError(
-                "expected nonoptional record reference".into(),
-            )),
+            _ => Err(a.error("expected nonoptional record reference")?),
         }
     }
-    fn expr(&mut self, expr: &Expr, env: &Environment, depth: usize, state: bool) -> Result<Type> {
+    fn expr<M: StringValueMap<Type>>(&mut self, expr: &Expr, env: &M, depth: usize, state: bool) -> Result<Type> {
+        let a = self.audit;
+        a.pay(8)?;
         self.node(depth)?;
         let next = depth + 1;
+        a.pay(12)?;
         Ok(match expr {
             Expr::Literal { value_type, value } => {
                 self.typ(value_type, 0)?;
-                validate_value(value, value_type, 0)?;
-                value_type.clone()
+                validate_value_audited(value, value_type, 0, a)?;
+                a.clone_owned(value_type)?
             }
-            Expr::Variable { name } => env
-                .get(name)
-                .cloned()
-                .ok_or_else(|| ContractError(format!("unbound variable: {name}")))?,
+            Expr::Variable { name } => {
+                match a.get(env, name)? {
+                    Some(value) => a.clone_owned(value)?,
+                    None => {a.pay(2)?;a.format(name.len().checked_add(18).ok_or_else(||a.overflow())?)?;
+                        return Err(ContractError(format!("unbound variable: {name}")));}
+                }
+            },
             Expr::Field { record, field } => {
                 let entity = self.record_entity(record, env, next, state)?;
-                self.field(&entity, field)?.value_type.clone()
+                a.clone_owned(&self.field(&entity, field)?.value_type)?
             }
             Expr::State { state: id } => {
-                require(
+                a.require(
                     state,
                     "durable constraints cannot reference transient state",
                 )?;
-                self.state(id)?.value_type.clone()
+                a.clone_owned(&self.state(id)?.value_type)?
             }
             Expr::Today => Type::Date,
             Expr::Query {
@@ -722,20 +2619,22 @@ impl<'a> Validator<'a> {
                 ..
             } => {
                 self.entity(entity)?;
-                require(
+                a.require(
                     *limit > 0 && *limit <= MAX_COLLECTION,
                     "query limit out of bounds",
                 )?;
-                bounded(sort.len())?;
-                let env = Self::bound(env, binding, Type::reference(entity))?;
+                a.bounded(sort.len())?;
+                let env = self.bound_for(env, binding, a.reference_type(entity)?)?;
                 self.expect(predicate, &env, &Type::Boolean, next, state)?;
-                for key in sort {
-                    require(
+                a.slice(sort.len())?;
+        for key in sort {
+            a.pay(8)?;
+                    a.require(
                         self.expr(&key.value, &env, next, state)?.is_scalar(),
                         "sort key must be scalar",
                     )?;
                 }
-                Type::list(Type::reference(entity))
+                a.list_type(a.reference_type(entity)?)?
             }
             Expr::Filter {
                 items,
@@ -753,10 +2652,10 @@ impl<'a> Validator<'a> {
                 predicate,
             } => {
                 let item = self.list_item(items, env, next, state)?;
-                let env = Self::bound(env, binding, item.clone())?;
+                let env = self.bound_for(env, binding, a.clone_owned(&item)?)?;
                 self.expect(predicate, &env, &Type::Boolean, next, state)?;
                 if matches!(expr, Expr::Filter { .. }) {
-                    Type::list(item)
+                    a.list_type(item)?
                 } else {
                     Type::Boolean
                 }
@@ -767,8 +2666,8 @@ impl<'a> Validator<'a> {
                 value,
             } => {
                 let item = self.list_item(items, env, next, state)?;
-                let env = Self::bound(env, binding, item)?;
-                let result = Type::list(self.expr(value, &env, next, state)?);
+                let env = self.bound_for(env, binding, item)?;
+                let result = a.list_type(self.expr(value, &env, next, state)?)?;
                 self.typ(&result, 0)?;
                 result
             }
@@ -777,7 +2676,7 @@ impl<'a> Validator<'a> {
                 Type::Integer
             }
             Expr::Sum { items } => {
-                self.expect(items, env, &Type::list(Type::Integer), next, state)?;
+                self.expect(items, env, &a.list_type(Type::Integer)?, next, state)?;
                 Type::Integer
             }
             Expr::Contains { items, value } => {
@@ -786,12 +2685,7 @@ impl<'a> Validator<'a> {
                 Type::Boolean
             }
             Expr::Equal { left, right } | Expr::Less { left, right } => {
-                let typ = self.expr(left, env, next, state)?;
-                if matches!(expr, Expr::Less { .. }) {
-                    require(typ.is_scalar(), "ordered comparison requires scalar")?;
-                }
-                self.expect(right, env, &typ, next, state)?;
-                Type::Boolean
+                self.comparison_operands(left, right, env, next, state, matches!(expr, Expr::Less { .. }))?
             }
             Expr::Add { left, right } | Expr::Subtract { left, right } => {
                 self.expect(left, env, &Type::Integer, next, state)?;
@@ -813,9 +2707,11 @@ impl<'a> Validator<'a> {
                 Type::Text
             }
             Expr::And { values } | Expr::Or { values } => {
-                bounded(values.len())?;
-                require(!values.is_empty(), "empty boolean connective")?;
-                for value in values {
+                a.bounded(values.len())?;
+                a.require(!values.is_empty(), "empty boolean connective")?;
+                a.slice(values.len())?;
+        for value in values {
+            a.pay(8)?;
                     self.expect(value, env, &Type::Boolean, next, state)?;
                 }
                 Type::Boolean
@@ -836,7 +2732,7 @@ impl<'a> Validator<'a> {
             }
             Expr::Coalesce { value, fallback } => {
                 let Type::Optional { item } = self.expr(value, env, next, state)? else {
-                    return Err(ContractError("coalesce requires optional value".into()));
+                    return Err(a.error("coalesce requires optional value")?);
                 };
                 self.expect(fallback, env, &item, next, state)?;
                 *item
@@ -853,13 +2749,24 @@ impl<'a> Validator<'a> {
             }
         })
     }
-    fn assignment(
+    fn comparison_operands<M: StringValueMap<Type>>(&mut self, left: &Expr, right: &Expr, env: &M,
+        depth: usize, state: bool, ordered: bool) -> Result<Type> {
+        let a=self.audit;
+        a.pay(6)?;
+        let typ=self.expr(left, env, depth, state)?;
+        if ordered {a.require(typ.is_scalar(), "ordered comparison requires scalar")?;}
+        self.expect(right, env, &typ, depth, state)?;
+        Ok(Type::Boolean)
+    }
+    fn assignment<M: StringValueMap<Type>>(
         &mut self,
         value: &Expr,
-        env: &Environment,
+        env: &M,
         expected: &Type,
         depth: usize,
     ) -> Result<()> {
+        let a = self.audit;
+        a.pay(8)?;
         // Storage supplies the expected optional type to each conditional
         // branch. A sealed value may be Null while the live branch computes T.
         // This does not widen If expressions outside an optional assignment.
@@ -878,22 +2785,32 @@ impl<'a> Validator<'a> {
             return self.assignment(else_value, env, expected, depth + 1);
         }
         let actual = self.expr(value, env, depth, true)?;
-        require(
-            &actual == expected
-                || matches!(expected, Type::Optional { item } if item.as_ref() == &actual),
-            format!("assignment type mismatch: expected {expected:?}, found {actual:?}"),
-        )
+        let compatible = a.type_equal(&actual, expected)? || match expected {
+            Type::Optional { item } => a.type_equal(item, &actual)?, _ => false,
+        };
+        a.pay(8)?;
+        if a.enabled() && compatible {
+            a.pay(1)?;
+            Ok(())
+        } else {
+        a.type_message(44, expected, &actual)?;
+        a.require_owned(compatible, format!("assignment type mismatch: expected {expected:?}, found {actual:?}"))
+        }
     }
     fn assignments(
         &mut self,
         entity: &str,
-        values: &BTreeMap<Id, Expr>,
-        env: &Environment,
+        values: &impl StringValueMap<Expr>,
+        env: &impl StringValueMap<Type>,
         depth: usize,
         create: bool,
     ) -> Result<()> {
-        bounded(values.len())?;
-        for (field, value) in values {
+        let a = self.audit;
+        a.pay(8)?;
+        a.bounded(values.len())?;
+        a.map_iter(values.len())?;
+        for (field, value) in values.iter() {
+            a.pay(8)?;
             let typ = &self.field(entity, field)?.value_type;
             // Optional storage accepts a computed non-null inner value as well
             // as an explicitly optional expression, without splitting an atomic
@@ -901,239 +2818,220 @@ impl<'a> Validator<'a> {
             self.assignment(value, env, typ, depth)?;
         }
         if create {
-            for field in &self.entity(entity)?.fields {
-                require(
-                    values.contains_key(&field.id)
-                        || matches!(field.value_type, Type::Optional { .. }),
-                    format!("missing required field: {}", field.id),
-                )?;
+            let fields = &self.entity(entity)?.fields;
+            a.slice(fields.len())?;
+            for field in fields {
+            a.pay(8)?;
+                let present = a.has(values, &field.id)? || matches!(field.value_type, Type::Optional { .. });
+        a.pay(8)?;
+        if a.enabled() && present {
+            a.pay(1)?;
+        } else {
+                a.pay(2)?;a.format(field.id.len().checked_add(24).ok_or_else(||a.overflow())?)?;
+                a.require_owned(present, format!("missing required field: {}", field.id))?;
+        }
             }
         }
         Ok(())
     }
-    fn statements(
-        &mut self,
-        steps: &[Statement],
-        env: &mut Environment,
-        depth: usize,
-    ) -> Result<()> {
-        bounded(steps.len())?;
-        for step in steps {
+    fn statements(&mut self, steps: StatementSlice<'_>, env: &mut AppEnvironment, depth: usize) -> Result<()> {
+        let a = self.audit;
+        a.pay(8)?;
+        a.bounded(steps.len())?;
+        a.slice(steps.len())?;
+        steps.visit(&mut |step| {
+            a.pay(8)?;
+            a.pay(12)?;
             self.node(depth)?;
-            match step {
-                Statement::Create {
-                    entity,
-                    values,
-                    bind,
-                } => {
+            match step.statement_view() {
+                StatementView::Create { entity, values, bind } => {
                     self.entity(entity)?;
-                    self.assignments(entity, values, env, depth + 1, true)?;
-                    *env = Self::bound(env, bind, Type::reference(entity))?;
+                    self.assignments(entity, &values, env, depth + 1, true)?;
+                    let typ = a.reference_type(entity)?;
+                    *env = self.bound_for(env, bind, typ)?;
                 }
-                Statement::Update { record, values } => {
+                StatementView::Update { record, values } => {
                     let entity = self.record_entity(record, env, depth + 1, true)?;
-                    require(!values.is_empty(), "empty update")?;
-                    self.assignments(&entity, values, env, depth + 1, false)?;
+                    a.require(!values.is_empty(), "empty update")?;
+                    self.assignments(&entity, &values, env, depth + 1, false)?;
                 }
-                Statement::Archive { record } => {
-                    self.record_entity(record, env, depth + 1, true)?;
-                }
-                Statement::SetState { state, value } => {
+                StatementView::Archive { record } => { self.record_entity(record, env, depth + 1, true)?; }
+                StatementView::SetState { state, value } => {
                     self.expect(value, env, &self.state(state)?.value_type, depth + 1, true)?;
                 }
-                Statement::Collection { target, items, .. } => {
+                StatementView::Collection { target, items, .. } => {
                     let typ = match target {
-                        CollectionTarget::State { state } => self.state(state)?.value_type.clone(),
+                        CollectionTarget::State { state } => a.clone_owned(&self.state(state)?.value_type)?,
                         CollectionTarget::Field { record, field } => {
                             let entity = self.record_entity(record, env, depth + 1, true)?;
-                            self.field(&entity, field)?.value_type.clone()
+                            a.clone_owned(&self.field(&entity, field)?.value_type)?
                         }
                     };
-                    require(
-                        matches!(typ, Type::List { .. }),
-                        "collection mutation requires list target",
-                    )?;
+                    a.require(matches!(typ, Type::List { .. }), "collection mutation requires list target")?;
                     self.expect(items, env, &typ, depth + 1, true)?;
                 }
-                Statement::ForEach {
-                    items,
-                    binding,
-                    steps,
-                } => {
+                StatementView::ForEach { items, binding, steps } => {
                     let item = self.list_item(items, env, depth + 1, true)?;
-                    let mut local = Self::bound(env, binding, item)?;
+                    let mut local = self.bound_for(env, binding, item)?;
                     self.statements(steps, &mut local, depth + 1)?;
                 }
-                Statement::Assert { condition, message } => {
-                    nonempty(message)?;
+                StatementView::Assert { condition, message } => {
+                    a.nonempty(message)?;
                     self.expect(condition, env, &Type::Boolean, depth + 1, true)?;
                 }
-                Statement::Emit {
-                    output,
-                    items,
-                    binding,
-                    columns,
-                } => {
-                    let output = self
-                        .app
-                        .outputs
-                        .iter()
-                        .find(|o| &o.id == output)
-                        .ok_or_else(|| ContractError("unknown output".into()))?;
+                StatementView::Emit { output, items, binding, columns } => {
+                    let output = match a.find(self.outputs, output, |o| &o.id)? {
+                        Some(value) => value, None => return Err(a.error("unknown output")?),
+                    };
                     let item = self.list_item(items, env, depth + 1, true)?;
-                    let env = Self::bound(env, binding, item)?;
-                    require(
-                        columns.len() == output.columns.len(),
-                        "output columns differ from definition",
-                    )?;
+                    let local = self.bound_for(env, binding, item)?;
+                    a.require(columns.len() == output.columns.len(), "output columns differ from definition")?;
+                    a.slice(output.columns.len())?;
                     for column in &output.columns {
-                        let value = columns
-                            .get(&column.id)
-                            .ok_or_else(|| ContractError("missing output column".into()))?;
-                        self.expect(value, &env, &column.value_type, depth + 1, true)?;
+                        a.pay(8)?;
+                        let value = match a.get(&columns, &column.id)? {
+                            Some(value) => value, None => return Err(a.error("missing output column")?),
+                        };
+                        self.expect(value, &local, &column.value_type, depth + 1, true)?;
                     }
                 }
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
-    fn columns(&mut self, columns: &[Column], env: &Environment) -> Result<()> {
-        unique(columns.iter().map(|c| c.id.as_str()))?;
+    fn columns<C: ColumnNode>(&mut self, columns: &[C], env: &AppEnvironment) -> Result<()> {
+        let a = self.audit;
+        a.pay(8)?;
+        a.unique(columns.iter().map(|c| c.id()))?;
+        a.slice(columns.len())?;
         for column in columns {
-            nonempty(&column.label)?;
-            self.expr(&column.value, env, 0, true)?;
+            a.pay(8)?;
+            a.nonempty(column.label())?;
+            self.expr(column.value(), env, 0, true)?;
         }
         Ok(())
     }
     fn on_change(&self, action: Option<&str>, typ: &Type) -> Result<()> {
-        if let Some(action) = action {
-            require(
-                self.action(action)?.parameters == BTreeMap::from([("value".into(), typ.clone())]),
-                "on-change action must take exactly one value parameter of the control type",
-            )?;
+        let a = self.audit;
+        a.pay(8)?;
+        if let Some(action_id) = action {
+            let action = self.action_any(action_id)?;
+            let parameters = action.parameters();
+            if let ActionRef::Legacy(legacy) = action {
+                a.string(5)?;
+                if a.enabled() { typ.pay_owned(a)?; }
+                capture_canonical::reserve_from_iter::<String,Type>(1, a.comparator(5)?, a)?;
+                let expected = BTreeMap::from([("value".into(), typ.clone())]);
+                a.require(a.equal_owned(&legacy.parameters, &expected)?,
+                    "on-change action must take exactly one value parameter of the control type")?;
+            } else {
+                a.map_iter(parameters.len())?;
+                let matches = parameters.len() == 1 && match a.get(&parameters, "value")? {
+                    Some(value) => a.type_equal(value, typ)?, None => false,
+                };
+                a.require(matches, "on-change action must take exactly one value parameter of the control type")?;
+            }
         }
         Ok(())
     }
-    fn view(&mut self, view: &ViewDefinition) -> Result<()> {
-        nonempty(&view.label)?;
-        let mut env = Environment::new();
-        match &view.kind {
-            ViewKind::List {
-                entity,
-                rows,
-                columns,
-                controls,
-                selection,
-            } => {
+    fn view<V: ViewNode>(&mut self, view: &V) -> Result<()> {
+        let a = self.audit;
+        a.pay(8)?;
+        a.nonempty(view.label())?;
+        a.pay(8)?;
+        let mut env = self.empty_environment();
+        match view.kind() {
+            ViewKindView::List { entity, rows, columns, controls, selection } => {
                 self.entity(entity)?;
-                self.expect(rows, &env, &Type::list(Type::reference(entity)), 0, true)?;
-                env.insert("row".into(), Type::reference(entity));
+                self.expect(rows, &env, &a.list_type(a.reference_type(entity)?)?, 0, true)?;
+                let row_type = a.reference_type(entity)?;
+                self.insert_environment(&mut env, "row", row_type)?;
                 self.columns(columns, &env)?;
-                unique(
-                    controls
-                        .iter()
-                        .map(|c| c.id.as_str())
-                        .chain(selection.iter().map(|s| s.id.as_str())),
-                )?;
+                a.unique(controls.iter().map(|c|c.id()).chain(selection.iter().map(|s|s.id())))?;
+                a.slice(controls.len())?;
                 for control in controls {
-                    nonempty(&control.label)?;
-                    let typ = &self.state(&control.state)?.value_type;
-                    require(
-                        typ.is_scalar()
-                            || matches!(typ, Type::Optional { item } if item.is_scalar()),
-                        "control must edit a scalar",
-                    )?;
-                    self.on_change(control.on_change.as_deref(), typ)?;
+                    a.pay(8)?;
+                    a.nonempty(control.label())?;
+                    let typ = &self.state(control.state())?.value_type;
+                    a.require(typ.is_scalar() || matches!(typ,Type::Optional{item} if item.is_scalar()),
+                        "control must edit a scalar")?;
+                    self.on_change(control.on_change(), typ)?;
                 }
                 if let Some(selection) = selection {
-                    let typ = &self.state(&selection.state)?.value_type;
-                    require(
-                        *typ == Type::list(Type::reference(entity)),
-                        "selection state has wrong entity/type",
-                    )?;
-                    self.on_change(selection.on_change.as_deref(), typ)?;
+                    let typ = &self.state(selection.state())?.value_type;
+                    a.require(a.type_equal(typ,&a.list_type(a.reference_type(entity)?)?)?,
+                        "selection state has wrong entity/type")?;
+                    self.on_change(selection.on_change(), typ)?;
                 }
             }
-            ViewKind::Detail {
-                entity,
-                record,
-                columns,
-            } => {
+            ViewKindView::Detail { entity, record, columns } => {
                 self.entity(entity)?;
-                self.expect(record, &env, &Type::reference(entity), 0, true)?;
-                env.insert("row".into(), Type::reference(entity));
-                self.columns(columns, &env)?;
+                self.expect(record,&env,&a.reference_type(entity)?,0,true)?;
+                let row_type = a.reference_type(entity)?;
+                self.insert_environment(&mut env,"row",row_type)?;
+                self.columns(columns,&env)?;
             }
-            ViewKind::Form {
-                action,
-                fields,
-                defaults,
-            } => {
-                let action = self.action(action)?;
-                unique(fields.iter().map(|f| f.parameter.as_str()))?;
+            ViewKindView::Form { action: action_id, fields, defaults } => {
+                let action = self.action_any(action_id)?;
+                let parameters = action.parameters();
+                a.unique(fields.iter().map(|f|f.parameter()))?;
+                a.slice(fields.len())?;
                 for field in fields {
-                    nonempty(&field.label)?;
-                    require(
-                        action.parameters.contains_key(&field.parameter),
-                        "unknown form parameter",
-                    )?;
+                    a.pay(8)?;
+                    a.nonempty(field.label())?;
+                    a.require(a.has(&parameters,field.parameter())?,"unknown form parameter")?;
                 }
-                for (id, value) in defaults {
-                    let typ = action
-                        .parameters
-                        .get(id)
-                        .ok_or_else(|| ContractError("unknown default parameter".into()))?;
-                    validate_value(value, typ, 0)?;
+                a.map_iter(defaults.len())?;
+                for (id,value) in defaults.iter() {
+                    a.pay(8)?;
+                    let typ = match a.get(&parameters,id)? {Some(value)=>value,None=>return Err(a.error("unknown default parameter")?)};
+                    validate_value_audited(value,typ,0,a)?;
                 }
-                for id in action.parameters.keys() {
-                    require(
-                        defaults.contains_key(id) || fields.iter().any(|f| &f.parameter == id),
-                        "form omits required action parameter",
-                    )?;
+                a.map_iter(parameters.len())?;
+                for (id,_) in parameters.iter() {
+                    a.pay(8)?;
+                    a.require(a.has(defaults,id)? || a.find(fields,id,|f|f.parameter())?.is_some(),
+                        "form omits required action parameter")?;
                 }
             }
         }
-        unique(view.actions.iter().map(|a| a.id.as_str()))?;
-        for binding in &view.actions {
-            let env = if binding.placement == ActionPlacement::Row {
-                require(
-                    env.contains_key("row"),
-                    "row action requires a list or detail view",
-                )?;
-                env.clone()
-            } else {
-                Environment::new()
-            };
-            nonempty(&binding.label)?;
-            let action = self.action(&binding.action)?;
-            require(
-                binding.arguments.len() == action.parameters.len(),
-                "action argument count mismatch",
-            )?;
-            for (name, typ) in &action.parameters {
-                let value = binding
-                    .arguments
-                    .get(name)
-                    .ok_or_else(|| ContractError("missing action argument".into()))?;
-                self.expect(value, &env, typ, 0, true)?;
+        a.unique(view.actions().iter().map(|binding|binding.id()))?;
+        a.slice(view.actions().len())?;
+        for binding in view.actions() {
+            a.pay(8)?;
+            let local_env = if binding.placement()==ActionPlacement::Row {
+                a.require(a.has(&env,"row")?,"row action requires a list or detail view")?;
+                self.clone_environment(&env)?
+            } else { a.pay(8)?; self.empty_environment() };
+            a.nonempty(binding.label())?;
+            let action = self.action_any(binding.action())?;
+            let parameters = action.parameters();
+            let arguments = binding.arguments();
+            a.require(arguments.len()==parameters.len(),"action argument count mismatch")?;
+            a.map_iter(parameters.len())?;
+            for (name,typ) in parameters.iter() {
+                a.pay(8)?;
+                let value = match a.get(&arguments,name)? {Some(value)=>value,None=>return Err(a.error("missing action argument")?)};
+                self.expect(value,&local_env,typ,0,true)?;
             }
-            self.expect(&binding.enabled, &env, &Type::Boolean, 0, true)?;
+            self.expect(binding.enabled(),&local_env,&Type::Boolean,0,true)?;
         }
-        bounded(view.keys.len())?;
+        a.bounded(view.keys().len())?;
+        a.pay(8)?;
         let mut seen = BTreeSet::new();
-        for key in &view.keys {
-            require(valid_key(&key.key), "unsupported keyboard key")?;
-            require(
-                seen.insert((&key.key, &key.modifiers)),
-                "duplicate keyboard chord",
-            )?;
-            require(
-                view.actions.iter().any(|a| a.id == key.binding),
-                "unknown keyboard action binding",
-            )?;
+        a.slice(view.keys().len())?;
+        for key in view.keys() {
+            a.pay(8)?;
+            a.scaled(key.key().len(),4,40)?;
+            a.require(valid_key(key.key()),"unsupported keyboard key")?;
+            let chord=(key.key(),key.mask());
+            a.insert::<(&str,u8),()>(seen.len(),a.key_comparator_parts(key.key().len(),key.modifier_count())?)?;
+            a.require(seen.insert(chord),"duplicate keyboard chord")?;
+            a.require(a.find(view.actions(),key.binding(),|v|v.id())?.is_some(),"unknown keyboard action binding")?;
         }
         Ok(())
     }
+
 }
 pub fn valid_key(key: &str) -> bool {
     (key.len() == 1
@@ -1155,35 +3053,40 @@ pub fn valid_key(key: &str) -> bool {
         )
 }
 pub fn validate_value(value: &DataValue, typ: &Type, depth: usize) -> Result<()> {
-    require(depth <= MAX_TYPE_DEPTH, "value nesting budget exceeded")?;
+    validate_value_audited(value, typ, depth, Audit::none())
+}
+fn validate_value_audited(value: &DataValue, typ: &Type, depth: usize, a: Audit<'_>) -> Result<()> {
+    a.pay(8)?;
+    a.require(depth <= MAX_TYPE_DEPTH, "value nesting budget exceeded")?;
     if let Type::Optional { item } = typ {
         if matches!(value, DataValue::Null) {
             return Ok(());
         }
-        return validate_value(value, item, depth + 1);
+        return validate_value_audited(value, item, depth + 1, a);
     }
     match (value, typ) {
         (DataValue::Boolean { .. }, Type::Boolean) | (DataValue::Integer { .. }, Type::Integer) => {
             Ok(())
         }
-        (DataValue::Text { value }, Type::Text) => text(value),
-        (DataValue::Date { days }, Type::Date) => validate_day(*days),
+        (DataValue::Text { value }, Type::Text) => a.text(value),
+        (DataValue::Date { days }, Type::Date) => a.day(*days),
         (DataValue::Reference { entity, record }, Type::Reference { entity: expected }) => {
-            check_id(entity)?;
-            check_id(record)?;
-            require(entity == expected, "reference entity type mismatch")
+            a.check_id(entity)?;
+            a.check_id(record)?;
+            a.require(a.eq_str(entity, expected)?, "reference entity type mismatch")
         }
         (DataValue::List { items, item_type }, Type::List { item }) => {
-            require(
-                items.len() <= MAX_COLLECTION && item_type == item.as_ref(),
+            a.require(
+                items.len() <= MAX_COLLECTION && a.type_equal(item_type, item)?,
                 "collection bound or element type mismatch",
             )?;
+            a.slice(items.len())?;
             for value in items {
-                validate_value(value, item, depth + 1)?;
+                validate_value_audited(value, item, depth + 1, a)?;
             }
             Ok(())
         }
-        _ => Err(ContractError("value does not match declared type".into())),
+        _ => Err(a.error("value does not match declared type")?),
     }
 }
 pub fn validate_day(day: i32) -> Result<()> {
@@ -1199,77 +3102,24 @@ impl AppDefinition {
         Ok(app)
     }
     pub fn validate(&self) -> Result<()> {
-        #[cfg(test)]
-        count_validation(|counts| counts.apps += 1);
-        version(self.version)?;
-        check_id(&self.id)?;
-        nonempty(&self.label)?;
-        require(
-            !self.entities.is_empty() && !self.views.is_empty(),
-            "application needs entities and views",
-        )?;
-        unique(self.entities.iter().map(|e| e.id.as_str()))?;
-        unique(self.state.iter().map(|s| s.id.as_str()))?;
-        unique(self.actions.iter().map(|a| a.id.as_str()))?;
-        unique(self.outputs.iter().map(|o| o.id.as_str()))?;
-        unique(self.observables.iter().map(|o| o.id.as_str()))?;
-        unique(self.views.iter().map(|v| v.id.as_str()))?;
-        require(
-            self.views.iter().any(|v| v.id == self.initial_view),
-            "unknown initial view",
-        )?;
-        let mut validator = Validator {
-            app: self,
-            nodes: 0,
+        self.validate_audited(Audit::none()).map(|_| ())
+    }
+    fn validate_audited(&self, a: Audit<'_>) -> Result<capture_validation::CaptureFacts> {
+        let mut app_validation_cx = crate::product_alloc::AllocationContext::new();
+        validate_app_semantics!(self, a, validator, action_prefix_nodes, &mut app_validation_cx);
+        // Keep the ordinary Vec alive through the original validation tail.
+        let bytes;
+        let canonical_len = if a.enabled() {
+            capture_canonical::app_canonical_len_audited(self, a)?
+        } else {
+            bytes = capture_canonical::canonical_bytes_audited(self, a)?;
+            bytes.len()
         };
-        validate_entities(&self.entities, &mut validator)?;
-        for state in &self.state {
-            nonempty(&state.label)?;
-            validator.typ(&state.value_type, 0)?;
-            validate_value(&state.initial, &state.value_type, 0)?;
-        }
-        for output in &self.outputs {
-            nonempty(&output.label)?;
-            require(!output.columns.is_empty(), "output needs columns")?;
-            unique(output.columns.iter().map(|c| c.id.as_str()))?;
-            for column in &output.columns {
-                nonempty(&column.label)?;
-                validator.typ(&column.value_type, 0)?;
-                require(
-                    column.value_type.is_scalar(),
-                    "output columns must be scalar",
-                )?;
-            }
-        }
-        for action in &self.actions {
-            nonempty(&action.label)?;
-            require(!action.steps.is_empty(), "action needs steps")?;
-            unique(action.parameters.keys().map(String::as_str))?;
-            for typ in action.parameters.values() {
-                validator.typ(typ, 0)?;
-            }
-            let mut env = action.parameters.clone();
-            bounded(action.guards.len())?;
-            bounded(action.ensures.len())?;
-            for guard in &action.guards {
-                validator.expect(guard, &env, &Type::Boolean, 0, true)?;
-            }
-            validator.statements(&action.steps, &mut env, 0)?;
-            for condition in &action.ensures {
-                validator.expect(condition, &env, &Type::Boolean, 0, true)?;
-            }
-        }
-        for observable in &self.observables {
-            nonempty(&observable.label)?;
-            validator.expr(&observable.value, &Environment::new(), 0, true)?;
-        }
-        for view in &self.views {
-            validator.view(view)?;
-        }
-        require(
-            canonical_bytes(self)?.len() <= MAX_WIRE_BYTES,
-            "program exceeds byte budget",
-        )
+        a.pay(3)?;
+        a.require(canonical_len <= MAX_WIRE_BYTES, "program exceeds byte budget")?;
+        a.pay(5)?;
+        Ok(capture_validation::CaptureFacts { total_nodes: validator.nodes,
+            action_prefix_nodes, canonical_len, action_count: self.actions.len() })
     }
     pub fn identity(&self) -> Result<Digest> {
         self.validate()?;
@@ -1278,86 +3128,219 @@ impl AppDefinition {
     pub fn semantic_identity(&self) -> Result<Digest> {
         self.validate()?;
         let mut app = self.clone();
-        app.label.clear();
-        for entity in &mut app.entities {
+        app.clear_display_labels_audited(Audit::none())?;
+        canonical_digest(IdentityDomain::SemanticProgram, &app)
+    }
+}
+
+pub(crate) fn decoded_expression_type_with(
+    app: &fallible_app_decode::DecodedAppDefinition,
+    expression: &Expr,
+    binding: &str,
+    entity: &str,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<Type, AppValidationError> {
+    let mut env = fallible_app_decode::FallibleMap::new();
+    let key = crate::product_alloc::try_copy_str(binding, cx, crate::product_alloc::AllocationSite::String)
+        .map_err(AppValidationError::Allocation)?;
+    let entity = crate::product_alloc::try_copy_str(entity, cx, crate::product_alloc::AllocationSite::String)
+        .map_err(AppValidationError::Allocation)?;
+    let reference = Type::Reference { entity };
+    let reference = values_map::try_clone_type(&reference, cx).map_err(AppValidationError::Allocation)?;
+    env.try_insert(key, reference, cx).map_err(AppValidationError::Allocation)?;
+    let mut validator = Validator::new_app(AppRef::Decoded(app), Audit::none(), cx);
+    let result = validator.expr(expression, &env, 0, true);
+    if let Some(failure) = validator.allocation_failure.take() {
+        return Err(AppValidationError::Allocation(failure));
+    }
+    result.map_err(AppValidationError::Contract)
+}
+
+/// Type-check a decoded expression in the empty environment, preserving the
+/// allocation accounting used by view observables and other host projections.
+pub(crate) fn decoded_expression_type_empty_with(
+    app: &fallible_app_decode::DecodedAppDefinition,
+    expression: &Expr,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<Type, AppValidationError> {
+    let env = fallible_app_decode::FallibleMap::new();
+    let mut validator = Validator::new_app(AppRef::Decoded(app), Audit::none(), cx);
+    let result = validator.expr(expression, &env, 0, true);
+    if let Some(failure) = validator.allocation_failure.take() {
+        return Err(AppValidationError::Allocation(failure));
+    }
+    result.map_err(AppValidationError::Contract)
+}
+
+/// Type-check a decoded expression against an already-owned lexical map.
+/// Callers which build nested statement scopes can share one charged ordered
+/// environment instead of cloning/reconstructing a one-binding map per read.
+pub(crate) fn decoded_expression_type_in_with(
+    app: &fallible_app_decode::DecodedAppDefinition,
+    expression: &Expr,
+    bindings: &impl StringValueMap<Type>,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<Type, AppValidationError> {
+    let mut validator = Validator::new_app(AppRef::Decoded(app), Audit::none(), cx);
+    let result = validator.expr(expression, bindings, 0, true);
+    if let Some(failure) = validator.allocation_failure.take() {
+        return Err(AppValidationError::Allocation(failure));
+    }
+    result.map_err(AppValidationError::Contract)
+}
+
+pub(crate) fn validate_decoded_app(
+    app: &fallible_app_decode::DecodedAppDefinition,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<(), AppValidationError> {
+    let audit = Audit::none();
+    let semantic = (|| -> std::result::Result<(usize, usize), AppValidationError> {
+        validate_app_semantics!(app, audit, validator, action_prefix_nodes, cx);
+        let nodes = validator.nodes;
+        drop(validator);
+        Ok((nodes, action_prefix_nodes))
+    })();
+    if let Some(failure) = cx.first_failure() {
+        return Err(AppValidationError::Allocation(failure));
+    }
+    semantic?;
+    let bytes = crate::product_backup::fallible_codec::canonical_bytes(app, cx).map_err(|error| match error {
+        crate::product_backup::fallible_codec::CodecError::Allocation(failure) => AppValidationError::Allocation(failure),
+        _ => AppValidationError::Contract(ContractError("program canonical encoding failed".into())),
+    })?;
+    if bytes.len() > MAX_WIRE_BYTES {
+        return Err(AppValidationError::Contract(ContractError("program exceeds byte budget".into())));
+    }
+    Ok(())
+}
+impl AppDefinition {
+    fn clear_display_labels_audited(&mut self,a:Audit<'_>)->Result<()> {
+        a.pay(1)?;
+        a.pay(1)?;
+        self.label.clear();
+        a.slice(self.entities.len())?;
+        for entity in &mut self.entities {
+            a.pay(1)?;
             entity.label.clear();
-            for field in &mut entity.fields {
+            a.slice(entity.fields.len())?;
+        for field in &mut entity.fields {
+                a.pay(1)?;
                 field.label.clear();
             }
         }
-        for state in &mut app.state {
+        a.slice(self.state.len())?;
+        for state in &mut self.state {
+            a.pay(1)?;
             state.label.clear();
         }
-        for action in &mut app.actions {
+        a.slice(self.actions.len())?;
+        for action in &mut self.actions {
+            a.pay(1)?;
             action.label.clear();
         }
-        for output in &mut app.outputs {
+        a.slice(self.outputs.len())?;
+        for output in &mut self.outputs {
+            a.pay(1)?;
             output.label.clear();
-            for column in &mut output.columns {
+            a.slice(output.columns.len())?;
+        for column in &mut output.columns {
+                a.pay(1)?;
                 column.label.clear();
             }
         }
-        for observable in &mut app.observables {
+        a.slice(self.observables.len())?;
+        for observable in &mut self.observables {
+            a.pay(1)?;
             observable.label.clear();
         }
-        for view in &mut app.views {
+        a.slice(self.views.len())?;
+        for view in &mut self.views {
+            a.pay(1)?;
             view.label.clear();
-            for action in &mut view.actions {
+            a.slice(view.actions.len())?;
+        for action in &mut view.actions {
+                a.pay(1)?;
                 action.label.clear();
             }
             match &mut view.kind {
                 ViewKind::List {
                     columns, controls, ..
                 } => {
+                    a.slice(columns.len())?;
                     for column in columns {
+                        a.pay(1)?;
                         column.label.clear();
                     }
+                    a.slice(controls.len())?;
                     for control in controls {
+                        a.pay(1)?;
                         control.label.clear();
                     }
                 }
                 ViewKind::Detail { columns, .. } => {
+                    a.slice(columns.len())?;
                     for column in columns {
+                        a.pay(1)?;
                         column.label.clear();
                     }
                 }
                 ViewKind::Form { fields, .. } => {
+                    a.slice(fields.len())?;
                     for field in fields {
+                        a.pay(1)?;
                         field.label.clear();
                     }
                 }
             }
         }
-        canonical_digest(IdentityDomain::SemanticProgram, &app)
+        Ok(())
     }
 }
-fn validate_entities(entities: &[EntityDefinition], validator: &mut Validator<'_>) -> Result<()> {
-    unique(entities.iter().map(|e| e.id.as_str()))?;
+
+fn validate_entities(entities: &[EntityDefinition], validator: &mut Validator<'_, '_, '_>) -> Result<()> {
+    let a = validator.audit;
+    a.pay(1)?;
+    a.unique(entities.iter().map(|e| e.id.as_str()))?;
+    a.slice(entities.len())?;
     for entity in entities {
-        nonempty(&entity.label)?;
-        require(!entity.fields.is_empty(), "entity needs fields")?;
-        unique(entity.fields.iter().map(|f| f.id.as_str()))?;
-        for field in &entity.fields {
-            nonempty(&field.label)?;
+            a.pay(12)?;
+        a.nonempty(&entity.label)?;
+        a.require(!entity.fields.is_empty(), "entity needs fields")?;
+        a.unique(entity.fields.iter().map(|f| f.id.as_str()))?;
+        a.slice(entity.fields.len())?;
+    for field in &entity.fields {
+            a.pay(12)?;
+            a.nonempty(&field.label)?;
             validator.typ(&field.value_type, 0)?;
         }
-        bounded(entity.unique.len())?;
+        a.bounded(entity.unique.len())?;
+        a.pay(8)?;
         let mut tuples = BTreeSet::new();
-        for tuple in &entity.unique {
-            require(!tuple.is_empty(), "empty unique constraint")?;
-            unique(tuple.iter().map(String::as_str))?;
-            require(tuples.insert(tuple), "duplicate unique constraint")?;
-            for field in tuple {
+        a.slice(entity.unique.len())?;
+    for tuple in &entity.unique {
+            a.pay(12)?;
+            a.require(!tuple.is_empty(), "empty unique constraint")?;
+            a.unique(tuple.iter().map(String::as_str))?;
+            a.insert::<&Vec<Id>, ()>(tuples.len(), a.tuple_comparator(tuple)?)?;
+            a.require(tuples.insert(tuple), "duplicate unique constraint")?;
+            a.slice(tuple.len())?;
+    for field in tuple {
+            a.pay(12)?;
                 let typ = &validator.field(&entity.id, field)?.value_type;
-                require(
+                a.require(
                     typ.is_scalar() || matches!(typ,Type::Optional { item } if item.is_scalar()),
                     "unique constraint needs scalar fields",
                 )?;
             }
         }
-        bounded(entity.constraints.len())?;
-        let env = BTreeMap::from([("record".into(), Type::reference(&entity.id))]);
-        for constraint in &entity.constraints {
+        a.bounded(entity.constraints.len())?;
+        a.string(6)?;
+        a.string(entity.id.len())?;
+        capture_canonical::reserve_from_iter::<String,Type>(1,a.comparator(6)?,a)?;
+        let env=BTreeMap::from([("record".into(),Type::reference(&entity.id))]);
+        a.slice(entity.constraints.len())?;
+    for constraint in &entity.constraints {
+            a.pay(12)?;
             validator.expect(constraint, &env, &Type::Boolean, 0, false)?;
         }
     }
@@ -1417,14 +3400,16 @@ pub struct SourceBinding {
     pub source_digest: Digest,
 }
 impl SourceBinding {
-    pub fn validate(&self) -> Result<()> {
-        check_id(&self.project_id)?;
-        validate_relative_path(&self.program_path)?;
+    pub fn validate(&self) -> Result<()> {self.validate_audited(Audit::none())}
+    fn validate_audited(&self,a:Audit<'_>)->Result<()> {
+        a.pay(6)?;
+        a.check_id(&self.project_id)?;
+        validate_relative_path_audited(&self.program_path,a)?;
         if let Some(task) = &self.task {
-            check_id(&task.task_id)?;
-            nonempty(&task.source_fingerprint)?;
+            a.check_id(&task.task_id)?;
+            a.nonempty(&task.source_fingerprint)?;
         }
-        self.producer.validate()?;
+        self.producer.validate_audited(a)?;
         Ok(())
     }
     pub fn identity(&self) -> Result<Digest> {
@@ -1532,48 +3517,75 @@ impl CapturedProgram {
         self.binding.program_path = path.into();
         Ok(self)
     }
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {self.validate_audited(Audit::none()).map(|_|())}
+    pub(crate) fn validate_capture_facts(&self) -> Result<CaptureFacts> {
+        self.validate_audited(Audit::none())
+    }
+    fn validate_audited(&self,a:Audit<'_>)->Result<capture_validation::CaptureFacts> {
+        a.pay(8)?;
         #[cfg(test)]
         count_validation(|counts| counts.captures += 1);
-        self.binding.validate()?;
-        version(self.artifact.version)?;
-        require(
-            self.artifact.kind == ArtifactKind::GeneratedApp
-                && self.artifact.language == LANGUAGE_VERSION,
-            "unsupported executable artifact",
-        )?;
-        require(
-            self.source_bytes.len() <= MAX_WIRE_BYTES,
-            "source exceeds byte limit",
-        )?;
-        let actual = AppDefinition::parse(&self.source_bytes)?;
-        require(
-            actual == self.program,
-            "source bytes do not represent captured program",
-        )?;
-        require(
-            self.artifact.raw_digest == bytes_digest(IdentityDomain::Source, &self.source_bytes)
-                && self.binding.source_digest == self.artifact.raw_digest,
-            "raw source digest mismatch",
-        )?;
-        require(
-            self.artifact.program_digest == actual.identity()?
-                && self.artifact.semantic_digest == actual.semantic_identity()?,
-            "program digest mismatch",
-        )
+        self.binding.validate_audited(a)?;
+        a.version(self.artifact.version)?;
+        a.require(self.artifact.kind == ArtifactKind::GeneratedApp
+            && a.eq_str(&self.artifact.language, LANGUAGE_VERSION)?, "unsupported executable artifact")?;
+        a.require(self.source_bytes.len() <= MAX_WIRE_BYTES, "source exceeds byte limit")?;
+        let actual: AppDefinition = if a.enabled() {
+            // Both roots precede the new helper, closures, and borrowed owners.
+            a.pay(capture_canonical::COMMON)?;
+            a.pay(capture_canonical::SOURCE_DELTA_ROOT)?;
+            return capture_canonical::validate_guarded_native_capture(self, a);
+        } else {parse(&self.source_bytes)?};
+        let facts=actual.validate_audited(a)?;
+        a.require(a.equal_owned(&actual,&self.program)?, "source bytes do not represent captured program")?;
+        let raw=capture_validation::bytes_digest_audited(IdentityDomain::Source,&self.source_bytes,a)?;
+        a.require(a.eq_str(self.artifact.raw_digest.as_str(),raw.as_str())?
+            && a.eq_str(self.binding.source_digest.as_str(),self.artifact.raw_digest.as_str())?, "raw source digest mismatch")?;
+        a.pay(8 + 2 * std::mem::size_of::<Audit<'_>>() as u64 + 4 * std::mem::size_of::<bool>() as u64)?;
+        if !a.enabled() { actual.validate_audited(a)?; }
+        let bytes=capture_canonical::canonical_bytes_audited(&actual,a)?;
+        let program=capture_validation::bytes_digest_audited(IdentityDomain::Program,&bytes,a)?;
+        let equal=a.eq_str(self.artifact.program_digest.as_str(),program.as_str())?;
+        let equal=if equal {
+            a.pay(8 + 2 * std::mem::size_of::<Audit<'_>>() as u64 + 4 * std::mem::size_of::<bool>() as u64)?;
+            if !a.enabled() { actual.validate_audited(a)?; }
+            let mut semantic=a.clone_owned(&actual)?;
+            semantic.clear_display_labels_audited(a)?;
+            let bytes=capture_canonical::canonical_bytes_audited(&semantic,a)?;
+            let digest=capture_validation::bytes_digest_audited(IdentityDomain::SemanticProgram,&bytes,a)?;
+            a.eq_str(self.artifact.semantic_digest.as_str(),digest.as_str())?
+        } else {false};
+        a.require(equal,"program digest mismatch")?;
+        Ok(facts)
     }
 }
-pub fn validate_relative_path(path: &str) -> Result<()> {
-    require(
-        !path.is_empty()
-            && path.len() <= 1024
-            && !path.contains(['\\', ':', '\0'])
-            && !path.chars().any(char::is_control)
-            && path
-                .split('/')
-                .all(|p| !p.is_empty() && p != "." && p != ".."),
-        "unsafe relative source path",
-    )
+pub fn validate_relative_path(path: &str) -> Result<()> {validate_relative_path_audited(path,Audit::none())}
+fn validate_relative_path_audited(path: &str,a:Audit<'_>)->Result<()> {
+    if !a.enabled() {
+        return require(!path.is_empty() && path.len() <= 1024
+            && !path.contains(['\\', ':', '\0']) && !path.chars().any(char::is_control)
+            && path.split('/').all(|p| !p.is_empty() && p != "." && p != ".."),
+            "unsafe relative source path");
+    }
+    a.pay(8)?;
+    let valid=if path.is_empty() || path.len()>1024 {false} else {
+        // Native three-character search: UTF-8 decode + three candidate tests.
+        a.scaled(path.len(),7,4)?;
+        if path.contains(['\\', ':', '\0']) {false} else {
+            // Native control predicate: decode + finite C0/C1 range checks.
+            a.scaled(path.len(),6,4)?;
+            if path.chars().any(char::is_control) {false} else {
+                a.scaled(path.len(),1,2)?; // Original slash search bytes.
+                let mut valid=true;
+                for part in path.split('/') {
+                    a.pay(6)?;
+                    if part.is_empty() || a.eq_str(part,".")? || a.eq_str(part,"..")? {valid=false;break;}
+                }
+                a.pay(1)?;valid
+            }
+        }
+    };
+    a.require(valid,"unsafe relative source path")
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1675,112 +3687,11 @@ impl DataSnapshot {
         data.validate()?;
         Ok(data)
     }
-    pub fn validate(&self) -> Result<()> {
-        version(self.version)?;
-        check_id(&self.project_id)?;
-        require(
-            self.records.len() <= MAX_COLLECTION && self.events.len() <= MAX_EVENTS,
-            "data record/event budget exceeded",
-        )?;
-        let schema_app = AppDefinition {
-            version: CONTRACT_VERSION,
-            id: "schema".into(),
-            label: "Schema".into(),
-            entities: self.schema.clone(),
-            state: vec![],
-            actions: vec![],
-            outputs: vec![],
-            observables: vec![],
-            views: vec![],
-            initial_view: String::new(),
-        };
-        let mut validator = Validator {
-            app: &schema_app,
-            nodes: 0,
-        };
-        validate_entities(&self.schema, &mut validator)?;
-        let mut records = BTreeSet::new();
-        for record in &self.records {
-            check_id(&record.id)?;
-            require(record.revision > 0, "record revision must be positive")?;
-            require(
-                records.insert((record.entity.as_str(), record.id.as_str())),
-                "duplicate record identity",
-            )?;
-            validate_record_values(&validator, &record.entity, &record.values)?;
-        }
-        for record in &self.records {
-            for value in record.values.values() {
-                validate_references(value, &records)?;
-            }
-        }
-        for entity in &self.schema {
-            for fields in &entity.unique {
-                let mut tuples = BTreeSet::new();
-                for record in self
-                    .records
-                    .iter()
-                    .filter(|r| r.entity == entity.id && !r.archived)
-                {
-                    let tuple: Vec<_> = fields
-                        .iter()
-                        .map(|f| record.values.get(f).unwrap_or(&DataValue::Null))
-                        .collect();
-                    if tuple.iter().any(|v| matches!(v, DataValue::Null)) {
-                        continue;
-                    }
-                    require(
-                        tuples.insert(canonical_bytes(&tuple)?),
-                        "duplicate unique field tuple",
-                    )?;
-                }
-            }
-        }
-        let mut events = BTreeSet::new();
-        let mut operations = BTreeSet::new();
-        let mut previous = 0;
-        for event in &self.events {
-            check_id(&event.id)?;
-            check_id(&event.operation_id)?;
-            check_id(&event.action)?;
-            validate_day(event.day)?;
-            require(
-                events.insert(&event.id) && operations.insert(&event.operation_id),
-                "duplicate event or operation receipt",
-            )?;
-            require(
-                event.sequence > previous && event.sequence <= self.generation,
-                "event sequence is not ordered within generation",
-            )?;
-            previous = event.sequence;
-            bounded(event.changes.len())?;
-            bounded(event.outputs.len())?;
-            let mut changed = BTreeSet::new();
-            for change in &event.changes {
-                check_id(&change.record)?;
-                require(
-                    changed.insert((&change.entity, &change.record)),
-                    "duplicate event record change",
-                )?;
-                validator.entity(&change.entity)?;
-                require(
-                    records.contains(&(change.entity.as_str(), change.record.as_str())),
-                    "event record is missing",
-                )?;
-                // Historical maps may omit later-added fields, but never change
-                // the meaning/type of values that were actually recorded.
-                for values in change.before.iter().chain(std::iter::once(&change.after)) {
-                    bounded(values.len())?;
-                    for (id, value) in values {
-                        validate_value(value, &validator.field(&change.entity, id)?.value_type, 0)?;
-                        validate_references(value, &records)?;
-                    }
-                }
-            }
-        }
-        serialized_bound(self, MAX_WIRE_BYTES)?;
-        Ok(())
+    pub fn validate(&self) -> Result<()> { self.validate_audited(Audit::none()) }
+    fn validate_audited(&self, a: Audit<'_>) -> Result<()> {
+        fallible_snapshot_validate::validate(self, a)
     }
+
     pub fn identity(&self) -> Result<Digest> {
         self.validate()?;
         canonical_digest(IdentityDomain::Data, self)
@@ -1790,29 +3701,237 @@ impl DataSnapshot {
         canonical_digest(IdentityDomain::Schema, &self.schema)
     }
 }
-fn validate_record_values(validator: &Validator<'_>, entity: &str, values: &Values) -> Result<()> {
-    let entity = validator.entity(entity)?;
-    bounded(values.len())?;
-    for (id, value) in values {
-        validate_value(value, &validator.field(&entity.id, id)?.value_type, 0)?;
+
+fn records_equal(left: DataRecordView<'_>, right: DataRecordView<'_>) -> bool {
+    left.entity() == right.entity()
+        && left.id() == right.id()
+        && left.revision() == right.revision()
+        && left.created_program() == right.created_program()
+        && left.archived() == right.archived()
+        && values_equal(left.values(), right.values())
+}
+
+fn values_equal(left: DataValuesView<'_>, right: DataValuesView<'_>) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right.iter()).all(|((left_key, left_value), (right_key, right_value))| {
+            left_key == right_key && left_value == right_value
+        })
+}
+
+fn clone_values(
+    values: DataValuesView<'_>,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<FallibleValues, crate::product_alloc::AllocationFailure> {
+    use crate::product_alloc::{try_copy_str, AllocationSite};
+    let mut cloned = FallibleValues::new();
+    for (id, value) in values.iter() {
+        let id = try_copy_str(id, cx, AllocationSite::String)?;
+        let value = try_clone_data_value_with(value, cx)?;
+        cloned.try_insert(id, value, cx)?;
     }
-    for field in &entity.fields {
-        require(
-            values.contains_key(&field.id) || matches!(field.value_type, Type::Optional { .. }),
-            "record lacks required field",
-        )?;
+    Ok(cloned)
+}
+
+/// Borrowed read-only view over either persisted snapshot owner. Runtime
+/// proof evaluation uses this to share the same evaluator without converting
+/// fallible `Values` back into BTreeMap-backed legacy records.
+#[derive(Clone, Copy)]
+pub(crate) enum DataSnapshotView<'a> {
+    Legacy(&'a DataSnapshot),
+    Fallible(&'a FallibleDecodedDataSnapshot),
+    FallibleHistorical { data: &'a FallibleDecodedDataSnapshot, override_record: DataRecordView<'a>, values: &'a FallibleValues, archived: bool },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DataRecordView<'a> {
+    inner: DataRecordKind<'a>,
+}
+#[derive(Clone, Copy)]
+enum DataRecordKind<'a> {
+    Legacy(&'a Record),
+    Fallible(&'a fallible_persisted_decode::DecodedRecord),
+    FallibleOverride(&'a fallible_persisted_decode::DecodedRecord, &'a FallibleValues, bool),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum DataValuesView<'a> {
+    Legacy(&'a Values),
+    Fallible(&'a FallibleValues),
+}
+
+pub(crate) struct DataRecordIter<'a>(DataRecordIterKind<'a>);
+enum DataRecordIterKind<'a> {
+    Legacy(std::slice::Iter<'a, Record>),
+    Fallible(std::slice::Iter<'a, fallible_persisted_decode::DecodedRecord>),
+    FallibleHistorical { iter: std::slice::Iter<'a, fallible_persisted_decode::DecodedRecord>, override_record: DataRecordView<'a>, values: &'a FallibleValues, archived: bool },
+}
+
+impl<'a> Iterator for DataRecordIter<'a> {
+    type Item = DataRecordView<'a>;
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.0 {
+            DataRecordIterKind::Legacy(iter) => iter.next().map(|row| DataRecordView { inner: DataRecordKind::Legacy(row) }),
+            DataRecordIterKind::Fallible(iter) => iter.next().map(|row| DataRecordView { inner: DataRecordKind::Fallible(row) }),
+            DataRecordIterKind::FallibleHistorical { iter, override_record, values, archived } => iter.next().map(|row| {
+                // The historical overlay has already resolved its target record.
+                // Compare owners by address here so each evaluator row step does
+                // constant work instead of rescanning long entity/record IDs.
+                let view = DataRecordView { inner: DataRecordKind::Fallible(row) };
+                if view.same_fallible_record(override_record) { DataRecordView { inner: DataRecordKind::FallibleOverride(row, values, *archived) } }
+                else { view }
+            }),
+        }
     }
-    Ok(())
+}
+
+pub(crate) enum DataValueIter<'a> {
+    Legacy(std::collections::btree_map::Iter<'a, String, DataValue>),
+    Fallible(values_map::FallibleValuesIter<'a>),
+}
+impl<'a> Iterator for DataValueIter<'a> {
+    type Item = (&'a String, &'a DataValue);
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Legacy(iter) => iter.next(),
+            Self::Fallible(iter) => iter.next(),
+        }
+    }
+}
+impl ExactSizeIterator for DataValueIter<'_> {}
+
+impl<'a> DataSnapshotView<'a> {
+    pub(crate) fn legacy(&self) -> Option<&'a DataSnapshot> { match self { Self::Legacy(data) => Some(data), _ => None } }
+    pub(crate) fn fallible_historical(data: &'a FallibleDecodedDataSnapshot, override_record: DataRecordView<'a>, values: &'a FallibleValues, archived: bool) -> Self {
+        Self::FallibleHistorical { data, override_record, values, archived }
+    }
+    pub(crate) fn project_id(&self) -> &str {
+        match self { Self::Legacy(data) => &data.project_id, Self::Fallible(data) | Self::FallibleHistorical { data, .. } => data.project_id() }
+    }
+    pub(crate) fn generation(&self) -> u64 {
+        match self { Self::Legacy(data) => data.generation, Self::Fallible(data) | Self::FallibleHistorical { data, .. } => data.generation() }
+    }
+    pub(crate) fn record_count(&self) -> usize {
+        match self { Self::Legacy(data) => data.records.len(), Self::Fallible(data) | Self::FallibleHistorical { data, .. } => data.records().len() }
+    }
+    pub(crate) fn schema(&self) -> &[EntityDefinition] {
+        match self { Self::Legacy(data) => &data.schema, Self::Fallible(data) | Self::FallibleHistorical { data, .. } => data.schema() }
+    }
+    pub(crate) fn records(&self) -> DataRecordIter<'a> {
+        match self {
+            Self::Legacy(data) => DataRecordIter(DataRecordIterKind::Legacy(data.records.iter())),
+            Self::Fallible(data) => DataRecordIter(DataRecordIterKind::Fallible(data.0.records.iter())),
+            Self::FallibleHistorical { data, override_record, values, archived } => DataRecordIter(DataRecordIterKind::FallibleHistorical { iter: data.0.records.iter(), override_record: *override_record, values, archived: *archived }),
+        }
+    }
+    pub(crate) fn record(&self, entity: &str, id: &str) -> Option<DataRecordView<'a>> {
+        self.records().find(|record| record.entity() == entity && record.id() == id)
+    }
+    pub(crate) fn validate_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), AppValidationError> {
+        match self {
+            Self::Legacy(data) => data.validate().map_err(AppValidationError::Contract),
+            Self::Fallible(data) | Self::FallibleHistorical { data, .. } => data.validate_with(cx),
+        }
+    }
+}
+impl<'a> From<&'a DataSnapshot> for DataSnapshotView<'a> {
+    fn from(value: &'a DataSnapshot) -> Self { Self::Legacy(value) }
+}
+impl<'a> From<&'a FallibleDecodedDataSnapshot> for DataSnapshotView<'a> {
+    fn from(value: &'a FallibleDecodedDataSnapshot) -> Self { Self::Fallible(value) }
+}
+impl<'a> DataRecordView<'a> {
+    pub(crate) fn entity(&self) -> &str {
+        match self.inner { DataRecordKind::Legacy(row) => &row.entity, DataRecordKind::Fallible(row) | DataRecordKind::FallibleOverride(row, _, _) => &row.entity }
+    }
+    pub(crate) fn id(&self) -> &str {
+        match self.inner { DataRecordKind::Legacy(row) => &row.id, DataRecordKind::Fallible(row) | DataRecordKind::FallibleOverride(row, _, _) => &row.id }
+    }
+    pub(crate) fn archived(&self) -> bool {
+        match self.inner { DataRecordKind::Legacy(row) => row.archived, DataRecordKind::Fallible(row) => row.archived, DataRecordKind::FallibleOverride(_, _, archived) => archived }
+    }
+    pub(crate) fn revision(&self) -> u64 {
+        match self.inner { DataRecordKind::Legacy(row) => row.revision, DataRecordKind::Fallible(row) | DataRecordKind::FallibleOverride(row, _, _) => row.revision }
+    }
+    pub(crate) fn created_program(&self) -> &'a Digest {
+        match self.inner { DataRecordKind::Legacy(row) => &row.created_program, DataRecordKind::Fallible(row) | DataRecordKind::FallibleOverride(row, _, _) => &row.created_program }
+    }
+    pub(crate) fn values(&self) -> DataValuesView<'_> {
+        match self.inner { DataRecordKind::Legacy(row) => DataValuesView::Legacy(&row.values), DataRecordKind::Fallible(row) => DataValuesView::Fallible(&row.values), DataRecordKind::FallibleOverride(_, values, _) => DataValuesView::Fallible(values) }
+    }
+    fn same_fallible_record(&self, other: &Self) -> bool {
+        match self.inner {
+            DataRecordKind::Fallible(row) | DataRecordKind::FallibleOverride(row, _, _) => match other.inner {
+                DataRecordKind::Fallible(other) | DataRecordKind::FallibleOverride(other, _, _) => std::ptr::eq(row, other),
+                DataRecordKind::Legacy(_) => false,
+            },
+            DataRecordKind::Legacy(_) => false,
+        }
+    }
+}
+impl<'a> DataValuesView<'a> {
+    pub(crate) fn len(&self) -> usize {
+        match self { Self::Legacy(values) => values.len(), Self::Fallible(values) => values.len() }
+    }
+    pub(crate) fn get(&self, key: &str) -> Option<&'a DataValue> {
+        match self { Self::Legacy(values) => values.get(key), Self::Fallible(values) => values.get(key) }
+    }
+    pub(crate) fn iter(&self) -> DataValueIter<'a> {
+        match self { Self::Legacy(values) => DataValueIter::Legacy(values.iter()), Self::Fallible(values) => DataValueIter::Fallible(values.iter()) }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum SessionStateView<'a> {
+    Legacy(&'a SessionState),
+    Fallible(&'a FallibleDecodedSessionState),
+}
+impl<'a> SessionStateView<'a> {
+    pub(crate) fn legacy(&self) -> Option<&'a SessionState> { match self { Self::Legacy(state) => Some(state), _ => None } }
+    pub(crate) fn values(&self) -> DataValuesView<'a> {
+        match self {
+            Self::Legacy(session) => DataValuesView::Legacy(&session.values),
+            Self::Fallible(session) => DataValuesView::Fallible(&session.0.values),
+        }
+    }
+}
+impl<'a> From<&'a SessionState> for SessionStateView<'a> {
+    fn from(value: &'a SessionState) -> Self { Self::Legacy(value) }
+}
+impl<'a> From<&'a FallibleDecodedSessionState> for SessionStateView<'a> {
+    fn from(value: &'a FallibleDecodedSessionState) -> Self { Self::Fallible(value) }
+}
+trait RecordLookup {
+    fn len(&self) -> usize;
+    fn contains_pair(&self, entity: &str, record: &str) -> bool;
+}
+impl RecordLookup for BTreeSet<(&str, &str)> {
+    fn len(&self) -> usize { BTreeSet::len(self) }
+    fn contains_pair(&self, entity: &str, record: &str) -> bool { self.contains(&(entity, record)) }
+}
+impl RecordLookup for crate::product_alloc::ordered::OrderedSet<(&str, &str)> {
+    fn len(&self) -> usize { crate::product_alloc::ordered::OrderedSet::len(self) }
+    fn contains_pair(&self, entity: &str, record: &str) -> bool { self.contains(&(entity, record)) }
 }
 fn validate_references(value: &DataValue, records: &BTreeSet<(&str, &str)>) -> Result<()> {
+    validate_references_audited(value, records, Audit::none())
+}
+fn validate_references_audited<R: RecordLookup>(value: &DataValue, records: &R, a: Audit<'_>) -> Result<()> {
+    a.pay(4)?;
     match value {
-        DataValue::Reference { entity, record } => require(
-            records.contains(&(entity.as_str(), record.as_str())),
-            "dangling record reference",
-        ),
+        DataValue::Reference { entity, record } => {
+            if a.enabled() {
+                a.pay(bounded_input::capture_payment_core::SEARCH_DESCRIPTOR)?;
+                a.amount(bounded_input::capture_payment_core::btree_search(records.len(), a.pair_comparator(entity, record)?))?;
+            }
+            a.require(records.contains_pair(entity, record), "dangling record reference")
+        },
         DataValue::List { items, .. } => {
+            a.slice(items.len())?;
             for item in items {
-                validate_references(item, records)?;
+                validate_references_audited(item, records, a)?;
             }
             Ok(())
         }
@@ -2026,7 +4145,7 @@ impl ScenarioSpec {
     }
 }
 pub fn validate_input(input: &SemanticInput, app: &AppDefinition) -> Result<()> {
-    let validator = Validator { app, nodes: 0 };
+    let validator = Validator::new(app, Audit::none());
     let view = |id: &str| {
         app.views
             .iter()
@@ -3269,43 +5388,209 @@ pub struct DecisionGraph {
 }
 impl DecisionGraph {
     pub fn validate(&self) -> Result<()> {
-        version(self.version)?;
-        unique(self.decisions.iter().map(|d| d.id.as_str()))?;
-        let index: BTreeMap<_, _> = self.decisions.iter().map(|d| (d.id.as_str(), d)).collect();
-        for decision in &self.decisions {
-            decision.validate()?;
-            for prior in &decision.supersedes {
-                let prior = index
-                    .get(prior.as_str())
-                    .ok_or_else(|| ContractError("unknown superseded decision".into()))?;
-                require(
-                    matches!(&prior.status,DecisionStatus::Superseded { by } if by == &decision.id),
-                    "supersession graph is not reciprocal",
-                )?;
-            }
-            let mut seen = BTreeSet::new();
-            let mut current = decision;
-            while let DecisionStatus::Superseded { by } = &current.status {
-                require(
-                    seen.insert(current.id.as_str()),
-                    "cyclic decision supersession",
-                )?;
-                let next = *index
-                    .get(by.as_str())
-                    .ok_or_else(|| ContractError("missing superseding decision".into()))?;
-                require(
-                    next.supersedes.contains(&current.id),
-                    "supersession history is missing",
-                )?;
-                current = next;
-            }
-        }
-        Ok(())
+        let mut cx = crate::product_alloc::AllocationContext::new();
+        self.validate_with(&mut cx).map_err(decision_contract_error)
+    }
+    pub(crate) fn validate_with(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), DecisionValidationError> {
+        validate_decision_graph_with(self.version, &self.decisions, cx)
     }
     pub fn identity(&self) -> Result<Digest> {
         self.validate()?;
         canonical_digest(IdentityDomain::Decision, self)
     }
+}
+
+trait DecisionGraphNode {
+    fn id(&self) -> &str;
+    fn supersedes(&self) -> &[String];
+    fn superseding_id(&self) -> Option<&str>;
+    fn validate_node(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), DecisionValidationError>;
+}
+
+impl DecisionGraphNode for ScopedDecision {
+    fn id(&self) -> &str { &self.id }
+    fn supersedes(&self) -> &[String] { &self.supersedes }
+    fn superseding_id(&self) -> Option<&str> {
+        match &self.status { DecisionStatus::Superseded { by } => Some(by), _ => None }
+    }
+    fn validate_node(
+        &self,
+        _cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), DecisionValidationError> {
+        self.validate().map_err(DecisionValidationError::Contract)
+    }
+}
+
+impl DecisionGraphNode for fallible_decision_decode::DecodedScopedDecision {
+    fn id(&self) -> &str { &self.id }
+    fn supersedes(&self) -> &[String] { &self.supersedes }
+    fn superseding_id(&self) -> Option<&str> {
+        match &self.status { DecisionStatus::Superseded { by } => Some(by), _ => None }
+    }
+    fn validate_node(
+        &self,
+        cx: &mut crate::product_alloc::AllocationContext,
+    ) -> std::result::Result<(), DecisionValidationError> {
+        validate_decoded_decision(self, cx)
+    }
+}
+
+fn decision_contract_error(error: DecisionValidationError) -> ContractError {
+    match error {
+        DecisionValidationError::Contract(error) => error,
+        DecisionValidationError::Allocation(_) => ContractError("decision validation allocation failed".into()),
+    }
+}
+
+fn validate_decision_graph_with<D: DecisionGraphNode>(
+    graph_version: u32,
+    decisions: &[D],
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<(), DecisionValidationError> {
+    version(graph_version)?;
+    let mut index = crate::product_alloc::ordered::OrderedMap::<&str, usize>::new();
+    for (position, decision) in decisions.iter().enumerate() {
+        check_id(decision.id())?;
+        if index.try_insert(decision.id(), position, cx)
+            .map_err(DecisionValidationError::Allocation)?.is_some()
+        {
+            return Err(ContractError(format!("duplicate ID: {}", decision.id())).into());
+        }
+    }
+    bounded(index.len())?;
+
+    for decision in decisions {
+        decision.validate_node(cx)?;
+        for prior_id in decision.supersedes() {
+            let prior_position = *index.get(prior_id.as_str())
+                .ok_or_else(|| ContractError("unknown superseded decision".into()))?;
+            let prior = &decisions[prior_position];
+            require(
+                matches!(prior.superseding_id(), Some(by) if by == decision.id()),
+                "supersession graph is not reciprocal",
+            )?;
+        }
+        let mut seen = crate::product_alloc::ordered::OrderedSet::<&str>::new();
+        let mut current = decision;
+        while let Some(by) = current.superseding_id() {
+            require(
+                seen.try_insert(current.id(), cx).map_err(DecisionValidationError::Allocation)?,
+                "cyclic decision supersession",
+            )?;
+            let next_position = *index.get(by)
+                .ok_or_else(|| ContractError("missing superseding decision".into()))?;
+            let next = &decisions[next_position];
+            require(
+                next.supersedes().iter().any(|id| id == current.id()),
+                "supersession history is missing",
+            )?;
+            current = next;
+        }
+    }
+    Ok(())
+}
+
+fn unique_with<'a>(
+    ids: impl IntoIterator<Item = &'a str>,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<(), DecisionValidationError> {
+    let mut seen = crate::product_alloc::ordered::OrderedSet::new();
+    for id in ids {
+        check_id(id)?;
+        if !seen.try_insert(id, cx).map_err(DecisionValidationError::Allocation)? {
+            return Err(ContractError(format!("duplicate ID: {id}")).into());
+        }
+    }
+    bounded(seen.len())?;
+    Ok(())
+}
+
+fn validate_decoded_decision(
+    decision: &fallible_decision_decode::DecodedScopedDecision,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<(), DecisionValidationError> {
+    check_id(&decision.id)?;
+    require(decision.revision > 0, "decision revision must be positive")?;
+    nonempty(&decision.request)?;
+    if let Some(rationale) = &decision.rationale { text(rationale)?; }
+
+    validate_decoded_decision_scope(&decision.scope, cx)?;
+    unique_with(decision.obligations.iter().map(|property| property.id.as_str()), cx)?;
+    for property in &decision.obligations { property.validate()?; }
+    bounded(decision.scenarios.len())?;
+    require(!decision.scenarios.is_empty(), "decision lacks accepted scenario")?;
+    unique_with(decision.supersedes.iter().map(String::as_str), cx)?;
+    require(!decision.supersedes.contains(&decision.id), "decision supersedes itself")?;
+    match &decision.status {
+        DecisionStatus::Superseded { by } => {
+            check_id(by)?;
+            require(by != &decision.id, "decision retires itself")?;
+        }
+        DecisionStatus::Withdrawn { adoption } => check_id(adoption)?,
+        DecisionStatus::Active | DecisionStatus::Pending => {}
+    }
+    if matches!(decision.outcome, DecisionOutcome::BothNeeded | DecisionOutcome::NeitherFits | DecisionOutcome::Deferred) {
+        require(!matches!(decision.status, DecisionStatus::Active), "unresolved decision cannot activate behavior")?;
+    }
+    Ok(())
+}
+
+fn validate_decoded_decision_scope(
+    scope: &fallible_decision_decode::DecodedDecisionScope,
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<(), DecisionValidationError> {
+    require(!scope.operations.is_empty(), "decision scope needs explicit operations")?;
+    unique_with(scope.operations.iter().map(String::as_str), cx)?;
+    bounded(scope.conditions.len())?;
+    for (id, value) in scope.conditions.iter() {
+        check_id(id)?;
+        validate_untyped_value(value, 0)?;
+    }
+    validate_record_refs_with(&scope.excluded_records, cx)?;
+    match &scope.population {
+        Population::Entity { entity } => check_id(entity)?,
+        Population::Where { entity, predicate } => {
+            check_id(entity)?;
+            check_expr_shape(predicate, 0, &mut 0)?;
+        }
+        Population::Records { records } => {
+            require(!records.is_empty(), "empty record scope")?;
+            validate_record_refs_with(records, cx)?;
+        }
+        Population::All | Population::NewWork | Population::CreatedAfter { .. } => {}
+    }
+    unique_with(scope.unknowns.iter().map(|unknown| unknown.id.as_str()), cx)?;
+    for unknown in &scope.unknowns {
+        nonempty(&unknown.description)?;
+        unique_with(unknown.operations.iter().map(String::as_str), cx)?;
+        require(!unknown.operations.is_empty(), "unknown boundary needs affected operations")?;
+    }
+
+    Ok(())
+}
+
+fn validate_record_refs_with(
+    records: &[RecordRef],
+    cx: &mut crate::product_alloc::AllocationContext,
+) -> std::result::Result<(), DecisionValidationError> {
+    require(records.len() <= MAX_COLLECTION, "record selection exceeds limit")?;
+    let mut seen = crate::product_alloc::ordered::OrderedSet::new();
+    for record in records {
+        check_id(&record.entity)?;
+        check_id(&record.record)?;
+        if !seen.try_insert((record.entity.as_str(), record.record.as_str()), cx)
+            .map_err(DecisionValidationError::Allocation)?
+        {
+            return Err(ContractError("duplicate selected record".into()).into());
+        }
+    }
+    Ok(())
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -3942,6 +6227,7 @@ fn validate_values_shape(values: &Values) -> Result<()> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AdapterError {
     Invalid(ContractError),
+    Allocation(crate::product_alloc::AllocationFailure),
     Unsupported(String),
     Stale(String),
     Cancelled,
@@ -4543,7 +6829,7 @@ impl DecisionScope {
     pub fn validate_for(&self, app: &AppDefinition) -> Result<()> {
         self.validate()?;
         app.validate()?;
-        let mut validator = Validator { app, nodes: 0 };
+        let mut validator = Validator::new(app, Audit::none());
         for operation in &self.operations {
             validator.action(operation)?;
         }
@@ -4634,7 +6920,9 @@ impl CompatibilityReport {
 }
 
 impl Producer {
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {self.validate_audited(Audit::none())}
+    fn validate_audited(&self,a:Audit<'_>)->Result<()> {
+        a.pay(8)?;
         match self {
             Producer::LiveAgent {
                 provider,
@@ -4642,14 +6930,14 @@ impl Producer {
                 session_id,
                 ..
             } => {
-                nonempty(provider)?;
-                nonempty(invocation_id)?;
+                a.nonempty(provider)?;
+                a.nonempty(invocation_id)?;
                 if let Some(session) = session_id {
-                    nonempty(session)?;
+                    a.nonempty(session)?;
                 }
             }
-            Producer::ExternalAuthor { description } => nonempty(description)?,
-            Producer::Fixture { name } => nonempty(name)?,
+            Producer::ExternalAuthor { description } => a.nonempty(description)?,
+            Producer::Fixture { name } => a.nonempty(name)?,
             Producer::UserAuthored => {}
         }
         Ok(())
@@ -4975,10 +7263,7 @@ impl AppDefinition {
         expression: &Expr,
         bindings: &BTreeMap<Id, Type>,
     ) -> Result<Type> {
-        Validator {
-            app: self,
-            nodes: 0,
-        }
+        Validator::new(self, Audit::none())
         .expr(expression, bindings, 0, true)
     }
 
@@ -5004,10 +7289,7 @@ impl AppDefinition {
             } => (entity, columns),
             ViewKind::Form { .. } => return Ok(None),
         };
-        let mut validator = Validator {
-            app: self,
-            nodes: 0,
-        };
+        let mut validator = Validator::new(self, Audit::none());
         let env = BTreeMap::from([("row".into(), Type::reference(entity))]);
         let columns = columns
             .iter()
@@ -5038,16 +7320,13 @@ impl AppDefinition {
     fn observable_types_validated(&self) -> Result<BTreeMap<Id, Type>> {
         #[cfg(test)]
         count_validation(|counts| counts.observables += 1);
-        let mut validator = Validator {
-            app: self,
-            nodes: 0,
-        };
+        let mut validator = Validator::new(self, Audit::none());
         self.observables
             .iter()
             .map(|observable| {
                 Ok((
                     observable.id.clone(),
-                    validator.expr(&observable.value, &Environment::new(), 0, true)?,
+                    validator.expr(&observable.value, &BTreeMap::new(), 0, true)?,
                 ))
             })
             .collect()
@@ -5153,3 +7432,15 @@ impl Observation {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "product_contract/capture_stage_tests.rs"]
+mod capture_stage_tests;
+
+#[cfg(test)]
+#[path = "product_contract/capture_canonical_removal_tests.rs"]
+mod capture_canonical_removal_tests;
+
+#[cfg(test)]
+#[path = "product_contract/retained_source_controls.rs"]
+mod retained_source_controls;

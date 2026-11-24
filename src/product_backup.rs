@@ -4,7 +4,7 @@
 use crate::product_contract::{
     canonical_bytes, canonical_digest, Digest, IdentityDomain, RuntimeLimits,
 };
-use crate::product_decisions::{validate_bundle, IntentArchive, IntentionBundle};
+use crate::product_decisions::{IntentArchive, IntentionBundle};
 use crate::product_locations::{
     CreatedTool, Folder, IssueKind, OperationIssue, RecentTools, Result, SelectedFile,
     ToolIdentity, ToolLocations,
@@ -21,6 +21,9 @@ const MAX_AUTOMATIC_CHECKS: usize = 64;
 const MAGIC: &str = "gitmanager.generated-tool-backup";
 #[path = "tool_proposal_input.rs"]
 mod bounded_input;
+#[path = "product_backup/fallible_codec.rs"]
+#[allow(dead_code)]
+pub(crate) mod fallible_codec;
 fn backup_header(bytes: &[u8]) -> Result<serde_json::Value> {
     bounded_input::parse_json_bytes_with_limit(bytes, MAX_BACKUP_BYTES)
         .map_err(|e| OperationIssue::new(IssueKind::Corrupt, e))
@@ -82,40 +85,54 @@ pub struct BackupSummary {
     pub intention_objects: usize,
 }
 impl VerifiedBackup {
+    #[cfg(test)]
+    pub(crate) fn test_fallible_codec_oracles(&self) -> usize {
+        fallible_codec::test_full_backup_oracles(self)
+    }
     pub fn capture(store: &ProductStore) -> Result<Self> {
         // CURRENT selects one immutable committed snapshot. Do not enumerate
         // the project directory: orphan/interrupted writes are not commits.
-        let snapshot = store.load()?;
-        let intentions = IntentArchive::new(store.clone())
-            .export_for(&snapshot)
-            .map_err(|e| OperationIssue::new(IssueKind::Corrupt, e))?;
-        let payload = Payload {
-            snapshot,
-            intentions,
-        };
-        let digest = canonical_digest(IdentityDomain::Evidence, &payload)?;
-        let backup = Self {
-            envelope: Envelope {
-                magic: MAGIC.into(),
-                version: 1,
-                digest,
-                payload,
-            },
-        };
-        // export_for just validated this exact owned snapshot and every
-        // reachable bundle object with the same default execution context.
-        // Neither value is exposed or mutated before becoming this envelope.
-        backup.validate_envelope()?;
-        backup.validate_runtime()?;
-        Ok(backup)
+        store.with_verified_snapshot(|snapshot, archive| {
+            let intentions = IntentArchive::new(store.clone())
+                .export_for_validated(snapshot, archive)
+                .map_err(|e| OperationIssue::new(IssueKind::Corrupt, e))?;
+            let payload = Payload {
+                snapshot: snapshot.clone(),
+                intentions,
+            };
+            let digest = canonical_digest(IdentityDomain::Evidence, &payload)?;
+            let backup = Self {
+                envelope: Envelope {
+                    magic: MAGIC.into(),
+                    version: 1,
+                    digest,
+                    payload,
+                },
+            };
+            // export_for_validated checks every reachable object against the
+            // one-use reconstruction from this exact freshly loaded snapshot.
+            backup.validate_envelope()?;
+            backup.validate_runtime()?;
+            Ok(backup)
+        })
     }
     fn validate(&self) -> Result<()> {
+        self.validate_with_archive().map(|_| ())
+    }
+    fn validate_with_archive(
+        &self,
+    ) -> Result<Option<crate::product_store::scope::ValidatedOwnedArchive<'_>>> {
         self.validate_envelope()?;
         let snapshot = self.snapshot();
-        snapshot.validate()?;
-        validate_bundle(snapshot, &self.envelope.payload.intentions)
+        let archive = snapshot.validate_with_archive()?;
+        crate::product_decisions::validate_bundle_with_archive(
+            snapshot,
+            &self.envelope.payload.intentions,
+            archive.as_ref(),
+        )
             .map_err(|e| OperationIssue::new(IssueKind::Corrupt, e))?;
-        self.validate_runtime()
+        self.validate_runtime()?;
+        Ok(archive)
     }
     fn validate_envelope(&self) -> Result<()> {
         let envelope = &self.envelope;
@@ -288,7 +305,7 @@ impl VerifiedBackup {
         selected: Option<&RecoveryDestination>,
         verify_instance: &dyn Fn() -> Result<()>,
     ) -> Result<ProductStore> {
-        self.validate()?;
+        let archive_proof = self.validate_with_archive()?;
         let destination = SelectedFile::new(path)?;
         let payload = &self.envelope.payload;
         let before_activate = |fresh: &ProductStore| {
@@ -303,7 +320,11 @@ impl VerifiedBackup {
             // The archive restores and re-reads the exact reachable objects before
             // returning; CURRENT still does not exist at this point.
             archive
-                .restore_for(&payload.snapshot, &payload.intentions)
+                .restore_for_validated(
+                    &payload.snapshot,
+                    &payload.intentions,
+                    archive_proof.as_ref(),
+                )
                 .map_err(|e| StoreError::Corrupt(e.to_string()))?;
             destination
                 .check_parent()
@@ -311,12 +332,18 @@ impl VerifiedBackup {
             verify_instance().map_err(|e| StoreError::Conflict(e.to_string()))
         };
         let store = match selected {
-            Some(selected) => ProductStore::create_recovered_selected(
+            Some(selected) => ProductStore::create_recovered_selected_validated(
                 selected,
                 &payload.snapshot,
+                archive_proof.as_ref(),
                 before_activate,
             ),
-            None => ProductStore::create_recovered_with(path, &payload.snapshot, before_activate),
+            None => ProductStore::create_recovered_with_validated(
+                path,
+                &payload.snapshot,
+                archive_proof.as_ref(),
+                before_activate,
+            ),
         }?;
         destination.check_parent()?;
         if let Some(selected) = selected {

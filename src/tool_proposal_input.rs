@@ -8,6 +8,13 @@
 
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value};
+#[path = "tool_proposal_input/capture_payment_core.rs"]
+pub(crate) mod capture_payment_core;
+#[path = "tool_proposal_input/capture_paid.rs"]
+mod capture_paid;
+pub(super) use capture_paid::{parse_json_bytes_with_work, InputWorkError};
+pub(super) use capture_paid::{lexical_envelope_with_work, LexicalEnvelope};
+
 use std::fmt;
 use std::io::{self, Read};
 
@@ -93,6 +100,7 @@ pub(crate) fn parse_json_bytes_with_limit(
     let result = ValueSeed {
         depth: 0,
         violation: &mut violation,
+        paid: None,
     }
     .deserialize(&mut deserializer);
     let value = result.map_err(|error| violation.unwrap_or(InputError::InvalidJson(error)))?;
@@ -120,13 +128,14 @@ pub fn read_json(reader: impl Read) -> Result<Value, InputError> {
 
 // Use serde's tokenizer and syntax checks, customizing only container traversal
 // so depth and duplicate members are checked before accepting nested values.
-struct ValueSeed<'a> {
+struct ValueSeed<'v, 'w> {
     depth: usize,
     // Preserve typed intake errors through serde's generic error interface.
-    violation: &'a mut Option<InputError>,
+    violation: &'v mut Option<InputError>,
+    paid: Option<&'w std::cell::RefCell<dyn capture_paid::IntakeCharge + 'w>>,
 }
 
-impl<'de> DeserializeSeed<'de> for ValueSeed<'_> {
+impl<'de> DeserializeSeed<'de> for ValueSeed<'_, '_> {
     type Value = Value;
 
     fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<Value, D::Error> {
@@ -134,8 +143,9 @@ impl<'de> DeserializeSeed<'de> for ValueSeed<'_> {
     }
 }
 
-impl ValueSeed<'_> {
+impl ValueSeed<'_, '_> {
     fn check_container<E: de::Error>(&mut self) -> Result<(), E> {
+        self.pay::<E>(2)?;
         if self.depth >= MAX_NESTING_DEPTH {
             *self.violation = Some(InputError::NestingTooDeep);
             return Err(E::custom("JSON nesting limit exceeded"));
@@ -144,69 +154,91 @@ impl ValueSeed<'_> {
     }
 }
 
-impl<'de> Visitor<'de> for ValueSeed<'_> {
+impl<'de> Visitor<'de> for ValueSeed<'_, '_> {
     type Value = Value;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("a JSON value")
     }
 
-    fn visit_unit<E>(self) -> Result<Value, E> {
+    fn visit_unit<E: de::Error>(self) -> Result<Value, E> {
+        self.pay::<E>(2)?;
         Ok(Value::Null)
     }
 
-    fn visit_bool<E>(self, value: bool) -> Result<Value, E> {
+    fn visit_bool<E: de::Error>(self, value: bool) -> Result<Value, E> {
+        self.pay::<E>(2)?;
         Ok(Value::Bool(value))
     }
 
-    fn visit_i64<E>(self, value: i64) -> Result<Value, E> {
+    fn visit_i64<E: de::Error>(self, value: i64) -> Result<Value, E> {
+        self.pay::<E>(2)?;
         Ok(Value::Number(value.into()))
     }
 
-    fn visit_u64<E>(self, value: u64) -> Result<Value, E> {
+    fn visit_u64<E: de::Error>(self, value: u64) -> Result<Value, E> {
+        self.pay::<E>(2)?;
         Ok(Value::Number(value.into()))
     }
 
     fn visit_f64<E: de::Error>(self, value: f64) -> Result<Value, E> {
+        self.pay::<E>(2)?;
         Number::from_f64(value)
             .map(Value::Number)
             .ok_or_else(|| E::custom("non-finite JSON number"))
     }
 
     fn visit_str<E: de::Error>(self, value: &str) -> Result<Value, E> {
+        self.copy_string::<E>(value.len())?;
         self.visit_string(value.to_owned())
     }
 
-    fn visit_string<E>(self, value: String) -> Result<Value, E> {
+    fn visit_string<E: de::Error>(self, value: String) -> Result<Value, E> {
+        self.pay::<E>(2)?;
         Ok(Value::String(value))
     }
 
     fn visit_seq<A: SeqAccess<'de>>(mut self, mut sequence: A) -> Result<Value, A::Error> {
         self.check_container()?;
+        self.pay::<A::Error>(3)?;
         let mut values = Vec::new();
-        while let Some(value) = sequence.next_element_seed(ValueSeed {
+        loop {
+            self.pay::<A::Error>(3)?;
+            let Some(value) = sequence.next_element_seed(ValueSeed {
             depth: self.depth + 1,
             violation: self.violation,
-        })? {
-            values.push(value);
+            paid: self.paid,
+        })? else { break };
+            self.push::<A::Error>(&mut values, value)?;
         }
         Ok(Value::Array(values))
     }
 
     fn visit_map<A: MapAccess<'de>>(mut self, mut object: A) -> Result<Value, A::Error> {
         self.check_container()?;
+        self.pay::<A::Error>(9)?;
         let mut values = Map::new();
-        while let Some(key) = object.next_key::<String>()? {
+        loop {
+            self.pay::<A::Error>(1)?;
+            let Some(key) = object.next_key::<String>()? else { break };
+            self.map_search::<A::Error>(values.len(), &key)?;
             if values.contains_key(&key) {
                 *self.violation = Some(InputError::DuplicateObjectMember);
                 return Err(de::Error::custom("duplicate JSON object member"));
             }
+            self.pay::<A::Error>(3)?;
             let value = object.next_value_seed(ValueSeed {
                 depth: self.depth + 1,
                 violation: self.violation,
+                paid: self.paid,
             })?;
+            self.map_insert::<A::Error>(values.len(), &key)?;
             values.insert(key, value);
         }
         Ok(Value::Object(values))
     }
 }
+
+#[cfg(test)]
+#[path = "product_contract/capture_input_stage_tests.rs"]
+mod capture_input_stage_tests;

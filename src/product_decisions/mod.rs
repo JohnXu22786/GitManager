@@ -6,8 +6,16 @@ mod context;
 mod evolution;
 mod mapping;
 mod owned;
+mod owned_policy;
+mod owned_transition;
+use owned_transition::OwnedTransitionDecisionContext;
+pub use owned_transition::OwnedWithdrawalSummary;
 use owned::{ChangeAuthority, OwnedDecisionContext};
 mod recovery;
+#[cfg(test)]
+mod current_scene_controls;
+#[cfg(test)]
+pub(crate) use current_scene_controls::CurrentScenePendingForTest;
 mod replay;
 use crate::product_contract::*;
 use crate::product_runtime::{LocalRuntime, DRIVER_VERSION};
@@ -18,6 +26,7 @@ use crate::product_store::scope::{
 use crate::product_store::{PreparedAdoption, ProductStore, ProjectSnapshot, StoreError};
 pub use archive::IntentArchive;
 pub(crate) use bundle::upgrade_bundle_binding;
+pub(crate) use bundle::validate_bundle_with_archive;
 pub use bundle::{validate_bundle, IntentionBundle};
 pub use context::VerifiedDiscoveryScene;
 pub use evolution::{EvolutionDraft, ReconciliationRequest};
@@ -121,6 +130,7 @@ impl CheckReport {
 struct SceneCoverage {
     applicable: BTreeSet<Id>,
     boundary: crate::product_store::scope::OwnedBoundaryCoverage,
+    refresh_admission: bool,
 }
 /// Kept opaque: only this host can prepare it, and commit repeats the checks.
 pub struct VerifiedChange {
@@ -154,9 +164,12 @@ struct AdmissionKey {
     rehearsal: Option<(Vec<PreparedScopedChange>, Vec<Id>)>,
     correspondences: BTreeMap<Digest, ScopeCorrespondence>,
     owned: Option<OwnedDecisionContext>,
+    owned_transition: Option<OwnedTransitionDecisionContext>,
     limits: RuntimeLimits,
     runtime: RuntimeCapabilities,
     driver: &'static str,
+    scope_verifier: u32,
+    owned_lowerings: [u32;2],
 }
 struct AdmissionCache {
     key: AdmissionKey,
@@ -168,6 +181,7 @@ pub struct DecisionEngine<R: RuntimeAdapter> {
     limits: RuntimeLimits,
     pending_scope: RefCell<Option<PreparedScopedChange>>,
     pending_owned: RefCell<Option<OwnedDecisionContext>>,
+    pending_owned_transition: RefCell<Option<OwnedTransitionDecisionContext>>,
     pending_rehearsal: RefCell<Option<(Vec<PreparedScopedChange>, Vec<Id>)>>,
     pending_correspondences: RefCell<BTreeMap<Digest, ScopeCorrespondence>>,
     // One immutable admission result; every lookup still freshly loads and
@@ -186,6 +200,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             limits: RuntimeLimits::default(),
             pending_scope: RefCell::new(None),
             pending_owned: RefCell::new(None),
+            pending_owned_transition: RefCell::new(None),
             pending_rehearsal: RefCell::new(None),
             pending_correspondences: RefCell::new(BTreeMap::new()),
             admission_cache: RefCell::new(None),
@@ -223,7 +238,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         }
     }
     fn scope_context(&self) -> Result<ScopedExecutionContext> {
-        let current = match self.archive.snapshot() {
+        let (current, validated_registry) = match self.archive.snapshot_with_validated_registry() {
             Ok(current) => current,
             Err(error) => {
                 self.clear_admission_cache();
@@ -236,10 +251,19 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             rehearsal: self.pending_rehearsal.borrow().clone(),
             correspondences: self.pending_correspondences.borrow().clone(),
             owned: self.pending_owned.borrow().clone(),
+            owned_transition: self.pending_owned_transition.borrow().clone(),
             limits: self.limits.clone(),
             runtime: self.runtime.capabilities(),
             driver: DRIVER_VERSION,
+            scope_verifier: crate::product_store::scope::SCOPE_VERIFIER_REVISION,
+            owned_lowerings: crate::product_store::scope::SUPPORTED_OWNED_LOWERINGS,
         };
+        if let Some(transition) = &key.owned_transition {
+            transition.prepared.check_basis(&key.current)?;
+            if key.owned.is_some() || key.prepared.is_some() || key.rehearsal.is_some() || !key.correspondences.is_empty() {
+                return Err(invalid("owned transition and other authority cannot coexist"));
+            }
+        }
         if let Some(owned) = &key.owned {
             owned.prepared.check_basis(&key.current)?;
             if key.prepared.is_some() || key.rehearsal.is_some() || !key.correspondences.is_empty()
@@ -259,7 +283,13 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         self.clear_admission_cache();
         #[cfg(test)]
         self.admission_builds.set(self.admission_builds.get() + 1);
-        let context = if let Some(owned) = &key.owned {
+        let context = if let Some(transition) = &key.owned_transition {
+            if transition.current_scene {
+                ScopedExecutionContext::owned_transition_current(&key.current,&transition.prepared,transition.next.as_ref())?
+            } else {
+                ScopedExecutionContext::owned_transition_prepared(&key.current,&transition.prepared,transition.next.as_ref())?
+            }
+        } else if let Some(owned) = &key.owned {
             ScopedExecutionContext::owned_prepared(
                 &key.current,
                 &owned.prepared,
@@ -276,7 +306,10 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         } else if let Some((prepared, _)) = &key.rehearsal {
             ScopedExecutionContext::rehearsals(&key.current, prepared)?
         } else {
-            ScopedExecutionContext::committed(&key.current)?
+            match &validated_registry {
+                Some(validated) => ScopedExecutionContext::committed_with_validated_registry(validated)?,
+                None => ScopedExecutionContext::committed(&key.current)?,
+            }
         };
         let context = context.with_correspondences(&key.correspondences)?;
         self.admission_cache.replace(Some(AdmissionCache {
@@ -298,6 +331,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
     ) -> Result<ScopedExecutionContext> {
         if self.pending_scope.borrow().is_some()
             || self.pending_owned.borrow().is_some()
+            || self.pending_owned_transition.borrow().is_some()
             || self.pending_rehearsal.borrow().is_some()
             || self.archive.snapshot()? != *current
         {
@@ -332,6 +366,17 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         id: &str,
     ) -> Result<(RunEvidence, Vec<ScopeContext>)> {
         let context = self.scope_context()?;
+        self.execute_scene_in_context(program, scenario, graph, limits, id, &context)
+    }
+    fn execute_scene_in_context(
+        &self,
+        program: &CapturedProgram,
+        scenario: &ScenarioSpec,
+        graph: &DecisionGraph,
+        limits: RuntimeLimits,
+        id: &str,
+        context: &ScopedExecutionContext,
+    ) -> Result<(RunEvidence, Vec<ScopeContext>)> {
         execute_admitted(
             &self.runtime,
             program,
@@ -339,8 +384,22 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             graph,
             limits,
             id,
-            Some(&context),
+            Some(context),
         )
+    }
+    fn refresh_scope_context(&self, context: &mut ScopedExecutionContext) -> Result<bool> {
+        let current = match self.archive.snapshot() {
+            Ok(current) => current,
+            Err(error) => {
+                self.clear_admission_cache();
+                return Err(error);
+            }
+        };
+        if context.require_current_scene_snapshot(&current).is_err() {
+            *context = self.scope_context()?;
+            return Ok(true);
+        }
+        Ok(false)
     }
     fn execute_mapped_scene(
         &self,
@@ -369,23 +428,45 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         )?;
         Ok((run, contexts, actual))
     }
-    fn execute_retained_owned_scene(
+    fn execute_retained_owned_scene<'a>(
         &self,
         decision: &ScopedDecision,
-        scene: &AcceptedScene,
+        scene: &'a AcceptedScene,
         target: &CapturedProgram,
         graph: &DecisionGraph,
         id: &str,
+        context: &mut ScopedExecutionContext,
+        scene_index: usize,
+        decision_scenes: &'a [AcceptedScene],
+        retained_archive: &mut Option<archive::RetainedArchive<'a>>,
     ) -> Result<(RunEvidence, Vec<ScopeContext>, ScenarioSpec)> {
-        let current = self.archive.snapshot()?;
-        let token = self.archive.retained_scene(&current, decision, scene)?;
+        let current = context.current_snapshot().clone();
+        let token = if current.decisions.decisions.contains(decision) {
+            if retained_archive.is_none() {
+                *retained_archive = Some(self.archive.retained_archive(
+                    &current,
+                    decision,
+                    decision_scenes,
+                )?);
+            }
+            self.archive.retained_scene_from_archive(
+                &current,
+                decision,
+                scene,
+                scene_index,
+                retained_archive.as_ref().expect("retained archive was prepared"),
+            )?
+        } else {
+            self.archive.retained_scene(&current, decision, scene)?
+        };
+        if self.archive.snapshot()? != current {
+            return Err(invalid("retained scene snapshot changed"));
+        }
         let cancelled = self
             .runtime
             .cancellation_token()
             .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
-        let (actual, admission) = self
-            .scope_context()?
-            .project_retained_scene(&token, target, graph, cancelled)?;
+        let (actual, admission) = context.project_retained_scene(&token, target, graph, cancelled)?;
         let (run, contexts) = execute_admitted(
             &self.runtime,
             target,
@@ -438,6 +519,42 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         scenario: &ScenarioSpec,
         disclosure: Disclosure,
     ) -> Result<AcceptedScene> {
+        if matches!(
+            &current.scope,
+            crate::product_store::scope::ScopeEnvelope::OwnedV2(_)
+        ) {
+            if !self.pending_correspondences.borrow().is_empty() {
+                return Err(invalid(
+                    "retained replay context does not match the committed snapshot",
+                ));
+            }
+            let context = self.retained_replay_context(current)?;
+            context.require_current_scene_snapshot(current)?;
+            let program = current.program()?;
+            context.verify_seed(program, &scenario.seed, scenario.clock_day)?;
+            let (run, _) = execute_admitted(
+                &self.runtime,
+                program,
+                scenario,
+                &current.decisions,
+                self.limits.clone(),
+                "accepted",
+                Some(&context),
+            )?;
+            if run.state != EvidenceState::Observed {
+                return Err(invalid("accepted scene must execute completely"));
+            }
+            if self.archive.snapshot()? != *current {
+                return Err(invalid("saved work changed during current scene replay"));
+            }
+            return Ok(AcceptedScene {
+                program: program.clone(),
+                scenario: scenario.clone(),
+                evidence: run,
+                disclosure,
+                bind_outcome: true,
+            });
+        }
         ScopedExecutionContext::committed(current)?.verify_seed(
             current.program()?,
             &scenario.seed,
@@ -811,7 +928,8 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         target: &CapturedProgram,
         mappings: &[ImplementationMapping],
     ) -> Result<CheckReport> {
-        self.scope_context()?.admit_target(target)?;
+        let mut scoped = self.scope_context()?;
+        scoped.admit_target(target)?;
         graph.validate()?;
         target.validate()?;
         self.runtime.validate(target)?;
@@ -875,13 +993,28 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             let start = report.checks.len();
             let mut exercised = BTreeSet::new();
             let mut boundaries = BTreeSet::new();
+            let mut retained_archive = None;
             for (index, scene) in scenes.iter().enumerate() {
                 let relevant = mappings.iter().find(|m| {
                     m.source_program == scene.program.artifact.program_digest
                         && m.source_program != target.artifact.program_digest
                 });
-                let coverage =
-                    self.check_scene(graph, decision, scene, target, relevant, index, &mut report)?;
+                let coverage = self.check_scene(
+                    graph,
+                    decision,
+                    scene,
+                    target,
+                    relevant,
+                    index,
+                    &mut report,
+                    &mut scoped,
+                    &scenes,
+                    &mut retained_archive,
+                )?;
+                if coverage.refresh_admission {
+                    scoped = self.scope_context()?;
+                    retained_archive = None;
+                }
                 exercised.extend(coverage.applicable);
                 boundaries.extend(coverage.boundary.operations().iter().cloned());
             }
@@ -910,15 +1043,18 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         }
         Ok(report)
     }
-    fn check_scene(
+    fn check_scene<'a>(
         &self,
         graph: &DecisionGraph,
         decision: &ScopedDecision,
-        scene: &AcceptedScene,
+        scene: &'a AcceptedScene,
         target: &CapturedProgram,
         bound: Option<&ImplementationMapping>,
         index: usize,
         report: &mut CheckReport,
+        scoped: &mut ScopedExecutionContext,
+        decision_scenes: &'a [AcceptedScene],
+        retained_archive: &mut Option<archive::RetainedArchive<'a>>,
     ) -> Result<SceneCoverage> {
         let relevant: Vec<_> = bound
             .map(|m| m.mappings.as_slice())
@@ -928,7 +1064,10 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             .cloned()
             .collect();
         let mapping = Mapping::new(&scene.program.program, &target.program, &relevant)?;
-        let (prior, contexts) = self.execute_scene(
+        if self.refresh_scope_context(scoped)? {
+            *retained_archive = None;
+        }
+        let (prior, contexts) = self.execute_scene_in_context(
             &scene.program,
             &scene.scenario,
             graph,
@@ -937,8 +1076,12 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 "old-{}",
                 &canonical_digest(IdentityDomain::Decision, &(&decision.id, index))?.as_str()[..32]
             ),
+            scoped,
         )?;
-        let applicability = self.scope_context()?.applicability(
+        if self.refresh_scope_context(scoped)? {
+            *retained_archive = None;
+        }
+        let applicability = scoped.applicability(
             &scene.program,
             target,
             &decision.scope,
@@ -979,7 +1122,10 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             })
             .map(|c| c.operation.clone())
             .collect();
-        let boundary = self.scope_context()?.owned_boundary_coverage(
+        if self.refresh_scope_context(scoped)? {
+            *retained_archive = None;
+        }
+        let boundary = scoped.owned_boundary_coverage(
             &scene.program,
             target,
             &decision.scope,
@@ -988,9 +1134,10 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 .cancellation_token()
                 .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))),
         )?;
-        let coverage = SceneCoverage {
+        let mut coverage = SceneCoverage {
             applicable: exercised.clone(),
             boundary,
+            refresh_admission: false,
         };
         if scope != ScopeMatch::Applies {
             check.state = if scope == ScopeMatch::Outside {
@@ -1025,7 +1172,10 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                 .iter()
                 .find(|s| s.original == scene.scenario.identity().expect("validated scene"))
         });
-        let mapped = match if self.scope_context()?.uses_owned_initializer(target) {
+        if self.refresh_scope_context(scoped)? {
+            *retained_archive = None;
+        }
+        let mapped = match if scoped.uses_owned_replay_recipe(target) {
             // Required owned cells must come from the verified isolated recipe,
             // before ordinary target-schema mapping can validate this old seed.
             if !relevant.is_empty() || explicit.is_some() {
@@ -1056,10 +1206,25 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             "check-{}",
             &canonical_digest(IdentityDomain::Decision, &(&decision.id, index))?.as_str()[..32]
         );
+        if self.refresh_scope_context(scoped)? {
+            *retained_archive = None;
+        }
+        let use_owned_recipe = scoped.uses_owned_replay_recipe(target) && scene.program != *target;
         let execution =
-            if self.scope_context()?.uses_owned_initializer(target) && scene.program != *target {
-                self.execute_retained_owned_scene(decision, scene, target, graph, &run_id)
+            if use_owned_recipe {
+                self.execute_retained_owned_scene(
+                    decision,
+                    scene,
+                    target,
+                    graph,
+                    &run_id,
+                    scoped,
+                    index,
+                    decision_scenes,
+                    retained_archive,
+                )
             } else {
+                coverage.refresh_admission = true;
                 self.execute_mapped_scene(
                     &scene.program,
                     &scene.scenario,
@@ -1638,6 +1803,7 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
                         .as_ref()
                         .map(|o| o.prepared.scope())
                 })
+                .or_else(|| self.pending_owned_transition.borrow().as_ref().map(|o|o.prepared.scope()))
                 .unwrap_or_else(|| DecisionScope {
                     operations: target
                         .program
@@ -1675,7 +1841,10 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         validate_withdrawal_delta(current, &next, &plan)?;
         self.verify_destination_packages(store, current, &next, &plan)?;
         let owned = self.pending_owned.borrow().clone();
-        let prepared = if let Some(owned) = &owned {
+        let transition = self.pending_owned_transition.borrow().clone();
+        let prepared = if let Some(transition) = &transition {
+            store.prepare_owned_transition_adoption(plan,&transition.prepared,&next)?
+        } else if let Some(owned) = &owned {
             store.prepare_owned_adoption(plan, &owned.prepared, &owned.mode)?
         } else {
             match self.pending_scope.borrow().as_ref() {
@@ -1696,7 +1865,9 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
             scoped.correspondences = correspondences.clone();
         }
         Ok(VerifiedChange {
-            authority: if let Some(owned) = owned {
+            authority: if let Some(transition) = transition {
+                ChangeAuthority::OwnedTransition(transition)
+            } else if let Some(owned) = owned {
                 ChangeAuthority::Owned(owned)
             } else if let Some(scoped) = scoped {
                 ChangeAuthority::ScalarActivation(scoped)
@@ -1718,6 +1889,9 @@ impl<R: RuntimeAdapter> DecisionEngine<R> {
         })
     }
     pub fn adopt(&self, store: &ProductStore, change: &VerifiedChange) -> Result<ProjectSnapshot> {
+        if let ChangeAuthority::OwnedTransition(transition) = &change.authority {
+            return self.adopt_owned_transition(store,change,transition,#[cfg(test)]None);
+        }
         if let ChangeAuthority::Owned(owned) = &change.authority {
             return self.adopt_owned(
                 store,

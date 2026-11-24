@@ -11,6 +11,12 @@ mod product_decisions;
 mod product_locations;
 #[path = "../src/product_protocol.rs"]
 mod product_protocol;
+#[path = "../src/product_alloc.rs"]
+mod product_alloc;
+#[path = "../src/product_json.rs"]
+mod product_json;
+#[path = "../src/product_app.rs"]
+mod product_app;
 #[path = "../src/product_runtime/mod.rs"]
 mod product_runtime;
 #[path = "../src/product_store/mod.rs"]
@@ -68,6 +74,7 @@ fn verified_backups_recover_later_work_and_outputs_in_a_fresh_process() {
     let store = backup_source(&root);
     let saved = store.load().unwrap();
     let backup = VerifiedBackup::capture(&store).unwrap();
+    assert!(backup.test_fallible_codec_oracles() > 0);
     assert_eq!(backup.snapshot(), &saved);
     let file = root.join("my-tool.gmbak");
     backup.export_new(&file).unwrap();

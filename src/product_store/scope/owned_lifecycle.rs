@@ -49,6 +49,21 @@ impl AcceptedPreviewLifecycle {
         request: &OwnedPreviewRequest,
         meter: &mut ProofMeter,
     ) -> AdmissionResult<()> {
+        self.verify_profiled(snapshot, candidate, request, meter, None)
+    }
+    // Six copied reference roles, two return-place/status words and two
+    // alignment/cleanup words; prepay on None and stale-refusal paths too.
+    pub(super) const PROFILE_VERIFY_FRAME: u64 = 4 * (6 * std::mem::size_of::<&()>()
+        + 4 * std::mem::size_of::<usize>()) as u64 + 64;
+    pub(super) fn verify_profiled(
+        &self,
+        snapshot: &ProjectSnapshot,
+        candidate: &CapturedProgram,
+        request: &OwnedPreviewRequest,
+        meter: &mut ProofMeter,
+        profile: Option<&mut super::common_fact_admission::InitialLimitsProfile>,
+    ) -> AdmissionResult<()> {
+        meter.charge(Self::PROFILE_VERIFY_FRAME)?;
         if self.disclosure.snapshot != canonical_digest(IdentityDomain::Data, snapshot)?
             || self.disclosure.request != request_identity(request)?
             || self.disclosure.before != *snapshot.program()?
@@ -65,6 +80,7 @@ impl AcceptedPreviewLifecycle {
             request,
             &self.disclosure.witnesses,
             meter,
+            profile,
         )?;
         if evidence != self.disclosure.evidence
             || disclosure_id(
@@ -108,7 +124,14 @@ fn replay(
     request: &OwnedPreviewRequest,
     witnesses: &[LifecycleWitness],
     meter: &mut ProofMeter,
+    mut profile: Option<&mut super::common_fact_admission::InitialLimitsProfile>,
 ) -> AdmissionResult<Vec<RunEvidence>> {
+    // Extra optional-limit owner, tuple-copy/observation scratch, transport and
+    // cleanup are prepaid for every route, including an ordinary None profile.
+    const PROFILE_ROOT: usize = 4 * (std::mem::size_of::<Option<RuntimeLimits>>()
+        + std::mem::size_of::<RuntimeLimits>() + 8 * std::mem::size_of::<usize>()
+        + 4 * std::mem::size_of::<Option<&mut super::common_fact_admission::InitialLimitsProfile>>());
+    meter.charge(PROFILE_ROOT as u64 + 32)?;
     if witnesses.len() != 2
         || witnesses[0].side != OwnedSourceSide::Before
         || witnesses[1].side != OwnedSourceSide::After
@@ -119,6 +142,13 @@ fn replay(
         ));
     }
     let runtime = LocalRuntime::with_cancellation(meter.cancelled());
+    let active_program = snapshot.program()?;
+    let committed_owned = matches!(&snapshot.scope, ScopeEnvelope::OwnedV2(state) if !state.layers.is_empty());
+    let owned_context = if matches!(&snapshot.scope, ScopeEnvelope::OwnedV2(_)) {
+        Some(super::owned_replay::OwnedExecutionContext::new(snapshot)?)
+    } else {
+        None
+    };
     let mut checks = ProjectionValidation::default();
     let mut result = vec![];
     for witness in witnesses {
@@ -151,13 +181,45 @@ fn replay(
             OwnedSourceSide::Before => (snapshot.program()?, &request.inventory.lifecycle.before),
             OwnedSourceSide::After => (candidate, &request.inventory.lifecycle.after),
         };
-        let run = runtime.replay(
-            program,
-            scenario,
-            &snapshot.decisions,
-            meter.runtime()?,
-            "lifecycle-support",
-        )?;
+        let use_context = program == active_program || committed_owned;
+        let run = if let Some(context) = owned_context.as_ref().filter(|_| use_context) {
+            let admission = if program == active_program {
+                context.begin_replay(
+                    program,
+                    scenario,
+                    &snapshot.decisions,
+                    meter.cancelled(),
+                )?
+            } else {
+                context.begin_append_only_candidate_replay(
+                    program,
+                    scenario,
+                    &snapshot.decisions,
+                    request,
+                    meter.cancelled(),
+                )?
+            };
+            runtime.replay_admitted(
+                program,
+                scenario,
+                &snapshot.decisions,
+                meter.runtime()?,
+                "lifecycle-support",
+                Some(admission.as_ref()),
+            )?
+        } else {
+            runtime.replay(
+                program,
+                scenario,
+                &snapshot.decisions,
+                meter.runtime()?,
+                "lifecycle-support",
+            )?
+        };
+        meter.charge(2)?;
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.observe(&run.limits, false, meter)?;
+        }
         if run.state != EvidenceState::Observed
             || run.observations.len() != 1
             || run.trace.len() != 1
@@ -176,9 +238,15 @@ fn replay(
             {
                 return Err(refuse("lifecycle witness", "active witness row missing"));
             }
+            let limits = meter.runtime()?;
+            meter.charge(2)?;
+            let completed_limits = if profile.is_some() {
+                meter.charge(64)?;
+                Some(limits.clone())
+            } else { None };
             let actual = runtime.evaluate_record_projection_with(
                 &mut checks,
-                meter.runtime()?,
+                limits,
                 program,
                 &data,
                 row,
@@ -187,6 +255,10 @@ fn replay(
                 &Type::Boolean,
                 snapshot.clock_day,
             )?;
+            meter.charge(2)?;
+            if let (Some(profile), Some(limits)) = (profile.as_deref_mut(), completed_limits) {
+                profile.observe(&limits, false, meter)?;
+            }
             if actual != (DataValue::Boolean { value: wanted }) {
                 return Err(refuse(
                     "lifecycle witness",
@@ -217,7 +289,7 @@ impl LifecycleAcceptanceHost {
         let mut meter = ProofMeter::new(budget, cancelled)?;
         let snapshot = store.load()?;
         authenticate(&snapshot, candidate, request, &mut meter)?;
-        let evidence = replay(&snapshot, candidate, request, witnesses, &mut meter)?;
+        let evidence = replay(&snapshot, candidate, request, witnesses, &mut meter, None)?;
         let identity = disclosure_id(&snapshot, candidate, request, witnesses, &evidence)?;
         Ok(Self {
             disclosure: Some(Disclosure {
@@ -308,6 +380,13 @@ impl LifecycleAcceptanceHost {
         store: &ProductStore,
     ) -> AdmissionResult<AcceptedPreviewLifecycle> {
         self.record_event(store, "synthetic-operator-fixture")
+    }
+    #[cfg(test)]
+    pub(crate) fn explicit_host_accept_for_test(
+        &mut self,
+        store: &ProductStore,
+    ) -> AdmissionResult<AcceptedPreviewLifecycle> {
+        self.record_event(store, "explicit-host-ui")
     }
 }
 

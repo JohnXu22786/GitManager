@@ -193,4 +193,42 @@ mod tests {
         .unwrap();
         assert!(allocate(&[1, 1], &[(vec![0, 1], 2)], &mut exhausted).is_err());
     }
+    #[test]
+    fn exact_epoch_endpoint_closes_shared_write_capacity_before_reseed() {
+        // This is an isolated feasibility model, never a durable-store fixture.
+        let key = ("shared".to_owned(), "row".to_owned());
+        let seed = DataSnapshot {
+            version: CONTRACT_VERSION,
+            project_id: "epoch-revisions".into(),
+            generation: 0,
+            schema: vec![],
+            records: vec![Record {
+                entity: key.0.clone(),
+                id: key.1.clone(),
+                revision: 1,
+                created_program: canonical_digest(IdentityDomain::Source, &"revision-model")
+                    .unwrap(),
+                archived: false,
+                values: Values::new(),
+            }],
+            events: vec![],
+        };
+        let cap = RuntimeLimits::default().transaction_writes as u64;
+        let mut first = RevisionHistory::new(&seed, |_| true);
+        first
+            .event(vec![key.clone()], cap - 2, &mut meter())
+            .unwrap();
+        let mut boundary = seed.clone();
+        boundary.records[0].revision = 3; // One coalesced row, two real writes.
+        first.validate(&boundary, &mut meter()).unwrap();
+        let mut second = RevisionHistory::new(&boundary, |_| true);
+        second.event(vec![key], cap - 1, &mut meter()).unwrap();
+        let mut endpoint = boundary.clone();
+        endpoint.records[0].revision = 4;
+        second.validate(&endpoint, &mut meter()).unwrap();
+        endpoint.records[0].revision = 5;
+        assert!(second.validate(&endpoint, &mut meter()).is_err());
+        boundary.records[0].revision = 4;
+        assert!(first.validate(&boundary, &mut meter()).is_err());
+    }
 }

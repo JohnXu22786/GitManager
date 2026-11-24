@@ -26,6 +26,83 @@ pub struct IntentArchive {
     store: ProductStore,
 }
 impl IntentArchive {
+    pub(super) fn retained_archive<'a>(
+        &self,
+        current: &ProjectSnapshot,
+        decision: &ScopedDecision,
+        scenes: &'a [AcceptedScene],
+    ) -> Result<RetainedArchive<'a>> {
+        if self.snapshot()? != *current {
+            return Err(invalid("retained scene snapshot changed"));
+        }
+        if !current.decisions.decisions.contains(decision) {
+            return Err(invalid("retained scene decision changed"));
+        }
+        let bytes = self.store.read_extension(&decision.witness)?;
+        let Content::Scenes { scenes: archived } = decode(&bytes, &decision.witness)? else {
+            return Err(invalid("expected accepted scenes, found another object"));
+        };
+        if archived != scenes {
+            return Err(invalid("retained scenes differ from their exact witness package"));
+        }
+        for scene in &archived {
+            scene.validate()?;
+        }
+        validate_scene_bindings(decision, &archived)?;
+        if archived
+            .iter()
+            .map(|scene| scene.scenario.identity())
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            != decision.scenarios
+            || archived.iter().any(|scene| {
+                scene.program.binding.project_id != current.data.project_id
+                    || scene.scenario.seed.project_id != current.data.project_id
+            })
+        {
+            return Err(invalid("accepted scenes differ from their exact stored intention"));
+        }
+        validate_rehearsal_scenes(&self.store.load()?, &decision.witness, &archived)?;
+        if self.snapshot()? != *current {
+            return Err(invalid("retained scene snapshot changed"));
+        }
+        Ok(RetainedArchive {
+            witness: decision.witness.clone(),
+            bytes,
+            decision: decision.clone(),
+            scenes,
+        })
+    }
+
+    pub(crate) fn retained_scene_from_archive(
+        &self,
+        current: &ProjectSnapshot,
+        decision: &ScopedDecision,
+        scene: &AcceptedScene,
+        scene_index: usize,
+        archive: &RetainedArchive<'_>,
+    ) -> Result<RetainedScene> {
+        if archive.witness != decision.witness
+            || archive.decision != *decision
+            || !archive.scenes.get(scene_index).is_some_and(|stored| std::ptr::eq(stored, scene))
+            || !current.decisions.decisions.contains(decision)
+            || self.snapshot()? != *current
+        {
+            return Err(invalid("retained scene differs from its exact witness/source/frame"));
+        }
+        if self.store.read_extension(&archive.witness)? != archive.bytes {
+            return Err(invalid("retained scene witness changed"));
+        }
+        if self.snapshot()? != *current {
+            return Err(invalid("retained scene snapshot changed"));
+        }
+        Ok(RetainedScene::from_verified_archive_parts(
+            current,
+            decision,
+            scene,
+            &archive.witness,
+        )?)
+    }
+
     pub(crate) fn retained_scene(
         &self,
         current: &ProjectSnapshot,
@@ -59,6 +136,13 @@ impl IntentArchive {
 
     pub(super) fn snapshot(&self) -> Result<ProjectSnapshot> {
         Ok(self.store.load()?)
+    }
+    pub(super) fn snapshot_with_validated_registry(
+        &self,
+    ) -> Result<(ProjectSnapshot, Option<crate::product_store::scope::ValidatedOwnedSnapshot>)> {
+        Ok(self.store.with_verified_snapshot(|snapshot, archive| {
+            Ok::<_, DecisionError>((snapshot.clone(), archive.map(|archive| archive.retain_snapshot())))
+        })?)
     }
     pub fn new(store: ProductStore) -> Self {
         Self { store }
@@ -171,6 +255,12 @@ impl IntentArchive {
         }
         Ok(mappings)
     }
+}
+pub(super) struct RetainedArchive<'a> {
+    witness: Digest,
+    bytes: Vec<u8>,
+    decision: ScopedDecision,
+    scenes: &'a [AcceptedScene],
 }
 /// Link already validated, immutable scenes to the exact prospective proof
 /// recorded with their decision. The store verifies those decision births;

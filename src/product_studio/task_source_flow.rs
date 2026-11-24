@@ -32,6 +32,7 @@ fn check_cancelled(cancelled: &AtomicBool) -> Result<()> {
 fn message(error: &AdapterError) -> String {
     match error {
         AdapterError::Invalid(e) => e.to_string(),
+        AdapterError::Allocation(e) => format!("Allocation refused: {e}"),
         AdapterError::Unsupported(s)
         | AdapterError::Stale(s)
         | AdapterError::BudgetExhausted(s)

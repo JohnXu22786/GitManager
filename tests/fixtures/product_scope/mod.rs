@@ -1,4 +1,4 @@
-//! Fictional, hand-authored production-language fixtures, not provider evidence.
+// Fictional, hand-authored production-language fixtures, not provider evidence.
 use crate::product_contract::*;
 use crate::product_store::{scope::*, ProductStore, ProjectSnapshot};
 use serde_json::{json, Value};

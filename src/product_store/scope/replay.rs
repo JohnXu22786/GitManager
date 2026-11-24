@@ -31,6 +31,28 @@ pub(crate) struct RetainedScene {
     scenario: ScenarioSpec,
 }
 impl RetainedScene {
+    pub(crate) fn from_verified_archive_parts(
+        current: &ProjectSnapshot,
+        decision: &ScopedDecision,
+        scene: &crate::product_decisions::AcceptedScene,
+        witness: &Digest,
+    ) -> Result<Self> {
+        if !current.decisions.decisions.contains(decision)
+            || &decision.witness != witness
+            || !decision.scenarios.contains(&scene.scenario().identity()?)
+        {
+            return Err(compiler::error(
+                "retained scene differs from its exact witness/source/frame",
+            ));
+        }
+        Ok(Self {
+            snapshot: canonical_digest(IdentityDomain::Data, current)?,
+            decision: decision.clone(),
+            program: scene.program().clone(),
+            scenario: scene.scenario().clone(),
+        })
+    }
+
     pub(crate) fn from_verified_archive(
         current: &ProjectSnapshot,
         decision: &ScopedDecision,
@@ -86,6 +108,17 @@ pub struct ScopedExecutionContext {
     correspondences: BTreeMap<Digest, correspondence::VerifiedCorrespondence>,
 }
 impl ScopedExecutionContext {
+    pub(crate) fn current_snapshot(&self) -> &ProjectSnapshot {
+        &self.snapshot
+    }
+    pub(crate) fn require_current_scene_snapshot(&self, expected: &ProjectSnapshot) -> Result<()> {
+        if self.snapshot != *expected {
+            return Err(StoreError::Invalid(
+                "current scene replay context differs from supplied snapshot".into(),
+            ));
+        }
+        Ok(())
+    }
     pub(crate) fn applicability(
         &self,
         source: &CapturedProgram,
@@ -145,6 +178,22 @@ impl ScopedExecutionContext {
                 .collect(),
         )
     }
+    pub(crate) fn committed_with_validated_registry(
+        validated: &super::ValidatedOwnedSnapshot,
+    ) -> Result<Self> {
+        let snapshot = validated.snapshot();
+        if !matches!(&snapshot.scope, ScopeEnvelope::OwnedV2(_)) {
+            return Self::committed(snapshot);
+        }
+        snapshot.validate_container()?;
+        Ok(Self {
+            snapshot: snapshot.clone(),
+            owned: Some(owned_replay::OwnedExecutionContext::from_validated_registry(validated)?),
+            adoption_target: snapshot.active_revision.clone(),
+            projected_seeds: BTreeSet::new(),
+            correspondences: BTreeMap::new(),
+        })
+    }
     pub(crate) fn owned_prepared(
         snapshot: &ProjectSnapshot,
         prepared: &PreparedOwnedScopedChangeV2,
@@ -163,6 +212,30 @@ impl ScopedExecutionContext {
             projected_seeds: BTreeSet::new(),
             correspondences: BTreeMap::new(),
         })
+    }
+    pub(crate) fn owned_transition_prepared(
+        snapshot: &ProjectSnapshot,
+        prepared: &PreparedOwnedTransitionV2,
+        graph: Option<&DecisionGraph>,
+    ) -> Result<Self> {
+        Ok(Self {
+            snapshot: snapshot.clone(),
+            owned: Some(owned_replay::OwnedExecutionContext::for_transition(
+                snapshot, prepared, graph,
+            )?),
+            adoption_target: revision(prepared.target())?,
+            projected_seeds: BTreeSet::new(),
+            correspondences: BTreeMap::new(),
+        })
+    }
+    pub(crate) fn owned_transition_current(
+        snapshot: &ProjectSnapshot,
+        prepared: &PreparedOwnedTransitionV2,
+        graph: Option<&DecisionGraph>,
+    ) -> Result<Self> {
+        let mut context = Self::owned_transition_prepared(snapshot, prepared, graph)?;
+        context.adoption_target = snapshot.active_revision.clone();
+        Ok(context)
     }
     pub(super) fn registry(snapshot: &ProjectSnapshot) -> Result<Self> {
         Ok(Self {
@@ -662,7 +735,7 @@ impl ScopedExecutionContext {
             })
         })
     }
-    pub(crate) fn uses_owned_initializer(&self, target: &CapturedProgram) -> bool {
+    pub(crate) fn uses_owned_replay_recipe(&self, target: &CapturedProgram) -> bool {
         self.owned
             .as_ref()
             .is_some_and(|owned| owned.contains(target))
